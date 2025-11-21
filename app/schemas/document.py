@@ -77,4 +77,4 @@ class DocumentRead(DocumentBase):
 	exif_data: Optional[ExifDataRead] = None
 
 	class Config:
-		orm_mode = True
+		form_attributes = True
