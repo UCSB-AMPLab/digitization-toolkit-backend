@@ -1,5 +1,6 @@
 from fastapi import FastAPI
 from fastapi.middleware.cors import CORSMiddleware
+from contextlib import asynccontextmanager
 
 # initialize DB tables
 from app.core.db import init_db
@@ -8,14 +9,16 @@ from app.core.db import init_db
 from app.api.documents import router as documents_router
 from app.api.cameras import router as cameras_router
 
+# Define lifespan event to initialize the database
+@asynccontextmanager
+async def lifespan(app: FastAPI):
+    init_db()
+    yield
+
 app = FastAPI()
 
-# Initialize database tables on startup
-
-
-@app.on_event("startup")
-def on_startup():
-    init_db()
+# Create FastAPI app with lifespan
+app = FastAPI(lifespan=lifespan)
 
 # Allow the Svelte dev server to call the API
 app.add_middleware(
