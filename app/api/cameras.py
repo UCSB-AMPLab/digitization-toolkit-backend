@@ -1,5 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
+from app.models.document import DocumentImage
 from typing import List
 
 from app.api.deps import get_db_dependency
@@ -11,10 +13,17 @@ router = APIRouter()
 
 @router.post("/", response_model=CameraSettingsRead)
 def create_camera_settings(payload: CameraSettingsCreate, db: Session = Depends(get_db_dependency)):
-	cs = CameraSettings(**payload.dict())
-	db.add(cs)
-	db.commit()
-	db.refresh(cs)
+	if not db.query(DocumentImage).filter(DocumentImage.id == payload.document_image_id).first():
+		raise HTTPException(status_code=404, detail="Document not found")
+
+	try:
+		cs = CameraSettings(**payload.dict())
+		db.add(cs)
+		db.commit()
+		db.refresh(cs)
+	except IntegrityError:
+		db.rollback()
+		raise HTTPException(status_code=409, detail="Camera settings already exist for this document")
 	return CameraSettingsRead.from_orm(cs)
 
 
