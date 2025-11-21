@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from typing import List
 
@@ -19,7 +19,11 @@ def create_camera_settings(payload: CameraSettingsCreate, db: Session = Depends(
 
 
 @router.get("/", response_model=List[CameraSettingsRead])
-def list_camera_settings(skip: int = 0, limit: int = 100, db: Session = Depends(get_db_dependency)):
+def list_camera_settings(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db_dependency)
+):
 	items = db.query(CameraSettings).offset(skip).limit(limit).all()
 	return [CameraSettingsRead.from_orm(i) for i in items]
 
