@@ -38,14 +38,15 @@ def get_db() -> Generator:
 
 
 def init_db() -> None:
-	"""Import models to ensure they are registered on the Base metadata, then create tables."""
+	"""
+	Import all models to register them with SQLAlchemy.
+	
+	Raises:
+		ImportError: If any model cannot be imported (app should not start)
+	"""
 	# Import model modules so they register with Base
-	try:
-		import app.models.document  # noqa: F401
-		import app.models.camera  # noqa: F401
-		import app.models.project  # noqa: F401
-		import app.models.user  # noqa: F401
-	except Exception:
-		raise # We cannot skip this; if models don't import, tables won't be created
+	import app.models.document  # noqa: F401
+	import app.models.camera  # noqa: F401
+	import app.models.project  # noqa: F401
+	import app.models.user  # noqa: F401
 
-	Base.metadata.create_all(bind=engine)
