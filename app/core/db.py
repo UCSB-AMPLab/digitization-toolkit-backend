@@ -3,7 +3,7 @@ import os
 
 from sqlalchemy import create_engine
 from sqlalchemy.orm import sessionmaker, declarative_base
-from sqlalchemy.pool import NullPool
+from sqlalchemy.pool import QueuePool
 
 from app.core.config import settings
 
@@ -20,7 +20,7 @@ if not DATABASE_URL:
 engine = create_engine(
 	DATABASE_URL,
 	echo=False,
-	poolclass=NullPool,
+	poolclass=QueuePool,
 )
 
 # Session factory
