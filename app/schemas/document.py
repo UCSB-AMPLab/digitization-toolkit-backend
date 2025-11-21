@@ -57,7 +57,7 @@ class ExifDataRead(ExifDataBase):
 	created_at: Optional[datetime]
 
 	class Config:
-		orm_mode = True
+		form_attributes = True
 
 
 class CameraSettingsRead(CameraSettingsBase):
@@ -66,7 +66,7 @@ class CameraSettingsRead(CameraSettingsBase):
 	created_at: Optional[datetime]
 
 	class Config:
-		orm_mode = True
+		form_attributes = True
 
 
 class DocumentRead(DocumentBase):
