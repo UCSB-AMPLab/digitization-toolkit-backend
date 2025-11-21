@@ -1,4 +1,4 @@
-from datetime import datetime
+from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, DateTime, Text
 from sqlalchemy.orm import relationship
 
@@ -17,8 +17,8 @@ class DocumentImage(Base):
 	format = Column(String(50), nullable=False)
 	resolution_width = Column(Integer, nullable=True)
 	resolution_height = Column(Integer, nullable=True)
-	created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
-	modified_at = Column(DateTime, default=datetime.utcnow, onupdate=datetime.utcnow)
+	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 	uploaded_by = Column(String(255), nullable=True)
 
 	camera_settings = relationship("CameraSettings", back_populates="document_image", uselist=False, cascade="all, delete-orphan")
@@ -63,6 +63,6 @@ class ExifData(Base):
 
 	raw_exif = Column(Text, nullable=True)
 
-	created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 	document_image = relationship("DocumentImage", back_populates="exif_data")

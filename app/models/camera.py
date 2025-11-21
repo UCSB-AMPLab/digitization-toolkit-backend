@@ -26,6 +26,6 @@ class CameraSettings(Base):
 	focus_mode = Column(String(100), nullable=True)
 	light_source = Column(String(100), nullable=True)
 
-	created_at = Column(DateTime, default=datetime.utcnow, nullable=False)
+	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
 	document_image = relationship("DocumentImage", back_populates="camera_settings")
