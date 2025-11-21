@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
 from sqlalchemy.orm import relationship
 
 from app.core.db import Base
@@ -29,7 +29,7 @@ class ExifData(Base):
 	__tablename__ = "exif_data"
 
 	id = Column(Integer, primary_key=True, index=True)
-	document_image_id = Column(Integer, nullable=False)
+	document_image_id = Column(Integer, ForeignKey("document_images.id"), nullable=False)
 
 	make = Column(String(255), nullable=True)
 	model = Column(String(255), nullable=True)
