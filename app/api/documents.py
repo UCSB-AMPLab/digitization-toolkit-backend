@@ -1,4 +1,4 @@
-from fastapi import APIRouter, Depends, HTTPException
+from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
 from sqlalchemy.orm import Session
 
@@ -45,7 +45,11 @@ def create_document(doc_in: DocumentCreate, db: Session = Depends(get_db_depende
 
 
 @router.get("/", response_model=List[DocumentRead])
-def list_documents(skip: int = 0, limit: int = 100, db: Session = Depends(get_db_dependency)):
+def list_documents(
+    skip: int = Query(default=0, ge=0),
+    limit: int = Query(default=100, ge=1, le=1000),
+    db: Session = Depends(get_db_dependency)
+):
 	docs = db.query(DocumentImage).offset(skip).limit(limit).all()
 	return [DocumentRead.from_orm(d) for d in docs]
 
