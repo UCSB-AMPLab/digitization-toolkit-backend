@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
-from sqlalchemy.orm import Session, IntegrityError
+from sqlalchemy.orm import Session
+from sqlalchemy.exc import IntegrityError
 
 from app.api.deps import get_db_dependency
 from app.models.document import DocumentImage, ExifData
