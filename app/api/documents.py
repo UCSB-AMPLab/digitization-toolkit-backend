@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List
-from sqlalchemy.orm import Session
+from sqlalchemy.orm import Session, IntegrityError
 
 from app.api.deps import get_db_dependency
 from app.models.document import DocumentImage, ExifData
@@ -24,9 +24,13 @@ def create_document(doc_in: DocumentCreate, db: Session = Depends(get_db_depende
 		resolution_height=doc_in.resolution_height,
 		uploaded_by=doc_in.uploaded_by,
 	)
-	db.add(doc)
-	db.commit()
-	db.refresh(doc)
+	try:
+		db.add(doc)
+		db.commit()
+		db.refresh(doc)
+	except IntegrityError:
+		db.rollback()
+		raise HTTPException(status_code=409, detail="Document with this filename already exists")
 
 	# optional camera settings
 	if doc_in.camera_settings:
