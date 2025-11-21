@@ -47,7 +47,6 @@ def init_db() -> None:
 		import app.models.project  # noqa: F401
 		import app.models.user  # noqa: F401
 	except Exception:
-		# Some modules may not exist yet; ignore import errors to allow partial setups
-		pass
+		raise # We cannot skip this; if models don't import, tables won't be created
 
 	Base.metadata.create_all(bind=engine)
