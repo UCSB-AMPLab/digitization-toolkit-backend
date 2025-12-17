@@ -17,12 +17,20 @@ class DocumentImage(Base):
 	format = Column(String(50), nullable=False)
 	resolution_width = Column(Integer, nullable=True)
 	resolution_height = Column(Integer, nullable=True)
+	project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+	# Object typology: book, dossier, document, map, planimetry, other
+	object_typology = Column(String(50), nullable=True)
+	author = Column(String(255), nullable=True)
+	material = Column(String(255), nullable=True)
+	date = Column(String(50), nullable=True)
+	custom_attributes = Column(Text, nullable=True)
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 	uploaded_by = Column(String(255), nullable=True)
 
 	camera_settings = relationship("CameraSettings", back_populates="document_image", uselist=False, cascade="all, delete-orphan")
 	exif_data = relationship("ExifData", back_populates="document_image", uselist=False, cascade="all, delete-orphan")
+	project = relationship("Project", back_populates="documents")
 
 
 class ExifData(Base):

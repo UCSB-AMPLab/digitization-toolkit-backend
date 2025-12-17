@@ -45,6 +45,11 @@ class DocumentBase(BaseModel):
 	resolution_width: Optional[int] = None
 	resolution_height: Optional[int] = None
 	uploaded_by: Optional[str] = None
+	object_typology: Optional[str] = None  # book, dossier, document, map, planimetry, other
+	author: Optional[str] = None
+	material: Optional[str] = None
+	date: Optional[str] = None
+	custom_attributes: Optional[str] = None  # JSON string for custom fields
 
 
 class DocumentCreate(DocumentBase):
@@ -57,7 +62,7 @@ class ExifDataRead(ExifDataBase):
 	created_at: Optional[datetime]
 
 	class Config:
-		form_attributes = True
+		from_attributes = True
 
 
 class CameraSettingsRead(CameraSettingsBase):
@@ -66,15 +71,30 @@ class CameraSettingsRead(CameraSettingsBase):
 	created_at: Optional[datetime]
 
 	class Config:
-		form_attributes = True
+		from_attributes = True
+
+
+class DocumentUpdate(BaseModel):
+	title: Optional[str] = None
+	description: Optional[str] = None
+	file_size: Optional[int] = None
+	resolution_width: Optional[int] = None
+	resolution_height: Optional[int] = None
+	project_id: Optional[int] = None
+	object_typology: Optional[str] = None
+	author: Optional[str] = None
+	material: Optional[str] = None
+	date: Optional[str] = None
+	custom_attributes: Optional[str] = None
 
 
 class DocumentRead(DocumentBase):
 	id: int
+	project_id: Optional[int] = None
 	created_at: Optional[datetime]
 	modified_at: Optional[datetime]
 	camera_settings: Optional[CameraSettingsRead] = None
 	exif_data: Optional[ExifDataRead] = None
 
 	class Config:
-		form_attributes = True
+		from_attributes = True
