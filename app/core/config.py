@@ -10,6 +10,9 @@ class Settings(BaseSettings):
     UVICORN_HOST: str = "0.0.0.0"
     UVICORN_PORT: int = 8000
     LOG_LEVEL: str = "info"
+    DTK_DATA_DIR: str = "/var/lib/dtk"
+    DTK_LOG_DIR: str = "/var/log/dtk"
+    PROJECTS_ROOT: str = Field(default="/var/lib/dtk/projects", env="PROJECTS_ROOT")
 
     model_config = {
         "env_file": ".env"
