@@ -8,7 +8,7 @@ from typing import Optional
 from utils import setup_rotating_logger
 from camera import CameraConfig
 from manifestHandler import generate_manifest_record, append_manifest_record
-from backends import CameraBackend, RpicamBackend
+from backends import CameraBackend, RpicamBackend, Picamera2Backend
 
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
@@ -34,12 +34,12 @@ def get_camera_backend() -> CameraBackend:
     """
     backend_type = settings.CAMERA_BACKEND.lower()
     
-    if backend_type == "subprocess":
+    if backend_type == "picamera2":
+        return Picamera2Backend(subprocess_logger)
+    elif backend_type == "subprocess":
         return RpicamBackend(subprocess_logger)
-    elif backend_type == "picamera2":
-        raise NotImplementedError("Picamera2 backend not yet implemented")
     else:
-        subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess")
+        subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
         return RpicamBackend(subprocess_logger)
 
 # Global backend instance (lazy initialization)
