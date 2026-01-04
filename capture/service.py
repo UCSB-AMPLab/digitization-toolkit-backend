@@ -155,7 +155,8 @@ def is_camera_connected(camera_index: int = 0) -> bool:
 def image_filename(
     camera_index: int, 
     index: str = None,
-    img_size: tuple = None) -> str:
+    img_size: tuple = None,
+    image_encoding: str = "jpg") -> str:
     """
     Generate a compact image filename with timestamp and camera index.
     
@@ -182,7 +183,7 @@ def image_filename(
         width, height = img_size
         filename += f"_{width}x{height}"
     
-    filename += ".jpg"
+    filename += image_encoding if image_encoding.startswith('.') else f".{image_encoding}"
     return filename
     
 
@@ -216,7 +217,8 @@ def capture_image(
     if not output_filename:
         output_filename = image_filename(
             camera_index=camera_config.camera_index,
-            img_size=camera_config.img_size if include_resolution else None
+            img_size=camera_config.img_size if include_resolution else None,
+            image_encoding=camera_config.encoding
         )
     
     output_path = Path(project_path, output_filename)
@@ -314,12 +316,14 @@ def dual_capture_image(
     filename1 = image_filename(
         camera_index=cam1_config.camera_index,
         index=timestamp_index,
-        img_size=cam1_config.img_size if include_resolution else None
+        img_size=cam1_config.img_size if include_resolution else None,
+        image_encoding=cam1_config.encoding
     )
     filename2 = image_filename(
         camera_index=cam2_config.camera_index,
         index=timestamp_index,
-        img_size=cam2_config.img_size if include_resolution else None
+        img_size=cam2_config.img_size if include_resolution else None,
+        image_encoding=cam2_config.encoding
     )
     
     timing = {}
