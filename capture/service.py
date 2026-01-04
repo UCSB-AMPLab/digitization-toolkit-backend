@@ -53,6 +53,8 @@ class CameraConfig:
     thumbnail: bool = False
     nopreview: bool = True
     zsl: bool = False  # Zero Shutter Lag (ZSL) mode
+    encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
+    raw: bool = False  # Capture RAW alongside JPEG
     
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""
@@ -245,6 +247,10 @@ def capture_image(
         command.extend(["--thumb", "320:240:70"])
     if camera_config.zsl:
         command.append("--zsl")
+    if camera_config.encoding != "jpg":
+        command.extend(["--encoding", camera_config.encoding])
+    if camera_config.raw:
+        command.append("--raw")
     
         
     subprocess_logger.info("Executing command: %s", ' '.join(command))
@@ -360,46 +366,16 @@ def dual_capture_image(
     
 
 if __name__ == "__main__":
-    # Example 1: Independent Camera Configurations
-    print("=== Example 1: Independent Camera Configurations ===")
-    cam1 = CameraConfig(
-        camera_index=0,
-        vflip=True,
-        hflip=False,
-        awb="auto",
-        img_size=IMG_SIZES["high"],
-        zsl=True
-    )
-    cam2 = CameraConfig(
-        camera_index=1,
-        vflip=False,
-        hflip=True,
-        awb="indoor",
-        img_size=IMG_SIZES["high"]
-    )
-    
-    start_time = time.time()
-    path1, path2, timing = dual_capture_image(
-        project_name="testproject",
-        cam1_config=cam1,
-        cam2_config=cam2,
-        check_camera=False
-    )
-    print(f"Captured in {time.time() - start_time:.3f}s")
-    print(f"Files: {path1.split('/')[-1]}, {path2.split('/')[-1]}")
-    print(f"Config 1: {cam1}")
-    print(f"Config 2: {cam2}")
-    print()
-    
-    # Example 2: Same settings for both cameras
-    print("=== Example 2: Same Configuration ===")
+    # Simple test of dual capture
     default_config = CameraConfig(
         camera_index=0,  # Will be overridden
         timeout=0,
         vflip=False,
         hflip=True,
         awb="auto",
-        zsl=False
+        zsl=True,
+        encoding="png",
+        raw=True
     )
     
     cam1 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 0})
