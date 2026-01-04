@@ -6,7 +6,6 @@ import sys
 from pathlib import Path
 import time
 from datetime import datetime, timezone
-
 import concurrent.futures
 
 backend_dir = Path(__file__).parent.parent
@@ -25,19 +24,6 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[logger_handler])
 
 subprocess_logger = logging.getLogger('subprocess_logger')
-
-## first test
-test_project = Path(PROJECTS_ROOT, 'testproject')
-os.makedirs(test_project, exist_ok=True)
-
-subprocess.run(
-    ["rpicam-still", "-o", Path(test_project, "test.jpg"), "--nopreview"],
-    check=True,
-    capture_output=True,
-    text=True
-)
-
-subprocess_logger.info("Test capture completed, image saved to %s", Path(test_project, "test.jpg"))
 
 IMG_SIZES = {
     "low": (2312, 1736),
