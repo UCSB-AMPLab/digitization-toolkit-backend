@@ -21,11 +21,12 @@ class CameraConfig:
     vflip: bool = False
     hflip: bool = False
     awb: str = "indoor"  # auto, indoor, tungsten, fluorescent, etc. See https://www.raspberrypi.com/documentation/computers/camera_software.html#awb for all options
-    timeout: int = 0  # 0 = immediate capture
+    timeout: int = 50  # Preview timeout in ms (needed for autofocus/auto-exposure)
     autofocus_on_capture: bool = True
     buffer_count: int = 2
     thumbnail: bool = False
     nopreview: bool = True
+    quality: int = 93  # JPEG quality (1-100, default 93)
     zsl: bool = False  # Zero Shutter Lag (ZSL) mode
     encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
     raw: bool = False  # Capture RAW alongside JPEG
