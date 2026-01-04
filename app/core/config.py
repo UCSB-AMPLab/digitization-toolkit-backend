@@ -12,11 +12,28 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = "info"
     DTK_DATA_DIR: str = "/var/lib/dtk"
     DTK_LOG_DIR: str = "/var/log/dtk"
-    PROJECTS_ROOT: str = Field(default="/var/lib/dtk/projects", env="PROJECTS_ROOT")
+    PROJECTS_ROOT: str = Field(default="", env="PROJECTS_ROOT")
+    EXPORTS_ROOT: str = Field(default="", env="DTK_EXPORTS_DIR")
 
     model_config = {
         "env_file": ".env"
     }
+    
+    @property
+    def data_dir(self) -> Path:
+        return Path(self.DTK_DATA_DIR)
+    
+    @property
+    def log_dir(self) -> Path:
+        return Path(self.DTK_LOG_DIR)
+    
+    @property
+    def projects_dir(self) -> Path:
+        return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
+    
+    @property
+    def exports_dir(self) -> Path:
+        return Path(self.EXPORTS_ROOT) if self.EXPORTS_ROOT else (self.data_dir / "exports")
 
 
 settings = Settings()

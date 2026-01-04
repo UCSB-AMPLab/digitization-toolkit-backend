@@ -15,8 +15,9 @@ sys.path.insert(0, str(backend_dir))
 
 from app.core.config import settings
 
-PROJECTS_ROOT = getattr(settings, "PROJECTS_ROOT", None)
-LOG_FILE = Path(getattr(settings, "DTK_LOG_DIR", None), 'capture_service.log')
+PROJECTS_ROOT = settings.projects_dir
+LOG_FILE = settings.log_dir / "capture_service.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
 logger_handler = RotatingFileHandler(LOG_FILE, maxBytes=5*1024*1024, backupCount=5)
 
@@ -137,13 +138,13 @@ def is_camera_connected(camera_index: int = 0) -> bool:
             timeout=5 
         )
         if f"{camera_index} :" in result.stdout:
-            subprocess_logger.info("Camera %d is connected.", camera_index)
+            subprocess_logger.info(f"Camera {camera_index} is connected.")
             return True
         else:
-            subprocess_logger.warning("Camera %d not found in available cameras.", camera_index)
+            subprocess_logger.warning(f"Camera {camera_index} not found in available cameras.")
             return False
     except subprocess.CalledProcessError as e:
-        subprocess_logger.error("Failed to list cameras: %s", e.stderr)
+        subprocess_logger.error(f"Failed to list cameras: {e.stderr}")
         return False
     except subprocess.TimeoutExpired:
         subprocess_logger.error("Camera list check timed out.")
@@ -207,8 +208,8 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = Path(PROJECTS_ROOT, project_name)
-    os.makedirs(project_path, exist_ok=True)
+    project_path = PROJECTS_ROOT / project_name / "images" / "main"
+    project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
         output_filename = image_filename(
@@ -255,16 +256,16 @@ def capture_image(
             text=capture_output,
             timeout=10
         )
-        subprocess_logger.info("Image captured successfully: %s", output_path)
+        subprocess_logger.info(f"Image captured successfully: {output_path}")
         return str(output_path)
     except subprocess.CalledProcessError as e:
         if capture_output:
-            subprocess_logger.error("Error capturing image: %s", e.stderr)
+            subprocess_logger.error(f"Error capturing image: {e.stderr}")
         else:
-            subprocess_logger.error("Error capturing image (exit code: %s)", e.returncode)
+            subprocess_logger.error(f"Error capturing image (exit code: {e.returncode})")
         raise
     except subprocess.TimeoutExpired:
-        subprocess_logger.error("Image capture timed out after %d ms", timeout)
+        subprocess_logger.error(f"Image capture timed out after {camera_config.timeout} ms")
         raise
     
 
@@ -328,7 +329,6 @@ def dual_capture_image(
             capture_output=False  # Max performance
         )
         elapsed = time.time() - start
-        elapsed = time.time() - start
         return path, elapsed
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
@@ -353,8 +353,7 @@ def dual_capture_image(
         'cam2_config': cam2_config.to_dict()
     }
     subprocess_logger.info(
-        "Parallel capture: cam%d=%.3fs, cam%d=%.3fs, stagger=%dms",
-        cam1_config.camera_index, time1, cam2_config.camera_index, time2, stagger_ms
+        f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, stagger={stagger_ms}ms"
     )
     
     return img1_path, img2_path, timing
