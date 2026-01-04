@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     DTK_LOG_DIR: str = "/var/log/dtk"
     PROJECTS_ROOT: str = Field(default="", env="PROJECTS_ROOT")
     EXPORTS_ROOT: str = Field(default="", env="DTK_EXPORTS_DIR")
+    app_version: str = "0.0.0-dev"
 
     model_config = {
         "env_file": ".env"
