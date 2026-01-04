@@ -1,5 +1,6 @@
 from pydantic_settings import BaseSettings
 from pydantic import Field
+from pathlib import Path
 
 class Settings(BaseSettings):
     DATABASE_URL: str = "postgresql://user:password@db:5432/digitization_toolkit"
