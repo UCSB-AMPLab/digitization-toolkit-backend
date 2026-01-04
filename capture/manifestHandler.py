@@ -9,10 +9,11 @@ import os
 import json
 import sys
 
-from utils import compute_sha256, setup_rotating_logger
-
 backend_dir = Path(__file__).parent.parent
-sys.path.insert(0, str(backend_dir))
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+from .utils import compute_sha256, setup_rotating_logger
 
 from app.core.config import settings
 

@@ -5,13 +5,14 @@ from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
 
-from utils import setup_rotating_logger
-from camera import CameraConfig
-from manifestHandler import generate_manifest_record, append_manifest_record
-from backends import CameraBackend, RpicamBackend, Picamera2Backend
-
 backend_dir = Path(__file__).parent.parent
-sys.path.insert(0, str(backend_dir))
+if str(backend_dir) not in sys.path:
+    sys.path.insert(0, str(backend_dir))
+
+from .utils import setup_rotating_logger
+from .camera import CameraConfig
+from .manifestHandler import generate_manifest_record, append_manifest_record
+from .backends import CameraBackend, RpicamBackend, Picamera2Backend
 
 from app.core.config import settings
 
