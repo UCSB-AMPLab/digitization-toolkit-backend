@@ -1,5 +1,6 @@
 import subprocess
 import os
+import json
 import logging
 from logging.handlers import RotatingFileHandler
 import sys
@@ -9,6 +10,7 @@ from datetime import datetime, timezone
 import concurrent.futures
 
 from camera import CameraConfig
+from manifestHandler import CaptureRecord, CaptureCamera, CaptureFile
 from typing import Optional
 
 backend_dir = Path(__file__).parent.parent
@@ -28,6 +30,98 @@ logging.basicConfig(level=logging.INFO,
                     handlers=[logger_handler])
 
 subprocess_logger = logging.getLogger('subprocess_logger')
+
+def generate_manifest_record(
+    project_name: str,
+    img_paths: list,
+    cam_configs: list,
+    times: list = None,
+    pair_id: str = None,
+    stagger: int = None,
+    roles: list = None) -> CaptureRecord:
+    """
+    Generate a manifest record for single or dual captures.
+    
+    Args:
+        project_name: Name of the project
+        img_paths: List of captured image paths
+        cam_configs: List of CameraConfig objects used
+        times: List of capture times in seconds (optional)
+        pair_id: Shared ID for dual captures (optional, auto-generated)
+        stagger: Delay between camera starts in ms (optional)
+        roles: List of role names (e.g., ["left", "right"] or ["single"])
+               If None, auto-assigns based on number of captures
+    
+    Returns:
+        CaptureRecord object
+    """
+    # Auto-assign roles if not provided
+    if roles is None:
+        if len(img_paths) == 1:
+            roles = ["single"]
+        elif len(img_paths) == 2:
+            roles = ["left", "right"]
+        else:
+            roles = [f"cam{i}" for i in range(len(img_paths))]
+    
+    # Build files list
+    files = []
+    for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
+        files.append(CaptureFile(
+            role=role,
+            relative_path=str(Path("images/main") / Path(path).name),
+            bytes=os.path.getsize(path),
+            mimetype=f"image/{config.encoding}"
+        ))
+    
+    # Build cameras list
+    cameras = []
+    for config in cam_configs:
+        cameras.append(CaptureCamera(
+            camera_index=config.camera_index,
+            config=config.to_dict()
+        ))
+    
+    # Build timing dict
+    timing = {}
+    if times:
+        for i, t in enumerate(times):
+            timing[f'camera{i+1}_seconds'] = t
+    if stagger is not None:
+        timing['stagger_ms'] = stagger
+    
+    return CaptureRecord(
+        project_name=project_name,
+        pair_id=pair_id,
+        files=files,
+        cameras=cameras,
+        timing=timing,
+        software={
+            "tool": "digitization-toolkit",
+            "version": settings.app_version,
+        }
+    )
+    
+
+def append_manifest_record(project_root: Path, record: CaptureRecord):
+    """
+    Append a capture record to the manifest file in the project directory.
+    
+    Args:
+        project_root (Path): The root directory of the project.
+        record (CaptureRecord): The capture record to append.
+    """
+    
+    metadata_dir = project_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    
+    manifest_path = metadata_dir / "manifest.jsonl"
+    
+    with open(manifest_path, 'a', encoding="utf-8") as f:
+        f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+        subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
 
 def is_camera_connected(camera_index: int = 0) -> bool:
     """
@@ -139,6 +233,7 @@ def capture_image(
         "-o", str(output_path),
         "--width", str(camera_config.img_size[0]),
         "--height", str(camera_config.img_size[1]),
+        "--quality", str(camera_config.quality),
         "--awb", camera_config.awb,
         "--buffer-count", str(camera_config.buffer_count),
         "--camera", str(camera_config.camera_index)
@@ -265,45 +360,52 @@ def dual_capture_image(
         # Wait for both to complete
         img1_path, time1 = future1.result()
         img2_path, time2 = future2.result()
+        
+    project_root = PROJECTS_ROOT / project_name
     
-    timing = {
-        'camera1_seconds': time1,
-        'camera2_seconds': time2,
-        'stagger_ms': stagger_ms,
-        'cam1_config': cam1_config.to_dict(),
-        'cam2_config': cam2_config.to_dict()
-    }
+    record = generate_manifest_record(
+        project_name=project_name,
+        pair_id=timestamp_index,
+        img_paths=[img1_path, img2_path],
+        cam_configs=[cam1_config, cam2_config],
+        times=[time1, time2],
+        stagger=stagger_ms
+    )
+    append_manifest_record(project_root, record)
+    
     subprocess_logger.info(
         f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, stagger={stagger_ms}ms"
     )
     
-    return img1_path, img2_path, timing
+    return img1_path, img2_path
     
 
 if __name__ == "__main__":
     # Simple test of dual capture
+    start_time = time.time()
     default_config = CameraConfig(
         camera_index=0,  # Will be overridden
-        timeout=0,
         vflip=False,
         hflip=True,
-        awb="auto",
-        zsl=True,
-        encoding="png",
-        raw=True
+        awb=awb,
+        zsl=True
     )
     
     cam1 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 0})
     cam2 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 1})
     
-    start_time = time.time()
-    path1, path2, timing = dual_capture_image(
-        project_name="testproject",
+    
+    path1, path2 = dual_capture_image(
+        project_name="testawb",
         cam1_config=cam1,
         cam2_config=cam2,
         check_camera=False
     )
     print(f"Captured in {time.time() - start_time:.3f}s")
-    print(f"Timing: {timing}")
-
+    # how many images per hour?
+    images_per_hour = 3600 / (time.time() - start_time)
+    print(f"Estimated images per hour: {images_per_hour:.1f}")
+    print(f"Camera 1 image: {path1}")
+    print(f"Camera 2 image: {path2}")
+    
     
