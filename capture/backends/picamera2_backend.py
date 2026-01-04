@@ -152,15 +152,8 @@ class Picamera2Backend(CameraBackend):
             # For now, we'll configure each time to ensure settings match
             # In future optimization, we could cache configurations
             
-            # Create still configuration
-            transform_args = {}
-            if camera_config.hflip:
-                transform_args['hflip'] = 1
-            if camera_config.vflip:
-                transform_args['vflip'] = 1
-            
-            # Build configuration
-            config_dict = {
+            # Create still configuration with transform if needed
+            config_args = {
                 "main": {
                     "size": camera_config.img_size,
                     "format": "RGB888" if camera_config.encoding == "rgb" else "BGR888"
@@ -168,10 +161,14 @@ class Picamera2Backend(CameraBackend):
                 "buffer_count": camera_config.buffer_count,
             }
             
-            if transform_args:
-                config_dict["transform"] = Picamera2.Transform(**transform_args)
+            # Apply transformations (flip)
+            if camera_config.hflip or camera_config.vflip:
+                from libcamera import Transform
+                hflip = 1 if camera_config.hflip else 0
+                vflip = 1 if camera_config.vflip else 0
+                config_args["transform"] = Transform(hflip=hflip, vflip=vflip)
             
-            still_config = picam2.create_still_configuration(**config_dict)
+            still_config = picam2.create_still_configuration(**config_args)
             
             # Check if camera is already running with different config
             if picam2.started:
