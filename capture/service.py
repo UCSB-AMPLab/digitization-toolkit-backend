@@ -1,4 +1,3 @@
-import subprocess
 import sys
 from pathlib import Path
 import time
@@ -9,6 +8,7 @@ from typing import Optional
 from utils import setup_rotating_logger
 from camera import CameraConfig
 from manifestHandler import generate_manifest_record, append_manifest_record
+from backends import CameraBackend, RpicamBackend
 
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
@@ -24,6 +24,36 @@ subprocess_logger = setup_rotating_logger(
     logger_name="capture_service"
 )
 
+# Initialize camera backend based on configuration
+def get_camera_backend() -> CameraBackend:
+    """
+    Get the configured camera backend instance.
+    
+    Returns:
+        CameraBackend: The active camera backend implementation.
+    """
+    backend_type = settings.CAMERA_BACKEND.lower()
+    
+    if backend_type == "subprocess":
+        return RpicamBackend(subprocess_logger)
+    elif backend_type == "picamera2":
+        raise NotImplementedError("Picamera2 backend not yet implemented")
+    else:
+        subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess")
+        return RpicamBackend(subprocess_logger)
+
+# Global backend instance (lazy initialization)
+_backend: Optional[CameraBackend] = None
+
+def get_backend() -> CameraBackend:
+    """Get or initialize the global camera backend."""
+    global _backend
+    if _backend is None:
+        _backend = get_camera_backend()
+        subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+    return _backend
+
+
 def is_camera_connected(camera_index: int = 0) -> bool:
     """
     Check if the camera is connected using --list-cameras (fast, no initialization).
@@ -33,30 +63,8 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     Returns:
         bool: True if the camera is connected, False otherwise.
     """
-    command = [
-        "rpicam-still",
-        "--list-cameras"
-    ]
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=True,
-            text=True,
-            timeout=5 
-        )
-        if f"{camera_index} :" in result.stdout:
-            subprocess_logger.info(f"Camera {camera_index} is connected.")
-            return True
-        else:
-            subprocess_logger.warning(f"Camera {camera_index} not found in available cameras.")
-            return False
-    except subprocess.CalledProcessError as e:
-        subprocess_logger.error(f"Failed to list cameras: {e.stderr}")
-        return False
-    except subprocess.TimeoutExpired:
-        subprocess_logger.error("Camera list check timed out.")
-        return False
+    backend = get_backend()
+    return backend.is_camera_connected(camera_index)
 
 def image_filename(
     camera_index: int, 
@@ -129,59 +137,9 @@ def capture_image(
     
     output_path = Path(project_path, output_filename)
     
-    command = [
-        "rpicam-still",
-        "-o", str(output_path),
-        "--width", str(camera_config.img_size[0]),
-        "--height", str(camera_config.img_size[1]),
-        "--quality", str(camera_config.quality),
-        "--awb", camera_config.awb,
-        "--buffer-count", str(camera_config.buffer_count),
-        "--camera", str(camera_config.camera_index)
-    ]
-    
-    if camera_config.timeout == 0:
-        command.append("--immediate")
-    else:
-        command.extend(["-t", str(camera_config.timeout)])
-    if camera_config.nopreview:
-        command.append("-n")
-    if camera_config.vflip:
-        command.append("--vflip")
-    if camera_config.hflip:
-        command.append("--hflip")
-    if camera_config.autofocus_on_capture:
-        command.append("--autofocus-on-capture")
-    if camera_config.thumbnail:
-        command.extend(["--thumb", "320:240:70"])
-    if camera_config.zsl:
-        command.append("--zsl")
-    if camera_config.encoding != "jpg":
-        command.extend(["--encoding", camera_config.encoding])
-    if camera_config.raw:
-        command.append("--raw")
-    
-        
-    subprocess_logger.info("Executing command: %s", ' '.join(command))
-    try:
-        result = subprocess.run(
-            command,
-            check=True,
-            capture_output=capture_output,
-            text=capture_output,
-            timeout=10
-        )
-        subprocess_logger.info(f"Image captured successfully: {output_path}")
-        return str(output_path)
-    except subprocess.CalledProcessError as e:
-        if capture_output:
-            subprocess_logger.error(f"Error capturing image: {e.stderr}")
-        else:
-            subprocess_logger.error(f"Error capturing image (exit code: {e.returncode})")
-        raise
-    except subprocess.TimeoutExpired:
-        subprocess_logger.error(f"Image capture timed out after {camera_config.timeout} ms")
-        raise
+    # Use backend for actual capture
+    backend = get_backend()
+    return backend.capture_image(output_path, camera_config, capture_output)
     
 
 def single_capture_image(
@@ -328,12 +286,4 @@ def dual_capture_image(
     return img1_path, img2_path
     
 if __name__ == "__main__":
-    # Example usage
-    cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
-    cam2 = CameraConfig(camera_index=1, hflip=True, awb="indoor")
-    
-    try:
-        path1, path2 = dual_capture_image("test_project", cam1, cam2)
-        print(f"Captured images: {path1}, {path2}")
-    except Exception as e:
-        print(f"Capture failed: {e}")
+    sys.exit(main())
