@@ -5,7 +5,24 @@ from pathlib import Path
 import uuid
 import platform
 import socket
+import os
+import json
+import sys
 
+from utils import compute_sha256, setup_rotating_logger
+
+backend_dir = Path(__file__).parent.parent
+sys.path.insert(0, str(backend_dir))
+
+from app.core.config import settings
+
+LOG_FILE = settings.log_dir / "capture_service.log"
+LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
+
+subprocess_logger = setup_rotating_logger(
+    log_file=str(LOG_FILE),
+    logger_name="capture_service"
+)
 
 @dataclass
 class CaptureFile:
@@ -65,3 +82,99 @@ class CaptureRecord:
 
     def to_dict(self) -> Dict:
         return asdict(self)
+
+
+#### Helper functions ####
+
+def generate_manifest_record(
+    project_name: str,
+    img_paths: list,
+    cam_configs: list,
+    times: list = None,
+    pair_id: str = None,
+    stagger: int = None,
+    roles: list = None) -> CaptureRecord:
+    """
+    Generate a manifest record for single or dual captures.
+    
+    Args:
+        project_name: Name of the project
+        img_paths: List of captured image paths
+        cam_configs: List of CameraConfig objects used
+        times: List of capture times in seconds (optional)
+        pair_id: Shared ID for dual captures (optional, auto-generated)
+        stagger: Delay between camera starts in ms (optional)
+        roles: List of role names (e.g., ["left", "right"] or ["single"])
+               If None, auto-assigns based on number of captures
+    
+    Returns:
+        CaptureRecord object
+    """
+    # Auto-assign roles if not provided
+    if roles is None:
+        if len(img_paths) == 1:
+            roles = ["single"]
+        elif len(img_paths) == 2:
+            roles = ["left", "right"]
+        else:
+            roles = [f"cam{i}" for i in range(len(img_paths))]
+    
+    # Build files list
+    files = []
+    for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
+        files.append(CaptureFile(
+            role=role,
+            relative_path=str(Path("images/main") / Path(path).name),
+            bytes=os.path.getsize(path),
+            mimetype=f"image/{config.encoding}",
+            sha256=compute_sha256(path)
+        ))
+    
+    # Build cameras list
+    cameras = []
+    for config in cam_configs:
+        cameras.append(CaptureCamera(
+            camera_index=config.camera_index,
+            config=config.to_dict()
+        ))
+    
+    # Build timing dict
+    timing = {}
+    if times:
+        for i, t in enumerate(times):
+            timing[f'camera{i+1}_seconds'] = t
+    if stagger is not None:
+        timing['stagger_ms'] = stagger
+    
+    return CaptureRecord(
+        project_name=project_name,
+        pair_id=pair_id,
+        files=files,
+        cameras=cameras,
+        timing=timing,
+        software={
+            "tool": "digitization-toolkit",
+            "version": settings.app_version,
+        }
+    )
+    
+
+def append_manifest_record(project_root: Path, record: CaptureRecord):
+    """
+    Append a capture record to the manifest file in the project directory.
+    
+    Args:
+        project_root (Path): The root directory of the project.
+        record (CaptureRecord): The capture record to append.
+    """
+    
+    metadata_dir = project_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    
+    manifest_path = metadata_dir / "manifest.jsonl"
+    
+    with open(manifest_path, 'a', encoding="utf-8") as f:
+        f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
+        f.flush()
+        os.fsync(f.fileno())
+        subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
