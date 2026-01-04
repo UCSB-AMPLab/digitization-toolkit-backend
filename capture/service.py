@@ -8,10 +8,11 @@ from pathlib import Path
 import time
 from datetime import datetime, timezone
 import concurrent.futures
+from typing import Optional
 
+from utils import compute_sha256
 from camera import CameraConfig
 from manifestHandler import CaptureRecord, CaptureCamera, CaptureFile
-from typing import Optional
 
 backend_dir = Path(__file__).parent.parent
 sys.path.insert(0, str(backend_dir))
@@ -71,7 +72,8 @@ def generate_manifest_record(
             role=role,
             relative_path=str(Path("images/main") / Path(path).name),
             bytes=os.path.getsize(path),
-            mimetype=f"image/{config.encoding}"
+            mimetype=f"image/{config.encoding}",
+            sha256=compute_sha256(path)
         ))
     
     # Build cameras list
@@ -426,25 +428,13 @@ def dual_capture_image(
     
     return img1_path, img2_path
     
-
 if __name__ == "__main__":
-    # Simple test of dual capture
-    start_time = time.time()
-    default_config = CameraConfig(
-        camera_index=0,  # Will be overridden
-        vflip=False,
-        hflip=True,
-        awb="fluorescent",
-        zsl=True
-    )
+    # Example usage
+    cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
+    cam2 = CameraConfig(camera_index=1, hflip=True, awb="indoor")
     
-    cam1 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 0})
-    cam2 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 1})
-    
-    
-    imgpath = single_capture_image(
-        project_name="single_test",
-        camera_config=cam1,
-        include_resolution=True
-    )
-    print(f"Single capture image saved to: {imgpath}")
+    try:
+        path1, path2 = dual_capture_image("test_project", cam1, cam2)
+        print(f"Captured images: {path1}, {path2}")
+    except Exception as e:
+        print(f"Capture failed: {e}")
