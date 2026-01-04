@@ -178,3 +178,4 @@ def append_manifest_record(project_root: Path, record: CaptureRecord):
         f.flush()
         os.fsync(f.fileno())
         subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
+        
