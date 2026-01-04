@@ -283,6 +283,53 @@ def capture_image(
         raise
     
 
+def single_capture_image(
+        project_name: str,
+        camera_config: CameraConfig,
+        check_camera: bool = True,
+        include_resolution: bool = False) -> str:
+    """
+    Capture an image from a single camera.
+    
+    Args:
+        project_name (str): The name of the project to save the image in.
+        camera_config (CameraConfig): Configuration for the camera.
+        check_camera (bool): Whether to check camera availability before capture.
+        include_resolution (bool): Include resolution in auto-generated filename.
+    Returns:
+        str: The path to the captured image file.
+    """
+    
+    if check_camera and not is_camera_connected(camera_config.camera_index):
+        raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
+    
+    start_time = time.time()
+    
+    output_path = capture_image(
+        project_name=project_name,
+        camera_config=camera_config,
+        check_camera=False,  # Already checked
+        include_resolution=include_resolution
+    )
+    
+    elapsed_time = time.time() - start_time
+    
+    project_root = PROJECTS_ROOT / project_name
+    
+    record = generate_manifest_record(
+        project_name=project_name,
+        img_paths=[output_path],
+        cam_configs=[camera_config],
+        times=[elapsed_time]
+    )
+    append_manifest_record(project_root, record)
+    
+    subprocess_logger.info(
+        f"Single capture: cam{camera_config.camera_index}={elapsed_time:.3f}s"
+    )
+    
+    return output_path
+
 def dual_capture_image(
         project_name: str,
         cam1_config: CameraConfig,
@@ -387,7 +434,7 @@ if __name__ == "__main__":
         camera_index=0,  # Will be overridden
         vflip=False,
         hflip=True,
-        awb=awb,
+        awb="fluorescent",
         zsl=True
     )
     
@@ -395,17 +442,9 @@ if __name__ == "__main__":
     cam2 = CameraConfig(**{**default_config.to_dict(), 'camera_index': 1})
     
     
-    path1, path2 = dual_capture_image(
-        project_name="testawb",
-        cam1_config=cam1,
-        cam2_config=cam2,
-        check_camera=False
+    imgpath = single_capture_image(
+        project_name="single_test",
+        camera_config=cam1,
+        include_resolution=True
     )
-    print(f"Captured in {time.time() - start_time:.3f}s")
-    # how many images per hour?
-    images_per_hour = 3600 / (time.time() - start_time)
-    print(f"Estimated images per hour: {images_per_hour:.1f}")
-    print(f"Camera 1 image: {path1}")
-    print(f"Camera 2 image: {path2}")
-    
-    
+    print(f"Single capture image saved to: {imgpath}")
