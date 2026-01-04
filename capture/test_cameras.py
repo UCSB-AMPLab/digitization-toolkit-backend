@@ -54,8 +54,3 @@ def test_dual_capture_image(override_projects_root, skip_if_single_camera):
     # Verify filenames contain camera indices
     assert "_c0_" in path1 or "_c0." in path1, "Camera 0 filename doesn't indicate camera index"
     assert "_c1_" in path2 or "_c1." in path2, "Camera 1 filename doesn't indicate camera index"
-    
-    print(f"\n✓ Dual capture successful:")
-    print(f"  Camera 0: {path1} ({os.path.getsize(path1) / 1024:.1f} KB)")
-    print(f"  Camera 1: {path2} ({os.path.getsize(path2) / 1024:.1f} KB)")
-    
