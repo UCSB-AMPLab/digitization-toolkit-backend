@@ -220,6 +220,10 @@ class Picamera2Backend(CameraBackend):
                 "buffer_count": camera_config.buffer_count,
             }
             
+            # Add raw stream if DNG capture requested
+            if camera_config.raw:
+                config_args["raw"] = {}  # Enable raw stream for DNG
+            
             # Apply transformations (flip)
             if camera_config.hflip or camera_config.vflip:
                 from libcamera import Transform
@@ -295,28 +299,43 @@ class Picamera2Backend(CameraBackend):
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
             
-            if camera_config.raw:
-                # Capture DNG (raw) format
-                # Use request-based capture for access to raw stream and metadata
-                request = picam2.capture_request()
-                try:
-                    request.save_dng(str(output_path))
-                    self.logger.debug(f"Saved DNG raw file")
-                    # Extract metadata before releasing request
-                    metadata = request.get_metadata()
-                finally:
-                    request.release()
-            else:
-                # Standard JPEG/PNG capture with metadata
-                # Use request-based capture to get metadata
-                request = picam2.capture_request()
-                try:
+            # Use request-based capture to get metadata and save files
+            request = picam2.capture_request()
+            try:
+                # Extract metadata first
+                metadata = request.get_metadata()
+                
+                if camera_config.raw:
+                    # Multi-format capture: save both JPEG and raw buffer
+                    # Raw buffer contains full sensor data for archival preservation
+                    # JPEG provides quick viewing/preview
+                    
+                    # Generate raw filename (.raw extension for now due to picamera2 DNG bug)
+                    raw_path = Path(str(output_path).rsplit('.', 1)[0] + '.raw')
+                    
+                    # Save JPEG first
+                    request.save("main", str(output_path))
+                    self.logger.debug(f"Saved JPEG: {Path(output_path).name}")
+                    
+                    # Save raw buffer directly (workaround for picamera2 save_dng bug)
+                    # picamera2 0.3.33 has a bug: Picamera2Camera.__init__() signature mismatch
+                    # Saving raw sensor data as binary until library is fixed
+                    try:
+                        raw_buffer = request.make_buffer("raw")
+                        with open(raw_path, 'wb') as f:
+                            f.write(raw_buffer)
+                        self.logger.debug(f"Saved raw buffer: {raw_path.name}")
+                        output_path = (str(output_path), str(raw_path))
+                    except Exception as e:
+                        self.logger.warning(f"Failed to save raw buffer: {e}, continuing with JPEG only")
+                        output_path = str(output_path)
+                else:
+                    # Standard JPEG/PNG capture only
                     request.save("main", str(output_path))
                     self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
-                    # Extract metadata before releasing request
-                    metadata = request.get_metadata()
-                finally:
-                    request.release()
+                    
+            finally:
+                request.release()
             
             # Extract relevant metadata for archival documentation
             archival_metadata = self._extract_archival_metadata(metadata)
@@ -327,7 +346,8 @@ class Picamera2Backend(CameraBackend):
             # Note: We keep the camera running for better performance on next capture
             # It will be stopped/reconfigured if settings change or in cleanup()
             
-            return str(output_path), archival_metadata
+            # Return path (can be string or tuple for multi-format) and metadata
+            return output_path, archival_metadata
             
         except Exception as e:
             self.logger.error(f"Failed to capture image: {e}")

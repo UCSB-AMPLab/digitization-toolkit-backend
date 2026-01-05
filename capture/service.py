@@ -142,11 +142,15 @@ def capture_image(
     backend = get_backend()
     result = backend.capture_image(output_path, camera_config, capture_output)
     
-    # Handle different return types (backends may return path only or (path, metadata))
-    if isinstance(result, tuple):
-        return result  # (path, metadata)
+    # Handle different return types
+    # Result is always (path_or_paths, metadata)
+    # path_or_paths can be:
+    #   - single path string for JPEG/PNG only
+    #   - tuple (jpeg_path, dng_path) for multi-format
+    if isinstance(result, tuple) and len(result) == 2:
+        return result  # (path_or_paths, metadata)
     else:
-        return result, None  # path only, no metadata
+        return result, None  # fallback: path only, no metadata
     
 
 def single_capture_image(
