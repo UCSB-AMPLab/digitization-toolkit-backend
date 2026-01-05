@@ -2,6 +2,7 @@ from pathlib import Path
 import logging
 import sys
 import json
+from typing import Optional, Tuple
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -10,6 +11,7 @@ if str(backend_dir) not in sys.path:
 from .utils import setup_rotating_logger
 from .manifestHandler import ProjectInfo, generate_manifest_project, append_manifest_record
 from .camera import IMG_SIZES
+from .camera_registry import CameraRegistry
 
 from app.core.config import settings
 
@@ -49,25 +51,29 @@ def load_calibration_profile(camera_index: int, calibration_dir: Path = None) ->
     return {}
 
 
-def default_camera_config(
+def default_camera_config_from_registry(
     camera_index: int,
     resolution: str = "high",
-    use_calibration: bool = True,
-    calibration_dir: Path = None
-) -> dict:
+    registry: Optional[CameraRegistry] = None
+) -> Tuple[dict, Optional[str]]:
     """
-    Generate default camera configuration dictionary with optional calibration data.
+    Generate camera configuration from registry data.
     
     Args:
-        camera_index: Camera index (0 or 1)
-        resolution: Resolution preset ("low", "medium", "high") or tuple
-        use_calibration: Whether to load and apply calibration data
-        calibration_dir: Directory containing calibration files
+        camera_index: Current camera index
+        resolution: Resolution preset
+        registry: CameraRegistry instance (creates new if None)
         
     Returns:
-        Dictionary with camera configuration parameters
+        Tuple of (config_dict, hardware_id)
     """
-    # Base configuration matching CameraConfig defaults
+    if registry is None:
+        registry = CameraRegistry()
+    
+    # Get hardware ID and calibration for current camera
+    hw_id, camera_data = registry.get_camera_by_index(camera_index)
+    
+    # Base configuration
     config = {
         "camera_index": camera_index,
         "img_size": IMG_SIZES.get(resolution, IMG_SIZES["high"]),
@@ -85,41 +91,38 @@ def default_camera_config(
         "raw": False
     }
     
-    # Apply calibration if available and requested
-    if use_calibration:
-        calibration = load_calibration_profile(camera_index, calibration_dir)
+    # Apply calibration if available
+    if camera_data and camera_data.get("calibration", {}).get("focus", {}).get("success"):
+        lens_position = camera_data["calibration"]["focus"]["lens_position"]
+        config["autofocus_on_capture"] = False
+        config["lens_position"] = lens_position
         
-        if calibration.get("focus", {}).get("success"):
-            # Use manual focus at calibrated position (much faster!)
-            lens_position = calibration["focus"]["lens_position"]
-            config["autofocus_on_capture"] = False
-            config["lens_position"] = lens_position
-            
-            subprocess_logger.info(
-                f"Applied calibration for camera {camera_index}: "
-                f"lens_position={lens_position:.2f} dioptres"
-            )
-        
-        # Future: Apply white balance calibration
-        # if calibration.get("white_balance", {}).get("gains"):
-        #     config["awb"] = "custom"
-        #     config["awb_gains"] = calibration["white_balance"]["gains"]
+        subprocess_logger.info(
+            f"Applied calibration for camera {camera_index} ({hw_id}): "
+            f"lens_position={lens_position:.2f} dioptres"
+        )
+    elif hw_id:
+        subprocess_logger.warning(
+            f"Camera {camera_index} ({hw_id}) has no calibration data. "
+            f"Using autofocus (slow). Run calibration for better performance."
+        )
     
-    return config
+    return config, hw_id
 
 
 def project_init(
     project_name: str,
-    default_resolution: str = "high",
-    use_calibration: bool = True
+    default_resolution: str = "high"
 ) -> Path:
     """
-    Initialize a new project directory structure with default camera configurations.
+    Initialize a new project directory structure with camera configurations.
+    
+    Cameras are identified by hardware ID from the global registry.
+    Configuration is inherited from registry calibration data.
     
     Args:
         project_name: Name of the project
         default_resolution: Default resolution preset for cameras
-        use_calibration: Whether to use calibrated camera settings
         
     Returns:
         Path to the created project directory
@@ -135,9 +138,21 @@ def project_init(
     
     subprocess_logger.info(f"Created project directory structure: {project_path}")
     
-    # Generate default camera configurations for dual camera setup
-    cam0_config = default_camera_config(0, default_resolution, use_calibration)
-    cam1_config = default_camera_config(1, default_resolution, use_calibration)
+    # Get camera configurations from registry
+    registry = CameraRegistry()
+    
+    # Ensure cameras are detected and registered
+    detected = registry.detect_cameras()
+    for idx, (hw_id, info) in detected.items():
+        if hw_id not in registry.cameras["cameras"]:
+            registry.register_camera(idx)
+    
+    cam0_config, cam0_hw_id = default_camera_config_from_registry(0, default_resolution, registry)
+    cam1_config, cam1_hw_id = default_camera_config_from_registry(1, default_resolution, registry)
+    
+    # Get camera hardware info
+    cam0_info = registry.get_camera_by_id(cam0_hw_id) if cam0_hw_id else None
+    cam1_info = registry.get_camera_by_id(cam1_hw_id) if cam1_hw_id else None
     
     # Generate and save project manifest
     project_info = generate_manifest_project(
@@ -150,10 +165,23 @@ def project_init(
             "packages": str(packages_dir),
         },
         default_camera_config={
-            "camera_0": cam0_config,
-            "camera_1": cam1_config,
             "resolution_preset": default_resolution,
-            "calibration_applied": use_calibration
+            "cameras": {
+                "left": {
+                    "hardware_id": cam0_hw_id,
+                    "model": cam0_info.get("model") if cam0_info else None,
+                    "serial": cam0_info.get("serial") if cam0_info else None,
+                    "current_index": 0,
+                    "config": cam0_config
+                },
+                "right": {
+                    "hardware_id": cam1_hw_id,
+                    "model": cam1_info.get("model") if cam1_info else None,
+                    "serial": cam1_info.get("serial") if cam1_info else None,
+                    "current_index": 1,
+                    "config": cam1_config
+                }
+            }
         }
     )
     
