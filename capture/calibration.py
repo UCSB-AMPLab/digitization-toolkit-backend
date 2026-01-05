@@ -62,7 +62,7 @@ class CameraCalibration:
             print(f"\n{'='*70}")
             print(f"FOCUS CALIBRATION - Camera {self.camera_index}")
             print(f"{'='*70}")
-            print("⚠️  Ensure subject is at normal working distance!")
+            print("⚠️  Ensure object is at normal working distance!")
             print(f"Resolution: {img_size[0]}x{img_size[1]}")
         
         picam2 = Picamera2(self.camera_index)
