@@ -39,6 +39,8 @@ class Picamera2Backend(CameraBackend):
         super().__init__(logger)
         self._cameras = {}  # Cache of initialized Picamera2 instances
         self._camera_info = None
+        self._last_configs = {}  # Track last configuration for each camera
+        self._format_mode = {}  # Track format mode per camera (YUV420 vs RGB888)
     
     def _get_camera_info(self):
         """Get global camera information (cached)."""
@@ -117,9 +119,10 @@ class Picamera2Backend(CameraBackend):
         if camera_config.awb.lower() in awb_map:
             controls["AwbMode"] = awb_map[camera_config.awb.lower()]
         
-        # Autofocus mode
+        # Autofocus mode: Use Auto mode for still capture (not Continuous)
+        # Auto mode lets us trigger AF before each capture for consistent focus
         if camera_config.autofocus_on_capture:
-            controls["AfMode"] = 2  # Continuous autofocus
+            controls["AfMode"] = 1  # Auto mode - trigger before capture
         else:
             controls["AfMode"] = 0  # Manual focus
         
@@ -152,11 +155,15 @@ class Picamera2Backend(CameraBackend):
             # For now, we'll configure each time to ensure settings match
             # In future optimization, we could cache configurations
             
+            # Use YUV420 format for JPEG captures (faster, less memory)
+            # Use RGB888 for PNG or when raw/DNG is needed
+            use_yuv = camera_config.encoding in ["jpg", "jpeg"] and not camera_config.raw
+            
             # Create still configuration with transform if needed
             config_args = {
                 "main": {
                     "size": camera_config.img_size,
-                    "format": "RGB888" if camera_config.encoding == "rgb" else "BGR888"
+                    "format": "YUV420" if use_yuv else "RGB888"
                 },
                 "buffer_count": camera_config.buffer_count,
             }
@@ -170,41 +177,86 @@ class Picamera2Backend(CameraBackend):
             
             still_config = picam2.create_still_configuration(**config_args)
             
-            # Check if camera is already running with different config
-            if picam2.started:
-                self.logger.debug(f"Stopping camera {camera_config.camera_index} to reconfigure")
-                picam2.stop()
+            # Check if camera is already running with the same config
+            # Only reconfigure if settings changed - this preserves AE/AF state
+            last_config = self._last_configs.get(camera_config.camera_index)
+            last_format = self._format_mode.get(camera_config.camera_index)
+            needs_reconfigure = (
+                last_config is None or
+                last_format != use_yuv or
+                last_config.img_size != camera_config.img_size or
+                last_config.hflip != camera_config.hflip or
+                last_config.vflip != camera_config.vflip or
+                last_config.buffer_count != camera_config.buffer_count
+            )
             
-            picam2.configure(still_config)
-            self.logger.debug(f"Camera {camera_config.camera_index} configured: {camera_config.img_size}")
+            if needs_reconfigure:
+                if picam2.started:
+                    self.logger.debug(f"Stopping camera {camera_config.camera_index} to reconfigure")
+                    picam2.stop()
+                
+                picam2.configure(still_config)
+                self.logger.debug(f"Camera {camera_config.camera_index} configured: {camera_config.img_size}, format={'YUV420' if use_yuv else 'RGB888'}")
+                self._last_configs[camera_config.camera_index] = camera_config
+                self._format_mode[camera_config.camera_index] = use_yuv
+            else:
+                self.logger.debug(f"Camera {camera_config.camera_index} using cached configuration")
             
             # Apply controls
             controls = self._config_to_picamera2_controls(camera_config)
             
-            # Start camera
-            picam2.start()
+            # Start camera if not already running
+            if not picam2.started:
+                picam2.start()
+                self.logger.debug(f"Camera {camera_config.camera_index} started")
+            
+            # Set JPEG quality via options (applies to capture_file)
+            picam2.options["quality"] = camera_config.quality
             
             # Apply controls after start
             if controls:
                 picam2.set_controls(controls)
             
-            # Wait for sensor to stabilize (similar to timeout in rpicam-still)
+            # Manual focus if lens position specified
+            if hasattr(camera_config, 'lens_position') and camera_config.lens_position is not None:
+                self.logger.debug(f"Setting manual focus: LensPosition={camera_config.lens_position}")
+                picam2.set_controls({"LensPosition": camera_config.lens_position})
+            
+            # Trigger autofocus cycle if enabled
+            # This ensures sharp images by focusing before capture
+            if camera_config.autofocus_on_capture:
+                self.logger.debug(f"Triggering autofocus for camera {camera_config.camera_index}")
+                success = picam2.autofocus_cycle()
+                if success:
+                    self.logger.debug(f"Autofocus succeeded")
+                else:
+                    self.logger.warning(f"Autofocus failed for camera {camera_config.camera_index}")
+            
+            # Wait for auto-exposure to stabilize
+            # Timeout allows AE to converge for proper exposure
             if camera_config.timeout > 0:
+                self.logger.debug(f"Waiting {camera_config.timeout}ms for AE stabilization")
                 time.sleep(camera_config.timeout / 1000.0)
             
-            # Capture image
+            # Capture image directly to file
+            # YUV420→JPEG is done efficiently by libcamera/picamera2
+            # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
             
-            # Determine file format from encoding
-            if camera_config.encoding in ["jpg", "jpeg"]:
-                # Capture and save with format specified
-                # Note: quality is controlled by JPEG encoder options in config, not capture_file
-                picam2.capture_file(str(output_path), format='jpeg')
-            elif camera_config.encoding == "png":
-                picam2.capture_file(str(output_path), format='png')
+            if camera_config.raw:
+                # Capture DNG (raw) format
+                # Use request-based capture for access to raw stream
+                request = picam2.capture_request()
+                try:
+                    request.save_dng(str(output_path))
+                    self.logger.debug(f"Saved DNG raw file")
+                finally:
+                    request.release()
             else:
-                # For other formats, capture array and save
+                # Standard JPEG/PNG capture
+                # Uses picam2.options["quality"] set above
                 picam2.capture_file(str(output_path))
+                self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
             
             self.logger.info(f"Image captured successfully: {output_path}")
             
