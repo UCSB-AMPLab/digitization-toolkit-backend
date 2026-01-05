@@ -11,7 +11,7 @@ from app.core.config import settings
 DATABASE_URL = getattr(settings, "DATABASE_URL", None)
 if not DATABASE_URL:
 	DATABASE_URL = (
-		f"postgresql://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
+		f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
 	)
 
 
