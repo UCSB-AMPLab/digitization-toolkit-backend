@@ -6,7 +6,6 @@ h11==0.16.0
 httptools==0.6.4
 idna==3.10
 pydantic==2.11.9
-pydantic[email]==2.11.9
 pydantic_core==2.33.2
 pydantic-settings==2.7.0
 python-dotenv==1.1.1
