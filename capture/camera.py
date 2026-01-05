@@ -23,6 +23,7 @@ class CameraConfig:
     awb: str = "indoor"  # auto, indoor, tungsten, fluorescent, etc. See https://www.raspberrypi.com/documentation/computers/camera_software.html#awb for all options
     timeout: int = 50  # Preview timeout in ms (needed for autofocus/auto-exposure)
     autofocus_on_capture: bool = True
+    lens_position: Optional[float] = None  # Manual focus lens position in dioptres (overrides autofocus)
     buffer_count: int = 2
     thumbnail: bool = False
     nopreview: bool = True
