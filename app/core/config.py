@@ -1,16 +1,13 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, ConfigDict
 from pathlib import Path
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql://user:password@db:5432/digitization_toolkit"
     DATABASE_USER: str = "user"
+    DATABASE_PASSWORD: str = "password"
     DATABASE_HOST: str = "db"
     DATABASE_PORT: int = 5432
     DATABASE_NAME: str = "digitization_toolkit"
-    UVICORN_HOST: str = "0.0.0.0"
-    UVICORN_PORT: int = 8000
-    LOG_LEVEL: str = "info"
     DTK_DATA_DIR: str = "/var/lib/dtk"
     DTK_LOG_DIR: str = "/var/log/dtk"
     PROJECTS_ROOT: str = Field(default="", env="PROJECTS_ROOT")
@@ -18,9 +15,11 @@ class Settings(BaseSettings):
     CAMERA_BACKEND: str = Field(default="picamera2", env="CAMERA_BACKEND")
     app_version: str = "0.0.0-dev"
 
-    model_config = {
-        "env_file": ".env"
-    }
+    model_config = ConfigDict(
+        env_file="../.env",  # Load .env from project root when running from backend/
+        env_file_encoding="utf-8",
+        extra="ignore"  # Ignore extra fields from .env like uvicorn_host
+    )
     
     @property
     def data_dir(self) -> Path:
