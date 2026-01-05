@@ -41,6 +41,9 @@ def init_db() -> None:
 	"""
 	Import all models to register them with SQLAlchemy.
 	
+	Database tables should be created and managed through Alembic migrations,
+	not through create_all(). This function only ensures models are imported.
+	
 	Raises:
 		ImportError: If any model cannot be imported (app should not start)
 	"""
@@ -49,7 +52,7 @@ def init_db() -> None:
 	import app.models.camera  # noqa: F401
 	import app.models.project  # noqa: F401
 	import app.models.user  # noqa: F401
-
-	# Create tables (useful for development without running alembic)
-	Base.metadata.create_all(bind=engine)
+	
+	# Note: Tables are created via Alembic migrations, not create_all()
+	# Run: alembic upgrade head
 
