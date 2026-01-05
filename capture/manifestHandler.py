@@ -173,15 +173,41 @@ def generate_manifest_record(
             roles = [f"cam{i}" for i in range(len(img_paths))]
     
     # Build files list
+    # Handle both single paths and multi-format (JPEG+raw) tuples
     files = []
     for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
-        files.append(CaptureFile(
-            role=role,
-            relative_path=str(Path("images/main") / Path(path).name),
-            bytes=os.path.getsize(path),
-            mimetype=f"image/{config.encoding}",
-            sha256=compute_sha256(path)
-        ))
+        # Check if path is a tuple (multi-format: JPEG + raw buffer)
+        if isinstance(path, tuple):
+            jpeg_path, raw_path = path
+            
+            # Add JPEG file
+            files.append(CaptureFile(
+                role=role,
+                relative_path=str(Path("images/main") / Path(jpeg_path).name),
+                bytes=os.path.getsize(jpeg_path),
+                mimetype=f"image/{config.encoding}",
+                sha256=compute_sha256(jpeg_path)
+            ))
+            
+            # Add raw sensor data file
+            # Note: Using .raw extension due to picamera2 DNG save bug
+            # Contains compressed raw sensor data (Pi 5) or packed pixels (Pi 4)
+            files.append(CaptureFile(
+                role=f"{role}_raw",
+                relative_path=str(Path("images/main") / Path(raw_path).name),
+                bytes=os.path.getsize(raw_path),
+                mimetype="application/octet-stream",  # Binary raw sensor data
+                sha256=compute_sha256(raw_path)
+            ))
+        else:
+            # Single format
+            files.append(CaptureFile(
+                role=role,
+                relative_path=str(Path("images/main") / Path(path).name),
+                bytes=os.path.getsize(path),
+                mimetype=f"image/{config.encoding}",
+                sha256=compute_sha256(path)
+            ))
     
     # Build cameras list with metadata
     cameras = []
