@@ -28,9 +28,9 @@ class CameraConfig:
     thumbnail: bool = False
     nopreview: bool = True
     quality: int = 93  # JPEG quality (1-100, default 93)
-    zsl: bool = False  # Zero Shutter Lag (ZSL) mode
     encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
     raw: bool = False  # Capture RAW alongside JPEG
+    denoise_frames: int = 10  # Number of frames to skip for temporal denoise warmup (Pi 5 feature, 0 to disable)
     
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""

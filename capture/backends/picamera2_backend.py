@@ -278,6 +278,16 @@ class Picamera2Backend(CameraBackend):
                 self.logger.debug(f"Setting manual focus: LensPosition={camera_config.lens_position}")
                 picam2.set_controls({"LensPosition": camera_config.lens_position})
             
+            # Temporal denoise warmup (Pi 5 feature)
+            # Skip frames after camera start to let temporal denoise algorithm build history
+            # This produces cleaner images with better noise reduction
+            if hasattr(camera_config, 'denoise_frames') and camera_config.denoise_frames > 0 and needs_reconfigure:
+                # Only apply warmup if we just reconfigured (camera was stopped/restarted)
+                # Calculate delay: assuming ~30fps, each frame is ~33ms
+                warmup_delay = camera_config.denoise_frames * 0.033
+                self.logger.debug(f"Temporal denoise warmup: skipping {camera_config.denoise_frames} frames ({warmup_delay:.2f}s)")
+                time.sleep(warmup_delay)
+            
             # Trigger autofocus cycle if enabled
             # This ensures sharp images by focusing before capture
             if camera_config.autofocus_on_capture:
