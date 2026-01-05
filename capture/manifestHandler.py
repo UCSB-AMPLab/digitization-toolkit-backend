@@ -73,6 +73,7 @@ class CaptureCamera:
     config: Dict                 # CameraConfig.to_dict()
     model: Optional[str] = None
     serial: Optional[str] = None
+    camera_controls_metadata: Optional[Dict] = None  # Capture metadata (exposure, gain, etc.)
 
 
 @dataclass
@@ -143,7 +144,8 @@ def generate_manifest_record(
     times: list = None,
     pair_id: str = None,
     stagger: int = None,
-    roles: list = None) -> CaptureRecord:
+    roles: list = None,
+    metadata_list: list = None) -> CaptureRecord:
     """
     Generate a manifest record for single or dual captures.
     
@@ -156,6 +158,7 @@ def generate_manifest_record(
         stagger: Delay between camera starts in ms (optional)
         roles: List of role names (e.g., ["left", "right"] or ["single"])
                If None, auto-assigns based on number of captures
+        metadata_list: List of metadata dicts from capture (optional)
     
     Returns:
         CaptureRecord object
@@ -180,12 +183,18 @@ def generate_manifest_record(
             sha256=compute_sha256(path)
         ))
     
-    # Build cameras list
+    # Build cameras list with metadata
     cameras = []
-    for config in cam_configs:
+    for i, config in enumerate(cam_configs):
+        # Get metadata for this camera if available
+        metadata = None
+        if metadata_list and i < len(metadata_list):
+            metadata = metadata_list[i]
+        
         cameras.append(CaptureCamera(
             camera_index=config.camera_index,
-            config=config.to_dict()
+            config=config.to_dict(),
+            camera_controls_metadata=metadata
         ))
     
     # Build timing dict

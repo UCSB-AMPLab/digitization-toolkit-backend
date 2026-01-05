@@ -128,6 +128,58 @@ class Picamera2Backend(CameraBackend):
         
         return controls
     
+    def _extract_archival_metadata(self, metadata: dict) -> dict:
+        """
+        Extract relevant metadata for archival documentation.
+        
+        Captures critical sensor conditions for cultural heritage standards:
+        - Exposure settings (time, gain)
+        - Focus position
+        - Color/white balance
+        - Timing information
+        
+        Args:
+            metadata: Raw metadata dict from Picamera2
+            
+        Returns:
+            Dict with archival-relevant metadata fields
+        """
+        archival = {}
+        
+        # Exposure information (critical for reproducibility)
+        if 'ExposureTime' in metadata:
+            archival['ExposureTime'] = metadata['ExposureTime']  # in microseconds
+        if 'AnalogueGain' in metadata:
+            archival['AnalogueGain'] = float(metadata['AnalogueGain'])
+        if 'DigitalGain' in metadata:
+            archival['DigitalGain'] = float(metadata['DigitalGain'])
+        
+        # Focus information
+        if 'LensPosition' in metadata:
+            archival['LensPosition'] = float(metadata['LensPosition'])  # in dioptres
+        if 'FocusFoM' in metadata:
+            archival['FocusFoM'] = metadata['FocusFoM']  # Focus Figure of Merit
+        
+        # Color/white balance information
+        if 'ColourGains' in metadata:
+            archival['ColourGains'] = list(metadata['ColourGains'])  # [red, blue] gains
+        if 'ColourTemperature' in metadata:
+            archival['ColourTemperature'] = metadata['ColourTemperature']  # in Kelvin
+        
+        # Timing information (exact capture moment)
+        if 'SensorTimestamp' in metadata:
+            archival['SensorTimestamp'] = metadata['SensorTimestamp']  # nanoseconds since boot
+        
+        # Sensor configuration
+        if 'SensorBlackLevels' in metadata:
+            archival['SensorBlackLevels'] = list(metadata['SensorBlackLevels'])
+        
+        # Image quality metrics
+        if 'Lux' in metadata:
+            archival['Lux'] = float(metadata['Lux'])  # Scene brightness
+        
+        return archival
+    
     def capture_image(
         self,
         output_path: Path,
@@ -238,32 +290,44 @@ class Picamera2Backend(CameraBackend):
                 self.logger.debug(f"Waiting {camera_config.timeout}ms for AE stabilization")
                 time.sleep(camera_config.timeout / 1000.0)
             
-            # Capture image directly to file
+            # Capture image directly to file with metadata
             # YUV420→JPEG is done efficiently by libcamera/picamera2
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
             
             if camera_config.raw:
                 # Capture DNG (raw) format
-                # Use request-based capture for access to raw stream
+                # Use request-based capture for access to raw stream and metadata
                 request = picam2.capture_request()
                 try:
                     request.save_dng(str(output_path))
                     self.logger.debug(f"Saved DNG raw file")
+                    # Extract metadata before releasing request
+                    metadata = request.get_metadata()
                 finally:
                     request.release()
             else:
-                # Standard JPEG/PNG capture
-                # Uses picam2.options["quality"] set above
-                picam2.capture_file(str(output_path))
-                self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
+                # Standard JPEG/PNG capture with metadata
+                # Use request-based capture to get metadata
+                request = picam2.capture_request()
+                try:
+                    request.save("main", str(output_path))
+                    self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
+                    # Extract metadata before releasing request
+                    metadata = request.get_metadata()
+                finally:
+                    request.release()
+            
+            # Extract relevant metadata for archival documentation
+            archival_metadata = self._extract_archival_metadata(metadata)
+            self.logger.debug(f"Captured metadata: {archival_metadata}")
             
             self.logger.info(f"Image captured successfully: {output_path}")
             
             # Note: We keep the camera running for better performance on next capture
             # It will be stopped/reconfigured if settings change or in cleanup()
             
-            return str(output_path)
+            return str(output_path), archival_metadata
             
         except Exception as e:
             self.logger.error(f"Failed to capture image: {e}")
