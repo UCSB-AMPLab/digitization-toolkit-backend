@@ -11,7 +11,7 @@ from app.core.config import settings
 DATABASE_URL = getattr(settings, "DATABASE_URL", None)
 if not DATABASE_URL:
 	DATABASE_URL = (
-		f"postgresql://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
+		f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
 	)
 
 
@@ -41,6 +41,9 @@ def init_db() -> None:
 	"""
 	Import all models to register them with SQLAlchemy.
 	
+	Database tables should be created and managed through Alembic migrations,
+	not through create_all(). This function only ensures models are imported.
+	
 	Raises:
 		ImportError: If any model cannot be imported (app should not start)
 	"""
@@ -49,4 +52,7 @@ def init_db() -> None:
 	import app.models.camera  # noqa: F401
 	import app.models.project  # noqa: F401
 	import app.models.user  # noqa: F401
+	
+	# Note: Tables are created via Alembic migrations, not create_all()
+	# Run: alembic upgrade head
 

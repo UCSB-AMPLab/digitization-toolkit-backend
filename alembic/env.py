@@ -48,9 +48,9 @@ def get_url():
     if url:
         return url
     
-    # Build from settings
+    # Build from settings (using psycopg3 driver)
     return (
-        f"postgresql://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}"
+        f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}"
         f"@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
     )
 

@@ -26,4 +26,4 @@ class CameraSettingsRead(CameraSettingsBase):
 	created_at: Optional[datetime]
 
 	class Config:
-		form_attributes = True
+		from_attributes = True
