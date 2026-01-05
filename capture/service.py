@@ -140,7 +140,13 @@ def capture_image(
     
     # Use backend for actual capture
     backend = get_backend()
-    return backend.capture_image(output_path, camera_config, capture_output)
+    result = backend.capture_image(output_path, camera_config, capture_output)
+    
+    # Handle different return types (backends may return path only or (path, metadata))
+    if isinstance(result, tuple):
+        return result  # (path, metadata)
+    else:
+        return result, None  # path only, no metadata
     
 
 def single_capture_image(
@@ -165,7 +171,7 @@ def single_capture_image(
     
     start_time = time.time()
     
-    output_path = capture_image(
+    output_path, metadata = capture_image(
         project_name=project_name,
         camera_config=camera_config,
         check_camera=False,  # Already checked
@@ -180,7 +186,8 @@ def single_capture_image(
         project_name=project_name,
         img_paths=[output_path],
         cam_configs=[camera_config],
-        times=[elapsed_time]
+        times=[elapsed_time],
+        metadata_list=[metadata] if metadata else None
     )
     append_manifest_record(project_root, record)
     
@@ -243,7 +250,7 @@ def dual_capture_image(
     
     def capture_with_timing(config, fname):
         start = time.time()
-        path = capture_image(
+        path, metadata = capture_image(
             project_name=project_name,
             camera_config=config,
             output_filename=fname,
@@ -252,7 +259,7 @@ def dual_capture_image(
             capture_output=False  # Max performance
         )
         elapsed = time.time() - start
-        return path, elapsed
+        return path, elapsed, metadata
     
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         # Submit first camera
@@ -265,10 +272,13 @@ def dual_capture_image(
         future2 = executor.submit(capture_with_timing, cam2_config, filename2)
         
         # Wait for both to complete
-        img1_path, time1 = future1.result()
-        img2_path, time2 = future2.result()
+        img1_path, time1, metadata1 = future1.result()
+        img2_path, time2, metadata2 = future2.result()
         
     project_root = PROJECTS_ROOT / project_name
+    
+    # Prepare metadata list (filter out None values)
+    metadata_list = [m for m in [metadata1, metadata2] if m is not None]
     
     record = generate_manifest_record(
         project_name=project_name,
@@ -276,7 +286,8 @@ def dual_capture_image(
         img_paths=[img1_path, img2_path],
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
-        stagger=stagger_ms
+        stagger=stagger_ms,
+        metadata_list=metadata_list if metadata_list else None
     )
     append_manifest_record(project_root, record)
     
