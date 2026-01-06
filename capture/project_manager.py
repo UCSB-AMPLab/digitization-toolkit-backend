@@ -1,5 +1,4 @@
 from pathlib import Path
-import logging
 import sys
 import json
 from typing import Optional, Tuple
