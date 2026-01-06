@@ -301,5 +301,29 @@ def dual_capture_image(
     
     return img1_path, img2_path
     
+def main():
+    """
+    Main entry point for testing the camera connectivity.
+    """
+    try:
+        # Check if cameras are connected
+        cam0_connected = is_camera_connected(0)
+        cam1_connected = is_camera_connected(1)
+        
+        subprocess_logger.info(f"Camera 0: {'Connected' if cam0_connected else 'Not connected'}")
+        subprocess_logger.info(f"Camera 1: {'Connected' if cam1_connected else 'Not connected'}")
+        
+        if not cam0_connected and not cam1_connected:
+            subprocess_logger.error("No cameras detected!")
+            return 1
+        
+        subprocess_logger.info("Capture service initialized successfully")
+        return 0
+        
+    except Exception as e:
+        subprocess_logger.error(f"Service initialization failed: {e}", exc_info=True)
+        return 1
+
+
 if __name__ == "__main__":
     sys.exit(main())

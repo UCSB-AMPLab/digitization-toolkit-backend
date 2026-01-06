@@ -1,6 +1,8 @@
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
+import logging
 
+subprocess_logger = logging.getLogger(__name__)
 IMG_SIZES = {
     "low": (2312, 1736),      # ~4 MP, ~195 DPI for A4, 1379 pph - Preview only
     "medium": (3840, 2160),   # ~8 MP, ~350 DPI for A4, 883 pph - RECOMMENDED for production
@@ -26,22 +28,23 @@ class CameraConfig:
     - 474 pages/hour (slower but higher quality)
     - Pushes Pi 5 ISP to hardware limits
     """
-    camera_index: int
+    camera_index: int = 0
     img_size: Tuple[int, int] = IMG_SIZES["medium"]
+    quality: int = 90
+    awb: str = "auto"
+    buffer_count: int = 4
+    timeout: int = 0
+    nopreview: bool = True
     vflip: bool = False
     hflip: bool = False
-    awb: str = "indoor"  # auto, indoor, tungsten, fluorescent, etc. See https://www.raspberrypi.com/documentation/computers/camera_software.html#awb for all options
-    timeout: int = 50  # Preview timeout in ms (needed for autofocus/auto-exposure)
-    autofocus_on_capture: bool = True
-    lens_position: Optional[float] = None  # Manual focus lens position in dioptres (overrides autofocus)
-    buffer_count: int = 2
+    autofocus_on_capture: bool = False
     thumbnail: bool = False
-    nopreview: bool = True
-    quality: int = 93  # JPEG quality (1-100, default 93)
-    encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
-    raw: bool = False  # Capture RAW alongside JPEG
-    denoise_frames: int = 10  # Number of frames to skip for temporal denoise warmup (Pi 5 feature, 0 to disable)
-    
+    encoding: str = "jpg"
+    raw: bool = False
+    # New optional fields
+    zsl: bool = False
+    lens_position: Optional[float] = None
+
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""
         return asdict(self)

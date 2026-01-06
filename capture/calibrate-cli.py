@@ -3,10 +3,10 @@
 Command-line tool for camera calibration.
 
 Usage:
-    python calibrate.py                    # Calibrate camera 0
-    python calibrate.py 1                  # Calibrate camera 1
-    python calibrate.py 0 my_profile.json  # Save to custom path
-    python calibrate.py dual               # Calibrate both cameras
+    python calibrate-cli.py                    # Calibrate camera 0
+    python calibrate-cli.py 1                  # Calibrate camera 1
+    python calibrate-cli.py 0 my_profile.json  # Save to custom path
+    python calibrate-cli.py dual               # Calibrate both cameras
 """
 import sys
 from pathlib import Path

@@ -7,7 +7,7 @@ for specific setups. Calibration profiles can be saved and loaded for reuse.
 import json
 import time
 from pathlib import Path
-from datetime import datetime
+from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from picamera2 import Picamera2
 
@@ -113,7 +113,7 @@ class CameraCalibration:
         
         # Store in calibration data
         self.calibration_data["focus"] = result
-        self.calibration_data["calibrated_at"] = datetime.utcnow().isoformat()
+        self.calibration_data["calibrated_at"] = datetime.now(timezone.utc).isoformat()
         
         return result
     

@@ -6,10 +6,19 @@ direct access to libcamera. It supports advanced features like streaming,
 live preview, and dynamic settings adjustment.
 """
 
+import sys
 import time
 from pathlib import Path
-from typing import Optional
-from picamera2 import Picamera2
+
+# Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi)
+if sys.platform == "linux":
+    from picamera2 import Picamera2
+    from libcamera import Transform
+else:
+    Picamera2 = None
+    Transform = None
+
+
 
 from .base import CameraBackend
 
@@ -27,6 +36,7 @@ class Picamera2Backend(CameraBackend):
     Trade-offs:
     - Slightly more memory usage (keeps camera resources)
     - Requires picamera2 Python library
+    - Only works on Linux (Raspberry Pi)
     """
     
     def __init__(self, logger):
@@ -36,6 +46,9 @@ class Picamera2Backend(CameraBackend):
         Args:
             logger: Logger instance for logging operations.
         """
+        if Picamera2 is None:
+            raise RuntimeError("Picamera2Backend requires Linux (Raspberry Pi OS)")
+        
         super().__init__(logger)
         self._cameras = {}  # Cache of initialized Picamera2 instances
         self._camera_info = None
@@ -226,7 +239,8 @@ class Picamera2Backend(CameraBackend):
             
             # Apply transformations (flip)
             if camera_config.hflip or camera_config.vflip:
-                from libcamera import Transform
+                if Transform is None:
+                    raise RuntimeError("Transform requires Linux")
                 hflip = 1 if camera_config.hflip else 0
                 vflip = 1 if camera_config.vflip else 0
                 config_args["transform"] = Transform(hflip=hflip, vflip=vflip)
