@@ -103,7 +103,7 @@ class RpicamBackend(CameraBackend):
             command.append("--autofocus-on-capture")
         if camera_config.thumbnail:
             command.extend(["--thumb", "320:240:70"])
-        if camera_config.zsl:
+        if getattr(camera_config, "zsl", False):
             command.append("--zsl")
         if camera_config.encoding != "jpg":
             command.extend(["--encoding", camera_config.encoding])
