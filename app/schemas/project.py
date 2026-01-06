@@ -12,6 +12,12 @@ class ProjectCreate(ProjectBase):
     created_by: Optional[str] = None
 
 
+class ProjectUpdate(BaseModel):
+    """Schema for updating a project. All fields optional."""
+    name: Optional[str] = None
+    description: Optional[str] = None
+
+
 class ProjectRead(ProjectBase):
     id: int
     created_by: Optional[str] = None
