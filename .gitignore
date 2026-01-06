@@ -3,3 +3,6 @@ __pycache__
 *.db
 data
 .env
+_data/
+_logs/
+*.pdf
