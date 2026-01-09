@@ -13,6 +13,7 @@ class DocumentImage(Base):
 	title = Column(String(255), nullable=True)
 	description = Column(Text, nullable=True)
 	file_path = Column(String(512), nullable=False)
+	thumbnail_path = Column(String(512), nullable=True)
 	file_size = Column(Integer, nullable=True)
 	format = Column(String(50), nullable=False)
 	resolution_width = Column(Integer, nullable=True)
