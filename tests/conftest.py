@@ -9,7 +9,8 @@ import tempfile
 import shutil
 from pathlib import Path
 
-backend_dir = Path(__file__).parent
+# Add backend directory to path (parent of tests directory)
+backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
@@ -17,7 +18,7 @@ if str(backend_dir) not in sys.path:
 @pytest.fixture(scope="session")
 def backend_root():
     """Return the backend root directory."""
-    return Path(__file__).parent
+    return Path(__file__).parent.parent
 
 
 @pytest.fixture(scope="session")
@@ -212,3 +213,98 @@ def pytest_collection_modifyitems(config, items):
         # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
+
+
+# ==================== Database Fixtures ====================
+
+@pytest.fixture
+def db_session(override_projects_root):
+    """
+    Create a test database session with fresh schema.
+    
+    Each test gets its own in-memory SQLite database.
+    """
+    import tempfile
+    from app.core.db import Base, engine, SessionLocal
+    from sqlalchemy import create_engine
+    
+    # Use temporary file-based SQLite for testing
+    temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    test_db_url = f"sqlite:///{temp_db.name}"
+    
+    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
+    
+    # Create tables
+    Base.metadata.create_all(test_engine)
+    
+    # Create session
+    SessionLocal.configure(bind=test_engine)
+    session = SessionLocal()
+    
+    yield session
+    
+    session.close()
+    Path(temp_db.name).unlink(missing_ok=True)
+
+
+@pytest.fixture
+def client(db_session):
+    """
+    Create a test client for API endpoints.
+    """
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.deps import get_db_dependency
+    
+    def override_get_db():
+        try:
+            yield db_session
+        finally:
+            pass
+    
+    app.dependency_overrides[get_db_dependency] = override_get_db
+    
+    client = TestClient(app)
+    yield client
+    
+    app.dependency_overrides.clear()
+
+
+@pytest.fixture
+def test_user(db_session):
+    """
+    Create a test user in the database.
+    """
+    from app.models.user import User
+    from app.core.security import hash_password
+    
+    user = User(
+        username="testuser",
+        email="test@example.com",
+        hashed_password=hash_password("testpassword"),
+        is_active=True
+    )
+    db_session.add(user)
+    db_session.commit()
+    db_session.refresh(user)
+    
+    return user
+
+
+@pytest.fixture
+def test_project(db_session, test_user):
+    """
+    Create a test project in the database.
+    """
+    from app.models.project import Project
+    
+    project = Project(
+        name="test_project",
+        description="Test project for integration tests",
+        created_by=test_user.username
+    )
+    db_session.add(project)
+    db_session.commit()
+    db_session.refresh(project)
+    
+    return project
