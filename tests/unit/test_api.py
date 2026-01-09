@@ -2,14 +2,12 @@
 """
 Minimal test script to validate API endpoints and routes.
 This script tests the core functionality without requiring a running server.
-Run with: python test_api.py
+Run with: python -m pytest tests/unit/test_api.py
 """
 
 import sys
 import os
-
-# Add app directory to path
-sys.path.insert(0, os.path.dirname(os.path.abspath(__file__)))
+import pytest
 
 def test_imports():
     """Test that all modules can be imported without errors."""
@@ -205,40 +203,6 @@ def test_models():
         return False
 
 
-def main():
-    """Run all tests."""
-    print("=" * 60)
-    print("BACKEND API VALIDATION TEST SUITE")
-    print("=" * 60)
-    
-    results = []
-    
-    results.append(("Imports", test_imports()))
-    results.append(("Password Hashing", test_password_hashing()))
-    results.append(("Token Generation", test_token_generation()))
-    results.append(("Schemas", test_schemas()))
-    results.append(("Models", test_models()))
-    results.append(("Routes", test_routes()))
-    results.append(("New Endpoints", test_new_endpoints()))
-    
-    print("\n" + "=" * 60)
-    print("TEST SUMMARY")
-    print("=" * 60)
-    
-    passed = sum(1 for _, result in results if result)
-    total = len(results)
-    
-    for name, result in results:
-        status = "✓ PASS" if result else "✗ FAIL"
-        print(f"{name:.<40} {status}")
-    
-    print("-" * 60)
-    print(f"Total: {passed}/{total} tests passed")
-    print("=" * 60)
-    
-    return 0 if passed == total else 1
-
-
 def test_new_endpoints():
     """Test newly added endpoint schemas and models."""
     print("\nTesting new endpoint schemas...")
@@ -266,5 +230,47 @@ def test_new_endpoints():
         return False
 
 
+@pytest.mark.unit
+def test_api_imports_pytest():
+    """Pytest version of import test."""
+    assert test_imports()
+
+
+@pytest.mark.unit
+def test_api_password_pytest():
+    """Pytest version of password test."""
+    assert test_password_hashing()
+
+
+@pytest.mark.unit
+def test_api_tokens_pytest():
+    """Pytest version of token test."""
+    assert test_token_generation()
+
+
+@pytest.mark.unit
+def test_api_schemas_pytest():
+    """Pytest version of schemas test."""
+    assert test_schemas()
+
+
+@pytest.mark.unit
+def test_api_routes_pytest():
+    """Pytest version of routes test."""
+    assert test_routes()
+
+
+@pytest.mark.unit
+def test_api_models_pytest():
+    """Pytest version of models test."""
+    assert test_models()
+
+
+@pytest.mark.unit
+def test_api_endpoints_pytest():
+    """Pytest version of endpoints test."""
+    assert test_new_endpoints()
+
+
 if __name__ == "__main__":
-    sys.exit(main())
+    pytest.main([__file__, "-v"])

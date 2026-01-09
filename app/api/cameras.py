@@ -145,17 +145,21 @@ def list_camera_devices():
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,
-	current_user: User = Depends(get_current_user)
+	current_user: User = Depends(get_current_user),
+	db: Session = Depends(get_db_dependency)
 ):
 	"""
 	Trigger a single image capture on the specified camera.
 	
 	Requires a project to exist (use /projects/{id}/initialize first).
+	Captures image locally to microSD, then creates database record with metadata.
 	"""
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
 		from capture.project_manager import default_camera_config_from_registry
+		from PIL import Image
+		from PIL.ExifTags import TAGS
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
@@ -181,29 +185,112 @@ def trigger_capture(
 			include_resolution=request.include_resolution_in_filename
 		)
 		
+		# Extract image dimensions and EXIF data
+		resolution_width = None
+		resolution_height = None
+		exif_dict = {}
+		
+		try:
+			from PIL import Image
+			with Image.open(output_path) as img:
+				resolution_width, resolution_height = img.size
+				
+				# Extract EXIF data if available
+				try:
+					exif_data = img._getexif()
+					if exif_data:
+						for tag_id, value in exif_data.items():
+							tag_name = TAGS.get(tag_id, tag_id)
+							exif_dict[tag_name] = str(value)
+				except:
+					pass  # No EXIF data or error reading
+		except Exception as e:
+			logger.warning(f"Could not extract image metadata: {e}")
+		
+		# Get file size
+		from pathlib import Path
+		file_path = Path(output_path)
+		file_size = file_path.stat().st_size if file_path.exists() else 0
+		
+		# Create database record for the captured image
+		from app.models.document import DocumentImage, ExifData
+		from app.models.camera import CameraSettings
+		from app.models.project import Project
+		
+		# Get or find project by name
+		project = db.query(Project).filter(Project.name == request.project_name).first()
+		project_id = project.id if project else None
+		
+		# Create document record
+		doc = DocumentImage(
+			filename=file_path.name,
+			title=f"{request.project_name} - Camera {request.camera_index}",
+			description=f"Captured via API at {request.resolution} resolution",
+			file_path=str(output_path),
+			file_size=file_size,
+			format="jpg",
+			resolution_width=resolution_width,
+			resolution_height=resolution_height,
+			uploaded_by=current_user.username,
+			project_id=project_id,
+			object_typology="document",
+		)
+		
+		db.add(doc)
+		db.flush()  # Get the ID
+		
+		# Save camera settings
+		cs = CameraSettings(
+			document_image_id=doc.id,
+			camera_model=camera_config.__class__.__name__,
+			iso=None,
+			aperture=None,
+			focal_length=None,
+			white_balance=camera_config.awb,
+		)
+		db.add(cs)
+		
+		# Save EXIF data
+		if exif_dict:
+			ex = ExifData(
+				document_image_id=doc.id,
+				raw_exif=str(exif_dict),
+			)
+			db.add(ex)
+		
+		db.commit()
+		db.refresh(doc)
+		
+		logger.info(f"Created database record for captured image: {doc.id}")
+		
 		return CaptureResponse(
 			success=True,
 			file_path=str(output_path)
 		)
 	except Exception as e:
 		logger.exception(f"Capture failed: {e}")
+		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
 
 @router.post("/capture/dual", response_model=CaptureResponse)
 def trigger_dual_capture(
 	request: DualCaptureRequest,
-	current_user: User = Depends(get_current_user)
+	current_user: User = Depends(get_current_user),
+	db: Session = Depends(get_db_dependency)
 ):
 	"""
 	Trigger simultaneous capture on both cameras (index 0 and 1).
 	
 	Used for book scanning where left and right pages are captured together.
+	Both images stored locally; metadata saved to database.
 	"""
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig
 		from capture.project_manager import default_camera_config_from_registry
+		from PIL import Image
+		from PIL.ExifTags import TAGS
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
@@ -223,7 +310,7 @@ def trigger_dual_capture(
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
-		path0, path1, timing = dual_capture_image(
+		path0, path1 = dual_capture_image(
 			project_name=request.project_name,
 			cam1_config=cam0_config,
 			cam2_config=cam1_config,
@@ -232,13 +319,94 @@ def trigger_dual_capture(
 			stagger_ms=request.stagger_ms
 		)
 		
+		from pathlib import Path
+		from app.models.document import DocumentImage, ExifData
+		from app.models.camera import CameraSettings
+		from app.models.project import Project
+		
+		# Get project
+		project = db.query(Project).filter(Project.name == request.project_name).first()
+		project_id = project.id if project else None
+		
+		# Helper to process captured image
+		def create_document_from_capture(file_path_str: str, camera_idx: int):
+			file_path = Path(file_path_str)
+			file_size = file_path.stat().st_size if file_path.exists() else 0
+			
+			# Extract image info
+			resolution_width = None
+			resolution_height = None
+			exif_dict = {}
+			
+			try:
+				with Image.open(file_path_str) as img:
+					resolution_width, resolution_height = img.size
+					try:
+						exif_data = img._getexif()
+						if exif_data:
+							for tag_id, value in exif_data.items():
+								tag_name = TAGS.get(tag_id, tag_id)
+								exif_dict[tag_name] = str(value)
+					except:
+						pass
+			except Exception as e:
+				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
+			
+			# Create document record
+			doc = DocumentImage(
+				filename=file_path.name,
+				title=f"{request.project_name} - Camera {camera_idx} (Dual)",
+				description=f"Dual capture via API at {request.resolution} resolution",
+				file_path=str(file_path_str),
+				file_size=file_size,
+				format="jpg",
+				resolution_width=resolution_width,
+				resolution_height=resolution_height,
+				uploaded_by=current_user.username,
+				project_id=project_id,
+				object_typology="document",
+			)
+			
+			db.add(doc)
+			db.flush()
+			
+			# Camera settings
+			cam_config = cam0_config if camera_idx == 0 else cam1_config
+			cs = CameraSettings(
+				document_image_id=doc.id,
+				camera_model=cam_config.__class__.__name__,
+				iso=None,
+				aperture=None,
+				focal_length=None,
+				white_balance=cam_config.awb,
+			)
+			db.add(cs)
+			
+			# EXIF data
+			if exif_dict:
+				ex = ExifData(
+					document_image_id=doc.id,
+					raw_exif=str(exif_dict),
+				)
+				db.add(ex)
+			
+			return doc
+		
+		# Create records for both captures
+		doc0 = create_document_from_capture(str(path0), 0)
+		doc1 = create_document_from_capture(str(path1), 1)
+		
+		db.commit()
+		
+		logger.info(f"Created dual capture database records: {doc0.id}, {doc1.id}")
+		
 		return CaptureResponse(
 			success=True,
-			file_paths=[str(path0), str(path1)],
-			timing=timing
+			file_paths=[str(path0), str(path1)]
 		)
 	except Exception as e:
 		logger.exception(f"Dual capture failed: {e}")
+		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
 
