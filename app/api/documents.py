@@ -15,6 +15,7 @@ from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.document import DocumentCreate, DocumentRead, DocumentUpdate
 from app.core.config import settings
+from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -150,6 +151,10 @@ def delete_document(
 	if not doc:
 		raise HTTPException(status_code=404, detail="Document not found")
 	
+	# Clean up thumbnail if it exists
+	if doc.thumbnail_path:
+		delete_thumbnail(doc.thumbnail_path)
+	
 	db.delete(doc)
 	db.commit()
 	return {"detail": "document deleted"}
@@ -211,6 +216,7 @@ async def upload_document(
 	# Try to get image dimensions
 	resolution_width = None
 	resolution_height = None
+	thumbnail_path = None
 	try:
 		from PIL import Image
 		with Image.open(file_path) as img:
@@ -218,12 +224,21 @@ async def upload_document(
 	except Exception:
 		pass  # PIL not available or invalid image
 	
+	# Generate thumbnail
+	try:
+		thumbnails_dir = settings.data_dir / "thumbnails"
+		thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+	except Exception as e:
+		logger.warning(f"Failed to generate thumbnail for {file.filename}: {e}")
+		# Don't fail the upload if thumbnail generation fails
+	
 	# Create document record
 	doc = DocumentImage(
 		filename=file.filename or unique_filename,
 		title=title or file.filename,
 		description=description,
 		file_path=str(file_path),
+		thumbnail_path=thumbnail_path,
 		file_size=file_size,
 		format=file_format,
 		resolution_width=resolution_width,
@@ -310,3 +325,33 @@ def get_document_checksum(
 	
 	checksum = _compute_sha256(file_path)
 	return {"document_id": doc_id, "sha256": checksum}
+
+
+@router.get("/{doc_id}/thumbnail")
+def get_document_thumbnail(
+	doc_id: int,
+	current_user: User = Depends(get_current_user),
+	db: Session = Depends(get_db_dependency)
+):
+	"""
+	Download the thumbnail image for a document.
+	
+	Returns the thumbnail file as a JPEG image response.
+	"""
+	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
+	if not doc:
+		raise HTTPException(status_code=404, detail="Document not found")
+	
+	if not doc.thumbnail_path:
+		raise HTTPException(status_code=404, detail="Document has no thumbnail")
+	
+	thumbnail_path = Path(doc.thumbnail_path)
+	if not thumbnail_path.exists():
+		raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
+	
+	return FileResponse(
+		path=thumbnail_path,
+		filename=f"{Path(doc.filename).stem}_thumb.jpg",
+		media_type="image/jpeg"
+	)
+

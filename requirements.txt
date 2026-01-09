@@ -22,5 +22,8 @@ watchfiles==1.1.0
 websockets==15.0.1
 pytest==9.0.2
 
+# Image processing
+Pillow>=11.0.0
+
 # Camera backends
 picamera2>=0.3.33

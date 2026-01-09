@@ -40,6 +40,7 @@ class DocumentBase(BaseModel):
 	title: Optional[str] = None
 	description: Optional[str] = None
 	file_path: str
+	thumbnail_path: Optional[str] = None
 	file_size: Optional[int] = None
 	format: str
 	resolution_width: Optional[int] = None
