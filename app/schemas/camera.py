@@ -15,10 +15,26 @@ class CameraSettingsBase(BaseModel):
 	exposure_compensation: Optional[float] = None
 	white_balance: Optional[str] = None
 	flash_used: Optional[bool] = None
+	zsl: Optional[bool] = None  # Zero Shutter Lag mode
 
 
 class CameraSettingsCreate(CameraSettingsBase):
 	document_image_id: int
+
+
+class CameraSettingsUpdate(BaseModel):
+	"""Schema for updating camera settings. All fields optional."""
+	camera_model: Optional[str] = None
+	camera_manufacturer: Optional[str] = None
+	lens_model: Optional[str] = None
+	iso: Optional[int] = None
+	aperture: Optional[float] = None
+	shutter_speed: Optional[str] = None
+	focal_length: Optional[float] = None
+	exposure_compensation: Optional[float] = None
+	white_balance: Optional[str] = None
+	flash_used: Optional[bool] = None
+	zsl: Optional[bool] = None
 
 
 class CameraSettingsRead(CameraSettingsBase):

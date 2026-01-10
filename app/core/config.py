@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings
-from pydantic import Field
+from pydantic import Field, ConfigDict
 from pathlib import Path
 
 class Settings(BaseSettings):
@@ -16,9 +16,10 @@ class Settings(BaseSettings):
     CAMERA_BACKEND: str = Field(default="picamera2", env="CAMERA_BACKEND")
     app_version: str = "0.0.0-dev"
 
-    model_config = {
-        "env_file": ".env"
-    }
+    model_config = ConfigDict(
+        env_file=".env",
+        extra="ignore"  # Ignore extra fields from .env like uvicorn_host
+    )
     
     @property
     def data_dir(self) -> Path:

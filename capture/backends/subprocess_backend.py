@@ -103,8 +103,12 @@ class RpicamBackend(CameraBackend):
             command.append("--autofocus-on-capture")
         if camera_config.thumbnail:
             command.extend(["--thumb", "320:240:70"])
-        if getattr(camera_config, "zsl", False):
+        if camera_config.zsl:
             command.append("--zsl")
+        # Manual focus via lens position (optional float, in dioptres)
+        lens_pos = getattr(camera_config, "lens_position", None)
+        if lens_pos is not None:
+            command.extend(["--lens-position", str(lens_pos)])
         if camera_config.encoding != "jpg":
             command.extend(["--encoding", camera_config.encoding])
         if camera_config.raw:

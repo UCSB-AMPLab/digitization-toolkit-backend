@@ -9,7 +9,8 @@ import tempfile
 import shutil
 from pathlib import Path
 
-backend_dir = Path(__file__).parent
+# Add backend directory to path (parent of tests directory)
+backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
@@ -17,7 +18,7 @@ if str(backend_dir) not in sys.path:
 @pytest.fixture(scope="session")
 def backend_root():
     """Return the backend root directory."""
-    return Path(__file__).parent
+    return Path(__file__).parent.parent
 
 
 @pytest.fixture(scope="session")
@@ -307,4 +308,3 @@ def test_project(db_session, test_user):
     db_session.refresh(project)
     
     return project
-

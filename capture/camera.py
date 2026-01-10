@@ -1,6 +1,8 @@
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
+import logging
 
+subprocess_logger = logging.getLogger(__name__)
 IMG_SIZES = {
     "low": (2312, 1736),      # ~4 MP, ~195 DPI for A4, 1379 pph - Preview only
     "medium": (3840, 2160),   # ~8 MP, ~350 DPI for A4, 883 pph - RECOMMENDED for production
@@ -41,7 +43,8 @@ class CameraConfig:
     encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
     raw: bool = False  # Capture RAW alongside JPEG
     denoise_frames: int = 10  # Number of frames to skip for temporal denoise warmup (Pi 5 feature, 0 to disable)
-    
+    zsl: bool = False  # Zero shutter lag mode (enables faster captures, may affect exposure)
+
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""
         return asdict(self)
