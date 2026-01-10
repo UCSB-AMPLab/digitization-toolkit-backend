@@ -28,22 +28,22 @@ class CameraConfig:
     - 474 pages/hour (slower but higher quality)
     - Pushes Pi 5 ISP to hardware limits
     """
-    camera_index: int = 0
+    camera_index: int
     img_size: Tuple[int, int] = IMG_SIZES["medium"]
-    quality: int = 90
-    awb: str = "auto"
-    buffer_count: int = 4
-    timeout: int = 0
-    nopreview: bool = True
     vflip: bool = False
     hflip: bool = False
-    autofocus_on_capture: bool = False
+    awb: str = "indoor"  # auto, indoor, tungsten, fluorescent, etc. See https://www.raspberrypi.com/documentation/computers/camera_software.html#awb for all options
+    timeout: int = 50  # Preview timeout in ms (needed for autofocus/auto-exposure)
+    autofocus_on_capture: bool = True
+    lens_position: Optional[float] = None  # Manual focus lens position in dioptres (overrides autofocus)
+    buffer_count: int = 2
     thumbnail: bool = False
-    encoding: str = "jpg"
-    raw: bool = False
-    # New optional fields
-    zsl: bool = False
-    lens_position: Optional[float] = None
+    nopreview: bool = True
+    quality: int = 93  # JPEG quality (1-100, default 93)
+    encoding: str = "jpg"  # Options: jpg, png, bmp, rgb, yuv420
+    raw: bool = False  # Capture RAW alongside JPEG
+    denoise_frames: int = 10  # Number of frames to skip for temporal denoise warmup (Pi 5 feature, 0 to disable)
+    zsl: bool = False  # Zero shutter lag mode (enables faster captures, may affect exposure)
 
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""
