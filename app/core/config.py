@@ -3,7 +3,6 @@ from pydantic import Field, ConfigDict
 from pathlib import Path
 
 class Settings(BaseSettings):
-    DATABASE_URL: str = "postgresql+psycopg://user:password@db:5432/digitization_toolkit"
     DATABASE_USER: str = "user"
     DATABASE_PASSWORD: str = "password"
     DATABASE_HOST: str = "db"
@@ -17,7 +16,8 @@ class Settings(BaseSettings):
     app_version: str = "0.0.0-dev"
 
     model_config = ConfigDict(
-        env_file=".env",
+        env_file="../.env",  # Load .env from project root when running from backend/
+        env_file_encoding="utf-8",
         extra="ignore"  # Ignore extra fields from .env like uvicorn_host
     )
     

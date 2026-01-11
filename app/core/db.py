@@ -7,12 +7,11 @@ from sqlalchemy.pool import QueuePool
 from app.core.config import settings
 
 
-# Build DATABASE_URL from settings (settings.DATABASE_URL may already be set)
-DATABASE_URL = getattr(settings, "DATABASE_URL", None)
-if not DATABASE_URL:
-	DATABASE_URL = (
-		f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
-	)
+# Build DATABASE_URL from individual components
+DATABASE_URL = (
+	f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}"
+	f"@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
+)
 
 
 # Create engine
