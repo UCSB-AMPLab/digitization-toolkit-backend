@@ -103,7 +103,6 @@ class RpicamBackend(CameraBackend):
             command.append("--autofocus-on-capture")
         if camera_config.thumbnail:
             command.extend(["--thumb", "320:240:70"])
-        # Enable zero-shutter-lag if configured on the CameraConfig
         if camera_config.zsl:
             command.append("--zsl")
         # Manual focus via lens position (optional float, in dioptres)
