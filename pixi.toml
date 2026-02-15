@@ -6,7 +6,7 @@ channels = ["conda-forge"]
 platforms = ["linux-aarch64", "linux-64"]
 
 [dependencies]
-python = ">=3.11,<3.13"
+python = "~=3.11.0"
 # Web framework
 fastapi = ">=0.116.2"
 uvicorn = ">=0.35.0"
@@ -31,7 +31,7 @@ pillow = ">=11.0.0"
 pytest = ">=9.0.2"
 
 # Camera support - these require system packages
-# Note: picamera2 and libcamera need to be accessed via system packages
+# Note: picamera2 and rpicam need to be accessed via system packages
 # We'll handle this in the tasks
 
 [tasks]
