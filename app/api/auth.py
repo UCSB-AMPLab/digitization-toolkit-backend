@@ -4,7 +4,7 @@ from sqlalchemy.orm import Session
 
 from app.api.deps import get_db_dependency
 from app.models.user import User
-from app.schemas.user import UserCreate, UserRead, PasswordReset, PasswordResetRequest, TokenRefresh
+from app.schemas.user import UserCreate, UserLogin, UserRead, PasswordReset, PasswordResetRequest, TokenRefresh
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token
 
 router = APIRouter()
@@ -23,7 +23,7 @@ def register(payload: UserCreate, db: Session = Depends(get_db_dependency)):
 
 
 @router.post("/login")
-def login(payload: UserCreate, db: Session = Depends(get_db_dependency)):
+def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Invalid credentials")
