@@ -82,6 +82,7 @@ class RecordUpdate(BaseModel):
 	resolution_width: Optional[int] = None
 	resolution_height: Optional[int] = None
 	project_id: Optional[int] = None
+	collection_id: Optional[int] = None
 	object_typology: Optional[str] = None
 	author: Optional[str] = None
 	material: Optional[str] = None
@@ -92,6 +93,7 @@ class RecordUpdate(BaseModel):
 class RecordRead(RecordBase):
 	id: int
 	project_id: Optional[int] = None
+	collection_id: Optional[int] = None
 	created_at: Optional[datetime]
 	modified_at: Optional[datetime]
 	camera_settings: Optional[CameraSettingsRead] = None

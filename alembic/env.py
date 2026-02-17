@@ -16,9 +16,10 @@ from app.core.db import Base
 from app.core.config import settings
 
 # Import all models so they are registered with Base.metadata
-import app.models.document  # noqa: F401
+import app.models.record  # noqa: F401
 import app.models.camera  # noqa: F401
 import app.models.project  # noqa: F401
+import app.models.collection  # noqa: F401
 import app.models.user  # noqa: F401
 
 # this is the Alembic Config object, which provides

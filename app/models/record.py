@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint
 from sqlalchemy.orm import relationship
 
 from app.core.db import Base
@@ -18,7 +18,8 @@ class RecordImage(Base):
 	format = Column(String(50), nullable=False)
 	resolution_width = Column(Integer, nullable=True)
 	resolution_height = Column(Integer, nullable=True)
-	project_id = Column(Integer, ForeignKey("projects.id"), nullable=True)
+	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True)
 	# Object typology: book, dossier, document, map, planimetry, other
 	object_typology = Column(String(50), nullable=True)
 	author = Column(String(255), nullable=True)
@@ -32,6 +33,15 @@ class RecordImage(Base):
 	camera_settings = relationship("CameraSettings", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
 	exif_data = relationship("ExifData", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
 	project = relationship("Project", back_populates="records")
+	collection = relationship("Collection", back_populates="records")
+
+	# Constraint: must have either project_id OR collection_id (or neither, but not both)
+	__table_args__ = (
+		CheckConstraint(
+			'NOT (project_id IS NOT NULL AND collection_id IS NOT NULL)',
+			name='check_record_single_parent'
+		),
+	)
 
 
 class ExifData(Base):

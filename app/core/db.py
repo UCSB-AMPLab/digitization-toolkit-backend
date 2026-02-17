@@ -50,6 +50,7 @@ def init_db() -> None:
 	import app.models.record  # noqa: F401
 	import app.models.camera  # noqa: F401
 	import app.models.project  # noqa: F401
+	import app.models.collection  # noqa: F401
 	import app.models.user  # noqa: F401
 	
 	# Note: Tables are created via Alembic migrations, not create_all()
