@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from app.models.record import RecordImage
+from app.models.record import Record, RecordImage
 from typing import List, Optional
 from pydantic import BaseModel
 import logging
@@ -33,6 +33,8 @@ class CaptureRequest(BaseModel):
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False
+	record_id: Optional[int] = None  # Link to existing record, or create new if None
+	record_title: Optional[str] = None  # Used if creating new record
 
 
 class DualCaptureRequest(BaseModel):
@@ -41,6 +43,9 @@ class DualCaptureRequest(BaseModel):
 	resolution: str = "medium"
 	include_resolution_in_filename: bool = False
 	stagger_ms: int = 20
+	record_id: Optional[int] = None  # Link to existing record, or create new if None
+	record_title: Optional[str] = None  # Used if creating new record
+	sequence: Optional[int] = None  # Page number/order
 
 
 class CaptureResponse(BaseModel):
@@ -48,6 +53,8 @@ class CaptureResponse(BaseModel):
 	success: bool
 	file_path: Optional[str] = None
 	file_paths: Optional[List[str]] = None
+	record_id: Optional[int] = None
+	image_ids: Optional[List[int]] = None
 	timing: Optional[dict] = None
 	error: Optional[str] = None
 
@@ -151,8 +158,7 @@ def trigger_capture(
 	"""
 	Trigger a single image capture on the specified camera.
 	
-	Requires a project to exist (use /projects/{id}/initialize first).
-	Captures image locally to microSD, then creates database record with metadata.
+	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
 	"""
 	try:
 		from capture.service import single_capture_image, is_camera_connected
@@ -160,6 +166,8 @@ def trigger_capture(
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
 		from PIL.ExifTags import TAGS
+		from app.models.project import Project
+		from app.models.record import ExifData
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
@@ -178,7 +186,8 @@ def trigger_capture(
 		)
 		camera_config = CameraConfig(**config_dict)
 		
-		output_path = single_capture_image(
+		# Capture image and get manifest IDs
+		output_path, capture_id, pair_id = single_capture_image(
 			project_name=request.project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
@@ -186,15 +195,16 @@ def trigger_capture(
 		)
 		
 		# Extract image dimensions and EXIF data
+		from pathlib import Path
+		file_path = Path(output_path)
+		file_size = file_path.stat().st_size if file_path.exists() else 0
 		resolution_width = None
 		resolution_height = None
 		exif_dict = {}
 		
 		try:
-			from PIL import Image
 			with Image.open(output_path) as img:
 				resolution_width, resolution_height = img.size
-				
 				# Extract EXIF data if available
 				try:
 					exif_data = img._getexif()
@@ -207,41 +217,49 @@ def trigger_capture(
 		except Exception as e:
 			logger.warning(f"Could not extract image metadata: {e}")
 		
-		# Get file size
-		from pathlib import Path
-		file_path = Path(output_path)
-		file_size = file_path.stat().st_size if file_path.exists() else 0
-		
-		# Create database record for the captured image
-		from app.models.record import RecordImage, ExifData
-		from app.models.camera import CameraSettings
-		from app.models.project import Project
-		
 		# Get or find project by name
 		project = db.query(Project).filter(Project.name == request.project_name).first()
 		project_id = project.id if project else None
 		
-		# Create record
-		rec = RecordImage(
+		# Get or create Record
+		if request.record_id:
+			# Link to existing record
+			record = db.query(Record).filter(Record.id == request.record_id).first()
+			if not record:
+				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		else:
+			# Create new record for this capture
+			record = Record(
+				title=request.record_title or f"{request.project_name} - {file_path.stem}",
+				description=f"Captured at {request.resolution} resolution",
+				object_typology="document",
+				project_id=project_id,
+				created_by=current_user.username,
+			)
+			db.add(record)
+			db.flush()  # Get the ID
+		
+		# Create RecordImage with capture linkage
+		img = RecordImage(
+			record_id=record.id,
 			filename=file_path.name,
-			title=f"{request.project_name} - Camera {request.camera_index}",
-			description=f"Captured via API at {request.resolution} resolution",
 			file_path=str(output_path),
 			file_size=file_size,
 			format="jpg",
 			resolution_width=resolution_width,
 			resolution_height=resolution_height,
+			capture_id=capture_id,
+			pair_id=pair_id,
+			role="single",
 			uploaded_by=current_user.username,
-			project_id=project_id,
-			object_typology="document",
 		)
 		
-		db.add(rec)
+		db.add(img)
 		db.flush()  # Get the ID
 		
 		# Save camera settings
 		cs = CameraSettings(
-			record_image_id=rec.id,
+			record_image_id=img.id,
 			camera_model=camera_config.__class__.__name__,
 			iso=None,
 			aperture=None,
@@ -253,20 +271,25 @@ def trigger_capture(
 		# Save EXIF data
 		if exif_dict:
 			ex = ExifData(
-				record_image_id=rec.id,
+				record_image_id=img.id,
 				raw_exif=str(exif_dict),
 			)
 			db.add(ex)
 		
 		db.commit()
-		db.refresh(rec)
+		db.refresh(record)
+		db.refresh(img)
 		
-		logger.info(f"Created database record for captured image: {rec.id}")
+		logger.info(f"Created record {record.id}, image {img.id}, capture_id={capture_id}")
 		
 		return CaptureResponse(
 			success=True,
-			file_path=str(output_path)
+			file_path=str(output_path),
+			record_id=record.id,
+			image_ids=[img.id]
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"Capture failed: {e}")
 		db.rollback()
@@ -283,7 +306,7 @@ def trigger_dual_capture(
 	Trigger simultaneous capture on both cameras (index 0 and 1).
 	
 	Used for book scanning where left and right pages are captured together.
-	Both images stored locally; metadata saved to database.
+	Creates or links to existing Record, then creates two linked RecordImages.
 	"""
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
@@ -291,6 +314,9 @@ def trigger_dual_capture(
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
 		from PIL.ExifTags import TAGS
+		from pathlib import Path
+		from app.models.project import Project
+		from app.models.record import ExifData
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
@@ -310,7 +336,8 @@ def trigger_dual_capture(
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
-		path0, path1 = dual_capture_image(
+		# Capture both images and get manifest IDs
+		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=request.project_name,
 			cam1_config=cam0_config,
 			cam2_config=cam1_config,
@@ -319,17 +346,30 @@ def trigger_dual_capture(
 			stagger_ms=request.stagger_ms
 		)
 		
-		from pathlib import Path
-		from app.models.record import RecordImage, ExifData
-		from app.models.camera import CameraSettings
-		from app.models.project import Project
-		
 		# Get project
 		project = db.query(Project).filter(Project.name == request.project_name).first()
 		project_id = project.id if project else None
 		
+		# Get or create Record
+		if request.record_id:
+			# Link to existing record (adding new pages to multi-page document)
+			record = db.query(Record).filter(Record.id == request.record_id).first()
+			if not record:
+				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		else:
+			# Create new record for this dual capture
+			record = Record(
+				title=request.record_title or f"{request.project_name} - Dual capture",
+				description=f"Dual camera capture at {request.resolution} resolution",
+				object_typology="book",  # Default to book for dual captures
+				project_id=project_id,
+				created_by=current_user.username,
+			)
+			db.add(record)
+			db.flush()  # Get the ID
+		
 		# Helper to process captured image
-		def create_record_from_capture(file_path_str: str, camera_idx: int):
+		def create_image_record(file_path_str: str, camera_idx: int, role: str):
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
@@ -352,28 +392,29 @@ def trigger_dual_capture(
 			except Exception as e:
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
-			# Create record
-			rec = RecordImage(
+			# Create RecordImage with capture linkage
+			img = RecordImage(
+				record_id=record.id,
 				filename=file_path.name,
-				title=f"{request.project_name} - Camera {camera_idx} (Dual)",
-				description=f"Dual capture via API at {request.resolution} resolution",
 				file_path=str(file_path_str),
 				file_size=file_size,
 				format="jpg",
 				resolution_width=resolution_width,
 				resolution_height=resolution_height,
+				capture_id=capture_id,  # Both images share same capture event
+				pair_id=pair_id,  # Both images share same pair_id
+				sequence=request.sequence,
+				role=role,
 				uploaded_by=current_user.username,
-				project_id=project_id,
-				object_typology="document",
 			)
 			
-			db.add(rec)
+			db.add(img)
 			db.flush()
 			
 			# Camera settings
 			cam_config = cam0_config if camera_idx == 0 else cam1_config
 			cs = CameraSettings(
-				record_image_id=rec.id,
+				record_image_id=img.id,
 				camera_model=cam_config.__class__.__name__,
 				iso=None,
 				aperture=None,
@@ -385,25 +426,33 @@ def trigger_dual_capture(
 			# EXIF data
 			if exif_dict:
 				ex = ExifData(
-					record_image_id=rec.id,
+					record_image_id=img.id,
 					raw_exif=str(exif_dict),
 				)
 				db.add(ex)
 			
-			return rec
+			return img
 		
-		# Create records for both captures
-		rec0 = create_record_from_capture(str(path0), 0)
-		rec1 = create_record_from_capture(str(path1), 1)
+		# Create RecordImages for both captures with appropriate roles
+		img0 = create_image_record(str(path0), 0, "left")
+		img1 = create_image_record(str(path1), 1, "right")
 		
 		db.commit()
+		db.refresh(record)
 		
-		logger.info(f"Created dual capture database records: {rec0.id}, {rec1.id}")
+		logger.info(
+			f"Created dual capture: record {record.id}, images [{img0.id}, {img1.id}], "
+			f"capture_id={capture_id}, pair_id={pair_id}"
+		)
 		
 		return CaptureResponse(
 			success=True,
-			file_paths=[str(path0), str(path1)]
+			file_paths=[str(path0), str(path1)],
+			record_id=record.id,
+			image_ids=[img0.id, img1.id]
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"Dual capture failed: {e}")
 		db.rollback()
