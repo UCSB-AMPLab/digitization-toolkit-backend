@@ -1,6 +1,7 @@
-from fastapi import APIRouter, Depends, HTTPException, Security
+from fastapi import APIRouter, Depends, HTTPException, Security, Query
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
+from typing import Optional
 
 from app.api.deps import get_db_dependency
 from app.models.user import User
@@ -9,6 +10,9 @@ from app.core.security import hash_password, verify_password, create_access_toke
 
 router = APIRouter()
 security = HTTPBearer()
+# auto_error=False so the dependency doesn't raise when header is absent
+# (allows falling back to ?token= query param for browser src= requests)
+_optional_bearer = HTTPBearer(auto_error=False)
 
 
 @router.post("/register", response_model=UserRead)
@@ -72,9 +76,16 @@ def reset_password(
     return {"detail": "password updated successfully"}
 
 
-def get_current_user(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db_dependency)):
-    token = credentials.credentials
-    payload = verify_access_token(token)
+def get_current_user(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    token: Optional[str] = Query(default=None),
+    db: Session = Depends(get_db_dependency)
+):
+    # Accept token from Authorization header OR ?token= query param (needed for <img src>)
+    raw_token = credentials.credentials if credentials else token
+    if not raw_token:
+        raise HTTPException(status_code=401, detail="Not authenticated")
+    payload = verify_access_token(raw_token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user_id = int(payload.get("sub"))
