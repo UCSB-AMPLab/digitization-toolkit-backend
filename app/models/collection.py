@@ -30,7 +30,7 @@ class Collection(Base):
     project = relationship("Project", back_populates="collections")
     parent_collection = relationship("Collection", remote_side=[id], back_populates="child_collections")
     child_collections = relationship("Collection", back_populates="parent_collection", cascade="all, delete-orphan")
-    records = relationship("RecordImage", back_populates="collection")
+    records = relationship("Record", back_populates="collection")
 
     # Constraint: must have either project_id OR parent_collection_id (but not both)
     __table_args__ = (
