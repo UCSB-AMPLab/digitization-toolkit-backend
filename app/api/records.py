@@ -72,10 +72,20 @@ def create_record(
 def list_records(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
+    collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_dependency)
 ):
-	recs = db.query(RecordImage).offset(skip).limit(limit).all()
+	query = db.query(RecordImage)
+	
+	# Apply filters if provided
+	if project_id is not None:
+		query = query.filter(RecordImage.project_id == project_id)
+	if collection_id is not None:
+		query = query.filter(RecordImage.collection_id == collection_id)
+	
+	recs = query.offset(skip).limit(limit).all()
 	return [RecordRead.model_validate(r) for r in recs]
 
 
