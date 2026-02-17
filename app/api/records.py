@@ -368,7 +368,8 @@ def get_image_thumbnail(
 		if not source_path.exists():
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
 		try:
-			thumbnails_dir = settings.data_dir / "thumbnails"
+			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
+			thumbnails_dir = source_path.parent.parent / "thumbnails"
 			generated = generate_thumbnail(source_path, thumbnails_dir)
 			if generated:
 				img.thumbnail_path = generated
