@@ -354,18 +354,34 @@ def get_image_thumbnail(
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Download the thumbnail for an image."""
+	"""Download the thumbnail for an image. Generates it on demand if missing."""
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	
-	if not img.thumbnail_path:
-		raise HTTPException(status_code=404, detail="Image has no thumbnail")
-	
-	thumbnail_path = Path(img.thumbnail_path)
-	if not thumbnail_path.exists():
-		raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
-	
+
+	# If thumbnail is missing or the file was deleted, try to generate it now
+	thumbnail_path = Path(img.thumbnail_path) if img.thumbnail_path else None
+	if thumbnail_path is None or not thumbnail_path.exists():
+		if not img.file_path:
+			raise HTTPException(status_code=404, detail="Image has no source file for thumbnail generation")
+		source_path = Path(img.file_path)
+		if not source_path.exists():
+			raise HTTPException(status_code=404, detail="Source image file not found on disk")
+		try:
+			thumbnails_dir = settings.data_dir / "thumbnails"
+			generated = generate_thumbnail(source_path, thumbnails_dir)
+			if generated:
+				img.thumbnail_path = generated
+				db.add(img)
+				db.commit()
+				thumbnail_path = Path(generated)
+		except Exception as e:
+			logger.warning(f"On-demand thumbnail generation failed for image {img_id}: {e}")
+			raise HTTPException(status_code=500, detail="Failed to generate thumbnail")
+
+	if thumbnail_path is None or not thumbnail_path.exists():
+		raise HTTPException(status_code=404, detail="Thumbnail could not be generated")
+
 	return FileResponse(
 		path=thumbnail_path,
 		filename=f"{Path(img.filename).stem}_thumb.jpg",

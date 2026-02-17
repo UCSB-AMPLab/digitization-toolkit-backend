@@ -11,6 +11,8 @@ from app.api.auth import get_current_user
 from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
+from app.core.config import settings
+from app.core.thumbnail import generate_thumbnail
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -239,11 +241,20 @@ def trigger_capture(
 			db.add(record)
 			db.flush()  # Get the ID
 		
+		# Generate thumbnail
+		thumbnail_path = None
+		try:
+			thumbnails_dir = settings.data_dir / "thumbnails"
+			thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+		except Exception as e:
+			logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
 		# Create RecordImage with capture linkage
 		img = RecordImage(
 			record_id=record.id,
 			filename=file_path.name,
 			file_path=str(output_path),
+			thumbnail_path=thumbnail_path,
 			file_size=file_size,
 			format="jpg",
 			resolution_width=resolution_width,
@@ -392,11 +403,20 @@ def trigger_dual_capture(
 			except Exception as e:
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
+			# Generate thumbnail
+			thumbnail_path = None
+			try:
+				thumbnails_dir = settings.data_dir / "thumbnails"
+				thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+			except Exception as e:
+				logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
 			# Create RecordImage with capture linkage
 			img = RecordImage(
 				record_id=record.id,
 				filename=file_path.name,
 				file_path=str(file_path_str),
+				thumbnail_path=thumbnail_path,
 				file_size=file_size,
 				format="jpg",
 				resolution_width=resolution_width,
