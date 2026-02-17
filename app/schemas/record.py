@@ -35,7 +35,7 @@ class ExifDataCreate(ExifDataBase):
 	pass
 
 
-class DocumentBase(BaseModel):
+class RecordBase(BaseModel):
 	filename: str
 	title: Optional[str] = None
 	description: Optional[str] = None
@@ -53,7 +53,7 @@ class DocumentBase(BaseModel):
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
 
 
-class DocumentCreate(DocumentBase):
+class RecordCreate(RecordBase):
 	camera_settings: Optional[CameraSettingsCreate] = None
 	exif_data: Optional[ExifDataCreate] = None
 
@@ -68,14 +68,14 @@ class ExifDataRead(ExifDataBase):
 
 class CameraSettingsRead(CameraSettingsBase):
 	id: int
-	document_image_id: int
+	record_image_id: int
 	created_at: Optional[datetime]
 
 	class Config:
 		from_attributes = True
 
 
-class DocumentUpdate(BaseModel):
+class RecordUpdate(BaseModel):
 	title: Optional[str] = None
 	description: Optional[str] = None
 	file_size: Optional[int] = None
@@ -89,7 +89,7 @@ class DocumentUpdate(BaseModel):
 	custom_attributes: Optional[str] = None
 
 
-class DocumentRead(DocumentBase):
+class RecordRead(RecordBase):
 	id: int
 	project_id: Optional[int] = None
 	created_at: Optional[datetime]

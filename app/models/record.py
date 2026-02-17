@@ -5,8 +5,8 @@ from sqlalchemy.orm import relationship
 from app.core.db import Base
 
 
-class DocumentImage(Base):
-	__tablename__ = "document_images"
+class RecordImage(Base):
+	__tablename__ = "record_images"
 
 	id = Column(Integer, primary_key=True, index=True)
 	filename = Column(String(255), unique=True, index=True, nullable=False)
@@ -29,16 +29,16 @@ class DocumentImage(Base):
 	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 	uploaded_by = Column(String(255), nullable=True)
 
-	camera_settings = relationship("CameraSettings", back_populates="document_image", uselist=False, cascade="all, delete-orphan")
-	exif_data = relationship("ExifData", back_populates="document_image", uselist=False, cascade="all, delete-orphan")
-	project = relationship("Project", back_populates="documents")
+	camera_settings = relationship("CameraSettings", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
+	exif_data = relationship("ExifData", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
+	project = relationship("Project", back_populates="records")
 
 
 class ExifData(Base):
 	__tablename__ = "exif_data"
 
 	id = Column(Integer, primary_key=True, index=True)
-	document_image_id = Column(Integer, ForeignKey("document_images.id"), nullable=False)
+	record_image_id = Column(Integer, ForeignKey("record_images.id"), nullable=False)
 
 	make = Column(String(255), nullable=True)
 	model = Column(String(255), nullable=True)
@@ -74,4 +74,4 @@ class ExifData(Base):
 
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-	document_image = relationship("DocumentImage", back_populates="exif_data")
+	record_image = relationship("RecordImage", back_populates="exif_data")

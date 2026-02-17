@@ -10,10 +10,10 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user
-from app.models.document import DocumentImage, ExifData
+from app.models.record import RecordImage, ExifData
 from app.models.camera import CameraSettings
 from app.models.user import User
-from app.schemas.document import DocumentCreate, DocumentRead, DocumentUpdate
+from app.schemas.record import RecordCreate, RecordRead, RecordUpdate
 from app.core.config import settings
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 
@@ -21,143 +21,143 @@ router = APIRouter()
 logger = logging.getLogger(__name__)
 
 
-@router.post("/", response_model=DocumentRead)
-def create_document(
-	doc_in: DocumentCreate,
+@router.post("/", response_model=RecordRead)
+def create_record(
+	rec_in: RecordCreate,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	# create document
-	doc = DocumentImage(
-		filename=doc_in.filename,
-		title=doc_in.title,
-		description=doc_in.description,
-		file_path=doc_in.file_path,
-		file_size=doc_in.file_size,
-		format=doc_in.format,
-		resolution_width=doc_in.resolution_width,
-		resolution_height=doc_in.resolution_height,
-		uploaded_by=doc_in.uploaded_by or current_user.username,
-		object_typology=doc_in.object_typology,
-		author=doc_in.author,
-		material=doc_in.material,
-		date=doc_in.date,
-		custom_attributes=doc_in.custom_attributes,
+	# create record
+	rec = RecordImage(
+		filename=rec_in.filename,
+		title=rec_in.title,
+		description=rec_in.description,
+		file_path=rec_in.file_path,
+		file_size=rec_in.file_size,
+		format=rec_in.format,
+		resolution_width=rec_in.resolution_width,
+		resolution_height=rec_in.resolution_height,
+		uploaded_by=rec_in.uploaded_by or current_user.username,
+		object_typology=rec_in.object_typology,
+		author=rec_in.author,
+		material=rec_in.material,
+		date=rec_in.date,
+		custom_attributes=rec_in.custom_attributes,
 	)
 	try:
-		db.add(doc)
+		db.add(rec)
 		db.commit()
-		db.refresh(doc)
+		db.refresh(rec)
 	except IntegrityError:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Document with this filename already exists")
+		raise HTTPException(status_code=409, detail="Record with this filename already exists")
 
 	# optional camera settings
-	if doc_in.camera_settings:
-		cs = CameraSettings(document_image_id=doc.id, **doc_in.camera_settings.dict())
+	if rec_in.camera_settings:
+		cs = CameraSettings(record_image_id=rec.id, **rec_in.camera_settings.dict())
 		db.add(cs)
 
 	# optional exif
-	if doc_in.exif_data:
-		ex = ExifData(document_image_id=doc.id, **doc_in.exif_data.dict())
+	if rec_in.exif_data:
+		ex = ExifData(record_image_id=rec.id, **rec_in.exif_data.dict())
 		db.add(ex)
 
 	db.commit()
-	db.refresh(doc)
+	db.refresh(rec)
 
-	return DocumentRead.model_validate(doc)
+	return RecordRead.model_validate(rec)
 
 
-@router.get("/", response_model=List[DocumentRead])
-def list_documents(
+@router.get("/", response_model=List[RecordRead])
+def list_records(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
     current_user: User = Depends(get_current_user),
     db: Session = Depends(get_db_dependency)
 ):
-	docs = db.query(DocumentImage).offset(skip).limit(limit).all()
-	return [DocumentRead.model_validate(d) for d in docs]
+	recs = db.query(RecordImage).offset(skip).limit(limit).all()
+	return [RecordRead.model_validate(r) for r in recs]
 
 
-@router.get("/{doc_id}", response_model=DocumentRead)
-def get_document(doc_id: int, db: Session = Depends(get_db_dependency)):
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
-	return DocumentRead.model_validate(doc)
+@router.get("/{rec_id}", response_model=RecordRead)
+def get_record(rec_id: int, db: Session = Depends(get_db_dependency)):
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	return RecordRead.model_validate(rec)
 
 
-@router.patch("/{doc_id}", response_model=DocumentRead)
-def update_document(
-	doc_id: int,
-	payload: DocumentUpdate,
+@router.patch("/{rec_id}", response_model=RecordRead)
+def update_record(
+	rec_id: int,
+	payload: RecordUpdate,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
 	# Update only provided fields
 	for field, value in payload.dict(exclude_unset=True).items():
-		setattr(doc, field, value)
+		setattr(rec, field, value)
 	
-	db.add(doc)
+	db.add(rec)
 	db.commit()
-	db.refresh(doc)
-	return DocumentRead.model_validate(doc)
+	db.refresh(rec)
+	return RecordRead.model_validate(rec)
 
 
-@router.put("/{doc_id}", response_model=DocumentRead)
-def replace_document(
-	doc_id: int,
-	payload: DocumentCreate,
+@router.put("/{rec_id}", response_model=RecordRead)
+def replace_record(
+	rec_id: int,
+	payload: RecordCreate,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
 	# Replace all fields
-	doc.filename = payload.filename
-	doc.title = payload.title
-	doc.description = payload.description
-	doc.file_path = payload.file_path
-	doc.file_size = payload.file_size
-	doc.format = payload.format
-	doc.resolution_width = payload.resolution_width
-	doc.resolution_height = payload.resolution_height
-	doc.uploaded_by = payload.uploaded_by
-	doc.object_typology = payload.object_typology
-	doc.author = payload.author
-	doc.material = payload.material
-	doc.date = payload.date
-	doc.custom_attributes = payload.custom_attributes
+	rec.filename = payload.filename
+	rec.title = payload.title
+	rec.description = payload.description
+	rec.file_path = payload.file_path
+	rec.file_size = payload.file_size
+	rec.format = payload.format
+	rec.resolution_width = payload.resolution_width
+	rec.resolution_height = payload.resolution_height
+	rec.uploaded_by = payload.uploaded_by
+	rec.object_typology = payload.object_typology
+	rec.author = payload.author
+	rec.material = payload.material
+	rec.date = payload.date
+	rec.custom_attributes = payload.custom_attributes
 	
-	db.add(doc)
+	db.add(rec)
 	db.commit()
-	db.refresh(doc)
-	return DocumentRead.model_validate(doc)
+	db.refresh(rec)
+	return RecordRead.model_validate(rec)
 
 
-@router.delete("/{doc_id}")
-def delete_document(
-	doc_id: int,
+@router.delete("/{rec_id}")
+def delete_record(
+	rec_id: int,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
 	# Clean up thumbnail if it exists
-	if doc.thumbnail_path:
-		delete_thumbnail(doc.thumbnail_path)
+	if rec.thumbnail_path:
+		delete_thumbnail(rec.thumbnail_path)
 	
-	db.delete(doc)
+	db.delete(rec)
 	db.commit()
-	return {"detail": "document deleted"}
+	return {"detail": "record deleted"}
 
 
 def _compute_sha256(file_path: Path) -> str:
@@ -169,8 +169,8 @@ def _compute_sha256(file_path: Path) -> str:
 	return sha256_hash.hexdigest()
 
 
-@router.post("/upload", response_model=DocumentRead)
-async def upload_document(
+@router.post("/upload", response_model=RecordRead)
+async def upload_record(
 	file: UploadFile = File(...),
 	title: Optional[str] = None,
 	description: Optional[str] = None,
@@ -179,9 +179,9 @@ async def upload_document(
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
-	Upload a document image file.
+	Upload a record image file.
 	
-	Creates a document record and stores the file in the uploads directory.
+	Creates a record and stores the file in the uploads directory.
 	"""
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
@@ -232,8 +232,8 @@ async def upload_document(
 		logger.warning(f"Failed to generate thumbnail for {file.filename}: {e}")
 		# Don't fail the upload if thumbnail generation fails
 	
-	# Create document record
-	doc = DocumentImage(
+	# Create record
+	rec = RecordImage(
 		filename=file.filename or unique_filename,
 		title=title or file.filename,
 		description=description,
@@ -248,37 +248,37 @@ async def upload_document(
 	)
 	
 	try:
-		db.add(doc)
+		db.add(rec)
 		db.commit()
-		db.refresh(doc)
+		db.refresh(rec)
 	except IntegrityError:
 		db.rollback()
 		# Clean up file
 		file_path.unlink(missing_ok=True)
-		raise HTTPException(status_code=409, detail="Document with this filename already exists")
+		raise HTTPException(status_code=409, detail="Record with this filename already exists")
 	
-	return DocumentRead.model_validate(doc)
+	return RecordRead.model_validate(rec)
 
 
-@router.get("/{doc_id}/file")
-def download_document_file(
-	doc_id: int,
+@router.get("/{rec_id}/file")
+def download_record_file(
+	rec_id: int,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
-	Download the actual image file for a document.
+	Download the actual image file for a record.
 	
 	Returns the file as a binary response with appropriate content type.
 	"""
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
-	if not doc.file_path:
-		raise HTTPException(status_code=404, detail="Document has no associated file")
+	if not rec.file_path:
+		raise HTTPException(status_code=404, detail="Record has no associated file")
 	
-	file_path = Path(doc.file_path)
+	file_path = Path(rec.file_path)
 	if not file_path.exists():
 		raise HTTPException(status_code=404, detail="File not found on disk")
 	
@@ -296,62 +296,61 @@ def download_document_file(
 	
 	return FileResponse(
 		path=file_path,
-		filename=doc.filename,
+		filename=rec.filename,
 		media_type=media_type
 	)
 
 
-@router.get("/{doc_id}/checksum")
-def get_document_checksum(
-	doc_id: int,
+@router.get("/{rec_id}/checksum")
+def get_record_checksum(
+	rec_id: int,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
-	Get the SHA256 checksum of a document's file.
+	Get the SHA256 checksum of a record's file.
 	
 	Useful for verifying file integrity.
 	"""
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
-	if not doc.file_path:
-		raise HTTPException(status_code=404, detail="Document has no associated file")
+	if not rec.file_path:
+		raise HTTPException(status_code=404, detail="Record has no associated file")
 	
-	file_path = Path(doc.file_path)
+	file_path = Path(rec.file_path)
 	if not file_path.exists():
 		raise HTTPException(status_code=404, detail="File not found on disk")
 	
 	checksum = _compute_sha256(file_path)
-	return {"document_id": doc_id, "sha256": checksum}
+	return {"record_id": rec_id, "sha256": checksum}
 
 
-@router.get("/{doc_id}/thumbnail")
-def get_document_thumbnail(
-	doc_id: int,
+@router.get("/{rec_id}/thumbnail")
+def get_record_thumbnail(
+	rec_id: int,
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
-	Download the thumbnail image for a document.
+	Download the thumbnail image for a record.
 	
 	Returns the thumbnail file as a JPEG image response.
 	"""
-	doc = db.query(DocumentImage).filter(DocumentImage.id == doc_id).first()
-	if not doc:
-		raise HTTPException(status_code=404, detail="Document not found")
+	rec = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
 	
-	if not doc.thumbnail_path:
-		raise HTTPException(status_code=404, detail="Document has no thumbnail")
+	if not rec.thumbnail_path:
+		raise HTTPException(status_code=404, detail="Record has no thumbnail")
 	
-	thumbnail_path = Path(doc.thumbnail_path)
+	thumbnail_path = Path(rec.thumbnail_path)
 	if not thumbnail_path.exists():
 		raise HTTPException(status_code=404, detail="Thumbnail file not found on disk")
 	
 	return FileResponse(
 		path=thumbnail_path,
-		filename=f"{Path(doc.filename).stem}_thumb.jpg",
+		filename=f"{Path(rec.filename).stem}_thumb.jpg",
 		media_type="image/jpeg"
 	)
-

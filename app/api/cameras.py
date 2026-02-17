@@ -1,7 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from app.models.document import DocumentImage
+from app.models.record import RecordImage
 from typing import List, Optional
 from pydantic import BaseModel
 import logging
@@ -213,7 +213,7 @@ def trigger_capture(
 		file_size = file_path.stat().st_size if file_path.exists() else 0
 		
 		# Create database record for the captured image
-		from app.models.document import DocumentImage, ExifData
+		from app.models.record import RecordImage, ExifData
 		from app.models.camera import CameraSettings
 		from app.models.project import Project
 		
@@ -221,8 +221,8 @@ def trigger_capture(
 		project = db.query(Project).filter(Project.name == request.project_name).first()
 		project_id = project.id if project else None
 		
-		# Create document record
-		doc = DocumentImage(
+		# Create record
+		rec = RecordImage(
 			filename=file_path.name,
 			title=f"{request.project_name} - Camera {request.camera_index}",
 			description=f"Captured via API at {request.resolution} resolution",
@@ -236,12 +236,12 @@ def trigger_capture(
 			object_typology="document",
 		)
 		
-		db.add(doc)
+		db.add(rec)
 		db.flush()  # Get the ID
 		
 		# Save camera settings
 		cs = CameraSettings(
-			document_image_id=doc.id,
+			record_image_id=rec.id,
 			camera_model=camera_config.__class__.__name__,
 			iso=None,
 			aperture=None,
@@ -253,15 +253,15 @@ def trigger_capture(
 		# Save EXIF data
 		if exif_dict:
 			ex = ExifData(
-				document_image_id=doc.id,
+				record_image_id=rec.id,
 				raw_exif=str(exif_dict),
 			)
 			db.add(ex)
 		
 		db.commit()
-		db.refresh(doc)
+		db.refresh(rec)
 		
-		logger.info(f"Created database record for captured image: {doc.id}")
+		logger.info(f"Created database record for captured image: {rec.id}")
 		
 		return CaptureResponse(
 			success=True,
@@ -320,7 +320,7 @@ def trigger_dual_capture(
 		)
 		
 		from pathlib import Path
-		from app.models.document import DocumentImage, ExifData
+		from app.models.record import RecordImage, ExifData
 		from app.models.camera import CameraSettings
 		from app.models.project import Project
 		
@@ -329,7 +329,7 @@ def trigger_dual_capture(
 		project_id = project.id if project else None
 		
 		# Helper to process captured image
-		def create_document_from_capture(file_path_str: str, camera_idx: int):
+		def create_record_from_capture(file_path_str: str, camera_idx: int):
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
@@ -352,8 +352,8 @@ def trigger_dual_capture(
 			except Exception as e:
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
-			# Create document record
-			doc = DocumentImage(
+			# Create record
+			rec = RecordImage(
 				filename=file_path.name,
 				title=f"{request.project_name} - Camera {camera_idx} (Dual)",
 				description=f"Dual capture via API at {request.resolution} resolution",
@@ -367,13 +367,13 @@ def trigger_dual_capture(
 				object_typology="document",
 			)
 			
-			db.add(doc)
+			db.add(rec)
 			db.flush()
 			
 			# Camera settings
 			cam_config = cam0_config if camera_idx == 0 else cam1_config
 			cs = CameraSettings(
-				document_image_id=doc.id,
+				record_image_id=rec.id,
 				camera_model=cam_config.__class__.__name__,
 				iso=None,
 				aperture=None,
@@ -385,20 +385,20 @@ def trigger_dual_capture(
 			# EXIF data
 			if exif_dict:
 				ex = ExifData(
-					document_image_id=doc.id,
+					record_image_id=rec.id,
 					raw_exif=str(exif_dict),
 				)
 				db.add(ex)
 			
-			return doc
+			return rec
 		
 		# Create records for both captures
-		doc0 = create_document_from_capture(str(path0), 0)
-		doc1 = create_document_from_capture(str(path1), 1)
+		rec0 = create_record_from_capture(str(path0), 0)
+		rec1 = create_record_from_capture(str(path1), 1)
 		
 		db.commit()
 		
-		logger.info(f"Created dual capture database records: {doc0.id}, {doc1.id}")
+		logger.info(f"Created dual capture database records: {rec0.id}, {rec1.id}")
 		
 		return CaptureResponse(
 			success=True,
@@ -515,8 +515,8 @@ def create_camera_settings(
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
-	if not db.query(DocumentImage).filter(DocumentImage.id == payload.document_image_id).first():
-		raise HTTPException(status_code=404, detail="Document not found")
+	if not db.query(RecordImage).filter(RecordImage.id == payload.record_image_id).first():
+		raise HTTPException(status_code=404, detail="Record not found")
 
 	try:
 		cs = CameraSettings(**payload.dict())
@@ -525,7 +525,7 @@ def create_camera_settings(
 		db.refresh(cs)
 	except IntegrityError:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Camera settings already exist for this document")
+		raise HTTPException(status_code=409, detail="Camera settings already exist for this record")
 	return CameraSettingsRead.model_validate(cs)
 
 

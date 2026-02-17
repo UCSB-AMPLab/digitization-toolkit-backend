@@ -6,7 +6,7 @@ from contextlib import asynccontextmanager
 from app.core.db import init_db
 
 # routers
-from app.api.documents import router as documents_router
+from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router
 from app.api.projects import router as projects_router
 from app.api.auth import router as auth_router
@@ -31,7 +31,7 @@ app.add_middleware(
     allow_headers=["*"],
 )
 
-app.include_router(documents_router, prefix="/documents", tags=["documents"])
+app.include_router(records_router, prefix="/records", tags=["records"])
 app.include_router(cameras_router, prefix="/cameras", tags=["cameras"])
 app.include_router(projects_router, prefix="/projects", tags=["projects"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])

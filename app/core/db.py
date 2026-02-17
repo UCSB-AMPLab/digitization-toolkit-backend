@@ -47,7 +47,7 @@ def init_db() -> None:
 		ImportError: If any model cannot be imported (app should not start)
 	"""
 	# Import model modules so they register with Base
-	import app.models.document  # noqa: F401
+	import app.models.record  # noqa: F401
 	import app.models.camera  # noqa: F401
 	import app.models.project  # noqa: F401
 	import app.models.user  # noqa: F401
