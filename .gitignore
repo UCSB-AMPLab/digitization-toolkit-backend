@@ -8,3 +8,4 @@ data
 _data/
 _logs/
 *.pdf
+*.backup
