@@ -7,7 +7,7 @@ import logging
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user
 from app.models.project import Project
-from app.models.record import RecordImage
+from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
 
@@ -75,7 +75,7 @@ def add_record_to_project(
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    r = db.query(RecordImage).filter(RecordImage.id == rec_id).first()
+    r = db.query(Record).filter(Record.id == rec_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Record not found")
     r.project_id = p.id
@@ -94,7 +94,7 @@ def remove_record_from_project(
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    r = db.query(RecordImage).filter(RecordImage.id == rec_id, RecordImage.project_id == p.id).first()
+    r = db.query(Record).filter(Record.id == rec_id, Record.project_id == p.id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Record not found on this project")
     r.project_id = None
@@ -147,7 +147,7 @@ def delete_project(
         raise HTTPException(status_code=404, detail="Project not found")
     
     # Unlink all records from this project
-    db.query(RecordImage).filter(RecordImage.project_id == project_id).update(
+    db.query(Record).filter(Record.project_id == project_id).update(
         {"project_id": None}
     )
     
@@ -210,8 +210,8 @@ def list_project_records(
         raise HTTPException(status_code=404, detail="Project not found")
     
     from app.schemas.record import RecordRead
-    recs = db.query(RecordImage).filter(
-        RecordImage.project_id == project_id
+    recs = db.query(Record).filter(
+        Record.project_id == project_id
     ).offset(skip).limit(limit).all()
     
     return [RecordRead.model_validate(r) for r in recs]
