@@ -65,6 +65,7 @@ def list_records(
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
 	object_typology: Optional[str] = Query(default=None, description="Filter by object type"),
+	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
 	current_user: User = Depends(get_current_user),
 	db: Session = Depends(get_db_dependency)
 ):
@@ -78,6 +79,8 @@ def list_records(
 		query = query.filter(Record.collection_id == collection_id)
 	if object_typology is not None:
 		query = query.filter(Record.object_typology == object_typology)
+	if orphaned is True:
+		query = query.filter(Record.project_id == None, Record.collection_id == None)
 	
 	recs = query.offset(skip).limit(limit).all()
 	return [RecordRead.model_validate(r) for r in recs]
