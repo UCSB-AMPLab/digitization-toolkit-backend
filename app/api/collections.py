@@ -8,7 +8,7 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user
 from app.models.collection import Collection
 from app.models.project import Project
-from app.models.record import RecordImage
+from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 
@@ -190,8 +190,8 @@ def delete_collection(
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     
     # Check if collection has records
-    record_count = db.query(func.count(RecordImage.id)).filter(
-        RecordImage.collection_id == collection_id
+    record_count = db.query(func.count(Record.id)).filter(
+        Record.collection_id == collection_id
     ).scalar()
     
     if record_count > 0:
