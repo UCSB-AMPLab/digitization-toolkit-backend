@@ -24,10 +24,11 @@ app = FastAPI()
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
-# Allow the Svelte dev server to call the API
+# Allow the Svelte frontend to call the API
+# :5173 = Vite dev server, :3000 = production Node server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173"],
+    allow_origins=["http://localhost:5173", "http://localhost:3000"],
     allow_credentials=True,
     allow_methods=["*"],
     allow_headers=["*"],
