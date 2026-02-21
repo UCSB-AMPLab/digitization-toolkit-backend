@@ -4,7 +4,10 @@ from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Optional
 from pydantic import BaseModel
+from concurrent.futures import ThreadPoolExecutor
 import logging
+import subprocess
+import sys
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user
@@ -107,41 +110,65 @@ def _get_camera_registry():
 
 def _probe_camera_operational(index: int) -> bool:
 	"""
-	Verify a camera is truly operational by attempting a brief start/stop cycle.
+	Verify a camera is truly operational by starting it in a subprocess and
+	checking whether libcamera emits RPISTREAM errors.
 
-	global_camera_info() reads i2c bus state at the kernel level — it reports cameras
-	as present even after physical disconnection (the i2c device tree entry persists).
-	This probe actually communicates with the sensor to verify it responds.
-
-	Returns True if the camera responds, or if it is already in use by another
-	process (which implies it is working). Returns False on hardware failure.
+	Why subprocess instead of in-process Picamera2:
+	  - global_camera_info() (and the kernel i2c bus) reports the camera as
+	    present even after physical disconnection.
+	  - Picamera2.start() succeeds without talking to the sensor; the hardware
+	    error only appears in stderr ("RPISTREAM / Failed to queue buffer") when
+	    the first frame is attempted.
+	  - capture_metadata() blocks indefinitely on a dead camera because the
+	    frame-complete callback never fires; stop() then also hangs.
+	  - A subprocess with a hard OS timeout sidesteps all of that: the child
+	    is killed cleanly after 4 seconds regardless of camera state.
 	"""
+	# On non-Pi environments picamera2 is not installed — skip the probe.
 	try:
-		from picamera2 import Picamera2
-	except ImportError:
-		return True  # Not on Pi; skip probe
-
-	cam = None
-	try:
-		cam = Picamera2(index)
-		config = cam.create_still_configuration(main={"size": (64, 64)})
-		cam.configure(config)
-		cam.start()
-		cam.stop()
-		return True
-	except Exception as e:
-		err = str(e).lower()
-		# Camera acquired by another process → it is working
-		if any(kw in err for kw in ("already", "in use", "busy")):
+		import importlib.util
+		if importlib.util.find_spec("picamera2") is None:
 			return True
-		logger.warning(f"Camera {index} probe failed: {e}")
+	except Exception:
+		return True
+
+	# Inline probe: start camera, sleep briefly so the first frame attempt
+	# fires (RPISTREAM errors appear within ~50 ms of start on dead hardware),
+	# then exit cleanly.  "already open" errors from another process mean
+	# the camera is working, so we treat those as success.
+	probe_code = (
+		f"import sys, time\n"
+		f"try:\n"
+		f"    from picamera2 import Picamera2\n"
+		f"    cam = Picamera2({index})\n"
+		f"    cam.configure(cam.create_still_configuration(main={{\"size\": (64, 64)}}))\n"
+		f"    cam.start()\n"
+		f"    time.sleep(0.6)\n"
+		f"    sys.exit(0)\n"
+		f"except Exception as e:\n"
+		f"    msg = str(e).lower()\n"
+		f"    if any(k in msg for k in ('already', 'in use', 'busy')):\n"
+		f"        sys.exit(0)\n"
+		f"    sys.exit(1)\n"
+	)
+	try:
+		result = subprocess.run(
+			[sys.executable, "-c", probe_code],
+			timeout=4,
+			capture_output=True,
+			text=True,
+		)
+		# RPISTREAM / I/O errors in libcamera stderr = dead sensor
+		if "RPISTREAM" in result.stderr or "Failed to queue buffer" in result.stderr:
+			logger.warning(f"Camera {index}: hardware stream error detected")
+			return False
+		return result.returncode == 0
+	except subprocess.TimeoutExpired:
+		logger.warning(f"Camera {index}: probe subprocess timed out")
 		return False
-	finally:
-		if cam is not None:
-			try:
-				cam.close()
-			except Exception:
-				pass
+	except Exception as e:
+		logger.warning(f"Camera {index}: probe error: {e}")
+		return True  # can't probe ⇒ assume operational
 
 
 @router.get("/devices", response_model=List[DeviceInfo])
@@ -158,23 +185,28 @@ def list_camera_devices():
 	
 	try:
 		detected = registry.detect_cameras()
+
+		# Probe all cameras in parallel so N cameras cost ~same time as 1.
+		indices = list(detected.keys())
+		with ThreadPoolExecutor(max_workers=max(len(indices), 1)) as executor:
+			probe_results: dict[int, bool] = dict(
+				zip(indices, executor.map(_probe_camera_operational, indices))
+			)
+
 		devices = []
-		
 		for idx, (hw_id, info) in detected.items():
 			# Check if camera is registered and has calibration
 			camera_data = registry.get_camera_by_id(hw_id)
 			calibrated = False
 			machine_id = None
 			label = None
-			
+
 			if camera_data:
 				calibrated = bool(
 					camera_data.get("calibration", {}).get("focus", {}).get("success")
 				)
 				machine_id = camera_data.get("machine_id")
 				label = camera_data.get("label")
-			
-			operational = _probe_camera_operational(idx)
 
 			devices.append(DeviceInfo(
 				hardware_id=hw_id,
@@ -184,9 +216,9 @@ def list_camera_devices():
 				machine_id=machine_id,
 				label=label,
 				calibrated=calibrated,
-				operational=operational
+				operational=probe_results.get(idx, False),
 			))
-		
+
 		return devices
 	except Exception as e:
 		logger.error(f"Failed to detect cameras: {e}")
