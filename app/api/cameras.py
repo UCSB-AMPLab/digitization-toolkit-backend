@@ -26,6 +26,7 @@ class DeviceInfo(BaseModel):
 	machine_id: Optional[str] = None
 	label: Optional[str] = None
 	calibrated: bool = False
+	operational: bool = False
 
 
 class CaptureRequest(BaseModel):
@@ -104,6 +105,45 @@ def _get_camera_registry():
 		return None
 
 
+def _probe_camera_operational(index: int) -> bool:
+	"""
+	Verify a camera is truly operational by attempting a brief start/stop cycle.
+
+	global_camera_info() reads i2c bus state at the kernel level — it reports cameras
+	as present even after physical disconnection (the i2c device tree entry persists).
+	This probe actually communicates with the sensor to verify it responds.
+
+	Returns True if the camera responds, or if it is already in use by another
+	process (which implies it is working). Returns False on hardware failure.
+	"""
+	try:
+		from picamera2 import Picamera2
+	except ImportError:
+		return True  # Not on Pi; skip probe
+
+	cam = None
+	try:
+		cam = Picamera2(index)
+		config = cam.create_still_configuration(main={"size": (64, 64)})
+		cam.configure(config)
+		cam.start()
+		cam.stop()
+		return True
+	except Exception as e:
+		err = str(e).lower()
+		# Camera acquired by another process → it is working
+		if any(kw in err for kw in ("already", "in use", "busy")):
+			return True
+		logger.warning(f"Camera {index} probe failed: {e}")
+		return False
+	finally:
+		if cam is not None:
+			try:
+				cam.close()
+			except Exception:
+				pass
+
+
 @router.get("/devices", response_model=List[DeviceInfo])
 def list_camera_devices():
 	"""
@@ -134,6 +174,8 @@ def list_camera_devices():
 				machine_id = camera_data.get("machine_id")
 				label = camera_data.get("label")
 			
+			operational = _probe_camera_operational(idx)
+
 			devices.append(DeviceInfo(
 				hardware_id=hw_id,
 				model=info.get("model", "unknown"),
@@ -141,7 +183,8 @@ def list_camera_devices():
 				location=info.get("location"),
 				machine_id=machine_id,
 				label=label,
-				calibrated=calibrated
+				calibrated=calibrated,
+				operational=operational
 			))
 		
 		return devices
