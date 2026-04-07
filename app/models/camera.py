@@ -10,7 +10,7 @@ class CameraSettings(Base):
     __tablename__ = "camera_settings"
 
     id = Column(Integer, primary_key=True, index=True)
-    document_image_id = Column(Integer, ForeignKey("document_images.id"), unique=True, nullable=False)
+    record_image_id = Column(Integer, ForeignKey("record_images.id"), unique=True, nullable=False)
 
     camera_model = Column(String(255), nullable=True)
     camera_manufacturer = Column(String(255), nullable=True)
@@ -30,4 +30,4 @@ class CameraSettings(Base):
 
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-    document_image = relationship("DocumentImage", back_populates="camera_settings")
+    record_image = relationship("RecordImage", back_populates="camera_settings")

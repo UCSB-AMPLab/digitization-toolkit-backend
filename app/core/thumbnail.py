@@ -1,7 +1,7 @@
 """
-Thumbnail generation utilities for document images.
+Thumbnail generation utilities for record images.
 
-This module provides functions for generating and managing thumbnails of document images.
+This module provides functions for generating and managing thumbnails of record images.
 """
 
 import logging

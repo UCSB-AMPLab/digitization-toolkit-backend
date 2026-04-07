@@ -1,4 +1,6 @@
 .venv
+.pixi
+pixi.lock
 __pycache__
 *.db
 data
@@ -6,3 +8,5 @@ data
 _data/
 _logs/
 *.pdf
+*.backup
+.DS_Store

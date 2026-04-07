@@ -157,7 +157,7 @@ def single_capture_image(
         project_name: str,
         camera_config: CameraConfig,
         check_camera: bool = True,
-        include_resolution: bool = False) -> str:
+        include_resolution: bool = False) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -167,7 +167,7 @@ def single_capture_image(
         check_camera (bool): Whether to check camera availability before capture.
         include_resolution (bool): Include resolution in auto-generated filename.
     Returns:
-        str: The path to the captured image file.
+        tuple: (output_path, capture_id, pair_id) - path to image and manifest IDs.
     """
     
     if check_camera and not is_camera_connected(camera_config.camera_index):
@@ -196,10 +196,10 @@ def single_capture_image(
     append_manifest_record(project_root, record)
     
     subprocess_logger.info(
-        f"Single capture: cam{camera_config.camera_index}={elapsed_time:.3f}s"
+        f"Single capture: cam{camera_config.camera_index}={elapsed_time:.3f}s, capture_id={record.capture_id}"
     )
     
-    return output_path
+    return output_path, record.capture_id, record.pair_id
 
 def dual_capture_image(
         project_name: str,
@@ -219,12 +219,12 @@ def dual_capture_image(
         include_resolution (bool): Include resolution in auto-generated filenames.
         stagger_ms (int): Delay in ms between starting cameras (default is 20ms).
     Returns:
-        tuple: (path1, path2, timing_dict) with paths and timing metrics.
+        tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
         
     Example:
         cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
         cam2 = CameraConfig(camera_index=1, hflip=True, awb="indoor")
-        path1, path2, timing = dual_capture_image("myproject", cam1, cam2)
+        path1, path2, capture_id, pair_id = dual_capture_image("myproject", cam1, cam2)
     """
     
     if check_camera:
@@ -296,10 +296,11 @@ def dual_capture_image(
     append_manifest_record(project_root, record)
     
     subprocess_logger.info(
-        f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, stagger={stagger_ms}ms"
+        f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, "
+        f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     
-    return img1_path, img2_path
+    return img1_path, img2_path, record.capture_id, record.pair_id
     
 def main():
     """

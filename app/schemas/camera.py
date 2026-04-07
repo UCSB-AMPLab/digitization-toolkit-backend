@@ -4,7 +4,7 @@ from datetime import datetime
 
 
 class CameraSettingsBase(BaseModel):
-	document_image_id: Optional[int] = None
+	record_image_id: Optional[int] = None
 	camera_model: Optional[str] = None
 	camera_manufacturer: Optional[str] = None
 	lens_model: Optional[str] = None
@@ -19,7 +19,7 @@ class CameraSettingsBase(BaseModel):
 
 
 class CameraSettingsCreate(CameraSettingsBase):
-	document_image_id: int
+	record_image_id: int
 
 
 class CameraSettingsUpdate(BaseModel):

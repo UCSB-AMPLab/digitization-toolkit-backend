@@ -14,4 +14,5 @@ class Project(Base):
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-    documents = relationship("DocumentImage", back_populates="project")
+    records = relationship("Record", back_populates="project")
+    collections = relationship("Collection", back_populates="project", cascade="all, delete-orphan")

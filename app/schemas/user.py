@@ -18,6 +18,11 @@ class UserCreate(BaseModel):
         return v.lower()
 
 
+class UserLogin(BaseModel):
+    username: str
+    password: str
+
+
 class UserRead(BaseModel):
     id: int
     username: str
