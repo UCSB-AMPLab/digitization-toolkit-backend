@@ -13,6 +13,10 @@ from app.models.user import User
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 
+#Catalina agregó esto para intentar resolver el api para el streaming de las cámaras, pero no se llegó a implementar completamente. Queda como referencia para futuras implementaciones de esta funcionalidad.
+from fastapi.responses import Response
+import os
+
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
@@ -655,3 +659,85 @@ def delete_camera_settings(
 	db.delete(cs)
 	db.commit()
 	return {"detail": "Camera settings deleted"}
+
+
+#está es una ruta temporal para el preview de las cámaras, no es parte de la API oficial ni está documentada, solo es para uso interno del frontend mientras se desarrolla la funcionalidad de live preview. Queda como referencia para futuras implementaciones de esta funcionalidad.
+
+@router.get("/preview/{camera_index}")
+def get_camera_preview(
+    camera_index: int,
+    current_user: User = Depends(get_current_user)
+):
+    """
+    Captura un frame de baja resolución y lo devuelve como JPEG.
+    
+    - Usa resolución 'low' (2312x1736) para máxima velocidad
+    - NO escribe al manifest ni a la base de datos
+    - Borra el archivo temporal inmediatamente después de leerlo
+    - Usado por el frontend para polling del live preview (cada ~2s)
+    
+    Para cambiar la resolución del preview, modifica "low" por "medium".
+    Para cambiar la frecuencia, modificar PREVIEW_INTERVAL_MS en LiveViewport.svelte.
+    """
+    try:
+        from capture.service import capture_image, is_camera_connected
+        from capture.camera import CameraConfig
+        from capture.project_manager import default_camera_config_from_registry
+    except ImportError as e:
+        raise HTTPException(status_code=503, detail=f"Camera system not available: {e}")
+
+    # Verificar que la cámara está conectada
+    if not is_camera_connected(camera_index):
+        raise HTTPException(
+            status_code=404,
+            detail=f"Camera {camera_index} not connected"
+        )
+
+    output_path = None
+    try:
+        # Obtener config con calibración si existe
+        # Usamos "low" para máxima velocidad en el preview
+        config_dict, _ = default_camera_config_from_registry(camera_index, "low")
+        config = CameraConfig(**config_dict)
+
+        # capture_image devuelve (path, metadata) — NO escribe al manifest
+        # Usa "_preview" como nombre de proyecto para separar estos archivos
+        result = capture_image(
+            project_name="_preview",
+            camera_config=config,
+            check_camera=False,   # ya verificamos arriba
+            include_resolution=False,
+        )
+
+        # capture_image puede devolver (path, metadata) o solo path según el backend
+        if isinstance(result, tuple):
+            output_path = result[0]
+        else:
+            output_path = result
+
+        # Leer el archivo a memoria
+        with open(str(output_path), "rb") as f:
+            image_bytes = f.read()
+
+        return Response(
+            content=image_bytes,
+            media_type="image/jpeg",
+            headers={
+                "Cache-Control": "no-cache, no-store, must-revalidate",
+                "Pragma": "no-cache",
+            }
+        )
+
+    except HTTPException:
+        raise
+    except Exception as e:
+        logger.error(f"Preview failed for camera {camera_index}: {e}")
+        raise HTTPException(status_code=500, detail=str(e))
+
+    finally:
+        # Borrar el archivo temporal siempre, incluso si hubo error
+        if output_path:
+            try:
+                os.remove(str(output_path))
+            except Exception:
+                pass  # Si falla el borrado, no es crítico
