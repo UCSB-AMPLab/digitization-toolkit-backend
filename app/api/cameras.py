@@ -7,7 +7,7 @@ from pydantic import BaseModel
 import logging
 
 from app.api.deps import get_db_dependency
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, RoleChecker
 from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
@@ -15,6 +15,9 @@ from app.core.thumbnail import generate_thumbnail
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+allow_contributor = RoleChecker(["admin", "operator"])
+allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
 class DeviceInfo(BaseModel):
@@ -105,7 +108,7 @@ def _get_camera_registry():
 
 
 @router.get("/devices", response_model=List[DeviceInfo])
-def list_camera_devices():
+def list_camera_devices(current_user: User = Depends(allow_read_only)):
 	"""
 	Return available camera devices detected via libcamera/picamera2.
 
@@ -153,7 +156,7 @@ def list_camera_devices():
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
@@ -309,7 +312,7 @@ def trigger_capture(
 @router.post("/capture/dual", response_model=CaptureResponse)
 def trigger_dual_capture(
 	request: DualCaptureRequest,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
@@ -481,7 +484,7 @@ def trigger_dual_capture(
 @router.post("/calibrate", response_model=CalibrationResponse)
 def calibrate_camera(
 	request: CalibrationRequest,
-	current_user: User = Depends(get_current_user)
+	current_user: User = Depends(allow_contributor)
 ):
 	"""
 	Run autofocus calibration on a camera to find optimal lens position.
@@ -530,7 +533,7 @@ def calibrate_camera(
 @router.post("/calibrate/white-balance", response_model=WhiteBalanceCalibrationResponse)
 def calibrate_white_balance(
 	request: WhiteBalanceCalibrationRequest,
-	current_user: User = Depends(get_current_user)
+	current_user: User = Depends(allow_contributor)
 ):
 	"""
 	Calibrate white balance for consistent color reproduction.
@@ -580,7 +583,7 @@ def calibrate_white_balance(
 @router.post("/", response_model=CameraSettingsRead)
 def create_camera_settings(
 	payload: CameraSettingsCreate,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	if not db.query(RecordImage).filter(RecordImage.id == payload.record_image_id).first():
@@ -601,7 +604,7 @@ def create_camera_settings(
 def list_camera_settings(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
 	items = db.query(CameraSettings).offset(skip).limit(limit).all()
@@ -611,7 +614,7 @@ def list_camera_settings(
 @router.get("/{id}", response_model=CameraSettingsRead)
 def get_camera_settings(
 	id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	cs = db.query(CameraSettings).filter(CameraSettings.id == id).first()
@@ -624,7 +627,7 @@ def get_camera_settings(
 def update_camera_settings(
 	id: int,
 	payload: CameraSettingsUpdate,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Update camera settings by ID."""
@@ -644,7 +647,7 @@ def update_camera_settings(
 @router.delete("/settings/{id}")
 def delete_camera_settings(
 	id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Delete camera settings by ID."""

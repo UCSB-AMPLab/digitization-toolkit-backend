@@ -7,6 +7,7 @@ import base64
 import secrets
 from typing import Optional
 
+from fastapi import HTTPException
 
 SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
 DEFAULT_EXPIRE_SECONDS = int(os.environ.get("ACCESS_TOKEN_EXPIRE_SECONDS", 3600))

@@ -5,8 +5,15 @@ Tests the full flow: capture image -> save to microSD -> create database record.
 Run with: python -m pytest tests/integration/test_capture_integration.py
 """
 import pytest
+import sys
 from pathlib import Path
-from app.models.document import DocumentImage, ExifData
+
+# Skip on non-Linux platforms
+if sys.platform != 'linux':
+    pytest.skip("Integration tests require Linux/Raspberry Pi environment", allow_module_level=True)
+
+
+from app.models.record import Record, RecordImage, ExifData
 from app.models.camera import CameraSettings
 from app.models.project import Project
 
@@ -14,7 +21,7 @@ from app.models.project import Project
 @pytest.mark.integration
 def test_single_capture_creates_database_record(client, db_session, test_project):
     """
-    Test that /cameras/capture creates a DocumentImage record in database.
+    Test that /cameras/capture creates a RecordImage record in database.
     """
     # Ensure project exists
     project_name = test_project.name
@@ -38,16 +45,18 @@ def test_single_capture_creates_database_record(client, db_session, test_project
     assert data["file_path"] is not None
     
     # Verify database record was created
-    doc = db_session.query(DocumentImage).filter(
-        DocumentImage.file_path == data["file_path"]
+    doc = db_session.query(RecordImage).filter(
+        RecordImage.file_path == data["file_path"]
     ).first()
     
     assert doc is not None
-    assert doc.title is not None
     assert doc.format == "jpg"
     assert doc.resolution_width is not None
     assert doc.resolution_height is not None
-    assert doc.project_id == test_project.id
+    # Check that the record is linked to the project
+    record = db_session.query(Record).filter(Record.id == doc.record_id).first()
+    assert record is not None
+    assert record.project_id == test_project.id
     
     # Verify camera settings were saved
     cs = db_session.query(CameraSettings).filter(

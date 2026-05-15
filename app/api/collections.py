@@ -5,7 +5,7 @@ from sqlalchemy import select, func
 import logging
 
 from app.api.deps import get_db_dependency
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, RoleChecker
 from app.models.collection import Collection
 from app.models.project import Project
 from app.models.record import Record, RecordImage
@@ -15,11 +15,14 @@ from app.schemas.collection import CollectionCreate, CollectionRead, CollectionU
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+allow_contributor = RoleChecker(["admin", "operator"])
+allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
 
 @router.post("/", response_model=CollectionRead, status_code=201)
 def create_collection(
     payload: CollectionCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """
@@ -67,7 +70,7 @@ def list_collections(
     parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection (use 'null' for top-level)"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
     """
@@ -92,7 +95,7 @@ def list_collections(
 @router.get("/{collection_id}", response_model=CollectionRead)
 def get_collection(
     collection_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
     """Get a specific collection by ID."""
@@ -105,7 +108,7 @@ def get_collection(
 @router.get("/{collection_id}/hierarchy", response_model=CollectionWithChildren)
 def get_collection_hierarchy(
     collection_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
     """
@@ -133,7 +136,7 @@ def get_collection_hierarchy(
 def update_collection(
     collection_id: int,
     payload: CollectionUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """
@@ -177,7 +180,7 @@ def update_collection(
 @router.delete("/{collection_id}", status_code=204)
 def delete_collection(
     collection_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """

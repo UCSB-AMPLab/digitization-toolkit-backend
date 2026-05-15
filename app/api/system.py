@@ -3,14 +3,16 @@ import subprocess
 
 from fastapi import APIRouter, Depends
 
-from app.api.auth import get_current_user
+from app.api.auth import RoleChecker
 from app.models.user import User
+
+allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 router = APIRouter()
 
 
 @router.get("/temperature")
-def get_temperature(current_user: User = Depends(get_current_user)):
+def get_temperature(current_user: User = Depends(allow_read_only)):
     """Get Raspberry Pi CPU temperature via vcgencmd measure_temp.
 
     Returns temperature in Celsius, or available=False if vcgencmd is not

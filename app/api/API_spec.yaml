@@ -1,0 +1,1863 @@
+openapi: 3.0.3
+info:
+  title: Digitization Toolkit Backend API
+  description: |
+    API for the Digitization Toolkit - an open-source, modular digitization platform
+    for capturing, managing, and organizing archival materials using Raspberry Pi and 64MP ArduCam cameras.
+    
+    The API provides endpoints for:
+    - User authentication and account management
+    - Project and collection management
+    - Record (document/archival object) metadata management
+    - Image capture control and processing
+    - Camera device discovery and calibration
+    - System monitoring
+  version: 1.0.0
+  contact:
+    name: UCSB AMP Lab
+    url: https://github.com/UCSB-AMPLab/digitization-toolkit-backend
+  license:
+    name: MIT
+    url: https://opensource.org/licenses/MIT
+
+servers:
+  - url: http://localhost:8000
+    description: Development server
+  - url: http://localhost:3000
+    description: Production server (frontend proxy)
+
+tags:
+  - name: auth
+    description: User authentication and account management
+  - name: records
+    description: Archival record (document/object) management
+  - name: projects
+    description: Project management and organization
+  - name: collections
+    description: Collection and subcollection hierarchy
+  - name: cameras
+    description: Camera device control and image capture
+  - name: system
+    description: System information and monitoring
+
+paths:
+  /health:
+    get:
+      summary: Health check endpoint
+      operationId: health_check
+      tags:
+        - system
+      responses:
+        '200':
+          description: Service is healthy
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  status:
+                    type: string
+                    example: ok
+
+  # ============================================================================
+  # Authentication Endpoints
+  # ============================================================================
+
+  /auth/register:
+    post:
+      summary: Register a new user
+      operationId: register_user
+      tags:
+        - auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserCreate'
+      responses:
+        '200':
+          description: User successfully registered
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/UserRead'
+        '409':
+          description: Username or email already exists
+
+  /auth/login:
+    post:
+      summary: Login and get access token
+      operationId: login_user
+      tags:
+        - auth
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/UserLogin'
+      responses:
+        '200':
+          description: Login successful
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  access_token:
+                    type: string
+                    description: JWT token for authentication
+                  token_type:
+                    type: string
+                    example: bearer
+        '401':
+          description: Invalid credentials
+        '403':
+          description: User is inactive
+
+  /auth/refresh:
+    post:
+      summary: Refresh access token
+      operationId: refresh_token
+      tags:
+        - auth
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: Token refreshed successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/TokenRefresh'
+        '401':
+          description: Invalid or expired token
+
+  /auth/password-reset:
+    post:
+      summary: Reset user password
+      operationId: reset_password
+      tags:
+        - auth
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/PasswordReset'
+      responses:
+        '200':
+          description: Password reset successful
+        '401':
+          description: Invalid credentials or token
+
+  /auth/{user_id}:
+    delete:
+      summary: Delete user account
+      operationId: delete_user
+      tags:
+        - auth
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: user_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: User deleted successfully
+        '403':
+          description: Not authorized to delete this user
+        '404':
+          description: User not found
+
+  # ============================================================================
+  # Project Endpoints
+  # ============================================================================
+
+  /projects:
+    post:
+      summary: Create a new project
+      operationId: create_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectCreate'
+      responses:
+        '200':
+          description: Project created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRead'
+        '409':
+          description: Project with this name already exists
+
+    get:
+      summary: List all projects
+      operationId: list_projects
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of projects
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/ProjectRead'
+
+  /projects/{project_id}:
+    get:
+      summary: Get a specific project
+      operationId: get_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRead'
+        '404':
+          description: Project not found
+
+    put:
+      summary: Update a project
+      operationId: update_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectUpdate'
+      responses:
+        '200':
+          description: Project updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectRead'
+        '404':
+          description: Project not found
+        '409':
+          description: Project with this name already exists
+
+    delete:
+      summary: Delete a project
+      operationId: delete_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Project deleted successfully
+        '404':
+          description: Project not found
+
+  /projects/{project_id}/initialize:
+    post:
+      summary: Initialize project filesystem
+      operationId: initialize_project_filesystem
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/ProjectInitRequest'
+      responses:
+        '200':
+          description: Project filesystem initialized
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/ProjectInitResponse'
+        '404':
+          description: Project not found
+
+  /projects/{project_id}/records:
+    get:
+      summary: List records in a project
+      operationId: list_project_records
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of records in project
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordRead'
+        '404':
+          description: Project not found
+
+  /projects/{project_id}/add_record/{rec_id}:
+    post:
+      summary: Add a record to a project
+      operationId: add_record_to_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Record added to project
+        '404':
+          description: Project or record not found
+
+  /projects/{project_id}/remove_record/{rec_id}:
+    post:
+      summary: Remove a record from a project
+      operationId: remove_record_from_project
+      tags:
+        - projects
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Record removed from project
+        '404':
+          description: Project or record not found
+
+  # ============================================================================
+  # Collection Endpoints
+  # ============================================================================
+
+  /collections:
+    post:
+      summary: Create a new collection
+      operationId: create_collection
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CollectionCreate'
+      responses:
+        '201':
+          description: Collection created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionRead'
+        '400':
+          description: Invalid parent specification
+        '404':
+          description: Parent project or collection not found
+
+    get:
+      summary: List collections
+      operationId: list_collections
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: project_id
+          in: query
+          schema:
+            type: integer
+          description: Filter by project
+        - name: parent_collection_id
+          in: query
+          schema:
+            type: integer
+          description: Filter by parent collection
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of collections
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CollectionRead'
+
+  /collections/{collection_id}:
+    get:
+      summary: Get a specific collection
+      operationId: get_collection
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Collection details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionRead'
+        '404':
+          description: Collection not found
+
+    patch:
+      summary: Update a collection
+      operationId: update_collection
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CollectionUpdate'
+      responses:
+        '200':
+          description: Collection updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionRead'
+        '400':
+          description: Invalid update (e.g., circular hierarchy)
+        '404':
+          description: Collection not found
+
+    delete:
+      summary: Delete a collection
+      operationId: delete_collection
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '204':
+          description: Collection deleted successfully
+        '404':
+          description: Collection not found
+
+  /collections/{collection_id}/hierarchy:
+    get:
+      summary: Get collection with full hierarchy tree
+      operationId: get_collection_hierarchy
+      tags:
+        - collections
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: collection_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Collection with nested children
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CollectionWithChildren'
+        '404':
+          description: Collection not found
+
+  # ============================================================================
+  # Record Endpoints
+  # ============================================================================
+
+  /records:
+    post:
+      summary: Create a new record
+      operationId: create_record
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordCreate'
+      responses:
+        '200':
+          description: Record created successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordRead'
+        '409':
+          description: Database integrity error
+
+    get:
+      summary: List all records with optional filtering
+      operationId: list_records
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+        - name: project_id
+          in: query
+          schema:
+            type: integer
+          description: Filter by project ID
+        - name: collection_id
+          in: query
+          schema:
+            type: integer
+          description: Filter by collection ID
+        - name: object_typology
+          in: query
+          schema:
+            type: string
+          description: Filter by object type
+        - name: orphaned
+          in: query
+          schema:
+            type: boolean
+          description: Return only records with no project or collection
+      responses:
+        '200':
+          description: List of records
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordRead'
+
+  /records/{rec_id}:
+    get:
+      summary: Get a specific record with all images
+      operationId: get_record
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Record details with images
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordRead'
+        '404':
+          description: Record not found
+
+    patch:
+      summary: Update record metadata
+      operationId: update_record
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordUpdate'
+      responses:
+        '200':
+          description: Record updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordRead'
+        '404':
+          description: Record not found
+
+    delete:
+      summary: Delete a record and all images
+      operationId: delete_record
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Record deleted successfully
+        '404':
+          description: Record not found
+
+  /records/{rec_id}/images:
+    post:
+      summary: Upload and attach an image to a record
+      operationId: add_image_to_record
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+        - name: capture_id
+          in: query
+          schema:
+            type: string
+          description: Capture event identifier
+        - name: pair_id
+          in: query
+          schema:
+            type: string
+          description: Pair identifier for dual captures
+        - name: sequence
+          in: query
+          schema:
+            type: integer
+          description: Page number or order in sequence
+        - name: role
+          in: query
+          schema:
+            type: string
+          description: Role of image (e.g., 'left', 'right', 'single')
+      requestBody:
+        required: true
+        content:
+          multipart/form-data:
+            schema:
+              type: object
+              properties:
+                file:
+                  type: string
+                  format: binary
+              required:
+                - file
+      responses:
+        '200':
+          description: Image uploaded and attached successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordImageRead'
+        '400':
+          description: Invalid file type
+        '404':
+          description: Record not found
+        '500':
+          description: Failed to save file
+
+    get:
+      summary: List all images for a record
+      operationId: list_record_images
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: rec_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: List of images ordered by sequence
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/RecordImageRead'
+        '404':
+          description: Record not found
+
+  /records/images/{img_id}:
+    get:
+      summary: Get details about a specific image
+      operationId: get_image
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: img_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Image details
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordImageRead'
+        '404':
+          description: Image not found
+
+    patch:
+      summary: Update image metadata
+      operationId: update_image
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: img_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/RecordImageUpdate'
+      responses:
+        '200':
+          description: Image updated successfully
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/RecordImageRead'
+        '404':
+          description: Image not found
+
+    delete:
+      summary: Delete an image from a record
+      operationId: delete_image
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: img_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Image deleted successfully
+        '404':
+          description: Image not found
+
+  /records/images/{img_id}/file:
+    get:
+      summary: Download the actual image file
+      operationId: download_image_file
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: img_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Image file
+          content:
+            image/jpeg: {}
+            image/png: {}
+            image/tiff: {}
+            image/webp: {}
+        '404':
+          description: Image or file not found
+
+  /records/images/{img_id}/thumbnail:
+    get:
+      summary: Download thumbnail for an image
+      operationId: get_image_thumbnail
+      tags:
+        - records
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: img_id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Thumbnail image (JPEG)
+          content:
+            image/jpeg: {}
+        '404':
+          description: Thumbnail could not be generated
+
+  # ============================================================================
+  # Camera Endpoints
+  # ============================================================================
+
+  /cameras/devices:
+    get:
+      summary: List available camera devices
+      operationId: list_camera_devices
+      tags:
+        - cameras
+      responses:
+        '200':
+          description: List of detected camera devices
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/DeviceInfo'
+
+  /cameras/capture:
+    post:
+      summary: Trigger single image capture
+      operationId: trigger_capture
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CaptureRequest'
+      responses:
+        '200':
+          description: Capture successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureResponse'
+        '404':
+          description: Camera not connected or record not found
+
+  /cameras/capture/dual:
+    post:
+      summary: Trigger simultaneous dual camera capture
+      operationId: trigger_dual_capture
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/DualCaptureRequest'
+      responses:
+        '200':
+          description: Dual capture successful
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CaptureResponse'
+        '404':
+          description: Camera not connected or record not found
+
+  /cameras/calibrate:
+    post:
+      summary: Run autofocus calibration on camera
+      operationId: calibrate_camera
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CalibrationRequest'
+      responses:
+        '200':
+          description: Calibration completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CalibrationResponse'
+
+  /cameras/calibrate/white-balance:
+    post:
+      summary: Calibrate white balance for consistent color reproduction
+      operationId: calibrate_white_balance
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/WhiteBalanceCalibrationRequest'
+      responses:
+        '200':
+          description: White balance calibration completed
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/WhiteBalanceCalibrationResponse'
+
+  /cameras:
+    post:
+      summary: Create camera settings record
+      operationId: create_camera_settings
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CameraSettingsCreate'
+      responses:
+        '200':
+          description: Camera settings created
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraSettingsRead'
+        '404':
+          description: Record image not found
+        '409':
+          description: Camera settings already exist
+
+    get:
+      summary: List camera settings
+      operationId: list_camera_settings
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: skip
+          in: query
+          schema:
+            type: integer
+            minimum: 0
+            default: 0
+        - name: limit
+          in: query
+          schema:
+            type: integer
+            minimum: 1
+            maximum: 1000
+            default: 100
+      responses:
+        '200':
+          description: List of camera settings
+          content:
+            application/json:
+              schema:
+                type: array
+                items:
+                  $ref: '#/components/schemas/CameraSettingsRead'
+
+  /cameras/{id}:
+    get:
+      summary: Get camera settings by ID
+      operationId: get_camera_settings
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Camera settings
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraSettingsRead'
+        '404':
+          description: Camera settings not found
+
+  /cameras/settings/{id}:
+    put:
+      summary: Update camera settings
+      operationId: update_camera_settings
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      requestBody:
+        required: true
+        content:
+          application/json:
+            schema:
+              $ref: '#/components/schemas/CameraSettingsUpdate'
+      responses:
+        '200':
+          description: Camera settings updated
+          content:
+            application/json:
+              schema:
+                $ref: '#/components/schemas/CameraSettingsRead'
+        '404':
+          description: Camera settings not found
+
+    delete:
+      summary: Delete camera settings
+      operationId: delete_camera_settings
+      tags:
+        - cameras
+      security:
+        - BearerAuth: []
+      parameters:
+        - name: id
+          in: path
+          required: true
+          schema:
+            type: integer
+      responses:
+        '200':
+          description: Camera settings deleted
+        '404':
+          description: Camera settings not found
+
+  # ============================================================================
+  # System Endpoints
+  # ============================================================================
+
+  /system/temperature:
+    get:
+      summary: Get Raspberry Pi CPU temperature
+      operationId: get_temperature
+      tags:
+        - system
+      security:
+        - BearerAuth: []
+      responses:
+        '200':
+          description: System temperature information
+          content:
+            application/json:
+              schema:
+                type: object
+                properties:
+                  temperature:
+                    type: number
+                    format: float
+                    nullable: true
+                    description: CPU temperature in Celsius
+                  unit:
+                    type: string
+                    example: C
+                  available:
+                    type: boolean
+                    description: Whether temperature reading is available
+
+components:
+  schemas:
+    # User Schemas
+    UserCreate:
+      type: object
+      required:
+        - username
+        - email
+        - password
+      properties:
+        username:
+          type: string
+          example: johndoe
+        email:
+          type: string
+          format: email
+          example: john@example.com
+        password:
+          type: string
+          format: password
+          example: securepassword123
+
+    UserLogin:
+      type: object
+      required:
+        - username
+        - password
+      properties:
+        username:
+          type: string
+        password:
+          type: string
+          format: password
+
+    UserRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        username:
+          type: string
+        email:
+          type: string
+          format: email
+        is_active:
+          type: boolean
+        created_at:
+          type: string
+          format: date-time
+
+    PasswordReset:
+      type: object
+      required:
+        - old_password
+        - new_password
+      properties:
+        old_password:
+          type: string
+          format: password
+        new_password:
+          type: string
+          format: password
+
+    TokenRefresh:
+      type: object
+      properties:
+        access_token:
+          type: string
+        token_type:
+          type: string
+          example: bearer
+
+    # Project Schemas
+    ProjectCreate:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+          example: Ancient Manuscripts 2025
+        description:
+          type: string
+          nullable: true
+        created_by:
+          type: string
+          nullable: true
+
+    ProjectUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+
+    ProjectRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    ProjectInitRequest:
+      type: object
+      properties:
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          default: high
+
+    ProjectInitResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        project_path:
+          type: string
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    # Collection Schemas
+    CollectionCreate:
+      type: object
+      required:
+        - name
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        collection_type:
+          type: string
+          example: series
+        archival_metadata:
+          type: object
+          nullable: true
+        project_id:
+          type: integer
+          nullable: true
+        parent_collection_id:
+          type: integer
+          nullable: true
+        created_by:
+          type: string
+          nullable: true
+
+    CollectionUpdate:
+      type: object
+      properties:
+        name:
+          type: string
+        description:
+          type: string
+        collection_type:
+          type: string
+        archival_metadata:
+          type: object
+        parent_collection_id:
+          type: integer
+          nullable: true
+
+    CollectionRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        name:
+          type: string
+        description:
+          type: string
+          nullable: true
+        collection_type:
+          type: string
+        archival_metadata:
+          type: object
+        project_id:
+          type: integer
+          nullable: true
+        parent_collection_id:
+          type: integer
+          nullable: true
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    CollectionWithChildren:
+      allOf:
+        - $ref: '#/components/schemas/CollectionRead'
+        - type: object
+          properties:
+            child_collections:
+              type: array
+              items:
+                $ref: '#/components/schemas/CollectionWithChildren'
+            record_count:
+              type: integer
+
+    # Record Schemas
+    RecordCreate:
+      type: object
+      required:
+        - title
+      properties:
+        title:
+          type: string
+          example: First Edition Map of California
+        description:
+          type: string
+          nullable: true
+        object_typology:
+          type: string
+          example: map
+        author:
+          type: string
+          nullable: true
+        material:
+          type: string
+          nullable: true
+          example: paper
+        date:
+          type: string
+          nullable: true
+        custom_attributes:
+          type: object
+          nullable: true
+        project_id:
+          type: integer
+          nullable: true
+        collection_id:
+          type: integer
+          nullable: true
+        created_by:
+          type: string
+          nullable: true
+
+    RecordUpdate:
+      type: object
+      properties:
+        title:
+          type: string
+        description:
+          type: string
+        object_typology:
+          type: string
+        author:
+          type: string
+        material:
+          type: string
+        date:
+          type: string
+        custom_attributes:
+          type: object
+
+    RecordRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        title:
+          type: string
+        description:
+          type: string
+          nullable: true
+        object_typology:
+          type: string
+        author:
+          type: string
+          nullable: true
+        material:
+          type: string
+          nullable: true
+        date:
+          type: string
+          nullable: true
+        custom_attributes:
+          type: object
+        project_id:
+          type: integer
+          nullable: true
+        collection_id:
+          type: integer
+          nullable: true
+        created_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+        images:
+          type: array
+          items:
+            $ref: '#/components/schemas/RecordImageRead'
+
+    RecordImageCreate:
+      type: object
+      properties:
+        filename:
+          type: string
+        capture_id:
+          type: string
+          nullable: true
+        pair_id:
+          type: string
+          nullable: true
+        sequence:
+          type: integer
+          nullable: true
+        role:
+          type: string
+          nullable: true
+
+    RecordImageUpdate:
+      type: object
+      properties:
+        sequence:
+          type: integer
+          nullable: true
+        role:
+          type: string
+          nullable: true
+
+    RecordImageRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        record_id:
+          type: integer
+        filename:
+          type: string
+        file_path:
+          type: string
+        thumbnail_path:
+          type: string
+          nullable: true
+        file_size:
+          type: integer
+        format:
+          type: string
+          example: jpg
+        resolution_width:
+          type: integer
+          nullable: true
+        resolution_height:
+          type: integer
+          nullable: true
+        capture_id:
+          type: string
+          nullable: true
+        pair_id:
+          type: string
+          nullable: true
+        sequence:
+          type: integer
+          nullable: true
+        role:
+          type: string
+          nullable: true
+        uploaded_by:
+          type: string
+        created_at:
+          type: string
+          format: date-time
+
+    # Camera Schemas
+    DeviceInfo:
+      type: object
+      properties:
+        hardware_id:
+          type: string
+          example: imx519_d19
+        model:
+          type: string
+          example: IMX519
+        index:
+          type: integer
+          example: 0
+        location:
+          type: string
+          nullable: true
+        machine_id:
+          type: string
+          nullable: true
+        label:
+          type: string
+          nullable: true
+        calibrated:
+          type: boolean
+
+    CaptureRequest:
+      type: object
+      required:
+        - project_name
+      properties:
+        project_name:
+          type: string
+          example: Ancient Manuscripts
+        camera_index:
+          type: integer
+          default: 0
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          default: medium
+        include_resolution_in_filename:
+          type: boolean
+          default: false
+        record_id:
+          type: integer
+          nullable: true
+          description: Link to existing record, or create new if None
+        record_title:
+          type: string
+          nullable: true
+          description: Used if creating new record
+
+    DualCaptureRequest:
+      type: object
+      required:
+        - project_name
+      properties:
+        project_name:
+          type: string
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          default: medium
+        include_resolution_in_filename:
+          type: boolean
+          default: false
+        stagger_ms:
+          type: integer
+          description: Milliseconds between camera triggers
+          default: 20
+        record_id:
+          type: integer
+          nullable: true
+        record_title:
+          type: string
+          nullable: true
+        sequence:
+          type: integer
+          nullable: true
+          description: Page number/order
+
+    CaptureResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        file_path:
+          type: string
+          nullable: true
+        file_paths:
+          type: array
+          items:
+            type: string
+          nullable: true
+        record_id:
+          type: integer
+          nullable: true
+        image_ids:
+          type: array
+          items:
+            type: integer
+          nullable: true
+        timing:
+          type: object
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    CalibrationRequest:
+      type: object
+      properties:
+        camera_index:
+          type: integer
+          default: 0
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          default: high
+
+    CalibrationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        lens_position:
+          type: number
+          format: float
+          nullable: true
+        distance_meters:
+          type: number
+          format: float
+          nullable: true
+        af_time:
+          type: number
+          format: float
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    WhiteBalanceCalibrationRequest:
+      type: object
+      properties:
+        camera_index:
+          type: integer
+          default: 0
+        resolution:
+          type: string
+          enum: [low, medium, high]
+          default: high
+        stabilization_frames:
+          type: integer
+          default: 30
+
+    WhiteBalanceCalibrationResponse:
+      type: object
+      properties:
+        success:
+          type: boolean
+        awb_gains:
+          type: array
+          items:
+            type: number
+            format: float
+          nullable: true
+        colour_temperature:
+          type: integer
+          nullable: true
+        converged:
+          type: boolean
+          nullable: true
+        error:
+          type: string
+          nullable: true
+
+    CameraSettingsCreate:
+      type: object
+      required:
+        - record_image_id
+      properties:
+        record_image_id:
+          type: integer
+        camera_model:
+          type: string
+        iso:
+          type: integer
+          nullable: true
+        aperture:
+          type: number
+          nullable: true
+        focal_length:
+          type: number
+          nullable: true
+        white_balance:
+          type: string
+          nullable: true
+
+    CameraSettingsUpdate:
+      type: object
+      properties:
+        camera_model:
+          type: string
+        iso:
+          type: integer
+          nullable: true
+        aperture:
+          type: number
+          nullable: true
+        focal_length:
+          type: number
+          nullable: true
+        white_balance:
+          type: string
+          nullable: true
+
+    CameraSettingsRead:
+      type: object
+      properties:
+        id:
+          type: integer
+        record_image_id:
+          type: integer
+        camera_model:
+          type: string
+        iso:
+          type: integer
+          nullable: true
+        aperture:
+          type: number
+          nullable: true
+        focal_length:
+          type: number
+          nullable: true
+        white_balance:
+          type: string
+          nullable: true
+        created_at:
+          type: string
+          format: date-time
+
+  securitySchemes:
+    BearerAuth:
+      type: http
+      scheme: bearer
+      bearerFormat: JWT
+      description: JWT token obtained from /auth/login or /auth/register
+
+  responses:
+    NotFound:
+      description: Resource not found
+    Unauthorized:
+      description: Authentication required or failed
+    Forbidden:
+      description: User is not authorized to access this resource
+    Conflict:
+      description: Resource already exists or constraint violation

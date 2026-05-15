@@ -10,7 +10,7 @@ from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router
 from app.api.projects import router as projects_router
 from app.api.collections import router as collections_router
-from app.api.auth import router as auth_router
+from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
 
 # Define lifespan event to initialize the database
@@ -37,6 +37,7 @@ app.include_router(cameras_router, prefix="/cameras", tags=["cameras"])
 app.include_router(projects_router, prefix="/projects", tags=["projects"])
 app.include_router(collections_router, prefix="/collections", tags=["collections"])
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
+app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(system_router, prefix="/system", tags=["system"])
 
 

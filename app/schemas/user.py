@@ -1,14 +1,17 @@
-from typing import Optional
+from typing import Optional, Literal
 from pydantic import BaseModel, field_validator
 from datetime import datetime
 import re
+
+VALID_ROLES = ("admin", "operator", "reviewer")
 
 
 class UserCreate(BaseModel):
     username: str
     email: str
     password: str
-    
+    role: Literal["admin", "operator", "reviewer"] = "reviewer"
+
     @field_validator('email')
     @classmethod
     def validate_email(cls, v: str) -> str:
@@ -27,11 +30,16 @@ class UserRead(BaseModel):
     id: int
     username: str
     email: str
+    role: str
     is_active: bool
     created_at: Optional[datetime]
 
     class Config:
         from_attributes = True
+
+
+class UserRoleUpdate(BaseModel):
+    role: Literal["admin", "operator", "reviewer"]
 
 
 class PasswordReset(BaseModel):
