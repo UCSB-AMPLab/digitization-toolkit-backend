@@ -17,13 +17,33 @@ _optional_bearer = HTTPBearer(auto_error=False)
 
 
 @router.post("/register", response_model=UserRead)
-def register(payload: UserCreate, db: Session = Depends(get_db_dependency)):
-    if db.query(User).filter((User.username == payload.username) | (User.email == payload.email)).first():
+def register(
+    payload: UserCreate,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    db: Session = Depends(get_db_dependency),
+):
+    is_first_user = db.query(User).count() == 0
+
+    if not is_first_user:
+        # After bootstrap, only admins may create accounts.
+        if not credentials:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        token_payload = verify_access_token(credentials.credentials)
+        if not token_payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        caller = db.query(User).filter(
+            User.id == int(token_payload.get("sub")), User.is_active == True
+        ).first()
+        if not caller or caller.role != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can register new users")
+
+    if db.query(User).filter(
+        (User.username == payload.username) | (User.email == payload.email)
+    ).first():
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
-    # First user in the system becomes admin (bootstrap); all subsequent users are reviewers.
+    # First user becomes admin (bootstrap); all subsequent users start as reviewer.
     # Role is never taken from the request payload — use PATCH /auth/users/{id}/role to elevate.
-    is_first_user = db.query(User).count() == 0
     role = "admin" if is_first_user else "reviewer"
 
     user = User(
