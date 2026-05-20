@@ -89,6 +89,22 @@ def list_records(
 	return [RecordRead.model_validate(r) for r in recs]
 
 
+@router.get("/count")
+def count_records(
+	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
+	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Return the total number of records matching the given filters."""
+	query = db.query(Record)
+	if project_id is not None:
+		query = query.filter(Record.project_id == project_id)
+	if collection_id is not None:
+		query = query.filter(Record.collection_id == collection_id)
+	return {"count": query.count()}
+
+
 @router.get("/{rec_id}", response_model=RecordRead)
 def get_record(
 	rec_id: int,
