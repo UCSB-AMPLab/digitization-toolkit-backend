@@ -33,6 +33,10 @@ class Settings(BaseSettings):
     
     @property
     def projects_dir(self) -> Path:
+        from app.core.storage_override import get_storage_override
+        override = get_storage_override()
+        if override:
+            return Path(override)
         return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
     
     @property
