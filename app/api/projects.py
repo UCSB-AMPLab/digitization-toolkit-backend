@@ -10,6 +10,7 @@ from app.models.project import Project
 from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
+from app.core.audit import log_event
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -151,13 +152,16 @@ def delete_project(
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
     
+    project_name = p.name
     # Unlink all records from this project
     db.query(Record).filter(Record.project_id == project_id).update(
         {"project_id": None}
     )
-    
+
     db.delete(p)
     db.commit()
+    log_event(db, level="WARN", category="activity", action="project_deleted",
+              actor=current_user.username, subject=project_name)
     return {"detail": "project deleted"}
 
 

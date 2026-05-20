@@ -7,6 +7,7 @@ from app.api.deps import get_db_dependency
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token
+from app.core.audit import log_event
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
@@ -55,6 +56,9 @@ def register(
     db.add(user)
     db.commit()
     db.refresh(user)
+    actor = caller.username if not is_first_user else "bootstrap"
+    log_event(db, level="INFO", category="access", action="user_created",
+              actor=actor, subject=user.username)
     return UserRead.model_validate(user)
 
 
@@ -62,9 +66,15 @@ def register(
 def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
+        log_event(db, level="WARN", category="access", action="login_failed",
+                  actor=payload.username)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.is_active:
+        log_event(db, level="WARN", category="access", action="login_failed",
+                  actor=user.username, detail="cuenta inactiva")
         raise HTTPException(status_code=403, detail="User is inactive")
+    log_event(db, level="INFO", category="access", action="login_success",
+              actor=user.username)
     token = create_access_token(subject=str(user.id))
     return {"access_token": token, "token_type": "bearer"}
 

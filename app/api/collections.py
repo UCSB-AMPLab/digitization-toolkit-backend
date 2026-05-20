@@ -11,6 +11,7 @@ from app.models.project import Project
 from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
+from app.core.audit import log_event
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -61,6 +62,8 @@ def create_collection(
     db.add(collection)
     db.commit()
     db.refresh(collection)
+    log_event(db, level="INFO", category="activity", action="collection_created",
+              actor=current_user.username, subject=collection.name)
     return CollectionRead.model_validate(collection)
 
 

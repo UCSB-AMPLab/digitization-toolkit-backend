@@ -1,14 +1,37 @@
 import re
 import subprocess
+from typing import Optional
 
-from fastapi import APIRouter, Depends
+from fastapi import APIRouter, Depends, Query
+from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker
+from app.api.deps import get_db_dependency
+from app.models.system_log import SystemLog
 from app.models.user import User
+from app.schemas.system_log import SystemLogOut
 
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+allow_admin     = RoleChecker(["admin"])
 
 router = APIRouter()
+
+
+@router.get("/logs", response_model=list[SystemLogOut])
+def get_system_logs(
+    limit:    int            = Query(default=50, ge=1, le=500),
+    category: Optional[str] = Query(default=None),
+    level:    Optional[str] = Query(default=None),
+    current_user: User    = Depends(allow_admin),
+    db: Session           = Depends(get_db_dependency),
+):
+    """Return recent audit log entries, newest first. Admin-only."""
+    query = db.query(SystemLog).order_by(SystemLog.created_at.desc())
+    if category:
+        query = query.filter(SystemLog.category == category)
+    if level:
+        query = query.filter(SystemLog.level == level)
+    return query.limit(limit).all()
 
 
 @router.get("/temperature")
