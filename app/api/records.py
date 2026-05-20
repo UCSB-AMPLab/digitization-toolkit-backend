@@ -9,7 +9,7 @@ import uuid
 import logging
 
 from app.api.deps import get_db_dependency
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, RoleChecker
 from app.models.record import Record, RecordImage, ExifData
 from app.models.camera import CameraSettings
 from app.models.user import User
@@ -23,6 +23,9 @@ from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+allow_contributor = RoleChecker(["admin", "operator"])
+allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
 
 # ==============================================================================
 # Record endpoints (archival documents/objects)
@@ -31,7 +34,7 @@ logger = logging.getLogger(__name__)
 @router.post("/", response_model=RecordRead)
 def create_record(
 	rec_in: RecordCreate,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Create a new archival record (document/object like a book, map, document)."""
@@ -66,7 +69,7 @@ def list_records(
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
 	object_typology: Optional[str] = Query(default=None, description="Filter by object type"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""List all records with optional filtering."""
@@ -89,7 +92,7 @@ def list_records(
 @router.get("/{rec_id}", response_model=RecordRead)
 def get_record(
 	rec_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Get a specific record with all its images."""
@@ -103,7 +106,7 @@ def get_record(
 def update_record(
 	rec_id: int,
 	payload: RecordUpdate,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Update a record's descriptive metadata."""
@@ -124,7 +127,7 @@ def update_record(
 @router.delete("/{rec_id}")
 def delete_record(
 	rec_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Delete a record and all its associated images (CASCADE)."""
@@ -156,7 +159,7 @@ async def add_image_to_record(
 	pair_id: Optional[str] = None,
 	sequence: Optional[int] = None,
 	role: Optional[str] = None,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""
@@ -242,7 +245,7 @@ async def add_image_to_record(
 @router.get("/{rec_id}/images", response_model=List[RecordImageRead])
 def list_record_images(
 	rec_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Get all images for a specific record, ordered by sequence."""
@@ -261,7 +264,7 @@ def list_record_images(
 @router.get("/images/{img_id}", response_model=RecordImageRead)
 def get_image(
 	img_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Get details about a specific image."""
@@ -275,7 +278,7 @@ def get_image(
 def update_image(
 	img_id: int,
 	payload: RecordImageUpdate,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Update image metadata (sequence, role, etc.)."""
@@ -295,7 +298,7 @@ def update_image(
 @router.delete("/images/{img_id}")
 def delete_image(
 	img_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Delete a specific image from a record."""
@@ -317,7 +320,7 @@ def delete_image(
 @router.get("/images/{img_id}/file")
 def download_image_file(
 	img_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Download the actual image file."""
@@ -354,7 +357,7 @@ def download_image_file(
 @router.get("/images/{img_id}/thumbnail")
 def get_image_thumbnail(
 	img_id: int,
-	current_user: User = Depends(get_current_user),
+	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Download the thumbnail for an image. Generates it on demand if missing."""

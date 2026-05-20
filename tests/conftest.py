@@ -140,8 +140,14 @@ def skip_if_single_camera():
     """
     from capture import is_camera_connected
     
-    if not (is_camera_connected(0) and is_camera_connected(1)):
-        pytest.skip("Dual cameras not detected - skipping test")
+    try:
+        if not (is_camera_connected(0) and is_camera_connected(1)):
+            pytest.skip("Dual cameras not detected - skipping test")
+    except RuntimeError as e:
+        if "requires Linux" in str(e) or "Picamera2Backend" in str(e):
+            pytest.skip("Camera backend not available on this platform - skipping test")
+        else:
+            raise
 
 
 @pytest.fixture(params=["subprocess", "picamera2"])

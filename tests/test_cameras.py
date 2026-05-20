@@ -119,9 +119,9 @@ def test_capture_performance(override_projects_root, skip_if_single_camera):
     # (hardware variations can affect timing)
     target_time = 5.0  # Conservative target
     if avg_time > target_time:
-        print(f"  ⚠ WARNING: Average time {avg_time:.2f}s exceeds target {target_time}s")
+        print(f" [WARN] WARNING: Average time {avg_time:.2f}s exceeds target {target_time}s")
     else:
-        print(f"  ✓ Performance good: under {target_time}s target")
+        print(f" [OK] Performance good: under {target_time}s target")
     
     # Verify times are reasonable (not failing completely)
     assert avg_time < 15.0, f"Capture too slow: {avg_time:.2f}s (expected < 15s)"

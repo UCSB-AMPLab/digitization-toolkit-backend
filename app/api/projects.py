@@ -5,7 +5,7 @@ from pydantic import BaseModel
 import logging
 
 from app.api.deps import get_db_dependency
-from app.api.auth import get_current_user
+from app.api.auth import get_current_user, RoleChecker
 from app.models.project import Project
 from app.models.record import Record, RecordImage
 from app.models.user import User
@@ -13,6 +13,11 @@ from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, Project
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
+
+# Role checkers
+allow_admin = RoleChecker(["admin"])
+allow_contributor = RoleChecker(["admin", "operator"])
+allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
 class ProjectInitRequest(BaseModel):
@@ -30,7 +35,7 @@ class ProjectInitResponse(BaseModel):
 @router.post("/", response_model=ProjectRead)
 def create_project(
     payload: ProjectCreate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     if db.query(Project).filter(Project.name == payload.name).first():
@@ -46,7 +51,7 @@ def create_project(
 def list_projects(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
     items = db.query(Project).offset(skip).limit(limit).all()
@@ -56,7 +61,7 @@ def list_projects(
 @router.get("/{project_id}", response_model=ProjectRead)
 def get_project(
     project_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
     p = db.query(Project).filter(Project.id == project_id).first()
@@ -69,7 +74,7 @@ def get_project(
 def add_record_to_project(
     project_id: int,
     rec_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     p = db.query(Project).filter(Project.id == project_id).first()
@@ -88,7 +93,7 @@ def add_record_to_project(
 def remove_record_from_project(
     project_id: int,
     rec_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     p = db.query(Project).filter(Project.id == project_id).first()
@@ -107,7 +112,7 @@ def remove_record_from_project(
 def update_project(
     project_id: int,
     payload: ProjectUpdate,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """Update a project's details."""
@@ -133,7 +138,7 @@ def update_project(
 @router.delete("/{project_id}")
 def delete_project(
     project_id: int,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """
@@ -160,7 +165,7 @@ def delete_project(
 def initialize_project_filesystem(
     project_id: int,
     request: ProjectInitRequest,
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """
@@ -201,7 +206,7 @@ def list_project_records(
     project_id: int,
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
-    current_user: User = Depends(get_current_user),
+    current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
     """List all records associated with a project."""
