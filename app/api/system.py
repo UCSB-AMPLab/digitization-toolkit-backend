@@ -227,6 +227,67 @@ def mount_device(
     return {"mountpoint": str(mountpoint), "message": f"Montado en {mountpoint}"}
 
 
+class UnmountRequest(BaseModel):
+    mountpoint: str
+
+
+@router.delete("/storage/mount")
+def unmount_device(
+    body: UnmountRequest,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Safely unmount a partition that was mounted by DTK.
+
+    If the unmounted path is currently the active storage override, the override
+    is cleared automatically so the backend falls back to its default path.
+    """
+    from app.core.storage_override import get_storage_override, clear_storage_override
+    from app.core.audit import log_event
+
+    target = Path(body.mountpoint)
+
+    # Only allow unmounting paths we own — must be under _MOUNT_BASE
+    try:
+        target.resolve().relative_to(_MOUNT_BASE.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail="Solo se pueden desmontar rutas gestionadas por DTK.")
+
+    # If this mountpoint (or a subpath of it) is the active storage override,
+    # clear it first so the backend doesn't try to write to a stale path.
+    override = get_storage_override()
+    override_cleared = False
+    if override and Path(override).resolve().is_relative_to(target.resolve()):
+        clear_storage_override()
+        override_cleared = True
+
+    result = subprocess.run(
+        ["sudo", "umount", str(target)],
+        capture_output=True, text=True, timeout=30,
+    )
+    if result.returncode != 0:
+        # Restore the override if umount failed (best-effort)
+        if override_cleared and override:
+            from app.core.storage_override import set_storage_override
+            set_storage_override(override)
+        detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al desmontar."
+        raise HTTPException(status_code=500, detail=detail)
+
+    # Remove the now-empty mount directory so it doesn't clutter the listing
+    try:
+        target.rmdir()
+    except OSError:
+        pass  # non-empty or already gone — not fatal
+
+    log_event(db, level="INFO", category="system", action="storage_unmount",
+              actor=current_user.username, subject=str(target))
+
+    msg = "Dispositivo desmontado correctamente."
+    if override_cleared:
+        msg += " Almacenamiento restaurado al predeterminado."
+    return {"message": msg, "override_cleared": override_cleared}
+
+
 @router.post("/storage/activate")
 def activate_storage(
     body: ActivateStorageRequest,
