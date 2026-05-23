@@ -17,6 +17,8 @@ class ProjectMemberRead(BaseModel):
     # Flattened user details (joined at query time)
     username: str
     email: str
+    # True for admins who are always implicit collaborators
+    is_implicit: bool = False
 
     class Config:
         from_attributes = True
