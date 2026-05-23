@@ -153,6 +153,37 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		return []
 
 
+@router.get("/preview/{camera_index}")
+def get_camera_preview(
+	camera_index: int,
+	current_user: User = Depends(allow_read_only),
+):
+	"""
+	Capture a low-resolution preview frame and return it as JPEG.
+
+	Called by the frontend every PREVIEW_INTERVAL_MS milliseconds for the
+	live preview view.  Uses a lightweight config (1280×720, no AF, no denoise)
+	so frames are returned quickly without interfering with full captures.
+
+	Returns 404 when the requested camera is not connected.
+	"""
+	from fastapi.responses import Response
+
+	try:
+		from capture.service import capture_preview_frame
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		jpeg_bytes = capture_preview_frame(camera_index)
+		return Response(content=jpeg_bytes, media_type="image/jpeg")
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"Preview capture failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Preview capture failed")
+
+
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,

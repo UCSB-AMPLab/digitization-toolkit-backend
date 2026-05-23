@@ -302,6 +302,58 @@ def dual_capture_image(
     
     return img1_path, img2_path, record.capture_id, record.pair_id
     
+def capture_preview_frame(camera_index: int) -> bytes:
+    """
+    Capture a low-resolution preview frame and return JPEG bytes.
+
+    Not saved to the project directory — intended for live preview polling
+    from the frontend. Uses a temporary file cleaned up immediately after reading.
+
+    The preview uses a lightweight configuration:
+      - 1280×720 (native fast mode, no cropping)
+      - No autofocus cycle (too slow for live preview)
+      - No AE stabilisation wait
+      - No temporal denoise warmup
+      - Reduced JPEG quality (75) for a smaller payload
+
+    Args:
+        camera_index: Camera index (0 or 1).
+
+    Returns:
+        JPEG bytes of the preview frame.
+
+    Raises:
+        RuntimeError: If the camera is not connected or capture fails.
+    """
+    import tempfile
+
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    tmp_path = Path(tempfile.gettempdir()) / f"preview_c{camera_index}.jpg"
+
+    preview_config = CameraConfig(
+        camera_index=camera_index,
+        img_size=(1280, 720),        # Native 80 fps mode — fast, no crop
+        autofocus_on_capture=False,  # Skip AF cycle for live preview
+        timeout=0,                   # No AE stabilisation wait
+        denoise_frames=0,            # No temporal denoise warmup
+        quality=75,                  # Smaller payload for polling
+        encoding="jpg",
+        raw=False,
+    )
+
+    backend = get_backend()
+    try:
+        backend.capture_image(tmp_path, preview_config)
+        return tmp_path.read_bytes()
+    finally:
+        try:
+            tmp_path.unlink(missing_ok=True)
+        except Exception:
+            pass
+
+
 def main():
     """
     Main entry point for testing the camera connectivity.
