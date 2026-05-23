@@ -180,6 +180,35 @@ def update_collection(
     return CollectionRead.model_validate(collection)
 
 
+@router.post("/{collection_id}/move-records", status_code=200)
+def move_collection_records(
+    collection_id: int,
+    target_collection_id: int = Query(..., description="ID of the target collection to move records into"),
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Move all records from one collection to another.
+    Used before deleting a collection to preserve its contents.
+    """
+    source = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not source:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    target = db.query(Collection).filter(Collection.id == target_collection_id).first()
+    if not target:
+        raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
+
+    moved = db.query(Record).filter(Record.collection_id == collection_id).update(
+        {"collection_id": target_collection_id},
+        synchronize_session=False
+    )
+    db.commit()
+
+    logger.info(f"Moved {moved} records from collection {collection_id} to {target_collection_id}")
+    return {"moved": moved, "target_collection_id": target_collection_id}
+
+
 @router.delete("/{collection_id}", status_code=204)
 def delete_collection(
     collection_id: int,
@@ -188,21 +217,22 @@ def delete_collection(
 ):
     """
     Delete a collection.
-    
+
     Warning: This will cascade delete all child collections and orphan any records in this collection.
+    Use POST /{collection_id}/move-records first if you want to preserve the records.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    
+
     # Check if collection has records
     record_count = db.query(func.count(Record.id)).filter(
         Record.collection_id == collection_id
     ).scalar()
-    
+
     if record_count > 0:
         logger.warning(f"Deleting collection {collection_id} with {record_count} records - records will be orphaned")
-    
+
     db.delete(collection)
     db.commit()
     return None
