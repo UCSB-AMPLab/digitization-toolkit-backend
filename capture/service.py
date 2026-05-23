@@ -330,7 +330,10 @@ def capture_preview_frame(camera_index: int) -> bytes:
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
-    tmp_path = Path(tempfile.gettempdir()) / f"preview_c{camera_index}.jpg"
+    # Use mkstemp so concurrent requests (e.g. two browser tabs) never share
+    # the same temp file, avoiding partial-read races.
+    fd, tmp_str = tempfile.mkstemp(suffix=".jpg", prefix=f"preview_c{camera_index}_")
+    tmp_path = Path(tmp_str)
 
     preview_config = CameraConfig(
         camera_index=camera_index,
@@ -345,6 +348,8 @@ def capture_preview_frame(camera_index: int) -> bytes:
 
     backend = get_backend()
     try:
+        import os
+        os.close(fd)  # Release the OS file descriptor; picamera2 will open it by path
         backend.capture_image(tmp_path, preview_config)
         return tmp_path.read_bytes()
     finally:
