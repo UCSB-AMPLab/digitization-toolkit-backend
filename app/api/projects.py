@@ -7,9 +7,11 @@ import logging
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.project import Project
+from app.models.project_member import ProjectMember
 from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
+from app.schemas.project_member import ProjectMemberCreate, ProjectMemberRead
 from app.core.audit import log_event
 
 router = APIRouter()
@@ -224,3 +226,129 @@ def list_project_records(
     ).offset(skip).limit(limit).all()
     
     return [RecordRead.model_validate(r) for r in recs]
+
+
+# ---------------------------------------------------------------------------
+# MEMBER ENDPOINTS
+# ---------------------------------------------------------------------------
+
+def _assert_can_manage_members(project: Project, current_user: User, db: Session) -> None:
+    """Raise 403 if current_user may not manage members for this project."""
+    if current_user.role == "admin":
+        return
+    if current_user.role == "operator":
+        # Operator may manage if they created the project or are already a member
+        is_creator = project.created_by == current_user.username
+        is_member  = db.query(ProjectMember).filter(
+            ProjectMember.project_id == project.id,
+            ProjectMember.user_id    == current_user.id
+        ).first() is not None
+        if is_creator or is_member:
+            return
+    raise HTTPException(status_code=403, detail="Not authorised to manage members for this project")
+
+
+@router.get("/{project_id}/members", response_model=List[ProjectMemberRead])
+def list_project_members(
+    project_id: int,
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """List all users associated with a project."""
+    p = db.query(Project).filter(Project.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+
+    rows = (
+        db.query(ProjectMember, User)
+        .join(User, User.id == ProjectMember.user_id)
+        .filter(ProjectMember.project_id == project_id)
+        .all()
+    )
+    return [
+        ProjectMemberRead(
+            project_id=m.project_id,
+            user_id=m.user_id,
+            role=m.role,
+            added_at=m.added_at,
+            added_by=m.added_by,
+            username=u.username,
+            email=u.email,
+        )
+        for m, u in rows
+    ]
+
+
+@router.post("/{project_id}/members", response_model=ProjectMemberRead, status_code=201)
+def add_project_member(
+    project_id: int,
+    payload: ProjectMemberCreate,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """Add a user to a project with a given role (operator|reviewer)."""
+    p = db.query(Project).filter(Project.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    _assert_can_manage_members(p, current_user, db)
+
+    if payload.role not in ("operator", "reviewer"):
+        raise HTTPException(status_code=422, detail="role must be 'operator' or 'reviewer'")
+
+    target_user = db.query(User).filter(User.id == payload.user_id).first()
+    if not target_user:
+        raise HTTPException(status_code=404, detail="User not found")
+
+    existing = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id    == payload.user_id,
+    ).first()
+    if existing:
+        # Update role if already a member
+        existing.role = payload.role
+        db.commit()
+        db.refresh(existing)
+        m = existing
+    else:
+        m = ProjectMember(
+            project_id=project_id,
+            user_id=payload.user_id,
+            role=payload.role,
+            added_by=current_user.username,
+        )
+        db.add(m)
+        db.commit()
+        db.refresh(m)
+
+    return ProjectMemberRead(
+        project_id=m.project_id,
+        user_id=m.user_id,
+        role=m.role,
+        added_at=m.added_at,
+        added_by=m.added_by,
+        username=target_user.username,
+        email=target_user.email,
+    )
+
+
+@router.delete("/{project_id}/members/{user_id}", status_code=204)
+def remove_project_member(
+    project_id: int,
+    user_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """Remove a user from a project."""
+    p = db.query(Project).filter(Project.id == project_id).first()
+    if not p:
+        raise HTTPException(status_code=404, detail="Project not found")
+    _assert_can_manage_members(p, current_user, db)
+
+    m = db.query(ProjectMember).filter(
+        ProjectMember.project_id == project_id,
+        ProjectMember.user_id    == user_id,
+    ).first()
+    if not m:
+        raise HTTPException(status_code=404, detail="Member not found")
+    db.delete(m)
+    db.commit()
