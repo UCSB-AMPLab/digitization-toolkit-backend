@@ -34,10 +34,16 @@ def setup_rotating_logger(log_file: str, logger_name: str, level=logging.INFO, m
     """
     logger = logging.getLogger(logger_name)
     logger.setLevel(level)
-    
-    handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
-    formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
-    handler.setFormatter(formatter)
-    
-    logger.addHandler(handler)
+
+    # Guard against duplicate handlers when the module is reimported by
+    # uvicorn's auto-reloader (the logger singleton persists across reloads).
+    if not any(
+        isinstance(h, RotatingFileHandler) and getattr(h, "baseFilename", None) == log_file
+        for h in logger.handlers
+    ):
+        handler = RotatingFileHandler(log_file, maxBytes=max_bytes, backupCount=backup_count)
+        formatter = logging.Formatter('%(asctime)s - %(name)s - %(levelname)s - %(message)s')
+        handler.setFormatter(formatter)
+        logger.addHandler(handler)
+
     return logger
