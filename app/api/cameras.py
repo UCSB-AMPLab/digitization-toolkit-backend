@@ -29,6 +29,11 @@ class DeviceInfo(BaseModel):
 	machine_id: Optional[str] = None
 	label: Optional[str] = None
 	calibrated: bool = False
+	# Calibration data (populated when calibrated=True)
+	lens_position: Optional[float] = None
+	awb_gains: Optional[List[float]] = None
+	# Capabilities
+	has_aperture_control: bool = False
 
 
 class CaptureRequest(BaseModel):
@@ -39,6 +44,7 @@ class CaptureRequest(BaseModel):
 	include_resolution_in_filename: bool = False
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
+	collection_id: Optional[int] = None  # Collection to link the record to
 
 
 class DualCaptureRequest(BaseModel):
@@ -50,6 +56,7 @@ class DualCaptureRequest(BaseModel):
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
+	collection_id: Optional[int] = None  # Collection to link the record to
 
 
 class CaptureResponse(BaseModel):
@@ -129,13 +136,29 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 			calibrated = False
 			machine_id = None
 			label = None
+			lens_position = None
+			awb_gains = None
 
 			if camera_data:
-				calibrated = bool(
-					camera_data.get("calibration", {}).get("focus", {}).get("success")
-				)
+				focus_cal = camera_data.get("calibration", {}).get("focus", {})
+				calibrated = bool(focus_cal.get("success"))
 				machine_id = camera_data.get("machine_id")
 				label = camera_data.get("label")
+				lens_position = focus_cal.get("lens_position")
+				awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
+				if awb_raw:
+					awb_gains = list(awb_raw)
+
+			# Detect aperture control from cached picamera2 instance if available
+			has_aperture_control = False
+			try:
+				from capture.service import get_backend
+				from capture.backends.picamera2_backend import Picamera2Backend
+				bk = get_backend()
+				if isinstance(bk, Picamera2Backend) and idx in bk._cameras:
+					has_aperture_control = "Aperture" in bk._cameras[idx].camera_controls
+			except Exception:
+				pass
 
 			devices.append(DeviceInfo(
 				hardware_id=hw_id,
@@ -145,6 +168,9 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 				machine_id=machine_id,
 				label=label,
 				calibrated=calibrated,
+				lens_position=lens_position,
+				awb_gains=awb_gains,
+				has_aperture_control=has_aperture_control,
 			))
 
 		return devices
@@ -269,6 +295,7 @@ def trigger_capture(
 				description=f"Captured at {request.resolution} resolution",
 				object_typology="document",
 				project_id=project_id,
+				collection_id=request.collection_id,
 				created_by=current_user.username,
 			)
 			db.add(record)
@@ -407,6 +434,7 @@ def trigger_dual_capture(
 				description=f"Dual camera capture at {request.resolution} resolution",
 				object_typology="book",  # Default to book for dual captures
 				project_id=project_id,
+				collection_id=request.collection_id,
 				created_by=current_user.username,
 			)
 			db.add(record)

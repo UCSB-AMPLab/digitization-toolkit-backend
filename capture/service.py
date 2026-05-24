@@ -347,16 +347,40 @@ def capture_preview_frame(camera_index: int) -> bytes:
     )
 
     backend = get_backend()
-    try:
-        import os
-        os.close(fd)  # Release the OS file descriptor; picamera2 will open it by path
-        backend.capture_image(tmp_path, preview_config)
-        return tmp_path.read_bytes()
-    finally:
+    import os
+    os.close(fd)  # Release the OS file descriptor; picamera2 will open it by path
+
+    for attempt in range(2):
         try:
-            tmp_path.unlink(missing_ok=True)
-        except Exception:
-            pass
+            backend.capture_image(tmp_path, preview_config)
+            data = tmp_path.read_bytes()
+            return data
+        except Exception as exc:
+            subprocess_logger.warning(
+                f"Preview capture failed for camera {camera_index} "
+                f"(attempt {attempt + 1}/2): {exc}"
+            )
+            # Evict the cached camera instance so the next attempt (or the
+            # next polling cycle) gets a clean Picamera2 object.
+            if hasattr(backend, "reset_camera"):
+                backend.reset_camera(camera_index)
+            if attempt == 1:
+                raise RuntimeError(
+                    f"Preview capture failed for camera {camera_index}: {exc}"
+                ) from exc
+        finally:
+            try:
+                tmp_path.unlink(missing_ok=True)
+            except Exception:
+                pass
+            # Recreate the temp file for a potential second attempt
+            if attempt == 0:
+                import tempfile as _tf
+                fd, tmp_str = _tf.mkstemp(
+                    suffix=".jpg", prefix=f"preview_c{camera_index}_"
+                )
+                tmp_path = Path(tmp_str)
+                os.close(fd)
 
 
 def main():

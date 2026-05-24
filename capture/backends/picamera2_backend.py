@@ -404,6 +404,59 @@ class Picamera2Backend(CameraBackend):
         """
         return "picamera2"
     
+    def reset_camera(self, camera_index: int) -> None:
+        """
+        Stop, close and evict a camera instance from the cache.
+
+        Called after a capture error to ensure the next request gets a
+        fresh Picamera2 instance rather than one left in a broken state.
+
+        Args:
+            camera_index: The camera index to reset.
+        """
+        picam2 = self._cameras.pop(camera_index, None)
+        self._last_configs.pop(camera_index, None)
+        self._format_mode.pop(camera_index, None)
+        if picam2 is not None:
+            try:
+                if picam2.started:
+                    picam2.stop()
+                picam2.close()
+                self.logger.info(f"Reset camera {camera_index} (evicted from cache)")
+            except Exception as e:
+                self.logger.warning(f"Error while resetting camera {camera_index}: {e}")
+
+    def apply_controls(self, camera_index: int, controls: dict) -> None:
+        """
+        Apply picamera2 controls to a running camera without a full capture.
+
+        Used by the settings and focus endpoints to update live camera
+        parameters (exposure, colour gains, lens position, etc.) so that
+        the next preview frame reflects the new values.
+
+        Does nothing if the camera has not been initialised yet.
+
+        Args:
+            camera_index: The camera index.
+            controls: Dict of picamera2 control names → values.
+        """
+        picam2 = self._cameras.get(camera_index)
+        if picam2 is None:
+            self.logger.debug(
+                f"apply_controls: camera {camera_index} not yet open, skipping"
+            )
+            return
+        if not picam2.started:
+            self.logger.debug(
+                f"apply_controls: camera {camera_index} not started, skipping"
+            )
+            return
+        try:
+            picam2.set_controls(controls)
+            self.logger.debug(f"Applied controls to camera {camera_index}: {controls}")
+        except Exception as e:
+            self.logger.warning(f"Failed to apply controls to camera {camera_index}: {e}")
+
     def cleanup(self):
         """
         Cleanup camera resources.
