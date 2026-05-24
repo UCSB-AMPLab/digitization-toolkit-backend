@@ -28,7 +28,7 @@ subprocess_logger = setup_rotating_logger(
 def secure_project_filename(project_name):
     project_name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
     project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
-    return project_name.lstrip('.')
+    return project_name.lstrip('.').lower()
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """

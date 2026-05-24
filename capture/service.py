@@ -129,9 +129,9 @@ def capture_image(
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
     if collection_name:
-        project_path = PROJECTS_ROOT / project_name / secure_project_filename(collection_name) / "images" / "main"
+        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / secure_project_filename(collection_name) / "images" / "main"
     else:
-        project_path = PROJECTS_ROOT / project_name / "images" / "main"
+        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / "images" / "main"
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
