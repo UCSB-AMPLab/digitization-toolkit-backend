@@ -210,6 +210,63 @@ def get_camera_preview(
 		raise HTTPException(status_code=500, detail="Preview capture failed")
 
 
+# ---------------------------------------------------------------------------
+# Focus endpoints
+# ---------------------------------------------------------------------------
+
+class FocusRequest(BaseModel):
+	"""Request body for manual focus endpoint."""
+	lens_position: float  # Dioptres: 0 = infinity, 10 ≈ 10 cm
+
+
+class FocusResponse(BaseModel):
+	camera_index: int
+	lens_position: float
+
+
+@router.get("/focus/{camera_index}", response_model=FocusResponse)
+def get_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_read_only),
+):
+	"""Return the current lens position (dioptres) for the given camera."""
+	try:
+		from capture.service import get_focus as _get_focus
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		pos = _get_focus(camera_index)
+		return FocusResponse(camera_index=camera_index, lens_position=pos)
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"get_focus failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to get focus")
+
+
+@router.post("/focus/{camera_index}", response_model=FocusResponse)
+def set_focus(
+	camera_index: int,
+	request: FocusRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Set manual lens position (dioptres) on the given camera."""
+	try:
+		from capture.service import set_focus as _set_focus
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		pos = _set_focus(camera_index, request.lens_position)
+		return FocusResponse(camera_index=camera_index, lens_position=pos)
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"set_focus failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to set focus")
+
+
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,

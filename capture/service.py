@@ -383,7 +383,62 @@ def capture_preview_frame(camera_index: int) -> bytes:
                 os.close(fd)
 
 
-def main():
+# ---------------------------------------------------------------------------
+# Focus helpers
+# ---------------------------------------------------------------------------
+
+def get_focus(camera_index: int) -> float:
+    """Return the current lens position (dioptres) for *camera_index*.
+
+    Reads the value from the running Picamera2 instance's metadata if
+    available, otherwise falls back to 0.0 (infinity).
+    """
+    backend = get_backend()
+
+    # picamera2 backend exposes the cached instance
+    if hasattr(backend, "_cameras") and camera_index in backend._cameras:
+        picam2 = backend._cameras[camera_index]
+        try:
+            meta = picam2.capture_metadata()
+            # LensPosition is available when AF is in use (may be None otherwise)
+            pos = meta.get("LensPosition")
+            if pos is not None:
+                return float(pos)
+        except Exception:
+            pass
+
+    return 0.0
+
+
+def set_focus(camera_index: int, lens_position: float) -> float:
+    """Set the lens to *lens_position* dioptres on *camera_index*.
+
+    Switches the camera to manual AF mode and applies the controls.
+    Returns the applied lens_position.
+
+    Raises RuntimeError if the camera is not connected or the backend does
+    not support manual focus control.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+
+    # Clamp to a reasonable range (0 = infinity, 10 = ~10 cm)
+    pos = max(0.0, min(10.0, float(lens_position)))
+
+    if hasattr(backend, "apply_controls"):
+        backend.apply_controls(camera_index, {
+            "AfMode": 0,        # 0 = Manual AF mode
+            "LensPosition": pos,
+        })
+    else:
+        raise RuntimeError("Current camera backend does not support manual focus")
+
+    return pos
+
+
+
     """
     Main entry point for testing the camera connectivity.
     """
