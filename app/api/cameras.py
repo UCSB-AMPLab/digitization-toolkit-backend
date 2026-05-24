@@ -359,11 +359,19 @@ def trigger_capture(
 		camera_config = CameraConfig(**config_dict)
 		
 		# Capture image and get manifest IDs
+		# Look up collection name so images go to project/collection/images/main/
+		collection_name = None
+		if request.collection_id:
+			from app.models.collection import Collection
+			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
+			collection_name = col.name if col else None
+
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=request.project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
-			include_resolution=request.include_resolution_in_filename
+			include_resolution=request.include_resolution_in_filename,
+			collection_name=collection_name
 		)
 		
 		# Extract image dimensions and EXIF data
@@ -523,13 +531,21 @@ def trigger_dual_capture(
 		cam1_config = CameraConfig(**config1_dict)
 		
 		# Capture both images and get manifest IDs
+		# Look up collection name so images go to project/collection/images/main/
+		collection_name = None
+		if request.collection_id:
+			from app.models.collection import Collection
+			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
+			collection_name = col.name if col else None
+
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=request.project_name,
 			cam1_config=cam0_config,
 			cam2_config=cam1_config,
 			check_camera=False,
 			include_resolution=request.include_resolution_in_filename,
-			stagger_ms=request.stagger_ms
+			stagger_ms=request.stagger_ms,
+			collection_name=collection_name
 		)
 		
 		# Get project

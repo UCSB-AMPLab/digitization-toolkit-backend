@@ -13,6 +13,7 @@ from .utils import setup_rotating_logger
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend
+from .project_manager import secure_project_filename
 
 from app.core.config import settings
 
@@ -108,7 +109,8 @@ def capture_image(
         output_filename: Optional[str] = None,
         check_camera: bool = True,
         include_resolution: bool = False,
-        capture_output: bool = False) -> str:
+        capture_output: bool = False,
+        collection_name: Optional[str] = None) -> str:
     """
     Capture an image using the rpicam-still command.
     
@@ -126,7 +128,10 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = PROJECTS_ROOT / project_name / "images" / "main"
+    if collection_name:
+        project_path = PROJECTS_ROOT / project_name / secure_project_filename(collection_name) / "images" / "main"
+    else:
+        project_path = PROJECTS_ROOT / project_name / "images" / "main"
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -157,7 +162,8 @@ def single_capture_image(
         project_name: str,
         camera_config: CameraConfig,
         check_camera: bool = True,
-        include_resolution: bool = False) -> tuple:
+        include_resolution: bool = False,
+        collection_name: Optional[str] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -179,7 +185,8 @@ def single_capture_image(
         project_name=project_name,
         camera_config=camera_config,
         check_camera=False,  # Already checked
-        include_resolution=include_resolution
+        include_resolution=include_resolution,
+        collection_name=collection_name
     )
     
     elapsed_time = time.time() - start_time
@@ -207,7 +214,8 @@ def dual_capture_image(
         cam2_config: CameraConfig,
         check_camera: bool = True,
         include_resolution: bool = False,
-        stagger_ms: int = 20) -> tuple:
+        stagger_ms: int = 20,
+        collection_name: Optional[str] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -260,7 +268,8 @@ def dual_capture_image(
             output_filename=fname,
             check_camera=False,  # Already checked
             include_resolution=include_resolution,
-            capture_output=False  # Max performance
+            capture_output=False,  # Max performance
+            collection_name=collection_name
         )
         elapsed = time.time() - start
         return path, elapsed, metadata

@@ -134,12 +134,9 @@ def project_init(
     """
         
     project_path = Path(PROJECTS_ROOT, secure_project_filename(project_name))
-    images_main = Path(project_path, "images", "main")
-    images_temp = Path(project_path, "images", "temp")
-    images_trash = Path(project_path, "images", "trash")
     packages_dir = Path(project_path, "packages")
     
-    for path in [images_main, images_temp, images_trash, packages_dir]:
+    for path in [packages_dir]:
         path.mkdir(parents=True, exist_ok=True)
     
     subprocess_logger.info(f"Created project directory structure: {project_path}")
@@ -165,9 +162,6 @@ def project_init(
         project_name=project_name,
         paths={
             "project_root": str(project_path),
-            "images_main": str(images_main),
-            "images_temp": str(images_temp),
-            "images_trash": str(images_trash),
             "packages": str(packages_dir),
         },
         default_camera_config={
