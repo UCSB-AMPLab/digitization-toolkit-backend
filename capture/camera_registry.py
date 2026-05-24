@@ -10,8 +10,6 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
 from picamera2 import Picamera2
 
-Picamera2.set_logging(Picamera2.BEBUG, output='/var/log/dtk/capture_service.log', msg="Picamera2 logging: %(name)s %(levelname)s: %(message)s")
-
 class CameraRegistry:
     """
     Manages global camera registry with hardware identification.

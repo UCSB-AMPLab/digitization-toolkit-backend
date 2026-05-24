@@ -45,6 +45,18 @@ subprocess_logger = setup_rotating_logger(
     logger_name="capture_service"
 )
 
+# Route picamera2's own log output into the same rotating log file.
+# picamera2 uses Python's standard logging under the "picamera2" namespace,
+# so we attach a single RotatingFileHandler from the existing logger.
+import logging as _logging
+from logging.handlers import RotatingFileHandler as _RFH
+_picamera2_logger = _logging.getLogger("picamera2")
+if not _picamera2_logger.handlers:
+    _rfh = next((h for h in subprocess_logger.handlers if isinstance(h, _RFH)), None)
+    if _rfh:
+        _picamera2_logger.setLevel(_logging.DEBUG)
+        _picamera2_logger.addHandler(_rfh)
+
 # Initialize camera backend based on configuration
 def get_camera_backend() -> CameraBackend:
     """
