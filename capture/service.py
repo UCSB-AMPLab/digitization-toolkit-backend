@@ -438,7 +438,26 @@ def set_focus(camera_index: int, lens_position: float) -> float:
     return pos
 
 
+def set_camera_controls(camera_index: int, controls: dict) -> None:
+    """Apply arbitrary picamera2 controls to *camera_index* live.
 
+    *controls* should use picamera2 control names directly
+    (e.g. ``{'AeEnable': False, 'ExposureTime': 125}``).
+
+    Raises RuntimeError if the camera is not available or the backend does not
+    support live control updates.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not hasattr(backend, "apply_controls"):
+        raise RuntimeError("Current camera backend does not support live control updates")
+
+    backend.apply_controls(camera_index, controls)
+
+
+def main():
     """
     Main entry point for testing the camera connectivity.
     """

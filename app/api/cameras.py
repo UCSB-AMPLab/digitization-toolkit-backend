@@ -267,6 +267,60 @@ def set_focus(
 		raise HTTPException(status_code=500, detail="Failed to set focus")
 
 
+# ---------------------------------------------------------------------------
+# Camera settings / controls endpoint
+# ---------------------------------------------------------------------------
+
+class CameraSettingsRequest(BaseModel):
+	"""Arbitrary camera controls to apply live (all fields optional)."""
+	ae_enable: Optional[bool] = None          # Auto-exposure on/off
+	awb_enable: Optional[bool] = None         # Auto white-balance on/off
+	exposure_value: Optional[float] = None    # EV compensation (requires ae_enable=True)
+	exposure_time_us: Optional[int] = None    # Manual shutter time in microseconds
+	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ≈ 1.0)
+	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
+
+
+@router.post("/settings/{camera_index}")
+def apply_camera_settings(
+	camera_index: int,
+	request: CameraSettingsRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Apply live camera controls without triggering a capture."""
+	try:
+		from capture.service import set_camera_controls
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	# Map request fields to picamera2 control names
+	controls: dict = {}
+	if request.ae_enable is not None:
+		controls["AeEnable"] = request.ae_enable
+	if request.awb_enable is not None:
+		controls["AwbEnable"] = request.awb_enable
+	if request.exposure_value is not None:
+		controls["ExposureValue"] = float(request.exposure_value)
+	if request.exposure_time_us is not None:
+		controls["ExposureTime"] = int(request.exposure_time_us)
+	if request.analogue_gain is not None:
+		controls["AnalogueGain"] = float(request.analogue_gain)
+	if request.colour_gains is not None and len(request.colour_gains) == 2:
+		controls["ColourGains"] = (float(request.colour_gains[0]), float(request.colour_gains[1]))
+
+	if not controls:
+		return {"detail": "No controls specified"}
+
+	try:
+		set_camera_controls(camera_index, controls)
+		return {"detail": "Controls applied", "controls": list(controls.keys())}
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"apply_camera_settings failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
+
+
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,
