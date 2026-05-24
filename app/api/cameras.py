@@ -58,6 +58,7 @@ class DualCaptureRequest(BaseModel):
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
+	left_camera_index: int = 0  # Which camera index maps to the left page (0 or 1)
 	collection_id: Optional[int] = None  # Collection to link the record to
 
 
@@ -696,8 +697,11 @@ def trigger_dual_capture(
 			return img
 		
 		# Create RecordImages for both captures with appropriate roles
-		img0 = create_image_record(str(path0), 0, "left")
-		img1 = create_image_record(str(path1), 1, "right")
+		# left_camera_index controls which physical camera maps to the "left" page
+		role0 = "left" if request.left_camera_index == 0 else "right"
+		role1 = "right" if request.left_camera_index == 0 else "left"
+		img0 = create_image_record(str(path0), 0, role0)
+		img1 = create_image_record(str(path1), 1, role1)
 		
 		db.commit()
 		db.refresh(record)
