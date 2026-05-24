@@ -102,6 +102,12 @@ class WhiteBalanceCalibrationResponse(BaseModel):
 	error: Optional[str] = None
 
 
+class WhiteBalanceManualRequest(BaseModel):
+	"""Request to commit manually-sampled AWB gains to the registry."""
+	camera_index: int = 0
+	awb_gains: List[float]  # [red_gain, blue_gain]
+
+
 def _get_camera_registry():
 	"""Get or create camera registry. Handles import errors gracefully."""
 	try:
@@ -816,6 +822,59 @@ def calibrate_white_balance(
 		)
 	except Exception as e:
 		logger.exception(f"White balance calibration failed: {e}")
+		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
+
+
+@router.post("/calibrate/white-balance/manual", response_model=WhiteBalanceCalibrationResponse)
+def commit_manual_white_balance(
+	request: WhiteBalanceManualRequest,
+	current_user: User = Depends(allow_contributor)
+):
+	"""
+	Commit manually-sampled AWB gains to the camera registry.
+
+	Called after the user clicks on a neutral area in the live preview.
+	No camera capture is performed — the supplied gains are validated and
+	saved directly to the registry, the same way as after AWB convergence.
+	"""
+	if len(request.awb_gains) < 2:
+		return WhiteBalanceCalibrationResponse(success=False, error="awb_gains must be [red, blue]")
+
+	gains = [float(request.awb_gains[0]), float(request.awb_gains[1])]
+	if not all(0.1 <= g <= 8.0 for g in gains):
+		return WhiteBalanceCalibrationResponse(
+			success=False,
+			error=f"gains out of range [0.1, 8.0]: {gains}"
+		)
+
+	try:
+		from capture.camera_registry import CameraRegistry
+
+		registry = CameraRegistry()
+		hw_id, _ = registry.get_camera_hardware_id(request.camera_index)
+
+		if hw_id:
+			registry.register_camera(request.camera_index)
+			existing = registry.cameras.get("cameras", {}).get(hw_id, {}).get("calibration", {})
+			wb_result = {
+				"success": True,
+				"awb_gains": gains,
+				"colour_temperature": None,
+				"converged": True,
+				"source": "manual_sample",
+			}
+			calibration_data = {
+				**existing,
+				"camera_index": request.camera_index,
+				"calibrated_at": datetime.now(timezone.utc).isoformat(),
+				"white_balance": wb_result,
+			}
+			registry.update_calibration(hw_id, calibration_data)
+			logger.info(f"Saved manual WB for {hw_id}: gains={gains}")
+
+		return WhiteBalanceCalibrationResponse(success=True, awb_gains=gains)
+	except Exception as e:
+		logger.exception(f"Manual WB commit failed: {e}")
 		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
 
 
