@@ -17,6 +17,13 @@ security = HTTPBearer()
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
+@router.get("/setup/status")
+def setup_status(db: Session = Depends(get_db_dependency)):
+    """Check whether initial setup is needed (no users exist yet). No auth required."""
+    needs_setup = db.query(User).count() == 0
+    return {"needs_setup": needs_setup}
+
+
 @router.post("/register", response_model=UserRead)
 def register(
     payload: UserCreate,
