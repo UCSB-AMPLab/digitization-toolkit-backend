@@ -511,6 +511,25 @@ def set_camera_controls(camera_index: int, controls: dict) -> None:
     backend.apply_controls(camera_index, controls)
 
 
+def apply_zoom(camera_index: int, zoom_factor: float) -> None:
+    """Apply ScalerCrop-based digital zoom to the camera preview stream.
+
+    *zoom_factor* 1.0 restores the full sensor field of view.
+    Values > 1.0 crop towards the centre of the sensor.
+
+    Raises RuntimeError if the camera is unavailable or the backend does not
+    support zoom (e.g. subprocess backend).
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not hasattr(backend, "apply_zoom"):
+        raise RuntimeError("Current camera backend does not support digital zoom")
+
+    backend.apply_zoom(camera_index, zoom_factor)
+
+
 def main():
     """
     Main entry point for testing the camera connectivity.

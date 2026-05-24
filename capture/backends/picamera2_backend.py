@@ -345,7 +345,16 @@ class Picamera2Backend(CameraBackend):
             # YUV420→JPEG is done efficiently by libcamera/picamera2
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
-            
+
+            # Reset ScalerCrop to full sensor — zoom is preview-only.
+            # Ensures captures always use the full pixel array regardless of
+            # whatever zoom the user had applied to the live preview.
+            _pixel_array_size = picam2.camera_properties.get('PixelArraySize')
+            if _pixel_array_size:
+                picam2.set_controls(
+                    {"ScalerCrop": (0, 0, _pixel_array_size[0], _pixel_array_size[1])}
+                )
+
             # Use request-based capture to get metadata and save files
             request = picam2.capture_request()
             try:
@@ -616,6 +625,55 @@ class Picamera2Backend(CameraBackend):
             self._format_mode.pop(camera_index, None)
 
             return result
+
+    def apply_zoom(self, camera_index: int, zoom_factor: float) -> None:
+        """
+        Apply digital zoom via ScalerCrop on the running preview stream.
+
+        Sets the sensor Region of Interest to a centred crop of 1/zoom_factor
+        of the full pixel array.  zoom_factor=1.0 restores the full sensor.
+        Zoom is preview-only: capture_image() always resets ScalerCrop to the
+        full sensor before taking the shot.
+
+        Args:
+            camera_index: The camera index.
+            zoom_factor:  Zoom multiplier in the range [1.0, 8.0].
+        """
+        picam2 = self._cameras.get(camera_index)
+        if picam2 is None:
+            self.logger.debug(
+                f"apply_zoom: camera {camera_index} not yet open, skipping"
+            )
+            return
+        if not picam2.started:
+            self.logger.debug(
+                f"apply_zoom: camera {camera_index} not started, skipping"
+            )
+            return
+
+        zoom = max(1.0, min(float(zoom_factor), 8.0))
+        pixel_array_size = picam2.camera_properties.get('PixelArraySize')
+        if pixel_array_size is None:
+            self.logger.warning(
+                f"apply_zoom: PixelArraySize not available for camera {camera_index}"
+            )
+            return
+
+        sensor_w, sensor_h = pixel_array_size
+        crop_w = int(sensor_w / zoom)
+        crop_h = int(sensor_h / zoom)
+        crop_x = (sensor_w - crop_w) // 2
+        crop_y = (sensor_h - crop_h) // 2
+        try:
+            picam2.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
+            self.logger.debug(
+                f"Camera {camera_index} zoom {zoom:.1f}x: "
+                f"ScalerCrop=({crop_x},{crop_y},{crop_w},{crop_h})"
+            )
+        except Exception as e:
+            self.logger.warning(
+                f"Failed to apply zoom to camera {camera_index}: {e}"
+            )
 
     def apply_controls(self, camera_index: int, controls: dict) -> None:
         """

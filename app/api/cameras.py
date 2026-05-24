@@ -35,6 +35,7 @@ class DeviceInfo(BaseModel):
 	awb_gains: Optional[List[float]] = None
 	# Capabilities
 	has_aperture_control: bool = False
+	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
 
 
 class CaptureRequest(BaseModel):
@@ -158,12 +159,15 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 
 			# Detect aperture control from cached picamera2 instance if available
 			has_aperture_control = False
+			supports_zoom = False
 			try:
 				from capture.service import get_backend
 				from capture.backends.picamera2_backend import Picamera2Backend
 				bk = get_backend()
 				if isinstance(bk, Picamera2Backend) and idx in bk._cameras:
 					has_aperture_control = "Aperture" in bk._cameras[idx].camera_controls
+				if isinstance(bk, Picamera2Backend):
+					supports_zoom = True  # All picamera2 cameras support ScalerCrop
 			except Exception:
 				pass
 
@@ -178,6 +182,7 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 				lens_position=lens_position,
 				awb_gains=awb_gains,
 				has_aperture_control=has_aperture_control,
+				supports_zoom=supports_zoom,
 			))
 
 		return devices
@@ -308,6 +313,7 @@ class CameraSettingsRequest(BaseModel):
 	exposure_time_us: Optional[int] = None    # Manual shutter time in microseconds
 	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ≈ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
+	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
 
 
 @router.post("/settings/{camera_index}")
@@ -337,7 +343,18 @@ def apply_camera_settings(
 	if request.colour_gains is not None and len(request.colour_gains) == 2:
 		controls["ColourGains"] = (float(request.colour_gains[0]), float(request.colour_gains[1]))
 
-	if not controls:
+	# Zoom is handled separately: requires picam2 instance to compute ScalerCrop
+	if request.zoom_factor is not None:
+		try:
+			from capture.service import apply_zoom
+			apply_zoom(camera_index, float(request.zoom_factor))
+		except RuntimeError as e:
+			raise HTTPException(status_code=404, detail=str(e))
+		except Exception as e:
+			logger.exception(f"apply_zoom failed for camera {camera_index}: {e}")
+			raise HTTPException(status_code=500, detail="Failed to apply zoom")
+
+	if not controls and request.zoom_factor is None:
 		return {"detail": "No controls specified"}
 
 	try:
