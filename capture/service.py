@@ -1,9 +1,28 @@
 import sys
 from pathlib import Path
 import time
+import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
+
+# Fixed temp-file paths for live preview frames (one per camera).
+# Using stable names rather than mkstemp prevents unbounded accumulation when
+# the process is killed before the finally-block cleanup runs.
+_PREVIEW_TMP_DIR = Path("/tmp")
+_PREVIEW_PREFIX = "dtk_preview_c"
+
+# Per-camera locks so concurrent polling requests serialise writes to the
+# shared fixed-path temp file.
+_preview_locks: dict = {}
+_preview_locks_mutex = threading.Lock()
+
+def _get_preview_lock(camera_index: int) -> threading.Lock:
+    """Return (creating if necessary) the per-camera lock for preview writes."""
+    with _preview_locks_mutex:
+        if camera_index not in _preview_locks:
+            _preview_locks[camera_index] = threading.Lock()
+        return _preview_locks[camera_index]
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -316,7 +335,9 @@ def capture_preview_frame(camera_index: int) -> bytes:
     Capture a low-resolution preview frame and return JPEG bytes.
 
     Not saved to the project directory — intended for live preview polling
-    from the frontend. Uses a temporary file cleaned up immediately after reading.
+    from the frontend. Uses a stable per-camera temp file that is overwritten
+    on every call (rather than mkstemp), so at most one file per camera ever
+    exists in /tmp even if the process is killed unexpectedly.
 
     The preview uses a lightweight configuration:
       - 1280×720 (native fast mode, no cropping)
@@ -334,15 +355,14 @@ def capture_preview_frame(camera_index: int) -> bytes:
     Raises:
         RuntimeError: If the camera is not connected or capture fails.
     """
-    import tempfile
-
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
-    # Use mkstemp so concurrent requests (e.g. two browser tabs) never share
-    # the same temp file, avoiding partial-read races.
-    fd, tmp_str = tempfile.mkstemp(suffix=".jpg", prefix=f"preview_c{camera_index}_")
-    tmp_path = Path(tmp_str)
+    # Fixed per-camera path — overwrites the same file each poll cycle.
+    # A per-camera lock serialises concurrent requests so two tabs never
+    # race on the same path.
+    tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
+    lock = _get_preview_lock(camera_index)
 
     preview_config = CameraConfig(
         camera_index=camera_index,
@@ -356,40 +376,53 @@ def capture_preview_frame(camera_index: int) -> bytes:
     )
 
     backend = get_backend()
-    import os
-    os.close(fd)  # Release the OS file descriptor; picamera2 will open it by path
 
-    for attempt in range(2):
-        try:
-            backend.capture_image(tmp_path, preview_config)
-            data = tmp_path.read_bytes()
-            return data
-        except Exception as exc:
-            subprocess_logger.warning(
-                f"Preview capture failed for camera {camera_index} "
-                f"(attempt {attempt + 1}/2): {exc}"
-            )
-            # Evict the cached camera instance so the next attempt (or the
-            # next polling cycle) gets a clean Picamera2 object.
-            if hasattr(backend, "reset_camera"):
-                backend.reset_camera(camera_index)
-            if attempt == 1:
-                raise RuntimeError(
-                    f"Preview capture failed for camera {camera_index}: {exc}"
-                ) from exc
-        finally:
+    with lock:
+        for attempt in range(2):
             try:
-                tmp_path.unlink(missing_ok=True)
-            except Exception:
-                pass
-            # Recreate the temp file for a potential second attempt
-            if attempt == 0:
-                import tempfile as _tf
-                fd, tmp_str = _tf.mkstemp(
-                    suffix=".jpg", prefix=f"preview_c{camera_index}_"
+                backend.capture_image(tmp_path, preview_config)
+                data = tmp_path.read_bytes()
+                return data
+            except Exception as exc:
+                subprocess_logger.warning(
+                    f"Preview capture failed for camera {camera_index} "
+                    f"(attempt {attempt + 1}/2): {exc}"
                 )
-                tmp_path = Path(tmp_str)
-                os.close(fd)
+                # Evict the cached camera instance so the next attempt (or the
+                # next polling cycle) gets a clean Picamera2 object.
+                if hasattr(backend, "reset_camera"):
+                    backend.reset_camera(camera_index)
+                if attempt == 1:
+                    raise RuntimeError(
+                        f"Preview capture failed for camera {camera_index}: {exc}"
+                    ) from exc
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def flush_preview_tmp() -> int:
+    """
+    Delete all stale preview temp files from /tmp.
+
+    Useful when the server was previously killed without running cleanup,
+    leaving behind dtk_preview_c*.jpg files.  Safe to call at any time;
+    files in active use are simply recreated on the next polling cycle.
+
+    Returns:
+        Number of files deleted.
+    """
+    count = 0
+    for f in _PREVIEW_TMP_DIR.glob(f"{_PREVIEW_PREFIX}*.jpg"):
+        try:
+            f.unlink(missing_ok=True)
+            subprocess_logger.info(f"Flushed stale preview temp file: {f}")
+            count += 1
+        except Exception as e:
+            subprocess_logger.warning(f"Could not remove preview temp file {f}: {e}")
+    return count
 
 
 # ---------------------------------------------------------------------------

@@ -210,6 +210,28 @@ def get_camera_preview(
 		raise HTTPException(status_code=500, detail="Preview capture failed")
 
 
+@router.delete("/preview/tmp")
+def flush_preview_tmp_files(
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Delete stale preview temp files left in /tmp.
+
+	These files (dtk_preview_c*.jpg) are normally removed immediately after each
+	preview poll, but can be left behind if the backend process was killed
+	unexpectedly.  Call this from the admin settings page to reclaim disk space.
+
+	Returns the number of files deleted.
+	"""
+	try:
+		from capture.service import flush_preview_tmp
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	deleted = flush_preview_tmp()
+	return {"deleted": deleted, "detail": f"Removed {deleted} stale preview file(s) from /tmp"}
+
+
 # ---------------------------------------------------------------------------
 # Focus endpoints
 # ---------------------------------------------------------------------------
