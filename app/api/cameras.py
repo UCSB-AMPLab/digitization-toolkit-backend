@@ -1,3 +1,4 @@
+from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
@@ -709,40 +710,54 @@ def calibrate_camera(
 	focus position which is then stored and reused for faster captures.
 	"""
 	try:
-		from capture.calibration import CameraCalibration
 		from capture.camera_registry import CameraRegistry
 		from capture.camera import IMG_SIZES
+		from capture.service import get_backend
 	except ImportError as e:
 		return CalibrationResponse(success=False, error=f"Calibration system not available: {e}")
-	
+
 	try:
-		# Get resolution
 		img_size = IMG_SIZES.get(request.resolution, IMG_SIZES["high"])
-		
-		# Run calibration
-		cal = CameraCalibration(request.camera_index)
-		result = cal.calibrate_focus(img_size=img_size, verbose=False)
-		
+
+		# Route the AF cycle through the backend's own Picamera2 instance.
+		# The old approach (CameraCalibration / calibration.py) opened a brand-new
+		# Picamera2(camera_index) independently of the service cache.  Two concurrent
+		# libcamera handles on the same hardware corrupt both, leaving the service
+		# instance in a broken state so the next capture hangs indefinitely.
+		#
+		# run_autofocus_calibration() acquires the per-camera lock, reuses the cached
+		# instance, and leaves the camera stopped-but-not-closed for the next request.
+		backend = get_backend()
+		result = backend.run_autofocus_calibration(request.camera_index, img_size)
+
 		if result["success"]:
 			# Save calibration to registry
 			registry = CameraRegistry()
 			hw_id, _ = registry.get_camera_hardware_id(request.camera_index)
-			
+
 			if hw_id:
-				# Ensure camera is registered
 				registry.register_camera(request.camera_index)
-				# Update calibration data
-				registry.update_calibration(hw_id, cal.calibration_data)
-				logger.info(f"Saved calibration for {hw_id}: lens_position={result['lens_position']}")
-		
+				calibration_data = {
+					"camera_index": request.camera_index,
+					"calibrated_at": datetime.now(timezone.utc).isoformat(),
+					"focus": result,
+					"white_balance": {},
+					"exposure": {},
+				}
+				registry.update_calibration(hw_id, calibration_data)
+				logger.info(
+					f"Saved autofocus calibration for {hw_id}: "
+					f"lens_position={result['lens_position']}"
+				)
+
 		return CalibrationResponse(
 			success=result["success"],
 			lens_position=result.get("lens_position"),
 			distance_meters=result.get("distance_meters"),
-			af_time=result.get("af_time")
+			af_time=result.get("af_time"),
 		)
 	except Exception as e:
-		logger.exception(f"Calibration failed: {e}")
+		logger.exception(f"Autofocus calibration failed: {e}")
 		return CalibrationResponse(success=False, error=str(e))
 
 

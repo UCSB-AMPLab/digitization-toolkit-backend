@@ -449,6 +449,83 @@ class Picamera2Backend(CameraBackend):
             except Exception as e:
                 self.logger.warning(f"Error while resetting camera {camera_index}: {e}")
 
+    def run_autofocus_calibration(self, camera_index: int, img_size: tuple) -> dict:
+        """
+        Run an autofocus calibration cycle using the cached Picamera2 instance.
+
+        Acquires the per-camera lock so this is safe to call while preview
+        polling is active — it blocks until any in-flight preview completes,
+        then holds the lock for the duration of the AF cycle.
+
+        Unlike the legacy ``CameraCalibration`` class, this method does NOT
+        open a second ``Picamera2`` instance.  Creating two libcamera
+        connections to the same hardware corrupts both handles and leaves the
+        service's cached instance in a broken state.
+
+        After the AF cycle the camera is left *stopped* but not closed.
+        ``_last_configs`` and ``_format_mode`` are cleared so the next
+        preview/capture call knows to reconfigure from scratch.
+
+        Args:
+            camera_index: Camera index (0 or 1).
+            img_size: Resolution tuple for the still capture configuration.
+
+        Returns:
+            Dict with keys: success, lens_position, distance_meters, af_time
+        """
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            picam2 = self._get_camera(camera_index)
+
+            # Reconfigure to high-res still mode for the AF cycle
+            if picam2.started:
+                picam2.stop()
+
+            still_config = picam2.create_still_configuration(
+                main={"size": img_size}
+            )
+            picam2.configure(still_config)
+            picam2.start()
+            picam2.set_controls({"AfMode": 1})
+
+            af_start = time.time()
+            success = picam2.autofocus_cycle()
+            af_time = time.time() - af_start
+
+            result: dict = {
+                "success": success,
+                "af_time": af_time,
+                "lens_position": None,
+                "distance_meters": None,
+            }
+
+            if success:
+                metadata = picam2.capture_metadata()
+                lens_position = metadata.get("LensPosition")
+                if lens_position is not None:
+                    result["lens_position"] = lens_position
+                    result["distance_meters"] = (
+                        1.0 / lens_position if lens_position > 0 else float("inf")
+                    )
+                    self.logger.info(
+                        f"Autofocus calibration camera {camera_index}: "
+                        f"LensPosition={lens_position:.3f} dpt "
+                        f"({af_time:.2f}s)"
+                    )
+            else:
+                self.logger.warning(
+                    f"Autofocus calibration failed for camera {camera_index} "
+                    f"after {af_time:.2f}s"
+                )
+
+            # Leave camera stopped; clear cached config so the next
+            # capture_image() / preview call reconfigures cleanly.
+            picam2.stop()
+            self._last_configs.pop(camera_index, None)
+            self._format_mode.pop(camera_index, None)
+
+            return result
+
     def apply_controls(self, camera_index: int, controls: dict) -> None:
         """
         Apply picamera2 controls to a running camera without a full capture.
