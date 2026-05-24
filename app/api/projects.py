@@ -192,15 +192,19 @@ def delete_project(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete a project.
-    
-    Note: This only deletes the database record. Associated records
-    are unlinked but not deleted. Filesystem cleanup must be done separately.
+    Delete a project and its filesystem directory.
+
+    Deletes the DB record, unlinks associated records, then removes the
+    project directory (including all collection subdirectories and images).
     """
+    import shutil
+    from app.core.config import settings
+    from capture.project_manager import secure_project_filename
+
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     project_name = p.name
     # Unlink all records from this project
     db.query(Record).filter(Record.project_id == project_id).update(
@@ -211,6 +215,24 @@ def delete_project(
     db.commit()
     log_event(db, level="WARN", category="activity", action="project_deleted",
               actor=current_user.username, subject=project_name)
+
+    # Remove the project directory from disk.
+    # Two candidate paths are tried because project_init() sanitizes the name
+    # (spaces → underscores) while capture_image() uses the raw name directly.
+    safe_name = secure_project_filename(project_name)
+    candidates = [settings.projects_dir / project_name]
+    if safe_name != project_name:
+        candidates.append(settings.projects_dir / safe_name)
+
+    for candidate in candidates:
+        if candidate.exists() and candidate.is_dir():
+            try:
+                shutil.rmtree(candidate)
+                logger.info(f"Removed project directory: {candidate}")
+            except Exception as e:
+                logger.warning(f"Could not remove project directory {candidate}: {e}")
+            break
+
     return {"detail": "project deleted"}
 
 

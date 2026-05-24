@@ -216,11 +216,15 @@ def delete_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete a collection.
+    Delete a collection and its filesystem directory.
 
     Warning: This will cascade delete all child collections and orphan any records in this collection.
     Use POST /{collection_id}/move-records first if you want to preserve the records.
     """
+    import shutil
+    from app.core.config import settings
+    from capture.project_manager import secure_project_filename
+
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
@@ -233,6 +237,26 @@ def delete_collection(
     if record_count > 0:
         logger.warning(f"Deleting collection {collection_id} with {record_count} records - records will be orphaned")
 
+    # Capture names before deleting from DB
+    collection_name = collection.name
+    project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
+    project_name = project.name if project else None
+
     db.delete(collection)
     db.commit()
+
+    # Remove the collection directory from disk (project/collection/images/).
+    # Try both raw and sanitized names to handle historic inconsistencies.
+    if project_name:
+        safe_col = secure_project_filename(collection_name)
+        for proj_dir in [settings.projects_dir / project_name, settings.projects_dir / secure_project_filename(project_name)]:
+            for col_dir in ([proj_dir / collection_name] + ([proj_dir / safe_col] if safe_col != collection_name else [])):
+                if col_dir.exists() and col_dir.is_dir():
+                    try:
+                        shutil.rmtree(col_dir)
+                        logger.info(f"Removed collection directory: {col_dir}")
+                    except Exception as e:
+                        logger.warning(f"Could not remove collection directory {col_dir}: {e}")
+                    break
+
     return None
