@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 import json
 from typing import Optional, Tuple
+import re
+import unicodedata
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -23,6 +25,10 @@ subprocess_logger = setup_rotating_logger(
     logger_name="project_manager"
 )
 
+def secure_project_filename(project_name):
+    project_name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
+    project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
+    return project_name.lstrip('.')
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """
@@ -126,7 +132,8 @@ def project_init(
     Returns:
         Path to the created project directory
     """
-    project_path = Path(PROJECTS_ROOT, project_name)
+        
+    project_path = Path(PROJECTS_ROOT, secure_project_filename(project_name))
     images_main = Path(project_path, "images", "main")
     images_temp = Path(project_path, "images", "temp")
     images_trash = Path(project_path, "images", "trash")
