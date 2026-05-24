@@ -8,6 +8,7 @@ live preview, and dynamic settings adjustment.
 
 import sys
 import time
+import threading
 from pathlib import Path
 
 # Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi)
@@ -54,7 +55,18 @@ class Picamera2Backend(CameraBackend):
         self._camera_info = None
         self._last_configs = {}  # Track last configuration for each camera
         self._format_mode = {}  # Track format mode per camera (YUV420 vs RGB888)
+        # Per-camera mutex: serialises preview polling and full captures so they
+        # never call capture_request() on the same Picamera2 instance simultaneously.
+        self._camera_locks: dict = {}
+        self._locks_mutex = threading.Lock()
     
+    def _get_camera_lock(self, camera_index: int) -> threading.Lock:
+        """Return (creating if needed) the per-camera threading.Lock."""
+        with self._locks_mutex:
+            if camera_index not in self._camera_locks:
+                self._camera_locks[camera_index] = threading.Lock()
+            return self._camera_locks[camera_index]
+
     def _get_camera_info(self):
         """Get global camera information (cached)."""
         if self._camera_info is None:
@@ -213,6 +225,17 @@ class Picamera2Backend(CameraBackend):
         Raises:
             RuntimeError: If capture fails.
         """
+        lock = self._get_camera_lock(camera_config.camera_index)
+        with lock:
+            return self._capture_image_locked(output_path, camera_config, capture_output)
+
+    def _capture_image_locked(
+        self,
+        output_path: Path,
+        camera_config,
+        capture_output: bool = False
+    ) -> str:
+        """Internal capture implementation — must be called with the camera lock held."""
         try:
             picam2 = self._get_camera(camera_config.camera_index)
             
