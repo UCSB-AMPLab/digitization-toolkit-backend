@@ -393,6 +393,10 @@ def trigger_capture(
 		project = db.query(Project).filter(Project.name == request.project_name).first()
 		project_id = project.id if project else None
 		
+		# Records can have either project_id OR collection_id, not both (DB constraint).
+		# When a collection is provided, the project association is implicit through it.
+		effective_project_id = None if request.collection_id else project_id
+		
 		# Get or create Record
 		if request.record_id:
 			# Link to existing record
@@ -405,7 +409,7 @@ def trigger_capture(
 				title=request.record_title or f"{request.project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
 				object_typology="document",
-				project_id=project_id,
+				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				created_by=current_user.username,
 			)
@@ -532,6 +536,10 @@ def trigger_dual_capture(
 		project = db.query(Project).filter(Project.name == request.project_name).first()
 		project_id = project.id if project else None
 		
+		# Records can have either project_id OR collection_id, not both (DB constraint).
+		# When a collection is provided, the project association is implicit through it.
+		effective_project_id = None if request.collection_id else project_id
+		
 		# Get or create Record
 		if request.record_id:
 			# Link to existing record (adding new pages to multi-page document)
@@ -544,7 +552,7 @@ def trigger_dual_capture(
 				title=request.record_title or f"{request.project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				object_typology="book",  # Default to book for dual captures
-				project_id=project_id,
+				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				created_by=current_user.username,
 			)
