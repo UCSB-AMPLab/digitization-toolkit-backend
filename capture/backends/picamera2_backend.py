@@ -526,6 +526,97 @@ class Picamera2Backend(CameraBackend):
 
             return result
 
+    def run_white_balance_calibration(
+        self, camera_index: int, stabilization_frames: int = 30
+    ) -> dict:
+        """
+        Run a white balance calibration cycle using the cached Picamera2 instance.
+
+        Acquires the per-camera lock, uses a preview configuration to collect
+        ``stabilization_frames`` frames of AWB metadata, then reads the
+        converged ColourGains.
+
+        Like ``run_autofocus_calibration``, this method does NOT open a second
+        Picamera2 instance — doing so would corrupt the service's cached handle.
+
+        After the cycle the camera is left stopped; ``_last_configs`` and
+        ``_format_mode`` are cleared so the next request reconfigures cleanly.
+
+        Args:
+            camera_index: Camera index (0 or 1).
+            stabilization_frames: Frames to wait for AWB to converge (default 30).
+
+        Returns:
+            Dict with keys: success, awb_gains, colour_temperature, converged
+        """
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            picam2 = self._get_camera(camera_index)
+
+            if picam2.started:
+                picam2.stop()
+
+            # Preview config is sufficient for metadata reads — much faster than still
+            preview_config = picam2.create_preview_configuration(
+                main={"size": (1920, 1080)}
+            )
+            picam2.configure(preview_config)
+            picam2.start()
+
+            # Enable AWB and let the algorithm converge over several frames
+            picam2.set_controls({"AwbEnable": True, "AwbMode": 0})  # 0 = Auto
+
+            awb_gains_history: list = []
+            for _ in range(stabilization_frames):
+                metadata = picam2.capture_metadata()
+                gains = metadata.get("ColourGains")
+                if gains:
+                    awb_gains_history.append(gains)
+
+            # Read final settled values
+            final_metadata = picam2.capture_metadata()
+            final_gains = final_metadata.get("ColourGains")
+            colour_temp = final_metadata.get("ColourTemperature")
+
+            result: dict = {
+                "success": False,
+                "awb_gains": None,
+                "colour_temperature": None,
+                "converged": None,
+            }
+
+            if final_gains:
+                result["success"] = True
+                result["awb_gains"] = list(final_gains)
+                result["colour_temperature"] = colour_temp
+
+                # Convergence: variance of last 10 samples < 0.05
+                if len(awb_gains_history) >= 10:
+                    recent = awb_gains_history[-10:]
+                    r_vals = [g[0] for g in recent]
+                    b_vals = [g[1] for g in recent]
+                    result["converged"] = (
+                        max(r_vals) - min(r_vals) < 0.05
+                        and max(b_vals) - min(b_vals) < 0.05
+                    )
+
+                self.logger.info(
+                    f"WB calibration camera {camera_index}: "
+                    f"R={final_gains[0]:.3f}, B={final_gains[1]:.3f}"
+                    + (f", ~{colour_temp}K" if colour_temp else "")
+                )
+            else:
+                self.logger.warning(
+                    f"WB calibration camera {camera_index}: "
+                    "no ColourGains in metadata"
+                )
+
+            picam2.stop()
+            self._last_configs.pop(camera_index, None)
+            self._format_mode.pop(camera_index, None)
+
+            return result
+
     def apply_controls(self, camera_index: int, controls: dict) -> None:
         """
         Apply picamera2 controls to a running camera without a full capture.

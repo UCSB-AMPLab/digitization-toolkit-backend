@@ -774,37 +774,45 @@ def calibrate_white_balance(
 	then save the gains for future captures.
 	"""
 	try:
-		from capture.calibration import CameraCalibration
 		from capture.camera_registry import CameraRegistry
-		from capture.camera import IMG_SIZES
+		from capture.service import get_backend
 	except ImportError as e:
 		return WhiteBalanceCalibrationResponse(success=False, error=f"Calibration system not available: {e}")
-	
+
 	try:
-		img_size = IMG_SIZES.get(request.resolution, IMG_SIZES["high"])
-		
-		cal = CameraCalibration(request.camera_index)
-		result = cal.calibrate_white_balance(
-			img_size=img_size,
+		# Route WB calibration through the backend's cached Picamera2 instance —
+		# same reason as autofocus: calibration.py would open a second handle and
+		# corrupt the service's cached one.
+		backend = get_backend()
+		result = backend.run_white_balance_calibration(
+			request.camera_index,
 			stabilization_frames=request.stabilization_frames,
-			verbose=False
 		)
-		
+
 		if result["success"]:
-			# Save calibration to registry
 			registry = CameraRegistry()
 			hw_id, _ = registry.get_camera_hardware_id(request.camera_index)
-			
+
 			if hw_id:
 				registry.register_camera(request.camera_index)
-				registry.update_calibration(hw_id, cal.calibration_data)
-				logger.info(f"Saved WB calibration for {hw_id}: gains={result['awb_gains']}")
-		
+				# Merge into existing calibration data so focus entry is preserved
+				existing = registry.cameras.get("cameras", {}).get(hw_id, {}).get("calibration", {})
+				calibration_data = {
+					**existing,
+					"camera_index": request.camera_index,
+					"calibrated_at": datetime.now(timezone.utc).isoformat(),
+					"white_balance": result,
+				}
+				registry.update_calibration(hw_id, calibration_data)
+				logger.info(
+					f"Saved WB calibration for {hw_id}: gains={result['awb_gains']}"
+				)
+
 		return WhiteBalanceCalibrationResponse(
 			success=result["success"],
-			awb_gains=list(result["awb_gains"]) if result.get("awb_gains") else None,
+			awb_gains=result.get("awb_gains"),
 			colour_temperature=result.get("colour_temperature"),
-			converged=result.get("converged")
+			converged=result.get("converged"),
 		)
 	except Exception as e:
 		logger.exception(f"White balance calibration failed: {e}")
