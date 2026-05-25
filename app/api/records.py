@@ -15,7 +15,8 @@ from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.record import (
 	RecordCreate, RecordRead, RecordUpdate,
-	RecordImageCreate, RecordImageRead, RecordImageUpdate
+	RecordImageCreate, RecordImageRead, RecordImageUpdate,
+	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS
 )
 from app.core.config import settings
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
@@ -150,6 +151,13 @@ def delete_record(
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+
+	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first
+	if rec.status in ("in_review", "approved") and current_user.role != "admin":
+		raise HTTPException(
+			status_code=409,
+			detail=f"Cannot delete a record with status '{rec.status}'. Move it to 'rejected' first."
+		)
 	
 	# Clean up image files and thumbnails
 	for img in rec.images:
@@ -410,3 +418,116 @@ def get_image_thumbnail(
 		filename=f"{Path(img.filename).stem}_thumb.jpg",
 		media_type="image/jpeg"
 	)
+
+
+# ==============================================================================
+# Status management endpoints
+# ==============================================================================
+
+def _apply_status_change(
+	rec: Record,
+	new_status: str,
+	rejection_note: Optional[str],
+	user_role: str,
+) -> None:
+	"""
+	Validate and apply a status transition on a Record.
+	Raises HTTPException on invalid transition or insufficient role.
+	"""
+	current_status = rec.status or "captured"
+	if current_status == new_status:
+		return  # no-op
+
+	allowed_roles = STATUS_TRANSITIONS.get((current_status, new_status))
+	if allowed_roles is None:
+		raise HTTPException(
+			status_code=422,
+			detail=f"Transition '{current_status}' → '{new_status}' is not allowed."
+		)
+	if user_role not in allowed_roles:
+		raise HTTPException(
+			status_code=403,
+			detail=f"Your role '{user_role}' cannot perform the '{current_status}' → '{new_status}' transition."
+		)
+
+	rec.status = new_status
+	rec.rejection_note = rejection_note if new_status == "rejected" else None
+
+
+@router.patch("/{rec_id}/status", response_model=RecordRead)
+def update_record_status(
+	rec_id: int,
+	payload: RecordStatusUpdate,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""
+	Change the QA status of a record.
+
+	Valid transitions and required roles:
+	- captured  → in_review : operator, admin, reviewer
+	- in_review → rejected  : reviewer, admin
+	- in_review → approved  : reviewer, admin
+	- in_review → captured  : operator, admin  (cancel review)
+	- rejected  → captured  : operator, admin  (prepare for retake)
+	- approved  → rejected  : reviewer, admin  (flag for rework)
+	- approved  → captured  : admin only        (full reset)
+	"""
+	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+
+	_apply_status_change(rec, payload.status, payload.rejection_note, current_user.role)
+
+	db.commit()
+	db.refresh(rec)
+	return RecordRead.model_validate(rec)
+
+
+@router.post("/bulk-status", response_model=List[RecordRead])
+def bulk_update_status(
+	payload: BulkStatusUpdate,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""
+	Change the QA status of multiple records at once.
+	Records where the transition is not valid are skipped and reported in the response.
+
+	Returns the updated records.
+	"""
+	records = (
+		db.query(Record)
+		.options(joinedload(Record.images))
+		.filter(Record.id.in_(payload.record_ids))
+		.all()
+	)
+	if not records:
+		raise HTTPException(status_code=404, detail="No matching records found")
+
+	skipped: list[int] = []
+	updated: list[Record] = []
+
+	for rec in records:
+		current_status = rec.status or "captured"
+		if current_status == payload.status:
+			updated.append(rec)
+			continue
+
+		allowed_roles = STATUS_TRANSITIONS.get((current_status, payload.status))
+		if allowed_roles is None or current_user.role not in allowed_roles:
+			skipped.append(rec.id)
+			continue
+
+		rec.status = payload.status
+		rec.rejection_note = payload.rejection_note if payload.status == "rejected" else None
+		updated.append(rec)
+
+	db.commit()
+	for rec in updated:
+		db.refresh(rec)
+
+	if skipped:
+		logger.info(f"bulk-status: skipped {len(skipped)} records (invalid transition or insufficient role): {skipped}")
+
+	return [RecordRead.model_validate(r) for r in updated]
