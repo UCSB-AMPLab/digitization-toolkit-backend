@@ -11,7 +11,6 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from picamera2 import Picamera2
 
-
 class CameraCalibration:
     """
     Manages camera calibration for optimal settings.

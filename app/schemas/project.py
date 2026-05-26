@@ -6,6 +6,9 @@ from datetime import datetime
 class ProjectBase(BaseModel):
     name: str
     description: Optional[str] = None
+    fondo: Optional[str] = None
+    serie: Optional[str] = None
+    signatura: Optional[str] = None
 
 
 class ProjectCreate(ProjectBase):
@@ -16,6 +19,9 @@ class ProjectUpdate(BaseModel):
     """Schema for updating a project. All fields optional."""
     name: Optional[str] = None
     description: Optional[str] = None
+    fondo: Optional[str] = None
+    serie: Optional[str] = None
+    signatura: Optional[str] = None
 
 
 class ProjectRead(ProjectBase):

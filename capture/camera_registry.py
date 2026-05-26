@@ -10,7 +10,6 @@ from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
 from picamera2 import Picamera2
 
-
 class CameraRegistry:
     """
     Manages global camera registry with hardware identification.
