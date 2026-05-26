@@ -7,6 +7,7 @@ from app.api.deps import get_db_dependency
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token
+from app.core.audit import log_event
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
@@ -16,14 +17,41 @@ security = HTTPBearer()
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
+@router.get("/setup/status")
+def setup_status(db: Session = Depends(get_db_dependency)):
+    """Check whether initial setup is needed (no users exist yet). No auth required."""
+    needs_setup = db.query(User).count() == 0
+    return {"needs_setup": needs_setup}
+
+
 @router.post("/register", response_model=UserRead)
-def register(payload: UserCreate, db: Session = Depends(get_db_dependency)):
-    if db.query(User).filter((User.username == payload.username) | (User.email == payload.email)).first():
+def register(
+    payload: UserCreate,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    db: Session = Depends(get_db_dependency),
+):
+    is_first_user = db.query(User).count() == 0
+
+    if not is_first_user:
+        # After bootstrap, only admins may create accounts.
+        if not credentials:
+            raise HTTPException(status_code=401, detail="Not authenticated")
+        token_payload = verify_access_token(credentials.credentials)
+        if not token_payload:
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
+        caller = db.query(User).filter(
+            User.id == int(token_payload.get("sub")), User.is_active == True
+        ).first()
+        if not caller or caller.role != "admin":
+            raise HTTPException(status_code=403, detail="Only admins can register new users")
+
+    if db.query(User).filter(
+        (User.username == payload.username) | (User.email == payload.email)
+    ).first():
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
-    # First user in the system becomes admin (bootstrap); all subsequent users are reviewers.
+    # First user becomes admin (bootstrap); all subsequent users start as reviewer.
     # Role is never taken from the request payload — use PATCH /auth/users/{id}/role to elevate.
-    is_first_user = db.query(User).count() == 0
     role = "admin" if is_first_user else "reviewer"
 
     user = User(
@@ -35,6 +63,9 @@ def register(payload: UserCreate, db: Session = Depends(get_db_dependency)):
     db.add(user)
     db.commit()
     db.refresh(user)
+    actor = caller.username if not is_first_user else "bootstrap"
+    log_event(db, level="INFO", category="access", action="user_created",
+              actor=actor, subject=user.username)
     return UserRead.model_validate(user)
 
 
@@ -42,9 +73,15 @@ def register(payload: UserCreate, db: Session = Depends(get_db_dependency)):
 def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
+        log_event(db, level="WARN", category="access", action="login_failed",
+                  actor=payload.username)
         raise HTTPException(status_code=401, detail="Invalid credentials")
     if not user.is_active:
+        log_event(db, level="WARN", category="access", action="login_failed",
+                  actor=user.username, detail="cuenta inactiva")
         raise HTTPException(status_code=403, detail="User is inactive")
+    log_event(db, level="INFO", category="access", action="login_success",
+              actor=user.username)
     token = create_access_token(subject=str(user.id))
     return {"access_token": token, "token_type": "bearer"}
 

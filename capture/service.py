@@ -1,9 +1,28 @@
 import sys
 from pathlib import Path
 import time
+import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
+
+# Fixed temp-file paths for live preview frames (one per camera).
+# Using stable names rather than mkstemp prevents unbounded accumulation when
+# the process is killed before the finally-block cleanup runs.
+_PREVIEW_TMP_DIR = Path("/tmp")
+_PREVIEW_PREFIX = "dtk_preview_c"
+
+# Per-camera locks so concurrent polling requests serialise writes to the
+# shared fixed-path temp file.
+_preview_locks: dict = {}
+_preview_locks_mutex = threading.Lock()
+
+def _get_preview_lock(camera_index: int) -> threading.Lock:
+    """Return (creating if necessary) the per-camera lock for preview writes."""
+    with _preview_locks_mutex:
+        if camera_index not in _preview_locks:
+            _preview_locks[camera_index] = threading.Lock()
+        return _preview_locks[camera_index]
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -13,6 +32,7 @@ from .utils import setup_rotating_logger
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend
+from .project_manager import secure_project_filename
 
 from app.core.config import settings
 
@@ -24,6 +44,18 @@ subprocess_logger = setup_rotating_logger(
     log_file=str(LOG_FILE),
     logger_name="capture_service"
 )
+
+# Route picamera2's own log output into the same rotating log file.
+# picamera2 uses Python's standard logging under the "picamera2" namespace,
+# so we attach a single RotatingFileHandler from the existing logger.
+import logging as _logging
+from logging.handlers import RotatingFileHandler as _RFH
+_picamera2_logger = _logging.getLogger("picamera2")
+if not _picamera2_logger.handlers:
+    _rfh = next((h for h in subprocess_logger.handlers if isinstance(h, _RFH)), None)
+    if _rfh:
+        _picamera2_logger.setLevel(_logging.DEBUG)
+        _picamera2_logger.addHandler(_rfh)
 
 # Initialize camera backend based on configuration
 def get_camera_backend() -> CameraBackend:
@@ -108,7 +140,8 @@ def capture_image(
         output_filename: Optional[str] = None,
         check_camera: bool = True,
         include_resolution: bool = False,
-        capture_output: bool = False) -> str:
+        capture_output: bool = False,
+        collection_name: Optional[str] = None) -> str:
     """
     Capture an image using the rpicam-still command.
     
@@ -126,7 +159,10 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = PROJECTS_ROOT / project_name / "images" / "main"
+    if collection_name:
+        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / secure_project_filename(collection_name) / "images" / "main"
+    else:
+        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / "images" / "main"
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -157,7 +193,8 @@ def single_capture_image(
         project_name: str,
         camera_config: CameraConfig,
         check_camera: bool = True,
-        include_resolution: bool = False) -> tuple:
+        include_resolution: bool = False,
+        collection_name: Optional[str] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -179,7 +216,8 @@ def single_capture_image(
         project_name=project_name,
         camera_config=camera_config,
         check_camera=False,  # Already checked
-        include_resolution=include_resolution
+        include_resolution=include_resolution,
+        collection_name=collection_name
     )
     
     elapsed_time = time.time() - start_time
@@ -207,7 +245,8 @@ def dual_capture_image(
         cam2_config: CameraConfig,
         check_camera: bool = True,
         include_resolution: bool = False,
-        stagger_ms: int = 20) -> tuple:
+        stagger_ms: int = 20,
+        collection_name: Optional[str] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -260,7 +299,8 @@ def dual_capture_image(
             output_filename=fname,
             check_camera=False,  # Already checked
             include_resolution=include_resolution,
-            capture_output=False  # Max performance
+            capture_output=False,  # Max performance
+            collection_name=collection_name
         )
         elapsed = time.time() - start
         return path, elapsed, metadata
@@ -302,6 +342,194 @@ def dual_capture_image(
     
     return img1_path, img2_path, record.capture_id, record.pair_id
     
+def capture_preview_frame(camera_index: int) -> bytes:
+    """
+    Capture a low-resolution preview frame and return JPEG bytes.
+
+    Not saved to the project directory — intended for live preview polling
+    from the frontend. Uses a stable per-camera temp file that is overwritten
+    on every call (rather than mkstemp), so at most one file per camera ever
+    exists in /tmp even if the process is killed unexpectedly.
+
+    The preview uses a lightweight configuration:
+      - 1280×720 (native fast mode, no cropping)
+      - No autofocus cycle (too slow for live preview)
+      - No AE stabilisation wait
+      - No temporal denoise warmup
+      - Reduced JPEG quality (75) for a smaller payload
+
+    Args:
+        camera_index: Camera index (0 or 1).
+
+    Returns:
+        JPEG bytes of the preview frame.
+
+    Raises:
+        RuntimeError: If the camera is not connected or capture fails.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    # Fixed per-camera path — overwrites the same file each poll cycle.
+    # A per-camera lock serialises concurrent requests so two tabs never
+    # race on the same path.
+    tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
+    lock = _get_preview_lock(camera_index)
+
+    preview_config = CameraConfig(
+        camera_index=camera_index,
+        img_size=(1280, 720),        # Native 80 fps mode — fast, no crop
+        autofocus_on_capture=False,  # Skip AF cycle for live preview
+        timeout=0,                   # No AE stabilisation wait
+        denoise_frames=0,            # No temporal denoise warmup
+        quality=75,                  # Smaller payload for polling
+        encoding="jpg",
+        raw=False,
+    )
+
+    backend = get_backend()
+
+    with lock:
+        for attempt in range(2):
+            try:
+                backend.capture_image(tmp_path, preview_config)
+                data = tmp_path.read_bytes()
+                return data
+            except Exception as exc:
+                subprocess_logger.warning(
+                    f"Preview capture failed for camera {camera_index} "
+                    f"(attempt {attempt + 1}/2): {exc}"
+                )
+                # Evict the cached camera instance so the next attempt (or the
+                # next polling cycle) gets a clean Picamera2 object.
+                if hasattr(backend, "reset_camera"):
+                    backend.reset_camera(camera_index)
+                if attempt == 1:
+                    raise RuntimeError(
+                        f"Preview capture failed for camera {camera_index}: {exc}"
+                    ) from exc
+            finally:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except Exception:
+                    pass
+
+
+def flush_preview_tmp() -> int:
+    """
+    Delete all stale preview temp files from /tmp.
+
+    Useful when the server was previously killed without running cleanup,
+    leaving behind dtk_preview_c*.jpg files.  Safe to call at any time;
+    files in active use are simply recreated on the next polling cycle.
+
+    Returns:
+        Number of files deleted.
+    """
+    count = 0
+    for f in _PREVIEW_TMP_DIR.glob(f"{_PREVIEW_PREFIX}*.jpg"):
+        try:
+            f.unlink(missing_ok=True)
+            subprocess_logger.info(f"Flushed stale preview temp file: {f}")
+            count += 1
+        except Exception as e:
+            subprocess_logger.warning(f"Could not remove preview temp file {f}: {e}")
+    return count
+
+
+# ---------------------------------------------------------------------------
+# Focus helpers
+# ---------------------------------------------------------------------------
+
+def get_focus(camera_index: int) -> float:
+    """Return the current lens position (dioptres) for *camera_index*.
+
+    Reads the value from the running Picamera2 instance's metadata if
+    available, otherwise falls back to 0.0 (infinity).
+    """
+    backend = get_backend()
+
+    # picamera2 backend exposes the cached instance
+    if hasattr(backend, "_cameras") and camera_index in backend._cameras:
+        picam2 = backend._cameras[camera_index]
+        try:
+            meta = picam2.capture_metadata()
+            # LensPosition is available when AF is in use (may be None otherwise)
+            pos = meta.get("LensPosition")
+            if pos is not None:
+                return float(pos)
+        except Exception:
+            pass
+
+    return 0.0
+
+
+def set_focus(camera_index: int, lens_position: float) -> float:
+    """Set the lens to *lens_position* dioptres on *camera_index*.
+
+    Switches the camera to manual AF mode and applies the controls.
+    Returns the applied lens_position.
+
+    Raises RuntimeError if the camera is not connected or the backend does
+    not support manual focus control.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+
+    # Clamp to a reasonable range (0 = infinity, 10 = ~10 cm)
+    pos = max(0.0, min(10.0, float(lens_position)))
+
+    if hasattr(backend, "apply_controls"):
+        backend.apply_controls(camera_index, {
+            "AfMode": 0,        # 0 = Manual AF mode
+            "LensPosition": pos,
+        })
+    else:
+        raise RuntimeError("Current camera backend does not support manual focus")
+
+    return pos
+
+
+def set_camera_controls(camera_index: int, controls: dict) -> None:
+    """Apply arbitrary picamera2 controls to *camera_index* live.
+
+    *controls* should use picamera2 control names directly
+    (e.g. ``{'AeEnable': False, 'ExposureTime': 125}``).
+
+    Raises RuntimeError if the camera is not available or the backend does not
+    support live control updates.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not hasattr(backend, "apply_controls"):
+        raise RuntimeError("Current camera backend does not support live control updates")
+
+    backend.apply_controls(camera_index, controls)
+
+
+def apply_zoom(camera_index: int, zoom_factor: float) -> None:
+    """Apply ScalerCrop-based digital zoom to the camera preview stream.
+
+    *zoom_factor* 1.0 restores the full sensor field of view.
+    Values > 1.0 crop towards the centre of the sensor.
+
+    Raises RuntimeError if the camera is unavailable or the backend does not
+    support zoom (e.g. subprocess backend).
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not hasattr(backend, "apply_zoom"):
+        raise RuntimeError("Current camera backend does not support digital zoom")
+
+    backend.apply_zoom(camera_index, zoom_factor)
+
+
 def main():
     """
     Main entry point for testing the camera connectivity.

@@ -11,6 +11,9 @@ class Project(Base):
     id = Column(Integer, primary_key=True, index=True)
     name = Column(String(255), unique=True, index=True, nullable=False)
     description = Column(Text, nullable=True)
+    fondo = Column(String(512), nullable=True)
+    serie = Column(String(512), nullable=True)
+    signatura = Column(String(255), nullable=True)
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 

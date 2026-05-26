@@ -27,6 +27,11 @@ class Record(Base):
 	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
 	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True)
 	
+	# QA workflow
+	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
+	sequence = Column(Integer, nullable=True)  # ordering within a collection
+	rejection_note = Column(Text, nullable=True)  # optional note when status=rejected
+
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))

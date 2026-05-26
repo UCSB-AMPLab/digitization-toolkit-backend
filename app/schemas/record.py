@@ -1,7 +1,21 @@
 from __future__ import annotations
-from typing import Optional, List
-from pydantic import BaseModel
+from typing import Optional, List, Literal
+from pydantic import BaseModel, field_validator
 from datetime import datetime
+
+# Valid status values
+RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+
+# Allowed status transitions: (from_status, to_status) -> set of roles that can perform it
+STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
+	("captured",  "in_review"): {"operator", "admin", "reviewer"},
+	("in_review", "rejected"):  {"reviewer", "admin"},
+	("in_review", "approved"):  {"reviewer", "admin"},
+	("in_review", "captured"):  {"operator", "admin"},
+	("rejected",  "captured"):  {"operator", "admin"},
+	("approved",  "rejected"):  {"reviewer", "admin"},
+	("approved",  "captured"):  {"admin"},
+}
 
 
 # ==============================================================================
@@ -113,6 +127,9 @@ class RecordBase(BaseModel):
 	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
+	status: str = "captured"
+	sequence: Optional[int] = None
+	rejection_note: Optional[str] = None
 
 
 class RecordCreate(RecordBase):
@@ -144,6 +161,43 @@ class RecordRead(RecordBase):
 
 	class Config:
 		from_attributes = True
+
+
+# ==============================================================================
+# Status update schemas
+# ==============================================================================
+
+class RecordStatusUpdate(BaseModel):
+	status: RecordStatus
+	rejection_note: Optional[str] = None
+
+
+class BulkStatusUpdate(BaseModel):
+	record_ids: List[int]
+	status: RecordStatus
+	rejection_note: Optional[str] = None
+
+	@field_validator("record_ids")
+	@classmethod
+	def ids_not_empty(cls, v: List[int]) -> List[int]:
+		if not v:
+			raise ValueError("record_ids must not be empty")
+		return v
+
+
+# ==============================================================================
+# Reorder schema
+# ==============================================================================
+
+class ReorderRecords(BaseModel):
+	ordered_ids: List[int]
+
+	@field_validator("ordered_ids")
+	@classmethod
+	def ids_not_empty(cls, v: List[int]) -> List[int]:
+		if not v:
+			raise ValueError("ordered_ids must not be empty")
+		return v
 
 
 # ==============================================================================

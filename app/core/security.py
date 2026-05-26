@@ -1,4 +1,3 @@
-import os
 import json
 import time
 import hmac
@@ -8,9 +7,10 @@ import secrets
 from typing import Optional
 
 from fastapi import HTTPException
+from app.core.config import settings
 
-SECRET_KEY = os.environ.get("SECRET_KEY", "dev-secret-change-me")
-DEFAULT_EXPIRE_SECONDS = int(os.environ.get("ACCESS_TOKEN_EXPIRE_SECONDS", 3600))
+SECRET_KEY = settings.SECRET_KEY
+DEFAULT_EXPIRE_SECONDS = settings.ACCESS_TOKEN_EXPIRE_SECONDS
 
 
 def _b64u_encode(data: bytes) -> str:

@@ -2,6 +2,8 @@ from pathlib import Path
 import sys
 import json
 from typing import Optional, Tuple
+import re
+import unicodedata
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -23,6 +25,10 @@ subprocess_logger = setup_rotating_logger(
     logger_name="project_manager"
 )
 
+def secure_project_filename(project_name):
+    project_name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
+    project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
+    return project_name.lstrip('.').lower()
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """
@@ -126,13 +132,11 @@ def project_init(
     Returns:
         Path to the created project directory
     """
-    project_path = Path(PROJECTS_ROOT, project_name)
-    images_main = Path(project_path, "images", "main")
-    images_temp = Path(project_path, "images", "temp")
-    images_trash = Path(project_path, "images", "trash")
+        
+    project_path = Path(PROJECTS_ROOT, secure_project_filename(project_name))
     packages_dir = Path(project_path, "packages")
     
-    for path in [images_main, images_temp, images_trash, packages_dir]:
+    for path in [packages_dir]:
         path.mkdir(parents=True, exist_ok=True)
     
     subprocess_logger.info(f"Created project directory structure: {project_path}")
@@ -158,9 +162,6 @@ def project_init(
         project_name=project_name,
         paths={
             "project_root": str(project_path),
-            "images_main": str(images_main),
-            "images_temp": str(images_temp),
-            "images_trash": str(images_trash),
             "packages": str(packages_dir),
         },
         default_camera_config={

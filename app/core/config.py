@@ -13,6 +13,8 @@ class Settings(BaseSettings):
     PROJECTS_ROOT: str = Field(default="", env="PROJECTS_ROOT")
     EXPORTS_ROOT: str = Field(default="", env="DTK_EXPORTS_DIR")
     CAMERA_BACKEND: str = Field(default="picamera2", env="CAMERA_BACKEND")
+    SECRET_KEY: str = Field(default="dev-secret-change-me", env="SECRET_KEY")
+    ACCESS_TOKEN_EXPIRE_SECONDS: int = Field(default=28800, env="ACCESS_TOKEN_EXPIRE_SECONDS")  # 8 hours
     app_version: str = "0.0.0-dev"
 
     model_config = ConfigDict(
@@ -31,6 +33,10 @@ class Settings(BaseSettings):
     
     @property
     def projects_dir(self) -> Path:
+        from app.core.storage_override import get_storage_override
+        override = get_storage_override()
+        if override:
+            return Path(override)
         return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
     
     @property
