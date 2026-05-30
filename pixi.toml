@@ -74,3 +74,6 @@ httptools = ">=0.6.4"
 [environments]
 default = { solve-group = "default" }
 dev = { features = ["dev"], solve-group = "default" }
+
+[pypi-dependencies]
+gphoto2 = ">=2.6.3, <3"
