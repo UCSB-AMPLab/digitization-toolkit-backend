@@ -29,6 +29,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
+    allow_private_network=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )
