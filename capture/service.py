@@ -31,7 +31,7 @@ if str(backend_dir) not in sys.path:
 from .utils import setup_rotating_logger
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
-from .backends import CameraBackend, RpicamBackend, Picamera2Backend
+from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
 from .project_manager import secure_project_filename
 
 from app.core.config import settings
@@ -71,6 +71,8 @@ def get_camera_backend() -> CameraBackend:
         return Picamera2Backend(subprocess_logger)
     elif backend_type == "subprocess":
         return RpicamBackend(subprocess_logger)
+    elif backend_type == "gphoto2":
+        return GPhoto2Backend(subprocess_logger)
     else:
         subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
         return RpicamBackend(subprocess_logger)
