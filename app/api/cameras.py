@@ -965,6 +965,7 @@ def get_dslr_settings(
 	Returns HTTP 501 when the active backend does not support DSLR settings
 	(e.g. picamera2 or subprocess).
 	"""
+	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
 	if not caps.get("dslr_settings"):
@@ -992,6 +993,7 @@ def apply_dslr_settings(
 
 	Returns HTTP 501 when the active backend does not support DSLR settings.
 	"""
+	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
 	if not caps.get("dslr_settings"):
