@@ -8,9 +8,9 @@ Key design decisions:
   - capturetarget=Internal RAM, reviewtime=None, autopoweroff=0 applied at init.
   - Port map built lazily from gp.Camera.autodetect(); rebuilt automatically on
     session failure (handles USB re-enumeration after camera power-cycle).
-  - Flash detection: warns if camera flash is active. Flash (UV/visible) causes
-    photochemical degradation of archival paper and ink — use external continuous
-    lighting instead.
+  - Flash guard: disables camera flash (flashmode=Off) at session open and before
+    every capture. Flash (UV/visible) causes photochemical degradation of archival
+    paper and ink — use external continuous lighting instead.
   - Focus mode detection: warns if lens is not in MF (AF causes ~12s PTP hangs).
 
 Tested with: Canon EOS 1500D × 2, USB 2.0, Raspberry Pi.
@@ -87,7 +87,7 @@ class _PTPSession:
         self._apply_speed_preset()
         self._disable_autopoweroff()
         self._warn_if_af()
-        self._warn_if_flash()
+        self._enforce_flash_off()
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -124,7 +124,11 @@ class _PTPSession:
 
         Called before each capture so settings reflect the current config.
         Fields that are None are left at their current camera value.
+        Flash is always enforced off here as an archival safety guard.
         """
+        # ── Flash guard: must be first, before shutter opens ──────────
+        self._enforce_flash_off()
+
         fmt = getattr(camera_config, "image_format", None)
         ptp_fmt = _IMAGE_FORMAT_MAP.get(fmt, _IMAGE_FORMAT_DEFAULT) if fmt else _IMAGE_FORMAT_DEFAULT
         self._set_config("imageformat", ptp_fmt)
@@ -158,19 +162,37 @@ class _PTPSession:
                 "AF causes ~12s PTP hangs. Flip lens barrel switch to MF."
             )
 
-    def _warn_if_flash(self):
-        """Log a warning if any flash mode is active.
+    def _enforce_flash_off(self) -> bool:
+        """Actively disable camera flash before every capture.
+
+        Tries to set the flashmode PTP widget to 'Off'.  If the widget is
+        read-only or unavailable (some bodies don't expose it), falls back to
+        reading the current value and logging a warning if flash is still
+        active.  Never blocks the capture — returns False when flash cannot
+        be confirmed off so callers can decide.
 
         Flash (UV/visible) causes photochemical degradation of archival paper
-        and ink. Use stable external continuous lighting instead.
+        and ink.  Use stable external continuous lighting instead.
         """
-        flashmode = self._get_config("flashmode")
-        if flashmode and "off" not in str(flashmode).lower():
-            self._logger.warning(
-                f"[gphoto2] {self.port}: flashmode={flashmode!r} — "
-                "Flash is harmful to archival materials. "
-                "Use external continuous lighting and disable camera flash."
+        if self._set_config("flashmode", "Off"):
+            self._logger.debug(
+                f"[gphoto2] {self.port}: flash disabled (flashmode=Off)"
             )
+            return True
+        # Widget is read-only or not present — check current value
+        flashmode = self._get_config("flashmode")
+        if flashmode is None:
+            # Camera doesn't support the widget; assume no flash
+            return True
+        if "off" not in str(flashmode).lower():
+            self._logger.warning(
+                f"[gphoto2] {self.port}: flashmode={flashmode!r} and cannot be "
+                "set to Off automatically. "
+                "Flash is harmful to archival materials — "
+                "manually disable the flash before capturing."
+            )
+            return False
+        return True
 
     # ------------------------------------------------------------------
     # Capture
