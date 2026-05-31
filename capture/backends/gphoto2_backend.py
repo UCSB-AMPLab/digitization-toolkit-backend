@@ -431,6 +431,63 @@ class GPhoto2Backend(CameraBackend):
                 self._close_session(camera_index)
                 raise RuntimeError(f"DSLR capture failed: {exc}") from exc
 
+    def list_devices(self) -> list:
+        """Enumerate all connected DSLR cameras and return device metadata.
+
+        Uses the persistent port map (refreshed if empty). For each camera,
+        re-uses an already-open PTP session to read the serial number; if no
+        session is open yet, opens a brief one just for the read and closes it.
+        """
+        import re
+        port_map = self._get_port_map()
+        if not port_map:
+            return []
+
+        result = []
+        for idx, (model_raw, port) in sorted(port_map.items()):
+            serial = ""
+            # Re-use existing open session if available
+            session = self._sessions.get(idx)
+            if session is not None and session._cam is not None:
+                try:
+                    cfg = session._cam.get_config()
+                    serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                except Exception:
+                    pass
+            else:
+                # Brief PTP connection solely to read the serial number
+                try:
+                    al = gp.CameraAbilitiesList()
+                    al.load()
+                    cam = gp.Camera()
+                    cam.set_abilities(al[al.lookup_model(model_raw)])
+                    pil = gp.PortInfoList()
+                    pil.load()
+                    cam.set_port_info(pil[pil.lookup_path(port)])
+                    cam.init()
+                    cfg = cam.get_config()
+                    serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                    cam.exit()
+                except Exception:
+                    pass
+
+            model_slug = re.sub(r"[^a-z0-9]", "", model_raw.lower())
+            hw_id = (
+                f"{model_slug}_{serial}" if serial
+                else f"{model_slug}_idx{idx}"
+            )
+            result.append({
+                "index": idx,
+                "model": model_raw,
+                "hardware_id": hw_id,
+                "serial": serial or None,
+                "location": f"USB {port}",
+                "has_aperture_control": True,   # DSLRs always expose aperture via PTP
+                "supports_zoom": False,          # No digital zoom for DSLRs
+            })
+
+        return result
+
     def capture_preview(self, camera_index: int) -> bytes:
         """Return a live-preview JPEG frame from the camera.
 

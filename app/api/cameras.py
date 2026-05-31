@@ -126,70 +126,60 @@ def _get_camera_registry():
 @router.get("/devices", response_model=List[DeviceInfo])
 def list_camera_devices(current_user: User = Depends(allow_read_only)):
 	"""
-	Return available camera devices detected via libcamera/picamera2.
+	Return available camera devices detected by the active camera backend.
 
 	Returns hardware IDs, models, and calibration status for each camera.
+	Works with both picamera2 (IMX519) and gphoto2 (DSLR) backends.
 	On non-Pi systems or if camera libraries aren't available, returns empty list.
 	"""
 	registry = _get_camera_registry()
-	if registry is None:
-		return []
 
 	try:
-		detected = registry.detect_cameras()
-		devices = []
-
-		for idx, (hw_id, info) in detected.items():
-			# Check if camera is registered and has calibration
-			camera_data = registry.get_camera_by_id(hw_id)
-			calibrated = False
-			machine_id = None
-			label = None
-			lens_position = None
-			awb_gains = None
-
-			if camera_data:
-				focus_cal = camera_data.get("calibration", {}).get("focus", {})
-				calibrated = bool(focus_cal.get("success"))
-				machine_id = camera_data.get("machine_id")
-				label = camera_data.get("label")
-				lens_position = focus_cal.get("lens_position")
-				awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
-				if awb_raw:
-					awb_gains = list(awb_raw)
-
-			# Detect aperture control from cached picamera2 instance if available
-			has_aperture_control = False
-			supports_zoom = False
-			try:
-				from capture.service import get_backend
-				from capture.backends.picamera2_backend import Picamera2Backend
-				bk = get_backend()
-				if isinstance(bk, Picamera2Backend) and idx in bk._cameras:
-					has_aperture_control = "Aperture" in bk._cameras[idx].camera_controls
-				if isinstance(bk, Picamera2Backend):
-					supports_zoom = True  # All picamera2 cameras support ScalerCrop
-			except Exception:
-				pass
-
-			devices.append(DeviceInfo(
-				hardware_id=hw_id,
-				model=info.get("model", "unknown"),
-				index=idx,
-				location=info.get("location"),
-				machine_id=machine_id,
-				label=label,
-				calibrated=calibrated,
-				lens_position=lens_position,
-				awb_gains=awb_gains,
-				has_aperture_control=has_aperture_control,
-				supports_zoom=supports_zoom,
-			))
-
-		return devices
+		from capture.service import get_backend
+		backend = get_backend()
+		raw_devices = backend.list_devices()
 	except Exception as e:
-		logger.error(f"Failed to detect cameras: {e}")
+		logger.error(f"Failed to list camera devices: {e}")
 		return []
+
+	devices = []
+	for dev in raw_devices:
+		hw_id = dev["hardware_id"]
+		idx = dev["index"]
+
+		# Enrich with registry calibration data
+		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		calibrated = False
+		machine_id = None
+		label = None
+		lens_position = None
+		awb_gains = None
+
+		if camera_data:
+			focus_cal = camera_data.get("calibration", {}).get("focus", {})
+			calibrated = bool(focus_cal.get("success"))
+			machine_id = camera_data.get("machine_id")
+			label = camera_data.get("label")
+			lens_position = focus_cal.get("lens_position")
+			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
+			if awb_raw:
+				awb_gains = list(awb_raw)
+
+		devices.append(DeviceInfo(
+			hardware_id=hw_id,
+			model=dev.get("model", "unknown"),
+			index=idx,
+			location=dev.get("location"),
+			machine_id=machine_id,
+			label=label,
+			calibrated=calibrated,
+			lens_position=lens_position,
+			awb_gains=awb_gains,
+			has_aperture_control=dev.get("has_aperture_control", False),
+			supports_zoom=dev.get("supports_zoom", False),
+		))
+
+	return devices
 
 
 @router.get("/preview/{camera_index}")
