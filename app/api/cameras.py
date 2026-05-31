@@ -512,12 +512,20 @@ def trigger_capture(
 			db.flush()  # Get the ID
 		
 		# Generate thumbnail alongside the captured images
+		# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
 		thumbnail_path = None
 		try:
 			thumbnails_dir = file_path.parent.parent / "thumbnails"
-			thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+			thumb_source = file_path
+			if file_path.suffix.lower() == ".cr2":
+				preview = file_path.with_name(file_path.stem + "_preview.jpg")
+				if preview.exists():
+					thumb_source = preview
+			thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
 		except Exception as e:
 			logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
+		file_format = file_path.suffix.lower().lstrip(".")
 
 		# Create RecordImage with capture linkage
 		img = RecordImage(
@@ -526,7 +534,7 @@ def trigger_capture(
 			file_path=str(output_path),
 			thumbnail_path=thumbnail_path,
 			file_size=file_size,
-			format="jpg",
+			format=file_format,
 			resolution_width=resolution_width,
 			resolution_height=resolution_height,
 			capture_id=capture_id,
@@ -687,12 +695,20 @@ def trigger_dual_capture(
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
 			# Generate thumbnail alongside the captured images
+			# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
 			thumbnail_path = None
 			try:
 				thumbnails_dir = file_path.parent.parent / "thumbnails"
-				thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+				thumb_source = file_path
+				if file_path.suffix.lower() == ".cr2":
+					preview = file_path.with_name(file_path.stem + "_preview.jpg")
+					if preview.exists():
+						thumb_source = preview
+				thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
 			except Exception as e:
 				logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
+			file_format = file_path.suffix.lower().lstrip(".")
 
 			# Create RecordImage with capture linkage
 			img = RecordImage(
@@ -701,7 +717,7 @@ def trigger_dual_capture(
 				file_path=str(file_path_str),
 				thumbnail_path=thumbnail_path,
 				file_size=file_size,
-				format="jpg",
+				format=file_format,
 				resolution_width=resolution_width,
 				resolution_height=resolution_height,
 				capture_id=capture_id,  # Both images share same capture event

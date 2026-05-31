@@ -144,8 +144,10 @@ class _PTPSession:
         self._enforce_flash_off()
 
         fmt = getattr(camera_config, "image_format", None)
-        ptp_fmt = _IMAGE_FORMAT_MAP.get(fmt, _IMAGE_FORMAT_DEFAULT) if fmt else _IMAGE_FORMAT_DEFAULT
-        self._set_config("imageformat", ptp_fmt)
+        if fmt is not None:
+            ptp_fmt = _IMAGE_FORMAT_MAP.get(fmt, _IMAGE_FORMAT_DEFAULT)
+            self._set_config("imageformat", ptp_fmt)
+        # If fmt is None, leave the camera's current imageformat unchanged
 
         iso = getattr(camera_config, "iso", None)
         if iso is not None:
@@ -219,8 +221,12 @@ class _PTPSession:
         outpath: Path,
         retry: int = _DEFAULT_RETRY,
         retry_delay: float = _DEFAULT_SETTLE,
-    ) -> float:
-        """Capture one image to outpath. Returns elapsed seconds.
+    ) -> tuple[float, Path]:
+        """Capture one image to outpath. Returns (elapsed_seconds, actual_path).
+
+        actual_path may differ from outpath when the camera is in RAW mode
+        (extension becomes .cr2 instead of .jpg). Callers should use
+        actual_path to reference the saved file.
 
         When imageformat is RAW, the camera produces a .cr2 file. The embedded
         full-resolution JPEG (6000×4000, 11 ms to extract) is saved alongside
@@ -270,7 +276,7 @@ class _PTPSession:
                             f"[gphoto2] {self.port}: failed to extract embedded JPEG: {exc}"
                         )
 
-                return elapsed
+                return elapsed, actual_outpath
             except gp.GPhoto2Error as exc:
                 err = str(exc)
                 retriable = (
@@ -455,12 +461,12 @@ class GPhoto2Backend(CameraBackend):
             session = self._get_or_open_session(camera_index)
             try:
                 session.apply_dslr_config(camera_config)
-                elapsed = session.capture(output_path)
+                elapsed, actual_path = session.capture(output_path)
                 self.logger.info(
-                    f"[gphoto2] Camera {camera_index}: captured {output_path.name} "
+                    f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"
                 )
-                return str(output_path)
+                return str(actual_path), None
             except gp.GPhoto2Error as exc:
                 self.logger.error(
                     f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
