@@ -110,6 +110,24 @@ class WhiteBalanceManualRequest(BaseModel):
 	awb_gains: List[float]  # [red_gain, blue_gain]
 
 
+class DSLRSettingsResponse(BaseModel):
+	"""Current DSLR camera settings read via PTP."""
+	iso: Optional[str] = None
+	shutter_speed: Optional[str] = None
+	aperture: Optional[str] = None
+	image_format: Optional[str] = None
+	focus_mode: Optional[str] = None
+	flash_mode: Optional[str] = None
+
+
+class DSLRSettingsUpdate(BaseModel):
+	"""Request body for updating DSLR settings (all fields optional)."""
+	iso: Optional[str] = None           # PTP iso value e.g. "400"
+	shutter_speed: Optional[str] = None  # PTP shutterspeed e.g. "1/125"
+	aperture: Optional[str] = None       # PTP aperture e.g. "5.6"
+	image_format: Optional[str] = None   # "JPEG", "RAW", or "RAW+JPEG"
+
+
 def _get_camera_registry():
 	"""Get or create camera registry. Handles import errors gracefully."""
 	try:
@@ -180,6 +198,36 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		))
 
 	return devices
+
+
+@router.get("/capabilities")
+def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
+	"""
+	Return the capability flags of the active camera backend.
+
+	The frontend uses these flags to show/hide controls that are only
+	available for specific backends (e.g. focus slider for picamera2,
+	ISO/shutter/aperture dropdowns for gphoto2 DSLRs).
+
+	Example response:
+	    {
+	        "backend": "gphoto2",
+	        "live_preview": true,
+	        "focus_control": false,
+	        "live_controls": false,
+	        "zoom": false,
+	        "autofocus_calibration": false,
+	        "dslr_settings": true
+	    }
+	"""
+	try:
+		from capture.service import get_backend
+		backend = get_backend()
+		caps = backend.get_capabilities()
+		return {"backend": backend.get_backend_name(), **caps}
+	except Exception as e:
+		logger.error(f"Failed to get capabilities: {e}")
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
 
 @router.get("/preview/{camera_index}")
@@ -734,6 +782,13 @@ def calibrate_camera(
 		return CalibrationResponse(success=False, error=f"Calibration system not available: {e}")
 
 	try:
+		backend = get_backend()
+		if not backend.get_capabilities().get("autofocus_calibration", False):
+			raise HTTPException(
+				status_code=501,
+				detail=f"{backend.get_backend_name()} backend does not support autofocus calibration",
+			)
+
 		img_size = IMG_SIZES.get(request.resolution, IMG_SIZES["high"])
 
 		# Route the AF cycle through the backend's own Picamera2 instance.
@@ -797,6 +852,13 @@ def calibrate_white_balance(
 		return WhiteBalanceCalibrationResponse(success=False, error=f"Calibration system not available: {e}")
 
 	try:
+		backend = get_backend()
+		if not backend.get_capabilities().get("autofocus_calibration", False):
+			raise HTTPException(
+				status_code=501,
+				detail=f"{backend.get_backend_name()} backend does not support white balance calibration",
+			)
+
 		# Route WB calibration through the backend's cached Picamera2 instance —
 		# same reason as autofocus: calibration.py would open a second handle and
 		# corrupt the service's cached one.
@@ -887,6 +949,68 @@ def commit_manual_white_balance(
 	except Exception as e:
 		logger.exception(f"Manual WB commit failed: {e}")
 		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
+
+
+@router.get("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+def get_dslr_settings(
+	camera_index: int,
+	current_user: User = Depends(allow_read_only),
+):
+	"""
+	Read current DSLR settings (ISO, shutter speed, aperture, format) from the
+	PTP session for the given camera.
+
+	Returns HTTP 501 when the active backend does not support DSLR settings
+	(e.g. picamera2 or subprocess).
+	"""
+	backend = get_backend()
+	caps = backend.get_capabilities()
+	if not caps.get("dslr_settings"):
+		raise HTTPException(
+			status_code=501,
+			detail="Active camera backend does not support DSLR settings.",
+		)
+	try:
+		raw = backend.get_dslr_settings(camera_index)
+		return DSLRSettingsResponse(**raw)
+	except RuntimeError as e:
+		raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+def apply_dslr_settings(
+	camera_index: int,
+	request: DSLRSettingsUpdate,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Apply DSLR settings (ISO, shutter speed, aperture, image format) to the
+	given camera via PTP.  Only fields present in the request body are applied;
+	omitted fields are left at their current camera value.
+
+	Returns HTTP 501 when the active backend does not support DSLR settings.
+	"""
+	backend = get_backend()
+	caps = backend.get_capabilities()
+	if not caps.get("dslr_settings"):
+		raise HTTPException(
+			status_code=501,
+			detail="Active camera backend does not support DSLR settings.",
+		)
+	# Validate image_format if provided
+	if request.image_format is not None and request.image_format not in ("JPEG", "RAW", "RAW+JPEG"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"image_format must be one of JPEG, RAW, RAW+JPEG; got {request.image_format!r}",
+		)
+	try:
+		updated = backend.apply_dslr_settings(
+			camera_index,
+			request.model_dump(exclude_none=True),
+		)
+		return DSLRSettingsResponse(**updated)
+	except RuntimeError as e:
+		raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/", response_model=CameraSettingsRead)

@@ -475,7 +475,17 @@ class Picamera2Backend(CameraBackend):
             bool: True - Picamera2 supports live adjustments.
         """
         return True
-    
+
+    def get_capabilities(self) -> dict:
+        return {
+            "live_preview": True,
+            "focus_control": True,
+            "live_controls": True,
+            "zoom": True,
+            "autofocus_calibration": True,
+            "dslr_settings": False,
+        }
+
     def get_backend_name(self) -> str:
         """
         Get a human-readable name for this backend.

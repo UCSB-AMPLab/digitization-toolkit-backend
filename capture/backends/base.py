@@ -135,3 +135,26 @@ class CameraBackend(ABC):
         raise NotImplementedError(
             f"{self.get_backend_name()} does not support live preview"
         )
+
+    def get_capabilities(self) -> dict:
+        """
+        Return a dict of boolean capability flags for this backend.
+
+        Keys:
+            live_preview (bool): Can return JPEG frames for frontend polling.
+            focus_control (bool): Supports `get_focus` / `set_focus`.
+            live_controls (bool): Supports `set_camera_controls` (live picamera2 controls).
+            zoom (bool): Supports ScalerCrop-based digital zoom.
+            autofocus_calibration (bool): Can run AF + WB calibration routines.
+            dslr_settings (bool): Exposes ISO / shutter speed / aperture via PTP.
+
+        Subclasses should override this to reflect their actual capabilities.
+        """
+        return {
+            "live_preview": False,
+            "focus_control": False,
+            "live_controls": False,
+            "zoom": False,
+            "autofocus_calibration": False,
+            "dslr_settings": False,
+        }

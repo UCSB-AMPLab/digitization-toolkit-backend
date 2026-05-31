@@ -455,8 +455,15 @@ def get_focus(camera_index: int) -> float:
 
     Reads the value from the running Picamera2 instance's metadata if
     available, otherwise falls back to 0.0 (infinity).
+
+    Raises RuntimeError if the active backend does not support focus control.
     """
     backend = get_backend()
+
+    if not backend.get_capabilities().get("focus_control", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support focus control"
+        )
 
     # picamera2 backend exposes the cached instance
     if hasattr(backend, "_cameras") and camera_index in backend._cameras:
@@ -487,6 +494,11 @@ def set_focus(camera_index: int, lens_position: float) -> float:
 
     backend = get_backend()
 
+    if not backend.get_capabilities().get("focus_control", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support manual focus"
+        )
+
     # Clamp to a reasonable range (0 = infinity, 10 = ~10 cm)
     pos = max(0.0, min(10.0, float(lens_position)))
 
@@ -514,8 +526,10 @@ def set_camera_controls(camera_index: int, controls: dict) -> None:
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
-    if not hasattr(backend, "apply_controls"):
-        raise RuntimeError("Current camera backend does not support live control updates")
+    if not backend.get_capabilities().get("live_controls", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support live control updates"
+        )
 
     backend.apply_controls(camera_index, controls)
 
@@ -533,8 +547,10 @@ def apply_zoom(camera_index: int, zoom_factor: float) -> None:
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
-    if not hasattr(backend, "apply_zoom"):
-        raise RuntimeError("Current camera backend does not support digital zoom")
+    if not backend.get_capabilities().get("zoom", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support digital zoom"
+        )
 
     backend.apply_zoom(camera_index, zoom_factor)
 

@@ -514,11 +514,90 @@ class GPhoto2Backend(CameraBackend):
                     f"DSLR preview capture failed: {exc}"
                 ) from exc
 
+    def get_dslr_settings(self, camera_index: int) -> dict:
+        """Read current DSLR settings from the open PTP session.
+
+        Returns a dict with keys:
+            iso (str | None), shutter_speed (str | None), aperture (str | None),
+            image_format (str | None), focus_mode (str | None), flash_mode (str | None)
+        """
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            session = self._get_or_open_session(camera_index)
+            try:
+                raw = session.get_info()
+                return {
+                    "iso": raw.get("iso"),
+                    "shutter_speed": raw.get("shutterspeed"),
+                    "aperture": raw.get("aperture"),
+                    "image_format": raw.get("imageformat"),
+                    "focus_mode": raw.get("focusmode"),
+                    "flash_mode": raw.get("flashmode"),
+                }
+            except gp.GPhoto2Error as exc:
+                self.logger.error(
+                    f"[gphoto2] Camera {camera_index}: get_dslr_settings failed: {exc}"
+                )
+                raise RuntimeError(f"Failed to read DSLR settings: {exc}") from exc
+
+    def apply_dslr_settings(self, camera_index: int, settings: dict) -> dict:
+        """Apply a partial dict of DSLR settings via PTP and return updated values.
+
+        Accepted keys (all optional):
+            iso (str): PTP iso value e.g. "400"
+            shutter_speed (str): PTP shutterspeed e.g. "1/125"
+            aperture (str): PTP aperture e.g. "5.6"
+            image_format (str): "JPEG", "RAW", or "RAW+JPEG"
+
+        Returns the full settings dict (same shape as get_dslr_settings) after
+        applying the requested changes.
+        """
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            session = self._get_or_open_session(camera_index)
+            try:
+                if settings.get("iso") is not None:
+                    session._set_config("iso", str(settings["iso"]))
+                if settings.get("shutter_speed") is not None:
+                    session._set_config("shutterspeed", settings["shutter_speed"])
+                if settings.get("aperture") is not None:
+                    session._set_config("aperture", settings["aperture"])
+                if settings.get("image_format") is not None:
+                    ptp_fmt = _IMAGE_FORMAT_MAP.get(
+                        settings["image_format"], _IMAGE_FORMAT_DEFAULT
+                    )
+                    session._set_config("imageformat", ptp_fmt)
+                # Return updated state
+                raw = session.get_info()
+                return {
+                    "iso": raw.get("iso"),
+                    "shutter_speed": raw.get("shutterspeed"),
+                    "aperture": raw.get("aperture"),
+                    "image_format": raw.get("imageformat"),
+                    "focus_mode": raw.get("focusmode"),
+                    "flash_mode": raw.get("flashmode"),
+                }
+            except gp.GPhoto2Error as exc:
+                self.logger.error(
+                    f"[gphoto2] Camera {camera_index}: apply_dslr_settings failed: {exc}"
+                )
+                raise RuntimeError(f"Failed to apply DSLR settings: {exc}") from exc
+
     def supports_streaming(self) -> bool:
         return False
 
     def supports_live_adjustment(self) -> bool:
         return False
+
+    def get_capabilities(self) -> dict:
+        return {
+            "live_preview": True,
+            "focus_control": False,
+            "live_controls": False,
+            "zoom": False,
+            "autofocus_calibration": False,
+            "dslr_settings": True,
+        }
 
     def get_backend_name(self) -> str:
         return "gphoto2"

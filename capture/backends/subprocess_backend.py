@@ -152,7 +152,17 @@ class RpicamBackend(CameraBackend):
             bool: False - subprocess backend requires new process for settings changes.
         """
         return False
-    
+
+    def get_capabilities(self) -> dict:
+        return {
+            "live_preview": False,
+            "focus_control": False,
+            "live_controls": False,
+            "zoom": False,
+            "autofocus_calibration": False,
+            "dslr_settings": False,
+        }
+
     def get_backend_name(self) -> str:
         """
         Get a human-readable name for this backend.
