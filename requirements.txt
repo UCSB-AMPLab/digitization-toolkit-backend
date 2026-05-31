@@ -26,6 +26,9 @@ python-multipart==0.0.20
 # Image processing
 Pillow>=11.0.0
 
+# Image postprocessing
+rawpy>=0.23.0
+
 # Camera backends
 picamera2>=0.3.33
 gphoto2

@@ -30,6 +30,7 @@ pillow = ">=11.0.0"
 # Testing
 pytest = ">=9.0.2"
 bagit = ">=1.9.0,<2"
+rawpy = ">=0.27.0,<0.28"
 
 # Camera support - these require system packages
 # Note: picamera2 and rpicam need to be accessed via system packages
