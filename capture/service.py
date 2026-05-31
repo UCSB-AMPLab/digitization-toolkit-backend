@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
+from PIL import Image as _PILImage
 
 # Fixed temp-file paths for live preview frames (one per camera).
 # Using stable names rather than mkstemp prevents unbounded accumulation when
@@ -101,6 +102,63 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     backend = get_backend()
     return backend.is_camera_connected(camera_index)
 
+
+_PIL_ROTATE = {
+    90:  _PILImage.Transpose.ROTATE_270,  # 90° CW
+    180: _PILImage.Transpose.ROTATE_180,
+    270: _PILImage.Transpose.ROTATE_90,   # 90° CCW
+}
+
+# EXIF Orientation tag values for clockwise rotations.
+# Used to tag CR2 files so RAW converters (Lightroom, darktable) display them
+# correctly without modifying the pixel data.
+_EXIF_ORIENTATION_FOR_DEG = {
+    90: 6,    # 90° CW  → EXIF "rotated 90 CW"
+    180: 3,   # 180°    → EXIF "rotated 180"
+    270: 8,   # 270° CW → EXIF "rotated 90 CCW"
+}
+
+# Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
+# Tag ID 0x0112 = 274 decimal.
+_EXIF_ORIENTATION_TAG = 0x0112
+
+
+def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
+    """Rotate image in-place (clockwise). Skips 0°.
+
+    - JPEG/JPG: pixels are actually transposed (lossless-quality re-encode).
+    - CR2:      EXIF Orientation tag is written so RAW converters display it
+                correctly without touching the raw sensor data.
+    """
+    deg = rotate_deg % 360
+    if deg == 0:
+        return
+
+    suffix = file_path.suffix.lower()
+
+    if suffix in (".jpg", ".jpeg"):
+        transpose_op = _PIL_ROTATE.get(deg)
+        if transpose_op is None:
+            return
+        with _PILImage.open(file_path) as img:
+            rotated = img.transpose(transpose_op)
+        rotated.save(str(file_path), quality=95, subsampling=0)
+
+    elif suffix == ".cr2":
+        # Write EXIF Orientation tag into the CR2 without touching sensor data.
+        exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
+        if exif_val is None:
+            return
+        try:
+            import piexif
+            exif_dict = piexif.load(str(file_path))
+            exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, str(file_path))
+        except Exception:
+            pass  # piexif not available or CR2 EXIF unreadable — silently skip
+
+
 def image_filename(
     camera_index: int, 
     index: str = None,
@@ -186,9 +244,21 @@ def capture_image(
     #   - single path string for JPEG/PNG only
     #   - tuple (jpeg_path, dng_path) for multi-format
     if isinstance(result, tuple) and len(result) == 2:
-        return result  # (path_or_paths, metadata)
+        actual_path, metadata = result
     else:
-        return result, None  # fallback: path only, no metadata
+        actual_path, metadata = result, None
+
+    # Apply clockwise rotation if requested (e.g. for portrait manuscripts)
+    rotate_deg = getattr(camera_config, "rotate_deg", 0)
+    if rotate_deg:
+        _apply_rotation(Path(str(actual_path)), rotate_deg)
+        # Also rotate the _preview.jpg extracted from CR2 if present
+        preview = Path(str(actual_path)).with_suffix("")
+        preview = preview.parent / (preview.name + "_preview.jpg")
+        if preview.exists():
+            _apply_rotation(preview, rotate_deg)
+
+    return actual_path, metadata
     
 
 def single_capture_image(

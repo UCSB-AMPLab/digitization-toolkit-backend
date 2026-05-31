@@ -44,6 +44,9 @@ class CameraConfig:
     raw: bool = False  # Capture RAW alongside JPEG
     denoise_frames: int = 10  # Number of frames to skip for temporal denoise warmup (Pi 5 feature, 0 to disable)
     zsl: bool = False  # Zero shutter lag mode (enables faster captures, may affect exposure)
+    # Post-capture rotation applied to the saved file (degrees, clockwise).
+    # 0 = landscape (default), 90 = portrait CW, 180 = upside-down, 270 = portrait CCW.
+    rotate_deg: int = 0
     # DSLR-only fields (gphoto2 backend). Ignored by picamera2/subprocess backends.
     iso: Optional[int] = None            # e.g. 400; None = camera default
     shutter_speed: Optional[str] = None  # e.g. "1/250" (PTP shutterspeed string)

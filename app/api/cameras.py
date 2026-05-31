@@ -44,6 +44,7 @@ class CaptureRequest(BaseModel):
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False
+	rotate_deg: int = 0  # Clockwise rotation applied post-capture: 0, 90, 180, 270
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
@@ -55,6 +56,8 @@ class DualCaptureRequest(BaseModel):
 	resolution: str = "medium"
 	include_resolution_in_filename: bool = False
 	stagger_ms: int = 20
+	rotate_deg_cam0: int = 0  # Clockwise rotation for camera 0: 0, 90, 180, 270
+	rotate_deg_cam1: int = 0  # Clockwise rotation for camera 1: 0, 90, 180, 270
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
@@ -443,6 +446,8 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
+		if request.rotate_deg:
+			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
 		# Capture image and get manifest IDs
@@ -621,7 +626,12 @@ def trigger_dual_capture(
 		# Get configs from registry with calibration
 		config0_dict, _ = default_camera_config_from_registry(0, request.resolution)
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
-		
+
+		if request.rotate_deg_cam0:
+			config0_dict["rotate_deg"] = request.rotate_deg_cam0
+		if request.rotate_deg_cam1:
+			config1_dict["rotate_deg"] = request.rotate_deg_cam1
+
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
