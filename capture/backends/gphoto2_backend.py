@@ -84,10 +84,22 @@ class _PTPSession:
 
         self._cam.init()
         self._logger.info(f"[gphoto2] Opened session: {self.model} on {self.port}")
-        self._apply_speed_preset()
-        self._disable_autopoweroff()
-        self._warn_if_af()
-        self._enforce_flash_off()
+        # Run post-init config; on any error release the USB claim so the
+        # next attempt isn't blocked by a half-open session.
+        try:
+            self._apply_speed_preset()
+            self._disable_autopoweroff()
+            self._warn_if_af()
+            self._enforce_flash_off()
+        except Exception as exc:
+            self._logger.warning(
+                f"[gphoto2] {self.port}: error during session init ({exc}), releasing device"
+            )
+            try:
+                self._cam.exit()
+            except Exception:
+                pass
+            raise
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -100,7 +112,7 @@ class _PTPSession:
             widget.set_value(value)
             self._cam.set_config(cfg)
             return True
-        except gp.GPhoto2Error:
+        except (gp.GPhoto2Error, TypeError, ValueError):
             return False
 
     def _get_config(self, key: str):
@@ -147,11 +159,13 @@ class _PTPSession:
 
     def _disable_autopoweroff(self):
         """Disable camera auto-power-off to prevent sleep mid-session."""
-        # Canon EOS stores this as seconds; 0 = disabled.
-        if not self._set_config("autopoweroff", 0):
-            self._logger.debug(
-                f"[gphoto2] {self.port}: autopoweroff widget not available on {self.model}"
-            )
+        # Canon EOS PTP widget expects a string, not an integer.
+        # Try "0" first (some bodies), fall back to "Off" (others).
+        if not self._set_config("autopoweroff", "0"):
+            if not self._set_config("autopoweroff", "Off"):
+                self._logger.debug(
+                    f"[gphoto2] {self.port}: autopoweroff widget not available on {self.model}"
+                )
 
     def _warn_if_af(self):
         """Log a warning if the lens is not in manual focus mode."""

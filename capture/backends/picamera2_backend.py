@@ -11,13 +11,21 @@ import time
 import threading
 from pathlib import Path
 
-# Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi)
+# Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi).
+# Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
+# at import time on some Pi OS + pixi env combinations.
+_PICAMERA2_AVAILABLE = False
+Picamera2 = None
+Transform = None
 if sys.platform == "linux":
-    from picamera2 import Picamera2
-    from libcamera import Transform
-else:
-    Picamera2 = None
-    Transform = None
+    try:
+        from picamera2 import Picamera2
+        from libcamera import Transform
+        _PICAMERA2_AVAILABLE = True
+    except (ImportError, ValueError) as _picamera2_err:
+        Picamera2 = None
+        Transform = None
+        _PICAMERA2_AVAILABLE = False
 
 
 

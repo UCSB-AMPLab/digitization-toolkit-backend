@@ -12,7 +12,7 @@ from typing import Dict, Optional, List, Tuple
 try:
     from picamera2 import Picamera2
     _PICAMERA2_AVAILABLE = True
-except ImportError:
+except (ImportError, ValueError):
     Picamera2 = None  # type: ignore[assignment]
     _PICAMERA2_AVAILABLE = False
 

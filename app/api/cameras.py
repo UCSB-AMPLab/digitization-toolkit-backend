@@ -225,6 +225,8 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 		backend = get_backend()
 		caps = backend.get_capabilities()
 		return {"backend": backend.get_backend_name(), **caps}
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.error(f"Failed to get capabilities: {e}")
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
