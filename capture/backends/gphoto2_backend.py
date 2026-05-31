@@ -48,6 +48,8 @@ _IMAGE_FORMAT_MAP = {
 }
 # Default when image_format is None
 _IMAGE_FORMAT_DEFAULT = "L"
+# Reverse mapping: PTP widget value → user-facing label
+_IMAGE_FORMAT_REVERSE_MAP = {v: k for k, v in _IMAGE_FORMAT_MAP.items()}
 
 # Minimum settle time used as retry_delay in capture (seconds).
 # Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
@@ -566,7 +568,9 @@ class GPhoto2Backend(CameraBackend):
                     "iso": raw.get("iso"),
                     "shutter_speed": raw.get("shutterspeed"),
                     "aperture": raw.get("aperture"),
-                    "image_format": raw.get("imageformat"),
+                    "image_format": _IMAGE_FORMAT_REVERSE_MAP.get(
+                        raw.get("imageformat", ""), raw.get("imageformat")
+                    ),
                     "focus_mode": raw.get("focusmode"),
                     "flash_mode": raw.get("flashmode"),
                 }
@@ -609,7 +613,9 @@ class GPhoto2Backend(CameraBackend):
                     "iso": raw.get("iso"),
                     "shutter_speed": raw.get("shutterspeed"),
                     "aperture": raw.get("aperture"),
-                    "image_format": raw.get("imageformat"),
+                    "image_format": _IMAGE_FORMAT_REVERSE_MAP.get(
+                        raw.get("imageformat", ""), raw.get("imageformat")
+                    ),
                     "focus_mode": raw.get("focusmode"),
                     "flash_mode": raw.get("flashmode"),
                 }
