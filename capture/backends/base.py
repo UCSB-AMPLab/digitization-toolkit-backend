@@ -94,8 +94,25 @@ class CameraBackend(ABC):
     def cleanup(self):
         """
         Cleanup any resources held by the backend.
-        
+
         This is called when switching backends or shutting down.
         Subclasses should override if they need to release resources.
         """
         pass
+
+    def capture_preview(self, camera_index: int) -> bytes:
+        """
+        Capture a single live-preview frame and return raw JPEG bytes.
+
+        Not saved to disk. Intended for frontend polling loops.
+
+        Returns:
+            JPEG bytes of the preview frame.
+
+        Raises:
+            NotImplementedError: If this backend does not support live preview.
+            RuntimeError: If the capture fails.
+        """
+        raise NotImplementedError(
+            f"{self.get_backend_name()} does not support live preview"
+        )

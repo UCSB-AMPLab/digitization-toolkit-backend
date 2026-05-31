@@ -8,7 +8,13 @@ import json
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
-from picamera2 import Picamera2
+
+try:
+    from picamera2 import Picamera2
+    _PICAMERA2_AVAILABLE = True
+except ImportError:
+    Picamera2 = None  # type: ignore[assignment]
+    _PICAMERA2_AVAILABLE = False
 
 class CameraRegistry:
     """
@@ -49,17 +55,77 @@ class CameraRegistry:
             json.dump(self.cameras, f, indent=2)
     
     @staticmethod
+    def _get_camera_hardware_id_gphoto2(camera_index: int) -> Tuple[Optional[str], Dict]:
+        """Hardware ID resolution for gphoto2 (DSLR) cameras.
+
+        Opens a brief PTP session to read serialnumber + cameramodel,
+        then closes it immediately. ID format: "{sanitized_model}_{serial}"
+        e.g. "canoneos1500d_3456789".
+        """
+        try:
+            import gphoto2 as gp
+            import re
+            detected = gp.Camera.autodetect()
+            if camera_index >= len(detected):
+                return None, {}
+            model_raw, port = detected[camera_index][0], detected[camera_index][1]
+
+            # Open a brief PTP session to read serial number
+            al = gp.CameraAbilitiesList()
+            al.load()
+            cam = gp.Camera()
+            cam.set_abilities(al[al.lookup_model(model_raw)])
+            pil = gp.PortInfoList()
+            pil.load()
+            cam.set_port_info(pil[pil.lookup_path(port)])
+            cam.init()
+            try:
+                cfg = cam.get_config()
+                serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+            except Exception:
+                serial = ""
+            cam.exit()
+
+            # Sanitize model name: lowercase, remove spaces/special chars
+            model_slug = re.sub(r"[^a-z0-9]", "", model_raw.lower())
+            hw_id = (
+                f"{model_slug}_{serial}" if serial
+                else f"{model_slug}_idx{camera_index}"
+            )
+            return hw_id, {
+                "model": model_raw,
+                "serial": serial or None,
+                "location": f"USB {port}",
+                "id": port,
+                "index": camera_index,
+            }
+        except Exception as exc:
+            return None, {"error": str(exc)}
+
+    @staticmethod
     def get_camera_hardware_id(camera_index: int) -> Tuple[Optional[str], Dict]:
         """
         Get hardware ID and info for a camera at given index.
-        
+
+        Dispatches to the picamera2 or gphoto2 helper based on the active
+        CAMERA_BACKEND setting.
+
         Args:
             camera_index: Current camera index (0, 1, etc.)
-            
+
         Returns:
             Tuple of (hardware_id, camera_info_dict)
-            hardware_id format: "model_i2cbus" using Id field
         """
+        try:
+            from app.core.config import settings
+            if settings.CAMERA_BACKEND.lower() == "gphoto2":
+                return CameraRegistry._get_camera_hardware_id_gphoto2(camera_index)
+        except Exception:
+            pass
+
+        # --- picamera2 path (original logic) ---
+        if not _PICAMERA2_AVAILABLE:
+            return None, {"error": "Picamera2 not available and not using gphoto2 backend"}
         try:
             camera_info = Picamera2.global_camera_info()
             
@@ -101,18 +167,35 @@ class CameraRegistry:
     def detect_cameras(self) -> Dict[int, Tuple[str, Dict]]:
         """
         Detect all connected cameras and return their hardware IDs.
-        
+
         Returns:
             Dict mapping camera_index -> (hardware_id, info)
         """
         detected = {}
-        camera_info = Picamera2.global_camera_info()
-        
-        for idx in range(len(camera_info)):
+        try:
+            from app.core.config import settings
+            backend = settings.CAMERA_BACKEND.lower()
+        except Exception:
+            backend = "picamera2"
+
+        if backend == "gphoto2":
+            try:
+                import gphoto2 as gp
+                cameras = gp.Camera.autodetect()
+                count = len(cameras)
+            except Exception:
+                count = 0
+        else:
+            if not _PICAMERA2_AVAILABLE:
+                return {}
+            camera_info = Picamera2.global_camera_info()
+            count = len(camera_info)
+
+        for idx in range(count):
             hw_id, info = self.get_camera_hardware_id(idx)
             if hw_id:
                 detected[idx] = (hw_id, info)
-        
+
         return detected
     
     def register_camera(

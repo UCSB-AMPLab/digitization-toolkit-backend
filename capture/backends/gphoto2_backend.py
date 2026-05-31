@@ -26,6 +26,12 @@ import time
 from pathlib import Path
 
 try:
+    import rawpy
+    _RAWPY_AVAILABLE = True
+except ImportError:
+    rawpy = None  # type: ignore[assignment]
+    _RAWPY_AVAILABLE = False
+try:
     import gphoto2 as gp
     _GP_AVAILABLE = True
 except ImportError:
@@ -33,6 +39,15 @@ except ImportError:
     _GP_AVAILABLE = False
 
 from .base import CameraBackend
+
+# Image format mapping: CameraConfig.image_format → PTP imageformat widget value
+_IMAGE_FORMAT_MAP = {
+    "JPEG":     "L",
+    "RAW":      "RAW",
+    "RAW+JPEG": "RAW + L",
+}
+# Default when image_format is None
+_IMAGE_FORMAT_DEFAULT = "L"
 
 # Minimum settle time used as retry_delay in capture (seconds).
 # Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
@@ -104,6 +119,28 @@ class _PTPSession:
         self._set_config("capturetarget", "Internal RAM")
         self._set_config("reviewtime", "None")
 
+    def apply_dslr_config(self, camera_config) -> None:
+        """Apply DSLR-specific CameraConfig fields to the camera via PTP.
+
+        Called before each capture so settings reflect the current config.
+        Fields that are None are left at their current camera value.
+        """
+        fmt = getattr(camera_config, "image_format", None)
+        ptp_fmt = _IMAGE_FORMAT_MAP.get(fmt, _IMAGE_FORMAT_DEFAULT) if fmt else _IMAGE_FORMAT_DEFAULT
+        self._set_config("imageformat", ptp_fmt)
+
+        iso = getattr(camera_config, "iso", None)
+        if iso is not None:
+            self._set_config("iso", str(iso))
+
+        shutter = getattr(camera_config, "shutter_speed", None)
+        if shutter is not None:
+            self._set_config("shutterspeed", shutter)
+
+        aperture = getattr(camera_config, "aperture", None)
+        if aperture is not None:
+            self._set_config("aperture", aperture)
+
     def _disable_autopoweroff(self):
         """Disable camera auto-power-off to prevent sleep mid-session."""
         # Canon EOS stores this as seconds; 0 = disabled.
@@ -147,8 +184,12 @@ class _PTPSession:
     ) -> float:
         """Capture one image to outpath. Returns elapsed seconds.
 
-        Retries on transient I/O-busy errors within the same open session —
-        no reconnect, just a short wait for the camera buffer to clear.
+        When imageformat is RAW, the camera produces a .cr2 file. The embedded
+        full-resolution JPEG (6000×4000, 11 ms to extract) is saved alongside
+        the CR2 as ``{stem}_preview.jpg`` so the existing thumbnail/review
+        pipeline has a JPEG to work with.
+
+        Retries on transient I/O-busy errors within the same open session.
         Fatal errors (e.g. -1 Unspecified) are raised immediately.
         """
         outpath.parent.mkdir(parents=True, exist_ok=True)
@@ -156,12 +197,42 @@ class _PTPSession:
             try:
                 t0 = time.perf_counter()
                 file_path = self._cam.capture(gp.GP_CAPTURE_IMAGE)
+
+                # The captured filename tells us the actual format (.cr2 vs .jpg)
+                is_raw = file_path.name.lower().endswith(".cr2")
+                if is_raw:
+                    # Save CR2 with .cr2 extension regardless of outpath stem
+                    actual_outpath = outpath.with_suffix(".cr2")
+                else:
+                    actual_outpath = outpath
+
                 camera_file = self._cam.file_get(
                     file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
                 )
-                camera_file.save(str(outpath))
+                camera_file.save(str(actual_outpath))
                 self._cam.file_delete(file_path.folder, file_path.name)
-                return time.perf_counter() - t0
+                elapsed = time.perf_counter() - t0
+
+                # Extract embedded JPEG from CR2 for thumbnail/review pipeline
+                if is_raw and _RAWPY_AVAILABLE:
+                    try:
+                        preview_path = actual_outpath.with_name(
+                            actual_outpath.stem + "_preview.jpg"
+                        )
+                        with rawpy.imread(str(actual_outpath)) as raw:
+                            thumb = raw.extract_thumb()
+                        if hasattr(thumb, "data"):
+                            preview_path.write_bytes(thumb.data)
+                        self._logger.info(
+                            f"[gphoto2] {self.port}: embedded JPEG saved to "
+                            f"{preview_path.name}"
+                        )
+                    except Exception as exc:
+                        self._logger.warning(
+                            f"[gphoto2] {self.port}: failed to extract embedded JPEG: {exc}"
+                        )
+
+                return elapsed
             except gp.GPhoto2Error as exc:
                 err = str(exc)
                 retriable = (
@@ -345,6 +416,7 @@ class GPhoto2Backend(CameraBackend):
         with lock:
             session = self._get_or_open_session(camera_index)
             try:
+                session.apply_dslr_config(camera_config)
                 elapsed = session.capture(output_path)
                 self.logger.info(
                     f"[gphoto2] Camera {camera_index}: captured {output_path.name} "
@@ -358,6 +430,32 @@ class GPhoto2Backend(CameraBackend):
                 # Close the failed session so the next call re-opens it cleanly.
                 self._close_session(camera_index)
                 raise RuntimeError(f"DSLR capture failed: {exc}") from exc
+
+    def capture_preview(self, camera_index: int) -> bytes:
+        """Return a live-preview JPEG frame from the camera.
+
+        Uses the same persistent PTP session as full captures so there is no
+        reconnect overhead. The first frame takes ~1.3s (camera warms up video
+        subsystem); subsequent frames are ~30ms at ~33 fps.
+
+        The per-camera lock serialises preview and full-capture calls so they
+        never interleave on the same session.
+        """
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            session = self._get_or_open_session(camera_index)
+            try:
+                camera_file = session._cam.capture_preview()
+                data = camera_file.get_data_and_size()
+                return bytes(data)
+            except gp.GPhoto2Error as exc:
+                self.logger.error(
+                    f"[gphoto2] Camera {camera_index}: preview capture failed: {exc}"
+                )
+                self._close_session(camera_index)
+                raise RuntimeError(
+                    f"DSLR preview capture failed: {exc}"
+                ) from exc
 
     def supports_streaming(self) -> bool:
         return False

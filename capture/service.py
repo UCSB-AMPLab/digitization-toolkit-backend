@@ -372,6 +372,15 @@ def capture_preview_frame(camera_index: int) -> bytes:
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
+    backend = get_backend()
+
+    # If the backend has a native preview implementation (e.g. gphoto2), use it
+    # directly instead of the picamera2-specific CameraConfig path below.
+    try:
+        return backend.capture_preview(camera_index)
+    except NotImplementedError:
+        pass  # fall through to picamera2 path
+
     # Fixed per-camera path — overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
     # race on the same path.
@@ -388,8 +397,6 @@ def capture_preview_frame(camera_index: int) -> bytes:
         encoding="jpg",
         raw=False,
     )
-
-    backend = get_backend()
 
     with lock:
         for attempt in range(2):
