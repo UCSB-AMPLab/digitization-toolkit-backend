@@ -358,7 +358,13 @@ def download_image_file(
 	file_path = Path(img.file_path)
 	if not file_path.exists():
 		raise HTTPException(status_code=404, detail="File not found on disk")
-	
+
+	# For RAW files (e.g. CR2), serve the JPEG preview sidecar so browsers can display it
+	if file_path.suffix.lower() in (".cr2", ".nef", ".arw", ".raf", ".dng"):
+		preview_path = file_path.with_name(file_path.stem + "_preview.jpg")
+		if preview_path.exists():
+			file_path = preview_path
+
 	# Determine media type
 	media_type_map = {
 		"jpg": "image/jpeg",
