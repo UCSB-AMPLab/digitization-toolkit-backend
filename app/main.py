@@ -29,7 +29,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    allow_private_network=True,
+    # allow_private_network=True,  # Disabled: not supported by installed Starlette (PR #3065 never merged) — causes CORSMiddleware TypeError
     allow_methods=["*"],
     allow_headers=["*"],
 )
