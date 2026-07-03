@@ -11,13 +11,21 @@ import time
 import threading
 from pathlib import Path
 
-# Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi)
+# Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi).
+# Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
+# at import time on some Pi OS + pixi env combinations.
+_PICAMERA2_AVAILABLE = False
+Picamera2 = None
+Transform = None
 if sys.platform == "linux":
-    from picamera2 import Picamera2
-    from libcamera import Transform
-else:
-    Picamera2 = None
-    Transform = None
+    try:
+        from picamera2 import Picamera2
+        from libcamera import Transform
+        _PICAMERA2_AVAILABLE = True
+    except (ImportError, ValueError) as _picamera2_err:
+        Picamera2 = None
+        Transform = None
+        _PICAMERA2_AVAILABLE = False
 
 
 
@@ -117,6 +125,55 @@ class Picamera2Backend(CameraBackend):
         except Exception as e:
             self.logger.error(f"Failed to detect cameras: {e}")
             return False
+
+    def list_devices(self) -> list:
+        """Enumerate all libcamera/picamera2 cameras and return device metadata.
+
+        Builds stable hardware IDs using the libcamera ``Id`` path (i2c bus
+        address), matching the logic in ``CameraRegistry``.
+        """
+        try:
+            camera_info = self._get_camera_info()
+        except Exception:
+            return []
+
+        result = []
+        for idx, info in enumerate(camera_info):
+            model = info.get("Model", "unknown")
+            camera_id = info.get("Id", "")
+            location = info.get("Location", "")
+
+            # Build stable hardware ID — same logic as CameraRegistry (picamera2 path)
+            if camera_id:
+                id_parts = camera_id.split("/")
+                i2c_part = [p for p in id_parts if p.startswith("i2c@")]
+                if i2c_part:
+                    identifier = i2c_part[0].replace("i2c@", "")
+                    hw_id = f"{model}_{identifier}"
+                else:
+                    hw_id = f"{model}_{id_parts[-1]}"
+            else:
+                hw_id = f"{model}_idx{idx}"
+
+            # Aperture control only exposed if camera is already initialized
+            has_aperture = False
+            if idx in self._cameras:
+                try:
+                    has_aperture = "Aperture" in self._cameras[idx].camera_controls
+                except Exception:
+                    pass
+
+            result.append({
+                "index": idx,
+                "model": model,
+                "hardware_id": hw_id,
+                "serial": None,         # IMX519 doesn't expose a serial number
+                "location": str(location),
+                "has_aperture_control": has_aperture,
+                "supports_zoom": True,  # ScalerCrop available on all picamera2 cameras
+            })
+
+        return result
     
     def _config_to_picamera2_controls(self, camera_config):
         """
@@ -426,7 +483,17 @@ class Picamera2Backend(CameraBackend):
             bool: True - Picamera2 supports live adjustments.
         """
         return True
-    
+
+    def get_capabilities(self) -> dict:
+        return {
+            "live_preview": True,
+            "focus_control": True,
+            "live_controls": True,
+            "zoom": True,
+            "autofocus_calibration": True,
+            "dslr_settings": False,
+        }
+
     def get_backend_name(self) -> str:
         """
         Get a human-readable name for this backend.

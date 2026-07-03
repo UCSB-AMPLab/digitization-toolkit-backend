@@ -44,6 +44,7 @@ class CaptureRequest(BaseModel):
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False
+	rotate_deg: int = 0  # Clockwise rotation applied post-capture: 0, 90, 180, 270
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
@@ -55,6 +56,8 @@ class DualCaptureRequest(BaseModel):
 	resolution: str = "medium"
 	include_resolution_in_filename: bool = False
 	stagger_ms: int = 20
+	rotate_deg_cam0: int = 0  # Clockwise rotation for camera 0: 0, 90, 180, 270
+	rotate_deg_cam1: int = 0  # Clockwise rotation for camera 1: 0, 90, 180, 270
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
@@ -110,6 +113,24 @@ class WhiteBalanceManualRequest(BaseModel):
 	awb_gains: List[float]  # [red_gain, blue_gain]
 
 
+class DSLRSettingsResponse(BaseModel):
+	"""Current DSLR camera settings read via PTP."""
+	iso: Optional[str] = None
+	shutter_speed: Optional[str] = None
+	aperture: Optional[str] = None
+	image_format: Optional[str] = None
+	focus_mode: Optional[str] = None
+	flash_mode: Optional[str] = None
+
+
+class DSLRSettingsUpdate(BaseModel):
+	"""Request body for updating DSLR settings (all fields optional)."""
+	iso: Optional[str] = None           # PTP iso value e.g. "400"
+	shutter_speed: Optional[str] = None  # PTP shutterspeed e.g. "1/125"
+	aperture: Optional[str] = None       # PTP aperture e.g. "5.6"
+	image_format: Optional[str] = None   # "JPEG", "RAW", or "RAW+JPEG"
+
+
 def _get_camera_registry():
 	"""Get or create camera registry. Handles import errors gracefully."""
 	try:
@@ -126,70 +147,92 @@ def _get_camera_registry():
 @router.get("/devices", response_model=List[DeviceInfo])
 def list_camera_devices(current_user: User = Depends(allow_read_only)):
 	"""
-	Return available camera devices detected via libcamera/picamera2.
+	Return available camera devices detected by the active camera backend.
 
 	Returns hardware IDs, models, and calibration status for each camera.
+	Works with both picamera2 (IMX519) and gphoto2 (DSLR) backends.
 	On non-Pi systems or if camera libraries aren't available, returns empty list.
 	"""
 	registry = _get_camera_registry()
-	if registry is None:
-		return []
 
 	try:
-		detected = registry.detect_cameras()
-		devices = []
-
-		for idx, (hw_id, info) in detected.items():
-			# Check if camera is registered and has calibration
-			camera_data = registry.get_camera_by_id(hw_id)
-			calibrated = False
-			machine_id = None
-			label = None
-			lens_position = None
-			awb_gains = None
-
-			if camera_data:
-				focus_cal = camera_data.get("calibration", {}).get("focus", {})
-				calibrated = bool(focus_cal.get("success"))
-				machine_id = camera_data.get("machine_id")
-				label = camera_data.get("label")
-				lens_position = focus_cal.get("lens_position")
-				awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
-				if awb_raw:
-					awb_gains = list(awb_raw)
-
-			# Detect aperture control from cached picamera2 instance if available
-			has_aperture_control = False
-			supports_zoom = False
-			try:
-				from capture.service import get_backend
-				from capture.backends.picamera2_backend import Picamera2Backend
-				bk = get_backend()
-				if isinstance(bk, Picamera2Backend) and idx in bk._cameras:
-					has_aperture_control = "Aperture" in bk._cameras[idx].camera_controls
-				if isinstance(bk, Picamera2Backend):
-					supports_zoom = True  # All picamera2 cameras support ScalerCrop
-			except Exception:
-				pass
-
-			devices.append(DeviceInfo(
-				hardware_id=hw_id,
-				model=info.get("model", "unknown"),
-				index=idx,
-				location=info.get("location"),
-				machine_id=machine_id,
-				label=label,
-				calibrated=calibrated,
-				lens_position=lens_position,
-				awb_gains=awb_gains,
-				has_aperture_control=has_aperture_control,
-				supports_zoom=supports_zoom,
-			))
-
-		return devices
+		from capture.service import get_backend
+		backend = get_backend()
+		raw_devices = backend.list_devices()
 	except Exception as e:
-		logger.error(f"Failed to detect cameras: {e}")
+		logger.error(f"Failed to list camera devices: {e}")
 		return []
+
+	devices = []
+	for dev in raw_devices:
+		hw_id = dev["hardware_id"]
+		idx = dev["index"]
+
+		# Enrich with registry calibration data
+		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		calibrated = False
+		machine_id = None
+		label = None
+		lens_position = None
+		awb_gains = None
+
+		if camera_data:
+			focus_cal = camera_data.get("calibration", {}).get("focus", {})
+			calibrated = bool(focus_cal.get("success"))
+			machine_id = camera_data.get("machine_id")
+			label = camera_data.get("label")
+			lens_position = focus_cal.get("lens_position")
+			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
+			if awb_raw:
+				awb_gains = list(awb_raw)
+
+		devices.append(DeviceInfo(
+			hardware_id=hw_id,
+			model=dev.get("model", "unknown"),
+			index=idx,
+			location=dev.get("location"),
+			machine_id=machine_id,
+			label=label,
+			calibrated=calibrated,
+			lens_position=lens_position,
+			awb_gains=awb_gains,
+			has_aperture_control=dev.get("has_aperture_control", False),
+			supports_zoom=dev.get("supports_zoom", False),
+		))
+
+	return devices
+
+
+@router.get("/capabilities")
+def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
+	"""
+	Return the capability flags of the active camera backend.
+
+	The frontend uses these flags to show/hide controls that are only
+	available for specific backends (e.g. focus slider for picamera2,
+	ISO/shutter/aperture dropdowns for gphoto2 DSLRs).
+
+	Example response:
+	    {
+	        "backend": "gphoto2",
+	        "live_preview": true,
+	        "focus_control": false,
+	        "live_controls": false,
+	        "zoom": false,
+	        "autofocus_calibration": false,
+	        "dslr_settings": true
+	    }
+	"""
+	try:
+		from capture.service import get_backend
+		backend = get_backend()
+		caps = backend.get_capabilities()
+		return {"backend": backend.get_backend_name(), **caps}
+	except HTTPException:
+		raise
+	except Exception as e:
+		logger.error(f"Failed to get capabilities: {e}")
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
 
 @router.get("/preview/{camera_index}")
@@ -403,6 +446,8 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
+		if request.rotate_deg:
+			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
 		# Capture image and get manifest IDs
@@ -472,12 +517,20 @@ def trigger_capture(
 			db.flush()  # Get the ID
 		
 		# Generate thumbnail alongside the captured images
+		# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
 		thumbnail_path = None
 		try:
 			thumbnails_dir = file_path.parent.parent / "thumbnails"
-			thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+			thumb_source = file_path
+			if file_path.suffix.lower() == ".cr2":
+				preview = file_path.with_name(file_path.stem + "_preview.jpg")
+				if preview.exists():
+					thumb_source = preview
+			thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
 		except Exception as e:
 			logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
+		file_format = file_path.suffix.lower().lstrip(".")
 
 		# Create RecordImage with capture linkage
 		img = RecordImage(
@@ -486,7 +539,7 @@ def trigger_capture(
 			file_path=str(output_path),
 			thumbnail_path=thumbnail_path,
 			file_size=file_size,
-			format="jpg",
+			format=file_format,
 			resolution_width=resolution_width,
 			resolution_height=resolution_height,
 			capture_id=capture_id,
@@ -573,7 +626,12 @@ def trigger_dual_capture(
 		# Get configs from registry with calibration
 		config0_dict, _ = default_camera_config_from_registry(0, request.resolution)
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
-		
+
+		if request.rotate_deg_cam0:
+			config0_dict["rotate_deg"] = request.rotate_deg_cam0
+		if request.rotate_deg_cam1:
+			config1_dict["rotate_deg"] = request.rotate_deg_cam1
+
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
@@ -647,12 +705,20 @@ def trigger_dual_capture(
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
 			# Generate thumbnail alongside the captured images
+			# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
 			thumbnail_path = None
 			try:
 				thumbnails_dir = file_path.parent.parent / "thumbnails"
-				thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
+				thumb_source = file_path
+				if file_path.suffix.lower() == ".cr2":
+					preview = file_path.with_name(file_path.stem + "_preview.jpg")
+					if preview.exists():
+						thumb_source = preview
+				thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
 			except Exception as e:
 				logger.warning(f"Failed to generate thumbnail for {file_path.name}: {e}")
+
+			file_format = file_path.suffix.lower().lstrip(".")
 
 			# Create RecordImage with capture linkage
 			img = RecordImage(
@@ -661,7 +727,7 @@ def trigger_dual_capture(
 				file_path=str(file_path_str),
 				thumbnail_path=thumbnail_path,
 				file_size=file_size,
-				format="jpg",
+				format=file_format,
 				resolution_width=resolution_width,
 				resolution_height=resolution_height,
 				capture_id=capture_id,  # Both images share same capture event
@@ -744,6 +810,13 @@ def calibrate_camera(
 		return CalibrationResponse(success=False, error=f"Calibration system not available: {e}")
 
 	try:
+		backend = get_backend()
+		if not backend.get_capabilities().get("autofocus_calibration", False):
+			raise HTTPException(
+				status_code=501,
+				detail=f"{backend.get_backend_name()} backend does not support autofocus calibration",
+			)
+
 		img_size = IMG_SIZES.get(request.resolution, IMG_SIZES["high"])
 
 		# Route the AF cycle through the backend's own Picamera2 instance.
@@ -807,6 +880,13 @@ def calibrate_white_balance(
 		return WhiteBalanceCalibrationResponse(success=False, error=f"Calibration system not available: {e}")
 
 	try:
+		backend = get_backend()
+		if not backend.get_capabilities().get("autofocus_calibration", False):
+			raise HTTPException(
+				status_code=501,
+				detail=f"{backend.get_backend_name()} backend does not support white balance calibration",
+			)
+
 		# Route WB calibration through the backend's cached Picamera2 instance —
 		# same reason as autofocus: calibration.py would open a second handle and
 		# corrupt the service's cached one.
@@ -897,6 +977,70 @@ def commit_manual_white_balance(
 	except Exception as e:
 		logger.exception(f"Manual WB commit failed: {e}")
 		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
+
+
+@router.get("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+def get_dslr_settings(
+	camera_index: int,
+	current_user: User = Depends(allow_read_only),
+):
+	"""
+	Read current DSLR settings (ISO, shutter speed, aperture, format) from the
+	PTP session for the given camera.
+
+	Returns HTTP 501 when the active backend does not support DSLR settings
+	(e.g. picamera2 or subprocess).
+	"""
+	from capture.service import get_backend
+	backend = get_backend()
+	caps = backend.get_capabilities()
+	if not caps.get("dslr_settings"):
+		raise HTTPException(
+			status_code=501,
+			detail="Active camera backend does not support DSLR settings.",
+		)
+	try:
+		raw = backend.get_dslr_settings(camera_index)
+		return DSLRSettingsResponse(**raw)
+	except RuntimeError as e:
+		raise HTTPException(status_code=502, detail=str(e))
+
+
+@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+def apply_dslr_settings(
+	camera_index: int,
+	request: DSLRSettingsUpdate,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Apply DSLR settings (ISO, shutter speed, aperture, image format) to the
+	given camera via PTP.  Only fields present in the request body are applied;
+	omitted fields are left at their current camera value.
+
+	Returns HTTP 501 when the active backend does not support DSLR settings.
+	"""
+	from capture.service import get_backend
+	backend = get_backend()
+	caps = backend.get_capabilities()
+	if not caps.get("dslr_settings"):
+		raise HTTPException(
+			status_code=501,
+			detail="Active camera backend does not support DSLR settings.",
+		)
+	# Validate image_format if provided
+	if request.image_format is not None and request.image_format not in ("JPEG", "RAW", "RAW+JPEG"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"image_format must be one of JPEG, RAW, RAW+JPEG; got {request.image_format!r}",
+		)
+	try:
+		updated = backend.apply_dslr_settings(
+			camera_index,
+			request.model_dump(exclude_none=True),
+		)
+		return DSLRSettingsResponse(**updated)
+	except RuntimeError as e:
+		raise HTTPException(status_code=502, detail=str(e))
 
 
 @router.post("/", response_model=CameraSettingsRead)

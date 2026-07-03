@@ -5,6 +5,7 @@ import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
+from PIL import Image as _PILImage
 
 # Fixed temp-file paths for live preview frames (one per camera).
 # Using stable names rather than mkstemp prevents unbounded accumulation when
@@ -31,7 +32,7 @@ if str(backend_dir) not in sys.path:
 from .utils import setup_rotating_logger
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
-from .backends import CameraBackend, RpicamBackend, Picamera2Backend
+from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
 from .project_manager import secure_project_filename
 
 from app.core.config import settings
@@ -71,6 +72,8 @@ def get_camera_backend() -> CameraBackend:
         return Picamera2Backend(subprocess_logger)
     elif backend_type == "subprocess":
         return RpicamBackend(subprocess_logger)
+    elif backend_type == "gphoto2":
+        return GPhoto2Backend(subprocess_logger)
     else:
         subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
         return RpicamBackend(subprocess_logger)
@@ -98,6 +101,63 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     """
     backend = get_backend()
     return backend.is_camera_connected(camera_index)
+
+
+_PIL_ROTATE = {
+    90:  _PILImage.Transpose.ROTATE_270,  # 90° CW
+    180: _PILImage.Transpose.ROTATE_180,
+    270: _PILImage.Transpose.ROTATE_90,   # 90° CCW
+}
+
+# EXIF Orientation tag values for clockwise rotations.
+# Used to tag CR2 files so RAW converters (Lightroom, darktable) display them
+# correctly without modifying the pixel data.
+_EXIF_ORIENTATION_FOR_DEG = {
+    90: 6,    # 90° CW  → EXIF "rotated 90 CW"
+    180: 3,   # 180°    → EXIF "rotated 180"
+    270: 8,   # 270° CW → EXIF "rotated 90 CCW"
+}
+
+# Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
+# Tag ID 0x0112 = 274 decimal.
+_EXIF_ORIENTATION_TAG = 0x0112
+
+
+def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
+    """Rotate image in-place (clockwise). Skips 0°.
+
+    - JPEG/JPG: pixels are actually transposed (lossless-quality re-encode).
+    - CR2:      EXIF Orientation tag is written so RAW converters display it
+                correctly without touching the raw sensor data.
+    """
+    deg = rotate_deg % 360
+    if deg == 0:
+        return
+
+    suffix = file_path.suffix.lower()
+
+    if suffix in (".jpg", ".jpeg"):
+        transpose_op = _PIL_ROTATE.get(deg)
+        if transpose_op is None:
+            return
+        with _PILImage.open(file_path) as img:
+            rotated = img.transpose(transpose_op)
+        rotated.save(str(file_path), quality=95, subsampling=0)
+
+    elif suffix == ".cr2":
+        # Write EXIF Orientation tag into the CR2 without touching sensor data.
+        exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
+        if exif_val is None:
+            return
+        try:
+            import piexif
+            exif_dict = piexif.load(str(file_path))
+            exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
+            exif_bytes = piexif.dump(exif_dict)
+            piexif.insert(exif_bytes, str(file_path))
+        except Exception:
+            pass  # piexif not available or CR2 EXIF unreadable — silently skip
+
 
 def image_filename(
     camera_index: int, 
@@ -184,9 +244,21 @@ def capture_image(
     #   - single path string for JPEG/PNG only
     #   - tuple (jpeg_path, dng_path) for multi-format
     if isinstance(result, tuple) and len(result) == 2:
-        return result  # (path_or_paths, metadata)
+        actual_path, metadata = result
     else:
-        return result, None  # fallback: path only, no metadata
+        actual_path, metadata = result, None
+
+    # Apply clockwise rotation if requested (e.g. for portrait manuscripts)
+    rotate_deg = getattr(camera_config, "rotate_deg", 0)
+    if rotate_deg:
+        _apply_rotation(Path(str(actual_path)), rotate_deg)
+        # Also rotate the _preview.jpg extracted from CR2 if present
+        preview = Path(str(actual_path)).with_suffix("")
+        preview = preview.parent / (preview.name + "_preview.jpg")
+        if preview.exists():
+            _apply_rotation(preview, rotate_deg)
+
+    return actual_path, metadata
     
 
 def single_capture_image(
@@ -370,6 +442,15 @@ def capture_preview_frame(camera_index: int) -> bytes:
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
+    backend = get_backend()
+
+    # If the backend has a native preview implementation (e.g. gphoto2), use it
+    # directly instead of the picamera2-specific CameraConfig path below.
+    try:
+        return backend.capture_preview(camera_index)
+    except NotImplementedError:
+        pass  # fall through to picamera2 path
+
     # Fixed per-camera path — overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
     # race on the same path.
@@ -386,8 +467,6 @@ def capture_preview_frame(camera_index: int) -> bytes:
         encoding="jpg",
         raw=False,
     )
-
-    backend = get_backend()
 
     with lock:
         for attempt in range(2):
@@ -446,8 +525,15 @@ def get_focus(camera_index: int) -> float:
 
     Reads the value from the running Picamera2 instance's metadata if
     available, otherwise falls back to 0.0 (infinity).
+
+    Raises RuntimeError if the active backend does not support focus control.
     """
     backend = get_backend()
+
+    if not backend.get_capabilities().get("focus_control", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support focus control"
+        )
 
     # picamera2 backend exposes the cached instance
     if hasattr(backend, "_cameras") and camera_index in backend._cameras:
@@ -478,6 +564,11 @@ def set_focus(camera_index: int, lens_position: float) -> float:
 
     backend = get_backend()
 
+    if not backend.get_capabilities().get("focus_control", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support manual focus"
+        )
+
     # Clamp to a reasonable range (0 = infinity, 10 = ~10 cm)
     pos = max(0.0, min(10.0, float(lens_position)))
 
@@ -505,8 +596,10 @@ def set_camera_controls(camera_index: int, controls: dict) -> None:
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
-    if not hasattr(backend, "apply_controls"):
-        raise RuntimeError("Current camera backend does not support live control updates")
+    if not backend.get_capabilities().get("live_controls", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support live control updates"
+        )
 
     backend.apply_controls(camera_index, controls)
 
@@ -524,8 +617,10 @@ def apply_zoom(camera_index: int, zoom_factor: float) -> None:
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
-    if not hasattr(backend, "apply_zoom"):
-        raise RuntimeError("Current camera backend does not support digital zoom")
+    if not backend.get_capabilities().get("zoom", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support digital zoom"
+        )
 
     backend.apply_zoom(camera_index, zoom_factor)
 

@@ -94,8 +94,67 @@ class CameraBackend(ABC):
     def cleanup(self):
         """
         Cleanup any resources held by the backend.
-        
+
         This is called when switching backends or shutting down.
         Subclasses should override if they need to release resources.
         """
         pass
+
+    def list_devices(self) -> list:
+        """
+        List all camera devices currently detected by this backend.
+
+        Returns a list of dicts with at minimum these keys:
+            index (int): Camera index used in all capture calls.
+            model (str): Human-readable model/product name.
+            hardware_id (str): Stable ID derived from hardware identity
+                (not the USB index, which changes on power-cycle).
+            serial (str | None): Serial number if available.
+            location (str | None): Physical connection info (bus/port).
+            has_aperture_control (bool): True if aperture can be set via API.
+            supports_zoom (bool): True if digital/ScalerCrop zoom is available.
+
+        The default implementation returns an empty list. Backends should
+        override to provide accurate enumeration for their hardware type.
+        """
+        return []
+
+    def capture_preview(self, camera_index: int) -> bytes:
+        """
+        Capture a single live-preview frame and return raw JPEG bytes.
+
+        Not saved to disk. Intended for frontend polling loops.
+
+        Returns:
+            JPEG bytes of the preview frame.
+
+        Raises:
+            NotImplementedError: If this backend does not support live preview.
+            RuntimeError: If the capture fails.
+        """
+        raise NotImplementedError(
+            f"{self.get_backend_name()} does not support live preview"
+        )
+
+    def get_capabilities(self) -> dict:
+        """
+        Return a dict of boolean capability flags for this backend.
+
+        Keys:
+            live_preview (bool): Can return JPEG frames for frontend polling.
+            focus_control (bool): Supports `get_focus` / `set_focus`.
+            live_controls (bool): Supports `set_camera_controls` (live picamera2 controls).
+            zoom (bool): Supports ScalerCrop-based digital zoom.
+            autofocus_calibration (bool): Can run AF + WB calibration routines.
+            dslr_settings (bool): Exposes ISO / shutter speed / aperture via PTP.
+
+        Subclasses should override this to reflect their actual capabilities.
+        """
+        return {
+            "live_preview": False,
+            "focus_control": False,
+            "live_controls": False,
+            "zoom": False,
+            "autofocus_calibration": False,
+            "dslr_settings": False,
+        }

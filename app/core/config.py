@@ -15,6 +15,7 @@ class Settings(BaseSettings):
     CAMERA_BACKEND: str = Field(default="picamera2", env="CAMERA_BACKEND")
     SECRET_KEY: str = Field(default="dev-secret-change-me", env="SECRET_KEY")
     ACCESS_TOKEN_EXPIRE_SECONDS: int = Field(default=28800, env="ACCESS_TOKEN_EXPIRE_SECONDS")  # 8 hours
+    CORS_ORIGINS: list[str] = Field(default=["http://localhost:5173", "http://localhost:3000"], env="CORS_ORIGINS")
     app_version: str = "0.0.0-dev"
 
     model_config = ConfigDict(

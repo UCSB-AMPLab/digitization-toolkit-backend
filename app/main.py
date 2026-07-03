@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 # initialize DB tables
 from app.core.db import init_db
+from app.core.config import settings
 
 # routers
 from app.api.records import router as records_router
@@ -26,8 +27,9 @@ app = FastAPI(lifespan=lifespan)
 # :5173 = Vite dev server, :3000 = production Node server
 app.add_middleware(
     CORSMiddleware,
-    allow_origins=["http://localhost:5173", "http://localhost:3000"],
+    allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
+    # allow_private_network=True,  # Disabled: not supported by installed Starlette (PR #3065 never merged) — causes CORSMiddleware TypeError
     allow_methods=["*"],
     allow_headers=["*"],
 )
