@@ -233,9 +233,15 @@ def db_session(override_projects_root):
     import tempfile
     from app.core.db import Base, engine, SessionLocal
     from sqlalchemy import create_engine
+
+    # Import all models so their tables are registered on Base.metadata
+    from app.models import (  # noqa: F401
+        user, project, project_member, collection, record, camera, system_log,
+    )
     
     # Use temporary file-based SQLite for testing
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
+    temp_db.close()  # release the handle; SQLite reopens the file by name
     test_db_url = f"sqlite:///{temp_db.name}"
     
     test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
@@ -248,8 +254,9 @@ def db_session(override_projects_root):
     session = SessionLocal()
     
     yield session
-    
+
     session.close()
+    test_engine.dispose()  # close all pooled connections before removing the file
     Path(temp_db.name).unlink(missing_ok=True)
 
 
