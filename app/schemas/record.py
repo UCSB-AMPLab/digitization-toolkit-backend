@@ -99,9 +99,9 @@ class RecordImageCreate(RecordImageBase):
 
 
 class RecordImageUpdate(BaseModel):
+	# File paths are managed server-side and must never be client-settable
 	sequence: Optional[int] = None
 	role: Optional[str] = None
-	thumbnail_path: Optional[str] = None
 
 
 class RecordImageRead(RecordImageBase):

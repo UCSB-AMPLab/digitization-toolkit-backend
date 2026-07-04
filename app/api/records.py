@@ -19,6 +19,7 @@ from app.schemas.record import (
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS
 )
 from app.core.config import settings
+from app.core.paths import resolve_within_storage
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 
 router = APIRouter()
@@ -159,13 +160,15 @@ def delete_record(
 			detail=f"Cannot delete a record with status '{rec.status}'. Move it to 'rejected' first."
 		)
 	
-	# Clean up image files and thumbnails
+	# Clean up image files and thumbnails; only unlink paths inside storage
 	for img in rec.images:
-		if img.file_path:
-			Path(img.file_path).unlink(missing_ok=True)
-		if img.thumbnail_path:
-			delete_thumbnail(img.thumbnail_path)
-	
+		file_path = resolve_within_storage(img.file_path)
+		if file_path:
+			file_path.unlink(missing_ok=True)
+		thumbnail_path = resolve_within_storage(img.thumbnail_path)
+		if thumbnail_path:
+			delete_thumbnail(str(thumbnail_path))
+
 	db.delete(rec)
 	db.commit()
 	return {"detail": f"Record {rec_id} and {len(rec.images)} images deleted"}
@@ -309,9 +312,12 @@ def update_image(
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	
+
+	# Explicit whitelist: file paths and other fields stay server-managed
+	mutable_fields = {"sequence", "role"}
 	for field, value in payload.model_dump(exclude_unset=True).items():
-		setattr(img, field, value)
+		if field in mutable_fields:
+			setattr(img, field, value)
 	
 	db.add(img)
 	db.commit()
@@ -330,11 +336,13 @@ def delete_image(
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
 	
-	# Clean up files
-	if img.file_path:
-		Path(img.file_path).unlink(missing_ok=True)
-	if img.thumbnail_path:
-		delete_thumbnail(img.thumbnail_path)
+	# Clean up files; only unlink paths inside storage
+	file_path = resolve_within_storage(img.file_path)
+	if file_path:
+		file_path.unlink(missing_ok=True)
+	thumbnail_path = resolve_within_storage(img.thumbnail_path)
+	if thumbnail_path:
+		delete_thumbnail(str(thumbnail_path))
 	
 	db.delete(img)
 	db.commit()
@@ -354,9 +362,10 @@ def download_image_file(
 	
 	if not img.file_path:
 		raise HTTPException(status_code=404, detail="Image has no associated file")
-	
-	file_path = Path(img.file_path)
-	if not file_path.exists():
+
+	# Serve only files contained in the storage roots
+	file_path = resolve_within_storage(img.file_path)
+	if file_path is None or not file_path.exists():
 		raise HTTPException(status_code=404, detail="File not found on disk")
 
 	# For RAW files (e.g. CR2), serve the JPEG preview sidecar so browsers can display it
@@ -395,13 +404,13 @@ def get_image_thumbnail(
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
 
-	# If thumbnail is missing or the file was deleted, try to generate it now
-	thumbnail_path = Path(img.thumbnail_path) if img.thumbnail_path else None
+	# If the thumbnail is missing, deleted, or outside storage, regenerate it from the source
+	thumbnail_path = resolve_within_storage(img.thumbnail_path)
 	if thumbnail_path is None or not thumbnail_path.exists():
 		if not img.file_path:
 			raise HTTPException(status_code=404, detail="Image has no source file for thumbnail generation")
-		source_path = Path(img.file_path)
-		if not source_path.exists():
+		source_path = resolve_within_storage(img.file_path)
+		if source_path is None or not source_path.exists():
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
 		try:
 			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
@@ -471,13 +480,13 @@ def update_record_status(
 	Change the QA status of a record.
 
 	Valid transitions and required roles:
-	- captured  → in_review : operator, admin, reviewer
-	- in_review → rejected  : reviewer, admin
-	- in_review → approved  : reviewer, admin
-	- in_review → captured  : operator, admin  (cancel review)
-	- rejected  → captured  : operator, admin  (prepare for retake)
-	- approved  → rejected  : reviewer, admin  (flag for rework)
-	- approved  → captured  : admin only        (full reset)
+	- captured  > in_review : operator, admin, reviewer
+	- in_review > rejected  : reviewer, admin
+	- in_review > approved  : reviewer, admin
+	- in_review > captured  : operator, admin  (cancel review)
+	- rejected  > captured  : operator, admin  (prepare for retake)
+	- approved  > rejected  : reviewer, admin  (flag for rework)
+	- approved  > captured  : admin only       (full reset)
 	"""
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:
