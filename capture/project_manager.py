@@ -30,6 +30,21 @@ def secure_project_filename(project_name):
     project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
     return project_name.lstrip('.').lower()
 
+
+def project_capture_root(project_name: str) -> Path:
+    """Project-level directory holding the manifest and all image subdirs.
+    Args:
+        project_name: Name of the project"""
+    return Path(PROJECTS_ROOT, secure_project_filename(project_name))
+
+
+def image_output_dir(project_name: str, collection_name: Optional[str] = None) -> Path:
+    """Directory where captured images are written for a project/collection."""
+    root = project_capture_root(project_name)
+    if collection_name:
+        root = root / secure_project_filename(collection_name)
+    return root / "images" / "main"
+
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """
     Load calibration profile for a camera.
@@ -133,7 +148,7 @@ def project_init(
         Path to the created project directory
     """
         
-    project_path = Path(PROJECTS_ROOT, secure_project_filename(project_name))
+    project_path = project_capture_root(project_name)
     packages_dir = Path(project_path, "packages")
     
     for path in [packages_dir]:

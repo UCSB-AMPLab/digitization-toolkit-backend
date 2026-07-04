@@ -33,7 +33,7 @@ from .utils import setup_rotating_logger
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
-from .project_manager import secure_project_filename
+from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
 
@@ -219,10 +219,7 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    if collection_name:
-        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / secure_project_filename(collection_name) / "images" / "main"
-    else:
-        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / "images" / "main"
+    project_path = image_output_dir(project_name, collection_name)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -293,15 +290,16 @@ def single_capture_image(
     )
     
     elapsed_time = time.time() - start_time
-    
-    project_root = PROJECTS_ROOT / project_name
-    
+
+    project_root = project_capture_root(project_name)
+
     record = generate_manifest_record(
         project_name=project_name,
         img_paths=[output_path],
         cam_configs=[camera_config],
         times=[elapsed_time],
-        metadata_list=[metadata] if metadata else None
+        metadata_list=[metadata] if metadata else None,
+        project_root=project_root
     )
     append_manifest_record(project_root, record)
     
@@ -391,11 +389,11 @@ def dual_capture_image(
         img1_path, time1, metadata1 = future1.result()
         img2_path, time2, metadata2 = future2.result()
         
-    project_root = PROJECTS_ROOT / project_name
-    
+    project_root = project_capture_root(project_name)
+
     # Prepare metadata list (filter out None values)
     metadata_list = [m for m in [metadata1, metadata2] if m is not None]
-    
+
     record = generate_manifest_record(
         project_name=project_name,
         pair_id=timestamp_index,
@@ -403,7 +401,8 @@ def dual_capture_image(
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
         stagger=stagger_ms,
-        metadata_list=metadata_list if metadata_list else None
+        metadata_list=metadata_list if metadata_list else None,
+        project_root=project_root
     )
     append_manifest_record(project_root, record)
     

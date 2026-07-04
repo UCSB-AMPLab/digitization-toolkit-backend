@@ -248,18 +248,15 @@ def delete_collection(
     db.commit()
 
     # Remove the collection directory from disk (project/collection/images/).
-    # Try both raw and sanitized names to handle historic inconsistencies.
+    # Images and manifest share the sanitized path, so one candidate covers both.
     if project_name:
-        safe_col = secure_project_filename(collection_name)
-        for proj_dir in [settings.projects_dir / project_name, settings.projects_dir / secure_project_filename(project_name)]:
-            for col_dir in ([proj_dir / collection_name] + ([proj_dir / safe_col] if safe_col != collection_name else [])):
-                if col_dir.exists() and col_dir.is_dir():
-                    try:
-                        shutil.rmtree(col_dir)
-                        logger.info(f"Removed collection directory: {col_dir}")
-                    except Exception as e:
-                        logger.warning(f"Could not remove collection directory {col_dir}: {e}")
-                    break
+        col_dir = settings.projects_dir / secure_project_filename(project_name) / secure_project_filename(collection_name)
+        if col_dir.exists() and col_dir.is_dir():
+            try:
+                shutil.rmtree(col_dir)
+                logger.info(f"Removed collection directory: {col_dir}")
+            except Exception as e:
+                logger.warning(f"Could not remove collection directory {col_dir}: {e}")
 
     return None
 

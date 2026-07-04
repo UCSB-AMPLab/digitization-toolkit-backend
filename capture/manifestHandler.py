@@ -113,6 +113,21 @@ class CaptureRecord:
 
 #### Helper functions ####
 
+def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[Path]) -> str:
+    """Path of a captured file relative to the project root.
+
+    Keeps the manifest's paths in the same tree as the images (including any
+    collection subdir). Falls back to images/main/<name> when the file is not
+    under project_root.
+    """
+    p = Path(file_path)
+    if project_root is not None:
+        try:
+            return str(p.relative_to(project_root))
+        except ValueError:
+            pass
+    return str(Path("images/main") / p.name)
+
 def generate_manifest_project(
     project_name: str,
     paths: Dict[str, str] = None,
@@ -145,7 +160,8 @@ def generate_manifest_record(
     pair_id: str = None,
     stagger: int = None,
     roles: list = None,
-    metadata_list: list = None) -> CaptureRecord:
+    metadata_list: list = None,
+    project_root: Optional[Path] = None) -> CaptureRecord:
     """
     Generate a manifest record for single or dual captures.
     
@@ -183,18 +199,18 @@ def generate_manifest_record(
             # Add JPEG file
             files.append(CaptureFile(
                 role=role,
-                relative_path=str(Path("images/main") / Path(jpeg_path).name),
+                relative_path=_relative_capture_path(jpeg_path, project_root),
                 bytes=os.path.getsize(jpeg_path),
                 mimetype=f"image/{config.encoding}",
                 sha256=compute_sha256(jpeg_path)
             ))
-            
+
             # Add raw sensor data file
             # Note: Using .raw extension due to picamera2 DNG save bug
             # Contains compressed raw sensor data (Pi 5) or packed pixels (Pi 4)
             files.append(CaptureFile(
                 role=f"{role}_raw",
-                relative_path=str(Path("images/main") / Path(raw_path).name),
+                relative_path=_relative_capture_path(raw_path, project_root),
                 bytes=os.path.getsize(raw_path),
                 mimetype="application/octet-stream",  # Binary raw sensor data
                 sha256=compute_sha256(raw_path)
@@ -203,7 +219,7 @@ def generate_manifest_record(
             # Single format
             files.append(CaptureFile(
                 role=role,
-                relative_path=str(Path("images/main") / Path(path).name),
+                relative_path=_relative_capture_path(path, project_root),
                 bytes=os.path.getsize(path),
                 mimetype=f"image/{config.encoding}",
                 sha256=compute_sha256(path)
