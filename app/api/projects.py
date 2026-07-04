@@ -216,22 +216,14 @@ def delete_project(
     log_event(db, level="WARN", category="activity", action="project_deleted",
               actor=current_user.username, subject=project_name)
 
-    # Remove the project directory from disk.
-    # Two candidate paths are tried because project_init() sanitizes the name
-    # (spaces → underscores) while capture_image() uses the raw name directly.
-    safe_name = secure_project_filename(project_name)
-    candidates = [settings.projects_dir / project_name]
-    if safe_name != project_name:
-        candidates.append(settings.projects_dir / safe_name)
 
-    for candidate in candidates:
-        if candidate.exists() and candidate.is_dir():
-            try:
-                shutil.rmtree(candidate)
-                logger.info(f"Removed project directory: {candidate}")
-            except Exception as e:
-                logger.warning(f"Could not remove project directory {candidate}: {e}")
-            break
+    project_dir = settings.projects_dir / secure_project_filename(project_name)
+    if project_dir.exists() and project_dir.is_dir():
+        try:
+            shutil.rmtree(project_dir)
+            logger.info(f"Removed project directory: {project_dir}")
+        except Exception as e:
+            logger.warning(f"Could not remove project directory {project_dir}: {e}")
 
     return {"detail": "project deleted"}
 
