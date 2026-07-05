@@ -384,7 +384,7 @@ def export_collection_bagit(
     records = (
         db.query(Record)
         .filter(Record.collection_id == collection_id)
-        .order_by(Record.sequence.nulls_last(), Record.created_at)
+        .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
     if not records:
@@ -411,9 +411,9 @@ def export_collection_bagit(
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        # Copy image files into data/ organised by record sequence
+        # Copy image files into data/ numbered by their position in the ordered list
         for idx, rec in enumerate(records):
-            seq_label = f"{(rec.sequence if rec.sequence is not None else idx):04d}"
+            seq_label = f"{idx + 1:04d}"
             safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (rec.title or "record"))[:60]
             rec_dir = data_dir / f"{seq_label}_{safe_title}"
             rec_dir.mkdir(exist_ok=True)

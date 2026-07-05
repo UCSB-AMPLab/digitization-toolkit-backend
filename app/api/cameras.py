@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from app.models.record import Record, RecordImage
 from typing import List, Optional
 from pydantic import BaseModel
@@ -19,6 +20,21 @@ logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+
+def _next_record_sequence(db: Session, project_id: Optional[int], collection_id: Optional[int]) -> int:
+	"""Next monotonic record sequence within a collection (or project).
+
+	Assigned at capture time so export order never depends on the wall clock,
+	which is unreliable on a Pi without an RTC after a power cut.
+	"""
+	query = db.query(func.max(Record.sequence))
+	if collection_id is not None:
+		query = query.filter(Record.collection_id == collection_id)
+	else:
+		query = query.filter(Record.project_id == project_id)
+	current_max = query.scalar()
+	return (current_max + 1) if current_max is not None else 0
 
 
 class DeviceInfo(BaseModel):
@@ -511,6 +527,7 @@ def trigger_capture(
 				object_typology="document",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
+				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
 			)
 			db.add(record)
@@ -675,6 +692,7 @@ def trigger_dual_capture(
 				object_typology="book",  # Default to book for dual captures
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
+				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
 			)
 			db.add(record)
