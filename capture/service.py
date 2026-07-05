@@ -230,7 +230,15 @@ def capture_image(
         )
     
     output_path = Path(project_path, output_filename)
-    
+
+    # Never overwrite an existing master if a repeated timestamp collides
+    if output_path.exists():
+        stem, suffix = output_path.stem, output_path.suffix
+        counter = 1
+        while output_path.exists():
+            output_path = project_path / f"{stem}_{counter}{suffix}"
+            counter += 1
+
     # Use backend for actual capture
     backend = get_backend()
     result = backend.capture_image(output_path, camera_config, capture_output)
