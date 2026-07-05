@@ -38,11 +38,17 @@ def project_capture_root(project_name: str) -> Path:
     return Path(PROJECTS_ROOT, secure_project_filename(project_name))
 
 
+def collection_capture_root(project_name: str, collection_name: str) -> Path:
+    """On-disk root of a collection (sibling directory under the project root)."""
+    return project_capture_root(project_name) / secure_project_filename(collection_name)
+
+
 def image_output_dir(project_name: str, collection_name: Optional[str] = None) -> Path:
     """Directory where captured images are written for a project/collection."""
-    root = project_capture_root(project_name)
     if collection_name:
-        root = root / secure_project_filename(collection_name)
+        root = collection_capture_root(project_name, collection_name)
+    else:
+        root = project_capture_root(project_name)
     return root / "images" / "main"
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:

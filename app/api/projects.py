@@ -1,8 +1,17 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
 from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
 from pydantic import BaseModel
 import logging
+
+from app.core.storage_ops import (
+    collection_and_descendants,
+    collection_ids_under_project,
+    relocate_image,
+    remove_tree,
+    surviving_images_under,
+)
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
@@ -129,20 +138,39 @@ def update_project(
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
-    """Update a project's details."""
+    """Update a project's details, relocating image files if the name changes."""
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    
+
     # Check for name conflicts if name is being changed
-    if payload.name and payload.name != p.name:
+    name_changed = bool(payload.name) and payload.name != p.name
+    if name_changed:
         existing = db.query(Project).filter(Project.name == payload.name).first()
         if existing:
             raise HTTPException(status_code=409, detail="Project with this name already exists")
-    
+
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, field, value)
-    
+
+    # The on-disk directory is keyed by name, so a rename must relocate the files
+    if name_changed:
+        from capture.project_manager import image_output_dir
+
+        collection_ids = collection_ids_under_project(db, p.id)
+        filters = [Record.project_id == p.id]
+        if collection_ids:
+            filters.append(Record.collection_id.in_(collection_ids))
+        records = db.query(Record).filter(or_(*filters)).all()
+        col_names = {
+            c.id: c.name
+            for c in db.query(Collection).filter(Collection.id.in_(collection_ids)).all()
+        } if collection_ids else {}
+        for r in records:
+            target_dir = image_output_dir(p.name, col_names.get(r.collection_id))
+            for img in r.images:
+                relocate_image(img, target_dir)
+
     db.add(p)
     db.commit()
     db.refresh(p)
@@ -164,6 +192,8 @@ def move_collections(
     Move all top-level collections from this project to another project.
     Sub-collections follow automatically through their parent FK.
     """
+    from capture.project_manager import image_output_dir
+
     source = db.query(Project).filter(Project.id == project_id).first()
     if not source:
         raise HTTPException(status_code=404, detail="Source project not found")
@@ -173,11 +203,30 @@ def move_collections(
     if project_id == payload.target_project_id:
         raise HTTPException(status_code=400, detail="Source and target project must be different")
 
+    # Full moved subtree (top-level collections plus their nested descendants)
+    moved_collection_ids: list[int] = []
+    for c in db.query(Collection).filter(Collection.project_id == project_id).all():
+        moved_collection_ids.extend(collection_and_descendants(db, c.id))
+
+    # Re-parent the top-level collections; descendants follow via parent FK
     moved = (
         db.query(Collection)
         .filter(Collection.project_id == project_id)
         .update({"project_id": payload.target_project_id}, synchronize_session=False)
     )
+
+    # Relocate the image files so they physically live under the target project
+    if moved_collection_ids:
+        names = {
+            c.id: c.name
+            for c in db.query(Collection).filter(Collection.id.in_(moved_collection_ids)).all()
+        }
+        records = db.query(Record).filter(Record.collection_id.in_(moved_collection_ids)).all()
+        for r in records:
+            target_dir = image_output_dir(target.name, names.get(r.collection_id))
+            for img in r.images:
+                relocate_image(img, target_dir)
+
     db.commit()
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
@@ -188,42 +237,54 @@ def move_collections(
 @router.delete("/{project_id}")
 def delete_project(
     project_id: int,
-    current_user: User = Depends(allow_contributor),
+    current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete a project and its filesystem directory.
+    Delete an empty project and its (now unused) directory.
 
-    Deletes the DB record, unlinks associated records, then removes the
-    project directory (including all collection subdirectories and images).
+    Refuses (409) if the project still has collections or records (those must
+    be moved or deleted first) or if its directory still holds files that a
+    surviving record points at. A move relocates files, so the honest flow is
+    "move contents out, then delete the emptied project".
     """
-    import shutil
-    from app.core.config import settings
-    from capture.project_manager import secure_project_filename
+    from capture.project_manager import project_capture_root
 
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
 
     project_name = p.name
-    # Unlink all records from this project
-    db.query(Record).filter(Record.project_id == project_id).update(
-        {"project_id": None}
-    )
+
+    # Refuse to delete a non-empty project; report the blocking counts
+    collection_count = db.query(func.count(Collection.id)).filter(Collection.project_id == project_id).scalar()
+    record_count = db.query(func.count(Record.id)).filter(Record.project_id == project_id).scalar()
+    if collection_count or record_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete a non-empty project: {collection_count} collection(s) and {record_count} record(s) remain. Move or delete them first.",
+        )
+
+    project_dir = project_capture_root(project_name)
+
+    # Hard guard: never remove a directory that still holds a surviving record's files
+    if surviving_images_under(db, project_dir):
+        raise HTTPException(
+            status_code=409,
+            detail="Project directory still holds files referenced by other records. Move those records first.",
+        )
+
+    # Remove files first so a filesystem failure aborts before touching the DB
+    try:
+        remove_tree(project_dir)
+    except OSError as e:
+        logger.error(f"Failed to remove project directory {project_dir}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to remove project files from disk")
 
     db.delete(p)
     db.commit()
     log_event(db, level="WARN", category="activity", action="project_deleted",
               actor=current_user.username, subject=project_name)
-
-
-    project_dir = settings.projects_dir / secure_project_filename(project_name)
-    if project_dir.exists() and project_dir.is_dir():
-        try:
-            shutil.rmtree(project_dir)
-            logger.info(f"Removed project directory: {project_dir}")
-        except Exception as e:
-            logger.warning(f"Could not remove project directory {project_dir}: {e}")
 
     return {"detail": "project deleted"}
 
