@@ -1,23 +1,31 @@
 import json
+import logging
 import os
 import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.auth import RoleChecker
+from app.api.auth import RoleChecker, get_current_user
 from app.api.deps import get_db_dependency
 from app.models.system_log import SystemLog
 from app.models.user import User
 from app.schemas.system_log import SystemLogOut
 
+logger = logging.getLogger(__name__)
+
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 allow_admin     = RoleChecker(["admin"])
+
+# Single root-privileged entry point installed (root-owned, sudoers-whitelisted)
+# by the superproject setup. All privileged shell-outs go through this helper
+# rather than raw mount/umount/mkdir/chown; see /etc/sudoers.d/dtk-system-helper.
+HELPER = "/usr/local/bin/dtk-system-helper"
 
 router = APIRouter()
 
@@ -177,10 +185,16 @@ def mount_device(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Mount an unmounted partition via sudo mount (no polkit/D-Bus required).
+    """Mount an unmounted partition via the dtk-system-helper (no polkit/D-Bus).
 
-    Requires /etc/sudoers.d/dtk-storage to grant the service user passwordless
-    sudo for /usr/bin/mount and /usr/bin/umount.  This is set up by setup.sh.
+    Requires /etc/sudoers.d/dtk-system-helper to grant the service user
+    passwordless sudo for /usr/local/bin/dtk-system-helper. The helper adds the
+    uid/gid options for vfat/exfat itself and always mounts nosuid,nodev. This
+    is set up by the superproject installer.
+
+    The mounts root is root-owned and the helper is its only writer: the backend
+    just decides the mountpoint *name*; the helper creates the directory and
+    removes it again if the mount fails.
     """
     if not _DEVICE_RE.match(body.device):
         raise HTTPException(status_code=400, detail="Ruta de dispositivo no válida.")
@@ -193,29 +207,20 @@ def mount_device(
     if dev_info.get("mountpoint"):
         return {"mountpoint": dev_info["mountpoint"], "message": "El dispositivo ya está montado."}
 
-    # Build a safe mount point directory under the dtk data tree
+    # Build a safe mount point name under the dtk data tree. The mounts root is
+    # root-owned; the helper creates the directory itself (and removes it if the
+    # mount fails), so we don't mkdir here.
     label = dev_info.get("label") or dev_info["name"]
     safe  = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:32]
     mountpoint = _MOUNT_BASE / safe
-    mountpoint.mkdir(parents=True, exist_ok=True)
 
-    # Build mount command.
-    # FAT-based filesystems (exfat, vfat) don't store Unix ownership in the
-    # filesystem — ownership is controlled entirely by mount options.
-    # Pass uid/gid so all files appear owned by the running user (pi).
-    fstype = dev_info.get("fstype") or ""
-    cmd = ["sudo", "mount"]
-    if fstype in ("vfat", "exfat"):
-        cmd += ["-o", f"uid={os.getuid()},gid={os.getgid()}"]
-    cmd += [body.device, str(mountpoint)]
+    # Mount through the privileged helper. It handles fstype-specific options
+    # (uid/gid for vfat/exfat) and always mounts nosuid,nodev, so we don't build
+    # -o options here.
+    cmd = ["sudo", HELPER, "mount", body.device, str(mountpoint)]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        # Clean up the (empty) directory we just created
-        try:
-            mountpoint.rmdir()
-        except OSError:
-            pass
         detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al montar."
         raise HTTPException(status_code=500, detail=detail)
 
@@ -241,6 +246,9 @@ def unmount_device(
 
     If the unmounted path is currently the active storage override, the override
     is cleared automatically so the backend falls back to its default path.
+
+    The helper removes the (root-owned) mountpoint directory after a successful
+    umount, so no cleanup happens here.
     """
     from app.core.storage_override import get_storage_override, clear_storage_override
     from app.core.audit import log_event
@@ -262,7 +270,7 @@ def unmount_device(
         override_cleared = True
 
     result = subprocess.run(
-        ["sudo", "umount", str(target)],
+        ["sudo", HELPER, "umount", str(target)],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
@@ -272,12 +280,6 @@ def unmount_device(
             set_storage_override(override)
         detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al desmontar."
         raise HTTPException(status_code=500, detail=detail)
-
-    # Remove the now-empty mount directory so it doesn't clutter the listing
-    try:
-        target.rmdir()
-    except OSError:
-        pass  # non-empty or already gone — not fatal
 
     log_event(db, level="INFO", category="system", action="storage_unmount",
               actor=current_user.username, subject=str(target))
@@ -313,18 +315,15 @@ def activate_storage(
         projects_path.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         # ext4 / ext2 partitions freshly formatted have a root-owned filesystem root.
-        # Use sudo to create the directory, then hand ownership to pi.
+        # The helper does mkdir -p and hands ownership to the invoking user in one
+        # step (the path must end in dtk-projects, which it does).
         r1 = subprocess.run(
-            ["sudo", "mkdir", "-p", str(projects_path)],
+            ["sudo", HELPER, "prepare-projects", str(projects_path)],
             capture_output=True, text=True, timeout=10,
         )
         if r1.returncode != 0:
             detail = r1.stderr.strip() or "Error al crear el directorio."
             raise HTTPException(status_code=500, detail=f"No se puede crear el directorio: {detail}")
-        subprocess.run(
-            ["sudo", "chown", "pi:pi", str(projects_path)],
-            capture_output=True, text=True, timeout=10,
-        )
 
     set_storage_override(str(projects_path))
 
@@ -351,3 +350,72 @@ def reset_storage(
 
     from app.core.storage_override import get_storage_override  # should be None now
     return {"projects_path": str(settings.projects_dir), "message": "Restaurado al almacenamiento predeterminado."}
+
+
+# ---------------------------------------------------------------------------
+# Power management
+# ---------------------------------------------------------------------------
+
+class PowerRequest(BaseModel):
+    action: Literal["poweroff", "reboot"]
+
+
+def _run_power_action(action: str) -> None:
+    """Invoke the privileged helper to power off or reboot the appliance.
+
+    Runs in a background task after the HTTP response has been sent, so the
+    reply isn't lost when the system goes down. Failures are logged (there is
+    no client left to inform by the time this runs); stdin is closed so a
+    misconfigured sudoers can never sit waiting for a password until the
+    timeout.
+    """
+    try:
+        result = subprocess.run(
+            ["sudo", HELPER, action],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "sin salida"
+            logger.error("Power action %s failed (rc=%s): %s",
+                         action, result.returncode, detail)
+    except Exception:
+        logger.exception("Power action %s failed", action)
+
+
+@router.post("/power")
+def power_control(
+    body: PowerRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    """Power off or reboot the appliance. Any authenticated user may call this.
+
+    This is intentionally NOT admin-only: the operators who run the toolkit are
+    often non-technical staff, and anyone with physical access can already pull
+    the plug — a graceful shutdown from the UI is strictly safer than that.
+
+    The action is audit-logged and committed *before* it is triggered (the DB is
+    about to go down), then dispatched via a BackgroundTask so the HTTP response
+    is sent before the machine powers off.
+    """
+    # Refuse honestly on machines without the helper (dev Docker, non-Pi hosts)
+    # rather than pretending we scheduled a shutdown that will never happen.
+    if shutil.which("sudo") is None or not os.path.exists(HELPER):
+        raise HTTPException(
+            status_code=501,
+            detail="Control de energía no disponible en este equipo.",
+        )
+
+    from app.core.audit import log_event
+    log_event(db, level="INFO", category="system", action="power_" + body.action,
+              actor=current_user.username)
+
+    background_tasks.add_task(_run_power_action, body.action)
+
+    if body.action == "poweroff":
+        message = "El equipo se apagará en unos segundos."
+    else:
+        message = "El equipo se reiniciará en unos segundos."
+    return {"action": body.action, "message": message}
