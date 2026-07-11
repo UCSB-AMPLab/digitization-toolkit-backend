@@ -188,6 +188,10 @@ def mount_device(
     passwordless sudo for /usr/local/bin/dtk-system-helper. The helper adds the
     uid/gid options for vfat/exfat itself and always mounts nosuid,nodev. This
     is set up by the superproject installer.
+
+    The mounts root is root-owned and the helper is its only writer: the backend
+    just decides the mountpoint *name*; the helper creates the directory and
+    removes it again if the mount fails.
     """
     if not _DEVICE_RE.match(body.device):
         raise HTTPException(status_code=400, detail="Ruta de dispositivo no válida.")
@@ -200,11 +204,12 @@ def mount_device(
     if dev_info.get("mountpoint"):
         return {"mountpoint": dev_info["mountpoint"], "message": "El dispositivo ya está montado."}
 
-    # Build a safe mount point directory under the dtk data tree
+    # Build a safe mount point name under the dtk data tree. The mounts root is
+    # root-owned; the helper creates the directory itself (and removes it if the
+    # mount fails), so we don't mkdir here.
     label = dev_info.get("label") or dev_info["name"]
     safe  = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:32]
     mountpoint = _MOUNT_BASE / safe
-    mountpoint.mkdir(parents=True, exist_ok=True)
 
     # Mount through the privileged helper. It handles fstype-specific options
     # (uid/gid for vfat/exfat) and always mounts nosuid,nodev, so we don't build
@@ -213,11 +218,6 @@ def mount_device(
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        # Clean up the (empty) directory we just created
-        try:
-            mountpoint.rmdir()
-        except OSError:
-            pass
         detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al montar."
         raise HTTPException(status_code=500, detail=detail)
 
@@ -243,6 +243,9 @@ def unmount_device(
 
     If the unmounted path is currently the active storage override, the override
     is cleared automatically so the backend falls back to its default path.
+
+    The helper removes the (root-owned) mountpoint directory after a successful
+    umount, so no cleanup happens here.
     """
     from app.core.storage_override import get_storage_override, clear_storage_override
     from app.core.audit import log_event
@@ -274,12 +277,6 @@ def unmount_device(
             set_storage_override(override)
         detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al desmontar."
         raise HTTPException(status_code=500, detail=detail)
-
-    # Remove the now-empty mount directory so it doesn't clutter the listing
-    try:
-        target.rmdir()
-    except OSError:
-        pass  # non-empty or already gone — not fatal
 
     log_event(db, level="INFO", category="system", action="storage_unmount",
               actor=current_user.username, subject=str(target))
