@@ -16,7 +16,6 @@ from .camera_registry import CameraRegistry
 
 from app.core.config import settings
 
-PROJECTS_ROOT = settings.projects_dir
 LOG_FILE = settings.log_dir / "project_manager.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -31,11 +30,23 @@ def secure_project_filename(project_name):
     return project_name.lstrip('.').lower()
 
 
+def _projects_root() -> Path:
+    """Resolve the active projects root at call time.
+
+    Read from settings on every call (rather than a module-level constant
+    captured at import) so a runtime storage-drive switch — POST
+    /system/storage/activate flips the storage override in
+    app.core.config.Settings.projects_dir — takes effect immediately for new
+    captures, keeping writes and reads on the same disk.
+    """
+    return settings.projects_dir
+
+
 def project_capture_root(project_name: str) -> Path:
     """Project-level directory holding the manifest and all image subdirs.
     Args:
         project_name: Name of the project"""
-    return Path(PROJECTS_ROOT, secure_project_filename(project_name))
+    return Path(_projects_root(), secure_project_filename(project_name))
 
 
 def collection_capture_root(project_name: str, collection_name: str) -> Path:
