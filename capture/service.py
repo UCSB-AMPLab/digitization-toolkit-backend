@@ -37,7 +37,6 @@ from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
 
-PROJECTS_ROOT = settings.projects_dir
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
