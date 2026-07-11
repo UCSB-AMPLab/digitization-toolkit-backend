@@ -58,18 +58,31 @@ def test_power_returns_501_when_helper_missing(power_client, monkeypatch):
     assert "no disponible" in resp.json()["detail"].lower()
 
 
+class _Result:
+    def __init__(self, returncode=0, stdout="", stderr=""):
+        self.returncode = returncode
+        self.stdout = stdout
+        self.stderr = stderr
+
+
 @pytest.mark.unit
 def test_power_poweroff_success(power_client, monkeypatch):
     """When the helper is present: 200, Spanish message, audit logged, helper
-    dispatched via subprocess in the background task (not synchronously)."""
+    dispatched via subprocess in the background task (not synchronously),
+    with stdin closed so sudo can never sit waiting for a password."""
+    import subprocess as real_subprocess
     import app.api.system as system
 
     monkeypatch.setattr(system.shutil, "which", lambda name: "/usr/bin/sudo")
     monkeypatch.setattr(system.os.path, "exists", lambda p: True)
 
     calls = []
-    monkeypatch.setattr(system.subprocess, "run",
-                        lambda *a, **k: calls.append(a[0]))
+
+    def fake_run(cmd, **kwargs):
+        calls.append((cmd, kwargs))
+        return _Result(0)
+
+    monkeypatch.setattr(system.subprocess, "run", fake_run)
 
     logged = {}
 
@@ -93,7 +106,9 @@ def test_power_poweroff_success(power_client, monkeypatch):
 
     # TestClient runs background tasks after the response; the helper was called.
     assert calls, "background task should have invoked the helper"
-    assert calls[-1] == ["sudo", system.HELPER, "poweroff"]
+    cmd, kwargs = calls[-1]
+    assert cmd == ["sudo", system.HELPER, "poweroff"]
+    assert kwargs.get("stdin") == real_subprocess.DEVNULL
 
 
 @pytest.mark.unit
@@ -106,7 +121,7 @@ def test_power_reboot_success(power_client, monkeypatch):
 
     calls = []
     monkeypatch.setattr(system.subprocess, "run",
-                        lambda *a, **k: calls.append(a[0]))
+                        lambda cmd, **k: calls.append(cmd) or _Result(0))
 
     import app.core.audit as audit
     monkeypatch.setattr(audit, "log_event", lambda db, **k: None)
@@ -116,6 +131,37 @@ def test_power_reboot_success(power_client, monkeypatch):
     assert resp.status_code == 200
     assert "se reiniciará" in resp.json()["message"]
     assert calls[-1] == ["sudo", system.HELPER, "reboot"]
+
+
+@pytest.mark.unit
+def test_power_helper_failure_is_logged(power_client, monkeypatch):
+    """A non-zero exit from the helper is not silent: the background task logs
+    the return code and stderr via logger.error (there is no client left to
+    inform, so logging is the only diagnostic channel)."""
+    import app.api.system as system
+
+    monkeypatch.setattr(system.shutil, "which", lambda name: "/usr/bin/sudo")
+    monkeypatch.setattr(system.os.path, "exists", lambda p: True)
+    monkeypatch.setattr(
+        system.subprocess, "run",
+        lambda cmd, **k: _Result(1, stderr="sudo: not permitted by sudoers"),
+    )
+
+    import app.core.audit as audit
+    monkeypatch.setattr(audit, "log_event", lambda db, **k: None)
+
+    errors = []
+    monkeypatch.setattr(system.logger, "error",
+                        lambda msg, *args: errors.append(msg % args))
+
+    resp = power_client.post("/system/power", json={"action": "poweroff"})
+
+    # The endpoint itself still returns 200 — the failure happens post-response.
+    assert resp.status_code == 200
+    assert errors, "helper failure should have been logged"
+    assert "poweroff" in errors[-1]
+    assert "rc=1" in errors[-1]
+    assert "not permitted by sudoers" in errors[-1]
 
 
 if __name__ == "__main__":

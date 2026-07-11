@@ -1,4 +1,5 @@
 import json
+import logging
 import os
 import re
 import shutil
@@ -15,6 +16,8 @@ from app.api.deps import get_db_dependency
 from app.models.system_log import SystemLog
 from app.models.user import User
 from app.schemas.system_log import SystemLogOut
+
+logger = logging.getLogger(__name__)
 
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 allow_admin     = RoleChecker(["admin"])
@@ -361,14 +364,23 @@ def _run_power_action(action: str) -> None:
     """Invoke the privileged helper to power off or reboot the appliance.
 
     Runs in a background task after the HTTP response has been sent, so the
-    reply isn't lost when the system goes down. Failures are logged; there is
-    no client left to inform by the time this runs.
+    reply isn't lost when the system goes down. Failures are logged (there is
+    no client left to inform by the time this runs); stdin is closed so a
+    misconfigured sudoers can never sit waiting for a password until the
+    timeout.
     """
     try:
-        subprocess.run(["sudo", HELPER, action], timeout=30)
+        result = subprocess.run(
+            ["sudo", HELPER, action],
+            capture_output=True, text=True, timeout=30,
+            stdin=subprocess.DEVNULL,
+        )
+        if result.returncode != 0:
+            detail = result.stderr.strip() or result.stdout.strip() or "sin salida"
+            logger.error("Power action %s failed (rc=%s): %s",
+                         action, result.returncode, detail)
     except Exception:
-        import logging
-        logging.getLogger(__name__).exception("Power action %s failed", action)
+        logger.exception("Power action %s failed", action)
 
 
 @router.post("/power")
