@@ -19,6 +19,11 @@ from app.schemas.system_log import SystemLogOut
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 allow_admin     = RoleChecker(["admin"])
 
+# Single root-privileged entry point installed (root-owned, sudoers-whitelisted)
+# by the superproject setup. All privileged shell-outs go through this helper
+# rather than raw mount/umount/mkdir/chown; see /etc/sudoers.d/dtk-system-helper.
+HELPER = "/usr/local/bin/dtk-system-helper"
+
 router = APIRouter()
 
 
@@ -177,10 +182,12 @@ def mount_device(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Mount an unmounted partition via sudo mount (no polkit/D-Bus required).
+    """Mount an unmounted partition via the dtk-system-helper (no polkit/D-Bus).
 
-    Requires /etc/sudoers.d/dtk-storage to grant the service user passwordless
-    sudo for /usr/bin/mount and /usr/bin/umount.  This is set up by setup.sh.
+    Requires /etc/sudoers.d/dtk-system-helper to grant the service user
+    passwordless sudo for /usr/local/bin/dtk-system-helper. The helper adds the
+    uid/gid options for vfat/exfat itself and always mounts nosuid,nodev. This
+    is set up by the superproject installer.
     """
     if not _DEVICE_RE.match(body.device):
         raise HTTPException(status_code=400, detail="Ruta de dispositivo no válida.")
@@ -199,15 +206,10 @@ def mount_device(
     mountpoint = _MOUNT_BASE / safe
     mountpoint.mkdir(parents=True, exist_ok=True)
 
-    # Build mount command.
-    # FAT-based filesystems (exfat, vfat) don't store Unix ownership in the
-    # filesystem — ownership is controlled entirely by mount options.
-    # Pass uid/gid so all files appear owned by the running user (pi).
-    fstype = dev_info.get("fstype") or ""
-    cmd = ["sudo", "mount"]
-    if fstype in ("vfat", "exfat"):
-        cmd += ["-o", f"uid={os.getuid()},gid={os.getgid()}"]
-    cmd += [body.device, str(mountpoint)]
+    # Mount through the privileged helper. It handles fstype-specific options
+    # (uid/gid for vfat/exfat) and always mounts nosuid,nodev, so we don't build
+    # -o options here.
+    cmd = ["sudo", HELPER, "mount", body.device, str(mountpoint)]
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
@@ -262,7 +264,7 @@ def unmount_device(
         override_cleared = True
 
     result = subprocess.run(
-        ["sudo", "umount", str(target)],
+        ["sudo", HELPER, "umount", str(target)],
         capture_output=True, text=True, timeout=30,
     )
     if result.returncode != 0:
@@ -313,18 +315,15 @@ def activate_storage(
         projects_path.mkdir(parents=True, exist_ok=True)
     except PermissionError:
         # ext4 / ext2 partitions freshly formatted have a root-owned filesystem root.
-        # Use sudo to create the directory, then hand ownership to pi.
+        # The helper does mkdir -p and hands ownership to the invoking user in one
+        # step (the path must end in dtk-projects, which it does).
         r1 = subprocess.run(
-            ["sudo", "mkdir", "-p", str(projects_path)],
+            ["sudo", HELPER, "prepare-projects", str(projects_path)],
             capture_output=True, text=True, timeout=10,
         )
         if r1.returncode != 0:
             detail = r1.stderr.strip() or "Error al crear el directorio."
             raise HTTPException(status_code=500, detail=f"No se puede crear el directorio: {detail}")
-        subprocess.run(
-            ["sudo", "chown", "pi:pi", str(projects_path)],
-            capture_output=True, text=True, timeout=10,
-        )
 
     set_storage_override(str(projects_path))
 
