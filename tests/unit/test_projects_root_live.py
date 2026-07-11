@@ -14,9 +14,19 @@ followed the NEW root — splitting a project across two disks.
 Run with: python -m pytest tests/unit/test_projects_root_live.py
 """
 
+import tempfile
 from pathlib import Path
 
-import capture.project_manager as pm
+# Importing capture.project_manager runs LOG_FILE.parent.mkdir(...) at module
+# import time, with settings.log_dir defaulting to /var/log/dtk — not writable
+# on dev machines. Point the already-instantiated settings at a writable temp
+# dir BEFORE the capture import so this test is hermetic.
+from app.core.config import settings
+
+_TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="dtk-test-logs-"))
+settings.DTK_LOG_DIR = str(_TEST_LOG_DIR)
+
+import capture.project_manager as pm  # noqa: E402
 
 
 def test_project_capture_root_follows_runtime_override(tmp_path, monkeypatch):
