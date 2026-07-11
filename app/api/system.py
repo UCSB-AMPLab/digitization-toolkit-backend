@@ -4,13 +4,13 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Optional
+from typing import Literal, Optional
 
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from pydantic import BaseModel
 from sqlalchemy.orm import Session
 
-from app.api.auth import RoleChecker
+from app.api.auth import RoleChecker, get_current_user
 from app.api.deps import get_db_dependency
 from app.models.system_log import SystemLog
 from app.models.user import User
@@ -350,3 +350,63 @@ def reset_storage(
 
     from app.core.storage_override import get_storage_override  # should be None now
     return {"projects_path": str(settings.projects_dir), "message": "Restaurado al almacenamiento predeterminado."}
+
+
+# ---------------------------------------------------------------------------
+# Power management
+# ---------------------------------------------------------------------------
+
+class PowerRequest(BaseModel):
+    action: Literal["poweroff", "reboot"]
+
+
+def _run_power_action(action: str) -> None:
+    """Invoke the privileged helper to power off or reboot the appliance.
+
+    Runs in a background task after the HTTP response has been sent, so the
+    reply isn't lost when the system goes down. Failures are logged; there is
+    no client left to inform by the time this runs.
+    """
+    try:
+        subprocess.run(["sudo", HELPER, action], timeout=30)
+    except Exception:
+        import logging
+        logging.getLogger(__name__).exception("Power action %s failed", action)
+
+
+@router.post("/power")
+def power_control(
+    body: PowerRequest,
+    background_tasks: BackgroundTasks,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    """Power off or reboot the appliance. Any authenticated user may call this.
+
+    This is intentionally NOT admin-only: the operators who run the toolkit are
+    often non-technical staff, and anyone with physical access can already pull
+    the plug — a graceful shutdown from the UI is strictly safer than that.
+
+    The action is audit-logged and committed *before* it is triggered (the DB is
+    about to go down), then dispatched via a BackgroundTask so the HTTP response
+    is sent before the machine powers off.
+    """
+    # Refuse honestly on machines without the helper (dev Docker, non-Pi hosts)
+    # rather than pretending we scheduled a shutdown that will never happen.
+    if shutil.which("sudo") is None or not os.path.exists(HELPER):
+        raise HTTPException(
+            status_code=501,
+            detail="Control de energía no disponible en este equipo.",
+        )
+
+    from app.core.audit import log_event
+    log_event(db, level="INFO", category="system", action="power_" + body.action,
+              actor=current_user.username)
+
+    background_tasks.add_task(_run_power_action, body.action)
+
+    if body.action == "poweroff":
+        message = "El equipo se apagará en unos segundos."
+    else:
+        message = "El equipo se reiniciará en unos segundos."
+    return {"action": body.action, "message": message}
