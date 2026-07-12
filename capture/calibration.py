@@ -11,6 +11,8 @@ from datetime import datetime, timezone
 from typing import Optional, Dict, Any
 from picamera2 import Picamera2
 
+from .utils import atomic_write
+
 class CameraCalibration:
     """
     Manages camera calibration for optimal settings.
@@ -61,7 +63,7 @@ class CameraCalibration:
             print(f"\n{'='*70}")
             print(f"FOCUS CALIBRATION - Camera {self.camera_index}")
             print(f"{'='*70}")
-            print("⚠️  Ensure object is at normal working distance!")
+            print("[WARNING] Ensure object is at normal working distance!")
             print(f"Resolution: {img_size[0]}x{img_size[1]}")
         
         picam2 = Picamera2(self.camera_index)
@@ -73,7 +75,7 @@ class CameraCalibration:
         picam2.set_controls({"AfMode": 1})
         
         if verbose:
-            print("\n🔍 Running autofocus...")
+            print("\n[INFO] Running autofocus...")
         
         # Run autofocus cycle and time it
         af_start = time.time()
@@ -99,13 +101,13 @@ class CameraCalibration:
                 result["distance_meters"] = distance_meters
                 
                 if verbose:
-                    print(f"✅ Autofocus succeeded in {af_time:.2f}s")
-                    print(f"📍 Optimal LensPosition: {lens_position:.2f} dioptres")
-                    print(f"📏 Approximate distance: {distance_meters:.2f} meters ({distance_meters*100:.0f} cm)")
-                    print(f"⚡ Using manual focus will be ~100x faster than AF")
+                    print(f"[OK] Autofocus succeeded in {af_time:.2f}s")
+                    print(f"[INFO] Optimal LensPosition: {lens_position:.2f} dioptres")
+                    print(f"[INFO] Approximate distance: {distance_meters:.2f} meters ({distance_meters*100:.0f} cm)")
+                    print(f"[INFO] Using manual focus will be ~100x faster than AF")
         else:
             if verbose:
-                print(f"❌ Autofocus failed after {af_time:.2f}s")
+                print(f"[ERROR] Autofocus failed after {af_time:.2f}s")
         
         picam2.stop()
         picam2.close()
@@ -152,7 +154,7 @@ class CameraCalibration:
             print(f"\n{'='*70}")
             print(f"WHITE BALANCE CALIBRATION - Camera {self.camera_index}")
             print(f"{'='*70}")
-            print("⚠️  Place a neutral gray card or white paper in frame!")
+            print("[WARNING] Place a neutral gray card or white paper in frame!")
             print(f"Resolution: {img_size[0]}x{img_size[1]}")
             print(f"Stabilization frames: {stabilization_frames}")
         
@@ -175,7 +177,7 @@ class CameraCalibration:
             picam2.start()
             
             if verbose:
-                print("\n🔄 Running AWB convergence...")
+                print("\n[INFO] Running AWB convergence...")
             
             # Enable auto white balance and let it converge
             picam2.set_controls({"AwbEnable": True, "AwbMode": 0})  # 0 = Auto
@@ -219,22 +221,22 @@ class CameraCalibration:
                     result["converged"] = variance_r < 0.05 and variance_b < 0.05
                 
                 if verbose:
-                    print(f"\n✅ White balance calibration complete")
-                    print(f"🎨 AWB Gains: Red={final_gains[0]:.3f}, Blue={final_gains[1]:.3f}")
+                    print(f"\n[OK] White balance calibration complete")
+                    print(f"[INFO] AWB Gains: Red={final_gains[0]:.3f}, Blue={final_gains[1]:.3f}")
                     if colour_temp:
-                        print(f"🌡️  Colour temperature: ~{colour_temp}K")
+                        print(f"[INFO] Colour temperature: ~{colour_temp}K")
                     if result.get("converged"):
-                        print(f"✅ AWB converged (stable)")
+                        print(f"[OK] AWB converged (stable)")
                     else:
-                        print(f"⚠️  AWB may not be fully converged, consider more frames")
+                        print(f"[WARNING] AWB may not be fully converged, consider more frames")
             else:
                 if verbose:
-                    print(f"\n❌ Failed to get AWB gains from camera")
+                    print(f"\n[ERROR] Failed to get AWB gains from camera")
                     
         except Exception as e:
             result["error"] = str(e)
             if verbose:
-                print(f"\n❌ White balance calibration failed: {e}")
+                print(f"\n[ERROR] White balance calibration failed: {e}")
         
         # Store in calibration data
         self.calibration_data["white_balance"] = result
@@ -251,11 +253,11 @@ class CameraCalibration:
         """
         filepath = Path(filepath)
         filepath.parent.mkdir(parents=True, exist_ok=True)
-        
-        with open(filepath, 'w') as f:
-            json.dump(self.calibration_data, f, indent=2)
-        
-        print(f"\n💾 Calibration profile saved to: {filepath}")
+
+        # Atomic + durable: temp + fsync + replace, so a power cut cannot truncate it
+        atomic_write(filepath, lambda tmp: Path(tmp).write_text(json.dumps(self.calibration_data, indent=2)))
+
+        print(f"\n[INFO] Calibration profile saved to: {filepath}")
     
     def load_profile(self, filepath: str) -> Dict[str, Any]:
         """
@@ -267,10 +269,13 @@ class CameraCalibration:
         Returns:
             Loaded calibration data
         """
-        with open(filepath, 'r') as f:
-            self.calibration_data = json.load(f)
-        
-        print(f"📂 Loaded calibration profile from: {filepath}")
+        try:
+            with open(filepath, 'r') as f:
+                self.calibration_data = json.load(f)
+            print(f"[INFO] Loaded calibration profile from: {filepath}")
+        except (json.JSONDecodeError, OSError) as e:
+            # Corrupt/unreadable profile: keep current defaults instead of crashing
+            print(f"[WARNING] Could not load calibration profile {filepath} ({e}); keeping defaults")
         return self.calibration_data
     
     def get_recommended_config(self) -> Dict[str, Any]:

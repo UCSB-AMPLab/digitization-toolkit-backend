@@ -5,9 +5,12 @@ Manages physical camera identification, calibration, and configuration
 at a global level (PROJECTS_ROOT/cameras.json).
 """
 import json
+import logging
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Dict, Optional, List, Tuple
+
+from .utils import atomic_write
 
 try:
     from picamera2 import Picamera2
@@ -15,6 +18,8 @@ try:
 except (ImportError, ValueError):
     Picamera2 = None  # type: ignore[assignment]
     _PICAMERA2_AVAILABLE = False
+
+logger = logging.getLogger(__name__)
 
 class CameraRegistry:
     """
@@ -43,16 +48,25 @@ class CameraRegistry:
         self.cameras = self._load_registry()
     
     def _load_registry(self) -> Dict:
-        """Load camera registry from disk."""
-        if self.registry_path.exists():
+        """Load the camera registry, self-healing from a corrupt/truncated file."""
+        if not self.registry_path.exists():
+            return {"cameras": {}, "version": "1.0"}
+        try:
             with open(self.registry_path, 'r') as f:
                 return json.load(f)
-        return {"cameras": {}, "version": "1.0"}
-    
+        except (json.JSONDecodeError, OSError) as e:
+            # Corrupt/unreadable registry: keep it aside for inspection and start
+            # fresh so project creation and captures are never blocked.
+            logger.warning(f"cameras.json is unreadable ({e}); starting from an empty registry")
+            try:
+                self.registry_path.replace(self.registry_path.with_name(self.registry_path.name + ".corrupt"))
+            except OSError:
+                pass
+            return {"cameras": {}, "version": "1.0"}
+
     def _save_registry(self):
-        """Save camera registry to disk."""
-        with open(self.registry_path, 'w') as f:
-            json.dump(self.cameras, f, indent=2)
+        """Save the camera registry atomically (temp + fsync + replace)."""
+        atomic_write(self.registry_path, lambda tmp: Path(tmp).write_text(json.dumps(self.cameras, indent=2)))
     
     @staticmethod
     def _get_camera_hardware_id_gphoto2(camera_index: int) -> Tuple[Optional[str], Dict]:
@@ -347,10 +361,10 @@ def initialize_camera_system(run_calibration: bool = True) -> Dict:
             focus_result = cal.calibrate_focus(verbose=False)
             
             if focus_result["success"]:
-                print(f"  ✅ Focus calibrated: {focus_result['lens_position']:.2f} dioptres")
+                print(f"  [OK] Focus calibrated: {focus_result['lens_position']:.2f} dioptres")
                 registry.update_calibration(hw_id, cal.calibration_data)
             else:
-                print(f"  ❌ Calibration failed")
+                print(f"  [ERROR] Calibration failed")
         
         results["cameras"][idx] = {
             "hardware_id": hw_id,
