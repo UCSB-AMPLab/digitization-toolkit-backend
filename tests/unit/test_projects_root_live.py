@@ -9,7 +9,7 @@ Before the fix, capture/project_manager.py captured
 ``PROJECTS_ROOT = settings.projects_dir`` as a module-level constant at import
 time, so after an operator activated an external drive new captures kept
 writing to the OLD root while the registry/delete/export/storage-panel readers
-followed the NEW root — splitting a project across two disks.
+followed the NEW root - splitting a project across two disks.
 
 Run with: python -m pytest tests/unit/test_projects_root_live.py
 """
@@ -18,7 +18,7 @@ import tempfile
 from pathlib import Path
 
 # Importing capture.project_manager runs LOG_FILE.parent.mkdir(...) at module
-# import time, with settings.log_dir defaulting to /var/log/dtk — not writable
+# import time, with settings.log_dir defaulting to /var/log/dtk - not writable
 # on dev machines. Point the already-instantiated settings at a writable temp
 # dir BEFORE the capture import so this test is hermetic.
 from app.core.config import settings
@@ -43,7 +43,7 @@ def test_project_capture_root_follows_runtime_override(tmp_path, monkeypatch):
         lambda: str(new_root),
     )
 
-    # No re-import of pm — the module has been imported once already, exactly
+    # No re-import of pm - the module has been imported once already, exactly
     # as it is in the long-running backend process when the drive is switched.
     resolved = pm.project_capture_root("My Project")
 
@@ -54,7 +54,7 @@ def test_project_capture_root_follows_runtime_override(tmp_path, monkeypatch):
 
 def test_projects_root_reflects_override_change_between_calls(tmp_path, monkeypatch):
     """Two successive resolutions with different overrides must land on
-    different disks — proving the root is read per call, not cached."""
+    different disks - proving the root is read per call, not cached."""
     root_a = tmp_path / "disk-a"
     root_b = tmp_path / "disk-b"
     root_a.mkdir()

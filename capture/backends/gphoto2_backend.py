@@ -4,16 +4,16 @@ python-gphoto2 backend for DSLR cameras (Canon EOS, etc.).
 Uses persistent PTP sessions for ~1.3s capture times.
 
 Key design decisions:
-  - Sessions opened once and kept alive between captures — no reconnect overhead.
+  - Sessions opened once and kept alive between captures - no reconnect overhead.
   - capturetarget=Internal RAM, reviewtime=None, autopoweroff=0 applied at init.
   - Port map built lazily from gp.Camera.autodetect(); rebuilt automatically on
     session failure (handles USB re-enumeration after camera power-cycle).
   - Flash guard: disables camera flash (flashmode=Off) at session open and before
     every capture. Flash (UV/visible) causes photochemical degradation of archival
-    paper and ink — use external continuous lighting instead.
+    paper and ink - use external continuous lighting instead.
   - Focus mode detection: warns if lens is not in MF (AF causes ~12s PTP hangs).
 
-Tested with: Canon EOS 1500D × 2, USB 2.0, Raspberry Pi.
+Tested with: Canon EOS 1500D x 2, USB 2.0, Raspberry Pi.
 
 Future hooks (wire up when DSLRCameraConfig is introduced):
   - ISO control via `iso` PTP widget
@@ -41,7 +41,7 @@ except ImportError:
 from .base import CameraBackend
 from ..utils import atomic_write
 
-# Image format mapping: CameraConfig.image_format → PTP imageformat widget value
+# Image format mapping: CameraConfig.image_format -> PTP imageformat widget value
 _IMAGE_FORMAT_MAP = {
     "JPEG":     "L",
     "RAW":      "RAW",
@@ -49,7 +49,7 @@ _IMAGE_FORMAT_MAP = {
 }
 # Default when image_format is None
 _IMAGE_FORMAT_DEFAULT = "L"
-# Reverse mapping: PTP widget value → user-facing label
+# Reverse mapping: PTP widget value -> user-facing label
 _IMAGE_FORMAT_REVERSE_MAP = {v: k for k, v in _IMAGE_FORMAT_MAP.items()}
 
 # Minimum settle time used as retry_delay in capture (seconds).
@@ -63,7 +63,7 @@ class _PTPSession:
     An open PTP/USB session to one DSLR camera.
 
     Created once per camera; held alive between captures. Call close() when done.
-    Not thread-safe — callers must hold the per-camera lock.
+    Not thread-safe - callers must hold the per-camera lock.
     """
 
     def __init__(self, port: str, model: str, logger):
@@ -141,7 +141,7 @@ class _PTPSession:
         Fields that are None are left at their current camera value.
         Flash is always enforced off here as an archival safety guard.
         """
-        # ── Flash guard: must be first, before shutter opens ──────────
+        # -- Flash guard: must be first, before shutter opens ----------
         self._enforce_flash_off()
 
         fmt = getattr(camera_config, "image_format", None)
@@ -177,7 +177,7 @@ class _PTPSession:
         focusmode = self._get_config("focusmode")
         if focusmode and focusmode not in ("Manual", "MF"):
             self._logger.warning(
-                f"[gphoto2] {self.port}: focusmode={focusmode!r} — "
+                f"[gphoto2] {self.port}: focusmode={focusmode!r} - "
                 "AF causes ~12s PTP hangs. Flip lens barrel switch to MF."
             )
 
@@ -187,7 +187,7 @@ class _PTPSession:
         Tries to set the flashmode PTP widget to 'Off'.  If the widget is
         read-only or unavailable (some bodies don't expose it), falls back to
         reading the current value and logging a warning if flash is still
-        active.  Never blocks the capture — returns False when flash cannot
+        active.  Never blocks the capture - returns False when flash cannot
         be confirmed off so callers can decide.
 
         Flash (UV/visible) causes photochemical degradation of archival paper
@@ -198,7 +198,7 @@ class _PTPSession:
                 f"[gphoto2] {self.port}: flash disabled (flashmode=Off)"
             )
             return True
-        # Widget is read-only or not present — check current value
+        # Widget is read-only or not present - check current value
         flashmode = self._get_config("flashmode")
         if flashmode is None:
             # Camera doesn't support the widget; assume no flash
@@ -207,7 +207,7 @@ class _PTPSession:
             self._logger.warning(
                 f"[gphoto2] {self.port}: flashmode={flashmode!r} and cannot be "
                 "set to Off automatically. "
-                "Flash is harmful to archival materials — "
+                "Flash is harmful to archival materials - "
                 "manually disable the flash before capturing."
             )
             return False
@@ -230,7 +230,7 @@ class _PTPSession:
         actual_path to reference the saved file.
 
         When imageformat is RAW, the camera produces a .cr2 file. The embedded
-        full-resolution JPEG (6000×4000, 11 ms to extract) is saved alongside
+        full-resolution JPEG (6000x4000, 11 ms to extract) is saved alongside
         the CR2 as ``{stem}_preview.jpg`` so the existing thumbnail/review
         pipeline has a JPEG to work with.
 
@@ -331,9 +331,9 @@ class GPhoto2Backend(CameraBackend):
                 "Add it to pixi.toml with: pixi add python-gphoto2"
             )
         super().__init__(logger)
-        # camera_index → (model_name, usb_port)
+        # camera_index -> (model_name, usb_port)
         self._port_map: dict[int, tuple[str, str]] = {}
-        # camera_index → open _PTPSession
+        # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
         # per-camera lock for capture serialisation
         self._session_locks: dict[int, threading.Lock] = {}
@@ -448,7 +448,7 @@ class GPhoto2Backend(CameraBackend):
         Args:
             output_path: Destination path for the captured JPEG.
             camera_config: CameraConfig (camera_index used for routing).
-            capture_output: Unused — kept for interface compatibility.
+            capture_output: Unused - kept for interface compatibility.
 
         Returns:
             Absolute path string to the saved image file.

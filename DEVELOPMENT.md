@@ -4,7 +4,7 @@
 
 When using AI assistants (GitHub Copilot, ChatGPT, etc.) to work on this codebase, **always** provide these instructions:
 
-### ⚠️ Database Migrations
+### [WARNING] Database Migrations
 
 **NEVER add `Base.metadata.create_all()` to `app/core/db.py`**
 
@@ -29,20 +29,20 @@ def init_db() -> None:
 3. Review the generated migration file
 4. Apply: `docker compose exec backend alembic upgrade head`
 
-### 🔐 Authentication & Security
+### [INFO] Authentication & Security
 
 - **Custom token system is intentional** - This is a standalone/offline Raspberry Pi application
 - Do NOT suggest replacing with JWT libraries (python-jose, PyJWT) or OAuth2
 - Do NOT add `pydantic[email]` dependency - uses simple regex validation for offline compatibility
 - Secret keys must come from environment variables, never hardcoded
 
-### 🐘 PostgreSQL Configuration
+### [INFO] PostgreSQL Configuration
 
 - Use `postgresql+psycopg://` for psycopg3 (NOT `postgresql://`)
 - Always test with PostgreSQL in development (matching production)
 - Database URL format: `postgresql+psycopg://user:password@host:port/database`
 
-### 📦 Configuration Management
+### [INFO] Configuration Management
 
 **Only add settings that are used by application code**
 
@@ -50,18 +50,18 @@ def init_db() -> None:
 - Infrastructure settings (uvicorn host/port) belong in `docker-compose.yml`, not Settings
 - If you're adding a field to Settings, ensure it's actually used in the code
 
-### 🔧 Docker Commands
+### [INFO] Docker Commands
 
 - Use `docker compose` (not `docker-compose`) on Raspberry Pi
 - Always exec into container for Alembic: `docker compose exec backend alembic ...`
 
 ## Common AI Mistakes to Avoid
 
-1. ✗ Re-adding `create_all()` after it was intentionally removed
-2. ✗ Suggesting JWT/OAuth2 for a standalone offline application  
-3. ✗ Adding unused configuration fields "just in case"
-4. ✗ Using `postgresql://` instead of `postgresql+psycopg://`
-5. ✗ Creating migrations outside Docker (wrong database host)
+1. [ERROR] Re-adding `create_all()` after it was intentionally removed
+2. [ERROR] Suggesting JWT/OAuth2 for a standalone offline application  
+3. [ERROR] Adding unused configuration fields "just in case"
+4. [ERROR] Using `postgresql://` instead of `postgresql+psycopg://`
+5. [ERROR] Creating migrations outside Docker (wrong database host)
 
 ## Quick Reference
 

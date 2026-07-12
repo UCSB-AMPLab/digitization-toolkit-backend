@@ -54,10 +54,10 @@ PICAMERA2_PACKAGES=(
 # Check and install common packages
 for pkg in "${COMMON_PACKAGES[@]}"; do
     if check_installed "$pkg"; then
-        echo -e "${GREEN}✓${NC} $pkg (already installed)"
+        echo -e "${GREEN}[OK]${NC} $pkg (already installed)"
     else
-        echo -e "${YELLOW}→${NC} Installing $pkg..."
-        sudo apt-get install -y "$pkg" || echo -e "${RED}✗ Failed to install $pkg${NC}"
+        echo -e "${YELLOW}->${NC} Installing $pkg..."
+        sudo apt-get install -y "$pkg" || echo -e "${RED}[ERROR] Failed to install $pkg${NC}"
     fi
 done
 
@@ -66,10 +66,10 @@ echo ""
 echo "Installing Picamera2 system dependencies..."
 for pkg in "${PICAMERA2_PACKAGES[@]}"; do
     if check_installed "$pkg"; then
-        echo -e "${GREEN}✓${NC} $pkg (already installed)"
+        echo -e "${GREEN}[OK]${NC} $pkg (already installed)"
     else
-        echo -e "${YELLOW}→${NC} Installing $pkg..."
-        sudo apt-get install -y "$pkg" || echo -e "${RED}✗ Failed to install $pkg${NC}"
+        echo -e "${YELLOW}->${NC} Installing $pkg..."
+        sudo apt-get install -y "$pkg" || echo -e "${RED}[ERROR] Failed to install $pkg${NC}"
     fi
 done
 
@@ -81,9 +81,9 @@ BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
 VENV_DIR="$BACKEND_DIR/.venv"
 
 if [ -d "$VENV_DIR" ]; then
-    echo -e "${GREEN}✓${NC} Virtual environment exists: $VENV_DIR"
+    echo -e "${GREEN}[OK]${NC} Virtual environment exists: $VENV_DIR"
 else
-    echo -e "${YELLOW}→${NC} Creating virtual environment..."
+    echo -e "${YELLOW}->${NC} Creating virtual environment..."
     python3 -m venv "$VENV_DIR"
 fi
 
@@ -92,11 +92,11 @@ SITE_PACKAGES="$VENV_DIR/lib/python3.11/site-packages"
 PTH_FILE="$SITE_PACKAGES/system-packages.pth"
 
 if [ -f "$PTH_FILE" ]; then
-    echo -e "${GREEN}✓${NC} System packages already linked to venv"
+    echo -e "${GREEN}[OK]${NC} System packages already linked to venv"
 else
-    echo -e "${YELLOW}→${NC} Linking system site-packages to venv..."
+    echo -e "${YELLOW}->${NC} Linking system site-packages to venv..."
     echo "/usr/lib/python3/dist-packages" > "$PTH_FILE"
-    echo -e "${GREEN}✓${NC} System packages linked (libcamera accessible in venv)"
+    echo -e "${GREEN}[OK]${NC} System packages linked (libcamera accessible in venv)"
 fi
 
 echo ""
@@ -106,16 +106,16 @@ echo "----------------------------------------"
 source "$VENV_DIR/bin/activate"
 
 # Upgrade pip
-echo -e "${YELLOW}→${NC} Upgrading pip..."
+echo -e "${YELLOW}->${NC} Upgrading pip..."
 pip install --upgrade pip -q
 
 # Install requirements
 if [ -f "$BACKEND_DIR/requirements.txt" ]; then
-    echo -e "${YELLOW}→${NC} Installing from requirements.txt..."
+    echo -e "${YELLOW}->${NC} Installing from requirements.txt..."
     pip install -r "$BACKEND_DIR/requirements.txt"
-    echo -e "${GREEN}✓${NC} Python dependencies installed"
+    echo -e "${GREEN}[OK]${NC} Python dependencies installed"
 else
-    echo -e "${RED}✗ requirements.txt not found${NC}"
+    echo -e "${RED}[ERROR] requirements.txt not found${NC}"
     exit 1
 fi
 
@@ -124,26 +124,26 @@ echo "Step 5: Verifying installation..."
 echo "--------------------------------"
 
 # Test imports
-echo -e "${YELLOW}→${NC} Testing camera backend imports..."
+echo -e "${YELLOW}->${NC} Testing camera backend imports..."
 
-if python3 -c "from capture.backends import RpicamBackend; print('✓ RpicamBackend')" 2>/dev/null; then
-    echo -e "${GREEN}✓${NC} Subprocess backend available"
+if python3 -c "from capture.backends import RpicamBackend; print('[OK] RpicamBackend')" 2>/dev/null; then
+    echo -e "${GREEN}[OK]${NC} Subprocess backend available"
 else
-    echo -e "${RED}✗ Subprocess backend failed to import${NC}"
+    echo -e "${RED}[ERROR] Subprocess backend failed to import${NC}"
 fi
 
-if python3 -c "from capture.backends import Picamera2Backend; print('✓ Picamera2Backend')" 2>/dev/null; then
-    echo -e "${GREEN}✓${NC} Picamera2 backend available"
+if python3 -c "from capture.backends import Picamera2Backend; print('[OK] Picamera2Backend')" 2>/dev/null; then
+    echo -e "${GREEN}[OK]${NC} Picamera2 backend available"
 else
-    echo -e "${RED}✗ Picamera2 backend failed to import${NC}"
+    echo -e "${RED}[ERROR] Picamera2 backend failed to import${NC}"
     echo -e "${YELLOW}  This may be due to missing system packages${NC}"
 fi
 
 # Test libcamera
-if python3 -c "import libcamera; print('✓ libcamera')" 2>/dev/null; then
-    echo -e "${GREEN}✓${NC} libcamera Python bindings accessible"
+if python3 -c "import libcamera; print('[OK] libcamera')" 2>/dev/null; then
+    echo -e "${GREEN}[OK]${NC} libcamera Python bindings accessible"
 else
-    echo -e "${YELLOW}⚠${NC} libcamera not accessible (picamera2 backend will not work)"
+    echo -e "${YELLOW}[WARNING]${NC} libcamera not accessible (picamera2 backend will not work)"
 fi
 
 echo ""

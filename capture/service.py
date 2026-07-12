@@ -104,9 +104,9 @@ def is_camera_connected(camera_index: int = 0) -> bool:
 # EXIF Orientation tag values for clockwise rotations.
 # The image/sensor data is never modified; viewers that honour EXIF display the page upright, so the preservation master keeps full fidelity.
 _EXIF_ORIENTATION_FOR_DEG = {
-    90: 6,    # 90° CW  > EXIF "rotated 90 CW"
-    180: 3,   # 180°    > EXIF "rotated 180"
-    270: 8,   # 270° CW > EXIF "rotated 90 CCW"
+    90: 6,    # 90 deg CW  > EXIF "rotated 90 CW"
+    180: 3,   # 180 deg    > EXIF "rotated 180"
+    270: 8,   # 270 deg CW > EXIF "rotated 90 CCW"
 }
 
 # Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
@@ -119,7 +119,7 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
 
     Applies to JPEG and CR2 masters: the pixel/sensor data is never re-encoded,
     only the orientation metadata is set, so the preservation master keeps full
-    fidelity. Skips 0° and unsupported file types.
+    fidelity. Skips 0 deg and unsupported file types.
     """
     deg = rotate_deg % 360
     if deg == 0:
@@ -437,13 +437,13 @@ def capture_preview_frame(camera_index: int) -> bytes:
     """
     Capture a low-resolution preview frame and return JPEG bytes.
 
-    Not saved to the project directory — intended for live preview polling
+    Not saved to the project directory - intended for live preview polling
     from the frontend. Uses a stable per-camera temp file that is overwritten
     on every call (rather than mkstemp), so at most one file per camera ever
     exists in /tmp even if the process is killed unexpectedly.
 
     The preview uses a lightweight configuration:
-      - 1280×720 (native fast mode, no cropping)
+      - 1280x720 (native fast mode, no cropping)
       - No autofocus cycle (too slow for live preview)
       - No AE stabilisation wait
       - No temporal denoise warmup
@@ -470,7 +470,7 @@ def capture_preview_frame(camera_index: int) -> bytes:
     except NotImplementedError:
         pass  # fall through to picamera2 path
 
-    # Fixed per-camera path — overwrites the same file each poll cycle.
+    # Fixed per-camera path - overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
     # race on the same path.
     tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
@@ -478,7 +478,7 @@ def capture_preview_frame(camera_index: int) -> bytes:
 
     preview_config = CameraConfig(
         camera_index=camera_index,
-        img_size=(1280, 720),        # Native 80 fps mode — fast, no crop
+        img_size=(1280, 720),        # Native 80 fps mode - fast, no crop
         autofocus_on_capture=False,  # Skip AF cycle for live preview
         timeout=0,                   # No AE stabilisation wait
         denoise_frames=0,            # No temporal denoise warmup

@@ -57,7 +57,7 @@ def create_project(
     db.add(p)
     db.commit()
     db.refresh(p)
-    # Auto-add creator as explicit member (unless they're an admin — admins are always implicit)
+    # Auto-add creator as explicit member (unless they're an admin - admins are always implicit)
     if current_user.role != "admin":
         member = ProjectMember(
             project_id=p.id,
@@ -230,7 +230,7 @@ def move_collections(
     db.commit()
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
-              subject=f"{source.name} → {target.name} ({moved} collections)")
+              subject=f"{source.name} -> {target.name} ({moved} collections)")
     return {"moved": moved, "target_project_id": payload.target_project_id}
 
 

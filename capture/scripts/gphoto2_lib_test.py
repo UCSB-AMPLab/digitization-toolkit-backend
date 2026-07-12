@@ -10,7 +10,7 @@ Key findings from testing:
   - Lens barrel MUST be set to MF (manual focus). AF causes ~12s hangs.
   - capturetarget=Internal RAM and reviewtime=None are set automatically.
   - Stable external continuous lighting eliminates exposure-hunt errors.
-    Do NOT use the built-in popup flash — UV/visible flash causes
+    Do NOT use the built-in popup flash - UV/visible flash causes
     photochemical degradation of archival paper and ink.
   - settle=3s between shots is the reliable minimum for the 1500D.
 
@@ -37,14 +37,14 @@ except ImportError:
 
 
 # ---------------------------------------------------------------------------
-# Camera context manager — holds the PTP session open between captures
+# Camera context manager - holds the PTP session open between captures
 # ---------------------------------------------------------------------------
 
 class DSLRCamera:
     """Persistent gphoto2 camera session. Use as a context manager.
 
     Opens the PTP session once on enter, applies speed settings, and keeps
-    the connection alive for multiple captures — no reconnect overhead or
+    the connection alive for multiple captures - no reconnect overhead or
     Device Busy errors between shots.
     """
 
@@ -56,7 +56,7 @@ class DSLRCamera:
     def __enter__(self):
         # gphoto2 requires BOTH port info AND camera abilities (model driver).
         # Setting only the port gives -105 Unknown model on init().
-        # autodetect() is NOT thread-safe — callers should pass model= explicitly
+        # autodetect() is NOT thread-safe - callers should pass model= explicitly
         # when opening cameras from worker threads.
         model = self.model
         if model is None:
@@ -122,7 +122,7 @@ class DSLRCamera:
         """Capture and download one image. Returns elapsed seconds.
 
         Retries within the same persistent session on transient I/O-busy
-        errors — no reconnect needed, just a short wait for the camera buffer.
+        errors - no reconnect needed, just a short wait for the camera buffer.
         Fatal errors (e.g. -1 Unspecified) are raised immediately.
         """
         outpath.parent.mkdir(parents=True, exist_ok=True)

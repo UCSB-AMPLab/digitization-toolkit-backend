@@ -68,7 +68,7 @@ try_capture() {
   local e1_ms=$(( t1_end - t1_start ))
   local delta_start_ms=$(( t1_start - t0_start ))
 
-  # Safe defaults if files didn’t materialize
+  # Safe defaults if files didn't materialize
   local b0=0 b1=0 s0="" s1=""
   [[ -f "$f0" ]] && b0=$(stat -c%s "$f0") && s0=$(sha256_of "$f0")
   [[ -f "$f1" ]] && b1=$(stat -c%s "$f1") && s1=$(sha256_of "$f1")

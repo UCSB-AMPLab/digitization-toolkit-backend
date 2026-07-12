@@ -89,12 +89,12 @@ Run the setup script to handle all dependencies:
 ```
 
 This script will:
-1. ✓ Check system compatibility
-2. ✓ Install system packages
-3. ✓ Create/update virtual environment
-4. ✓ Link system site-packages
-5. ✓ Install Python dependencies
-6. ✓ Verify installation
+1. [OK] Check system compatibility
+2. [OK] Install system packages
+3. [OK] Create/update virtual environment
+4. [OK] Link system site-packages
+5. [OK] Install Python dependencies
+6. [OK] Verify installation
 
 ## Verification
 

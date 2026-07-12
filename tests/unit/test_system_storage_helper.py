@@ -6,7 +6,7 @@ raw sudo mount/umount/mkdir/chown.
 
 These assert the exact argv passed to subprocess.run so a future regression that
 reintroduces raw sudo calls (or the hardcoded pi:pi chown) is caught. They also
-assert the backend never mkdirs/rmdirs under the mounts root — the root is
+assert the backend never mkdirs/rmdirs under the mounts root - the root is
 root-owned and the helper is its only writer. Run with:
     python -m pytest tests/unit/test_system_storage_helper.py
 """
@@ -89,7 +89,7 @@ def test_mount_uses_helper_and_does_not_mkdir(admin_client, monkeypatch, dir_op_
 @pytest.mark.unit
 def test_mount_failure_returns_500_without_cleanup(admin_client, monkeypatch, dir_op_recorder):
     """When the helper fails, surface its stderr as a 500 and do NOT try to
-    rmdir the mountpoint — the helper cleans up its own directory."""
+    rmdir the mountpoint - the helper cleans up its own directory."""
     import app.api.system as system
 
     monkeypatch.setattr(system, "_parse_lsblk", _one_vfat_partition)

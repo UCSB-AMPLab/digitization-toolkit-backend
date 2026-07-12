@@ -14,6 +14,6 @@ class SystemLog(Base):
     level    = Column(String(10),  nullable=False)  # INFO | WARN | ERR
     category = Column(String(20),  nullable=False)  # access | activity | capture | system
     actor    = Column(String(150), nullable=True)   # username who triggered the event
-    action   = Column(String(80),  nullable=False)  # login_success | project_created | …
+    action   = Column(String(80),  nullable=False)  # login_success | project_created | ...
     subject  = Column(String(300), nullable=True)   # affected entity name
-    detail   = Column(String(500), nullable=True)   # extra context (IP, count, …)
+    detail   = Column(String(500), nullable=True)   # extra context (IP, count, ...)

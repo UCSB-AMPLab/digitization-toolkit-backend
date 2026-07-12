@@ -34,9 +34,9 @@ def _projects_root() -> Path:
     """Resolve the active projects root at call time.
 
     Read from settings on every call (rather than a module-level constant
-    captured at import) so a runtime storage-drive switch — POST
+    captured at import) so a runtime storage-drive switch - POST
     /system/storage/activate flips the storage override in
-    app.core.config.Settings.projects_dir — takes effect immediately for new
+    app.core.config.Settings.projects_dir - takes effect immediately for new
     captures, keeping writes and reads on the same disk.
     """
     return settings.projects_dir

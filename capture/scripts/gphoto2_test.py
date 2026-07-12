@@ -103,9 +103,9 @@ def cmd_config(args):
             current = info.get("current", "?")
             choices = info.get("choices", [])
             if key == "focusmode" and current not in ("Manual", "MF"):
-                marker = " ◀ SET LENS TO MF — AF is the main source of latency & PTP Busy errors"
+                marker = " < SET LENS TO MF - AF is the main source of latency & PTP Busy errors"
             elif key in ("capturetarget", "reviewtime", "continuousaf"):
-                marker = " ◀ speed-relevant"
+                marker = " < speed-relevant"
             else:
                 marker = ""
             print(f"  {label:30s}  current={current!r:20s}  choices={choices}{marker}")
@@ -123,8 +123,8 @@ def cmd_preset(args):
     ports = args.port  # list
 
     # Settings that minimise capture+download latency:
-    #   capturetarget=0  → Internal RAM (skip SD card write)
-    #   reviewtime=0     → No on-camera image review delay (if supported)
+    #   capturetarget=0  -> Internal RAM (skip SD card write)
+    #   reviewtime=0     -> No on-camera image review delay (if supported)
     speed_settings = [
         ("capturetarget", "0"),   # Internal RAM
         ("reviewtime",    "0"),   # None / Off
@@ -135,7 +135,7 @@ def cmd_preset(args):
         for key, val in speed_settings:
             r = _gphoto2("--set-config", f"{key}={val}", port=port, timeout=10)
             status = "OK" if r.returncode == 0 else f"SKIP ({r.stderr.strip().splitlines()[-1] if r.stderr else 'unknown'})"
-            print(f"  set {key}={val!r}  → {status}")
+            print(f"  set {key}={val!r}  -> {status}")
 
     print("\nDone. Run 'config' subcommand to verify.")
 
@@ -154,7 +154,7 @@ def _capture_one(port: str, outpath: Path, retry: int = 3, retry_delay: float = 
 
     Note: 'PTP Device Busy / Canon EOS Full-Press failed' is almost always
     caused by autofocus being active (AI Focus / AI Servo mode). The fix is
-    to switch the lens barrel switch to MF (manual focus) — AF cannot be
+    to switch the lens barrel switch to MF (manual focus) - AF cannot be
     disabled via software on these bodies. With MF the first attempt succeeds
     immediately and no retries are needed.
     """
@@ -189,7 +189,7 @@ def _capture_one(port: str, outpath: Path, retry: int = 3, retry_delay: float = 
 def cmd_capture(args):
     """Capture a single image from one camera."""
     outpath = Path(args.out)
-    print(f"Capturing from {args.port} → {outpath} ...")
+    print(f"Capturing from {args.port} -> {outpath} ...")
     result = _capture_one(args.port, outpath)
     if result.success:
         size = outpath.stat().st_size / 1_048_576
