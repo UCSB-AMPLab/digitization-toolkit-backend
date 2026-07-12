@@ -5,7 +5,6 @@ import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
-from PIL import Image as _PILImage
 
 # Fixed temp-file paths for live preview frames (one per camera).
 # Using stable names rather than mkstemp prevents unbounded accumulation when
@@ -102,19 +101,12 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     return backend.is_camera_connected(camera_index)
 
 
-_PIL_ROTATE = {
-    90:  _PILImage.Transpose.ROTATE_270,  # 90° CW
-    180: _PILImage.Transpose.ROTATE_180,
-    270: _PILImage.Transpose.ROTATE_90,   # 90° CCW
-}
-
 # EXIF Orientation tag values for clockwise rotations.
-# Used to tag CR2 files so RAW converters (Lightroom, darktable) display them
-# correctly without modifying the pixel data.
+# The image/sensor data is never modified; viewers that honour EXIF display the page upright, so the preservation master keeps full fidelity.
 _EXIF_ORIENTATION_FOR_DEG = {
-    90: 6,    # 90° CW  → EXIF "rotated 90 CW"
-    180: 3,   # 180°    → EXIF "rotated 180"
-    270: 8,   # 270° CW → EXIF "rotated 90 CCW"
+    90: 6,    # 90° CW  > EXIF "rotated 90 CW"
+    180: 3,   # 180°    > EXIF "rotated 180"
+    270: 8,   # 270° CW > EXIF "rotated 90 CCW"
 }
 
 # Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
@@ -123,41 +115,31 @@ _EXIF_ORIENTATION_TAG = 0x0112
 
 
 def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
-    """Rotate image in-place (clockwise). Skips 0°.
+    """Record a clockwise rotation losslessly via the EXIF Orientation tag.
 
-    - JPEG/JPG: pixels are actually transposed (lossless-quality re-encode).
-    - CR2:      EXIF Orientation tag is written so RAW converters display it
-                correctly without touching the raw sensor data.
+    Applies to JPEG and CR2 masters: the pixel/sensor data is never re-encoded,
+    only the orientation metadata is set, so the preservation master keeps full
+    fidelity. Skips 0° and unsupported file types.
     """
     deg = rotate_deg % 360
     if deg == 0:
         return
 
-    suffix = file_path.suffix.lower()
+    exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
+    if exif_val is None:
+        return
+    if file_path.suffix.lower() not in (".jpg", ".jpeg", ".cr2"):
+        return
 
-    if suffix in (".jpg", ".jpeg"):
-        transpose_op = _PIL_ROTATE.get(deg)
-        if transpose_op is None:
-            return
-        with _PILImage.open(file_path) as img:
-            rotated = img.transpose(transpose_op)
-        # Durable re-save: temp + fsync + atomic replace, never a partial master in place
-        atomic_write(file_path, lambda tmp: rotated.save(tmp, format="JPEG", quality=95, subsampling=0))
-
-    elif suffix == ".cr2":
-        # Write EXIF Orientation tag into the CR2 without touching sensor data.
-        exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
-        if exif_val is None:
-            return
-        try:
-            import piexif
-            exif_dict = piexif.load(str(file_path))
-            exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
-            exif_bytes = piexif.dump(exif_dict)
-            # Durable: insert into a temp copy, then atomically replace the master
-            atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
-        except Exception:
-            pass  # piexif not available or CR2 EXIF unreadable — silently skip
+    try:
+        import piexif
+        exif_dict = piexif.load(str(file_path))
+        exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
+        exif_bytes = piexif.dump(exif_dict)
+        # Durable: write the tag into a temp copy, then atomically replace the master
+        atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
+    except Exception as e:
+        subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
 
 
 def image_filename(
