@@ -29,7 +29,7 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from .utils import setup_rotating_logger
+from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
@@ -141,7 +141,8 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
             return
         with _PILImage.open(file_path) as img:
             rotated = img.transpose(transpose_op)
-        rotated.save(str(file_path), quality=95, subsampling=0)
+        # Durable re-save: temp + fsync + atomic replace, never a partial master in place
+        atomic_write(file_path, lambda tmp: rotated.save(tmp, format="JPEG", quality=95, subsampling=0))
 
     elif suffix == ".cr2":
         # Write EXIF Orientation tag into the CR2 without touching sensor data.
@@ -153,7 +154,8 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
             exif_dict = piexif.load(str(file_path))
             exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
             exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, str(file_path))
+            # Durable: insert into a temp copy, then atomically replace the master
+            atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
         except Exception:
             pass  # piexif not available or CR2 EXIF unreadable — silently skip
 

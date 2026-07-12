@@ -39,6 +39,7 @@ except ImportError:
     _GP_AVAILABLE = False
 
 from .base import CameraBackend
+from ..utils import atomic_write
 
 # Image format mapping: CameraConfig.image_format → PTP imageformat widget value
 _IMAGE_FORMAT_MAP = {
@@ -253,7 +254,8 @@ class _PTPSession:
                 camera_file = self._cam.file_get(
                     file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
                 )
-                camera_file.save(str(actual_outpath))
+                # Durable save: temp + fsync + atomic replace, so no partial master survives a crash
+                atomic_write(actual_outpath, lambda tmp: camera_file.save(tmp))
                 self._cam.file_delete(file_path.folder, file_path.name)
                 elapsed = time.perf_counter() - t0
 

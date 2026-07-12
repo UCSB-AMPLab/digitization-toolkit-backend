@@ -30,6 +30,7 @@ if sys.platform == "linux":
 
 
 from .base import CameraBackend
+from ..utils import atomic_write
 
 
 class Picamera2Backend(CameraBackend):
@@ -426,25 +427,24 @@ class Picamera2Backend(CameraBackend):
                     # Generate raw filename (.raw extension for now due to picamera2 DNG bug)
                     raw_path = Path(str(output_path).rsplit('.', 1)[0] + '.raw')
                     
-                    # Save JPEG first
-                    request.save("main", str(output_path))
+                    # Save JPEG first (durable: temp + fsync + atomic replace)
+                    atomic_write(output_path, lambda tmp: request.save("main", tmp))
                     self.logger.debug(f"Saved JPEG: {Path(output_path).name}")
-                    
+
                     # Save raw buffer directly (workaround for picamera2 save_dng bug)
                     # picamera2 0.3.33 has a bug: Picamera2Camera.__init__() signature mismatch
                     # Saving raw sensor data as binary until library is fixed
                     try:
                         raw_buffer = request.make_buffer("raw")
-                        with open(raw_path, 'wb') as f:
-                            f.write(raw_buffer)
+                        atomic_write(raw_path, lambda tmp: Path(tmp).write_bytes(raw_buffer))
                         self.logger.debug(f"Saved raw buffer: {raw_path.name}")
                         output_path = (str(output_path), str(raw_path))
                     except Exception as e:
                         self.logger.warning(f"Failed to save raw buffer: {e}, continuing with JPEG only")
                         output_path = str(output_path)
                 else:
-                    # Standard JPEG/PNG capture only
-                    request.save("main", str(output_path))
+                    # Standard JPEG/PNG capture only (durable: temp + fsync + atomic replace)
+                    atomic_write(output_path, lambda tmp: request.save("main", tmp))
                     self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
                     
             finally:
