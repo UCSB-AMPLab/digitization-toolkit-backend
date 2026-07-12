@@ -180,25 +180,39 @@ class ActivateStorageRequest(BaseModel):
 def get_storage_info(current_user: User = Depends(allow_read_only)):
     """Return current projects path and disk usage figures."""
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override
+    from app.core.storage_override import get_storage_override, StorageOverrideError
 
-    projects_path = settings.projects_dir
+    # An unreadable override is surfaced as an error, not treated as "no override"
+    try:
+        projects_path = settings.projects_dir
+        is_override = get_storage_override() is not None
+    except StorageOverrideError as e:
+        return {
+            "projects_path": None,
+            "is_override":   True,
+            "error":         str(e),
+            "total_bytes":   0,
+            "used_bytes":    0,
+            "free_bytes":    0,
+            "available":     False,
+        }
+
     try:
         projects_path.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(projects_path)
     except OSError:
         return {
             "projects_path": str(projects_path),
-            "is_override": get_storage_override() is not None,
-            "total_bytes": 0,
-            "used_bytes":  0,
-            "free_bytes":  0,
-            "available":   False,
+            "is_override":   is_override,
+            "total_bytes":   0,
+            "used_bytes":    0,
+            "free_bytes":    0,
+            "available":     False,
         }
 
     return {
         "projects_path": str(projects_path),
-        "is_override":   get_storage_override() is not None,
+        "is_override":   is_override,
         "total_bytes":   usage.total,
         "used_bytes":    usage.used,
         "free_bytes":    usage.free,
@@ -233,15 +247,15 @@ def mount_device(
     removes it again if the mount fails.
     """
     if not _DEVICE_RE.match(body.device):
-        raise HTTPException(status_code=400, detail="Ruta de dispositivo no válida.")
+        raise HTTPException(status_code=400, detail="Invalid device path.")
 
     # Look up device info so we can build a labelled mount point
     partitions = _parse_lsblk()
     dev_info = next((p for p in partitions if p["path"] == body.device), None)
     if dev_info is None:
-        raise HTTPException(status_code=404, detail="Dispositivo no encontrado.")
+        raise HTTPException(status_code=404, detail="Device not found.")
     if dev_info.get("mountpoint"):
-        return {"mountpoint": dev_info["mountpoint"], "message": "El dispositivo ya está montado."}
+        return {"mountpoint": dev_info["mountpoint"], "message": "Device is already mounted."}
 
     # Build a safe mount point name under the dtk data tree. The mounts root is
     # root-owned; the helper creates the directory itself (and removes it if the
@@ -257,7 +271,7 @@ def mount_device(
 
     result = subprocess.run(cmd, capture_output=True, text=True, timeout=30)
     if result.returncode != 0:
-        detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al montar."
+        detail = result.stderr.strip() or result.stdout.strip() or "Unknown error while mounting."
         raise HTTPException(status_code=500, detail=detail)
 
     from app.core.audit import log_event
@@ -265,7 +279,7 @@ def mount_device(
               actor=current_user.username, subject=body.device,
               detail=str(mountpoint))
 
-    return {"mountpoint": str(mountpoint), "message": f"Montado en {mountpoint}"}
+    return {"mountpoint": str(mountpoint), "message": f"Mounted at {mountpoint}"}
 
 
 class UnmountRequest(BaseModel):
@@ -286,7 +300,7 @@ def unmount_device(
     The helper removes the (root-owned) mountpoint directory after a successful
     umount, so no cleanup happens here.
     """
-    from app.core.storage_override import get_storage_override, clear_storage_override
+    from app.core.storage_override import get_storage_override, clear_storage_override, StorageOverrideError
     from app.core.audit import log_event
 
     target = Path(body.mountpoint)
@@ -295,15 +309,21 @@ def unmount_device(
     try:
         target.resolve().relative_to(_MOUNT_BASE.resolve())
     except ValueError:
-        raise HTTPException(status_code=400, detail="Solo se pueden desmontar rutas gestionadas por DTK.")
+        raise HTTPException(status_code=400, detail="Only DTK-managed paths can be unmounted.")
 
-    # If this mountpoint (or a subpath of it) is the active storage override,
-    # clear it first so the backend doesn't try to write to a stale path.
-    override = get_storage_override()
+    # If this mountpoint (or a subpath) is the active storage override, clear it first, so the backend doesn't try to write to a stale path
     override_cleared = False
-    if override and Path(override).resolve().is_relative_to(target.resolve()):
+    try:
+        override = get_storage_override()
+    except StorageOverrideError:
+        # Override file is corrupt; clear it defensively rather than leave it behind.
         clear_storage_override()
+        override = None
         override_cleared = True
+    else:
+        if override and Path(override).resolve().is_relative_to(target.resolve()):
+            clear_storage_override()
+            override_cleared = True
 
     result = subprocess.run(
         ["sudo", HELPER, "umount", str(target)],
@@ -314,15 +334,15 @@ def unmount_device(
         if override_cleared and override:
             from app.core.storage_override import set_storage_override
             set_storage_override(override)
-        detail = result.stderr.strip() or result.stdout.strip() or "Error desconocido al desmontar."
+        detail = result.stderr.strip() or result.stdout.strip() or "Unknown error while unmounting."
         raise HTTPException(status_code=500, detail=detail)
 
     log_event(db, level="INFO", category="system", action="storage_unmount",
               actor=current_user.username, subject=str(target))
 
-    msg = "Dispositivo desmontado correctamente."
+    msg = "Device unmounted successfully."
     if override_cleared:
-        msg += " Almacenamiento restaurado al predeterminado."
+        msg += "Storage reverted to the default."
     return {"message": msg, "override_cleared": override_cleared}
 
 
@@ -339,9 +359,9 @@ def activate_storage(
 
     target = Path(body.path)
     if not target.exists():
-        raise HTTPException(status_code=400, detail="La ruta no existe.")
+        raise HTTPException(status_code=400, detail="The path does not exist.")
     if not target.is_dir():
-        raise HTTPException(status_code=400, detail="La ruta no es un directorio.")
+        raise HTTPException(status_code=400, detail="The path is not a directory.")
 
     # Use a clearly-labelled subdirectory so files aren't dumped into the root.
     projects_path = target / "dtk-projects"
@@ -358,15 +378,15 @@ def activate_storage(
             capture_output=True, text=True, timeout=10,
         )
         if r1.returncode != 0:
-            detail = r1.stderr.strip() or "Error al crear el directorio."
-            raise HTTPException(status_code=500, detail=f"No se puede crear el directorio: {detail}")
+            detail = r1.stderr.strip() or "Error creating the directory."
+            raise HTTPException(status_code=500, detail=f"Cannot create the directory: {detail}")
 
     set_storage_override(str(projects_path))
 
     log_event(db, level="INFO", category="system", action="storage_activated",
               actor=current_user.username, subject=str(projects_path))
 
-    return {"projects_path": str(projects_path), "message": "Almacenamiento activo actualizado."}
+    return {"projects_path": str(projects_path), "message": "Active storage updated."}
 
 
 @router.delete("/storage/activate")
@@ -385,7 +405,7 @@ def reset_storage(
               actor=current_user.username)
 
     from app.core.storage_override import get_storage_override  # should be None now
-    return {"projects_path": str(settings.projects_dir), "message": "Restaurado al almacenamiento predeterminado."}
+    return {"projects_path": str(settings.projects_dir), "message": "Reverted to the default storage."}
 
 
 # ---------------------------------------------------------------------------
@@ -412,7 +432,7 @@ def _run_power_action(action: str) -> None:
             stdin=subprocess.DEVNULL,
         )
         if result.returncode != 0:
-            detail = result.stderr.strip() or result.stdout.strip() or "sin salida"
+            detail = result.stderr.strip() or result.stdout.strip() or "no output"
             logger.error("Power action %s failed (rc=%s): %s",
                          action, result.returncode, detail)
     except Exception:
@@ -441,7 +461,7 @@ def power_control(
     if shutil.which("sudo") is None or not os.path.exists(HELPER):
         raise HTTPException(
             status_code=501,
-            detail="Control de energía no disponible en este equipo.",
+            detail="Power control is not available on this device.",
         )
 
     from app.core.audit import log_event
@@ -451,7 +471,7 @@ def power_control(
     background_tasks.add_task(_run_power_action, body.action)
 
     if body.action == "poweroff":
-        message = "El equipo se apagará en unos segundos."
+        message = "The device will shut down in a few seconds."
     else:
-        message = "El equipo se reiniciará en unos segundos."
+        message = "The device will restart in a few seconds."
     return {"action": body.action, "message": message}

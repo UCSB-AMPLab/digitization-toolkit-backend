@@ -55,7 +55,7 @@ def test_power_returns_501_when_helper_missing(power_client, monkeypatch):
 
     resp = power_client.post("/system/power", json={"action": "poweroff"})
     assert resp.status_code == 501
-    assert "no disponible" in resp.json()["detail"].lower()
+    assert "not available" in resp.json()["detail"].lower()
 
 
 class _Result:
@@ -67,7 +67,7 @@ class _Result:
 
 @pytest.mark.unit
 def test_power_poweroff_success(power_client, monkeypatch):
-    """When the helper is present: 200, Spanish message, audit logged, helper
+    """When the helper is present: 200, confirmation message, audit logged, helper
     dispatched via subprocess in the background task (not synchronously),
     with stdin closed so sudo can never sit waiting for a password."""
     import subprocess as real_subprocess
@@ -97,7 +97,7 @@ def test_power_poweroff_success(power_client, monkeypatch):
     assert resp.status_code == 200
     body = resp.json()
     assert body["action"] == "poweroff"
-    assert "se apagará" in body["message"]
+    assert "shut down" in body["message"]
 
     # Audit fired before the action, with the right category/action/actor.
     assert logged.get("category") == "system"
@@ -129,7 +129,7 @@ def test_power_reboot_success(power_client, monkeypatch):
     resp = power_client.post("/system/power", json={"action": "reboot"})
 
     assert resp.status_code == 200
-    assert "se reiniciará" in resp.json()["message"]
+    assert "restart" in resp.json()["message"]
     assert calls[-1] == ["sudo", system.HELPER, "reboot"]
 
 
