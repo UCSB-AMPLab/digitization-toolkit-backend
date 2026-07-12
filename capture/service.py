@@ -289,7 +289,7 @@ def single_capture_image(
         img_paths=[output_path],
         cam_configs=[camera_config],
         times=[elapsed_time],
-        metadata_list=[metadata] if metadata else None,
+        metadata_by_index={camera_config.camera_index: metadata} if metadata else None,
         project_root=project_root
     )
     append_manifest_record(project_root, record)
@@ -299,6 +299,23 @@ def single_capture_image(
     )
     
     return output_path, record.capture_id, record.pair_id
+
+
+def _unlink_capture_output(path) -> None:
+    """Remove image file(s) from a capture that was never written to the manifest.
+
+    Safe only for manifest-less files: a manifested capture must never be
+    auto-unlinked. Handles the (jpeg, raw) tuple and the RAW _preview.jpg sidecar.
+    """
+    parts = path if isinstance(path, (tuple, list)) else (path,)
+    for p in parts:
+        fp = Path(str(p))
+        for target in (fp, fp.with_name(fp.stem + "_preview.jpg")):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+
 
 def dual_capture_image(
         project_name: str,
@@ -366,24 +383,36 @@ def dual_capture_image(
         elapsed = time.time() - start
         return path, elapsed, metadata
     
+    results = {}
+    errors = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        # Submit first camera
         future1 = executor.submit(capture_with_timing, cam1_config, filename1)
-        
         # Stagger second camera start (like bash script)
         if stagger_ms > 0:
             time.sleep(stagger_ms / 1000.0)
-        
         future2 = executor.submit(capture_with_timing, cam2_config, filename2)
-        
-        # Wait for both to complete
-        img1_path, time1, metadata1 = future1.result()
-        img2_path, time2, metadata2 = future2.result()
-        
-    project_root = project_capture_root(project_name)
 
-    # Prepare metadata list (filter out None values)
-    metadata_list = [m for m in [metadata1, metadata2] if m is not None]
+        # Collect both results so one camera's failure never hides the other
+        for cfg, fut in ((cam1_config, future1), (cam2_config, future2)):
+            try:
+                results[cfg.camera_index] = fut.result()
+            except Exception as e:
+                errors[cfg.camera_index] = e
+
+    if errors:
+        # Partial/failed pair: any file already written has no manifest entry, so
+        # unlink it rather than leave a manifest-less orphan that looks like a page.
+        for path, _elapsed, _meta in results.values():
+            _unlink_capture_output(path)
+        raise RuntimeError(
+            "Dual capture failed on camera(s) "
+            + "; ".join(f"cam{i}: {e}" for i, e in sorted(errors.items()))
+        )
+
+    img1_path, time1, metadata1 = results[cam1_config.camera_index]
+    img2_path, time2, metadata2 = results[cam2_config.camera_index]
+
+    project_root = project_capture_root(project_name)
 
     record = generate_manifest_record(
         project_name=project_name,
@@ -392,7 +421,7 @@ def dual_capture_image(
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
         stagger=stagger_ms,
-        metadata_list=metadata_list if metadata_list else None,
+        metadata_by_index={cam1_config.camera_index: metadata1, cam2_config.camera_index: metadata2},
         project_root=project_root
     )
     append_manifest_record(project_root, record)
