@@ -7,7 +7,7 @@ This module provides functions for generating and managing thumbnails of record 
 import logging
 from pathlib import Path
 from typing import Optional
-from PIL import Image
+from PIL import Image, ImageOps
 import uuid
 
 logger = logging.getLogger(__name__)
@@ -50,6 +50,8 @@ def generate_thumbnail(
     try:
         # Open the image
         with Image.open(source_path) as img:
+            # Honour EXIF Orientation so a rotated master thumbnails upright
+            img = ImageOps.exif_transpose(img)
             # Convert RGBA/P to RGB for JPEG compatibility
             if img.mode in ("RGBA", "P", "LA"):
                 # Create white background
