@@ -16,6 +16,8 @@ class Settings(BaseSettings):
     SECRET_KEY: str = Field(default="dev-secret-change-me", env="SECRET_KEY")
     ACCESS_TOKEN_EXPIRE_SECONDS: int = Field(default=28800, env="ACCESS_TOKEN_EXPIRE_SECONDS")  # 8 hours
     CORS_ORIGINS: list[str] = Field(default=["http://localhost:5173", "http://localhost:3000"], env="CORS_ORIGINS")
+    # Application-level cap on uploaded image size. Defends the SD even if nginx (client_max_body_size 100m) is not in front of the app. Enforced while streaming.
+    MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, env="DTK_MAX_UPLOAD_BYTES")
     app_version: str = "0.0.0-dev"
 
     model_config = ConfigDict(
