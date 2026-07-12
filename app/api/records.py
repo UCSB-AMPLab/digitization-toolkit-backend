@@ -4,7 +4,6 @@ from typing import List, Optional
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
-import shutil
 import uuid
 import logging
 
@@ -27,6 +26,28 @@ logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+# Streamed uploads are copied in 1 MiB chunks so the size cap is enforced as bytes arrive, even when Content-Length is missing or wrong (e.g. chunked encoding).
+_UPLOAD_CHUNK = 1024 * 1024
+
+
+class _UploadTooLarge(Exception):
+	"""Raised when a streamed upload exceeds the configured size cap."""
+
+
+def _save_upload_capped(src, dst_path: Path, max_bytes: int) -> int:
+	"""Copy src to dst_path, aborting if more than max_bytes are read. Returns the number of bytes written. Callers unlink dst_path on failure."""
+	total = 0
+	with open(dst_path, "wb") as buffer:
+		while True:
+			chunk = src.read(_UPLOAD_CHUNK)
+			if not chunk:
+				break
+			total += len(chunk)
+			if total > max_bytes:
+				raise _UploadTooLarge()
+			buffer.write(chunk)
+	return total
 
 
 # ==============================================================================
@@ -215,16 +236,23 @@ async def add_image_to_record(
 	unique_filename = f"{uuid.uuid4().hex}{ext}"
 	file_path = uploads_dir / unique_filename
 	
-	# Save file
+	max_bytes = settings.MAX_UPLOAD_BYTES
+	# Fast reject before writing anything if the declared size already exceeds the cap
+	declared_size = getattr(file, "size", None)
+	if declared_size is not None and declared_size > max_bytes:
+		raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {max_bytes} bytes")
+
+	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
-		with open(file_path, "wb") as buffer:
-			shutil.copyfileobj(file.file, buffer)
+		file_size = _save_upload_capped(file.file, file_path, max_bytes)
+	except _UploadTooLarge:
+		file_path.unlink(missing_ok=True)
+		raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {max_bytes} bytes")
 	except Exception as e:
+		file_path.unlink(missing_ok=True)
 		logger.exception(f"Failed to save uploaded file: {e}")
 		raise HTTPException(status_code=500, detail="Failed to save file")
-	
-	# Get file info
-	file_size = file_path.stat().st_size
+
 	file_format = ext.lstrip(".").lower()
 	
 	# Try to get image dimensions
@@ -263,9 +291,18 @@ async def add_image_to_record(
 	)
 	
 	db.add(img)
-	db.commit()
+	try:
+		db.commit()
+	except Exception as e:
+		db.rollback()
+		# The DB row never persisted, so unlink the saved file and thumbnail to avoid orphaned files no record will reference.
+		file_path.unlink(missing_ok=True)
+		if thumbnail_path:
+			delete_thumbnail(str(thumbnail_path))
+		logger.exception(f"Failed to persist image record: {e}")
+		raise HTTPException(status_code=500, detail="Failed to save image record")
 	db.refresh(img)
-	
+
 	return RecordImageRead.model_validate(img)
 
 
