@@ -135,9 +135,9 @@ def get_collection_hierarchy(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     
-    # Count records in this collection
-    record_count = db.query(func.count(RecordImage.id)).filter(
-        RecordImage.collection_id == collection_id
+    # Count records in this collection (collection_id lives on Record)
+    record_count = db.query(func.count(Record.id)).filter(
+        Record.collection_id == collection_id
     ).scalar()
     
     result = CollectionWithChildren.model_validate(collection)
