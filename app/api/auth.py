@@ -51,7 +51,7 @@ def register(
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
     # First user becomes admin (bootstrap); all subsequent users start as reviewer.
-    # Role is never taken from the request payload — use PATCH /auth/users/{id}/role to elevate.
+    # Role is never taken from the request payload - use PATCH /auth/users/{id}/role to elevate.
     role = "admin" if is_first_user else "reviewer"
 
     user = User(
@@ -161,7 +161,7 @@ allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
 # ---------------------------------------------------------------------------
-# /users/me — current authenticated user's profile
+# /users/me - current authenticated user's profile
 # ---------------------------------------------------------------------------
 
 @users_router.get("/me", response_model=UserRead)

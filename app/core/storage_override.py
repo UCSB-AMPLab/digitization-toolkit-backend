@@ -4,7 +4,7 @@ Persistent override for the active projects storage path.
 Stored in /var/lib/dtk/storage-override.json so it survives backend restarts
 without requiring an env var change or service restart.
 
-All functions are safe to call from any context — failures are logged and
+All functions are safe to call from any context - failures are logged and
 silently swallowed so a corrupt/missing override file never crashes the app.
 """
 import json
@@ -37,7 +37,7 @@ def set_storage_override(projects_root: str) -> None:
 
 
 def clear_storage_override() -> None:
-    """Remove the override — app reverts to default DATA_DIR/projects path."""
+    """Remove the override - app reverts to default DATA_DIR/projects path."""
     try:
         _OVERRIDE_FILE.unlink(missing_ok=True)
     except Exception:

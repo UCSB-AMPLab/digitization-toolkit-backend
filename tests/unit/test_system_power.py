@@ -156,7 +156,7 @@ def test_power_helper_failure_is_logged(power_client, monkeypatch):
 
     resp = power_client.post("/system/power", json={"action": "poweroff"})
 
-    # The endpoint itself still returns 200 — the failure happens post-response.
+    # The endpoint itself still returns 200 - the failure happens post-response.
     assert resp.status_code == 200
     assert errors, "helper failure should have been logged"
     assert "poweroff" in errors[-1]

@@ -457,12 +457,12 @@ def _apply_status_change(
 	if allowed_roles is None:
 		raise HTTPException(
 			status_code=422,
-			detail=f"Transition '{current_status}' → '{new_status}' is not allowed."
+			detail=f"Transition '{current_status}' -> '{new_status}' is not allowed."
 		)
 	if user_role not in allowed_roles:
 		raise HTTPException(
 			status_code=403,
-			detail=f"Your role '{user_role}' cannot perform the '{current_status}' → '{new_status}' transition."
+			detail=f"Your role '{user_role}' cannot perform the '{current_status}' -> '{new_status}' transition."
 		)
 
 	rec.status = new_status

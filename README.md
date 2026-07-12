@@ -43,7 +43,7 @@ source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Test: Open your browser and navigate to `http://localhost:8000` to see the health check response → `{"status": "ok"}`
+Test: Open your browser and navigate to `http://localhost:8000` to see the health check response -> `{"status": "ok"}`
 
 ## Camera Backend Configuration
 
@@ -101,7 +101,7 @@ python capture/test_phase1_integration.py
 
 ## License
 
-Copyright © 2025 UCSB – Archives, Memory & Preservation Lab.
+Copyright (c) 2025 UCSB - Archives, Memory & Preservation Lab.
 
 This program is free software: you can redistribute it and/or modify it under
 the terms of the GNU Affero General Public License as published by the Free

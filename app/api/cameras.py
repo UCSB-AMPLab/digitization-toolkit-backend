@@ -260,7 +260,7 @@ def get_camera_preview(
 	Capture a low-resolution preview frame and return it as JPEG.
 
 	Called by the frontend every PREVIEW_INTERVAL_MS milliseconds for the
-	live preview view.  Uses a lightweight config (1280×720, no AF, no denoise)
+	live preview view.  Uses a lightweight config (1280x720, no AF, no denoise)
 	so frames are returned quickly without interfering with full captures.
 
 	Returns 404 when the requested camera is not connected.
@@ -310,7 +310,7 @@ def flush_preview_tmp_files(
 
 class FocusRequest(BaseModel):
 	"""Request body for manual focus endpoint."""
-	lens_position: float  # Dioptres: 0 = infinity, 10 ≈ 10 cm
+	lens_position: float  # Dioptres: 0 = infinity, 10 ~ 10 cm
 
 
 class FocusResponse(BaseModel):
@@ -371,7 +371,7 @@ class CameraSettingsRequest(BaseModel):
 	awb_enable: Optional[bool] = None         # Auto white-balance on/off
 	exposure_value: Optional[float] = None    # EV compensation (requires ae_enable=True)
 	exposure_time_us: Optional[int] = None    # Manual shutter time in microseconds
-	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ≈ 1.0)
+	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ~ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
 	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
 
@@ -907,7 +907,7 @@ def calibrate_white_balance(
 				detail=f"{backend.get_backend_name()} backend does not support white balance calibration",
 			)
 
-		# Route WB calibration through the backend's cached Picamera2 instance —
+		# Route WB calibration through the backend's cached Picamera2 instance -
 		# same reason as autofocus: calibration.py would open a second handle and
 		# corrupt the service's cached one.
 		backend = get_backend()
@@ -955,7 +955,7 @@ def commit_manual_white_balance(
 	Commit manually-sampled AWB gains to the camera registry.
 
 	Called after the user clicks on a neutral area in the live preview.
-	No camera capture is performed — the supplied gains are validated and
+	No camera capture is performed - the supplied gains are validated and
 	saved directly to the registry, the same way as after AWB convergence.
 	"""
 	if len(request.awb_gains) < 2:

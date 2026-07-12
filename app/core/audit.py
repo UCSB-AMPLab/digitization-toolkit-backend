@@ -18,7 +18,7 @@ def log_event(
     """
     Record an audit event in system_logs. Always commits immediately.
 
-    Safe to call from any route — exceptions are suppressed so that a
+    Safe to call from any route - exceptions are suppressed so that a
     logging failure never breaks the main request.
 
     Parameters
@@ -28,8 +28,8 @@ def log_event(
     category : "access" | "activity" | "capture" | "system"
     action   : machine-readable verb, e.g. "login_success", "project_created"
     actor    : username (or None for system-triggered events)
-    subject  : affected entity name (project name, username, …)
-    detail   : free-form extra context (IP address, record count, …)
+    subject  : affected entity name (project name, username, ...)
+    detail   : free-form extra context (IP address, record count, ...)
     """
     try:
         from app.models.system_log import SystemLog  # late import avoids circular refs

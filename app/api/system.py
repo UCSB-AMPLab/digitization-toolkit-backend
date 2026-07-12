@@ -255,7 +255,7 @@ def unmount_device(
 
     target = Path(body.mountpoint)
 
-    # Only allow unmounting paths we own — must be under _MOUNT_BASE
+    # Only allow unmounting paths we own - must be under _MOUNT_BASE
     try:
         target.resolve().relative_to(_MOUNT_BASE.resolve())
     except ValueError:
@@ -394,7 +394,7 @@ def power_control(
 
     This is intentionally NOT admin-only: the operators who run the toolkit are
     often non-technical staff, and anyone with physical access can already pull
-    the plug — a graceful shutdown from the UI is strictly safer than that.
+    the plug - a graceful shutdown from the UI is strictly safer than that.
 
     The action is audit-logged and committed *before* it is triggered (the DB is
     about to go down), then dispatched via a BackgroundTask so the HTTP response

@@ -53,7 +53,7 @@ def test_imports():
         
         return True
     except Exception as e:
-        print(f"✗ Import failed: {e}")
+        print(f"[ERROR] Import failed: {e}")
         return False
 
 
@@ -72,7 +72,7 @@ def test_password_hashing():
         print(" [OK] Password hashing works correctly")
         return True
     except Exception as e:
-        print(f"✗ Password hashing test failed: {e}")
+        print(f"[ERROR] Password hashing test failed: {e}")
         return False
 
 
@@ -99,7 +99,7 @@ def test_token_generation():
         print(" [OK] Token generation and verification works correctly")
         return True
     except Exception as e:
-        print(f"✗ Token test failed: {e}")
+        print(f"[ERROR] Token test failed: {e}")
         return False
 
 
@@ -142,7 +142,7 @@ def test_schemas():
         print(" [OK] Schema validation works correctly")
         return True
     except Exception as e:
-        print(f"✗ Schema test failed: {e}")
+        print(f"[ERROR] Schema test failed: {e}")
         return False
 
 
@@ -190,10 +190,10 @@ def test_routes():
         print(" [OK] All required routes are registered")
         return True
     except AssertionError as e:
-        print(f"✗ Route test failed: {e}")
+        print(f"[ERROR] Route test failed: {e}")
         return False
     except Exception as e:
-        print(f"✗ Route test error: {e}")
+        print(f"[ERROR] Route test error: {e}")
         return False
 
 
@@ -220,10 +220,10 @@ def test_models():
         print(" [OK] All models are properly registered")
         return True
     except AssertionError as e:
-        print(f"✗ Model test failed: {e}")
+        print(f"[ERROR] Model test failed: {e}")
         return False
     except Exception as e:
-        print(f"✗ Model test error: {e}")
+        print(f"[ERROR] Model test error: {e}")
         return False
 
 
@@ -250,7 +250,7 @@ def test_new_endpoints():
         print(" [OK] New endpoint schemas work correctly")
         return True
     except Exception as e:
-        print(f"✗ New endpoint test failed: {e}")
+        print(f"[ERROR] New endpoint test failed: {e}")
         return False
 
 

@@ -144,7 +144,7 @@ class Picamera2Backend(CameraBackend):
             camera_id = info.get("Id", "")
             location = info.get("Location", "")
 
-            # Build stable hardware ID — same logic as CameraRegistry (picamera2 path)
+            # Build stable hardware ID - same logic as CameraRegistry (picamera2 path)
             if camera_id:
                 id_parts = camera_id.split("/")
                 i2c_part = [p for p in id_parts if p.startswith("i2c@")]
@@ -293,7 +293,7 @@ class Picamera2Backend(CameraBackend):
         camera_config,
         capture_output: bool = False
     ) -> str:
-        """Internal capture implementation — must be called with the camera lock held."""
+        """Internal capture implementation - must be called with the camera lock held."""
         try:
             picam2 = self._get_camera(camera_config.camera_index)
             
@@ -400,11 +400,11 @@ class Picamera2Backend(CameraBackend):
                 time.sleep(camera_config.timeout / 1000.0)
             
             # Capture image directly to file with metadata
-            # YUV420→JPEG is done efficiently by libcamera/picamera2
+            # YUV420->JPEG is done efficiently by libcamera/picamera2
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
 
-            # Reset ScalerCrop to full sensor — zoom is preview-only.
+            # Reset ScalerCrop to full sensor - zoom is preview-only.
             # Ensures captures always use the full pixel array regardless of
             # whatever zoom the user had applied to the live preview.
             _pixel_array_size = picam2.camera_properties.get('PixelArraySize')
@@ -530,7 +530,7 @@ class Picamera2Backend(CameraBackend):
         Run an autofocus calibration cycle using the cached Picamera2 instance.
 
         Acquires the per-camera lock so this is safe to call while preview
-        polling is active — it blocks until any in-flight preview completes,
+        polling is active - it blocks until any in-flight preview completes,
         then holds the lock for the duration of the AF cycle.
 
         Unlike the legacy ``CameraCalibration`` class, this method does NOT
@@ -613,7 +613,7 @@ class Picamera2Backend(CameraBackend):
         converged ColourGains.
 
         Like ``run_autofocus_calibration``, this method does NOT open a second
-        Picamera2 instance — doing so would corrupt the service's cached handle.
+        Picamera2 instance - doing so would corrupt the service's cached handle.
 
         After the cycle the camera is left stopped; ``_last_configs`` and
         ``_format_mode`` are cleared so the next request reconfigures cleanly.
@@ -632,7 +632,7 @@ class Picamera2Backend(CameraBackend):
             if picam2.started:
                 picam2.stop()
 
-            # Preview config is sufficient for metadata reads — much faster than still
+            # Preview config is sufficient for metadata reads - much faster than still
             preview_config = picam2.create_preview_configuration(
                 main={"size": (1920, 1080)}
             )
@@ -754,7 +754,7 @@ class Picamera2Backend(CameraBackend):
 
         Args:
             camera_index: The camera index.
-            controls: Dict of picamera2 control names → values.
+            controls: Dict of picamera2 control names -> values.
         """
         picam2 = self._cameras.get(camera_index)
         if picam2 is None:
