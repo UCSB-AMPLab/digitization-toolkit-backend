@@ -47,6 +47,42 @@ def get_system_logs(
     return query.limit(limit).all()
 
 
+@router.get("/integrity")
+def integrity_check(
+    verify_hashes:  bool = Query(default=True, description="Recompute sha256 and compare against the capture manifest"),
+    max_hash_checks: int = Query(default=0, ge=0, description="Cap on files hashed (0 = no cap)"),
+    current_user: User = Depends(allow_admin),
+    db: Session        = Depends(get_db_dependency),
+):
+    """Reconcile the database against the image files and the capture manifest.
+
+    Reports images whose files are missing, image files no row or manifest
+    references, bytes that no longer match the capture-time sha256, and parentless
+    records. Read-only and admin-only. Run after an SD re-clone or DB restore.
+    """
+    from app.core.integrity import run_integrity_check
+    from app.core import audit
+
+    report = run_integrity_check(
+        db,
+        verify_hashes=verify_hashes,
+        max_hash_checks=(max_hash_checks or None),
+    )
+    summary = report["summary"]
+    audit.log_event(
+        db,
+        level="INFO" if summary["ok"] else "WARN",
+        category="system",
+        action="integrity_check",
+        actor=current_user.username,
+        detail=(
+            f"missing_files={summary['missing_files']} orphan_files={summary['orphan_files']} "
+            f"manifest_mismatches={summary['manifest_mismatches']} hashes_checked={summary['hashes_checked']}"
+        ),
+    )
+    return report
+
+
 @router.get("/temperature")
 def get_temperature(current_user: User = Depends(allow_read_only)):
     """Get Raspberry Pi CPU temperature via vcgencmd measure_temp.
