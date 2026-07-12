@@ -1,13 +1,14 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
 from sqlalchemy.orm import Session
-from sqlalchemy import func, or_
+from sqlalchemy import func
 from pydantic import BaseModel
 import logging
 
 from app.core.storage_ops import (
     collection_and_descendants,
-    collection_ids_under_project,
+    move_project_tree,
+    rebase_stored_path,
     relocate_image,
     remove_tree,
     surviving_images_under,
@@ -138,13 +139,14 @@ def update_project(
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
-    """Update a project's details, relocating image files if the name changes."""
+    """Update a project's details, moving its on-disk tree if the name changes."""
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
 
     # Check for name conflicts if name is being changed
-    name_changed = bool(payload.name) and payload.name != p.name
+    old_name = p.name
+    name_changed = bool(payload.name) and payload.name != old_name
     if name_changed:
         existing = db.query(Project).filter(Project.name == payload.name).first()
         if existing:
@@ -153,23 +155,36 @@ def update_project(
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, field, value)
 
-    # The on-disk directory is keyed by name, so a rename must relocate the files
+    # The whole on-disk tree (images, manifest, packages, collection subdirs) is
+    # keyed by name, so a rename moves the entire directory as a unit and rewrites
+    # the stored paths. This keeps every capture and its manifest together and
+    # leaves no stranded old-name directory for delete_project to miss later.
     if name_changed:
-        from capture.project_manager import image_output_dir
+        from capture.project_manager import secure_project_filename, project_capture_root
 
-        collection_ids = collection_ids_under_project(db, p.id)
-        filters = [Record.project_id == p.id]
-        if collection_ids:
-            filters.append(Record.collection_id.in_(collection_ids))
-        records = db.query(Record).filter(or_(*filters)).all()
-        col_names = {
-            c.id: c.name
-            for c in db.query(Collection).filter(Collection.id.in_(collection_ids)).all()
-        } if collection_ids else {}
-        for r in records:
-            target_dir = image_output_dir(p.name, col_names.get(r.collection_id))
-            for img in r.images:
-                relocate_image(img, target_dir)
+        # secure_project_filename collapses many display names onto one directory,
+        # so only touch the disk when the directory name actually changes.
+        if secure_project_filename(old_name) != secure_project_filename(p.name):
+            old_root = project_capture_root(old_name)
+            new_root = project_capture_root(p.name)
+            try:
+                moved = move_project_tree(old_root, new_root)
+            except FileExistsError:
+                raise HTTPException(status_code=409, detail="A project directory with this name already exists on disk")
+            except OSError as e:
+                logger.error(f"Failed to move project directory {old_root} -> {new_root}: {e}")
+                raise HTTPException(status_code=500, detail="Failed to move project files on disk")
+
+            if moved:
+                # Rewrite absolute paths for every image that lived under old_root
+                # (captures under the project or any of its collections).
+                for img in db.query(RecordImage).all():
+                    new_fp = rebase_stored_path(img.file_path, old_root, new_root)
+                    if new_fp:
+                        img.file_path = new_fp
+                    new_tp = rebase_stored_path(img.thumbnail_path, old_root, new_root)
+                    if new_tp:
+                        img.thumbnail_path = new_tp
 
     db.add(p)
     db.commit()

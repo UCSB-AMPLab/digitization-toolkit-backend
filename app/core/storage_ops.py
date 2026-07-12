@@ -3,8 +3,7 @@ Filesystem operations tied to project/collection/record moves and deletes.
 
 These helpers keep the image files on disk consistent with the database when
 records are re-parented (move) or their container is removed (delete), and
-provide the guard that stops a delete from erasing files still referenced by
-surviving records.
+provide the guard that stops a delete from erasing files still referenced by surviving records.
 """
 
 import shutil
@@ -140,3 +139,38 @@ def remove_tree(directory: Path) -> None:
     """Remove a directory tree. Raises OSError on failure (never silent)."""
     if directory.exists() and directory.is_dir():
         shutil.rmtree(directory)
+
+
+def move_project_tree(old_root: Path, new_root: Path) -> bool:
+    """Move an entire project directory tree from old_root to new_root.
+
+    Renaming a project must move the whole tree as a unit (images, the manifest,
+    packages, and any collection subdirs) so nothing is stranded under the old
+    name. Returns True if a move happened, False if old_root does not exist.
+    Raises FileExistsError if new_root already exists (the caller must not
+    clobber another project's directory) and OSError on filesystem failure.
+    """
+    if not old_root.exists():
+        return False
+    if new_root.exists():
+        raise FileExistsError(str(new_root))
+    new_root.parent.mkdir(parents=True, exist_ok=True)
+    shutil.move(str(old_root), str(new_root))
+    return True
+
+
+def rebase_stored_path(stored: Optional[str], old_root: Path, new_root: Path) -> Optional[str]:
+    """Rewrite a stored path from under old_root to new_root.
+
+    Returns the rewritten path, or None if `stored` is empty or does not point
+    inside old_root (e.g. an uploaded image living outside the project tree).
+    This is pure path math: the file has usually already been moved, so on-disk
+    existence is not required.
+    """
+    if not stored:
+        return None
+    try:
+        rel = Path(stored).resolve().relative_to(old_root.resolve())
+    except (OSError, ValueError):
+        return None
+    return str(new_root / rel)
