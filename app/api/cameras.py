@@ -603,6 +603,7 @@ def trigger_capture(
 		raise
 	except Exception as e:
 		logger.exception(f"Capture failed: {e}")
+		# DB-only rollback: a file that already has a manifest entry is kept (recoverable via ?orphaned=true), never auto-unlinked
 		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
@@ -805,6 +806,7 @@ def trigger_dual_capture(
 		raise
 	except Exception as e:
 		logger.exception(f"Dual capture failed: {e}")
+		# DB-only rollback: a file that already has a manifest entry is kept (recoverable via ?orphaned=true), never auto-unlinked
 		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
