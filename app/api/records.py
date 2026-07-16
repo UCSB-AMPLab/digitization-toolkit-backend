@@ -108,7 +108,10 @@ def list_records(
 	if orphaned is True:
 		query = query.filter(Record.project_id == None, Record.collection_id == None)
 	
-	recs = query.offset(skip).limit(limit).all()
+	# Deterministic order: without an ORDER BY, Postgres returns heap order,
+	# which shifts when rows are updated (NEH-159). Also required for stable
+	# skip/limit pagination.
+	recs = query.order_by(Record.id).offset(skip).limit(limit).all()
 	return [RecordRead.model_validate(r) for r in recs]
 
 
