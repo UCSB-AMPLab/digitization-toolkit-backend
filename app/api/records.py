@@ -184,6 +184,9 @@ def delete_record(
 			detail=f"Cannot delete a record with status '{rec.status}'. Move it to 'rejected' first."
 		)
 	
+	# Count images before delete/commit; rec.images is unusable once the row is expired
+	image_count = len(rec.images)
+
 	# Clean up image files and thumbnails; only unlink paths inside storage
 	for img in rec.images:
 		file_path = resolve_within_storage(img.file_path)
@@ -195,7 +198,7 @@ def delete_record(
 
 	db.delete(rec)
 	db.commit()
-	return {"detail": f"Record {rec_id} and {len(rec.images)} images deleted"}
+	return {"detail": f"Record {rec_id} and {image_count} images deleted"}
 
 
 # ==============================================================================
