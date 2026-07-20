@@ -8,6 +8,7 @@ import socket
 import os
 import json
 import sys
+import threading
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -24,6 +25,9 @@ subprocess_logger = setup_rotating_logger(
     log_file=str(LOG_FILE),
     logger_name="capture_service"
 )
+
+# Serialize manifest appends across the FastAPI threadpool
+_manifest_append_lock = threading.Lock()
 
 @dataclass
 class ProjectInfo:
@@ -272,13 +276,19 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     else:
         raise ValueError("record_type must be 'capture' or 'project'")
     
-    with open(manifest_path, 'a', encoding="utf-8") as f:
-        f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-        
-        if record_type == "project":
-            subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
-        else:
-            subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
+    line = (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            mv = memoryview(line)
+            while mv:  # one O_APPEND write keeps the JSONL line atomic
+                mv = mv[os.write(fd, mv):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    if record_type == "project":
+        subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
+    else:
+        subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
         
