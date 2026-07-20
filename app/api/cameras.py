@@ -12,8 +12,11 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.camera import CameraSettings
 from app.models.user import User
+from app.models.project import Project
+from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
+from app.core.storage_ops import resolve_project_name
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -35,6 +38,22 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 		query = query.filter(Record.project_id == project_id)
 	current_max = query.scalar()
 	return (current_max + 1) if current_max is not None else 0
+
+
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str]]:
+	"""Authoritative (project_name, collection_name) for the on-disk capture path."""
+	if collection_id:
+		col = db.query(Collection).filter(Collection.id == collection_id).first()
+		if not col:
+			raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+		resolved = resolve_project_name(db, col)
+		if not resolved:
+			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
+		return resolved, col.name
+	project = db.query(Project).filter(Project.name == project_name).first()
+	if not project:
+		raise HTTPException(status_code=422, detail="project_name does not match a known project")
+	return project.name, None
 
 
 class DeviceInfo(BaseModel):
@@ -466,16 +485,11 @@ def trigger_capture(
 			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
-		# Capture image and get manifest IDs
-		# Look up collection name so images go to project/collection/images/main/
-		collection_name = None
-		if request.collection_id:
-			from app.models.collection import Collection
-			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
-			collection_name = col.name if col else None
+		# Resolve the path from collection_id via the DB
+		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		output_path, capture_id, pair_id = single_capture_image(
-			project_name=request.project_name,
+			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
@@ -505,14 +519,14 @@ def trigger_capture(
 		except Exception as e:
 			logger.warning(f"Could not extract image metadata: {e}")
 		
-		# Get or find project by name
-		project = db.query(Project).filter(Project.name == request.project_name).first()
+		# Reuse the resolved project name so the DB record matches the on-disk tree
+		project = db.query(Project).filter(Project.name == project_name).first()
 		project_id = project.id if project else None
-		
+
 		# Records can have either project_id OR collection_id, not both (DB constraint).
 		# When a collection is provided, the project association is implicit through it.
 		effective_project_id = None if request.collection_id else project_id
-		
+
 		# Get or create Record
 		if request.record_id:
 			# Link to existing record
@@ -522,7 +536,7 @@ def trigger_capture(
 		else:
 			# Create new record for this capture
 			record = Record(
-				title=request.record_title or f"{request.project_name} - {file_path.stem}",
+				title=request.record_title or f"{project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
 				object_typology="document",
 				project_id=effective_project_id,
@@ -653,16 +667,11 @@ def trigger_dual_capture(
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
-		# Capture both images and get manifest IDs
-		# Look up collection name so images go to project/collection/images/main/
-		collection_name = None
-		if request.collection_id:
-			from app.models.collection import Collection
-			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
-			collection_name = col.name if col else None
+		# Resolve the path from collection_id via the DB
+		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		path0, path1, capture_id, pair_id = dual_capture_image(
-			project_name=request.project_name,
+			project_name=project_name,
 			cam1_config=cam0_config,
 			cam2_config=cam1_config,
 			check_camera=False,
@@ -670,9 +679,9 @@ def trigger_dual_capture(
 			stagger_ms=request.stagger_ms,
 			collection_name=collection_name
 		)
-		
-		# Get project
-		project = db.query(Project).filter(Project.name == request.project_name).first()
+
+		# Reuse the resolved project name so the DB record matches the on-disk tree
+		project = db.query(Project).filter(Project.name == project_name).first()
 		project_id = project.id if project else None
 		
 		# Records can have either project_id OR collection_id, not both (DB constraint).
@@ -688,7 +697,7 @@ def trigger_dual_capture(
 		else:
 			# Create new record for this dual capture
 			record = Record(
-				title=request.record_title or f"{request.project_name} - Dual capture",
+				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				object_typology="book",  # Default to book for dual captures
 				project_id=effective_project_id,
