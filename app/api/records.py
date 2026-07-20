@@ -156,12 +156,27 @@ def update_record(
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 	
-	# Update only provided fields
-	for field, value in payload.model_dump(exclude_unset=True).items():
+	data = payload.model_dump(exclude_unset=True)
+
+	# A record has at most one parent: reject setting both, null the opposite when one is set
+	set_project = data.get("project_id") is not None
+	set_collection = data.get("collection_id") is not None
+	if set_project and set_collection:
+		raise HTTPException(status_code=400, detail="A record cannot belong to both a project and a collection")
+	if set_project:
+		data["collection_id"] = None
+	elif set_collection:
+		data["project_id"] = None
+
+	for field, value in data.items():
 		setattr(rec, field, value)
-	
+
 	db.add(rec)
-	db.commit()
+	try:
+		db.commit()
+	except IntegrityError:
+		db.rollback()
+		raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
 	db.refresh(rec)
 	return RecordRead.model_validate(rec)
 
