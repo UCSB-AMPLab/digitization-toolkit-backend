@@ -2,6 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from typing import List, Optional
 from sqlalchemy.orm import Session
 from sqlalchemy import func
+from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 import logging
 
@@ -107,9 +108,15 @@ def add_record_to_project(
     r = db.query(Record).filter(Record.id == rec_id).first()
     if not r:
         raise HTTPException(status_code=404, detail="Record not found")
+    # A record has one parent: attaching it to a project detaches it from any collection
     r.project_id = p.id
+    r.collection_id = None
     db.add(r)
-    db.commit()
+    try:
+        db.commit()
+    except IntegrityError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
     return {"detail": "record added"}
 
 
