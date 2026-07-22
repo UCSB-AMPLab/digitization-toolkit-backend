@@ -21,6 +21,7 @@ from app.schemas.record import (
 from app.core.config import settings
 from app.core.paths import resolve_within_storage
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
+from app.core.audit import log_event
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -548,13 +549,31 @@ def delete_record_annotation(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Delete a single annotation."""
+	"""Delete a single annotation.
+
+	Operators and reviewers may only delete annotations they created; admins
+	may delete any. If created_by is NULL (legacy row with no owner recorded),
+	ownership cannot be enforced, so the delete is allowed.
+	"""
 	annotation = db.query(RecordAnnotation).filter(RecordAnnotation.id == annotation_id).first()
 	if not annotation:
 		raise HTTPException(status_code=404, detail="Annotation not found")
 
+	if (
+		annotation.created_by
+		and annotation.created_by != current_user.username
+		and current_user.role != "admin"
+	):
+		raise HTTPException(
+			status_code=403,
+			detail="Only the annotation's creator or an admin can delete it"
+		)
+
+	record_id = annotation.record_id
 	db.delete(annotation)
 	db.commit()
+	log_event(db, level="INFO", category="activity", action="annotation_deleted",
+	          actor=current_user.username, subject=f"record {record_id} annotation {annotation_id}")
 	return {"detail": "Annotation deleted"}
 
 
