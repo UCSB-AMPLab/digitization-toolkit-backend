@@ -102,8 +102,27 @@ def list_collections(
     if parent_collection_id is not None:
         query = query.filter(Collection.parent_collection_id == parent_collection_id)
     
-    items = query.offset(skip).limit(limit).all()
+    # Deterministic order: without an ORDER BY, Postgres returns heap order,
+    # which shifts when rows are updated. Also required for stable
+    # skip/limit pagination.
+    items = query.order_by(Collection.id).offset(skip).limit(limit).all()
     return [CollectionRead.model_validate(i) for i in items]
+
+
+@router.get("/count")
+def count_collections(
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection (use 'null' for top-level)"),
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """Return the total number of collections matching the given filters."""
+    query = db.query(Collection)
+    if project_id is not None:
+        query = query.filter(Collection.project_id == project_id)
+    if parent_collection_id is not None:
+        query = query.filter(Collection.parent_collection_id == parent_collection_id)
+    return {"count": query.count()}
 
 
 @router.get("/{collection_id}", response_model=CollectionRead)
@@ -434,14 +453,20 @@ def export_collection_bagit(
         .all()
     )
     if not records:
-        raise HTTPException(status_code=422, detail="Collection has no records to export.")
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Collection has no records to export.", "blocking_record_ids": []}
+        )
 
     # All records must be approved
     non_approved = [r.id for r in records if r.status != "approved"]
     if non_approved:
         raise HTTPException(
             status_code=422,
-            detail=f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}"
+            detail={
+                "message": f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
+                "blocking_record_ids": non_approved,
+            }
         )
 
     # Gather project info for bag metadata
