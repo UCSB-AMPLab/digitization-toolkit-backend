@@ -18,6 +18,7 @@ from app.core.storage_ops import (
     collection_and_descendants,
     relocate_image,
     remove_tree,
+    renumber_collection_images,
     resolve_project_name,
     surviving_images_under,
 )
@@ -351,6 +352,51 @@ def reorder_collection_records(
 
     db.commit()
     return {"reordered": len(records)}
+
+
+# ==============================================================================
+# Image renumbering
+# ==============================================================================
+
+@router.post("/{collection_id}/images/renumber", status_code=200)
+def renumber_images(
+    collection_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Physically renumber every image file in a collection (documentary unit),
+    sequentially from 1, zero-padded to the total capture count. Never
+    renames anything else — only assigns fresh sequential filenames based on
+    current display order. All-or-nothing: if any file operation fails,
+    every rename already applied is rolled back and the database is left
+    untouched.
+    """
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    try:
+        result = renumber_collection_images(db, collection)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to renumber images on disk: {e}")
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(f"Renumber DB commit failed for collection {collection_id} after files were already renamed on disk")
+        raise HTTPException(
+            status_code=500,
+            detail="Files were renumbered on disk but the database update failed; please retry"
+        )
+
+    log_event(db, level="INFO", category="activity", action="images_renumbered",
+              actor=current_user.username, subject=collection.name,
+              detail=f"Renumbered {result['renumbered']} images")
+    return result
 
 
 # ==============================================================================
