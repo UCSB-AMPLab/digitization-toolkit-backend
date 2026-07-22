@@ -9,13 +9,14 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.record import Record, RecordImage, ExifData
+from app.models.record import Record, RecordImage, ExifData, RecordAnnotation
 from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.record import (
 	RecordCreate, RecordRead, RecordUpdate,
 	RecordImageCreate, RecordImageRead, RecordImageUpdate,
-	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS
+	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
+	RecordAnnotationCreate, RecordAnnotationRead,
 )
 from app.core.config import settings
 from app.core.paths import resolve_within_storage
@@ -491,6 +492,70 @@ def get_image_thumbnail(
 		filename=f"{Path(img.filename).stem}_thumb.jpg",
 		media_type="image/jpeg"
 	)
+
+
+# ==============================================================================
+# Annotation endpoints (QA "Anotaciones" tab: flagged errors + notes)
+# ==============================================================================
+
+@router.get("/{rec_id}/annotations", response_model=List[RecordAnnotationRead])
+def list_record_annotations(
+	rec_id: int,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""List all annotations for a record, newest first."""
+	rec = db.query(Record).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+
+	annotations = (
+		db.query(RecordAnnotation)
+		.filter(RecordAnnotation.record_id == rec_id)
+		.order_by(RecordAnnotation.created_at.desc())
+		.all()
+	)
+	return [RecordAnnotationRead.model_validate(a) for a in annotations]
+
+
+@router.post("/{rec_id}/annotations", response_model=RecordAnnotationRead)
+def create_record_annotation(
+	rec_id: int,
+	payload: RecordAnnotationCreate,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Add an annotation (flagged error and/or note) to a record."""
+	rec = db.query(Record).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+
+	annotation = RecordAnnotation(
+		record_id=rec_id,
+		error_types=payload.error_types,
+		note=payload.note,
+		created_by=current_user.username,
+	)
+	db.add(annotation)
+	db.commit()
+	db.refresh(annotation)
+	return RecordAnnotationRead.model_validate(annotation)
+
+
+@router.delete("/annotations/{annotation_id}")
+def delete_record_annotation(
+	annotation_id: int,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Delete a single annotation."""
+	annotation = db.query(RecordAnnotation).filter(RecordAnnotation.id == annotation_id).first()
+	if not annotation:
+		raise HTTPException(status_code=404, detail="Annotation not found")
+
+	db.delete(annotation)
+	db.commit()
+	return {"detail": "Annotation deleted"}
 
 
 # ==============================================================================

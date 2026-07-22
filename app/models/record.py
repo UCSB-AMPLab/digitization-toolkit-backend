@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON
 from sqlalchemy.orm import relationship
 
 from app.core.db import Base
@@ -41,6 +41,7 @@ class Record(Base):
 	images = relationship("RecordImage", back_populates="record", cascade="all, delete-orphan")
 	project = relationship("Project", back_populates="records")
 	collection = relationship("Collection", back_populates="records")
+	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	
 	# Constraint: must have either project_id OR collection_id (or neither, but not both)
 	__table_args__ = (
@@ -90,6 +91,25 @@ class RecordImage(Base):
 	record = relationship("Record", back_populates="images")
 	camera_settings = relationship("CameraSettings", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
 	exif_data = relationship("ExifData", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
+
+
+class RecordAnnotation(Base):
+	"""
+	A reviewer annotation on a Record: a flagged error typology and/or a free-text note.
+	Created during the QA pass ("Anotaciones" tab) and scoped to a single record.
+	"""
+	__tablename__ = "record_annotations"
+
+	id = Column(Integer, primary_key=True, index=True)
+	record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False, index=True)
+
+	error_types = Column(JSON, nullable=True)  # list of error type ids, e.g. ["blur", "glare"]
+	note = Column(Text, nullable=True)
+
+	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+	created_by = Column(String(255), nullable=True)
+
+	record = relationship("Record", back_populates="annotations")
 
 
 class ExifData(Base):
