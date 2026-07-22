@@ -36,6 +36,16 @@ def init_db() -> None:
 - Do NOT add `pydantic[email]` dependency - uses simple regex validation for offline compatibility
 - Secret keys must come from environment variables, never hardcoded
 
+### [WARNING] Dependency Manifests
+
+**Two manifests must stay in lockstep: `requirements.txt` (Docker) and `pixi.toml` (native Pi)**
+
+- The Docker image installs from `requirements.txt`; the Pi runs the backend natively through pixi
+- Any dependency change updates **both** files in the same PR, then regenerates the lockfile: `pixi lock` (the committed `pixi.lock` only guarantees reproducible Pi installs when the updater runs `pixi install --locked`)
+- The committed lockfile uses lock-file format v6; the unit's installed pixi must be recent enough to read the committed format — check `pixi --version` on target hardware before shipping a regenerated lock
+- Version-equal is not behaviour-equal: conda-forge's `uvicorn` includes the `standard` extras, so the Pi runs **uvloop** while Docker runs plain asyncio, and `websockets` resolves to a different major on the Pi. Nothing in the app currently depends on either difference, but test on-device accordingly
+- `CORSMiddleware(allow_private_network=...)` is currently commented out in `app/main.py`; it requires starlette ≥0.51.0, which the pinned 1.3.1 satisfies if it is ever re-enabled (see NEH-161)
+
 ### [INFO] PostgreSQL Configuration
 
 - Use `postgresql+psycopg://` for psycopg3 (NOT `postgresql://`)
@@ -62,6 +72,7 @@ def init_db() -> None:
 3. [ERROR] Adding unused configuration fields "just in case"
 4. [ERROR] Using `postgresql://` instead of `postgresql+psycopg://`
 5. [ERROR] Creating migrations outside Docker (wrong database host)
+6. [ERROR] Changing a dependency in `requirements.txt` but not `pixi.toml` (or vice versa) — they must move together, with `pixi lock` re-run
 
 ## Quick Reference
 
