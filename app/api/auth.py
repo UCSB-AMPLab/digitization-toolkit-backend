@@ -11,10 +11,12 @@ from app.core.audit import log_event
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
-# auto_error=False on every HTTPBearer instance: FastAPI's default (auto_error=True)
-# raises 403 when the Authorization header is missing/malformed, but a missing/invalid
-# session is a 401 ("session problem"), never a 403 ("authorization answer"). Each
-# dependency below raises HTTPException(401, ...) explicitly instead. See NEH-167.
+# auto_error=False on every HTTPBearer instance so the status code for a
+# missing/malformed Authorization header is chosen by our code, not by the
+# framework default (which has varied across FastAPI versions). A credential
+# problem is always a 401 ("session problem"), never a 403 ("authorization
+# answer"); each dependency below raises HTTPException(401, ...) explicitly.
+# See NEH-167.
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
