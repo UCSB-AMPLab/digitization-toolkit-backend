@@ -26,7 +26,6 @@ from app.core.storage_ops import (
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
@@ -277,7 +276,7 @@ def move_collection_records(
 @router.delete("/{collection_id}", status_code=204)
 def delete_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
     """

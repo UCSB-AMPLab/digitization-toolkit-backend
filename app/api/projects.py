@@ -50,7 +50,7 @@ class ProjectInitResponse(BaseModel):
 @router.post("/", response_model=ProjectRead)
 def create_project(
     payload: ProjectCreate,
-    current_user: User = Depends(allow_contributor),
+    current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency)
 ):
     if db.query(Project).filter(Project.name == payload.name).first():
@@ -59,16 +59,8 @@ def create_project(
     db.add(p)
     db.commit()
     db.refresh(p)
-    # Auto-add creator as explicit member (unless they're an admin - admins are always implicit)
-    if current_user.role != "admin":
-        member = ProjectMember(
-            project_id=p.id,
-            user_id=current_user.id,
-            role=current_user.role,
-            added_by="system",
-        )
-        db.add(member)
-        db.commit()
+    # Creator is an admin, always an implicit collaborator — no explicit
+    # ProjectMember row needed (see list_project_members).
     return ProjectRead.model_validate(p)
 
 
@@ -376,22 +368,6 @@ def list_project_records(
 # MEMBER ENDPOINTS
 # ---------------------------------------------------------------------------
 
-def _assert_can_manage_members(project: Project, current_user: User, db: Session) -> None:
-    """Raise 403 if current_user may not manage members for this project."""
-    if current_user.role == "admin":
-        return
-    if current_user.role == "operator":
-        # Operator may manage if they created the project or are already a member
-        is_creator = project.created_by == current_user.username
-        is_member  = db.query(ProjectMember).filter(
-            ProjectMember.project_id == project.id,
-            ProjectMember.user_id    == current_user.id
-        ).first() is not None
-        if is_creator or is_member:
-            return
-    raise HTTPException(status_code=403, detail="Not authorised to manage members for this project")
-
-
 @router.get("/{project_id}/members", response_model=List[ProjectMemberRead])
 def list_project_members(
     project_id: int,
@@ -455,14 +431,13 @@ def list_project_members(
 def add_project_member(
     project_id: int,
     payload: ProjectMemberCreate,
-    current_user: User = Depends(allow_contributor),
+    current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Add a user to a project with a given role (operator|reviewer)."""
+    """Add a user to a project with a given role (operator|reviewer). Admin only."""
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    _assert_can_manage_members(p, current_user, db)
 
     if payload.role not in ("operator", "reviewer"):
         raise HTTPException(status_code=422, detail="role must be 'operator' or 'reviewer'")
@@ -507,14 +482,13 @@ def add_project_member(
 def remove_project_member(
     project_id: int,
     user_id: int,
-    current_user: User = Depends(allow_contributor),
+    current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Remove a user from a project."""
+    """Remove a user from a project. Admin only."""
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    _assert_can_manage_members(p, current_user, db)
 
     m = db.query(ProjectMember).filter(
         ProjectMember.project_id == project_id,
