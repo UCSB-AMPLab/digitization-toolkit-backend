@@ -94,6 +94,33 @@ def test_collections_count_with_and_without_project_filter(read_client, db_sessi
 
 
 @pytest.mark.unit
+def test_collections_count_with_parent_collection_filter(read_client, db_session):
+    from app.models.project import Project
+    from app.models.collection import Collection
+
+    proj = Project(name="P")
+    db_session.add(proj)
+    db_session.commit()
+
+    parent = Collection(name="parent", project_id=proj.id)
+    db_session.add(parent)
+    db_session.commit()
+
+    for i in range(4):
+        db_session.add(Collection(name=f"child{i}", parent_collection_id=parent.id))
+    db_session.commit()
+
+    resp = read_client.get("/collections/count", params={"parent_collection_id": parent.id})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"count": 4}
+
+    # A parent with no subcollections counts zero.
+    resp = read_client.get("/collections/count", params={"parent_collection_id": 999999})
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"count": 0}
+
+
+@pytest.mark.unit
 def test_collections_count_route_not_shadowed_by_collection_id_route(read_client, db_session):
     from app.models.project import Project
     from app.models.collection import Collection

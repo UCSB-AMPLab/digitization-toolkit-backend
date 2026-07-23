@@ -112,7 +112,7 @@ def list_collections(
 @router.get("/count")
 def count_collections(
     project_id: Optional[int] = Query(None, description="Filter by project"),
-    parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection (use 'null' for top-level)"),
+    parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection id"),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
