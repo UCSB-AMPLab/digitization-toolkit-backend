@@ -114,7 +114,7 @@ def validate_models():
 
         # Verify models can be instantiated
         proj = Project(name="test", description="test")
-        doc = RecordImage(filename="test.jpg", file_path="/test", format="jpg")
+        doc = RecordImage(record_id=1, filename="test.jpg", file_path="/test", format="jpg")
         cs = CameraSettings(record_image_id=1, white_balance="auto")
         
         print("[OK]")
