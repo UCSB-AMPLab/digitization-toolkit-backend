@@ -11,9 +11,12 @@ from app.core.audit import log_event
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
-security = HTTPBearer()
-# auto_error=False so the dependency doesn't raise when header is absent
-# (allows falling back to ?token= query param for browser src= requests)
+# auto_error=False on every HTTPBearer instance so the status code for a
+# missing/malformed Authorization header is chosen by our code, not by the
+# framework default (which has varied across FastAPI versions). A credential
+# problem is always a 401 ("session problem"), never a 403 ("authorization
+# answer"); each dependency below raises HTTPException(401, ...) explicitly.
+# See NEH-167.
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
@@ -87,7 +90,12 @@ def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
 
 
 @router.post("/refresh", response_model=TokenRefresh)
-def refresh_token(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db_dependency)):
+def refresh_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    db: Session = Depends(get_db_dependency),
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     payload = verify_access_token(token)
     if not payload:
@@ -103,9 +111,11 @@ def refresh_token(credentials: HTTPAuthorizationCredentials = Security(security)
 @router.post("/password-reset")
 def reset_password(
     payload: PasswordReset,
-    credentials: HTTPAuthorizationCredentials = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     db: Session = Depends(get_db_dependency)
 ):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     token_payload = verify_access_token(token)
     if not token_payload:

@@ -298,5 +298,31 @@ def test_api_endpoints_pytest():
     assert test_new_endpoints()
 
 
+@pytest.mark.unit
+def test_missing_credentials_returns_401_not_403(client):
+    """A protected endpoint with no Authorization header must reject with 401
+    ("session problem"), never 403 ("authorization answer"). NEH-167."""
+    resp = client.get("/users/me")
+    assert resp.status_code == 401
+
+
+@pytest.mark.unit
+def test_refresh_missing_credentials_returns_401(client):
+    """/auth/refresh with no Authorization header must return 401, like every
+    other protected endpoint. NEH-167."""
+    resp = client.post("/auth/refresh")
+    assert resp.status_code == 401
+
+
+@pytest.mark.unit
+def test_password_reset_missing_credentials_returns_401(client):
+    """/auth/password-reset with no Authorization header must return 401. NEH-167."""
+    resp = client.post(
+        "/auth/password-reset",
+        json={"old_password": "x", "new_password": "y"},
+    )
+    assert resp.status_code == 401
+
+
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
