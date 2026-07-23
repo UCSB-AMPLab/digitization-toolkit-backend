@@ -20,9 +20,10 @@ if sys.platform == "linux":
     try:
         from picamera2 import Picamera2
         _PICAMERA2_AVAILABLE = True
-    except (ImportError, ValueError) as _picamera2_err:
-        Picamera2 = None
-        _PICAMERA2_AVAILABLE = False
+    except (ImportError, ValueError):
+        # Single-name import: on failure the None/False defaults above still hold
+        # (unlike picamera2_backend.py, which imports two names and must reset).
+        pass
 
 from .utils import atomic_write
 

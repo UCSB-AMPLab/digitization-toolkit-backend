@@ -22,5 +22,5 @@ def test_calibrate_focus_raises_when_picamera2_unavailable(monkeypatch):
     monkeypatch.setattr(calibration, "_PICAMERA2_AVAILABLE", False)
 
     cal = calibration.CameraCalibration(camera_index=0)
-    with pytest.raises(RuntimeError):
+    with pytest.raises(RuntimeError, match="picamera2 is not available"):
         cal.calibrate_focus()
