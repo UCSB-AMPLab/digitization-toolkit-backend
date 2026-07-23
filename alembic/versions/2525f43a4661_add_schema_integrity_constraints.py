@@ -34,8 +34,8 @@ depends_on: Union[str, Sequence[str], None] = None
 
 def upgrade() -> None:
     # 1. Missing indexes
-    op.create_index('ix_records_project_id', 'records', ['project_id'])
-    op.create_index('ix_records_collection_id', 'records', ['collection_id'])
+    op.create_index(op.f('ix_records_project_id'), 'records', ['project_id'], unique=False)
+    op.create_index(op.f('ix_records_collection_id'), 'records', ['collection_id'], unique=False)
 
     # 2. exif_data <-> record_images is documented as one-to-one; enforce it.
     # No dedupe logic - if duplicates exist the migration fails loudly by design.
@@ -78,5 +78,5 @@ def downgrade() -> None:
     op.drop_constraint('exif_data_record_image_id_key', 'exif_data', type_='unique')
 
     # 1. Drop the indexes.
-    op.drop_index('ix_records_collection_id', table_name='records')
-    op.drop_index('ix_records_project_id', table_name='records')
+    op.drop_index(op.f('ix_records_collection_id'), table_name='records')
+    op.drop_index(op.f('ix_records_project_id'), table_name='records')
