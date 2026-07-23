@@ -109,7 +109,7 @@ def validate_models():
         # Verify models can be instantiated
         proj = Project(name="test", description="test")
         doc = DocumentImage(filename="test.jpg", file_path="/test", format="jpg")
-        cs = CameraSettings(document_image_id=1, white_balance="auto")
+        cs = CameraSettings(record_image_id=1, white_balance="auto")
         
         print("[OK]")
         return True
