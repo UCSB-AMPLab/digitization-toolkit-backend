@@ -5,11 +5,25 @@ This module provides calibration functions to determine optimal camera settings
 for specific setups. Calibration profiles can be saved and loaded for reuse.
 """
 import json
+import sys
 import time
 from pathlib import Path
 from datetime import datetime, timezone
 from typing import Optional, Dict, Any
-from picamera2 import Picamera2
+
+# Only import picamera2 on Linux (inside Docker/Raspberry Pi).
+# Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
+# at import time on some Pi OS + pixi env combinations.
+_PICAMERA2_AVAILABLE = False
+Picamera2 = None
+if sys.platform == "linux":
+    try:
+        from picamera2 import Picamera2
+        _PICAMERA2_AVAILABLE = True
+    except (ImportError, ValueError):
+        # Single-name import: on failure the None/False defaults above still hold
+        # (unlike picamera2_backend.py, which imports two names and must reset).
+        pass
 
 from .utils import atomic_write
 
@@ -59,13 +73,16 @@ class CameraCalibration:
                 "success": bool  # Whether AF succeeded
             }
         """
+        if not _PICAMERA2_AVAILABLE:
+            raise RuntimeError("picamera2 is not available on this system")
+
         if verbose:
             print(f"\n{'='*70}")
             print(f"FOCUS CALIBRATION - Camera {self.camera_index}")
             print(f"{'='*70}")
             print("[WARNING] Ensure object is at normal working distance!")
             print(f"Resolution: {img_size[0]}x{img_size[1]}")
-        
+
         picam2 = Picamera2(self.camera_index)
         config = picam2.create_still_configuration(main={"size": img_size})
         picam2.configure(config)
@@ -150,6 +167,9 @@ class CameraCalibration:
                 "frames_for_convergence": int
             }
         """
+        if not _PICAMERA2_AVAILABLE:
+            raise RuntimeError("picamera2 is not available on this system")
+
         if verbose:
             print(f"\n{'='*70}")
             print(f"WHITE BALANCE CALIBRATION - Camera {self.camera_index}")
