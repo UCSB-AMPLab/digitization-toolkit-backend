@@ -112,7 +112,19 @@ def list_records(
 	# Deterministic order: without an ORDER BY, Postgres returns heap order,
 	# which shifts when rows are updated (NEH-159). Also required for stable
 	# skip/limit pagination.
-	recs = query.order_by(Record.id).offset(skip).limit(limit).all()
+	#
+	# Within a collection, listing order must match export order (see
+	# export_collection_bagit in collections.py, which orders by
+	# sequence.nulls_last(), id) and must reflect operator reordering, which
+	# writes `sequence`. The id tiebreaker keeps the order total and
+	# pagination stable (still NEH-159-safe). Project-wide listings (no
+	# collection_id filter) keep pure id order, since per-collection
+	# sequences would interleave meaninglessly across collections.
+	if collection_id is not None:
+		query = query.order_by(Record.sequence.nulls_last(), Record.id)
+	else:
+		query = query.order_by(Record.id)
+	recs = query.offset(skip).limit(limit).all()
 	return [RecordRead.model_validate(r) for r in recs]
 
 
