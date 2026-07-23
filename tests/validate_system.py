@@ -92,8 +92,10 @@ def validate_api():
             "/records/",
         ]
         
+        # Exact membership: substring matching would let "/projects/" pass
+        # via "/projects/{project_id}" even if the list route disappeared.
         for route in required:
-            if not any(route in r for r in routes):
+            if route not in routes:
                 raise ValueError(f"Route '{route}' not found")
         
         print(f"[OK] ({len(routes)} endpoints)")
