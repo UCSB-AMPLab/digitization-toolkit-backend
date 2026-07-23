@@ -154,9 +154,13 @@ def test_routes():
     print("\nTesting route registration...")
     try:
         from app.main import app
-        
-        routes = {route.path: route.methods for route in app.routes}
-        
+
+        # Read paths from the OpenAPI schema rather than iterating app.routes:
+        # the entry types in app.routes are starlette internals that changed
+        # across versions (in starlette 1.x, included routers appear as
+        # _IncludedRouter objects with no .path attribute).
+        routes = set(app.openapi()["paths"].keys())
+
         # Check auth routes
         assert "/auth/register" in routes, "Auth register route missing"
         assert "/auth/login" in routes, "Auth login route missing"
@@ -165,9 +169,9 @@ def test_routes():
         
         # Check records routes
         assert "/records/" in routes, "Records list route missing"
-        assert "/records/{record_id}" in routes, "Records get route missing"
-        assert "/records/upload" in routes, "Records upload route missing"
-        assert "/records/{record_id}/file" in routes, "Records file download route missing"
+        assert "/records/{rec_id}" in routes, "Records get route missing"
+        assert "/records/{rec_id}/images" in routes, "Record images route missing"
+        assert "/records/images/{img_id}/file" in routes, "Record image file download route missing"
         
         # Check projects routes
         assert "/projects/" in routes, "Projects list route missing"
@@ -215,7 +219,7 @@ def test_models():
         
         assert "users" in table_names, "Users table not registered"
         assert "projects" in table_names, "Projects table not registered"
-        assert "document_images" in table_names, "Document images table not registered"
+        assert "record_images" in table_names, "Record images table not registered"
         
         print(" [OK] All models are properly registered")
         return True
