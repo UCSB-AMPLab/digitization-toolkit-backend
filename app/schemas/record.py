@@ -127,7 +127,7 @@ class RecordBase(BaseModel):
 	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
-	status: str = "captured"
+	status: RecordStatus = "captured"
 	sequence: Optional[int] = None
 	rejection_note: Optional[str] = None
 

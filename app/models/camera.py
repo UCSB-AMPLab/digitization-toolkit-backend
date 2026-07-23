@@ -10,7 +10,7 @@ class CameraSettings(Base):
     __tablename__ = "camera_settings"
 
     id = Column(Integer, primary_key=True, index=True)
-    record_image_id = Column(Integer, ForeignKey("record_images.id"), unique=True, nullable=False)
+    record_image_id = Column(Integer, ForeignKey("record_images.id", ondelete="CASCADE"), unique=True, nullable=False)
 
     camera_model = Column(String(255), nullable=True)
     camera_manufacturer = Column(String(255), nullable=True)
