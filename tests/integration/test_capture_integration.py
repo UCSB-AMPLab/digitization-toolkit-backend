@@ -60,7 +60,7 @@ def test_single_capture_creates_database_record(client, db_session, test_project
     
     # Verify camera settings were saved
     cs = db_session.query(CameraSettings).filter(
-        CameraSettings.document_image_id == doc.id
+        CameraSettings.record_image_id == doc.id
     ).first()
     assert cs is not None
     assert cs.white_balance == "indoor"
@@ -69,7 +69,7 @@ def test_single_capture_creates_database_record(client, db_session, test_project
 @pytest.mark.integration
 def test_dual_capture_creates_two_database_records(client, db_session, test_project):
     """
-    Test that /cameras/capture/dual creates two DocumentImage records.
+    Test that /cameras/capture/dual creates two RecordImage records.
     """
     project_name = test_project.name
     
@@ -92,8 +92,10 @@ def test_dual_capture_creates_two_database_records(client, db_session, test_proj
     assert len(data["file_paths"]) == 2
     
     # Verify both database records were created
-    docs = db_session.query(DocumentImage).filter(
-        DocumentImage.project_id == test_project.id
+    # RecordImage has no project_id — images belong to a Record, which
+    # belongs to the project.
+    docs = db_session.query(RecordImage).join(Record).filter(
+        Record.project_id == test_project.id
     ).all()
     
     assert len(docs) >= 2
@@ -101,7 +103,7 @@ def test_dual_capture_creates_two_database_records(client, db_session, test_proj
     # Check both have camera settings
     for doc in docs[-2:]:
         cs = db_session.query(CameraSettings).filter(
-            CameraSettings.document_image_id == doc.id
+            CameraSettings.record_image_id == doc.id
         ).first()
         assert cs is not None
 
@@ -154,15 +156,15 @@ def test_exif_data_extracted_and_saved(client, db_session, test_project):
     data = response.json()
     
     # Get database record
-    doc = db_session.query(DocumentImage).filter(
-        DocumentImage.file_path == data["file_path"]
+    doc = db_session.query(RecordImage).filter(
+        RecordImage.file_path == data["file_path"]
     ).first()
     
     assert doc is not None
     
     # Check if EXIF data was created
     exif = db_session.query(ExifData).filter(
-        ExifData.document_image_id == doc.id
+        ExifData.record_image_id == doc.id
     ).first()
     
     # EXIF might not be present if PIL can't read it, but raw_exif should have data
