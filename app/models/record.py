@@ -24,8 +24,8 @@ class Record(Base):
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
 	
 	# Organizational hierarchy
-	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
-	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True)
+	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
+	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
 	
 	# QA workflow
 	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
@@ -48,6 +48,10 @@ class Record(Base):
 		CheckConstraint(
 			'NOT (project_id IS NOT NULL AND collection_id IS NOT NULL)',
 			name='check_record_single_parent'
+		),
+		CheckConstraint(
+			"status IN ('captured','in_review','rejected','approved')",
+			name='check_record_status'
 		),
 	)
 
@@ -116,7 +120,7 @@ class ExifData(Base):
 	__tablename__ = "exif_data"
 
 	id = Column(Integer, primary_key=True, index=True)
-	record_image_id = Column(Integer, ForeignKey("record_images.id"), nullable=False)
+	record_image_id = Column(Integer, ForeignKey("record_images.id", ondelete="CASCADE"), unique=True, nullable=False)
 
 	make = Column(String(255), nullable=True)
 	model = Column(String(255), nullable=True)
