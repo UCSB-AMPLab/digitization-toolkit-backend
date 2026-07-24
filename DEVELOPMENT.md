@@ -42,7 +42,7 @@ def init_db() -> None:
 
 - The Docker image installs from `requirements.txt`; the Pi runs the backend natively through pixi
 - Any dependency change updates **both** files in the same PR, then regenerates the lockfile: `pixi lock` (the committed `pixi.lock` only guarantees reproducible Pi installs when the updater runs `pixi install --locked`)
-- The committed lockfile uses lock-file format v6; the unit's installed pixi must be recent enough to read the committed format — check `pixi --version` on target hardware before shipping a regenerated lock
+- The committed lockfile uses lock-file format v7 (since the 2026-07-24 re-lock with pixi 0.73); the unit's installed pixi must be recent enough to read the committed format — check `pixi --version` on target hardware before shipping a regenerated lock (NEH-170)
 - Version-equal is not behaviour-equal: conda-forge's `uvicorn` includes the `standard` extras, so the Pi runs **uvloop** while Docker runs plain asyncio, and `websockets` resolves to a different major on the Pi. Nothing in the app currently depends on either difference, but test on-device accordingly
 - `CORSMiddleware(allow_private_network=...)` is currently commented out in `app/main.py`; it requires starlette ≥0.51.0, which the pinned 1.3.1 satisfies if it is ever re-enabled (see NEH-161)
 

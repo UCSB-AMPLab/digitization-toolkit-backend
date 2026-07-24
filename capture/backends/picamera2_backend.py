@@ -26,7 +26,8 @@ if sys.platform == "linux":
     except (ImportError, ValueError) as _picamera2_err:
         # The except-as name is unbound once this block exits, so persist the
         # message for the error raised when the backend is actually used.
-        _PICAMERA2_IMPORT_ERROR = str(_picamera2_err)
+        # repr keeps the exception type visible even with an empty message.
+        _PICAMERA2_IMPORT_ERROR = repr(_picamera2_err)
         Picamera2 = None
         Transform = None
         _PICAMERA2_AVAILABLE = False
