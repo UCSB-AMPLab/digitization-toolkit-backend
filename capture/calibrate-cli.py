@@ -70,6 +70,6 @@ if __name__ == "__main__":
             save_path = sys.argv[2] if len(sys.argv) > 2 else None
             calibrate_camera_interactive(camera_index, save_path)
         except ValueError:
-            print(f"❌ Error: Invalid camera index '{sys.argv[1]}'")
+            print(f"[ERROR] Invalid camera index '{sys.argv[1]}'")
             print("\nUsage: python calibrate.py [camera_index|dual] [save_path]")
             sys.exit(1)

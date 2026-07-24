@@ -1,6 +1,5 @@
 .venv
 .pixi
-pixi.lock
 __pycache__
 *.db
 data

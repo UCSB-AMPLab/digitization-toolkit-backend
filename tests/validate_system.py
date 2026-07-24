@@ -23,11 +23,11 @@ def validate_imports():
         from app.core.config import settings
         from app.core.db import engine, Base, SessionLocal
         from app.models.project import Project
-        from app.models.document import DocumentImage, ExifData
+        from app.models.record import RecordImage, ExifData
         from app.models.camera import CameraSettings
         from app.models.user import User
         from app.api.cameras import CaptureRequest, CaptureResponse, DualCaptureRequest
-        from app.schemas.document import DocumentRead
+        from app.schemas.record import RecordRead
         from app.schemas.camera import CameraSettingsRead
         from capture.service import single_capture_image, dual_capture_image, is_camera_connected
         from capture.camera import CameraConfig, IMG_SIZES
@@ -44,7 +44,9 @@ def validate_config():
     print("[2/6] Validating configuration...", end=" ")
     try:
         from app.core.config import settings
-        assert settings.DATABASE_URL, "DATABASE_URL not set"
+        # Settings has discrete DATABASE_* fields, not a single DATABASE_URL
+        assert settings.DATABASE_HOST, "DATABASE_HOST not set"
+        assert settings.DATABASE_NAME, "DATABASE_NAME not set"
         assert settings.projects_dir, "projects_dir not set"
         assert settings.data_dir, "data_dir not set"
         print("[OK]")
@@ -62,7 +64,7 @@ def validate_database():
         inspector = inspect(engine)
         tables = inspector.get_table_names()
         
-        required = ["projects", "document_images", "camera_settings", "exif_data"]
+        required = ["projects", "record_images", "camera_settings", "exif_data"]
         for table in required:
             if table not in tables:
                 raise ValueError(f"Table '{table}' not found")
@@ -79,17 +81,21 @@ def validate_api():
     try:
         from app.main import app
         
-        routes = {r.path for r in app.routes if hasattr(r, 'path')}
+        # Paths via the OpenAPI schema: app.routes entries are starlette
+        # internals whose types changed across versions (see test_api.py).
+        routes = set(app.openapi()["paths"].keys())
         required = [
             "/cameras/capture",
             "/cameras/capture/dual",
             "/cameras/devices",
             "/projects/",
-            "/documents/",
+            "/records/",
         ]
         
+        # Exact membership: substring matching would let "/projects/" pass
+        # via "/projects/{project_id}" even if the list route disappeared.
         for route in required:
-            if not any(route in r for r in routes):
+            if route not in routes:
                 raise ValueError(f"Route '{route}' not found")
         
         print(f"[OK] ({len(routes)} endpoints)")
@@ -102,14 +108,14 @@ def validate_models():
     """Validate model definitions."""
     print("[5/6] Validating models...", end=" ")
     try:
-        from app.models.document import DocumentImage
+        from app.models.record import RecordImage
         from app.models.camera import CameraSettings
         from app.models.project import Project
-        
+
         # Verify models can be instantiated
         proj = Project(name="test", description="test")
-        doc = DocumentImage(filename="test.jpg", file_path="/test", format="jpg")
-        cs = CameraSettings(document_image_id=1, white_balance="auto")
+        doc = RecordImage(record_id=1, filename="test.jpg", file_path="/test", format="jpg")
+        cs = CameraSettings(record_image_id=1, white_balance="auto")
         
         print("[OK]")
         return True

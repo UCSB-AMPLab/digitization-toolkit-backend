@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Boolean, DateTime
+from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint
 
 from app.core.db import Base
 
@@ -14,3 +14,7 @@ class User(Base):
     role = Column(String(50), default="reviewer", nullable=False)  # admin, operator, reviewer
     is_active = Column(Boolean, default=True, nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+    __table_args__ = (
+        CheckConstraint("role IN ('admin','operator','reviewer')", name='check_user_role'),
+    )

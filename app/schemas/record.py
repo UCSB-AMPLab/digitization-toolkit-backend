@@ -1,6 +1,6 @@
 from __future__ import annotations
 from typing import Optional, List, Literal
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, field_validator, model_validator
 from datetime import datetime
 
 # Valid status values
@@ -99,9 +99,9 @@ class RecordImageCreate(RecordImageBase):
 
 
 class RecordImageUpdate(BaseModel):
+	# File paths are managed server-side and must never be client-settable
 	sequence: Optional[int] = None
 	role: Optional[str] = None
-	thumbnail_path: Optional[str] = None
 
 
 class RecordImageRead(RecordImageBase):
@@ -127,7 +127,7 @@ class RecordBase(BaseModel):
 	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
-	status: str = "captured"
+	status: RecordStatus = "captured"
 	sequence: Optional[int] = None
 	rejection_note: Optional[str] = None
 
@@ -198,6 +198,40 @@ class ReorderRecords(BaseModel):
 		if not v:
 			raise ValueError("ordered_ids must not be empty")
 		return v
+
+
+# ==============================================================================
+# RecordAnnotation Schemas (QA "Anotaciones" tab: flagged errors + notes)
+# ==============================================================================
+
+class RecordAnnotationCreate(BaseModel):
+	error_types: List[str] = []
+	note: Optional[str] = None
+
+	@field_validator("note")
+	@classmethod
+	def blank_note_is_none(cls, v: Optional[str]) -> Optional[str]:
+		if v is not None and not v.strip():
+			return None
+		return v
+
+	@model_validator(mode="after")
+	def at_least_one_field(self) -> "RecordAnnotationCreate":
+		if not self.error_types and not self.note:
+			raise ValueError("An annotation needs at least one error type or a note")
+		return self
+
+
+class RecordAnnotationRead(BaseModel):
+	id: int
+	record_id: int
+	error_types: List[str] = []
+	note: Optional[str] = None
+	created_at: Optional[datetime]
+	created_by: Optional[str] = None
+
+	class Config:
+		from_attributes = True
 
 
 # ==============================================================================

@@ -4,7 +4,7 @@
 
 When using AI assistants (GitHub Copilot, ChatGPT, etc.) to work on this codebase, **always** provide these instructions:
 
-### ⚠️ Database Migrations
+### [WARNING] Database Migrations
 
 **NEVER add `Base.metadata.create_all()` to `app/core/db.py`**
 
@@ -29,20 +29,30 @@ def init_db() -> None:
 3. Review the generated migration file
 4. Apply: `docker compose exec backend alembic upgrade head`
 
-### 🔐 Authentication & Security
+### [INFO] Authentication & Security
 
 - **Custom token system is intentional** - This is a standalone/offline Raspberry Pi application
 - Do NOT suggest replacing with JWT libraries (python-jose, PyJWT) or OAuth2
 - Do NOT add `pydantic[email]` dependency - uses simple regex validation for offline compatibility
 - Secret keys must come from environment variables, never hardcoded
 
-### 🐘 PostgreSQL Configuration
+### [WARNING] Dependency Manifests
+
+**Two manifests must stay in lockstep: `requirements.txt` (Docker) and `pixi.toml` (native Pi)**
+
+- The Docker image installs from `requirements.txt`; the Pi runs the backend natively through pixi
+- Any dependency change updates **both** files in the same PR, then regenerates the lockfile: `pixi lock` (the committed `pixi.lock` only guarantees reproducible Pi installs when the updater runs `pixi install --locked`)
+- The committed lockfile uses lock-file format v7 (since the 2026-07-24 re-lock with pixi 0.73); the unit's installed pixi must be recent enough to read the committed format — check `pixi --version` on target hardware before shipping a regenerated lock (NEH-170)
+- Version-equal is not behaviour-equal: conda-forge's `uvicorn` includes the `standard` extras, so the Pi runs **uvloop** while Docker runs plain asyncio, and `websockets` resolves to a different major on the Pi. Nothing in the app currently depends on either difference, but test on-device accordingly
+- `CORSMiddleware(allow_private_network=...)` is currently commented out in `app/main.py`; it requires starlette ≥0.51.0, which the pinned 1.3.1 satisfies if it is ever re-enabled (see NEH-161)
+
+### [INFO] PostgreSQL Configuration
 
 - Use `postgresql+psycopg://` for psycopg3 (NOT `postgresql://`)
 - Always test with PostgreSQL in development (matching production)
 - Database URL format: `postgresql+psycopg://user:password@host:port/database`
 
-### 📦 Configuration Management
+### [INFO] Configuration Management
 
 **Only add settings that are used by application code**
 
@@ -50,18 +60,19 @@ def init_db() -> None:
 - Infrastructure settings (uvicorn host/port) belong in `docker-compose.yml`, not Settings
 - If you're adding a field to Settings, ensure it's actually used in the code
 
-### 🔧 Docker Commands
+### [INFO] Docker Commands
 
 - Use `docker compose` (not `docker-compose`) on Raspberry Pi
 - Always exec into container for Alembic: `docker compose exec backend alembic ...`
 
 ## Common AI Mistakes to Avoid
 
-1. ✗ Re-adding `create_all()` after it was intentionally removed
-2. ✗ Suggesting JWT/OAuth2 for a standalone offline application  
-3. ✗ Adding unused configuration fields "just in case"
-4. ✗ Using `postgresql://` instead of `postgresql+psycopg://`
-5. ✗ Creating migrations outside Docker (wrong database host)
+1. [ERROR] Re-adding `create_all()` after it was intentionally removed
+2. [ERROR] Suggesting JWT/OAuth2 for a standalone offline application  
+3. [ERROR] Adding unused configuration fields "just in case"
+4. [ERROR] Using `postgresql://` instead of `postgresql+psycopg://`
+5. [ERROR] Creating migrations outside Docker (wrong database host)
+6. [ERROR] Changing a dependency in `requirements.txt` but not `pixi.toml` (or vice versa) — they must move together, with `pixi lock` re-run
 
 ## Quick Reference
 

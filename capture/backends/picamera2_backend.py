@@ -15,6 +15,7 @@ from pathlib import Path
 # Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
 # at import time on some Pi OS + pixi env combinations.
 _PICAMERA2_AVAILABLE = False
+_PICAMERA2_IMPORT_ERROR = None
 Picamera2 = None
 Transform = None
 if sys.platform == "linux":
@@ -23,6 +24,10 @@ if sys.platform == "linux":
         from libcamera import Transform
         _PICAMERA2_AVAILABLE = True
     except (ImportError, ValueError) as _picamera2_err:
+        # The except-as name is unbound once this block exits, so persist the
+        # message for the error raised when the backend is actually used.
+        # repr keeps the exception type visible even with an empty message.
+        _PICAMERA2_IMPORT_ERROR = repr(_picamera2_err)
         Picamera2 = None
         Transform = None
         _PICAMERA2_AVAILABLE = False
@@ -30,6 +35,7 @@ if sys.platform == "linux":
 
 
 from .base import CameraBackend
+from ..utils import atomic_write
 
 
 class Picamera2Backend(CameraBackend):
@@ -56,7 +62,12 @@ class Picamera2Backend(CameraBackend):
             logger: Logger instance for logging operations.
         """
         if Picamera2 is None:
-            raise RuntimeError("Picamera2Backend requires Linux (Raspberry Pi OS)")
+            if sys.platform != "linux":
+                raise RuntimeError("Picamera2Backend requires Linux (Raspberry Pi OS)")
+            # On a real Pi the import failed for a concrete reason (missing
+            # system package, numpy ABI mismatch, ...) — report that, not a
+            # misleading claim about the OS.
+            raise RuntimeError(f"picamera2 failed to import: {_PICAMERA2_IMPORT_ERROR}")
         
         super().__init__(logger)
         self._cameras = {}  # Cache of initialized Picamera2 instances
@@ -143,7 +154,7 @@ class Picamera2Backend(CameraBackend):
             camera_id = info.get("Id", "")
             location = info.get("Location", "")
 
-            # Build stable hardware ID — same logic as CameraRegistry (picamera2 path)
+            # Build stable hardware ID - same logic as CameraRegistry (picamera2 path)
             if camera_id:
                 id_parts = camera_id.split("/")
                 i2c_part = [p for p in id_parts if p.startswith("i2c@")]
@@ -292,7 +303,7 @@ class Picamera2Backend(CameraBackend):
         camera_config,
         capture_output: bool = False
     ) -> str:
-        """Internal capture implementation — must be called with the camera lock held."""
+        """Internal capture implementation - must be called with the camera lock held."""
         try:
             picam2 = self._get_camera(camera_config.camera_index)
             
@@ -399,11 +410,11 @@ class Picamera2Backend(CameraBackend):
                 time.sleep(camera_config.timeout / 1000.0)
             
             # Capture image directly to file with metadata
-            # YUV420→JPEG is done efficiently by libcamera/picamera2
+            # YUV420->JPEG is done efficiently by libcamera/picamera2
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
 
-            # Reset ScalerCrop to full sensor — zoom is preview-only.
+            # Reset ScalerCrop to full sensor - zoom is preview-only.
             # Ensures captures always use the full pixel array regardless of
             # whatever zoom the user had applied to the live preview.
             _pixel_array_size = picam2.camera_properties.get('PixelArraySize')
@@ -426,25 +437,24 @@ class Picamera2Backend(CameraBackend):
                     # Generate raw filename (.raw extension for now due to picamera2 DNG bug)
                     raw_path = Path(str(output_path).rsplit('.', 1)[0] + '.raw')
                     
-                    # Save JPEG first
-                    request.save("main", str(output_path))
+                    # Save JPEG first (durable: temp + fsync + atomic replace)
+                    atomic_write(output_path, lambda tmp: request.save("main", tmp))
                     self.logger.debug(f"Saved JPEG: {Path(output_path).name}")
-                    
+
                     # Save raw buffer directly (workaround for picamera2 save_dng bug)
                     # picamera2 0.3.33 has a bug: Picamera2Camera.__init__() signature mismatch
                     # Saving raw sensor data as binary until library is fixed
                     try:
                         raw_buffer = request.make_buffer("raw")
-                        with open(raw_path, 'wb') as f:
-                            f.write(raw_buffer)
+                        atomic_write(raw_path, lambda tmp: Path(tmp).write_bytes(raw_buffer))
                         self.logger.debug(f"Saved raw buffer: {raw_path.name}")
                         output_path = (str(output_path), str(raw_path))
                     except Exception as e:
                         self.logger.warning(f"Failed to save raw buffer: {e}, continuing with JPEG only")
                         output_path = str(output_path)
                 else:
-                    # Standard JPEG/PNG capture only
-                    request.save("main", str(output_path))
+                    # Standard JPEG/PNG capture only (durable: temp + fsync + atomic replace)
+                    atomic_write(output_path, lambda tmp: request.save("main", tmp))
                     self.logger.debug(f"Saved {'JPEG' if use_yuv else 'PNG'} with quality={camera_config.quality}")
                     
             finally:
@@ -530,7 +540,7 @@ class Picamera2Backend(CameraBackend):
         Run an autofocus calibration cycle using the cached Picamera2 instance.
 
         Acquires the per-camera lock so this is safe to call while preview
-        polling is active — it blocks until any in-flight preview completes,
+        polling is active - it blocks until any in-flight preview completes,
         then holds the lock for the duration of the AF cycle.
 
         Unlike the legacy ``CameraCalibration`` class, this method does NOT
@@ -613,7 +623,7 @@ class Picamera2Backend(CameraBackend):
         converged ColourGains.
 
         Like ``run_autofocus_calibration``, this method does NOT open a second
-        Picamera2 instance — doing so would corrupt the service's cached handle.
+        Picamera2 instance - doing so would corrupt the service's cached handle.
 
         After the cycle the camera is left stopped; ``_last_configs`` and
         ``_format_mode`` are cleared so the next request reconfigures cleanly.
@@ -632,7 +642,7 @@ class Picamera2Backend(CameraBackend):
             if picam2.started:
                 picam2.stop()
 
-            # Preview config is sufficient for metadata reads — much faster than still
+            # Preview config is sufficient for metadata reads - much faster than still
             preview_config = picam2.create_preview_configuration(
                 main={"size": (1920, 1080)}
             )
@@ -754,7 +764,7 @@ class Picamera2Backend(CameraBackend):
 
         Args:
             camera_index: The camera index.
-            controls: Dict of picamera2 control names → values.
+            controls: Dict of picamera2 control names -> values.
         """
         picam2 = self._cameras.get(camera_index)
         if picam2 is None:

@@ -16,7 +16,6 @@ from .camera_registry import CameraRegistry
 
 from app.core.config import settings
 
-PROJECTS_ROOT = settings.projects_dir
 LOG_FILE = settings.log_dir / "project_manager.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -29,6 +28,39 @@ def secure_project_filename(project_name):
     project_name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
     project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
     return project_name.lstrip('.').lower()
+
+
+def _projects_root() -> Path:
+    """Resolve the active projects root at call time.
+
+    Read from settings on every call (rather than a module-level constant
+    captured at import) so a runtime storage-drive switch - POST
+    /system/storage/activate flips the storage override in
+    app.core.config.Settings.projects_dir - takes effect immediately for new
+    captures, keeping writes and reads on the same disk.
+    """
+    return settings.projects_dir
+
+
+def project_capture_root(project_name: str) -> Path:
+    """Project-level directory holding the manifest and all image subdirs.
+    Args:
+        project_name: Name of the project"""
+    return Path(_projects_root(), secure_project_filename(project_name))
+
+
+def collection_capture_root(project_name: str, collection_name: str) -> Path:
+    """On-disk root of a collection (sibling directory under the project root)."""
+    return project_capture_root(project_name) / secure_project_filename(collection_name)
+
+
+def image_output_dir(project_name: str, collection_name: Optional[str] = None) -> Path:
+    """Directory where captured images are written for a project/collection."""
+    if collection_name:
+        root = collection_capture_root(project_name, collection_name)
+    else:
+        root = project_capture_root(project_name)
+    return root / "images" / "main"
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """
@@ -133,7 +165,7 @@ def project_init(
         Path to the created project directory
     """
         
-    project_path = Path(PROJECTS_ROOT, secure_project_filename(project_name))
+    project_path = project_capture_root(project_name)
     packages_dir = Path(project_path, "packages")
     
     for path in [packages_dir]:

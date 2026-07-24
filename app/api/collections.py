@@ -14,6 +14,14 @@ from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 from app.schemas.record import ReorderRecords
 from app.core.audit import log_event
+from app.core.storage_ops import (
+    collection_and_descendants,
+    relocate_image,
+    remove_tree,
+    renumber_collection_images,
+    resolve_project_name,
+    surviving_images_under,
+)
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -93,8 +101,27 @@ def list_collections(
     if parent_collection_id is not None:
         query = query.filter(Collection.parent_collection_id == parent_collection_id)
     
-    items = query.offset(skip).limit(limit).all()
+    # Deterministic order: without an ORDER BY, Postgres returns heap order,
+    # which shifts when rows are updated. Also required for stable
+    # skip/limit pagination.
+    items = query.order_by(Collection.id).offset(skip).limit(limit).all()
     return [CollectionRead.model_validate(i) for i in items]
+
+
+@router.get("/count")
+def count_collections(
+    project_id: Optional[int] = Query(None, description="Filter by project"),
+    parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection id"),
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """Return the total number of collections matching the given filters."""
+    query = db.query(Collection)
+    if project_id is not None:
+        query = query.filter(Collection.project_id == project_id)
+    if parent_collection_id is not None:
+        query = query.filter(Collection.parent_collection_id == parent_collection_id)
+    return {"count": query.count()}
 
 
 @router.get("/{collection_id}", response_model=CollectionRead)
@@ -127,9 +154,9 @@ def get_collection_hierarchy(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     
-    # Count records in this collection
-    record_count = db.query(func.count(RecordImage.id)).filter(
-        RecordImage.collection_id == collection_id
+    # Count records in this collection (collection_id lives on Record)
+    record_count = db.query(func.count(Record.id)).filter(
+        Record.collection_id == collection_id
     ).scalar()
     
     result = CollectionWithChildren.model_validate(collection)
@@ -173,10 +200,37 @@ def update_collection(
                 break
     
     # Update fields
+    old_name = collection.name
+    old_parent = collection.parent_collection_id
     update_data = payload.model_dump(exclude_unset=True)
     for field, value in update_data.items():
         setattr(collection, field, value)
-    
+
+    # A collection has exactly one parent: nesting it clears its direct project link
+    if collection.parent_collection_id is not None:
+        collection.project_id = None
+
+    # A rename or cross-project re-parent changes the on-disk dir; relocate files
+    layout_changed = (
+        ("name" in update_data and update_data["name"] != old_name)
+        or ("parent_collection_id" in update_data and update_data["parent_collection_id"] != old_parent)
+    )
+    if layout_changed:
+        from capture.project_manager import image_output_dir
+
+        project_name = resolve_project_name(db, collection)
+        if project_name:
+            subtree_ids = collection_and_descendants(db, collection.id)
+            names = {
+                c.id: c.name
+                for c in db.query(Collection).filter(Collection.id.in_(subtree_ids)).all()
+            }
+            records = db.query(Record).filter(Record.collection_id.in_(subtree_ids)).all()
+            for r in records:
+                target_dir = image_output_dir(project_name, names.get(r.collection_id))
+                for img in r.images:
+                    relocate_image(img, target_dir)
+
     db.commit()
     db.refresh(collection)
     return CollectionRead.model_validate(collection)
@@ -190,9 +244,11 @@ def move_collection_records(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Move all records from one collection to another.
-    Used before deleting a collection to preserve its contents.
+    Move all records from one collection to another, relocating their image
+    files on disk so the moved records keep pointing at existing files.
     """
+    from capture.project_manager import image_output_dir
+
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
@@ -201,14 +257,20 @@ def move_collection_records(
     if not target:
         raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
 
-    moved = db.query(Record).filter(Record.collection_id == collection_id).update(
-        {"collection_id": target_collection_id},
-        synchronize_session=False
-    )
+    target_project_name = resolve_project_name(db, target)
+    if not target_project_name:
+        raise HTTPException(status_code=422, detail="Target collection is not attached to a project")
+    target_dir = image_output_dir(target_project_name, target.name)
+
+    records = db.query(Record).filter(Record.collection_id == collection_id).all()
+    for r in records:
+        r.collection_id = target_collection_id
+        for img in r.images:
+            relocate_image(img, target_dir)
     db.commit()
 
-    logger.info(f"Moved {moved} records from collection {collection_id} to {target_collection_id}")
-    return {"moved": moved, "target_collection_id": target_collection_id}
+    logger.info(f"Moved {len(records)} records from collection {collection_id} to {target_collection_id}")
+    return {"moved": len(records), "target_collection_id": target_collection_id}
 
 
 @router.delete("/{collection_id}", status_code=204)
@@ -218,48 +280,48 @@ def delete_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete a collection and its filesystem directory.
+    Delete an empty collection and its (now unused) directory.
 
-    Warning: This will cascade delete all child collections and orphan any records in this collection.
-    Use POST /{collection_id}/move-records first if you want to preserve the records.
+    Refuses (409) if the collection still has sub-collections or records (those
+    must be moved or deleted first) or if its directory still holds files that a
+    surviving record points at.
     """
-    import shutil
-    from app.core.config import settings
-    from capture.project_manager import secure_project_filename
+    from capture.project_manager import collection_capture_root
 
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    # Check if collection has records
-    record_count = db.query(func.count(Record.id)).filter(
-        Record.collection_id == collection_id
-    ).scalar()
-
-    if record_count > 0:
-        logger.warning(f"Deleting collection {collection_id} with {record_count} records - records will be orphaned")
-
-    # Capture names before deleting from DB
     collection_name = collection.name
-    project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
-    project_name = project.name if project else None
+
+    # Refuse to delete a non-empty collection; report the blocking counts
+    child_count = db.query(func.count(Collection.id)).filter(Collection.parent_collection_id == collection_id).scalar()
+    record_count = db.query(func.count(Record.id)).filter(Record.collection_id == collection_id).scalar()
+    if child_count or record_count:
+        raise HTTPException(
+            status_code=409,
+            detail=f"Cannot delete a non-empty collection: {child_count} sub-collection(s) and {record_count} record(s) remain. Move or delete them first.",
+        )
+
+    project_name = resolve_project_name(db, collection)
+    col_dir = collection_capture_root(project_name, collection_name) if project_name else None
+
+    if col_dir is not None:
+        # Hard guard: never remove a directory that still holds a surviving record's files
+        if surviving_images_under(db, col_dir):
+            raise HTTPException(
+                status_code=409,
+                detail="Collection directory still holds files referenced by other records. Move those records first.",
+            )
+        # Remove files first so a filesystem failure aborts before touching the DB
+        try:
+            remove_tree(col_dir)
+        except OSError as e:
+            logger.error(f"Failed to remove collection directory {col_dir}: {e}")
+            raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
 
     db.delete(collection)
     db.commit()
-
-    # Remove the collection directory from disk (project/collection/images/).
-    # Try both raw and sanitized names to handle historic inconsistencies.
-    if project_name:
-        safe_col = secure_project_filename(collection_name)
-        for proj_dir in [settings.projects_dir / project_name, settings.projects_dir / secure_project_filename(project_name)]:
-            for col_dir in ([proj_dir / collection_name] + ([proj_dir / safe_col] if safe_col != collection_name else [])):
-                if col_dir.exists() and col_dir.is_dir():
-                    try:
-                        shutil.rmtree(col_dir)
-                        logger.info(f"Removed collection directory: {col_dir}")
-                    except Exception as e:
-                        logger.warning(f"Could not remove collection directory {col_dir}: {e}")
-                    break
 
     return None
 
@@ -311,6 +373,51 @@ def reorder_collection_records(
 
 
 # ==============================================================================
+# Image renumbering
+# ==============================================================================
+
+@router.post("/{collection_id}/images/renumber", status_code=200)
+def renumber_images(
+    collection_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Physically renumber every image file in a collection (documentary unit),
+    sequentially from 1, zero-padded to the total capture count. Never
+    renames anything else — only assigns fresh sequential filenames based on
+    current display order. All-or-nothing: if any file operation fails,
+    every rename already applied is rolled back and the database is left
+    untouched.
+    """
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    try:
+        result = renumber_collection_images(db, collection)
+    except ValueError as e:
+        raise HTTPException(status_code=422, detail=str(e))
+    except OSError as e:
+        raise HTTPException(status_code=500, detail=f"Failed to renumber images on disk: {e}")
+
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        logger.exception(f"Renumber DB commit failed for collection {collection_id} after files were already renamed on disk")
+        raise HTTPException(
+            status_code=500,
+            detail="Files were renumbered on disk but the database update failed; please retry"
+        )
+
+    log_event(db, level="INFO", category="activity", action="images_renumbered",
+              actor=current_user.username, subject=collection.name,
+              detail=f"Renumbered {result['renumbered']} images")
+    return result
+
+
+# ==============================================================================
 # BagIt export
 # ==============================================================================
 
@@ -341,18 +448,24 @@ def export_collection_bagit(
     records = (
         db.query(Record)
         .filter(Record.collection_id == collection_id)
-        .order_by(Record.sequence.nulls_last(), Record.created_at)
+        .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
     if not records:
-        raise HTTPException(status_code=422, detail="Collection has no records to export.")
+        raise HTTPException(
+            status_code=422,
+            detail={"message": "Collection has no records to export.", "blocking_record_ids": []}
+        )
 
     # All records must be approved
     non_approved = [r.id for r in records if r.status != "approved"]
     if non_approved:
         raise HTTPException(
             status_code=422,
-            detail=f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}"
+            detail={
+                "message": f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
+                "blocking_record_ids": non_approved,
+            }
         )
 
     # Gather project info for bag metadata
@@ -368,9 +481,9 @@ def export_collection_bagit(
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        # Copy image files into data/ organised by record sequence
+        # Copy image files into data/ numbered by their position in the ordered list
         for idx, rec in enumerate(records):
-            seq_label = f"{(rec.sequence if rec.sequence is not None else idx):04d}"
+            seq_label = f"{idx + 1:04d}"
             safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (rec.title or "record"))[:60]
             rec_dir = data_dir / f"{seq_label}_{safe_title}"
             rec_dir.mkdir(exist_ok=True)

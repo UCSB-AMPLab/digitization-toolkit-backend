@@ -43,7 +43,7 @@ source .venv/bin/activate
 uvicorn app.main:app --reload --host 0.0.0.0 --port 8000
 ```
 
-Test: Open your browser and navigate to `http://localhost:8000` to see the health check response → `{"status": "ok"}`
+Test: Open your browser and navigate to `http://localhost:8000` to see the health check response -> `{"status": "ok"}`
 
 ## Camera Backend Configuration
 
@@ -98,3 +98,12 @@ python capture/test_phase1_integration.py
 **Issue: Picamera2 backend fails**
 - Fall back to subprocess: `export CAMERA_BACKEND=subprocess`
 - Check system packages: `dpkg -l | grep libcamera`
+
+## License
+
+Copyright (c) 2025 UCSB - Archives, Memory & Preservation Lab.
+
+This program is free software: you can redistribute it and/or modify it under
+the terms of the GNU Affero General Public License as published by the Free
+Software Foundation, either version 3 of the License, or (at your option) any
+later version. See [LICENSE](LICENSE) for the full text.

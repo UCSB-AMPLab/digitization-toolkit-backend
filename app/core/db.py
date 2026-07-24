@@ -15,10 +15,18 @@ DATABASE_URL = (
 
 
 # Create engine
+# This is an unattended, offline-first appliance (Raspberry Pi): Postgres runs in a
+# Docker container that can restart under the backend (manual `docker restart`, or the
+# container restart policy), which leaves pooled connections stale. Without
+# pool_pre_ping, the next request to draw a stale connection raises OperationalError
+# and 500s the user before the pool discards it - unacceptable when no one is around
+# to retry. pool_recycle proactively retires connections before they go stale.
 engine = create_engine(
 	DATABASE_URL,
 	echo=False,
 	poolclass=QueuePool,
+	pool_pre_ping=True,
+	pool_recycle=1800,
 )
 
 # Session factory

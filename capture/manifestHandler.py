@@ -8,6 +8,7 @@ import socket
 import os
 import json
 import sys
+import threading
 
 backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
@@ -24,6 +25,9 @@ subprocess_logger = setup_rotating_logger(
     log_file=str(LOG_FILE),
     logger_name="capture_service"
 )
+
+# Serialize manifest appends across the FastAPI threadpool
+_manifest_append_lock = threading.Lock()
 
 @dataclass
 class ProjectInfo:
@@ -113,6 +117,21 @@ class CaptureRecord:
 
 #### Helper functions ####
 
+def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[Path]) -> str:
+    """Path of a captured file relative to the project root.
+
+    Keeps the manifest's paths in the same tree as the images (including any
+    collection subdir). Falls back to images/main/<name> when the file is not
+    under project_root.
+    """
+    p = Path(file_path)
+    if project_root is not None:
+        try:
+            return str(p.relative_to(project_root))
+        except ValueError:
+            pass
+    return str(Path("images/main") / p.name)
+
 def generate_manifest_project(
     project_name: str,
     paths: Dict[str, str] = None,
@@ -145,7 +164,8 @@ def generate_manifest_record(
     pair_id: str = None,
     stagger: int = None,
     roles: list = None,
-    metadata_list: list = None) -> CaptureRecord:
+    metadata_by_index: Optional[Dict[int, Dict]] = None,
+    project_root: Optional[Path] = None) -> CaptureRecord:
     """
     Generate a manifest record for single or dual captures.
     
@@ -158,7 +178,7 @@ def generate_manifest_record(
         stagger: Delay between camera starts in ms (optional)
         roles: List of role names (e.g., ["left", "right"] or ["single"])
                If None, auto-assigns based on number of captures
-        metadata_list: List of metadata dicts from capture (optional)
+        metadata_by_index: Metadata dicts keyed by camera_index (optional)
     
     Returns:
         CaptureRecord object
@@ -183,18 +203,18 @@ def generate_manifest_record(
             # Add JPEG file
             files.append(CaptureFile(
                 role=role,
-                relative_path=str(Path("images/main") / Path(jpeg_path).name),
+                relative_path=_relative_capture_path(jpeg_path, project_root),
                 bytes=os.path.getsize(jpeg_path),
                 mimetype=f"image/{config.encoding}",
                 sha256=compute_sha256(jpeg_path)
             ))
-            
+
             # Add raw sensor data file
             # Note: Using .raw extension due to picamera2 DNG save bug
             # Contains compressed raw sensor data (Pi 5) or packed pixels (Pi 4)
             files.append(CaptureFile(
                 role=f"{role}_raw",
-                relative_path=str(Path("images/main") / Path(raw_path).name),
+                relative_path=_relative_capture_path(raw_path, project_root),
                 bytes=os.path.getsize(raw_path),
                 mimetype="application/octet-stream",  # Binary raw sensor data
                 sha256=compute_sha256(raw_path)
@@ -203,7 +223,7 @@ def generate_manifest_record(
             # Single format
             files.append(CaptureFile(
                 role=role,
-                relative_path=str(Path("images/main") / Path(path).name),
+                relative_path=_relative_capture_path(path, project_root),
                 bytes=os.path.getsize(path),
                 mimetype=f"image/{config.encoding}",
                 sha256=compute_sha256(path)
@@ -211,12 +231,9 @@ def generate_manifest_record(
     
     # Build cameras list with metadata
     cameras = []
-    for i, config in enumerate(cam_configs):
-        # Get metadata for this camera if available
-        metadata = None
-        if metadata_list and i < len(metadata_list):
-            metadata = metadata_list[i]
-        
+    for config in cam_configs:
+        # Key metadata by camera_index so an asymmetric-None result never misattributes it
+        metadata = metadata_by_index.get(config.camera_index) if metadata_by_index else None
         cameras.append(CaptureCamera(
             camera_index=config.camera_index,
             config=config.to_dict(),
@@ -259,13 +276,19 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     else:
         raise ValueError("record_type must be 'capture' or 'project'")
     
-    with open(manifest_path, 'a', encoding="utf-8") as f:
-        f.write(json.dumps(record.to_dict(), ensure_ascii=False) + "\n")
-        f.flush()
-        os.fsync(f.fileno())
-        
-        if record_type == "project":
-            subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
-        else:
-            subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
+    line = (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            mv = memoryview(line)
+            while mv:  # one O_APPEND write keeps the JSONL line atomic
+                mv = mv[os.write(fd, mv):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)
+
+    if record_type == "project":
+        subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
+    else:
+        subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
         

@@ -53,7 +53,7 @@ def test_imports():
         
         return True
     except Exception as e:
-        print(f"✗ Import failed: {e}")
+        print(f"[ERROR] Import failed: {e}")
         return False
 
 
@@ -72,7 +72,7 @@ def test_password_hashing():
         print(" [OK] Password hashing works correctly")
         return True
     except Exception as e:
-        print(f"✗ Password hashing test failed: {e}")
+        print(f"[ERROR] Password hashing test failed: {e}")
         return False
 
 
@@ -99,7 +99,7 @@ def test_token_generation():
         print(" [OK] Token generation and verification works correctly")
         return True
     except Exception as e:
-        print(f"✗ Token test failed: {e}")
+        print(f"[ERROR] Token test failed: {e}")
         return False
 
 
@@ -142,7 +142,7 @@ def test_schemas():
         print(" [OK] Schema validation works correctly")
         return True
     except Exception as e:
-        print(f"✗ Schema test failed: {e}")
+        print(f"[ERROR] Schema test failed: {e}")
         return False
 
 
@@ -154,9 +154,13 @@ def test_routes():
     print("\nTesting route registration...")
     try:
         from app.main import app
-        
-        routes = {route.path: route.methods for route in app.routes}
-        
+
+        # Read paths from the OpenAPI schema rather than iterating app.routes:
+        # the entry types in app.routes are starlette internals that changed
+        # across versions (in starlette 1.x, included routers appear as
+        # _IncludedRouter objects with no .path attribute).
+        routes = set(app.openapi()["paths"].keys())
+
         # Check auth routes
         assert "/auth/register" in routes, "Auth register route missing"
         assert "/auth/login" in routes, "Auth login route missing"
@@ -165,9 +169,9 @@ def test_routes():
         
         # Check records routes
         assert "/records/" in routes, "Records list route missing"
-        assert "/records/{record_id}" in routes, "Records get route missing"
-        assert "/records/upload" in routes, "Records upload route missing"
-        assert "/records/{record_id}/file" in routes, "Records file download route missing"
+        assert "/records/{rec_id}" in routes, "Records get route missing"
+        assert "/records/{rec_id}/images" in routes, "Record images route missing"
+        assert "/records/images/{img_id}/file" in routes, "Record image file download route missing"
         
         # Check projects routes
         assert "/projects/" in routes, "Projects list route missing"
@@ -190,10 +194,10 @@ def test_routes():
         print(" [OK] All required routes are registered")
         return True
     except AssertionError as e:
-        print(f"✗ Route test failed: {e}")
+        print(f"[ERROR] Route test failed: {e}")
         return False
     except Exception as e:
-        print(f"✗ Route test error: {e}")
+        print(f"[ERROR] Route test error: {e}")
         return False
 
 
@@ -215,15 +219,15 @@ def test_models():
         
         assert "users" in table_names, "Users table not registered"
         assert "projects" in table_names, "Projects table not registered"
-        assert "document_images" in table_names, "Document images table not registered"
+        assert "record_images" in table_names, "Record images table not registered"
         
         print(" [OK] All models are properly registered")
         return True
     except AssertionError as e:
-        print(f"✗ Model test failed: {e}")
+        print(f"[ERROR] Model test failed: {e}")
         return False
     except Exception as e:
-        print(f"✗ Model test error: {e}")
+        print(f"[ERROR] Model test error: {e}")
         return False
 
 
@@ -250,7 +254,7 @@ def test_new_endpoints():
         print(" [OK] New endpoint schemas work correctly")
         return True
     except Exception as e:
-        print(f"✗ New endpoint test failed: {e}")
+        print(f"[ERROR] New endpoint test failed: {e}")
         return False
 
 
@@ -296,6 +300,32 @@ def test_api_models_pytest():
 def test_api_endpoints_pytest():
     """Pytest version of endpoints test."""
     assert test_new_endpoints()
+
+
+@pytest.mark.unit
+def test_missing_credentials_returns_401_not_403(client):
+    """A protected endpoint with no Authorization header must reject with 401
+    ("session problem"), never 403 ("authorization answer"). NEH-167."""
+    resp = client.get("/users/me")
+    assert resp.status_code == 401
+
+
+@pytest.mark.unit
+def test_refresh_missing_credentials_returns_401(client):
+    """/auth/refresh with no Authorization header must return 401, like every
+    other protected endpoint. NEH-167."""
+    resp = client.post("/auth/refresh")
+    assert resp.status_code == 401
+
+
+@pytest.mark.unit
+def test_password_reset_missing_credentials_returns_401(client):
+    """/auth/password-reset with no Authorization header must return 401. NEH-167."""
+    resp = client.post(
+        "/auth/password-reset",
+        json={"old_password": "x", "new_password": "y"},
+    )
+    assert resp.status_code == 401
 
 
 if __name__ == "__main__":

@@ -2,6 +2,7 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
+from sqlalchemy import func
 from app.models.record import Record, RecordImage
 from typing import List, Optional
 from pydantic import BaseModel
@@ -11,14 +12,48 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.camera import CameraSettings
 from app.models.user import User
+from app.models.project import Project
+from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
+from app.core.storage_ops import resolve_project_name
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+
+def _next_record_sequence(db: Session, project_id: Optional[int], collection_id: Optional[int]) -> int:
+	"""Next monotonic record sequence within a collection (or project).
+
+	Assigned at capture time so export order never depends on the wall clock,
+	which is unreliable on a Pi without an RTC after a power cut.
+	"""
+	query = db.query(func.max(Record.sequence))
+	if collection_id is not None:
+		query = query.filter(Record.collection_id == collection_id)
+	else:
+		query = query.filter(Record.project_id == project_id)
+	current_max = query.scalar()
+	return (current_max + 1) if current_max is not None else 0
+
+
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str]]:
+	"""Authoritative (project_name, collection_name) for the on-disk capture path."""
+	if collection_id:
+		col = db.query(Collection).filter(Collection.id == collection_id).first()
+		if not col:
+			raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+		resolved = resolve_project_name(db, col)
+		if not resolved:
+			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
+		return resolved, col.name
+	project = db.query(Project).filter(Project.name == project_name).first()
+	if not project:
+		raise HTTPException(status_code=422, detail="project_name does not match a known project")
+	return project.name, None
 
 
 class DeviceInfo(BaseModel):
@@ -244,7 +279,7 @@ def get_camera_preview(
 	Capture a low-resolution preview frame and return it as JPEG.
 
 	Called by the frontend every PREVIEW_INTERVAL_MS milliseconds for the
-	live preview view.  Uses a lightweight config (1280×720, no AF, no denoise)
+	live preview view.  Uses a lightweight config (1280x720, no AF, no denoise)
 	so frames are returned quickly without interfering with full captures.
 
 	Returns 404 when the requested camera is not connected.
@@ -294,7 +329,7 @@ def flush_preview_tmp_files(
 
 class FocusRequest(BaseModel):
 	"""Request body for manual focus endpoint."""
-	lens_position: float  # Dioptres: 0 = infinity, 10 ≈ 10 cm
+	lens_position: float  # Dioptres: 0 = infinity, 10 ~ 10 cm
 
 
 class FocusResponse(BaseModel):
@@ -355,7 +390,7 @@ class CameraSettingsRequest(BaseModel):
 	awb_enable: Optional[bool] = None         # Auto white-balance on/off
 	exposure_value: Optional[float] = None    # EV compensation (requires ae_enable=True)
 	exposure_time_us: Optional[int] = None    # Manual shutter time in microseconds
-	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ≈ 1.0)
+	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ~ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
 	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
 
@@ -450,16 +485,11 @@ def trigger_capture(
 			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
-		# Capture image and get manifest IDs
-		# Look up collection name so images go to project/collection/images/main/
-		collection_name = None
-		if request.collection_id:
-			from app.models.collection import Collection
-			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
-			collection_name = col.name if col else None
+		# Resolve the path from collection_id via the DB
+		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		output_path, capture_id, pair_id = single_capture_image(
-			project_name=request.project_name,
+			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
@@ -489,14 +519,14 @@ def trigger_capture(
 		except Exception as e:
 			logger.warning(f"Could not extract image metadata: {e}")
 		
-		# Get or find project by name
-		project = db.query(Project).filter(Project.name == request.project_name).first()
+		# Reuse the resolved project name so the DB record matches the on-disk tree
+		project = db.query(Project).filter(Project.name == project_name).first()
 		project_id = project.id if project else None
-		
+
 		# Records can have either project_id OR collection_id, not both (DB constraint).
 		# When a collection is provided, the project association is implicit through it.
 		effective_project_id = None if request.collection_id else project_id
-		
+
 		# Get or create Record
 		if request.record_id:
 			# Link to existing record
@@ -506,11 +536,12 @@ def trigger_capture(
 		else:
 			# Create new record for this capture
 			record = Record(
-				title=request.record_title or f"{request.project_name} - {file_path.stem}",
+				title=request.record_title or f"{project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
 				object_typology="document",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
+				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
 			)
 			db.add(record)
@@ -586,6 +617,7 @@ def trigger_capture(
 		raise
 	except Exception as e:
 		logger.exception(f"Capture failed: {e}")
+		# DB-only rollback: a file that already has a manifest entry is kept (recoverable via ?orphaned=true), never auto-unlinked
 		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
@@ -635,16 +667,11 @@ def trigger_dual_capture(
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
-		# Capture both images and get manifest IDs
-		# Look up collection name so images go to project/collection/images/main/
-		collection_name = None
-		if request.collection_id:
-			from app.models.collection import Collection
-			col = db.query(Collection).filter(Collection.id == request.collection_id).first()
-			collection_name = col.name if col else None
+		# Resolve the path from collection_id via the DB
+		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		path0, path1, capture_id, pair_id = dual_capture_image(
-			project_name=request.project_name,
+			project_name=project_name,
 			cam1_config=cam0_config,
 			cam2_config=cam1_config,
 			check_camera=False,
@@ -652,9 +679,9 @@ def trigger_dual_capture(
 			stagger_ms=request.stagger_ms,
 			collection_name=collection_name
 		)
-		
-		# Get project
-		project = db.query(Project).filter(Project.name == request.project_name).first()
+
+		# Reuse the resolved project name so the DB record matches the on-disk tree
+		project = db.query(Project).filter(Project.name == project_name).first()
 		project_id = project.id if project else None
 		
 		# Records can have either project_id OR collection_id, not both (DB constraint).
@@ -670,11 +697,12 @@ def trigger_dual_capture(
 		else:
 			# Create new record for this dual capture
 			record = Record(
-				title=request.record_title or f"{request.project_name} - Dual capture",
+				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				object_typology="book",  # Default to book for dual captures
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
+				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
 			)
 			db.add(record)
@@ -787,6 +815,7 @@ def trigger_dual_capture(
 		raise
 	except Exception as e:
 		logger.exception(f"Dual capture failed: {e}")
+		# DB-only rollback: a file that already has a manifest entry is kept (recoverable via ?orphaned=true), never auto-unlinked
 		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
 
@@ -887,7 +916,7 @@ def calibrate_white_balance(
 				detail=f"{backend.get_backend_name()} backend does not support white balance calibration",
 			)
 
-		# Route WB calibration through the backend's cached Picamera2 instance —
+		# Route WB calibration through the backend's cached Picamera2 instance -
 		# same reason as autofocus: calibration.py would open a second handle and
 		# corrupt the service's cached one.
 		backend = get_backend()
@@ -935,7 +964,7 @@ def commit_manual_white_balance(
 	Commit manually-sampled AWB gains to the camera registry.
 
 	Called after the user clicks on a neutral area in the live preview.
-	No camera capture is performed — the supplied gains are validated and
+	No camera capture is performed - the supplied gains are validated and
 	saved directly to the registry, the same way as after AWB convergence.
 	"""
 	if len(request.awb_gains) < 2:

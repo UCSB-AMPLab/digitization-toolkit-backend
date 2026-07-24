@@ -4,6 +4,7 @@ from contextlib import asynccontextmanager
 
 # initialize DB tables
 from app.core.db import init_db
+from app.core.schema import assert_schema_at_head
 from app.core.config import settings
 
 # routers
@@ -18,6 +19,8 @@ from app.api.system import router as system_router
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
+    # Refuse to serve against an un-migrated schema so the failure is loud at startup rather than a later 500 in the field
+    assert_schema_at_head()
     yield
 
 # Create FastAPI app with lifespan
@@ -29,7 +32,7 @@ app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    # allow_private_network=True,  # Disabled: not supported by installed Starlette (PR #3065 never merged) — causes CORSMiddleware TypeError
+    # allow_private_network=True,
     allow_methods=["*"],
     allow_headers=["*"],
 )

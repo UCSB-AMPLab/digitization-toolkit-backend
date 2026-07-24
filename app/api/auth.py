@@ -11,9 +11,12 @@ from app.core.audit import log_event
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
-security = HTTPBearer()
-# auto_error=False so the dependency doesn't raise when header is absent
-# (allows falling back to ?token= query param for browser src= requests)
+# auto_error=False on every HTTPBearer instance so the status code for a
+# missing/malformed Authorization header is chosen by our code, not by the
+# framework default (which has varied across FastAPI versions). A credential
+# problem is always a 401 ("session problem"), never a 403 ("authorization
+# answer"); each dependency below raises HTTPException(401, ...) explicitly.
+# See NEH-167.
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
@@ -51,7 +54,7 @@ def register(
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
     # First user becomes admin (bootstrap); all subsequent users start as reviewer.
-    # Role is never taken from the request payload — use PATCH /auth/users/{id}/role to elevate.
+    # Role is never taken from the request payload - use PATCH /auth/users/{id}/role to elevate.
     role = "admin" if is_first_user else "reviewer"
 
     user = User(
@@ -87,7 +90,12 @@ def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
 
 
 @router.post("/refresh", response_model=TokenRefresh)
-def refresh_token(credentials: HTTPAuthorizationCredentials = Security(security), db: Session = Depends(get_db_dependency)):
+def refresh_token(
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    db: Session = Depends(get_db_dependency),
+):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     payload = verify_access_token(token)
     if not payload:
@@ -103,9 +111,11 @@ def refresh_token(credentials: HTTPAuthorizationCredentials = Security(security)
 @router.post("/password-reset")
 def reset_password(
     payload: PasswordReset,
-    credentials: HTTPAuthorizationCredentials = Security(security),
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     db: Session = Depends(get_db_dependency)
 ):
+    if not credentials:
+        raise HTTPException(status_code=401, detail="Not authenticated")
     token = credentials.credentials
     token_payload = verify_access_token(token)
     if not token_payload:
@@ -138,9 +148,10 @@ def get_current_user(
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     user_id = int(payload.get("sub"))
-    user = db.query(User).filter(User.id == user_id).first()
+    # Mirror refresh_token: reject deactivated users so deactivation cuts access on the next request
+    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="User not found or inactive")
     return user
 
 
@@ -161,7 +172,7 @@ allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
 # ---------------------------------------------------------------------------
-# /users/me — current authenticated user's profile
+# /users/me - current authenticated user's profile
 # ---------------------------------------------------------------------------
 
 @users_router.get("/me", response_model=UserRead)

@@ -5,7 +5,6 @@ import threading
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
-from PIL import Image as _PILImage
 
 # Fixed temp-file paths for live preview frames (one per camera).
 # Using stable names rather than mkstemp prevents unbounded accumulation when
@@ -29,15 +28,14 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
-from .utils import setup_rotating_logger
+from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
-from .project_manager import secure_project_filename
+from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
 
-PROJECTS_ROOT = settings.projects_dir
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
 
@@ -103,19 +101,12 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     return backend.is_camera_connected(camera_index)
 
 
-_PIL_ROTATE = {
-    90:  _PILImage.Transpose.ROTATE_270,  # 90° CW
-    180: _PILImage.Transpose.ROTATE_180,
-    270: _PILImage.Transpose.ROTATE_90,   # 90° CCW
-}
-
 # EXIF Orientation tag values for clockwise rotations.
-# Used to tag CR2 files so RAW converters (Lightroom, darktable) display them
-# correctly without modifying the pixel data.
+# The image/sensor data is never modified; viewers that honour EXIF display the page upright, so the preservation master keeps full fidelity.
 _EXIF_ORIENTATION_FOR_DEG = {
-    90: 6,    # 90° CW  → EXIF "rotated 90 CW"
-    180: 3,   # 180°    → EXIF "rotated 180"
-    270: 8,   # 270° CW → EXIF "rotated 90 CCW"
+    90: 6,    # 90 deg CW  > EXIF "rotated 90 CW"
+    180: 3,   # 180 deg    > EXIF "rotated 180"
+    270: 8,   # 270 deg CW > EXIF "rotated 90 CCW"
 }
 
 # Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
@@ -124,39 +115,31 @@ _EXIF_ORIENTATION_TAG = 0x0112
 
 
 def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
-    """Rotate image in-place (clockwise). Skips 0°.
+    """Record a clockwise rotation losslessly via the EXIF Orientation tag.
 
-    - JPEG/JPG: pixels are actually transposed (lossless-quality re-encode).
-    - CR2:      EXIF Orientation tag is written so RAW converters display it
-                correctly without touching the raw sensor data.
+    Applies to JPEG and CR2 masters: the pixel/sensor data is never re-encoded,
+    only the orientation metadata is set, so the preservation master keeps full
+    fidelity. Skips 0 deg and unsupported file types.
     """
     deg = rotate_deg % 360
     if deg == 0:
         return
 
-    suffix = file_path.suffix.lower()
+    exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
+    if exif_val is None:
+        return
+    if file_path.suffix.lower() not in (".jpg", ".jpeg", ".cr2"):
+        return
 
-    if suffix in (".jpg", ".jpeg"):
-        transpose_op = _PIL_ROTATE.get(deg)
-        if transpose_op is None:
-            return
-        with _PILImage.open(file_path) as img:
-            rotated = img.transpose(transpose_op)
-        rotated.save(str(file_path), quality=95, subsampling=0)
-
-    elif suffix == ".cr2":
-        # Write EXIF Orientation tag into the CR2 without touching sensor data.
-        exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
-        if exif_val is None:
-            return
-        try:
-            import piexif
-            exif_dict = piexif.load(str(file_path))
-            exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
-            exif_bytes = piexif.dump(exif_dict)
-            piexif.insert(exif_bytes, str(file_path))
-        except Exception:
-            pass  # piexif not available or CR2 EXIF unreadable — silently skip
+    try:
+        import piexif
+        exif_dict = piexif.load(str(file_path))
+        exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
+        exif_bytes = piexif.dump(exif_dict)
+        # Durable: write the tag into a temp copy, then atomically replace the master
+        atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
+    except Exception as e:
+        subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
 
 
 def image_filename(
@@ -219,10 +202,7 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    if collection_name:
-        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / secure_project_filename(collection_name) / "images" / "main"
-    else:
-        project_path = PROJECTS_ROOT / secure_project_filename(project_name) / "images" / "main"
+    project_path = image_output_dir(project_name, collection_name)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -233,7 +213,15 @@ def capture_image(
         )
     
     output_path = Path(project_path, output_filename)
-    
+
+    # Never overwrite an existing master if a repeated timestamp collides
+    if output_path.exists():
+        stem, suffix = output_path.stem, output_path.suffix
+        counter = 1
+        while output_path.exists():
+            output_path = project_path / f"{stem}_{counter}{suffix}"
+            counter += 1
+
     # Use backend for actual capture
     backend = get_backend()
     result = backend.capture_image(output_path, camera_config, capture_output)
@@ -293,15 +281,16 @@ def single_capture_image(
     )
     
     elapsed_time = time.time() - start_time
-    
-    project_root = PROJECTS_ROOT / project_name
-    
+
+    project_root = project_capture_root(project_name)
+
     record = generate_manifest_record(
         project_name=project_name,
         img_paths=[output_path],
         cam_configs=[camera_config],
         times=[elapsed_time],
-        metadata_list=[metadata] if metadata else None
+        metadata_by_index={camera_config.camera_index: metadata} if metadata else None,
+        project_root=project_root
     )
     append_manifest_record(project_root, record)
     
@@ -310,6 +299,23 @@ def single_capture_image(
     )
     
     return output_path, record.capture_id, record.pair_id
+
+
+def _unlink_capture_output(path) -> None:
+    """Remove image file(s) from a capture that was never written to the manifest.
+
+    Safe only for manifest-less files: a manifested capture must never be
+    auto-unlinked. Handles the (jpeg, raw) tuple and the RAW _preview.jpg sidecar.
+    """
+    parts = path if isinstance(path, (tuple, list)) else (path,)
+    for p in parts:
+        fp = Path(str(p))
+        for target in (fp, fp.with_name(fp.stem + "_preview.jpg")):
+            try:
+                target.unlink(missing_ok=True)
+            except OSError:
+                pass
+
 
 def dual_capture_image(
         project_name: str,
@@ -377,25 +383,37 @@ def dual_capture_image(
         elapsed = time.time() - start
         return path, elapsed, metadata
     
+    results = {}
+    errors = {}
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
-        # Submit first camera
         future1 = executor.submit(capture_with_timing, cam1_config, filename1)
-        
         # Stagger second camera start (like bash script)
         if stagger_ms > 0:
             time.sleep(stagger_ms / 1000.0)
-        
         future2 = executor.submit(capture_with_timing, cam2_config, filename2)
-        
-        # Wait for both to complete
-        img1_path, time1, metadata1 = future1.result()
-        img2_path, time2, metadata2 = future2.result()
-        
-    project_root = PROJECTS_ROOT / project_name
-    
-    # Prepare metadata list (filter out None values)
-    metadata_list = [m for m in [metadata1, metadata2] if m is not None]
-    
+
+        # Collect both results so one camera's failure never hides the other
+        for cfg, fut in ((cam1_config, future1), (cam2_config, future2)):
+            try:
+                results[cfg.camera_index] = fut.result()
+            except Exception as e:
+                errors[cfg.camera_index] = e
+
+    if errors:
+        # Partial/failed pair: any file already written has no manifest entry, so
+        # unlink it rather than leave a manifest-less orphan that looks like a page.
+        for path, _elapsed, _meta in results.values():
+            _unlink_capture_output(path)
+        raise RuntimeError(
+            "Dual capture failed on camera(s) "
+            + "; ".join(f"cam{i}: {e}" for i, e in sorted(errors.items()))
+        )
+
+    img1_path, time1, metadata1 = results[cam1_config.camera_index]
+    img2_path, time2, metadata2 = results[cam2_config.camera_index]
+
+    project_root = project_capture_root(project_name)
+
     record = generate_manifest_record(
         project_name=project_name,
         pair_id=timestamp_index,
@@ -403,7 +421,8 @@ def dual_capture_image(
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
         stagger=stagger_ms,
-        metadata_list=metadata_list if metadata_list else None
+        metadata_by_index={cam1_config.camera_index: metadata1, cam2_config.camera_index: metadata2},
+        project_root=project_root
     )
     append_manifest_record(project_root, record)
     
@@ -418,13 +437,13 @@ def capture_preview_frame(camera_index: int) -> bytes:
     """
     Capture a low-resolution preview frame and return JPEG bytes.
 
-    Not saved to the project directory — intended for live preview polling
+    Not saved to the project directory - intended for live preview polling
     from the frontend. Uses a stable per-camera temp file that is overwritten
     on every call (rather than mkstemp), so at most one file per camera ever
     exists in /tmp even if the process is killed unexpectedly.
 
     The preview uses a lightweight configuration:
-      - 1280×720 (native fast mode, no cropping)
+      - 1280x720 (native fast mode, no cropping)
       - No autofocus cycle (too slow for live preview)
       - No AE stabilisation wait
       - No temporal denoise warmup
@@ -451,7 +470,7 @@ def capture_preview_frame(camera_index: int) -> bytes:
     except NotImplementedError:
         pass  # fall through to picamera2 path
 
-    # Fixed per-camera path — overwrites the same file each poll cycle.
+    # Fixed per-camera path - overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
     # race on the same path.
     tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
@@ -459,7 +478,7 @@ def capture_preview_frame(camera_index: int) -> bytes:
 
     preview_config = CameraConfig(
         camera_index=camera_index,
-        img_size=(1280, 720),        # Native 80 fps mode — fast, no crop
+        img_size=(1280, 720),        # Native 80 fps mode - fast, no crop
         autofocus_on_capture=False,  # Skip AF cycle for live preview
         timeout=0,                   # No AE stabilisation wait
         denoise_frames=0,            # No temporal denoise warmup
