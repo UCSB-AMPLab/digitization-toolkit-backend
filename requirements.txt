@@ -37,3 +37,7 @@ bagit>=1.9.0
 # Camera backends
 picamera2>=0.3.33
 gphoto2>=2.6.3,<3
+# numpy 2.x breaks the ABI of the Debian-built picamera2 dependency chain
+# bridged into the native env (simplejpeg first); keep in lockstep with
+# the pixi.toml pin.
+numpy<2
