@@ -15,6 +15,7 @@ from pathlib import Path
 # Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
 # at import time on some Pi OS + pixi env combinations.
 _PICAMERA2_AVAILABLE = False
+_PICAMERA2_IMPORT_ERROR = None
 Picamera2 = None
 Transform = None
 if sys.platform == "linux":
@@ -23,6 +24,9 @@ if sys.platform == "linux":
         from libcamera import Transform
         _PICAMERA2_AVAILABLE = True
     except (ImportError, ValueError) as _picamera2_err:
+        # The except-as name is unbound once this block exits, so persist the
+        # message for the error raised when the backend is actually used.
+        _PICAMERA2_IMPORT_ERROR = str(_picamera2_err)
         Picamera2 = None
         Transform = None
         _PICAMERA2_AVAILABLE = False
@@ -57,7 +61,12 @@ class Picamera2Backend(CameraBackend):
             logger: Logger instance for logging operations.
         """
         if Picamera2 is None:
-            raise RuntimeError("Picamera2Backend requires Linux (Raspberry Pi OS)")
+            if sys.platform != "linux":
+                raise RuntimeError("Picamera2Backend requires Linux (Raspberry Pi OS)")
+            # On a real Pi the import failed for a concrete reason (missing
+            # system package, numpy ABI mismatch, ...) — report that, not a
+            # misleading claim about the OS.
+            raise RuntimeError(f"picamera2 failed to import: {_PICAMERA2_IMPORT_ERROR}")
         
         super().__init__(logger)
         self._cameras = {}  # Cache of initialized Picamera2 instances
