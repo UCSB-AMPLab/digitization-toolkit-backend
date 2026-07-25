@@ -342,7 +342,7 @@ def unmount_device(
 
     msg = "Device unmounted successfully."
     if override_cleared:
-        msg += "Storage reverted to the default."
+        msg += " Storage reverted to the default."
     return {"message": msg, "override_cleared": override_cleared}
 
 
