@@ -105,7 +105,26 @@ def list_collections(
     # which shifts when rows are updated. Also required for stable
     # skip/limit pagination.
     items = query.order_by(Collection.id).offset(skip).limit(limit).all()
-    return [CollectionRead.model_validate(i) for i in items]
+
+    # Bulk-count records per collection in one query (avoids N+1 — the
+    # project detail page lists every collection and needs each one's
+    # count for the "No. of images/records" column, NEH-179).
+    counts_by_id: dict[int, int] = {}
+    if items:
+        rows = (
+            db.query(Record.collection_id, func.count(Record.id))
+            .filter(Record.collection_id.in_([c.id for c in items]))
+            .group_by(Record.collection_id)
+            .all()
+        )
+        counts_by_id = {collection_id: count for collection_id, count in rows}
+
+    results = []
+    for i in items:
+        r = CollectionRead.model_validate(i)
+        r.record_count = counts_by_id.get(i.id, 0)
+        results.append(r)
+    return results
 
 
 @router.get("/count")
