@@ -3,6 +3,8 @@ from pydantic import Field, ConfigDict
 from pathlib import Path
 
 class Settings(BaseSettings):
+    # Deployment environment. Anything outside _DEV_ENVIRONMENTS requires a real SECRET_KEY
+    APP_ENV: str = Field(default="development", env="APP_ENV")
     DATABASE_USER: str = "user"
     DATABASE_PASSWORD: str = "password"
     DATABASE_HOST: str = "db"
@@ -47,4 +49,33 @@ class Settings(BaseSettings):
         return Path(self.EXPORTS_ROOT) if self.EXPORTS_ROOT else (self.data_dir / "exports")
 
 
+# SECRET_KEY values that must never sign session tokens outside dev (NEH-54); includes the .env.example placeholder
+_INSECURE_SECRET_KEYS = {
+    "",
+    "dev-secret-change-me",
+    "your-secret-key-here-change-in-production",
+}
+
+# Environments exempt from the SECRET_KEY guard; anything else must set a strong key
+_DEV_ENVIRONMENTS = {"dev", "development", "test", "testing", "local"}
+
+
+def _guard_secret_key(config: "Settings") -> None:
+    """Refuse to start outside dev with a default/empty SECRET_KEY.
+
+    Runs at import time, right after Settings() is built, so it fires before
+    security.py reads settings.SECRET_KEY at its own module level. A FastAPI
+    startup event would be too late: by then the weak key is already bound.
+    """
+    if config.APP_ENV.strip().lower() in _DEV_ENVIRONMENTS:
+        return
+    if config.SECRET_KEY.strip() in _INSECURE_SECRET_KEYS:
+        raise RuntimeError(
+            "SECRET_KEY is unset or left at the insecure default while "
+            f"APP_ENV={config.APP_ENV!r}. Set a strong, unique SECRET_KEY "
+            "(e.g. `openssl rand -hex 32`) before starting outside development."
+        )
+
+
 settings = Settings()
+_guard_secret_key(settings)
