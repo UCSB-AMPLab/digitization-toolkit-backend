@@ -55,6 +55,13 @@ db-upgrade = "alembic upgrade head"
 db-migrate = { cmd = "alembic revision --autogenerate -m", depends-on = [] }
 db-downgrade = "alembic downgrade -1"
 db-history = "alembic history"
+# Schema drift guard (NEH-105): fails if the ORM models and a
+# migrated database disagree, i.e. if `db-migrate` would emit a
+# non-empty migration. Run it against a database already at head —
+# `pixi run db-upgrade` first. Drift is how collections acquired three
+# columns no model declared (dda9bc1bc608), and how project_members was
+# once dropped by an unreviewed autogenerate.
+db-check-drift = { cmd = "alembic check", depends-on = ["db-upgrade"] }
 
 # Testing
 test-cameras = "python test/test_cameras.py"
