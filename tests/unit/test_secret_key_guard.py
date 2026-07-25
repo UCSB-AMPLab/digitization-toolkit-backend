@@ -18,7 +18,7 @@ def test_dev_environments_allow_default_key(app_env):
     _guard_secret_key(_cfg(app_env, "dev-secret-change-me"))
 
 
-@pytest.mark.parametrize("bad_key", ["", "   ", "dev-secret-change-me", "your-secret-key-here-change-in-production"])
+@pytest.mark.parametrize("bad_key", ["", "   ", "dev-secret-change-me", "secret-key-here-change-in-production"])
 def test_production_rejects_default_or_empty_key(bad_key):
     with pytest.raises(RuntimeError):
         _guard_secret_key(_cfg("production", bad_key))
