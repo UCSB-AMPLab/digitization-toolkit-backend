@@ -44,6 +44,9 @@ class CollectionRead(CollectionBase):
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
+    # Direct record count (Record.collection_id == this collection's id).
+    # None unless the endpoint explicitly populates it (list/hierarchy).
+    record_count: Optional[int] = None
 
     class Config:
         from_attributes = True
@@ -52,7 +55,6 @@ class CollectionRead(CollectionBase):
 class CollectionWithChildren(CollectionRead):
     """Collection with nested child collections (for hierarchical views)."""
     child_collections: List["CollectionRead"] = []
-    record_count: Optional[int] = None
 
     class Config:
         from_attributes = True
