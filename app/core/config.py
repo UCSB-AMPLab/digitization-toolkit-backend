@@ -1,10 +1,11 @@
-from pydantic_settings import BaseSettings
-from pydantic import Field, ConfigDict
+from pydantic_settings import BaseSettings, SettingsConfigDict
+from pydantic import Field
 from pathlib import Path
 
 class Settings(BaseSettings):
-    # Deployment environment. Anything outside _DEV_ENVIRONMENTS requires a real SECRET_KEY
-    APP_ENV: str = Field(default="development", env="APP_ENV")
+    # Deployment environment
+    # Anything outside _DEV_ENVIRONMENTS requires a real SECRET_KEY
+    APP_ENV: str = "development"
     DATABASE_USER: str = "user"
     DATABASE_PASSWORD: str = "password"
     DATABASE_HOST: str = "db"
@@ -12,17 +13,19 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "digitization_toolkit"
     DTK_DATA_DIR: str = "/var/lib/dtk"
     DTK_LOG_DIR: str = "/var/log/dtk"
-    PROJECTS_ROOT: str = Field(default="", env="PROJECTS_ROOT")
-    EXPORTS_ROOT: str = Field(default="", env="DTK_EXPORTS_DIR")
-    CAMERA_BACKEND: str = Field(default="picamera2", env="CAMERA_BACKEND")
-    SECRET_KEY: str = Field(default="dev-secret-change-me", env="SECRET_KEY")
-    ACCESS_TOKEN_EXPIRE_SECONDS: int = Field(default=28800, env="ACCESS_TOKEN_EXPIRE_SECONDS")  # 8 hours
-    CORS_ORIGINS: list[str] = Field(default=["http://localhost:5173", "http://localhost:3000"], env="CORS_ORIGINS")
+    
+    PROJECTS_ROOT: str = ""
+    CAMERA_BACKEND: str = "picamera2"
+    SECRET_KEY: str = "dev-secret-change-me"
+    ACCESS_TOKEN_EXPIRE_SECONDS: int = 28800  # 8 hours
+    CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
+    
+    EXPORTS_ROOT: str = Field(default="", validation_alias="DTK_EXPORTS_DIR")
     # Application-level cap on uploaded image size. Defends the SD even if nginx (client_max_body_size 100m) is not in front of the app. Enforced while streaming.
-    MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, env="DTK_MAX_UPLOAD_BYTES")
+    MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, validation_alias="DTK_MAX_UPLOAD_BYTES")
     app_version: str = "0.0.0-dev"
 
-    model_config = ConfigDict(
+    model_config = SettingsConfigDict(
         env_file="../.env",  # Load .env from project root when running from backend/
         env_file_encoding="utf-8",
         extra="ignore"  # Ignore extra fields from .env like uvicorn_host
@@ -49,11 +52,11 @@ class Settings(BaseSettings):
         return Path(self.EXPORTS_ROOT) if self.EXPORTS_ROOT else (self.data_dir / "exports")
 
 
-# SECRET_KEY values that must never sign session tokens outside dev (NEH-54); includes the .env.example placeholder
+# Blacklist of SECRET_KEY values that must never sign session tokens outside development
 _INSECURE_SECRET_KEYS = {
     "",
     "dev-secret-change-me",
-    "your-secret-key-here-change-in-production",
+    "secret-key-here-change-in-production",
 }
 
 # Environments exempt from the SECRET_KEY guard; anything else must set a strong key
