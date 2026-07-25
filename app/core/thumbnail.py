@@ -13,8 +13,16 @@ import uuid
 logger = logging.getLogger(__name__)
 
 # Default thumbnail dimensions
-DEFAULT_THUMBNAIL_WIDTH = 200
-DEFAULT_THUMBNAIL_HEIGHT = 200
+#
+# 600px covers the largest grid-view cell size in the frontend (GridView's
+# column-count slider goes down to 2 columns, which can render cells ~500-
+# 540px wide) with a bit of margin. At 200px, `object-fit: cover` was
+# upscaling the thumbnail to fill much larger cells, producing visibly
+# blurry grids — this only affects the display size, not the stored master
+# image, so the storage/bandwidth cost stays a small fraction of the
+# full-resolution capture either way.
+DEFAULT_THUMBNAIL_WIDTH = 600
+DEFAULT_THUMBNAIL_HEIGHT = 600
 DEFAULT_THUMBNAIL_FORMAT = "JPEG"
 DEFAULT_THUMBNAIL_QUALITY = 85
 
