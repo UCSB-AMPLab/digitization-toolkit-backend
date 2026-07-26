@@ -17,6 +17,8 @@ class Settings(BaseSettings):
     PROJECTS_ROOT: str = ""
     CAMERA_BACKEND: str = "picamera2"
     SECRET_KEY: str = "dev-secret-change-me"
+    # Per-unit token protecting first-user admin bootstrap over the network
+    BOOTSTRAP_TOKEN: str = ""
     ACCESS_TOKEN_EXPIRE_SECONDS: int = 28800  # 8 hours
     CORS_ORIGINS: list[str] = ["http://localhost:5173", "http://localhost:3000"]
     
@@ -61,6 +63,12 @@ _INSECURE_SECRET_KEYS = {
 
 # Environments exempt from the production guards; anything else must set real secrets
 _DEV_ENVIRONMENTS = {"dev", "development", "test", "testing", "local"}
+
+
+def is_dev_env(app_env: str) -> bool:
+    """True when APP_ENV names a development or test environment."""
+    return app_env.strip().lower() in _DEV_ENVIRONMENTS
+
 
 # Blacklist of DATABASE_PASSWORD values that must never reach a production DB outside dev
 _INSECURE_DB_PASSWORDS = {
