@@ -59,8 +59,15 @@ _INSECURE_SECRET_KEYS = {
     "secret-key-here-change-in-production",
 }
 
-# Environments exempt from the SECRET_KEY guard; anything else must set a strong key
+# Environments exempt from the production guards; anything else must set real secrets
 _DEV_ENVIRONMENTS = {"dev", "development", "test", "testing", "local"}
+
+# Blacklist of DATABASE_PASSWORD values that must never reach a production DB outside dev
+_INSECURE_DB_PASSWORDS = {
+    "",
+    "password",
+    "change-this-in-production",
+}
 
 
 def _guard_secret_key(config: "Settings") -> None:
@@ -80,5 +87,21 @@ def _guard_secret_key(config: "Settings") -> None:
         )
 
 
+def _guard_database_password(config: "Settings") -> None:
+    """Refuse to start outside dev with a placeholder DATABASE_PASSWORD.
+
+    Per-unit passwords are generated at first boot; this is the
+    defense-in-depth half: a unit that slipped through on a shared placeholder
+    fails loudly instead of running with a credential known to every appliance.
+    """
+    if config.APP_ENV.strip().lower() in _DEV_ENVIRONMENTS:
+        return
+    if config.DATABASE_PASSWORD.strip() in _INSECURE_DB_PASSWORDS:
+        raise RuntimeError(
+            f"DATABASE_PASSWORD is unset or left at a shared placeholder while APP_ENV={config.APP_ENV!r}. Set a strong, unique DATABASE_PASSWORD (e.g. with `openssl rand -hex 32`) before starting outside development."
+        )
+
+
 settings = Settings()
 _guard_secret_key(settings)
+_guard_database_password(settings)
