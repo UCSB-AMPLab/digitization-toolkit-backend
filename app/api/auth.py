@@ -1,4 +1,6 @@
-from fastapi import APIRouter, Depends, HTTPException, Security, Query
+import hmac
+
+from fastapi import APIRouter, Depends, HTTPException, Security, Query, Header
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -7,6 +9,7 @@ from app.api.deps import get_db_dependency
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token
+from app.core.config import settings, is_dev_env
 from app.core.audit import log_event
 
 router = APIRouter()
@@ -20,6 +23,24 @@ users_router = APIRouter()  # mounted at /users in main.py
 _optional_bearer = HTTPBearer(auto_error=False)
 
 
+def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None:
+    """Gate first-user admin bootstrap behind a local trust factor.
+
+    On a fresh or re-flashed unit the first /register call creates an admin with
+    no auth. BOOTSTRAP_TOKEN is generated per-unit at first boot and is
+    only readable with local (console/SSH) access, so a network attacker cannot
+    claim the admin account. Dev keeps the tokenless bootstrap when no token is set.
+    """
+    configured = config.BOOTSTRAP_TOKEN.strip()
+    if is_dev_env(config.APP_ENV) and not configured:
+        return
+    if not configured:
+        # Production with no token configured: fail closed rather than open the bootstrap.
+        raise HTTPException(status_code=503, detail="First-user setup is unavailable: no bootstrap token configured")
+    if not provided_token or not hmac.compare_digest(provided_token.strip(), configured):
+        raise HTTPException(status_code=401, detail="Invalid or missing bootstrap token")
+
+
 @router.get("/setup/status")
 def setup_status(db: Session = Depends(get_db_dependency)):
     """Check whether initial setup is needed (no users exist yet). No auth required."""
@@ -31,11 +52,15 @@ def setup_status(db: Session = Depends(get_db_dependency)):
 def register(
     payload: UserCreate,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    bootstrap_token: Optional[str] = Header(default=None, alias="X-Bootstrap-Token"),
     db: Session = Depends(get_db_dependency),
 ):
     is_first_user = db.query(User).count() == 0
 
-    if not is_first_user:
+    if is_first_user:
+        # Unauthenticated first-user bootstrap requires a local bootstrap token
+        _authorize_bootstrap(bootstrap_token)
+    else:
         # After bootstrap, only admins may create accounts.
         if not credentials:
             raise HTTPException(status_code=401, detail="Not authenticated")
