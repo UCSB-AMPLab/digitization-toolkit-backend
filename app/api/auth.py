@@ -1,6 +1,6 @@
 import hmac
 
-from fastapi import APIRouter, Depends, HTTPException, Security, Query, Header
+from fastapi import APIRouter, Depends, HTTPException, Security, Query, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -8,8 +8,9 @@ from typing import List, Optional
 from app.api.deps import get_db_dependency
 from app.models.user import User
 from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
-from app.core.security import hash_password, verify_password, create_access_token, verify_access_token
+from app.core.security import hash_password, verify_password, create_access_token, verify_access_token, needs_rehash
 from app.core.config import settings, is_dev_env
+from app.core.login_throttle import login_throttle
 from app.core.audit import log_event
 
 router = APIRouter()
@@ -97,10 +98,41 @@ def register(
     return UserRead.model_validate(user)
 
 
+def _client_ip(request: Request) -> str:
+    """Best-effort real client IP for per-IP throttling.
+
+    Behind nginx the socket peer is the proxy, so a naive request.client.host would
+    put every user in one bucket and let 5 failures lock the whole unit. nginx sets
+    X-Real-IP / X-Forwarded-For (see nginx.conf), so prefer those; fall back to the
+    socket peer for direct connections. Per-account throttling is the robust half;
+    this just makes the per-IP half meaningful behind the reverse proxy.
+    """
+    xri = request.headers.get("x-real-ip")
+    if xri:
+        return xri.strip()
+    xff = request.headers.get("x-forwarded-for")
+    if xff:
+        return xff.split(",")[0].strip()
+    return request.client.host if request.client else "unknown"
+
+
 @router.post("/login")
-def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
+def login(payload: UserLogin, request: Request, db: Session = Depends(get_db_dependency)):
+    # Throttle brute force per account and per client IP on the untrusted LAN.
+    ip = _client_ip(request)
+    acct_key = f"user:{payload.username.strip().lower()}"
+    ip_key = f"ip:{ip}"
+
+    retry = login_throttle.retry_after(acct_key, ip_key)
+    if retry > 0:
+        log_event(db, level="WARN", category="access", action="login_throttled",
+                  actor=payload.username, detail=f"locked; retry after {retry}s")
+        raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.",
+                            headers={"Retry-After": str(retry)})
+
     user = db.query(User).filter(User.username == payload.username).first()
     if not user or not verify_password(payload.password, user.hashed_password):
+        login_throttle.record_failure(acct_key, ip_key)
         log_event(db, level="WARN", category="access", action="login_failed",
                   actor=payload.username)
         raise HTTPException(status_code=401, detail="Invalid credentials")
@@ -108,6 +140,14 @@ def login(payload: UserLogin, db: Session = Depends(get_db_dependency)):
         log_event(db, level="WARN", category="access", action="login_failed",
                   actor=user.username, detail="cuenta inactiva")
         raise HTTPException(status_code=403, detail="User is inactive")
+
+    # Success: clear the throttle counters and upgrade a legacy/weak hash while we still hold the plaintext
+    login_throttle.reset(acct_key, ip_key)
+    if needs_rehash(user.hashed_password):
+        user.hashed_password = hash_password(payload.password)
+        db.add(user)
+        db.commit()
+
     log_event(db, level="INFO", category="access", action="login_success",
               actor=user.username)
     token = create_access_token(subject=str(user.id))
