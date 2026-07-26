@@ -275,7 +275,7 @@ def set_user_active(
     return UserRead.model_validate(user)
 
 
-@router.delete("/{user_id}")
+@router.delete("/users/{user_id}")
 def delete_user(
     user_id: int,
     current_user: User = Depends(allow_admin),
@@ -284,6 +284,20 @@ def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    if user.id == current_user.id:
+        raise HTTPException(status_code=400, detail="Admins cannot delete their own account")
+    # Refuse to remove the last active admin: a headless appliance with no active
+    # admin can't manage users/storage/logs and can't mint a new admin (register
+    # needs an admin token once users exist) — an unrecoverable lockout (NEH-57).
+    if user.role == "admin" and user.is_active:
+        other_active_admins = db.query(User).filter(
+            User.role == "admin", User.is_active == True, User.id != user.id
+        ).count()
+        if other_active_admins == 0:
+            raise HTTPException(status_code=400, detail="Cannot delete the last active admin")
+    deleted_username = user.username
     db.delete(user)
     db.commit()
+    log_event(db, level="INFO", category="access", action="user_deleted",
+              actor=current_user.username, subject=deleted_username)
     return {"detail": "user deleted successfully"}
