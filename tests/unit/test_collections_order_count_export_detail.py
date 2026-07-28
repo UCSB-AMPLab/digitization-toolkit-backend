@@ -157,11 +157,11 @@ def test_list_records_orders_by_sequence_nulls_last_then_id_within_collection(re
 
     # Insert out of sequence order, mixing NULL and non-NULL sequence values.
     # Expected order: sequence 0, 1, 2 first (ascending), then NULLs by id.
-    r_null_a = Record(title="null-a", collection_id=col.id, sequence=None)
-    r_seq2 = Record(title="seq-2", collection_id=col.id, sequence=2)
-    r_null_b = Record(title="null-b", collection_id=col.id, sequence=None)
-    r_seq0 = Record(title="seq-0", collection_id=col.id, sequence=0)
-    r_seq1 = Record(title="seq-1", collection_id=col.id, sequence=1)
+    r_null_a = Record(title="null-a", collection_id=col.id, sequence=None, capture_mode="single")
+    r_seq2 = Record(title="seq-2", collection_id=col.id, sequence=2, capture_mode="single")
+    r_null_b = Record(title="null-b", collection_id=col.id, sequence=None, capture_mode="single")
+    r_seq0 = Record(title="seq-0", collection_id=col.id, sequence=0, capture_mode="single")
+    r_seq1 = Record(title="seq-1", collection_id=col.id, sequence=1, capture_mode="single")
     db_session.add_all([r_null_a, r_seq2, r_null_b, r_seq0, r_seq1])
     db_session.commit()
     for r in (r_null_a, r_seq2, r_null_b, r_seq0, r_seq1):
@@ -188,9 +188,9 @@ def test_list_records_without_collection_id_orders_by_id_only(read_client, db_se
 
     # Sequence values that would sort differently than id if honored;
     # project-wide listing must ignore them and use pure id order.
-    r1 = Record(title="r1", project_id=proj.id, sequence=5)
-    r2 = Record(title="r2", project_id=proj.id, sequence=1)
-    r3 = Record(title="r3", project_id=proj.id, sequence=None)
+    r1 = Record(title="r1", project_id=proj.id, sequence=5, capture_mode="single")
+    r2 = Record(title="r2", project_id=proj.id, sequence=1, capture_mode="single")
+    r3 = Record(title="r3", project_id=proj.id, sequence=None, capture_mode="single")
     db_session.add_all([r1, r2, r3])
     db_session.commit()
     for r in (r1, r2, r3):
@@ -255,9 +255,9 @@ def test_export_non_approved_records_returns_structured_422(contributor_client, 
     db_session.add(col)
     db_session.commit()
 
-    r1 = Record(title="r1", collection_id=col.id, status="captured")
-    r2 = Record(title="r2", collection_id=col.id, status="approved")
-    r3 = Record(title="r3", collection_id=col.id, status="in_review")
+    r1 = Record(title="r1", collection_id=col.id, status="rejected", capture_mode="single")
+    r2 = Record(title="r2", collection_id=col.id, status="approved", capture_mode="single")
+    r3 = Record(title="r3", collection_id=col.id, status="in_review", capture_mode="single")
     db_session.add_all([r1, r2, r3])
     db_session.commit()
     for r in (r1, r2, r3):

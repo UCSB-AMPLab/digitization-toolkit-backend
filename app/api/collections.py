@@ -507,7 +507,8 @@ def export_collection_bagit(
             rec_dir = data_dir / f"{seq_label}_{safe_title}"
             rec_dir.mkdir(exist_ok=True)
 
-            for img in sorted(rec.images, key=lambda i: (i.role or "z", i.id)):
+            # Only current images: a rejected-then-superseded file must never land in an export bag (NEH-208)
+            for img in sorted([i for i in rec.images if i.is_current], key=lambda i: (i.role or "z", i.id)):
                 if not img.file_path:
                     continue
                 src = _Path(img.file_path)
@@ -558,7 +559,7 @@ def export_collection_bagit(
                             "resolution_height": img.resolution_height,
                             "file_size": img.file_size,
                         }
-                        for img in r.images
+                        for img in r.images if img.is_current
                     ],
                 }
                 for r in records
