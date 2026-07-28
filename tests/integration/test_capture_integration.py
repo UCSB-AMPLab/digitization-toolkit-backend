@@ -57,7 +57,9 @@ def test_single_capture_creates_database_record(client, db_session, test_project
     record = db_session.query(Record).filter(Record.id == doc.record_id).first()
     assert record is not None
     assert record.project_id == test_project.id
-    
+    assert record.status == "in_review"
+    assert record.capture_mode == "single"
+
     # Verify camera settings were saved
     cs = db_session.query(CameraSettings).filter(
         CameraSettings.record_image_id == doc.id
@@ -99,7 +101,11 @@ def test_dual_capture_creates_two_database_records(client, db_session, test_proj
     ).all()
     
     assert len(docs) >= 2
-    
+
+    dual_record = db_session.query(Record).filter(Record.id == docs[-1].record_id).first()
+    assert dual_record.status == "in_review"
+    assert dual_record.capture_mode == "dual"
+
     # Check both have camera settings
     for doc in docs[-2:]:
         cs = db_session.query(CameraSettings).filter(

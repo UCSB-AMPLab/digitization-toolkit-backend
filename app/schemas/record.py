@@ -3,19 +3,32 @@ from typing import Optional, List, Literal
 from pydantic import BaseModel, field_validator, model_validator
 from datetime import datetime
 
-# Valid status values
-RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+# Valid status values. A record has no "captured" resting state — it enters
+# the queue as "in_review" the moment it's captured (NEH-208). "approved" is
+# terminal: the only way back to "in_review" is rejecting first, then
+# recapturing (see the dedicated reject endpoint and cameras.py).
+RecordStatus = Literal["in_review", "rejected", "approved"]
 
-# Allowed status transitions: (from_status, to_status) -> set of roles that can perform it
+# Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
+# Rejection is deliberately NOT here — it's its own endpoint (POST
+# /records/{id}/reject) with a mandatory predefined_reason, not reachable
+# through the generic status-update path. Recapture (rejected -> in_review)
+# is likewise not here — it only ever happens as a side effect of the
+# capture endpoints (app/api/cameras.py) actually receiving new image(s).
 STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
-	("captured",  "in_review"): {"operator", "admin", "reviewer"},
-	("in_review", "rejected"):  {"reviewer", "admin"},
-	("in_review", "approved"):  {"reviewer", "admin"},
-	("in_review", "captured"):  {"operator", "admin"},
-	("rejected",  "captured"):  {"operator", "admin"},
-	("approved",  "rejected"):  {"reviewer", "admin"},
-	("approved",  "captured"):  {"admin"},
+	("in_review", "approved"): {"reviewer", "admin"},
 }
+
+# The predefined rejection reasons, mirroring the list the annotation
+# feature's "Marcar error" already uses client-side
+# (LeftSidebar.svelte ERROR_TYPES) — this is the first place either list is
+# enforced server-side.
+PREDEFINED_REJECTION_REASONS = ("blur", "glare", "shadow", "focus", "exposure", "dirt")
+PredefinedRejectionReason = Literal["blur", "glare", "shadow", "focus", "exposure", "dirt"]
+
+# Which camera setup produced a document: one image, or an L+R pair fired
+# together on a single shutter press. Set once at capture time.
+CaptureMode = Literal["single", "dual"]
 
 
 # ==============================================================================
@@ -110,6 +123,11 @@ class RecordImageRead(RecordImageBase):
 	created_at: Optional[datetime]
 	camera_settings: Optional[CameraSettingsRead] = None
 	exif_data: Optional[ExifDataRead] = None
+	# Audit trail (NEH-208): False once a recapture has superseded this
+	# image — it stays queryable via GET /records/{id}/rejections but drops
+	# out of the default image list/gallery/export.
+	is_current: bool = True
+	superseded_at: Optional[datetime] = None
 
 	class Config:
 		from_attributes = True
@@ -127,9 +145,13 @@ class RecordBase(BaseModel):
 	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
-	status: RecordStatus = "captured"
+	status: RecordStatus = "in_review"
 	sequence: Optional[int] = None
-	rejection_note: Optional[str] = None
+	# Required: the camera capture endpoints always set this explicitly;
+	# manual record creation (POST /records/) must declare it up front since
+	# rejection scope resolution and the recapture mode-match guard both
+	# depend on it (NEH-208).
+	capture_mode: CaptureMode
 
 
 class RecordCreate(RecordBase):
@@ -169,13 +191,11 @@ class RecordRead(RecordBase):
 
 class RecordStatusUpdate(BaseModel):
 	status: RecordStatus
-	rejection_note: Optional[str] = None
 
 
 class BulkStatusUpdate(BaseModel):
 	record_ids: List[int]
 	status: RecordStatus
-	rejection_note: Optional[str] = None
 
 	@field_validator("record_ids")
 	@classmethod
@@ -183,6 +203,30 @@ class BulkStatusUpdate(BaseModel):
 		if not v:
 			raise ValueError("record_ids must not be empty")
 		return v
+
+
+# ==============================================================================
+# Rejection schemas (NEH-208)
+# ==============================================================================
+
+class RecordRejectRequest(BaseModel):
+	predefined_reason: PredefinedRejectionReason
+	comment: Optional[str] = None
+
+
+class RecordRejectionRead(BaseModel):
+	id: int
+	record_id: int
+	predefined_reason: str
+	comment: Optional[str] = None
+	rejected_by: Optional[str] = None
+	rejected_at: Optional[datetime]
+	# The image(s) this specific rejection flagged — both L and R for a
+	# dual-mode document, the one image for single-mode.
+	images: List[RecordImageRead] = []
+
+	class Config:
+		from_attributes = True
 
 
 # ==============================================================================

@@ -528,11 +528,24 @@ def trigger_capture(
 		effective_project_id = None if request.collection_id else project_id
 
 		# Get or create Record
+		is_recapture = False
 		if request.record_id:
 			# Link to existing record
 			record = db.query(Record).filter(Record.id == request.record_id).first()
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+			if record.status == "rejected":
+				# Recapture (NEH-208): a rejected record can only be redone with
+				# the same capture mode it was originally taken with — a single
+				# capture can't turn a dual-mode record's pair back into one image.
+				if record.capture_mode != "single":
+					raise HTTPException(
+						status_code=422,
+						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
+					)
+				is_recapture = True
+				from app.api.records import _supersede_current_images
+				_supersede_current_images(record)
 		else:
 			# Create new record for this capture
 			record = Record(
@@ -543,6 +556,7 @@ def trigger_capture(
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
+				capture_mode="single",
 			)
 			db.add(record)
 			db.flush()  # Get the ID
@@ -600,11 +614,14 @@ def trigger_capture(
 				raw_exif=str(exif_dict),
 			)
 			db.add(ex)
-		
+
+		if is_recapture:
+			record.status = "in_review"
+
 		db.commit()
 		db.refresh(record)
 		db.refresh(img)
-		
+
 		logger.info(f"Created record {record.id}, image {img.id}, capture_id={capture_id}")
 		
 		return CaptureResponse(
@@ -689,11 +706,24 @@ def trigger_dual_capture(
 		effective_project_id = None if request.collection_id else project_id
 		
 		# Get or create Record
+		is_recapture = False
 		if request.record_id:
 			# Link to existing record (adding new pages to multi-page document)
 			record = db.query(Record).filter(Record.id == request.record_id).first()
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+			if record.status == "rejected":
+				# Recapture (NEH-208): a rejected record can only be redone with
+				# the same capture mode it was originally taken with — a dual
+				# pair can't turn a single-mode record into two images.
+				if record.capture_mode != "dual":
+					raise HTTPException(
+						status_code=422,
+						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the single-capture endpoint to recapture it."
+					)
+				is_recapture = True
+				from app.api.records import _supersede_current_images
+				_supersede_current_images(record)
 		else:
 			# Create new record for this dual capture
 			record = Record(
@@ -704,6 +734,7 @@ def trigger_dual_capture(
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
+				capture_mode="dual",
 			)
 			db.add(record)
 			db.flush()  # Get the ID
@@ -796,7 +827,10 @@ def trigger_dual_capture(
 		role1 = "right" if request.left_camera_index == 0 else "left"
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
-		
+
+		if is_recapture:
+			record.status = "in_review"
+
 		db.commit()
 		db.refresh(record)
 		
