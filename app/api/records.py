@@ -657,11 +657,15 @@ def update_record_status(
 
 	Valid transitions and required roles:
 	- in_review > approved  : reviewer, admin
+	- approved  > in_review : reviewer, admin  (undo a mistaken approve, NEH-209)
+	- rejected  > in_review : reviewer, admin  (undo a mistaken reject, NEH-209)
 
-	Rejection is not reachable through this endpoint — use POST
+	Formal rejection is not reachable through this endpoint — use POST
 	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
-	approved is terminal; recapture (rejected -> in_review) only happens as a
-	side effect of the capture endpoints in app/api/cameras.py.
+	Recapture (rejected -> in_review as a side effect of a new capture
+	arriving) only happens via the capture endpoints in app/api/cameras.py —
+	the undo transition above is a plain status reset with no new image, no
+	reason, and no audit entry.
 	"""
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:

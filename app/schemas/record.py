@@ -4,19 +4,29 @@ from pydantic import BaseModel, field_validator, model_validator
 from datetime import datetime
 
 # Valid status values. A record has no "captured" resting state — it enters
-# the queue as "in_review" the moment it's captured (NEH-208). "approved" is
-# terminal: the only way back to "in_review" is rejecting first, then
-# recapturing (see the dedicated reject endpoint and cameras.py).
+# the queue as "in_review" the moment it's captured (NEH-208). A reviewer can
+# undo a mistaken approve/reject back to "in_review" (see STATUS_TRANSITIONS
+# below) — that's a plain status reset, not a recapture and not a formal
+# rejection, so it carries no reason/audit entry.
 RecordStatus = Literal["in_review", "rejected", "approved"]
 
 # Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
-# Rejection is deliberately NOT here — it's its own endpoint (POST
+#
+# Formal rejection is deliberately NOT here — it's its own endpoint (POST
 # /records/{id}/reject) with a mandatory predefined_reason, not reachable
-# through the generic status-update path. Recapture (rejected -> in_review)
-# is likewise not here — it only ever happens as a side effect of the
-# capture endpoints (app/api/cameras.py) actually receiving new image(s).
+# through this generic status-update path. Recapture (rejected -> in_review
+# as a side effect of a new capture actually arriving) is also not here —
+# that's driven entirely by app/api/cameras.py, not a client-chosen status
+# value.
+#
+# approved -> in_review and rejected -> in_review ARE here: these are the
+# "undo my mistake" resets a reviewer can trigger directly from the record
+# view (NEH-209) — no reason required since nothing formal is being
+# recorded, just moving the record back into the review queue.
 STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
 	("in_review", "approved"): {"reviewer", "admin"},
+	("approved", "in_review"): {"reviewer", "admin"},
+	("rejected", "in_review"): {"reviewer", "admin"},
 }
 
 # The predefined rejection reasons, mirroring the list the annotation
