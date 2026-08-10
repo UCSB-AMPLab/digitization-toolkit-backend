@@ -106,6 +106,44 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
     return by_path, by_name
 
 
+def verify_images_against_manifest(images) -> List[dict]:
+    """Re-hash each image and compare it to its capture-time manifest sha256.
+
+    Returns the list of mismatches: files whose bytes on disk differ from what was
+    recorded when they were captured. Images with no capture_id, no manifest entry,
+    or a missing file are skipped, as there is no capture-time fixity to check, and a
+    missing file is a separate failure the caller handles. Read-only.
+    """
+    by_path, by_name = _build_manifest_index(config.settings.projects_dir.resolve())
+    mismatches: List[dict] = []
+    for img in images:
+        if not img.capture_id:
+            continue
+        resolved = resolve_within_storage(img.file_path)
+        if resolved is None or not resolved.exists():
+            continue
+        paths = by_path.get(img.capture_id)
+        names = by_name.get(img.capture_id)
+        expected = paths.get(str(resolved)) if paths else None
+        if expected is None and names:
+            expected = names.get(resolved.name)
+        if expected is None:
+            continue
+        try:
+            actual = _sha256(resolved)
+        except OSError:
+            continue
+        if actual != expected:
+            mismatches.append({
+                "record_image_id": img.id,
+                "record_id": img.record_id,
+                "file_path": img.file_path,
+                "expected_sha256": expected,
+                "actual_sha256": actual,
+            })
+    return mismatches
+
+
 def run_integrity_check(db: Session, verify_hashes: bool = True,
                         max_hash_checks: Optional[int] = None) -> dict:
     """Reconcile the database, the image files, and the capture manifest.

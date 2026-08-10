@@ -14,6 +14,7 @@ from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 from app.schemas.record import ReorderRecords
 from app.core.audit import log_event
+from app.core.config import settings
 from app.core.storage_ops import (
     collection_and_descendants,
     relocate_image,
@@ -500,24 +501,63 @@ def export_collection_bagit(
         data_dir = tmp_path / "data"
         data_dir.mkdir()
 
-        # Copy image files into data/ numbered by their position in the ordered list
+        from app.core.paths import resolve_within_storage
+        from app.core.integrity import verify_images_against_manifest
+
+        to_copy = []  # (rec_dir_name, dest_name, resolved_src, img)
+        missing = []
+        used_names: dict = {}
         for idx, rec in enumerate(records):
             seq_label = f"{idx + 1:04d}"
             safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (rec.title or "record"))[:60]
-            rec_dir = data_dir / f"{seq_label}_{safe_title}"
-            rec_dir.mkdir(exist_ok=True)
-
-            # Only current images: a rejected-then-superseded file must never land in an export bag (NEH-208)
+            rec_dir_name = f"{seq_label}_{safe_title}"
             for img in sorted([i for i in rec.images if i.is_current], key=lambda i: (i.role or "z", i.id)):
-                if not img.file_path:
-                    continue
-                src = _Path(img.file_path)
-                if not src.exists():
-                    logger.warning(f"Missing file for image {img.id}: {img.file_path}")
+                resolved = resolve_within_storage(img.file_path) if img.file_path else None
+                if resolved is None or not resolved.exists():
+                    missing.append({"record_id": rec.id, "record_image_id": img.id, "file_path": img.file_path})
                     continue
                 role_prefix = img.role or f"img_{img.id}"
-                dest_name = f"{role_prefix}{src.suffix}"
-                _shutil.copy2(src, rec_dir / dest_name)
+                dest_name = f"{role_prefix}{resolved.suffix}"
+                seen = used_names.setdefault(rec_dir_name, set())
+                if dest_name in seen:
+                    dest_name = f"{role_prefix}_{img.id}{resolved.suffix}"
+                seen.add(dest_name)
+                to_copy.append((rec_dir_name, dest_name, resolved, img))
+
+        if missing:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": f"Cannot export: {len(missing)} image file(s) missing from disk.",
+                    "missing_image_ids": [m["record_image_id"] for m in missing],
+                    "missing": missing,
+                },
+            )
+
+        mismatches = verify_images_against_manifest([img for _, _, _, img in to_copy])
+        if mismatches:
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": f"Cannot export: {len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
+                    "mismatched_image_ids": [m["record_image_id"] for m in mismatches],
+                    "mismatches": mismatches,
+                },
+            )
+
+        # Copy the planned payload
+        for rec_dir_name, dest_name, resolved, img in to_copy:
+            rec_dir = data_dir / rec_dir_name
+            rec_dir.mkdir(exist_ok=True)
+            _shutil.copy2(resolved, rec_dir / dest_name)
+
+        expected_rows = sum(1 for rec in records for img in rec.images if img.is_current and img.file_path)
+        copied_files = sum(1 for p in data_dir.rglob("*") if p.is_file())
+        if copied_files != expected_rows or copied_files != len(to_copy):
+            raise HTTPException(
+                status_code=500,
+                detail=f"Export payload incomplete: staged {copied_files} files for {expected_rows} image rows",
+            )
 
         # Write metadata sidecar before bagging
         metadata_payload = {
@@ -569,6 +609,29 @@ def export_collection_bagit(
             json.dumps(metadata_payload, indent=2, ensure_ascii=False),
             encoding="utf-8"
         )
+
+        from app.core.storage_ops import resolve_project_name
+        from capture.project_manager import project_capture_root
+        capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
+        if capture_ids:
+            proj_name = resolve_project_name(db, collection)
+            manifest_src = project_capture_root(proj_name) / "metadata" / "manifest.jsonl" if proj_name else None
+            if manifest_src and manifest_src.exists():
+                kept = []
+                for line in manifest_src.read_text(encoding="utf-8").splitlines():
+                    stripped = line.strip()
+                    if not stripped:
+                        continue
+                    try:
+                        entry = json.loads(stripped)
+                    except json.JSONDecodeError:
+                        continue
+                    if entry.get("capture_id") in capture_ids:
+                        kept.append(stripped)
+                if kept:
+                    meta_dir = data_dir / "metadata"
+                    meta_dir.mkdir(exist_ok=True)
+                    (meta_dir / "manifest.jsonl").write_text("\n".join(kept) + "\n", encoding="utf-8")
 
         # Create BagIt bag in-place
         bag_metadata = {
