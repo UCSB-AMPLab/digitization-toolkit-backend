@@ -50,15 +50,19 @@ def get_system_logs(
 @router.get("/integrity")
 def integrity_check(
     verify_hashes:  bool = Query(default=True, description="Recompute sha256 and compare against the capture manifest"),
-    max_hash_checks: int = Query(default=0, ge=0, description="Cap on files hashed (0 = no cap)"),
+    full: bool = Query(default=False, description="Hash every manifested file. Off by default: a full sweep re-hashes every capture, which is I/O-punishing on a unit holding tens of thousands of images"),
+    max_hash_checks: int = Query(default=1000, ge=1, description="Upper bound on files hashed when not running a full sweep; a random sample is taken above this many eligible files"),
     current_user: User = Depends(allow_admin),
     db: Session        = Depends(get_db_dependency),
 ):
     """Reconcile the database against the image files and the capture manifest.
 
-    Reports images whose files are missing, image files no row or manifest
-    references, bytes that no longer match the capture-time sha256, and parentless
+    Reports images whose files are missing, image files with no row or manifest
+    reference, bytes that no longer match the capture-time sha256, and parentless
     records. Read-only and admin-only. Run after an SD re-clone or DB restore.
+
+    Hash verification defaults to a bounded random sample; pass full=true for the
+    exhaustive (and much slower) sweep.
     """
     from app.core.integrity import run_integrity_check
     from app.core import audit
@@ -66,7 +70,7 @@ def integrity_check(
     report = run_integrity_check(
         db,
         verify_hashes=verify_hashes,
-        max_hash_checks=(max_hash_checks or None),
+        max_hash_checks=(None if full else max_hash_checks),
     )
     summary = report["summary"]
     audit.log_event(
@@ -77,7 +81,9 @@ def integrity_check(
         actor=current_user.username,
         detail=(
             f"missing_files={summary['missing_files']} orphan_files={summary['orphan_files']} "
-            f"manifest_mismatches={summary['manifest_mismatches']} hashes_checked={summary['hashes_checked']}"
+            f"manifest_mismatches={summary['manifest_mismatches']} "
+            f"hashes_checked={summary['hashes_checked']}/{summary['hashes_eligible']} "
+            f"sampled={summary['hash_sampled']}"
         ),
     )
     return report
