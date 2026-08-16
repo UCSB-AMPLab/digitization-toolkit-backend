@@ -12,6 +12,7 @@ deletes, or rewrites anything.
 import hashlib
 import json
 import logging
+import random
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -202,7 +203,13 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     manifest_mismatches: List[dict] = []
     manifest_missing_entry: List[dict] = []
     hashes_checked = 0
+    hashes_eligible = 0
     if verify_hashes:
+        # Finding the manifest entry is cheap, so it runs over every image (a
+        # missing entry is worth reporting for all). Only the sha256 recompute is
+        # expensive, so when capped it hashes a random sample of the eligible
+        # files rather than the first N - a bounded but representative sweep.
+        eligible: List[Tuple] = []
         for img in images:
             if not img.capture_id:
                 continue
@@ -221,8 +228,14 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
                     "file_path": img.file_path,
                 })
                 continue
-            if max_hash_checks is not None and hashes_checked >= max_hash_checks:
-                continue
+            eligible.append((img, resolved, expected))
+
+        hashes_eligible = len(eligible)
+        to_hash = eligible
+        if max_hash_checks is not None and hashes_eligible > max_hash_checks:
+            to_hash = random.sample(eligible, max_hash_checks)
+
+        for img, resolved, expected in to_hash:
             try:
                 actual = _sha256(resolved)
             except OSError:
@@ -249,6 +262,8 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "missing_thumbnails": len(missing_thumbnails),
         "orphan_files": len(orphan_files),
         "hashes_checked": hashes_checked,
+        "hashes_eligible": hashes_eligible,
+        "hash_sampled": hashes_checked < hashes_eligible,
         "manifest_mismatches": len(manifest_mismatches),
         "manifest_missing_entry": len(manifest_missing_entry),
         "orphan_records": len(orphan_records),
