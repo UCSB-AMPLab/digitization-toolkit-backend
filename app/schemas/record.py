@@ -169,6 +169,12 @@ class RecordCreate(RecordBase):
 	collection_id: Optional[int] = None
 	created_by: Optional[str] = None
 
+	@model_validator(mode="after")
+	def _single_parent(self):
+		if self.project_id is not None and self.collection_id is not None:
+			raise ValueError("A record belongs to either a project or a collection, not both.")
+		return self
+
 
 class RecordUpdate(BaseModel):
 	title: Optional[str] = None

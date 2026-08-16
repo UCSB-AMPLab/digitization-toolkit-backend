@@ -17,6 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.storage_ops import resolve_project_name
+from app.core.db_errors import integrity_conflict
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -1120,9 +1121,9 @@ def create_camera_settings(
 		db.add(cs)
 		db.commit()
 		db.refresh(cs)
-	except IntegrityError:
+	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Camera settings already exist for this record")
+		raise integrity_conflict(e)
 	return CameraSettingsRead.model_validate(cs)
 
 
