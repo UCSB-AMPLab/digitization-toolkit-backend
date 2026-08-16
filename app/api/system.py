@@ -180,43 +180,34 @@ class ActivateStorageRequest(BaseModel):
 def get_storage_info(current_user: User = Depends(allow_read_only)):
     """Return current projects path and disk usage figures."""
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override, StorageOverrideError
+    from app.core.storage_override import get_storage_override_or_fallback
 
-    # An unreadable override is surfaced as an error, not treated as "no override"
-    try:
-        projects_path = settings.projects_dir
-        is_override = get_storage_override() is not None
-    except StorageOverrideError as e:
-        return {
-            "projects_path": None,
-            "is_override":   True,
-            "error":         str(e),
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
-        }
+    # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
+    override, override_invalid = get_storage_override_or_fallback()
+    projects_path = settings.projects_dir
 
     try:
         projects_path.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(projects_path)
     except OSError:
         return {
-            "projects_path": str(projects_path),
-            "is_override":   is_override,
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
+            "projects_path":    str(projects_path),
+            "is_override":      override is not None,
+            "override_invalid": override_invalid,
+            "total_bytes":      0,
+            "used_bytes":       0,
+            "free_bytes":       0,
+            "available":        False,
         }
 
     return {
-        "projects_path": str(projects_path),
-        "is_override":   is_override,
-        "total_bytes":   usage.total,
-        "used_bytes":    usage.used,
-        "free_bytes":    usage.free,
-        "available":     True,
+        "projects_path":    str(projects_path),
+        "is_override":      override is not None,
+        "override_invalid": override_invalid,
+        "total_bytes":      usage.total,
+        "used_bytes":       usage.used,
+        "free_bytes":       usage.free,
+        "available":        True,
     }
 
 

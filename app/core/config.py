@@ -43,8 +43,10 @@ class Settings(BaseSettings):
     
     @property
     def projects_dir(self) -> Path:
-        from app.core.storage_override import get_storage_override
-        override = get_storage_override()
+        # A corrupt override value (e.g. a path to a non-existent disk) is treated as "no override" so the fallback root is used instead. 
+        # This avoids splitting a project across two disks if the operator accidentally removes the external drive.
+        from app.core.storage_override import get_storage_override_or_fallback
+        override, _corrupt = get_storage_override_or_fallback()
         if override:
             return Path(override)
         return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
