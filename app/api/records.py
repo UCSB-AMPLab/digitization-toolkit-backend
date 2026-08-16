@@ -22,6 +22,7 @@ from app.schemas.record import (
 	RecordRejectRequest, RecordRejectionRead,
 )
 from app.core.config import settings
+from app.core.db_errors import integrity_conflict
 from app.core.paths import resolve_within_storage
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
@@ -103,7 +104,7 @@ def create_record(
 		db.refresh(rec)
 	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail=f"Database integrity error: {str(e)}")
+		raise integrity_conflict(e)
 	
 	return RecordRead.model_validate(rec)
 
@@ -210,9 +211,9 @@ def update_record(
 	db.add(rec)
 	try:
 		db.commit()
-	except IntegrityError:
+	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
+		raise integrity_conflict(e)
 	db.refresh(rec)
 	return _serialize_record(rec)
 

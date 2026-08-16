@@ -25,6 +25,7 @@ from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
 from app.schemas.project_member import ProjectMemberCreate, ProjectMemberRead
 from app.core.audit import log_event
+from app.core.db_errors import integrity_conflict
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -106,9 +107,9 @@ def add_record_to_project(
     db.add(r)
     try:
         db.commit()
-    except IntegrityError:
+    except IntegrityError as e:
         db.rollback()
-        raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
+        raise integrity_conflict(e)
     return {"detail": "record added"}
 
 
