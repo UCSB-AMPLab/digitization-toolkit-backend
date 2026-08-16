@@ -1,13 +1,14 @@
 """
-Hardware-gated integration tests for NEH-208 recapture through the real
+Hardware-gated integration tests for recapture through the real
 /cameras/capture and /cameras/capture/dual endpoints.
 
 Mirrors the skip pattern in test_capture_integration.py: these require real
-camera hardware (Linux/Raspberry Pi) and are not the primary coverage for
-this ticket — the non-hardware-gated test_reject_recapture_full_flow.py
-carries the required assertions on this dev machine. This file verifies the
-part only the real endpoints can exercise: the capture-mode mismatch guard,
-and that a recapture leaves the original file on disk untouched.
+camera hardware (Linux/Raspberry Pi) and skip when none is connected. They are
+not the primary coverage for recapture — the non-hardware-gated
+test_reject_recapture_full_flow.py carries the required assertions on a dev
+machine. This file verifies the part only the real endpoints can exercise: the
+capture-mode mismatch guard, and that a recapture leaves the original file on
+disk untouched.
 Run with: python -m pytest tests/integration/test_camera_capture_recapture_hardware.py
 """
 import pytest
@@ -24,10 +25,10 @@ from app.models.record import Record, RecordImage
 
 
 @pytest.mark.integration
-def test_single_capture_recapture_flips_rejected_back_to_in_review(client, db_session, test_project):
+def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client, db_session, test_project, skip_if_no_camera):
     project_name = test_project.name
 
-    response = client.post(
+    response = authed_client.post(
         "/cameras/capture",
         json={
             "project_name": project_name,
@@ -35,7 +36,6 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(client, db_se
             "resolution": "medium",
             "include_resolution_in_filename": False
         },
-        headers={"Authorization": "Bearer test_token"}
     )
     assert response.status_code == 200
     record_id = response.json()["record_id"]
@@ -45,7 +45,7 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(client, db_se
     record.status = "rejected"
     db_session.commit()
 
-    response = client.post(
+    response = authed_client.post(
         "/cameras/capture",
         json={
             "project_name": project_name,
@@ -54,7 +54,6 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(client, db_se
             "include_resolution_in_filename": False,
             "record_id": record_id,
         },
-        headers={"Authorization": "Bearer test_token"}
     )
     assert response.status_code == 200, response.text
 
@@ -70,10 +69,10 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(client, db_se
 
 
 @pytest.mark.integration
-def test_dual_capture_recapture_supersedes_both_sides(client, db_session, test_project):
+def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session, test_project, skip_if_no_camera):
     project_name = test_project.name
 
-    response = client.post(
+    response = authed_client.post(
         "/cameras/capture/dual",
         json={
             "project_name": project_name,
@@ -81,7 +80,6 @@ def test_dual_capture_recapture_supersedes_both_sides(client, db_session, test_p
             "include_resolution_in_filename": False,
             "stagger_ms": 20
         },
-        headers={"Authorization": "Bearer test_token"}
     )
     assert response.status_code == 200
     record_id = response.json()["record_id"]
@@ -94,7 +92,7 @@ def test_dual_capture_recapture_supersedes_both_sides(client, db_session, test_p
     old_images = db_session.query(RecordImage).filter(RecordImage.record_id == record_id).all()
     assert len(old_images) == 2
 
-    response = client.post(
+    response = authed_client.post(
         "/cameras/capture/dual",
         json={
             "project_name": project_name,
@@ -103,7 +101,6 @@ def test_dual_capture_recapture_supersedes_both_sides(client, db_session, test_p
             "stagger_ms": 20,
             "record_id": record_id,
         },
-        headers={"Authorization": "Bearer test_token"}
     )
     assert response.status_code == 200, response.text
 
@@ -121,7 +118,7 @@ def test_dual_capture_recapture_supersedes_both_sides(client, db_session, test_p
 
 
 @pytest.mark.integration
-def test_single_capture_recapture_rejects_mode_mismatch(client, db_session, test_project):
+def test_single_capture_recapture_rejects_mode_mismatch(authed_client, db_session, test_project, skip_if_no_camera):
     """A dual-mode record can't be recaptured through the single-camera endpoint."""
     project_name = test_project.name
 
@@ -129,7 +126,7 @@ def test_single_capture_recapture_rejects_mode_mismatch(client, db_session, test
     db_session.add(rec)
     db_session.commit()
 
-    response = client.post(
+    response = authed_client.post(
         "/cameras/capture",
         json={
             "project_name": project_name,
@@ -137,7 +134,6 @@ def test_single_capture_recapture_rejects_mode_mismatch(client, db_session, test
             "resolution": "medium",
             "record_id": rec.id,
         },
-        headers={"Authorization": "Bearer test_token"}
     )
     assert response.status_code == 422, response.text
 
