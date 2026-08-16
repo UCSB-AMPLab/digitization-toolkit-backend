@@ -159,19 +159,29 @@ def update_project(
     # keyed by name, so a rename moves the entire directory as a unit and rewrites
     # the stored paths. This keeps every capture and its manifest together and
     # leaves no stranded old-name directory for delete_project to miss later.
+    moved = False
+    wrote_journal = False
+    old_root = new_root = None
     if name_changed:
         from capture.project_manager import secure_project_filename, project_capture_root
+        from app.core.storage_ops import write_rename_journal, clear_rename_journal
 
         # secure_project_filename collapses many display names onto one directory,
         # so only touch the disk when the directory name actually changes.
         if secure_project_filename(old_name) != secure_project_filename(p.name):
             old_root = project_capture_root(old_name)
             new_root = project_capture_root(p.name)
+            # Record intent durably before the move so a crash between the move
+            # and the commit is repairable at startup rather than left dangling.
+            write_rename_journal(p.id, old_name, p.name, old_root, new_root)
+            wrote_journal = True
             try:
                 moved = move_project_tree(old_root, new_root)
             except FileExistsError:
+                clear_rename_journal()
                 raise HTTPException(status_code=409, detail="A project directory with this name already exists on disk")
             except OSError as e:
+                clear_rename_journal()
                 logger.error(f"Failed to move project directory {old_root} -> {new_root}: {e}")
                 raise HTTPException(status_code=500, detail="Failed to move project files on disk")
 
@@ -187,7 +197,21 @@ def update_project(
                         img.thumbnail_path = new_tp
 
     db.add(p)
-    db.commit()
+    try:
+        db.commit()
+    except Exception:
+        db.rollback()
+        # Undo the on-disk move so the filesystem matches the rolled-back DB.
+        if moved and old_root is not None:
+            try:
+                move_project_tree(new_root, old_root)
+            except OSError:
+                logger.exception("Failed to roll back project directory move; startup reconciliation will repair")
+        if wrote_journal:
+            clear_rename_journal()
+        raise
+    if wrote_journal:
+        clear_rename_journal()
     db.refresh(p)
     return ProjectRead.model_validate(p)
 

@@ -6,6 +6,7 @@ records are re-parented (move) or their container is removed (delete), and
 provide the guard that stops a delete from erasing files still referenced by surviving records.
 """
 
+import json
 import logging
 import os
 import shutil
@@ -178,6 +179,105 @@ def rebase_stored_path(stored: Optional[str], old_root: Path, new_root: Path) ->
     except (OSError, ValueError):
         return None
     return str(new_root / rel)
+
+
+# ---------------------------------------------------------------------------
+# Crash-safe project rename
+#
+# A rename moves the on-disk tree and then commits the new name/paths to the DB
+# - two steps that cannot share one transaction. On this power-loss-prone
+# appliance a crash between them would leave files at the new path while the DB
+# still points at the old one, dangling every record path. write_rename_journal
+# records intent durably before the move; reconcile_pending_rename replays or
+# discards it at startup so recovery is mechanical, not a manual SSH repair.
+# ---------------------------------------------------------------------------
+
+def _rename_journal_file() -> Path:
+    from app.core.config import settings
+    return settings.data_dir / "project-rename.journal"
+
+
+def write_rename_journal(project_id: int, old_name: str, new_name: str, old_root: Path, new_root: Path) -> None:
+    """Durably record intent to rename, before the on-disk move happens."""
+    from capture.utils import atomic_write
+
+    path = _rename_journal_file()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    payload = json.dumps({
+        "project_id": project_id,
+        "old_name": old_name,
+        "new_name": new_name,
+        "old_root": str(old_root),
+        "new_root": str(new_root),
+    }, indent=2)
+    atomic_write(path, lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"))
+
+
+def clear_rename_journal() -> None:
+    """Remove the journal once the rename has fully committed (or been undone)."""
+    try:
+        _rename_journal_file().unlink(missing_ok=True)
+    except OSError:
+        logger.exception("[ERROR] Failed to clear project rename journal")
+
+
+def read_rename_journal() -> Optional[dict]:
+    path = _rename_journal_file()
+    if not path.exists():
+        return None
+    try:
+        return json.loads(path.read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        logger.exception("[ERROR] Project rename journal is unreadable; discarding it")
+        clear_rename_journal()
+        return None
+
+
+def reconcile_pending_rename(db: Session) -> None:
+    """Replay or discard a rename interrupted by a crash. Idempotent; safe at every startup."""
+    j = read_rename_journal()
+    if not j:
+        return
+
+    project = db.query(Project).filter(Project.id == j["project_id"]).first()
+    old_root = Path(j["old_root"])
+    new_root = Path(j["new_root"])
+
+    if project is None:
+        clear_rename_journal()
+        return
+
+    # DB already carries the new name, so the move preceded the commit and files
+    # belong at new_root; repair only if a crash left them at old_root.
+    if project.name == j["new_name"]:
+        if old_root.exists() and not new_root.exists():
+            try:
+                move_project_tree(old_root, new_root)
+            except OSError:
+                logger.exception("[ERROR] Rename reconciliation could not move %s -> %s", old_root, new_root)
+                return  # keep the journal so the next startup retries
+        clear_rename_journal()
+        return
+
+    # DB still carries the old name: finish the DB side only if the files already moved.
+    if project.name == j["old_name"]:
+        if new_root.exists() and not old_root.exists():
+            project.name = j["new_name"]
+            for img in db.query(RecordImage).all():
+                new_fp = rebase_stored_path(img.file_path, old_root, new_root)
+                if new_fp:
+                    img.file_path = new_fp
+                new_tp = rebase_stored_path(img.thumbnail_path, old_root, new_root)
+                if new_tp:
+                    img.thumbnail_path = new_tp
+            db.commit()
+            logger.warning("Completed interrupted project rename %r -> %r after restart", j["old_name"], j["new_name"])
+        # Otherwise the move never happened and the DB is consistent at the old name.
+        clear_rename_journal()
+        return
+
+    # Name matches neither side (renamed again since): the journal is stale.
+    clear_rename_journal()
 
 
 def _do_renames(moves: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:

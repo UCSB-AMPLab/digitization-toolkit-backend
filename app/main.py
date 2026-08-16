@@ -21,6 +21,14 @@ async def lifespan(app: FastAPI):
     init_db()
     # Refuse to serve against an un-migrated schema so the failure is loud at startup rather than a later 500 in the field
     assert_schema_at_head()
+    # Finish or discard any project rename interrupted by a crash/power loss before serving requests
+    from app.core.db import SessionLocal
+    from app.core.storage_ops import reconcile_pending_rename
+    db = SessionLocal()
+    try:
+        reconcile_pending_rename(db)
+    finally:
+        db.close()
     yield
 
 # Create FastAPI app with lifespan
