@@ -482,6 +482,16 @@ def export_collection_bagit(
             },
         )
 
+    image_less = [r.id for r in records if not any(i.is_current for i in r.images)]
+    if image_less:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"Cannot export: {len(image_less)} record(s) have no image: {image_less}",
+                "blocking_record_ids": image_less,
+            },
+        )
+
     # One export per collection at a time: a retry returns the running job instead of
     # stacking a second export that doubles disk pressure. Integrity checks and the
     # zip build happen in the job, surfaced via the status endpoint.
