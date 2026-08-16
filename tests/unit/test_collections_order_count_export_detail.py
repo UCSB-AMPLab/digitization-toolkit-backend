@@ -273,3 +273,27 @@ def test_export_non_approved_records_returns_structured_422(contributor_client, 
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+@pytest.mark.unit
+def test_export_blocks_approved_record_with_no_image(contributor_client, db_session):
+    from app.models.project import Project
+    from app.models.collection import Collection
+    from app.models.record import Record, RecordImage
+
+    proj = Project(name="P"); db_session.add(proj); db_session.commit()
+    col = Collection(name="C", project_id=proj.id); db_session.add(col); db_session.commit()
+
+    r_ok = Record(title="ok", collection_id=col.id, status="approved", capture_mode="single")
+    r_empty = Record(title="empty", collection_id=col.id, status="approved", capture_mode="single")
+    db_session.add_all([r_ok, r_empty]); db_session.commit()
+    db_session.refresh(r_ok); db_session.refresh(r_empty)
+    db_session.add(RecordImage(record_id=r_ok.id, filename="x.jpg", file_path="/x.jpg",
+                               format="jpg", role="single", is_current=True))
+    db_session.commit()
+
+    resp = contributor_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 422, resp.text
+    detail = resp.json()["detail"]
+    assert r_empty.id in detail["blocking_record_ids"]
+    assert r_ok.id not in detail["blocking_record_ids"]

@@ -440,8 +440,15 @@ def delete_image(
 	if thumbnail_path:
 		delete_thumbnail(str(thumbnail_path))
 	
+	record_id = img.record_id
 	db.delete(img)
 	db.commit()
+
+	record = db.query(Record).filter(Record.id == record_id).first()
+	if record and record.status == "approved" and not any(i.is_current for i in record.images):
+		record.status = "in_review"
+		db.add(record)
+		db.commit()
 	return {"detail": "Image deleted"}
 
 
