@@ -63,11 +63,16 @@ def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
             thumb = raw.extract_thumb()
 
         if thumb.format == rawpy.ThumbFormat.JPEG:
-            preview_path.write_bytes(thumb.data)
+            atomic_write(preview_path, lambda tmp: Path(tmp).write_bytes(thumb.data))
         elif thumb.format == rawpy.ThumbFormat.BITMAP:
             from PIL import Image
 
-            Image.fromarray(thumb.data).save(preview_path, format="JPEG", quality=90)
+            atomic_write(
+                preview_path,
+                lambda tmp: Image.fromarray(thumb.data).save(
+                    tmp, format="JPEG", quality=90
+                ),
+            )
         else:
             logger.warning(
                 f"[gphoto2] unsupported thumbnail format {thumb.format!r} for "
@@ -78,7 +83,9 @@ def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
         logger.info(f"[gphoto2] embedded JPEG saved to {preview_path.name}")
         return True
     except Exception as exc:
-        logger.warning(f"[gphoto2] failed to extract embedded JPEG: {exc}")
+        logger.warning(
+            f"[gphoto2] failed to extract embedded JPEG from {raw_path.name}: {exc}"
+        )
         return False
 
 

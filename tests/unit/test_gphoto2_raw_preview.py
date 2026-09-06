@@ -64,6 +64,9 @@ def test_jpeg_thumb_is_written_directly(monkeypatch, tmp_path):
 
     assert result is True
     assert preview_path.read_bytes() == data
+    assert sorted(p.name for p in tmp_path.iterdir()) == sorted(
+        [raw_path.name, preview_path.name]
+    )
 
 
 def test_bitmap_thumb_is_encoded_as_jpeg(monkeypatch, tmp_path):
