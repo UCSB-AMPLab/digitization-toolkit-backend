@@ -180,25 +180,13 @@ def _get_camera_registry():
 		return None
 
 
-@router.get("/devices", response_model=List[DeviceInfo])
-def list_camera_devices(current_user: User = Depends(allow_read_only)):
+def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
+	"""Enrich raw backend device dicts with registry calibration data.
+
+	Shared by the enumeration and rescan routes so both return the same
+	DeviceInfo shape from the same backend dicts. A registry of None (import or
+	init failure) simply means nothing is enriched; enumeration still works.
 	"""
-	Return available camera devices detected by the active camera backend.
-
-	Returns hardware IDs, models, and calibration status for each camera.
-	Works with both picamera2 (IMX519) and gphoto2 (DSLR) backends.
-	On non-Pi systems or if camera libraries aren't available, returns empty list.
-	"""
-	registry = _get_camera_registry()
-
-	try:
-		from capture.service import get_backend
-		backend = get_backend()
-		raw_devices = backend.list_devices()
-	except Exception as e:
-		logger.error(f"Failed to list camera devices: {e}")
-		return []
-
 	devices = []
 	for dev in raw_devices:
 		hw_id = dev["hardware_id"]
@@ -237,6 +225,57 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		))
 
 	return devices
+
+
+@router.get("/devices", response_model=List[DeviceInfo])
+def list_camera_devices(current_user: User = Depends(allow_read_only)):
+	"""
+	Return available camera devices detected by the active camera backend.
+
+	Returns hardware IDs, models, and calibration status for each camera.
+	Works with both picamera2 (IMX519) and gphoto2 (DSLR) backends.
+	On non-Pi systems or if camera libraries aren't available, returns empty list.
+	"""
+	registry = _get_camera_registry()
+
+	try:
+		from capture.service import get_backend
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as e:
+		logger.error(f"Failed to list camera devices: {e}")
+		return []
+
+	return _device_infos(raw_devices, registry)
+
+
+@router.post("/rescan", response_model=List[DeviceInfo])
+def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
+	"""
+	Re-detect the attached cameras and drop any stale device sessions.
+
+	The operator's recovery lever when a DSLR drops off USB or re-enumerates
+	onto a different port mid-session: the backend rebuilds its port map and
+	closes the sessions that no longer match it, so the next capture opens
+	against the hardware as it actually is. Returns the same DeviceInfo list as
+	GET /devices.
+
+	This mutates backend state, so it sits behind allow_contributor rather than
+	allow_read_only. A backend failure is a 503 rather than an empty list: an
+	empty list reads as "no cameras attached" and would hide the failure from
+	the operator who just asked for a rescan.
+	"""
+	registry = _get_camera_registry()
+
+	try:
+		from capture.service import get_backend
+		backend = get_backend()
+		raw_devices = backend.rescan()
+	except Exception as exc:
+		logger.error(f"Camera rescan failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera rescan failed: {exc}")
+
+	return _device_infos(raw_devices, registry)
 
 
 @router.get("/capabilities")
