@@ -72,47 +72,30 @@ class CameraRegistry:
     def _get_camera_hardware_id_gphoto2(camera_index: int) -> Tuple[Optional[str], Dict]:
         """Hardware ID resolution for gphoto2 (DSLR) cameras.
 
-        Opens a brief PTP session to read serialnumber + cameramodel,
-        then closes it immediately. ID format: "{sanitized_model}_{serial}"
-        e.g. "canoneos1500d_3456789".
+        Delegates to the process-wide camera backend rather than opening its
+        own PTP session: a DSLR can only be claimed once, so a private
+        init()/exit() here is a second claim on a camera the live preview may
+        already hold. The backend owns the one session per camera, serialises
+        access to it, and reports the same hardware ID format
+        ("{sanitized_model}_{serial}", e.g. "canoneos1500d_3456789").
+
+        The import is function-local: capture.service reaches camera_registry
+        through project_manager, so a module-level import would be circular.
         """
         try:
-            import gphoto2 as gp
-            import re
-            detected = gp.Camera.autodetect()
-            if camera_index >= len(detected):
-                return None, {}
-            model_raw, port = detected[camera_index][0], detected[camera_index][1]
+            from capture.service import get_backend
 
-            # Open a brief PTP session to read serial number
-            al = gp.CameraAbilitiesList()
-            al.load()
-            cam = gp.Camera()
-            cam.set_abilities(al[al.lookup_model(model_raw)])
-            pil = gp.PortInfoList()
-            pil.load()
-            cam.set_port_info(pil[pil.lookup_path(port)])
-            cam.init()
-            try:
-                cfg = cam.get_config()
-                serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-            except Exception:
-                serial = ""
-            cam.exit()
-
-            # Sanitize model name: lowercase, remove spaces/special chars
-            model_slug = re.sub(r"[^a-z0-9]", "", model_raw.lower())
-            hw_id = (
-                f"{model_slug}_{serial}" if serial
-                else f"{model_slug}_idx{camera_index}"
-            )
-            return hw_id, {
-                "model": model_raw,
-                "serial": serial or None,
-                "location": f"USB {port}",
-                "id": port,
-                "index": camera_index,
-            }
+            for device in get_backend().list_devices():
+                if device["index"] != camera_index:
+                    continue
+                return device["hardware_id"], {
+                    "model": device["model"],
+                    "serial": device.get("serial"),
+                    "location": device.get("location"),
+                    "id": device.get("port"),
+                    "index": camera_index,
+                }
+            return None, {}
         except Exception as exc:
             return None, {"error": str(exc)}
 
