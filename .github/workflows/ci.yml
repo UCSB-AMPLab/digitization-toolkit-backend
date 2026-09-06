@@ -1,4 +1,6 @@
-# `-m "not camera"` deselects hardware-dependent tests (no camera in CI runners).
+# `-m "not camera"` deselects camera-marked tests; the remaining hardware fixtures
+# skip because the default picamera2 backend cannot be built on the runner
+# (the subprocess backend would raise FileNotFoundError for rpicam-still instead).
 # DATABASE_URL is set because alembic/env.py:50 (get_url) reads DATABASE_URL from
 # the environment before falling back to app settings, and `db-check-drift` needs
 # it to reach the postgres service below.
@@ -41,7 +43,6 @@ jobs:
           DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
           DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
           APP_ENV: test
-          CAMERA_BACKEND: subprocess
 
       - name: Schema drift guard
         run: pixi run -e dev db-check-drift
