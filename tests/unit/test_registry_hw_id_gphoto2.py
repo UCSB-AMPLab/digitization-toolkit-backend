@@ -118,3 +118,34 @@ def test_dispatch_uses_gphoto2_helper_when_backend_is_gphoto2(fake_backend, monk
     assert info["id"] == "usb:001,004"
     assert info["index"] == 0
     assert fake_backend.calls == 1
+
+
+def test_detect_enumerates_a_reserved_hole_at_its_pinned_index(monkeypatch, tmp_path):
+    """A map with a reserved hole must enumerate its one body at index 1.
+
+    detect_cameras() used to count gp.Camera.autodetect() and then walk
+    range(count), which puts a single surviving body at index 0 no matter
+    which index the backend pinned it to. It now builds its result from one
+    backend enumeration, so the index the backend published is the index the
+    registry records - and only one enumeration is run, not one per index.
+    """
+    from app.core.config import settings
+
+    backend = _FakeBackend([DEVICES[1]])
+    monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(settings, "CAMERA_BACKEND", "gphoto2")
+
+    registry = CameraRegistry(registry_path=tmp_path / "registry.json")
+    detected = registry.detect_cameras()
+
+    assert set(detected) == {1}
+    hw_id, info = detected[1]
+    assert hw_id == "canoneosrebelt7_2222222"
+    assert info["model"] == "Canon EOS Rebel T7"
+    assert info["serial"] == "2222222"
+    assert info["location"] == "USB usb:001,005"
+    assert info["id"] == "usb:001,005"
+    assert info["index"] == 1
+    assert backend.calls == 1, (
+        f"expected one enumeration, got {backend.calls}"
+    )

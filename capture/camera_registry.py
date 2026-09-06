@@ -165,6 +165,15 @@ class CameraRegistry:
         """
         Detect all connected cameras and return their hardware IDs.
 
+        The gphoto2 path asks the process-wide backend to enumerate once and
+        takes the indices it publishes, rather than counting the bodies on the
+        bus and walking range(count). The backend pins each index to a body
+        serial, so its map can have a reserved hole - one surviving body sitting
+        at index 1 while index 0 waits for the camera that is switched off -
+        and range(count) would report that body at index 0, quietly recording
+        the right-hand camera as the left-hand one. One enumeration also means
+        one pass over the bus, not one per index.
+
         Returns:
             Dict mapping camera_index -> (hardware_id, info)
         """
@@ -176,19 +185,32 @@ class CameraRegistry:
             backend = "picamera2"
 
         if backend == "gphoto2":
+            # Function-local import: capture.service reaches camera_registry
+            # through project_manager, so a module-level import is circular.
             try:
-                import gphoto2 as gp
-                cameras = gp.Camera.autodetect()
-                count = len(cameras)
-            except Exception:
-                count = 0
-        else:
-            if not _PICAMERA2_AVAILABLE:
-                return {}
-            camera_info = Picamera2.global_camera_info()
-            count = len(camera_info)
+                from capture.service import get_backend
 
-        for idx in range(count):
+                for device in get_backend().list_devices():
+                    hw_id = device.get("hardware_id")
+                    if not hw_id:
+                        continue
+                    idx = device["index"]
+                    detected[idx] = (hw_id, {
+                        "model": device["model"],
+                        "serial": device.get("serial"),
+                        "location": device.get("location"),
+                        "id": device.get("port"),
+                        "index": idx,
+                    })
+            except Exception:
+                return {}
+            return detected
+
+        if not _PICAMERA2_AVAILABLE:
+            return {}
+        camera_info = Picamera2.global_camera_info()
+
+        for idx in range(len(camera_info)):
             hw_id, info = self.get_camera_hardware_id(idx)
             if hw_id:
                 detected[idx] = (hw_id, info)
