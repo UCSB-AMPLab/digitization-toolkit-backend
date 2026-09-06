@@ -12,7 +12,7 @@ on:
 
 jobs:
   test:
-    runs-on: ubuntu-latest
+    runs-on: ubuntu-24.04
     services:
       postgres:
         image: postgres:16
@@ -21,7 +21,7 @@ jobs:
           POSTGRES_PASSWORD: dtk
           POSTGRES_DB: dtk
         ports:
-          - 5432:5432
+          - 5432
         options: >-
           --health-cmd pg_isready
           --health-interval 10s
@@ -30,7 +30,7 @@ jobs:
     steps:
       - uses: actions/checkout@v4
 
-      - uses: prefix-dev/setup-pixi@v0.10.2
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
         with:
           environments: dev
           cache: true
@@ -46,7 +46,7 @@ jobs:
       - name: Schema drift guard
         run: pixi run -e dev db-check-drift
         env:
-          DATABASE_URL: postgresql+psycopg://dtk:dtk@localhost:5432/dtk
+          DATABASE_URL: postgresql+psycopg://dtk:dtk@localhost:${{ job.services.postgres.ports[5432] }}/dtk
           DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
           DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
           APP_ENV: test
