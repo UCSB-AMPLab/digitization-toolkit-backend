@@ -658,11 +658,18 @@ class GPhoto2Backend(CameraBackend):
                 )
             pins = {}
             for key, serial in data["pins"].items():
-                if not isinstance(serial, str) or not serial:
-                    raise ValueError(f"binding {key!r} has no serial")
+                # The file is only ever written by _save_pins, in canonical
+                # form: decimal index strings and stripped serials. Anything
+                # else is a hand edit or corruption, and a key that is not
+                # canonical can collapse onto another index ("00" onto 0) or
+                # a serial can never match the stripped value a body answers.
+                if not isinstance(serial, str) or not serial or serial != serial.strip():
+                    raise ValueError(f"binding {key!r} has no canonical serial")
                 index = int(key)
-                if index < 0:
+                if index < 0 or str(index) != key:
                     raise ValueError(f"binding {key!r} is not a camera index")
+                if index in pins:
+                    raise ValueError(f"index {index} is bound twice")
                 if serial in pins.values():
                     # Two indices bound to one body would reserve a side for
                     # a body that can only ever be laid on the other one;

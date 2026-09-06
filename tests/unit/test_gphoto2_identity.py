@@ -883,6 +883,15 @@ def test_pins_survive_a_restart_and_restore_both_sides(monkeypatch, bindings_dir
             json.dumps({"version": 1, "pins": {"-1": SERIAL_A}}), id="negative-index"
         ),
         pytest.param(json.dumps({"version": 1, "pins": {"0": ""}}), id="empty-serial"),
+        pytest.param(
+            json.dumps({"version": 1, "pins": {"0": SERIAL_A, "00": SERIAL_B}}),
+            id="two-keys-one-index",
+        ),
+        pytest.param(
+            json.dumps({"version": 1, "pins": {"0": f" {SERIAL_A} ", "1": SERIAL_B}}),
+            id="untrimmed-serial",
+        ),
+        pytest.param(json.dumps({"version": 1, "pins": {"0": "   "}}), id="blank-serial"),
     ],
 )
 def test_a_malformed_bindings_file_is_ignored(monkeypatch, bindings_dir, caplog, raw):
