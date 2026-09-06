@@ -1,11 +1,12 @@
 """get_backend() must not race on the module-global singleton.
 
-get_backend() does an unsynchronised check-then-set on `capture.service._backend`.
-Camera endpoints run on FastAPI's thread pool, and the kiosk fires a device
-list plus two previews on boot, so two first callers can each pass the
-`if _backend is None:` check before either one assigns - each constructs its
-own backend, and the loser's PTP sessions and locks are never seen by the
-winner holding the module global.
+Without a lock, get_backend() would be an unsynchronised check-then-set on
+`capture.service._backend`. Camera endpoints run on FastAPI's thread pool, and
+the kiosk fires a device list plus two previews on boot, so two first callers
+could each pass the `if _backend is None:` check before either one assigned -
+each would construct its own backend, and the loser's PTP sessions and locks
+would never be seen by the winner holding the module global. `_backend_lock`
+now covers the whole check-and-construct; these tests hold it to that.
 
 The fake constructor below models exactly that window: it counts entries,
 records (and signals) each entry into the constructor body, and then blocks
