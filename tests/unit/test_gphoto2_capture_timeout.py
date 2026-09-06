@@ -242,7 +242,9 @@ def test_capture_times_out_when_no_file_event_arrives(monkeypatch, tmp_path):
     assert script.wait_calls >= 1, "the wait must poll in steps, not block once"
     assert 0 not in backend._sessions, "a timed-out session must be closed"
     assert script.exit_calls == 1
-    assert threading.active_count() == threads_before, "no watchdog thread may leak"
+    # <= rather than ==: an unrelated thread ending between the two counts is
+    # not a leak; a new thread surviving the timeout is.
+    assert threading.active_count() <= threads_before, "no watchdog thread may leak"
 
 
 # ----------------------------------------------------------------------
