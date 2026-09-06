@@ -41,6 +41,47 @@ except ImportError:
 from .base import CameraBackend
 from ..utils import atomic_write
 
+
+def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
+    """
+    Extract the embedded preview JPEG from a raw file and write it to preview_path.
+
+    rawpy's extract_thumb() returns either an already-encoded JPEG
+    (ThumbFormat.JPEG, .data is bytes) or a raw bitmap (ThumbFormat.BITMAP,
+    .data is an HxWx3 uint8 array) that must be encoded via Pillow. Never
+    raises - by the time this runs the master file has already been saved
+    and deleted from the camera, so a preview failure must not abort capture.
+    """
+    if not _RAWPY_AVAILABLE:
+        logger.warning(
+            f"[gphoto2] rawpy is not installed; no preview written for {raw_path.name}"
+        )
+        return False
+
+    try:
+        with rawpy.imread(str(raw_path)) as raw:
+            thumb = raw.extract_thumb()
+
+        if thumb.format == rawpy.ThumbFormat.JPEG:
+            preview_path.write_bytes(thumb.data)
+        elif thumb.format == rawpy.ThumbFormat.BITMAP:
+            from PIL import Image
+
+            Image.fromarray(thumb.data).save(preview_path, format="JPEG", quality=90)
+        else:
+            logger.warning(
+                f"[gphoto2] unsupported thumbnail format {thumb.format!r} for "
+                f"{raw_path.name}; no preview written"
+            )
+            return False
+
+        logger.info(f"[gphoto2] embedded JPEG saved to {preview_path.name}")
+        return True
+    except Exception as exc:
+        logger.warning(f"[gphoto2] failed to extract embedded JPEG: {exc}")
+        return False
+
+
 # Image format mapping: CameraConfig.image_format -> PTP imageformat widget value
 _IMAGE_FORMAT_MAP = {
     "JPEG":     "L",
@@ -260,23 +301,12 @@ class _PTPSession:
                 elapsed = time.perf_counter() - t0
 
                 # Extract embedded JPEG from CR2 for thumbnail/review pipeline
-                if is_raw and _RAWPY_AVAILABLE:
-                    try:
-                        preview_path = actual_outpath.with_name(
-                            actual_outpath.stem + "_preview.jpg"
-                        )
-                        with rawpy.imread(str(actual_outpath)) as raw:
-                            thumb = raw.extract_thumb()
-                        if hasattr(thumb, "data"):
-                            preview_path.write_bytes(thumb.data)
-                        self._logger.info(
-                            f"[gphoto2] {self.port}: embedded JPEG saved to "
-                            f"{preview_path.name}"
-                        )
-                    except Exception as exc:
-                        self._logger.warning(
-                            f"[gphoto2] {self.port}: failed to extract embedded JPEG: {exc}"
-                        )
+                if is_raw:
+                    _write_raw_preview(
+                        actual_outpath,
+                        actual_outpath.with_name(actual_outpath.stem + "_preview.jpg"),
+                        self._logger,
+                    )
 
                 return elapsed, actual_outpath
             except gp.GPhoto2Error as exc:
