@@ -112,39 +112,59 @@ def override_projects_root(tmp_path, monkeypatch):
     return test_projects_dir
 
 
+def _is_camera_backend_unavailable(exc):
+    """
+    Return True if the given RuntimeError indicates the camera backend
+    itself is unavailable on this platform (as opposed to a camera simply
+    not being connected).
+    """
+    message = str(exc)
+    return (
+        "requires Linux" in message
+        or "Picamera2Backend" in message
+        or "picamera2 failed to import" in message
+    )
+
+
 @pytest.fixture
 def skip_if_no_camera():
     """
     Skip test if no cameras are detected.
-    
+
     Usage:
         def test_camera_function(skip_if_no_camera):
             # Test will be skipped if no cameras found
             ...
     """
     from capture import is_camera_connected
-    
-    if not is_camera_connected(0):
-        pytest.skip("No camera detected - skipping hardware test")
+
+    try:
+        if not is_camera_connected(0):
+            pytest.skip("No camera detected - skipping hardware test")
+    except RuntimeError as e:
+        if _is_camera_backend_unavailable(e):
+            pytest.skip("Camera backend not available on this platform - skipping test")
+        else:
+            raise
 
 
 @pytest.fixture
 def skip_if_single_camera():
     """
     Skip test if fewer than 2 cameras are detected.
-    
+
     Usage:
         def test_dual_camera_function(skip_if_single_camera):
             # Test will be skipped if not enough cameras
             ...
     """
     from capture import is_camera_connected
-    
+
     try:
         if not (is_camera_connected(0) and is_camera_connected(1)):
             pytest.skip("Dual cameras not detected - skipping test")
     except RuntimeError as e:
-        if "requires Linux" in str(e) or "Picamera2Backend" in str(e):
+        if _is_camera_backend_unavailable(e):
             pytest.skip("Camera backend not available on this platform - skipping test")
         else:
             raise
