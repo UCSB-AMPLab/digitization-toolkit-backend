@@ -864,9 +864,36 @@ def test_pins_survive_a_restart_and_restore_both_sides(monkeypatch, bindings_dir
 # (k) a malformed bindings file is not an error
 # ----------------------------------------------------------------------
 
-def test_a_malformed_bindings_file_is_ignored(monkeypatch, bindings_dir, caplog):
-    """autodetect: [A, B], with a truncated bindings file on disk."""
-    _write_bindings(bindings_dir, None, raw='{"version": 1, "pins": {"0": ')
+@pytest.mark.parametrize(
+    "raw",
+    [
+        pytest.param('{"version": 1, "pins": {"0": ', id="truncated"),
+        pytest.param(
+            json.dumps({"version": 2, "pins": {"0": SERIAL_A}}), id="wrong-version"
+        ),
+        pytest.param(json.dumps({"pins": {"0": SERIAL_A}}), id="no-version"),
+        pytest.param(
+            json.dumps({"version": 1, "pins": {"0": SERIAL_A, "1": SERIAL_A}}),
+            id="duplicate-serial",
+        ),
+        pytest.param(
+            json.dumps({"version": 1, "pins": {"left": SERIAL_A}}), id="non-integer-key"
+        ),
+        pytest.param(
+            json.dumps({"version": 1, "pins": {"-1": SERIAL_A}}), id="negative-index"
+        ),
+        pytest.param(json.dumps({"version": 1, "pins": {"0": ""}}), id="empty-serial"),
+    ],
+)
+def test_a_malformed_bindings_file_is_ignored(monkeypatch, bindings_dir, caplog, raw):
+    """autodetect: [A, B], with a bindings file on disk that must not be trusted.
+
+    Every case degrades the same way: no pins, a warning naming the file, and
+    the positional map. A file that parses but is inconsistent - a version
+    this code does not know, one serial bound to two indices - is as
+    untrustworthy as one that does not parse, and is treated the same.
+    """
+    _write_bindings(bindings_dir, None, raw=raw)
 
     with caplog.at_level(logging.WARNING):
         backend, _claims, _detector, _bodies, _cls = _backend_with(

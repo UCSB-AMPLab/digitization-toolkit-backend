@@ -652,11 +652,23 @@ class GPhoto2Backend(CameraBackend):
             return
         try:
             data = json.loads(path.read_text(encoding="utf-8"))
+            if data.get("version") != _BINDINGS_VERSION:
+                raise ValueError(
+                    f"version {data.get('version')!r} is not {_BINDINGS_VERSION}"
+                )
             pins = {}
             for key, serial in data["pins"].items():
                 if not isinstance(serial, str) or not serial:
                     raise ValueError(f"binding {key!r} has no serial")
-                pins[int(key)] = serial
+                index = int(key)
+                if index < 0:
+                    raise ValueError(f"binding {key!r} is not a camera index")
+                if serial in pins.values():
+                    # Two indices bound to one body would reserve a side for
+                    # a body that can only ever be laid on the other one;
+                    # that is not a binding set, it is a corrupt one.
+                    raise ValueError(f"serial {serial!r} is bound to two indices")
+                pins[index] = serial
         except Exception as exc:
             self.logger.warning(
                 f"[gphoto2] {path} is unreadable ({exc}); starting with no "
