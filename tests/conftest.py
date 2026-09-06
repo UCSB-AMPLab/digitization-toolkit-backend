@@ -117,12 +117,26 @@ def _is_camera_backend_unavailable(exc):
     Return True if the given RuntimeError indicates the camera backend
     itself is unavailable on this platform (as opposed to a camera simply
     not being connected).
+
+    Matches the four sources of this RuntimeError:
+      - capture/backends/picamera2_backend.py:66 raises "... requires Linux"
+        when Picamera2 failed to import and we're not on Linux at all.
+      - capture/backends/picamera2_backend.py:70 raises "picamera2 failed to
+        import: ..." when Picamera2 failed to import on Linux for a concrete
+        reason.
+      - capture/backends/__init__.py:23 substitutes a stub Picamera2Backend
+        whose constructor raises "picamera2 is not available on this
+        system ..." when the real backend module itself fails to import
+        (ImportError/ValueError from a numpy ABI mismatch).
+      - capture/calibration.py raises "picamera2 is not available on this
+        system" when _PICAMERA2_AVAILABLE is False.
     """
     message = str(exc)
     return (
         "requires Linux" in message
         or "Picamera2Backend" in message
         or "picamera2 failed to import" in message
+        or "picamera2 is not available" in message
     )
 
 
@@ -130,6 +144,9 @@ def _is_camera_backend_unavailable(exc):
 def skip_if_no_camera():
     """
     Skip test if no cameras are detected.
+
+    Also skips when the camera backend itself cannot be initialised on this
+    platform (see _is_camera_backend_unavailable).
 
     Usage:
         def test_camera_function(skip_if_no_camera):
@@ -152,6 +169,9 @@ def skip_if_no_camera():
 def skip_if_single_camera():
     """
     Skip test if fewer than 2 cameras are detected.
+
+    Also skips when the camera backend itself cannot be initialised on this
+    platform (see _is_camera_backend_unavailable).
 
     Usage:
         def test_dual_camera_function(skip_if_single_camera):
