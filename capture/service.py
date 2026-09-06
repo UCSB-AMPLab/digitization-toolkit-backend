@@ -78,14 +78,22 @@ def get_camera_backend() -> CameraBackend:
 
 # Global backend instance (lazy initialization)
 _backend: Optional[CameraBackend] = None
+_backend_lock = threading.Lock()
 
 def get_backend() -> CameraBackend:
-    """Get or initialize the global camera backend."""
+    """Get or initialize the global camera backend.
+
+    The lock covers the whole check-and-construct so two first callers on the
+    thread pool cannot each build their own instance. Stays lazy: nothing is
+    constructed until the first call, and a failed construction leaves the
+    global unset so the next call retries.
+    """
     global _backend
-    if _backend is None:
-        _backend = get_camera_backend()
-        subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
-    return _backend
+    with _backend_lock:
+        if _backend is None:
+            _backend = get_camera_backend()
+            subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+        return _backend
 
 
 def is_camera_connected(camera_index: int = 0) -> bool:
