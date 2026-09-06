@@ -272,7 +272,7 @@ def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
 		backend = get_backend()
 		raw_devices = backend.rescan()
 	except Exception as exc:
-		logger.error(f"Camera rescan failed: {exc}")
+		logger.exception(f"Camera rescan failed: {exc}")
 		raise HTTPException(status_code=503, detail=f"Camera rescan failed: {exc}")
 
 	return _device_infos(raw_devices, registry)
