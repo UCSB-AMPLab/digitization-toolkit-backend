@@ -31,6 +31,22 @@ import pytest
 import capture.backends.gphoto2_backend as gb
 
 
+@pytest.fixture(autouse=True)
+def isolated_projects_root(monkeypatch, tmp_path):
+    """Keep this file's backends off any real projects root.
+
+    GPhoto2Backend now persists its index -> body bindings to
+    <projects_dir>/camera-bindings.json and seeds them at construction, so
+    without a per-test root one test's rig would seed the next test's backend.
+    """
+    from app.core.config import settings
+
+    root = tmp_path / "projects"
+    root.mkdir(parents=True, exist_ok=True)
+    monkeypatch.setattr(settings, "PROJECTS_ROOT", str(root))
+    return root
+
+
 MODEL = "Canon EOS Rebel T7"
 # A different body can take over an index after a rescan; the row must then
 # carry that body's model, not the one the enumeration snapshot remembered.
