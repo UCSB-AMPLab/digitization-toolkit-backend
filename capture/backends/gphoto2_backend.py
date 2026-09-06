@@ -538,6 +538,8 @@ class GPhoto2Backend(CameraBackend):
         # per-camera lock for capture serialisation
         self._session_locks: dict[int, threading.Lock] = {}
         self._map_lock = threading.Lock()
+        # serialises rescan() so overlapping snapshots publish in order
+        self._rescan_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Port map management
@@ -574,10 +576,53 @@ class GPhoto2Backend(CameraBackend):
     # Session management
     # ------------------------------------------------------------------
 
+    def _session_matches_map(self, camera_index: int) -> "_PTPSession | None":
+        """Return the cached session for camera_index if the current map still backs it.
+
+        Reads the port map fresh on every call - via self._get_port_map() -
+        rather than accepting a map the caller copied earlier, because
+        _refresh_port_map() can publish a new map at any time, outside
+        _rescan_lock, and a caller's snapshot can predate that publish. A
+        session validated against a stale snapshot could be closed for no
+        longer matching a map that was already out of date, or kept alive
+        past a publish that actually invalidated it.
+
+        A session is usable only while it is open and the current port map
+        still puts the same model on the same port at that index. A cached
+        session that fails either test is dead weight holding a PTP claim on
+        a body that has moved or gone, so it is closed here and None is
+        returned; the caller then treats the index as having no session.
+        Callers must hold the per-camera lock for camera_index, since closing
+        a session and the reads that follow must not interleave with a
+        capture, preview or open on the same body.
+        """
+        session = self._sessions.get(camera_index)
+        if session is None:
+            return None
+        entry = self._get_port_map().get(camera_index)
+        if session._cam is not None and entry == (session.model, session.port):
+            return session
+        self.logger.info(
+            f"[gphoto2] Camera {camera_index}: cached session "
+            f"({session.model} on {session.port}) does not match the port map "
+            f"entry {entry!r}; closing it"
+        )
+        self._close_session(camera_index)
+        return None
+
     def _get_or_open_session(self, camera_index: int) -> _PTPSession:
-        """Return an existing open session, or open a new one."""
-        existing = self._sessions.get(camera_index)
-        if existing is not None and existing._cam is not None:
+        """Return an existing open session, or open a new one.
+
+        The cached session is validated against the port map as currently
+        published (see _session_matches_map), never a snapshot held only by
+        this call. When validation finds no usable session, a new one is
+        opened against whatever the map says at that point; the map is free
+        to have moved on again by then, and that is fine - the open below
+        uses whatever is published now, and the -105 retry path further down
+        still refreshes and retries on top of that.
+        """
+        existing = self._session_matches_map(camera_index)
+        if existing is not None:
             return existing
 
         port_map = self._get_port_map()
@@ -695,9 +740,26 @@ class GPhoto2Backend(CameraBackend):
     def list_devices(self) -> list:
         """Enumerate all connected DSLR cameras and return device metadata.
 
-        Uses the persistent port map (refreshed if empty). For each camera,
-        re-uses an already-open PTP session to read the serial number; if no
-        session is open yet, opens a brief one just for the read and closes it.
+        Uses the persistent port map (refreshed if empty) to pick the set of
+        indices to look at, but every session match is against the map as
+        currently published (see _session_matches_map), not this call's
+        snapshot - a publish can land while this call is paused on a
+        per-camera lock. For each camera, re-uses an already-open PTP session
+        to read the serial number; if no session is open yet, opens a brief
+        one just for the read and closes it. A cached session is re-used only
+        while the current map still puts the same model on the same port at
+        that index - one that does not match is a claim on a body that has
+        moved or gone, so it is closed and the temporary read path runs
+        against the map's port instead. A row built from a matched session
+        reports the session's own port, which can be newer than this call's
+        snapshot.
+
+        When no session is cached and the current map disagrees with this
+        call's snapshot for an index - a different port, a different model,
+        or the index gone entirely - the temporary open is skipped for that
+        row rather than risking a claim on a port nothing backs any more; the
+        row is left out of the result, and the caller's next
+        list_devices()/rescan() call sees the current map.
 
         The per-camera lock is held while the serial is read, so enumeration
         serialises with capture, preview and session opening. Without it, an
@@ -713,16 +775,33 @@ class GPhoto2Backend(CameraBackend):
         result = []
         for idx, (model_raw, port) in sorted(port_map.items()):
             serial = ""
+            row_port = port
+            row_model = model_raw
             with self._get_camera_lock(idx):
-                # Re-use existing open session if available
-                session = self._sessions.get(idx)
-                if session is not None and session._cam is not None:
+                # Re-use an existing session, but only while the current map
+                # still backs it; a session on a stale port is closed here
+                # and the temporary read path below runs instead.
+                session = self._session_matches_map(idx)
+                if session is not None:
+                    # The match above is against the current map, not this
+                    # snapshot, so report the session's own port rather than
+                    # replay a port that may not be what this index's
+                    # snapshot row holds any more.
+                    row_port = session.port
+                    row_model = session.model
                     try:
                         cfg = session._cam.get_config()
                         serial = cfg.get_child_by_name("serialnumber").get_value().strip()
                     except Exception:
                         pass
                 else:
+                    current_entry = self._get_port_map().get(idx)
+                    if current_entry != (model_raw, port):
+                        # The current map disagrees with this row's
+                        # snapshot; opening against (model_raw, port) would
+                        # claim a port nothing backs any more. Leave this row
+                        # out - the next enumeration sees the current map.
+                        continue
                     # Nobody holds this camera, so a brief PTP connection just
                     # to read the serial number is not a competing claim.
                     cam = None
@@ -753,23 +832,64 @@ class GPhoto2Backend(CameraBackend):
                             except Exception:
                                 pass
 
-            model_slug = re.sub(r"[^a-z0-9]", "", model_raw.lower())
+            model_slug = re.sub(r"[^a-z0-9]", "", row_model.lower())
             hw_id = (
                 f"{model_slug}_{serial}" if serial
                 else f"{model_slug}_idx{idx}"
             )
             result.append({
                 "index": idx,
-                "model": model_raw,
+                "model": row_model,
                 "hardware_id": hw_id,
                 "serial": serial or None,
-                "location": f"USB {port}",
-                "port": port,                    # raw USB port, e.g. "usb:001,005"
+                "location": f"USB {row_port}",
+                "port": row_port,                # raw USB port, e.g. "usb:001,005"
                 "has_aperture_control": True,   # DSLRs always expose aperture via PTP
                 "supports_zoom": False,          # No digital zoom for DSLRs
             })
 
         return result
+
+    def rescan(self) -> list:
+        """Re-detect the bodies, republish the port map, drop stale sessions.
+
+        The recovery lever for a DSLR that drops off USB or re-enumerates onto
+        a different port mid-session: without it the only way to clear a stale
+        PTP session is a restart.
+
+        The new map is published before any session is reconciled, so a session
+        that finishes opening after this point is validated against the port
+        map as currently published at its next use, under its own lock - the
+        reconcile loop cannot see a session that is still inside its
+        constructor, and publishing first is what makes that harmless.
+        Reconcile, and the list_devices() enumeration returned below, both
+        read the port map fresh at the point of each check (see
+        _session_matches_map); a _refresh_port_map() from another caller
+        landing between this rescan's own publish and its reconcile is
+        honoured on that fresh read rather than masked by this rescan's own
+        snapshot. The rescan lock serialises overlapping rescans so their
+        snapshots publish in order rather than racing.
+
+        Returns:
+            list: The device dicts for the freshly detected bodies, in the same
+            shape list_devices() returns.
+        """
+        with self._rescan_lock:
+            new_map = self._build_port_map()
+            with self._map_lock:
+                self._port_map = new_map
+
+            closed = []
+            for idx in list(self._sessions):
+                with self._get_camera_lock(idx):
+                    if self._session_matches_map(idx) is None:
+                        closed.append(idx)
+
+            self.logger.info(
+                f"[gphoto2] rescan: closed stale sessions {closed}; "
+                f"port map is now {new_map}"
+            )
+            return self.list_devices()
 
     def capture_preview(self, camera_index: int) -> bytes:
         """Return a live-preview JPEG frame from the camera.
