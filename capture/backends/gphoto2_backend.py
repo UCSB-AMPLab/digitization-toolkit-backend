@@ -12,6 +12,11 @@ Key design decisions:
     every capture. Flash (UV/visible) causes photochemical degradation of archival
     paper and ink - use external continuous lighting instead.
   - Focus mode detection: warns if lens is not in MF (AF causes ~12s PTP hangs).
+  - Bounded capture: trigger_capture() then a stepped wait_for_event() loop
+    instead of one blocking capture() call. The deadline scales with the
+    configured exposure and is checked between libgphoto2 calls, each of which
+    is bounded by libgphoto2's own USB timeouts. A capture that passes the
+    deadline closes the session, so the next call re-opens it.
 
 Tested with: Canon EOS 1500D x 2, USB 2.0, Raspberry Pi.
 
@@ -105,6 +110,62 @@ _IMAGE_FORMAT_REVERSE_MAP = {v: k for k, v in _IMAGE_FORMAT_MAP.items()}
 _DEFAULT_SETTLE = 3.0
 _DEFAULT_RETRY = 3
 
+# Capture deadline: how long the camera has to hand over a file after the
+# shutter has been triggered, before the capture is abandoned and the session
+# closed. This is the part of the deadline that does not depend on the
+# exposure; the configured exposure is added on top (see _capture_deadline_s).
+_CAPTURE_TIMEOUT_BASE_S = 15.0
+# How long a single wait_for_event() call blocks, in milliseconds. The deadline
+# can only be checked between calls, so this is the polling granularity.
+_EVENT_STEP_MS = 500
+# A bulb shutterspeed carries no duration, and a shutterspeed that comes back
+# unreadable (a None from a failed config read) or unparseable ("auto", empty,
+# or garbage) gives no information at all - neither case is safe to treat as
+# a short exposure. Treat both as this many seconds of exposure when sizing
+# the deadline.
+_UNKNOWN_EXPOSURE_S = 30.0
+
+
+class CaptureTimeoutError(RuntimeError):
+    """No image arrived from the camera before the capture deadline."""
+
+
+def _parse_exposure_seconds(shutterspeed) -> float:
+    """Convert a Canon EOS shutterspeed widget value to seconds.
+
+    Canon bodies report shutterspeed as "auto", "bulb", whole seconds ("30"),
+    decimals ("20.3", "0.8") or fractions ("1/125"). Returns
+    _UNKNOWN_EXPOSURE_S - never None - when there is no usable number: "auto",
+    "bulb", an empty value, an unreadable widget (a None from a failed config
+    read), or anything unparseable. The caller must size the deadline as if
+    the exposure could be long, since "unknown" is not evidence that it is
+    short.
+    """
+    if shutterspeed is None:
+        return _UNKNOWN_EXPOSURE_S
+    text = str(shutterspeed).strip()
+    if not text or text.lower() == "auto":
+        return _UNKNOWN_EXPOSURE_S
+    if text.lower() == "bulb":
+        return _UNKNOWN_EXPOSURE_S
+    try:
+        if "/" in text:
+            numerator, _, denominator = text.partition("/")
+            return float(numerator) / float(denominator)
+        return float(text)
+    except (ValueError, ZeroDivisionError):
+        return _UNKNOWN_EXPOSURE_S
+
+
+def _capture_deadline_s(exposure: float) -> float:
+    """Deadline in seconds for one capture at the given exposure.
+
+    The exposure is counted twice: once for the shutter being open, once for
+    the post-exposure processing libgphoto2 budgets on top of it - it allows
+    30 s of noise reduction after a 30 s exposure.
+    """
+    return _CAPTURE_TIMEOUT_BASE_S + 2 * exposure
+
 
 class _PTPSession:
     """
@@ -119,6 +180,8 @@ class _PTPSession:
         self.model = model
         self._logger = logger
         self._cam = None
+        # Focus mode as read at session open; named in capture timeout messages.
+        self._focus_mode = None
         self._open()
 
     def _open(self):
@@ -223,6 +286,7 @@ class _PTPSession:
     def _warn_if_af(self):
         """Log a warning if the lens is not in manual focus mode."""
         focusmode = self._get_config("focusmode")
+        self._focus_mode = focusmode
         if focusmode and focusmode not in ("Manual", "MF"):
             self._logger.warning(
                 f"[gphoto2] {self.port}: focusmode={focusmode!r} - "
@@ -265,6 +329,109 @@ class _PTPSession:
     # Capture
     # ------------------------------------------------------------------
 
+    def _trigger_with_retry(self, retry: int, retry_delay: float, deadline_s: float):
+        """Fire the shutter, retrying only once the event queue proves it safe.
+
+        libgphoto2's EOS trigger_capture() full-presses the shutter and can
+        then fail on the half- or full-release call that follows, so a
+        "busy"/-110 error from trigger_capture() does not prove no exposure
+        happened - and that is just as true of the last attempt as of any
+        earlier one. A long exposure's file can take far longer to land than
+        any short settle delay, so every retriable trigger error - including
+        one on the final attempt - is first followed by polling the event
+        queue for the same capture deadline the post-trigger wait rests on:
+        the recovery poll rests on exactly the same evidence as the timeout
+        path, an event queue that stayed empty for the whole deadline. On a
+        retriable error this polls wait_for_event() via
+        self._poll_for_file(deadline_s) instead of sleeping. If a
+        GP_EVENT_FILE_ADDED turns up during that window, the shutter already
+        fired and its CameraFilePath is returned instead of re-triggering.
+        If the window is empty and attempts remain, the trigger is retried;
+        if the window is empty and this was the last attempt, the original
+        error is re-raised. retry_delay is accepted for signature stability;
+        it plays no part in sizing the wait.
+
+        Returns the CameraFilePath if one was seen while waiting out a retry,
+        otherwise None (the normal case - the trigger succeeded outright and
+        the caller collects the file the usual way).
+        """
+        for attempt in range(1, retry + 1):
+            try:
+                self._cam.trigger_capture()
+                return None
+            except gp.GPhoto2Error as exc:
+                err = str(exc).lower()
+                retriable = (
+                    "-110" in err
+                    or "i/o in progress" in err
+                    or "busy" in err
+                )
+                if not retriable:
+                    raise
+                self._logger.warning(
+                    f"[gphoto2] {self.port}: trigger busy (attempt {attempt}/{retry}): "
+                    f"waiting the capture deadline for a file before retrying"
+                )
+                file_path = self._poll_for_file(deadline_s)
+                if file_path is not None:
+                    return file_path
+                if attempt < retry:
+                    continue
+                raise
+
+    def _poll_for_file(self, window_s: float):
+        """Poll the event queue for window_s seconds; return a file if one lands.
+
+        Used only to make a busy-trigger retry safe: if the exposure already
+        happened, the event queue will show GP_EVENT_FILE_ADDED during this
+        window even though trigger_capture() itself raised. Returns None if
+        the window elapses with no file seen.
+        """
+        start = time.monotonic()
+        while time.monotonic() - start < window_s:
+            event_type, event_data = self._cam.wait_for_event(_EVENT_STEP_MS)
+            if event_type == gp.GP_EVENT_FILE_ADDED:
+                return event_data
+        return None
+
+    def _wait_for_file_added(self, deadline_s: float, shutterspeed=None):
+        """Poll the camera's event queue until a file lands, or the deadline passes.
+
+        Returns the gp.CameraFilePath (.folder / .name) carried by the
+        GP_EVENT_FILE_ADDED event. Every other event - capture complete,
+        timeout, unknown - just continues the loop. The deadline is checked
+        between wait_for_event() calls, each of which is bounded by
+        libgphoto2's own USB timeouts, and only after a call comes back
+        without a file. A file that arrives after the deadline has already
+        passed is still returned, never treated as a timeout - the check
+        only ever runs on an empty queue, and a delivered image is a good
+        capture regardless of when it lands. The deadline bounds how long an
+        empty queue is waited on, not whether a delivered file is accepted.
+
+        Errors raised by wait_for_event() propagate untouched: the shutter has
+        already fired by this point, so re-triggering would take a second
+        photograph rather than recover the first.
+        """
+        start = time.monotonic()
+        while True:
+            event_type, event_data = self._cam.wait_for_event(_EVENT_STEP_MS)
+            if event_type == gp.GP_EVENT_FILE_ADDED:
+                return event_data
+            elapsed = time.monotonic() - start
+            if elapsed >= deadline_s:
+                hint = ""
+                mode = self._focus_mode
+                if mode and mode not in ("Manual", "MF"):
+                    hint = (
+                        f" - focusmode={mode!r}: AF hangs capture, "
+                        "flip the lens barrel switch to MF"
+                    )
+                raise CaptureTimeoutError(
+                    f"{self.port}: no image after {elapsed:.1f}s "
+                    f"(deadline {deadline_s:.1f}s, shutterspeed={shutterspeed!r})"
+                    f"{hint}"
+                )
+
     def capture(
         self,
         outpath: Path,
@@ -282,55 +449,51 @@ class _PTPSession:
         the CR2 as ``{stem}_preview.jpg`` so the existing thumbnail/review
         pipeline has a JPEG to work with.
 
-        Retries on transient I/O-busy errors within the same open session.
-        Fatal errors (e.g. -1 Unspecified) are raised immediately.
+        The shutter is triggered and the file is then collected from the
+        camera's event queue under a deadline sized from the configured
+        exposure, so a camera that never delivers an image raises
+        CaptureTimeoutError instead of blocking the per-camera lock. Only the
+        trigger is retried, on transient I/O-busy errors, and only once the
+        event queue has stayed empty for that same capture deadline - a
+        retriable error can follow a successful exposure, so a shorter wait
+        risks re-triggering (a second photograph) while the first file is
+        still on its way. A failure after the shutter has fired is raised
+        as it comes.
         """
         outpath.parent.mkdir(parents=True, exist_ok=True)
-        for attempt in range(1, retry + 1):
-            try:
-                t0 = time.perf_counter()
-                file_path = self._cam.capture(gp.GP_CAPTURE_IMAGE)
+        shutterspeed = self._get_config("shutterspeed")
+        deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
 
-                # The captured filename tells us the actual format (.cr2 vs .jpg)
-                is_raw = file_path.name.lower().endswith(".cr2")
-                if is_raw:
-                    # Save CR2 with .cr2 extension regardless of outpath stem
-                    actual_outpath = outpath.with_suffix(".cr2")
-                else:
-                    actual_outpath = outpath
+        t0 = time.perf_counter()
+        file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
+        if file_path is None:
+            file_path = self._wait_for_file_added(deadline_s, shutterspeed)
 
-                camera_file = self._cam.file_get(
-                    file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
-                )
-                # Durable save: temp + fsync + atomic replace, so no partial master survives a crash
-                atomic_write(actual_outpath, lambda tmp: camera_file.save(tmp))
-                self._cam.file_delete(file_path.folder, file_path.name)
-                elapsed = time.perf_counter() - t0
+        # The captured filename tells us the actual format (.cr2 vs .jpg)
+        is_raw = file_path.name.lower().endswith(".cr2")
+        if is_raw:
+            # Save CR2 with .cr2 extension regardless of outpath stem
+            actual_outpath = outpath.with_suffix(".cr2")
+        else:
+            actual_outpath = outpath
 
-                # Extract embedded JPEG from CR2 for thumbnail/review pipeline
-                if is_raw:
-                    _write_raw_preview(
-                        actual_outpath,
-                        actual_outpath.with_name(actual_outpath.stem + "_preview.jpg"),
-                        self._logger,
-                    )
+        camera_file = self._cam.file_get(
+            file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
+        )
+        # Durable save: temp + fsync + atomic replace, so no partial master survives a crash
+        atomic_write(actual_outpath, lambda tmp: camera_file.save(tmp))
+        self._cam.file_delete(file_path.folder, file_path.name)
+        elapsed = time.perf_counter() - t0
 
-                return elapsed, actual_outpath
-            except gp.GPhoto2Error as exc:
-                err = str(exc)
-                retriable = (
-                    "-110" in err
-                    or "I/O in progress" in err
-                    or "busy" in err.lower()
-                )
-                if attempt < retry and retriable:
-                    self._logger.warning(
-                        f"[gphoto2] {self.port}: I/O busy (attempt {attempt}/{retry}), "
-                        f"retrying in {retry_delay}s ..."
-                    )
-                    time.sleep(retry_delay)
-                    continue
-                raise
+        # Extract embedded JPEG from CR2 for thumbnail/review pipeline
+        if is_raw:
+            _write_raw_preview(
+                actual_outpath,
+                actual_outpath.with_name(actual_outpath.stem + "_preview.jpg"),
+                self._logger,
+            )
+
+        return elapsed, actual_outpath
 
     def get_info(self) -> dict:
         """Return current camera settings as a dict (for logging / future API)."""
@@ -506,12 +669,27 @@ class GPhoto2Backend(CameraBackend):
                     f"in {elapsed:.2f}s"
                 )
                 return str(actual_path), None
-            except gp.GPhoto2Error as exc:
-                self.logger.error(
-                    f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
-                )
-                # Close the failed session so the next call re-opens it cleanly.
-                self._close_session(camera_index)
+            except (gp.GPhoto2Error, CaptureTimeoutError) as exc:
+                if isinstance(exc, CaptureTimeoutError):
+                    self.logger.error(
+                        f"[gphoto2] Camera {camera_index}: capture timed out "
+                        f"({exc}); closing session"
+                    )
+                    # Closing an EOS session runs several PTP operations, each
+                    # bounded by libgphoto2's own USB timeouts; on a wedged body
+                    # they are slow, so the elapsed time is logged.
+                    t_close = time.perf_counter()
+                    self._close_session(camera_index)
+                    self.logger.error(
+                        f"[gphoto2] Camera {camera_index}: session closed after "
+                        f"timeout in {time.perf_counter() - t_close:.1f}s"
+                    )
+                else:
+                    self.logger.error(
+                        f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
+                    )
+                    # Close the failed session so the next call re-opens it cleanly.
+                    self._close_session(camera_index)
                 raise RuntimeError(f"DSLR capture failed: {exc}") from exc
 
     def list_devices(self) -> list:
