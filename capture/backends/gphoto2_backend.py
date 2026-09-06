@@ -483,6 +483,12 @@ class GPhoto2Backend(CameraBackend):
         Uses the persistent port map (refreshed if empty). For each camera,
         re-uses an already-open PTP session to read the serial number; if no
         session is open yet, opens a brief one just for the read and closes it.
+
+        The per-camera lock is held while the serial is read, so enumeration
+        serialises with capture, preview and session opening. Without it, an
+        enumeration racing _get_or_open_session sees no cached session (the
+        session is only stored once _PTPSession.__init__ returns) and would
+        claim a camera another thread is already opening.
         """
         import re
         port_map = self._get_port_map()
@@ -492,30 +498,45 @@ class GPhoto2Backend(CameraBackend):
         result = []
         for idx, (model_raw, port) in sorted(port_map.items()):
             serial = ""
-            # Re-use existing open session if available
-            session = self._sessions.get(idx)
-            if session is not None and session._cam is not None:
-                try:
-                    cfg = session._cam.get_config()
-                    serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-                except Exception:
-                    pass
-            else:
-                # Brief PTP connection solely to read the serial number
-                try:
-                    al = gp.CameraAbilitiesList()
-                    al.load()
-                    cam = gp.Camera()
-                    cam.set_abilities(al[al.lookup_model(model_raw)])
-                    pil = gp.PortInfoList()
-                    pil.load()
-                    cam.set_port_info(pil[pil.lookup_path(port)])
-                    cam.init()
-                    cfg = cam.get_config()
-                    serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-                    cam.exit()
-                except Exception:
-                    pass
+            with self._get_camera_lock(idx):
+                # Re-use existing open session if available
+                session = self._sessions.get(idx)
+                if session is not None and session._cam is not None:
+                    try:
+                        cfg = session._cam.get_config()
+                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                    except Exception:
+                        pass
+                else:
+                    # Nobody holds this camera, so a brief PTP connection just
+                    # to read the serial number is not a competing claim.
+                    cam = None
+                    initialized = False
+                    try:
+                        al = gp.CameraAbilitiesList()
+                        al.load()
+                        cam = gp.Camera()
+                        cam.set_abilities(al[al.lookup_model(model_raw)])
+                        pil = gp.PortInfoList()
+                        pil.load()
+                        cam.set_port_info(pil[pil.lookup_path(port)])
+                        cam.init()
+                        initialized = True
+                        cfg = cam.get_config()
+                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                    except Exception:
+                        pass
+                    finally:
+                        # init() may have succeeded even if a later step (e.g.
+                        # get_config() or the serial read) raised. Always
+                        # release the PTP claim in that case, or the camera
+                        # stays claimed by this dangling `cam` object while
+                        # the lock is dropped and enumeration continues.
+                        if initialized:
+                            try:
+                                cam.exit()
+                            except Exception:
+                                pass
 
             model_slug = re.sub(r"[^a-z0-9]", "", model_raw.lower())
             hw_id = (
@@ -528,6 +549,7 @@ class GPhoto2Backend(CameraBackend):
                 "hardware_id": hw_id,
                 "serial": serial or None,
                 "location": f"USB {port}",
+                "port": port,                    # raw USB port, e.g. "usb:001,005"
                 "has_aperture_control": True,   # DSLRs always expose aperture via PTP
                 "supports_zoom": False,          # No digital zoom for DSLRs
             })
