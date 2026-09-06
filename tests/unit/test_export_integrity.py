@@ -102,12 +102,16 @@ def test_export_produces_valid_bag_with_manifest(export_client, db_session, over
     import hashlib, zipfile, bagit
     from app.core import config
     from app.models.record import RecordImage
+    from capture.project_manager import secure_project_filename
 
     exports = tmp_path / "exp"
     exports.mkdir()
     monkeypatch.setattr(config.settings, "EXPORTS_ROOT", str(exports))
 
-    proot = override_projects_root / "P"
+    # The export service resolves the manifest under the sanitised (lowercased)
+    # project filename, not the raw project name, and the filesystem may be
+    # case-sensitive (Linux/Docker/CI), unlike macOS.
+    proot = override_projects_root / secure_project_filename("P")
     (proot / "images").mkdir(parents=True)
     (proot / "metadata").mkdir(parents=True)
     f = proot / "images" / "cap.jpg"
