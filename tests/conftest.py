@@ -119,8 +119,10 @@ def _is_camera_backend_unavailable(exc):
     not being connected).
 
     Matches the four sources of this RuntimeError:
-      - capture/backends/picamera2_backend.py:66 raises "... requires Linux"
-        when Picamera2 failed to import and we're not on Linux at all.
+      - capture/backends/picamera2_backend.py:66 raises "Picamera2Backend
+        requires Linux ..." when Picamera2 failed to import off Linux
+        (matched by the class name; "requires Linux" alone would also match
+        the unrelated "Transform requires Linux" at :334).
       - capture/backends/picamera2_backend.py:70 raises "picamera2 failed to
         import: ..." when Picamera2 failed to import on Linux for a concrete
         reason.
@@ -133,8 +135,7 @@ def _is_camera_backend_unavailable(exc):
     """
     message = str(exc)
     return (
-        "requires Linux" in message
-        or "Picamera2Backend" in message
+        "Picamera2Backend" in message
         or "picamera2 failed to import" in message
         or "picamera2 is not available" in message
     )
