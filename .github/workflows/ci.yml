@@ -1,0 +1,52 @@
+# `-m "not camera"` deselects hardware-dependent tests (no camera in CI runners).
+# DATABASE_URL is set because alembic/env.py:50 (get_url) reads DATABASE_URL from
+# the environment before falling back to app settings, and `db-check-drift` needs
+# it to reach the postgres service below.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-latest
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dtk
+          POSTGRES_PASSWORD: dtk
+          POSTGRES_DB: dtk
+        ports:
+          - 5432:5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@v0.10.2
+        with:
+          environments: dev
+          cache: true
+
+      - name: Unit and integration tests
+        run: pixi run -e dev pytest tests/ -m "not camera" -q
+        env:
+          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
+          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          APP_ENV: test
+          CAMERA_BACKEND: subprocess
+
+      - name: Schema drift guard
+        run: pixi run -e dev db-check-drift
+        env:
+          DATABASE_URL: postgresql+psycopg://dtk:dtk@localhost:5432/dtk
+          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
+          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          APP_ENV: test
