@@ -22,7 +22,7 @@ def authed_client(client, db_session):
         username="capture_user",
         email="capture_user@example.com",
         hashed_password=hash_password("x"),
-        role="contributor",
+        role="operator",
         is_active=True,
     )
     db_session.add(user)
