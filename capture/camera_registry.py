@@ -6,11 +6,19 @@ at a global level (PROJECTS_ROOT/cameras.json).
 """
 import json
 import logging
+import threading
 from pathlib import Path
 from datetime import datetime, timezone
-from typing import Dict, Optional, List, Tuple
+from typing import Callable, Dict, Optional, List, Tuple
 
 from .utils import atomic_write
+
+# Serialises every registry mutation across the whole process. A
+# CameraRegistry instance is constructed fresh per request (see
+# _get_camera_registry in app/api/cameras.py) and loads its own snapshot of
+# cameras.json at construction time; the file on disk is the only state two
+# such instances share. See CameraRegistry._mutate.
+_REGISTRY_WRITE_LOCK = threading.Lock()
 
 try:
     from picamera2 import Picamera2
@@ -67,7 +75,25 @@ class CameraRegistry:
     def _save_registry(self):
         """Save the camera registry atomically (temp + fsync + replace)."""
         atomic_write(self.registry_path, lambda tmp: Path(tmp).write_text(json.dumps(self.cameras, indent=2)))
-    
+
+    def _mutate(self, change: Callable[[Dict], None]) -> None:
+        """Reload, modify, and save the registry under one process-wide lock.
+
+        A CameraRegistry instance is constructed fresh per request, so two
+        instances that change different cameras and save in turn would
+        otherwise lose one change - a calibration write could erase an
+        orientation, and vice versa - because the file is the only state
+        they share. Every mutator routes through here: under the lock, it
+        reloads self.cameras from disk, applies ``change`` to that fresh
+        copy, and writes the whole file back before releasing the lock, so
+        no instance ever saves over a write it did not see.
+        """
+        with _REGISTRY_WRITE_LOCK:
+            self.cameras = self._load_registry()
+            change(self.cameras)
+            self._save_registry()
+
+
     @staticmethod
     def _get_camera_hardware_id_gphoto2(camera_index: int) -> Tuple[Optional[str], Dict]:
         """Hardware ID resolution for gphoto2 (DSLR) cameras.
@@ -235,34 +261,52 @@ class CameraRegistry:
             Hardware ID of registered camera, or None if failed
         """
         hw_id, info = self.get_camera_hardware_id(camera_index)
-        
+
         if not hw_id:
             return None
-        
-        now = datetime.now(timezone.utc).isoformat()
-        
-        # Check if camera already registered
-        if hw_id in self.cameras["cameras"] and not force:
-            # Update last_seen info
-            self.cameras["cameras"][hw_id]["last_seen_index"] = camera_index
-            self.cameras["cameras"][hw_id]["last_seen_at"] = now
-        else:
-            # New registration
-            self.cameras["cameras"][hw_id] = {
-                "model": info.get("model"),
-                "serial": info.get("serial"),
-                "location": info.get("location"),
-                "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
-                "label": None,  # Human-readable description
-                "last_seen_index": camera_index,
-                "first_registered_at": now,
-                "last_seen_at": now,
-                "calibration": calibration_data or {}
-            }
-        
-        self._save_registry()
+
+        self.register_resolved(hw_id, info, camera_index, calibration_data=calibration_data, force=force)
         return hw_id
-    
+
+    def register_resolved(
+        self,
+        hardware_id: str,
+        info: Dict,
+        camera_index: int,
+        calibration_data: Optional[Dict] = None,
+        force: bool = False,
+    ) -> None:
+        """Write a registration for an already-resolved hardware identity.
+
+        register_camera resolves camera_index to a hardware id itself and
+        delegates here. Callers that have already resolved and checked the
+        identity (the orientation route, guarding against a rescan mid-
+        request per R30-4) must write under that exact identity rather than
+        letting a second resolution pick a different body.
+        """
+        def change(cameras: Dict) -> None:
+            now = datetime.now(timezone.utc).isoformat()
+            if hardware_id in cameras["cameras"] and not force:
+                # Update last_seen info
+                cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
+                cameras["cameras"][hardware_id]["last_seen_at"] = now
+            else:
+                # New registration
+                cameras["cameras"][hardware_id] = {
+                    "model": info.get("model"),
+                    "serial": info.get("serial"),
+                    "location": info.get("location"),
+                    "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
+                    "label": None,  # Human-readable description
+                    "last_seen_index": camera_index,
+                    "first_registered_at": now,
+                    "last_seen_at": now,
+                    "calibration": calibration_data or {},
+                    "orientation": None,  # Never set; the frontend keeps its own default (NEH-71)
+                }
+
+        self._mutate(change)
+
     def get_camera_by_id(self, hardware_id: str) -> Optional[Dict]:
         """Get camera data by hardware ID."""
         return self.cameras["cameras"].get(hardware_id)
@@ -282,34 +326,83 @@ class CameraRegistry:
     
     def update_calibration(self, hardware_id: str, calibration_data: Dict):
         """Update calibration data for a camera."""
-        if hardware_id in self.cameras["cameras"]:
-            self.cameras["cameras"][hardware_id]["calibration"] = calibration_data
-            self.cameras["cameras"][hardware_id]["calibrated_at"] = \
-                datetime.now(timezone.utc).isoformat()
-            self._save_registry()
-    
+        def change(cameras: Dict) -> None:
+            if hardware_id in cameras["cameras"]:
+                cameras["cameras"][hardware_id]["calibration"] = calibration_data
+                cameras["cameras"][hardware_id]["calibrated_at"] = \
+                    datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def set_camera_info(self, hardware_id: str, machine_id: Optional[str] = None, label: Optional[str] = None):
         """
         Set user-assigned identification for a camera.
-        
+
         Useful for cameras without serial numbers (e.g., IMX519).
         The machine_id should match a physical label on the camera.
-        
+
         Args:
             hardware_id: Hardware ID of the camera
             machine_id: User-assigned ID (e.g., "CAM-001", "LEFT", "A", "B")
             label: Human-readable description (e.g., "Left scanner camera")
-            
+
         Example:
             registry.set_camera_info("imx519_88000", machine_id="CAM-L", label="Left Scanner")
         """
-        if hardware_id in self.cameras["cameras"]:
-            if machine_id is not None:
-                self.cameras["cameras"][hardware_id]["machine_id"] = machine_id
-            if label is not None:
-                self.cameras["cameras"][hardware_id]["label"] = label
-            self._save_registry()
-    
+        def change(cameras: Dict) -> None:
+            if hardware_id in cameras["cameras"]:
+                if machine_id is not None:
+                    cameras["cameras"][hardware_id]["machine_id"] = machine_id
+                if label is not None:
+                    cameras["cameras"][hardware_id]["label"] = label
+
+        self._mutate(change)
+
+    VALID_ORIENTATIONS = (0, 90, 180, 270)
+
+    @staticmethod
+    def is_valid_orientation(value) -> bool:
+        """True only for a stored orientation the capture path can use.
+
+        A bool is an int in Python and a hand-edited file can hold anything,
+        so the check is by value and by type, not by isinstance(int).
+        """
+        return type(value) is int and value in CameraRegistry.VALID_ORIENTATIONS
+
+    def update_orientation(self, hardware_id: str, degrees: int) -> None:
+        """Persist the clockwise rotation to apply for this camera body.
+
+        Keyed by hardware id rather than USB/backend index: orientation is a
+        property of the physical body (which page it faces, which way it is
+        mounted), and hardware ids stay stable across re-enumeration
+        (NEH-129) while indices do not - the same rotation must follow the
+        body if it re-enumerates onto a different index.
+
+        A value of None (set at registration, see register_resolved) means
+        orientation was never set for this body; the frontend falls back to
+        its own default rather than treating a missing value as an explicit
+        "no rotation".
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            degrees: Clockwise rotation in degrees; one of 0, 90, 180, 270.
+
+        Raises:
+            ValueError: degrees is not one of 0, 90, 180, 270.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        if not self.is_valid_orientation(degrees):
+            raise ValueError(f"orientation must be one of 0, 90, 180, 270; got {degrees}")
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            cameras["cameras"][hardware_id]["orientation"] = degrees
+            cameras["cameras"][hardware_id]["orientation_updated_at"] = \
+                datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())

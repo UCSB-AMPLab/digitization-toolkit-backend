@@ -4,8 +4,8 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from app.models.record import Record, RecordImage
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Literal, Optional
+from pydantic import BaseModel, field_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -69,9 +69,19 @@ class DeviceInfo(BaseModel):
 	# Calibration data (populated when calibrated=True)
 	lens_position: Optional[float] = None
 	awb_gains: Optional[List[float]] = None
+	orientation: Optional[int] = None  # Saved rotation for this body, if ever set (NEH-71)
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+
+
+_VALID_ROTATIONS = (0, 90, 180, 270)
+
+
+def _validate_rotate_deg(v: Optional[int]) -> Optional[int]:
+	if v is not None and v not in _VALID_ROTATIONS:
+		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}; got {v}")
+	return v
 
 
 class CaptureRequest(BaseModel):
@@ -80,10 +90,19 @@ class CaptureRequest(BaseModel):
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False
-	rotate_deg: int = 0  # Clockwise rotation applied post-capture: 0, 90, 180, 270
+	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
+	# None (the default) leaves the registry's saved orientation from
+	# default_camera_config_from_registry in place; an explicit value,
+	# including 0, overrides it (NEH-71 - the one behaviour change of the ticket).
+	rotate_deg: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
+
+	@field_validator("rotate_deg")
+	@classmethod
+	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
+		return _validate_rotate_deg(v)
 
 
 class DualCaptureRequest(BaseModel):
@@ -92,13 +111,21 @@ class DualCaptureRequest(BaseModel):
 	resolution: str = "medium"
 	include_resolution_in_filename: bool = False
 	stagger_ms: int = 20
-	rotate_deg_cam0: int = 0  # Clockwise rotation for camera 0: 0, 90, 180, 270
-	rotate_deg_cam1: int = 0  # Clockwise rotation for camera 1: 0, 90, 180, 270
+	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
+	# registry's saved orientation in place; an explicit value, including 0,
+	# overrides it (NEH-71 - see CaptureRequest.rotate_deg).
+	rotate_deg_cam0: Optional[int] = None
+	rotate_deg_cam1: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
 	left_camera_index: int = 0  # Which camera index maps to the left page (0 or 1)
 	collection_id: Optional[int] = None  # Collection to link the record to
+
+	@field_validator("rotate_deg_cam0", "rotate_deg_cam1")
+	@classmethod
+	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
+		return _validate_rotate_deg(v)
 
 
 class CaptureResponse(BaseModel):
@@ -199,6 +226,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 		label = None
 		lens_position = None
 		awb_gains = None
+		orientation = None
 
 		if camera_data:
 			focus_cal = camera_data.get("calibration", {}).get("focus", {})
@@ -209,6 +237,10 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
 			if awb_raw:
 				awb_gains = list(awb_raw)
+			# Report only a supported angle; a malformed stored value is
+			# shown as unset so the UI never receives an angle it cannot use.
+			stored = camera_data.get("orientation")
+			orientation = stored if type(stored) is int and stored in _VALID_ROTATIONS else None
 
 		devices.append(DeviceInfo(
 			hardware_id=hw_id,
@@ -220,6 +252,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			calibrated=calibrated,
 			lens_position=lens_position,
 			awb_gains=awb_gains,
+			orientation=orientation,
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
 		))
@@ -521,7 +554,10 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
-		if request.rotate_deg:
+		# NEH-71: omitted (None) leaves the registry's saved orientation from
+		# default_camera_config_from_registry in place; an explicit value,
+		# including 0, overrides it. This is the one behaviour change of the ticket.
+		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
@@ -716,9 +752,11 @@ def trigger_dual_capture(
 		config0_dict, _ = default_camera_config_from_registry(0, request.resolution)
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
 
-		if request.rotate_deg_cam0:
+		# NEH-71: see trigger_capture - omitted (None) leaves the registry's
+		# saved orientation in place; an explicit value, including 0, overrides it.
+		if request.rotate_deg_cam0 is not None:
 			config0_dict["rotate_deg"] = request.rotate_deg_cam0
-		if request.rotate_deg_cam1:
+		if request.rotate_deg_cam1 is not None:
 			config1_dict["rotate_deg"] = request.rotate_deg_cam1
 
 		cam0_config = CameraConfig(**config0_dict)
@@ -1144,6 +1182,79 @@ def apply_dslr_settings(
 		return DSLRSettingsResponse(**updated)
 	except RuntimeError as e:
 		raise HTTPException(status_code=502, detail=str(e))
+
+
+class OrientationRequest(BaseModel):
+	"""Request body for setting a camera body's saved rotation (NEH-71)."""
+	orientation: Literal[0, 90, 180, 270]
+	# Hardware id the client resolved for this index (from GET /devices or
+	# POST /rescan). Checked against the index's current identity so a
+	# rescan racing this request can't save the value onto the wrong body.
+	hardware_id: str
+
+
+@router.put("/{camera_index}/orientation", response_model=DeviceInfo)
+def set_camera_orientation(
+	camera_index: int,
+	request: OrientationRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Persist the clockwise rotation to apply for the camera body at this index.
+
+	Saved to the registry keyed by hardware id (NEH-71), not by index, so it
+	survives reopening the app and rebooting the Pi - unlike the per-capture
+	rotate_deg fields, which are never persisted. Hardware ids are stable
+	across re-enumeration (NEH-129) while indices are not.
+
+	The request body carries the hardware id the client resolved for this
+	index. A rescan can put a different body on the same index between that
+	read and this write; if the index's current identity does not match the
+	one in the request, this returns 409 instead of silently saving the new
+	value under someone else's body (R30-4). The client should reload the
+	device list and try again.
+	"""
+	try:
+		from capture.camera_registry import CameraRegistry
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	registry = CameraRegistry()
+	hw_id, info = registry.get_camera_hardware_id(camera_index)
+
+	if hw_id is None:
+		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
+
+	if hw_id != request.hardware_id:
+		raise HTTPException(
+			status_code=409,
+			detail=(
+				f"Camera {camera_index} is now {hw_id}, not {request.hardware_id}; "
+				"reload the device list and try again"
+			),
+		)
+
+	if registry.get_camera_by_id(hw_id) is None:
+		# A body that was never calibrated must still be able to hold an
+		# orientation. Register it under the identity just checked above -
+		# never re-resolve it, per the same guard as the 409 check.
+		registry.register_resolved(hw_id, info, camera_index)
+
+	registry.update_orientation(hw_id, request.orientation)
+
+	try:
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as exc:
+		logger.exception(f"Camera enumeration failed after orientation update: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera enumeration failed: {exc}")
+
+	for device_info in _device_infos(raw_devices, registry):
+		if device_info.index == camera_index:
+			return device_info
+
+	raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
 
 
 @router.post("/", response_model=CameraSettingsRead)
