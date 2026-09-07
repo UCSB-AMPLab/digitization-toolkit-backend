@@ -19,7 +19,7 @@ from capture.camera_registry import CameraRegistry
 
 
 def _register(registry, hw_id, camera_index=0, model="Canon EOS Rebel T7"):
-    registry._register_resolved(
+    registry.register_resolved(
         hw_id,
         {"model": model, "serial": "1111111", "location": "USB usb:001,004"},
         camera_index,

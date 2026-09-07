@@ -265,10 +265,10 @@ class CameraRegistry:
         if not hw_id:
             return None
 
-        self._register_resolved(hw_id, info, camera_index, calibration_data=calibration_data, force=force)
+        self.register_resolved(hw_id, info, camera_index, calibration_data=calibration_data, force=force)
         return hw_id
 
-    def _register_resolved(
+    def register_resolved(
         self,
         hardware_id: str,
         info: Dict,
@@ -378,7 +378,7 @@ class CameraRegistry:
         (NEH-129) while indices do not - the same rotation must follow the
         body if it re-enumerates onto a different index.
 
-        A value of None (set at registration, see _register_resolved) means
+        A value of None (set at registration, see register_resolved) means
         orientation was never set for this body; the frontend falls back to
         its own default rather than treating a missing value as an explicit
         "no rotation".

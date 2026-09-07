@@ -1239,7 +1239,7 @@ def set_camera_orientation(
 		# A body that was never calibrated must still be able to hold an
 		# orientation. Register it under the identity just checked above -
 		# never re-resolve it, per the same guard as the 409 check.
-		registry._register_resolved(hw_id, info, camera_index)
+		registry.register_resolved(hw_id, info, camera_index)
 
 	registry.update_orientation(hw_id, request.orientation)
 
