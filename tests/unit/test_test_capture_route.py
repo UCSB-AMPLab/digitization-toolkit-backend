@@ -109,6 +109,25 @@ class _FakeBackendRaw:
         return str(cr2_path), None
 
 
+class _FakeBackendTupleRotated:
+    """Multi-format capture like _FakeBackendTuple, but returns a metadata
+    dict (not None) as the picamera2 backend does for raw captures
+    (capture/backends/picamera2_backend.py:709 returns (jpeg, raw) paths)."""
+
+    def __init__(self, recorded):
+        self.recorded = recorded
+
+    def capture_image(self, path, camera_config, capture_output=False):
+        self.recorded["camera_config"] = camera_config
+        jpeg_path = Path(path)
+        raw_path = jpeg_path.with_suffix(".raw")
+        jpeg_path.write_bytes(b"\xff\xd8fake")
+        raw_path.write_bytes(b"rawdata")
+        self.recorded["jpeg_path"] = jpeg_path
+        self.recorded["raw_path"] = raw_path
+        return (str(jpeg_path), str(raw_path)), {}
+
+
 class _FakeBackendWrappedTimeout:
     def capture_image(self, path, camera_config, capture_output=False):
         raise RuntimeError("DSLR capture failed: timed out") from CaptureTimeoutError("no image arrived")
@@ -246,6 +265,30 @@ def test_test_capture_500s_when_a_raw_capture_has_no_preview_sidecar(client, mon
     resp = api.post("/cameras/test-capture/0")
 
     assert resp.status_code == 500, resp.text
+
+
+@pytest.mark.unit
+def test_test_capture_rotates_every_path_of_a_multiformat_capture(client, monkeypatch):
+    recorded = {}
+    rotation_calls = []
+    _install_default_config(monkeypatch, {"camera_index": 0, "rotate_deg": 270})
+    _install_backend(monkeypatch, _FakeBackendTupleRotated(recorded))
+
+    import capture.service as capture_service_module
+
+    def spy_apply_rotation(file_path, rotate_deg):
+        rotation_calls.append(file_path)
+
+    monkeypatch.setattr(capture_service_module, "_apply_rotation", spy_apply_rotation)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0")
+
+    assert resp.status_code == 200, resp.text
+    assert recorded["jpeg_path"] in rotation_calls
+    for call in rotation_calls:
+        assert isinstance(call, Path)
+        assert call in (recorded["jpeg_path"], recorded["raw_path"])
 
 
 @pytest.mark.unit

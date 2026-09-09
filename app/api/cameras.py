@@ -564,21 +564,26 @@ def test_capture(
 	for POST routes that take a camera_index (/focus/{camera_index},
 	/settings/{camera_index}), and to keep it unambiguous against any future
 	/{camera_index}-shaped route.
+
+	Checks the camera is connected before calling the service, mirroring
+	trigger_capture, rather than sniffing the RuntimeError message for
+	"not connected" after the fact.
 	"""
 	from capture.camera import IMG_SIZES
 
 	if resolution not in IMG_SIZES:
 		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
 
-	from capture.service import test_capture_bytes
+	from capture.service import test_capture_bytes, is_camera_connected
+
+	if not is_camera_connected(camera_index):
+		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
 
 	try:
 		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
 	except RuntimeError as e:
 		if _is_capture_timeout(e):
 			raise HTTPException(status_code=504, detail=str(e))
-		if "not connected" in str(e):
-			raise HTTPException(status_code=404, detail=str(e))
 		raise HTTPException(status_code=500, detail=str(e))
 	except HTTPException:
 		raise

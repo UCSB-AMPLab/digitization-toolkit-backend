@@ -327,7 +327,7 @@ def _unlink_capture_output(path) -> None:
                 pass
 
 
-def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple:
+def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
     """Take a real still for the dashboard's "Probar camaras" button and return it inline.
 
     Exercises the same shutter/autofocus/backend path as POST /capture -
@@ -366,9 +366,9 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple:
     try:
         output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
 
-        start_time = time.time()
+        start_time = time.perf_counter()
         result = get_backend().capture_image(output_path, camera_config)
-        elapsed_time = time.time() - start_time
+        elapsed_time = time.perf_counter() - start_time
 
         # Result is always (path_or_paths, metadata), same as capture_image (above).
         if isinstance(result, tuple) and len(result) == 2:
@@ -376,23 +376,35 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple:
         else:
             actual_path, _metadata = result, None
 
+        # actual_path may be a single path or, for a multi-format capture
+        # (e.g. picamera2_backend.py:709 returns (jpeg_path, raw_path) for
+        # raw captures), a tuple/list of paths - never stringify the tuple
+        # itself, or _apply_rotation gets handed a nonexistent path built
+        # from Python's tuple repr.
+        paths = (
+            [Path(str(p)) for p in actual_path]
+            if isinstance(actual_path, (tuple, list))
+            else [Path(str(actual_path))]
+        )
+
         # Apply clockwise rotation if requested - mirrors capture_image's own
         # rotation block above (including its rotation of a RAW _preview.jpg
-        # sidecar, if one was extracted).
+        # sidecar, if one was extracted) - but for every file of a
+        # multi-path capture, not just the first.
         rotate_deg = getattr(camera_config, "rotate_deg", 0)
         if rotate_deg:
-            _apply_rotation(Path(str(actual_path)), rotate_deg)
-            preview = Path(str(actual_path)).with_suffix("")
-            preview = preview.parent / (preview.name + "_preview.jpg")
-            if preview.exists():
-                _apply_rotation(preview, rotate_deg)
+            for p in paths:
+                _apply_rotation(p, rotate_deg)
+                preview = p.parent / (p.stem + "_preview.jpg")
+                if preview.exists():
+                    _apply_rotation(preview, rotate_deg)
 
         # Pick the bytes to return.
         if isinstance(actual_path, (tuple, list)):
             # Multi-format capture: (jpeg_path, raw_path) - return the jpeg.
-            image_bytes = Path(str(actual_path[0])).read_bytes()
+            image_bytes = paths[0].read_bytes()
         else:
-            single_path = Path(str(actual_path))
+            single_path = paths[0]
             if single_path.suffix.lower() in (".cr2", ".raw"):
                 sidecar = single_path.with_name(single_path.stem + "_preview.jpg")
                 if not sidecar.exists():
