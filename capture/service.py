@@ -29,7 +29,7 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from .utils import setup_rotating_logger, atomic_write
-from .camera import CameraConfig
+from .camera import CameraConfig, IMG_SIZES
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
 from .project_manager import project_capture_root, image_output_dir
@@ -441,42 +441,57 @@ def dual_capture_image(
     
     return img1_path, img2_path, record.capture_id, record.pair_id
     
-def capture_preview_frame(camera_index: int) -> bytes:
+def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
-    Capture a low-resolution preview frame and return JPEG bytes.
+    Capture a live preview frame and return JPEG bytes.
 
     Not saved to the project directory - intended for live preview polling
-    from the frontend. Uses a stable per-camera temp file that is overwritten
-    on every call (rather than mkstemp), so at most one file per camera ever
-    exists in /tmp even if the process is killed unexpectedly.
+    from the frontend. Uses a stable per-camera temp path (rather than
+    mkstemp) that is removed after each call, so at most one file per camera
+    can ever be left in /tmp, and only if the process dies mid-call.
 
-    The preview uses a lightweight configuration:
-      - 1280x720 (native fast mode, no cropping)
-      - No autofocus cycle (too slow for live preview)
-      - No AE stabilisation wait
-      - No temporal denoise warmup
-      - Reduced JPEG quality (75) for a smaller payload
+    On picamera2 the frame is the second ("lores") stream of the still's own
+    configuration at ``resolution``: same sensor mode, same ScalerCrop, so the
+    preview's field of view is the capture's and nothing is reconfigured
+    between a poll and a capture of the same size. No autofocus cycle, no AE
+    stabilisation wait, no denoise warmup, and JPEG quality 75 for a smaller
+    polling payload.
 
     Args:
         camera_index: Camera index (0 or 1).
+        resolution: Key into IMG_SIZES ("low", "medium", "high") naming the
+            still whose configuration the preview rides on. Backends with
+            their own native preview (gphoto2) pick their own size and ignore
+            this.
 
     Returns:
         JPEG bytes of the preview frame.
 
     Raises:
+        ValueError: If ``resolution`` is not a known IMG_SIZES key.
         RuntimeError: If the camera is not connected or capture fails.
     """
+    img_size = IMG_SIZES.get(resolution)
+    if img_size is None:
+        raise ValueError(
+            f"Unknown resolution '{resolution}'; expected one of {sorted(IMG_SIZES)}"
+        )
+
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
+    is_picamera2 = isinstance(backend, Picamera2Backend)
+
     # If the backend has a native preview implementation (e.g. gphoto2), use it
-    # directly instead of the picamera2-specific CameraConfig path below.
-    try:
-        return backend.capture_preview(camera_index)
-    except NotImplementedError:
-        pass  # fall through to picamera2 path
+    # directly. Its signature takes no size, so it is called as the base class
+    # declares it.
+    if not is_picamera2:
+        try:
+            return backend.capture_preview(camera_index)
+        except NotImplementedError:
+            pass  # fall through to the generic capture_image path
 
     # Fixed per-camera path - overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
@@ -484,9 +499,11 @@ def capture_preview_frame(camera_index: int) -> bytes:
     tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
     lock = _get_preview_lock(camera_index)
 
+    # Fallback for backends with neither a native preview nor a lores stream
+    # (rpicam subprocess): a small standalone capture, as before.
     preview_config = CameraConfig(
         camera_index=camera_index,
-        img_size=(1280, 720),        # Native 80 fps mode - fast, no crop
+        img_size=(1280, 720),
         autofocus_on_capture=False,  # Skip AF cycle for live preview
         timeout=0,                   # No AE stabilisation wait
         denoise_frames=0,            # No temporal denoise warmup
@@ -498,6 +515,10 @@ def capture_preview_frame(camera_index: int) -> bytes:
     with lock:
         for attempt in range(2):
             try:
+                if is_picamera2:
+                    return backend.capture_preview(
+                        camera_index, img_size=img_size, tmp_path=tmp_path
+                    )
                 backend.capture_image(tmp_path, preview_config)
                 data = tmp_path.read_bytes()
                 return data

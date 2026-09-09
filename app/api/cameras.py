@@ -346,16 +346,20 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 @router.get("/preview/{camera_index}")
 def get_camera_preview(
 	camera_index: int,
+	resolution: str = Query("medium"),
 	current_user: User = Depends(allow_read_only),
 ):
 	"""
-	Capture a low-resolution preview frame and return it as JPEG.
+	Capture a live preview frame and return it as JPEG.
 
 	Called by the frontend every PREVIEW_INTERVAL_MS milliseconds for the
-	live preview view.  Uses a lightweight config (1280x720, no AF, no denoise)
-	so frames are returned quickly without interfering with full captures.
+	live preview view.  The frame rides on the still configuration for
+	`resolution`, so it shows the field of view a capture at that resolution
+	would record, with no AF cycle and no denoise warmup.
 
-	Returns 404 when the requested camera is not connected.
+	Returns 422 for an unknown resolution, 404 when the requested camera is
+	not connected or the frame could not be captured (any RuntimeError from
+	the capture service), 500 on anything else.
 	"""
 	from fastapi.responses import Response
 
@@ -365,8 +369,10 @@ def get_camera_preview(
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
 	try:
-		jpeg_bytes = capture_preview_frame(camera_index)
+		jpeg_bytes = capture_preview_frame(camera_index, resolution)
 		return Response(content=jpeg_bytes, media_type="image/jpeg")
+	except ValueError as e:
+		raise HTTPException(status_code=422, detail=str(e))
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
