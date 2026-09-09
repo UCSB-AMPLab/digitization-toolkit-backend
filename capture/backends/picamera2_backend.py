@@ -515,6 +515,7 @@ class Picamera2Backend(CameraBackend):
             last_config is None or
             last_format != use_yuv or
             last_config.img_size != camera_config.img_size or
+            last_config.raw != camera_config.raw or
             last_config.hflip != camera_config.hflip or
             last_config.vflip != camera_config.vflip or
             last_config.buffer_count != camera_config.buffer_count

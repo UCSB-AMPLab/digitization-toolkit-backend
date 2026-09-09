@@ -446,9 +446,9 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
     Capture a live preview frame and return JPEG bytes.
 
     Not saved to the project directory - intended for live preview polling
-    from the frontend. Uses a stable per-camera temp file that is overwritten
-    on every call (rather than mkstemp), so at most one file per camera ever
-    exists in /tmp even if the process is killed unexpectedly.
+    from the frontend. Uses a stable per-camera temp path (rather than
+    mkstemp) that is removed after each call, so at most one file per camera
+    can ever be left in /tmp, and only if the process dies mid-call.
 
     On picamera2 the frame is the second ("lores") stream of the still's own
     configuration at ``resolution``: same sensor mode, same ScalerCrop, so the

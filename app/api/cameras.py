@@ -358,7 +358,8 @@ def get_camera_preview(
 	would record, with no AF cycle and no denoise warmup.
 
 	Returns 422 for an unknown resolution, 404 when the requested camera is
-	not connected.
+	not connected or the frame could not be captured (any RuntimeError from
+	the capture service), 500 on anything else.
 	"""
 	from fastapi.responses import Response
 

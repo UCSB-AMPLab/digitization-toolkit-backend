@@ -673,7 +673,7 @@ class _NativePreviewBackend:
         return b"\xff\xd8native"
 
 
-def test_the_service_passes_the_requested_size_to_the_pibody2_backend(monkeypatch):
+def test_the_service_passes_the_requested_size_to_the_pi_backend(monkeypatch):
     backend = _RecordingPicamera2Backend()
     monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda index: True)
@@ -754,3 +754,16 @@ def test_a_rectangle_object_crop_yields_all_four_values():
     assert _crop_rect(
         SimpleNamespace(x=12, y=9, width=4632, height=3478)
     ) == (12, 9, 4632, 3478)
+
+
+def test_turning_raw_on_with_the_same_encoding_reconfigures(monkeypatch, tmp_path):
+    """A PNG still with raw=False and one with raw=True share use_yuv (both
+    RGB888), so without `raw` in the reconfigure key the second would reuse
+    the first configuration and have no raw stream to save a sidecar from
+    (Copilot, C91b-2)."""
+    backend, cls = _install(monkeypatch)
+    backend.capture_image(tmp_path / "a.png", _still_config(resolution="high", encoding="png", raw=False))
+    configures_before = len(cls.INSTANCES[0].configs)
+    backend.capture_image(tmp_path / "b.png", _still_config(resolution="high", encoding="png", raw=True))
+    assert len(cls.INSTANCES[0].configs) == configures_before + 1
+    assert "raw" in cls.INSTANCES[0].configs[-1]
