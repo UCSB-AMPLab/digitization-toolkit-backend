@@ -1,0 +1,53 @@
+# `-m "not camera"` deselects camera-marked tests; the remaining hardware fixtures
+# skip because the default picamera2 backend cannot be built on the runner
+# (the subprocess backend would raise FileNotFoundError for rpicam-still instead).
+# DATABASE_URL is set because alembic/env.py:50 (get_url) reads DATABASE_URL from
+# the environment before falling back to app settings, and `db-check-drift` needs
+# it to reach the postgres service below.
+name: CI
+
+on:
+  pull_request:
+    branches: [dev]
+  push:
+    branches: [dev]
+
+jobs:
+  test:
+    runs-on: ubuntu-24.04
+    services:
+      postgres:
+        image: postgres:16
+        env:
+          POSTGRES_USER: dtk
+          POSTGRES_PASSWORD: dtk
+          POSTGRES_DB: dtk
+        ports:
+          - 5432
+        options: >-
+          --health-cmd pg_isready
+          --health-interval 10s
+          --health-timeout 5s
+          --health-retries 5
+    steps:
+      - uses: actions/checkout@v4
+
+      - uses: prefix-dev/setup-pixi@d3f436a425481402e6a95a1d1fc10331c708cd9e # v0.10.2
+        with:
+          environments: dev
+          cache: true
+
+      - name: Unit and integration tests
+        run: pixi run -e dev pytest tests/ -m "not camera" -q
+        env:
+          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
+          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          APP_ENV: test
+
+      - name: Schema drift guard
+        run: pixi run -e dev db-check-drift
+        env:
+          DATABASE_URL: postgresql+psycopg://dtk:dtk@localhost:${{ job.services.postgres.ports[5432] }}/dtk
+          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
+          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          APP_ENV: test

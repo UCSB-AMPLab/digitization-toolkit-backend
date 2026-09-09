@@ -21,20 +21,29 @@ async def lifespan(app: FastAPI):
     init_db()
     # Refuse to serve against an un-migrated schema so the failure is loud at startup rather than a later 500 in the field
     assert_schema_at_head()
+    # Finish or discard any project rename interrupted by a crash/power loss before serving requests
+    from app.core.db import SessionLocal
+    from app.core.storage_ops import reconcile_pending_rename
+    db = SessionLocal()
+    try:
+        reconcile_pending_rename(db)
+    finally:
+        db.close()
     yield
 
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
-# Allow the Svelte frontend to call the API
-# :5173 = Vite dev server, :3000 = production Node server
+# Allow Svelte frontend API access. Production is same-origin via nginx;
+# CORS applies only to the dev server. Origins use a deployment allowlist.
+# Methods and headers are restricted to those required by the app.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
-    # allow_private_network=True,
-    allow_methods=["*"],
-    allow_headers=["*"],
+    allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
+    allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token"],
+    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes"],
 )
 
 app.include_router(records_router, prefix="/records", tags=["records"])

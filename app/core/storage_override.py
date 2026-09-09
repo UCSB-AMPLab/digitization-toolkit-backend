@@ -5,7 +5,9 @@ Stored in /var/lib/dtk/storage-override.json so it survives backend restarts
 without requiring an env var change or service restart.
 
 A missing override file means "no override" and is normal. An override file that
-exists but cannot be read raises StorageOverrideError, so a corrupt file surfaces as an error instead of a silent fallback to the internal SD.
+exists but cannot be read raises StorageOverrideError from the low-level reader;
+callers use get_storage_override_or_fallback to log it and revert to internal
+storage rather than let one corrupt file 500 the whole app.
 """
 import json
 import logging
@@ -33,6 +35,15 @@ def get_storage_override() -> str | None:
             f"[ERROR] Storage override file '{_OVERRIDE_FILE}' exists but is unreadable; the active storage path is unknown. Re-activate the storage drive or clear the override."
         ) from e
     return str(value) if value else None
+
+
+def get_storage_override_or_fallback() -> tuple[str | None, bool]:
+    """Return (override_path_or_None, corrupt). Never raises: a corrupt override file is logged and reported as corrupt=True so callers fall back to internal storage instead of turning every request into a 500."""
+    try:
+        return get_storage_override(), False
+    except StorageOverrideError:
+        logger.error("[ERROR] Storage override unreadable; falling back to internal storage")
+        return None, True
 
 
 def set_storage_override(projects_root: str) -> None:

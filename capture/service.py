@@ -2,6 +2,8 @@ import sys
 from pathlib import Path
 import time
 import threading
+import tempfile
+import shutil
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
@@ -29,7 +31,7 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from .utils import setup_rotating_logger, atomic_write
-from .camera import CameraConfig
+from .camera import CameraConfig, IMG_SIZES
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
 from .project_manager import project_capture_root, image_output_dir
@@ -78,14 +80,22 @@ def get_camera_backend() -> CameraBackend:
 
 # Global backend instance (lazy initialization)
 _backend: Optional[CameraBackend] = None
+_backend_lock = threading.Lock()
 
 def get_backend() -> CameraBackend:
-    """Get or initialize the global camera backend."""
+    """Get or initialize the global camera backend.
+
+    The lock covers the whole check-and-construct so two first callers on the
+    thread pool cannot each build their own instance. Stays lazy: nothing is
+    constructed until the first call, and a failed construction leaves the
+    global unset so the next call retries.
+    """
     global _backend
-    if _backend is None:
-        _backend = get_camera_backend()
-        subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
-    return _backend
+    with _backend_lock:
+        if _backend is None:
+            _backend = get_camera_backend()
+            subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+        return _backend
 
 
 def is_camera_connected(camera_index: int = 0) -> bool:
@@ -317,6 +327,101 @@ def _unlink_capture_output(path) -> None:
                 pass
 
 
+def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
+    """Take a real still for the dashboard's "Probar camaras" button and return it inline.
+
+    Exercises the same shutter/autofocus/backend path as POST /capture -
+    same registry-driven CameraConfig (default_camera_config_from_registry,
+    so a saved orientation still applies) and the same
+    get_backend().capture_image() call - but the file never lands under the
+    projects root: it is written to a throwaway temp directory that is
+    always removed before returning, and no manifest record is ever
+    generated or appended. This is a one-off test capture, not a document
+    capture, so it must never appear in a project's capture history.
+
+    Args:
+        camera_index: The index of the camera to test.
+        resolution: Resolution preset (see capture.camera.IMG_SIZES).
+
+    Returns:
+        tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
+            backend capture call, not config lookup or file cleanup.
+
+    Raises:
+        RuntimeError: if the camera is not connected (mirrors capture_image),
+            if the backend raises during capture (including a DSLR timeout -
+            see capture/backends/gphoto2_backend.py:1418, which wraps
+            CaptureTimeoutError in a plain RuntimeError), or if a RAW capture
+            has no JPEG preview sidecar to return.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected.")
+
+    from .project_manager import default_camera_config_from_registry
+
+    config_dict, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+    camera_config = CameraConfig(**config_dict)
+
+    tmpdir = tempfile.mkdtemp(prefix="dtk_testcap_")
+    try:
+        output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
+
+        start_time = time.perf_counter()
+        result = get_backend().capture_image(output_path, camera_config)
+        elapsed_time = time.perf_counter() - start_time
+
+        # Result is a (path_or_paths, metadata) pair from the picamera2 and
+        # gphoto2 backends, or a bare path from the subprocess backend; same
+        # two shapes capture_image (above) accepts.
+        if isinstance(result, tuple) and len(result) == 2:
+            actual_path, _metadata = result
+        else:
+            actual_path, _metadata = result, None
+
+        # actual_path may be a single path or, for a multi-format capture
+        # (e.g. picamera2_backend.py:709 returns (jpeg_path, raw_path) for
+        # raw captures), a tuple/list of paths - never stringify the tuple
+        # itself, or _apply_rotation gets handed a nonexistent path built
+        # from Python's tuple repr.
+        paths = (
+            [Path(str(p)) for p in actual_path]
+            if isinstance(actual_path, (tuple, list))
+            else [Path(str(actual_path))]
+        )
+
+        # Apply clockwise rotation if requested - mirrors capture_image's own
+        # rotation block above (including its rotation of a RAW _preview.jpg
+        # sidecar, if one was extracted) - but for every file of a
+        # multi-path capture, not just the first.
+        rotate_deg = getattr(camera_config, "rotate_deg", 0)
+        if rotate_deg:
+            for p in paths:
+                _apply_rotation(p, rotate_deg)
+                preview = p.parent / (p.stem + "_preview.jpg")
+                if preview.exists():
+                    _apply_rotation(preview, rotate_deg)
+
+        # Pick the bytes to return.
+        if isinstance(actual_path, (tuple, list)):
+            # Multi-format capture: (jpeg_path, raw_path) - return the jpeg.
+            image_bytes = paths[0].read_bytes()
+        else:
+            single_path = paths[0]
+            if single_path.suffix.lower() in (".cr2", ".raw"):
+                sidecar = single_path.with_name(single_path.stem + "_preview.jpg")
+                if not sidecar.exists():
+                    raise RuntimeError(
+                        f"No JPEG preview available for RAW capture {single_path.name}"
+                    )
+                image_bytes = sidecar.read_bytes()
+            else:
+                image_bytes = single_path.read_bytes()
+
+        return image_bytes, elapsed_time
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
+
+
 def dual_capture_image(
         project_name: str,
         cam1_config: CameraConfig,
@@ -433,42 +538,57 @@ def dual_capture_image(
     
     return img1_path, img2_path, record.capture_id, record.pair_id
     
-def capture_preview_frame(camera_index: int) -> bytes:
+def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
-    Capture a low-resolution preview frame and return JPEG bytes.
+    Capture a live preview frame and return JPEG bytes.
 
     Not saved to the project directory - intended for live preview polling
-    from the frontend. Uses a stable per-camera temp file that is overwritten
-    on every call (rather than mkstemp), so at most one file per camera ever
-    exists in /tmp even if the process is killed unexpectedly.
+    from the frontend. Uses a stable per-camera temp path (rather than
+    mkstemp) that is removed after each call, so at most one file per camera
+    can ever be left in /tmp, and only if the process dies mid-call.
 
-    The preview uses a lightweight configuration:
-      - 1280x720 (native fast mode, no cropping)
-      - No autofocus cycle (too slow for live preview)
-      - No AE stabilisation wait
-      - No temporal denoise warmup
-      - Reduced JPEG quality (75) for a smaller payload
+    On picamera2 the frame is the second ("lores") stream of the still's own
+    configuration at ``resolution``: same sensor mode, same ScalerCrop, so the
+    preview's field of view is the capture's and nothing is reconfigured
+    between a poll and a capture of the same size. No autofocus cycle, no AE
+    stabilisation wait, no denoise warmup, and JPEG quality 75 for a smaller
+    polling payload.
 
     Args:
         camera_index: Camera index (0 or 1).
+        resolution: Key into IMG_SIZES ("low", "medium", "high") naming the
+            still whose configuration the preview rides on. Backends with
+            their own native preview (gphoto2) pick their own size and ignore
+            this.
 
     Returns:
         JPEG bytes of the preview frame.
 
     Raises:
+        ValueError: If ``resolution`` is not a known IMG_SIZES key.
         RuntimeError: If the camera is not connected or capture fails.
     """
+    img_size = IMG_SIZES.get(resolution)
+    if img_size is None:
+        raise ValueError(
+            f"Unknown resolution '{resolution}'; expected one of {sorted(IMG_SIZES)}"
+        )
+
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
+    is_picamera2 = isinstance(backend, Picamera2Backend)
+
     # If the backend has a native preview implementation (e.g. gphoto2), use it
-    # directly instead of the picamera2-specific CameraConfig path below.
-    try:
-        return backend.capture_preview(camera_index)
-    except NotImplementedError:
-        pass  # fall through to picamera2 path
+    # directly. Its signature takes no size, so it is called as the base class
+    # declares it.
+    if not is_picamera2:
+        try:
+            return backend.capture_preview(camera_index)
+        except NotImplementedError:
+            pass  # fall through to the generic capture_image path
 
     # Fixed per-camera path - overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
@@ -476,9 +596,11 @@ def capture_preview_frame(camera_index: int) -> bytes:
     tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
     lock = _get_preview_lock(camera_index)
 
+    # Fallback for backends with neither a native preview nor a lores stream
+    # (rpicam subprocess): a small standalone capture, as before.
     preview_config = CameraConfig(
         camera_index=camera_index,
-        img_size=(1280, 720),        # Native 80 fps mode - fast, no crop
+        img_size=(1280, 720),
         autofocus_on_capture=False,  # Skip AF cycle for live preview
         timeout=0,                   # No AE stabilisation wait
         denoise_frames=0,            # No temporal denoise warmup
@@ -490,6 +612,10 @@ def capture_preview_frame(camera_index: int) -> bytes:
     with lock:
         for attempt in range(2):
             try:
+                if is_picamera2:
+                    return backend.capture_preview(
+                        camera_index, img_size=img_size, tmp_path=tmp_path
+                    )
                 backend.capture_image(tmp_path, preview_config)
                 data = tmp_path.read_bytes()
                 return data

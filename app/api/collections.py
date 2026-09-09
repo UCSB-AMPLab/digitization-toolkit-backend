@@ -14,6 +14,9 @@ from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 from app.schemas.record import ReorderRecords
 from app.core.audit import log_event
+from app.core.config import settings
+from app.core.export_jobs import export_jobs
+from app.core.export_service import run_export
 from app.core.storage_ops import (
     collection_and_descendants,
     relocate_image,
@@ -105,7 +108,26 @@ def list_collections(
     # which shifts when rows are updated. Also required for stable
     # skip/limit pagination.
     items = query.order_by(Collection.id).offset(skip).limit(limit).all()
-    return [CollectionRead.model_validate(i) for i in items]
+
+    # Bulk-count records per collection in one query (avoids N+1 — the
+    # project detail page lists every collection and needs each one's
+    # count for the "No. of images/records" column, NEH-179).
+    counts_by_id: dict[int, int] = {}
+    if items:
+        rows = (
+            db.query(Record.collection_id, func.count(Record.id))
+            .filter(Record.collection_id.in_([c.id for c in items]))
+            .group_by(Record.collection_id)
+            .all()
+        )
+        counts_by_id = {collection_id: count for collection_id, count in rows}
+
+    results = []
+    for i in items:
+        r = CollectionRead.model_validate(i)
+        r.record_count = counts_by_id.get(i.id, 0)
+        results.append(r)
+    return results
 
 
 @router.get("/count")
@@ -428,19 +450,13 @@ def export_collection_bagit(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Package all approved records in this collection as a BagIt zip archive.
+    Start a background BagIt export of this collection and return a job to poll.
 
-    Requires ALL records in the collection to have status 'approved'.
-    The generated zip is saved to the exports directory and a download URL is returned.
+    Requires all records to be approved. The heavy work (integrity verification and
+    streaming the zip straight into the exports dir, with no staging copy) runs in a
+    background job, so proxied clients never hit nginx's read timeout; poll
+    GET /{collection_id}/export/status/{job_id} for progress.
     """
-    import bagit
-    import json
-    import shutil as _shutil
-    import tempfile
-    import zipfile
-    from datetime import datetime, timezone
-    from pathlib import Path as _Path
-
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
@@ -454,10 +470,8 @@ def export_collection_bagit(
     if not records:
         raise HTTPException(
             status_code=422,
-            detail={"message": "Collection has no records to export.", "blocking_record_ids": []}
+            detail={"message": "Collection has no records to export.", "blocking_record_ids": []},
         )
-
-    # All records must be approved
     non_approved = [r.id for r in records if r.status != "approved"]
     if non_approved:
         raise HTTPException(
@@ -465,116 +479,47 @@ def export_collection_bagit(
             detail={
                 "message": f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
                 "blocking_record_ids": non_approved,
-            }
-        )
-
-    # Gather project info for bag metadata
-    project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
-
-    timestamp = datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
-    bag_name = f"collection_{collection_id}_{timestamp}"
-    exports_dir = settings.exports_dir
-    exports_dir.mkdir(parents=True, exist_ok=True)
-
-    with tempfile.TemporaryDirectory() as tmpdir:
-        tmp_path = _Path(tmpdir)
-        data_dir = tmp_path / "data"
-        data_dir.mkdir()
-
-        # Copy image files into data/ numbered by their position in the ordered list
-        for idx, rec in enumerate(records):
-            seq_label = f"{idx + 1:04d}"
-            safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (rec.title or "record"))[:60]
-            rec_dir = data_dir / f"{seq_label}_{safe_title}"
-            rec_dir.mkdir(exist_ok=True)
-
-            for img in sorted(rec.images, key=lambda i: (i.role or "z", i.id)):
-                if not img.file_path:
-                    continue
-                src = _Path(img.file_path)
-                if not src.exists():
-                    logger.warning(f"Missing file for image {img.id}: {img.file_path}")
-                    continue
-                role_prefix = img.role or f"img_{img.id}"
-                dest_name = f"{role_prefix}{src.suffix}"
-                _shutil.copy2(src, rec_dir / dest_name)
-
-        # Write metadata sidecar before bagging
-        metadata_payload = {
-            "exported_at": timestamp,
-            "collection": {
-                "id": collection.id,
-                "name": collection.name,
-                "description": collection.description,
-                "collection_type": collection.collection_type,
-                "archival_metadata": collection.archival_metadata,
-                "created_by": collection.created_by,
-                "created_at": collection.created_at.isoformat() if collection.created_at else None,
             },
-            "project": {
-                "id": project.id if project else None,
-                "name": project.name if project else None,
-            } if project else None,
-            "records": [
-                {
-                    "id": r.id,
-                    "sequence": r.sequence,
-                    "title": r.title,
-                    "description": r.description,
-                    "object_typology": r.object_typology,
-                    "author": r.author,
-                    "material": r.material,
-                    "date": r.date,
-                    "status": r.status,
-                    "created_by": r.created_by,
-                    "created_at": r.created_at.isoformat() if r.created_at else None,
-                    "images": [
-                        {
-                            "id": img.id,
-                            "filename": img.filename,
-                            "role": img.role,
-                            "sequence": img.sequence,
-                            "format": img.format,
-                            "resolution_width": img.resolution_width,
-                            "resolution_height": img.resolution_height,
-                            "file_size": img.file_size,
-                        }
-                        for img in r.images
-                    ],
-                }
-                for r in records
-            ],
-        }
-        (data_dir / "metadata.json").write_text(
-            json.dumps(metadata_payload, indent=2, ensure_ascii=False),
-            encoding="utf-8"
         )
 
-        # Create BagIt bag in-place
-        bag_metadata = {
-            "Source-Organization": project.name if project else "Digitization Toolkit",
-            "External-Description": collection.description or collection.name,
-            "Bagging-Date": timestamp[:8],
-            "External-Identifier": f"collection-{collection_id}",
-            "Bag-Count": "1 of 1",
-            "Record-Count": str(len(records)),
-        }
-        bagit.make_bag(str(tmp_path), bag_metadata, checksum=["md5", "sha256"])
+    image_less = [r.id for r in records if not any(i.is_current for i in r.images)]
+    if image_less:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"Cannot export: {len(image_less)} record(s) have no image: {image_less}",
+                "blocking_record_ids": image_less,
+            },
+        )
 
-        # Zip the bag
-        zip_path = exports_dir / f"{bag_name}.zip"
-        with zipfile.ZipFile(zip_path, "w", zipfile.ZIP_DEFLATED) as zf:
-            for file in tmp_path.rglob("*"):
-                if file.is_file():
-                    zf.write(file, arcname=_Path(bag_name) / file.relative_to(tmp_path))
-
-    logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
+    # One export per collection at a time: a retry returns the running job instead of
+    # stacking a second export that doubles disk pressure. Integrity checks and the
+    # zip build happen in the job, surfaced via the status endpoint.
+    job = export_jobs.start(collection_id, lambda j: run_export(j, collection_id))
+    log_event(db, level="INFO", category="activity", action="export_started",
+              actor=current_user.username, subject=collection.name)
     return {
-        "bag_name": bag_name,
-        "zip_filename": zip_path.name,
-        "size_bytes": zip_path.stat().st_size,
-        "download_url": f"/collections/{collection_id}/export/download",
+        "job_id": job.id,
+        "state": job.state,
+        "status_url": f"/collections/{collection_id}/export/status/{job.id}",
     }
+
+
+@router.get("/{collection_id}/export/status/{job_id}")
+def export_status(
+    collection_id: int,
+    job_id: str,
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """Poll the state and progress of a background export job."""
+    job = export_jobs.get(job_id)
+    if not job or job.collection_id != collection_id:
+        raise HTTPException(status_code=404, detail="Export job not found")
+    body = job.to_dict()
+    if job.state == "done" and job.zip_filename:
+        body["download_url"] = f"/collections/{collection_id}/export/download"
+    return body
 
 
 @router.get("/{collection_id}/export/download")

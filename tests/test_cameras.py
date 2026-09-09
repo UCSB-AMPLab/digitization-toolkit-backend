@@ -37,27 +37,31 @@ def test_dual_capture_image(override_projects_root, skip_if_single_camera):
 
     
     # Capture images
-    path1, path2 = dual_capture_image(
+    path1, path2, capture_id, pair_id = dual_capture_image(
         project_name,
         cam1_config=cam1,
         cam2_config=cam2,
         include_resolution=True,
     )
-    
+
     # Verify files were created
     assert os.path.exists(path1), f"Camera 0 image not created: {path1}"
     assert os.path.exists(path2), f"Camera 1 image not created: {path2}"
-    
+
     # Verify files have content
     assert os.path.getsize(path1) > 0, "Camera 0 image is empty"
     assert os.path.getsize(path2) > 0, "Camera 1 image is empty"
-    
+
     # Verify filenames contain camera indices
     # Convert to string in case they're Path objects
     path1_str = str(path1)
     path2_str = str(path2)
     assert "_c0_" in path1_str or "_c0." in path1_str, "Camera 0 filename doesn't indicate camera index"
     assert "_c1_" in path2_str or "_c1." in path2_str, "Camera 1 filename doesn't indicate camera index"
+
+    # Verify manifest record identifiers were returned
+    assert isinstance(capture_id, str) and capture_id, "capture_id should be a non-empty string"
+    assert isinstance(pair_id, str) and pair_id, "pair_id should be a non-empty string"
 
 
 @pytest.mark.camera
@@ -93,14 +97,18 @@ def test_capture_performance(override_projects_root, skip_if_single_camera):
     times = []
     for i in range(3):
         start = time.time()
-        path1, path2 = dual_capture_image(project_name, cam1, cam2)
+        path1, path2, capture_id, pair_id = dual_capture_image(project_name, cam1, cam2)
         elapsed = time.time() - start
         times.append(elapsed)
-        
+
         # Verify capture succeeded
         assert os.path.exists(path1), f"Camera 0 image not created"
         assert os.path.exists(path2), f"Camera 1 image not created"
-        
+
+        # Verify manifest record identifiers were returned
+        assert isinstance(capture_id, str) and capture_id, "capture_id should be a non-empty string"
+        assert isinstance(pair_id, str) and pair_id, "pair_id should be a non-empty string"
+
         # Small delay between captures
         if i < 2:
             time.sleep(0.5)
