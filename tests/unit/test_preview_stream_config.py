@@ -767,3 +767,17 @@ def test_turning_raw_on_with_the_same_encoding_reconfigures(monkeypatch, tmp_pat
     backend.capture_image(tmp_path / "b.png", _still_config(resolution="high", encoding="png", raw=True))
     assert len(cls.INSTANCES[0].configs) == configures_before + 1
     assert "raw" in cls.INSTANCES[0].configs[-1]
+
+
+def test_without_the_control_the_fallback_is_the_modes_maximum_crop(monkeypatch, tmp_path):
+    """A build that does not expose camera_controls["ScalerCrop"] must not
+    fall back to the pixel array in a banded mode: ScalerCropMaximum is the
+    reachable rectangle there (Copilot, second review)."""
+    backend, cls = _install(monkeypatch)
+    cam_cls = cls
+    backend.capture_preview(0, img_size=IMG_SIZES["medium"], tmp_path=tmp_path / "p.jpg")
+    cam = cam_cls.INSTANCES[0]
+    monkeypatch.setattr(type(cam), "camera_controls", property(lambda self: {}), raising=False)
+    backend._invalidate_camera_caches(0)
+    rect = backend._unzoomed_rect(cam, 0)
+    assert rect == pb._crop_rect(cam.camera_properties["ScalerCropMaximum"])

@@ -449,8 +449,9 @@ class Picamera2Backend(CameraBackend):
 
         picamera2 exposes each control as a (min, max, default) tuple that
         reflects the configuration in force, so the default is the reachable
-        unzoomed rectangle for this output aspect. Falls back to the whole
-        pixel array only on a build that does not report the control.
+        unzoomed rectangle for this output aspect. On a build that does not
+        report the control, falls back to the mode's ScalerCropMaximum
+        property, and only then to the whole pixel array.
 
         Returns:
             (x, y, width, height), or None if neither source is available.
@@ -462,6 +463,16 @@ class Picamera2Backend(CameraBackend):
                 return _crop_rect(entry[2])
             except (IndexError, TypeError, ValueError) as e:
                 self.logger.warning(f"Unreadable ScalerCrop control range: {e}")
+
+        # No control range: the mode's own maximum crop is the reachable
+        # rectangle (a banded mode cannot deliver the pixel array), so it
+        # comes before the pixel array as a fallback.
+        crop_maximum = picam2.camera_properties.get('ScalerCropMaximum')
+        if crop_maximum is not None:
+            try:
+                return _crop_rect(crop_maximum)
+            except (IndexError, TypeError, ValueError) as e:
+                self.logger.warning(f"Unreadable ScalerCropMaximum: {e}")
 
         pixel_array_size = picam2.camera_properties.get('PixelArraySize')
         if pixel_array_size is None:
