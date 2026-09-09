@@ -74,9 +74,14 @@ def register(
         if not caller or caller.role != "admin":
             raise HTTPException(status_code=403, detail="Only admins can register new users")
 
-    if db.query(User).filter(
-        (User.username == payload.username) | (User.email == payload.email)
-    ).first():
+    # Only compare email when one was given: with email optional (NEH-162),
+    # every user without one has email=NULL, and NULL never equals NULL in
+    # SQL, so an == comparison here would never itself risk a false 409 —
+    # but skipping it when payload.email is None keeps the intent explicit.
+    conflict_filter = User.username == payload.username
+    if payload.email is not None:
+        conflict_filter = conflict_filter | (User.email == payload.email)
+    if db.query(User).filter(conflict_filter).first():
         raise HTTPException(status_code=409, detail="Username or email already exists")
 
     # First user becomes admin (bootstrap); all subsequent users start as reviewer.

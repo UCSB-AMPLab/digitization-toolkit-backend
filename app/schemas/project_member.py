@@ -16,7 +16,8 @@ class ProjectMemberRead(BaseModel):
     added_by: Optional[str] = None
     # Flattened user details (joined at query time)
     username: str
-    email: str
+    # Optional: email is optional on the user account itself (NEH-162).
+    email: Optional[str] = None
     # True for admins who are always implicit collaborators
     is_implicit: bool = False
 
