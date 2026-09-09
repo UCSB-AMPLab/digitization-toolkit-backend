@@ -14,8 +14,7 @@ import pytest
 
 def _register(client, username, password="pass1234", email=...):
     """POST /auth/register. `email` defaults to the sentinel `...` meaning
-    "omit the key entirely"; pass None or "" to send those values explicitly,
-    or an Authorization header via `headers` for a non-bootstrap call."""
+    "omit the key entirely"; pass None or "" to send those values explicitly."""
     payload = {"username": username, "password": password}
     if email is not ...:
         payload["email"] = email
@@ -171,13 +170,10 @@ def test_add_emailless_collaborator_returns_200_and_lists(emailless_admin_client
     assert collaborator_rows[0]["email"] is None
 
 
-import pytest
-
-
 @pytest.mark.parametrize("bad", [123, ["a@b.co"], {"address": "a@b.co"}, True])
 def test_a_non_string_email_is_a_422_not_a_server_error(client, bad):
     """R47-1: a "before" validator sees the raw payload value, so a number,
     a list, an object or a boolean must be refused as a format error rather
     than crash on .strip()."""
-    resp = client.post("/auth/register", json={"username": f"u_{abs(hash(str(bad)))%10000}", "email": bad, "password": "Passw0rd!x"})
+    resp = client.post("/auth/register", json={"username": "u_bad_email", "email": bad, "password": "Passw0rd!x"})
     assert resp.status_code == 422, resp.text
