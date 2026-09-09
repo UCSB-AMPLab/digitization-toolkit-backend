@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
@@ -523,6 +523,82 @@ def apply_camera_settings(
 	except Exception as e:
 		logger.exception(f"apply_camera_settings failed for camera {camera_index}: {e}")
 		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
+
+
+def _is_capture_timeout(exc: BaseException) -> bool:
+	"""True if exc, or something it was raised from, is a CaptureTimeoutError.
+
+	capture/backends/gphoto2_backend.py:1418 wraps a CaptureTimeoutError in a
+	plain RuntimeError ("DSLR capture failed: ...") so a stalled DSLR body
+	can travel the same failure path as any other capture error, keeping the
+	original timeout as __cause__. Catching RuntimeError (or CaptureTimeoutError
+	itself, which is a RuntimeError subclass) would therefore either be too
+	broad or miss every real DSLR timeout wrapped this way, so this walks a
+	few links of the __cause__ / __context__ chain looking for the real class.
+	"""
+	from capture.backends.gphoto2_backend import CaptureTimeoutError
+
+	current = exc
+	for _ in range(5):
+		if current is None:
+			return False
+		if isinstance(current, CaptureTimeoutError):
+			return True
+		current = current.__cause__ or current.__context__
+	return False
+
+
+@router.post("/test-capture/{camera_index}")
+def test_capture(
+	camera_index: int,
+	resolution: str = Query("medium"),
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Take a real still capture - shutter, autofocus, the full backend path -
+	and return it inline as a JPEG, never stored (dashboard "Probar camaras"
+	button; NEH-166, option (a)).
+
+	Uses the literal-first path (/test-capture/{camera_index}, not
+	/{camera_index}/test-capture) to match this router's existing convention
+	for POST routes that take a camera_index (/focus/{camera_index},
+	/settings/{camera_index}), and to keep it unambiguous against any future
+	/{camera_index}-shaped route.
+
+	Checks the camera is connected before calling the service, mirroring
+	trigger_capture, rather than sniffing the RuntimeError message for
+	"not connected" after the fact.
+	"""
+	from capture.camera import IMG_SIZES
+
+	if resolution not in IMG_SIZES:
+		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
+
+	from capture.service import test_capture_bytes, is_camera_connected
+
+	if not is_camera_connected(camera_index):
+		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
+
+	try:
+		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
+	except RuntimeError as e:
+		if _is_capture_timeout(e):
+			raise HTTPException(status_code=504, detail=str(e))
+		raise HTTPException(status_code=500, detail=str(e))
+	except HTTPException:
+		raise
+	except Exception:
+		logger.exception("Test capture failed")
+		raise HTTPException(status_code=500, detail="Test capture failed")
+
+	return Response(
+		content=image_bytes,
+		media_type="image/jpeg",
+		headers={
+			"X-Capture-Seconds": f"{elapsed_time:.3f}",
+			"X-Capture-Bytes": str(len(image_bytes)),
+		},
+	)
 
 
 @router.post("/capture", response_model=CaptureResponse)
