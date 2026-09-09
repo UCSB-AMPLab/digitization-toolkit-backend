@@ -217,7 +217,7 @@ def test_test_capture_removes_its_temp_directory_on_failure(client, monkeypatch)
 
 
 @pytest.mark.unit
-def test_test_capture_passes_the_registrys_rotate_deg_to_the_backend(client, monkeypatch):
+def test_test_capture_passes_the_registry_rotate_deg_to_the_backend(client, monkeypatch):
     recorded = {}
     _install_default_config(monkeypatch, {"camera_index": 0, "rotate_deg": 270})
     _install_backend(monkeypatch, _FakeBackendSingle(recorded))

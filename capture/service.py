@@ -370,7 +370,9 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
         result = get_backend().capture_image(output_path, camera_config)
         elapsed_time = time.perf_counter() - start_time
 
-        # Result is always (path_or_paths, metadata), same as capture_image (above).
+        # Result is a (path_or_paths, metadata) pair from the picamera2 and
+        # gphoto2 backends, or a bare path from the subprocess backend; same
+        # two shapes capture_image (above) accepts.
         if isinstance(result, tuple) and len(result) == 2:
             actual_path, _metadata = result
         else:
