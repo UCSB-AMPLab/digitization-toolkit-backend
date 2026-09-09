@@ -74,10 +74,10 @@ def register(
         if not caller or caller.role != "admin":
             raise HTTPException(status_code=403, detail="Only admins can register new users")
 
-    # Only compare email when one was given: with email optional (NEH-162),
-    # every user without one has email=NULL, and NULL never equals NULL in
-    # SQL, so an == comparison here would never itself risk a false 409 —
-    # but skipping it when payload.email is None keeps the intent explicit.
+    # Only compare email when one was given (NEH-162): SQLAlchemy compiles
+    # `User.email == None` to `users.email IS NULL`, which would match every
+    # user without an email and raise a false 409, so the email predicate is
+    # added only when the payload carries one.
     conflict_filter = User.username == payload.username
     if payload.email is not None:
         conflict_filter = conflict_filter | (User.email == payload.email)
