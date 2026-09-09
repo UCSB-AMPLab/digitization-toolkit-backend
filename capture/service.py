@@ -2,6 +2,8 @@ import sys
 from pathlib import Path
 import time
 import threading
+import tempfile
+import shutil
 from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
@@ -323,6 +325,87 @@ def _unlink_capture_output(path) -> None:
                 target.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple:
+    """Take a real still for the dashboard's "Probar camaras" button and return it inline.
+
+    Exercises the same shutter/autofocus/backend path as POST /capture -
+    same registry-driven CameraConfig (default_camera_config_from_registry,
+    so a saved orientation still applies) and the same
+    get_backend().capture_image() call - but the file never lands under the
+    projects root: it is written to a throwaway temp directory that is
+    always removed before returning, and no manifest record is ever
+    generated or appended. This is a one-off test capture, not a document
+    capture, so it must never appear in a project's capture history.
+
+    Args:
+        camera_index: The index of the camera to test.
+        resolution: Resolution preset (see capture.camera.IMG_SIZES).
+
+    Returns:
+        tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
+            backend capture call, not config lookup or file cleanup.
+
+    Raises:
+        RuntimeError: if the camera is not connected (mirrors capture_image),
+            if the backend raises during capture (including a DSLR timeout -
+            see capture/backends/gphoto2_backend.py:1418, which wraps
+            CaptureTimeoutError in a plain RuntimeError), or if a RAW capture
+            has no JPEG preview sidecar to return.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected.")
+
+    from .project_manager import default_camera_config_from_registry
+
+    config_dict, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+    camera_config = CameraConfig(**config_dict)
+
+    tmpdir = tempfile.mkdtemp(prefix="dtk_testcap_")
+    try:
+        output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
+
+        start_time = time.time()
+        result = get_backend().capture_image(output_path, camera_config)
+        elapsed_time = time.time() - start_time
+
+        # Result is always (path_or_paths, metadata), same as capture_image (above).
+        if isinstance(result, tuple) and len(result) == 2:
+            actual_path, _metadata = result
+        else:
+            actual_path, _metadata = result, None
+
+        # Apply clockwise rotation if requested - mirrors capture_image's own
+        # rotation block above (including its rotation of a RAW _preview.jpg
+        # sidecar, if one was extracted).
+        rotate_deg = getattr(camera_config, "rotate_deg", 0)
+        if rotate_deg:
+            _apply_rotation(Path(str(actual_path)), rotate_deg)
+            preview = Path(str(actual_path)).with_suffix("")
+            preview = preview.parent / (preview.name + "_preview.jpg")
+            if preview.exists():
+                _apply_rotation(preview, rotate_deg)
+
+        # Pick the bytes to return.
+        if isinstance(actual_path, (tuple, list)):
+            # Multi-format capture: (jpeg_path, raw_path) - return the jpeg.
+            image_bytes = Path(str(actual_path[0])).read_bytes()
+        else:
+            single_path = Path(str(actual_path))
+            if single_path.suffix.lower() in (".cr2", ".raw"):
+                sidecar = single_path.with_name(single_path.stem + "_preview.jpg")
+                if not sidecar.exists():
+                    raise RuntimeError(
+                        f"No JPEG preview available for RAW capture {single_path.name}"
+                    )
+                image_bytes = sidecar.read_bytes()
+            else:
+                image_bytes = single_path.read_bytes()
+
+        return image_bytes, elapsed_time
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def dual_capture_image(
