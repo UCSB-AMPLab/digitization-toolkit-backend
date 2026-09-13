@@ -132,6 +132,7 @@ class Body:
         preview_error=None,
         mode_error=None,
         product_error=None,
+        version_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -146,6 +147,8 @@ class Body:
         self.preview_error = preview_error
         self.mode_error = mode_error
         self.product_error = product_error
+        self.version_error = version_error
+        self.version_calls = 0
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -204,6 +207,13 @@ class _FakeChdkPTP:
 
     def __init__(self, body):
         self._body = body
+
+    def get_version(self):
+        """The cheapest CHDK transaction there is: one command, no data."""
+        self._body.version_calls += 1
+        if self._body.version_error is not None:
+            raise self._body.version_error
+        return (2, 9)
 
     def get_display_data(self, flags=0):
         self._body.frames_served += 1

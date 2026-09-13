@@ -19,7 +19,13 @@ import pytest
 
 from capture.camera import CameraConfig
 
-from .chdk_fakes import Body, PTPError, make_backend, make_pychdk
+from .chdk_fakes import (
+    Body,
+    PTPError,
+    TransportError,
+    make_backend,
+    make_pychdk,
+)
 
 
 EVEN_CARD = b"EVEN\nid=aaaaaaaaaaaa\n"
@@ -183,3 +189,64 @@ def test_the_backend_looks_at_the_bus_again_after_a_cleanup(monkeypatch):
 
     assert backend.is_camera_connected(0) is True
     assert body.opens == 2
+
+
+@pytest.mark.unit
+def test_a_different_body_at_the_same_address_is_not_the_same_session(monkeypatch):
+    """A bus address is a place, not a camera, and places are reused."""
+    original = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD)
+    fake = make_pychdk(original)
+    backend = make_backend(monkeypatch, fake)
+    assert backend.list_devices()[0]["serial"] == "AAA111"
+
+    replacement = Body(bus=1, address=4, serial="BBB222", card=ODD_CARD)
+    fake.bodies = [replacement]
+
+    rows = backend.list_devices()
+
+    assert rows[0]["serial"] == "BBB222", "the old session was kept"
+    assert original.closes == 1, "the old session was never closed"
+    assert replacement.opens == 1
+
+
+@pytest.mark.unit
+def test_a_body_that_stopped_answering_is_opened_again(monkeypatch):
+    """A replug can bring a body back at the same address with no serial.
+
+    Nothing in the enumeration record can tell it from the one that left, and
+    the library's own connected flag is local - it says what the host last
+    did, not whether the camera is still there. One cheap transaction on the
+    session settles it: a handle whose device was unplugged cannot answer,
+    whatever took its place.
+    """
+    original = Body(bus=1, address=4, serial=None,
+                    card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    fake = make_pychdk(original)
+    backend = make_backend(monkeypatch, fake)
+    assert backend.list_devices()[0]["hardware_id"].endswith("aaaaaaaaaaaa")
+
+    original.version_error = TransportError("[Errno 19] No such device")
+    replacement = Body(bus=1, address=4, serial=None,
+                       card=b"EVEN\nid=bbbbbbbbbbbb\n")
+    fake.bodies = [replacement]
+
+    rows = backend.list_devices()
+
+    assert rows[0]["hardware_id"].endswith("bbbbbbbbbbbb"), "the stale card state stood"
+    assert original.closes == 1
+    assert replacement.opens == 1
+
+
+@pytest.mark.unit
+def test_a_body_that_is_still_answering_is_not_reopened(monkeypatch):
+    """The check costs one transaction, not a session."""
+    body = Body(serial="AAA111", card=EVEN_CARD)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+
+    backend.list_devices()
+    assert body.version_calls == 0, "a body just opened was asked to prove itself"
+    backend.list_devices()
+    backend.list_devices()
+
+    assert body.opens == 1, "a healthy body was reopened"
+    assert body.version_calls == 2, "the session was taken on trust"

@@ -582,6 +582,47 @@ class ChdkBackend(CameraBackend):
             )
         return body
 
+    def _is_the_same_body(self, body, info):
+        """Is the camera at this address the one this session was opened on?
+
+        A bus address is a place, not a camera: unplug one and plug in
+        another and the second can land on the address the first had. The
+        enumeration record is what the bus says about the thing that is there
+        now, so anything in it that differs - a serial, a product - is a
+        different camera, and the session pointed at the old one has to go.
+        """
+        return tuple(body.info) == tuple(info)
+
+    def _still_answering(self, body):
+        """Prove the session is on a camera that is still there, or drop it.
+
+        The library's connected flag is local: it records what the host last
+        did with the session, not whether the camera survived. So a body that
+        was unplugged and replaced by an identical one - same product, no
+        serial to tell them apart, and the same address - would otherwise
+        keep its session, its card state and its index, and the bench's
+        reconnect test would read as the camera never coming back.
+
+        One CHDK version transaction settles it. It is the cheapest thing the
+        protocol has, one command with no data phase, and a handle whose
+        device was unplugged cannot answer it whatever has taken its place.
+        A body that fails it is closed here and opened again by the caller.
+        """
+        if not body.device.is_connected:
+            self._close_body(body, "the device reports itself disconnected")
+            return False
+        with body.lock:
+            try:
+                body.device._chdk.get_version()
+            except Exception as exc:
+                self.logger.info(
+                    f"[chdk] {body.port}: stopped answering "
+                    f"({_name_failure(exc)}); opening it again"
+                )
+                self._close_body(body, "it stopped answering")
+                return False
+        return True
+
     def _read_model(self, device, info):
         """The body's model, from its USB product string if it answers one.
 
@@ -810,9 +851,11 @@ class ChdkBackend(CameraBackend):
 
         Bodies that have left are closed and dropped; bodies that are new are
         opened and read; bodies that were already open keep their device, and
-        so their lock, so nothing in flight on them is disturbed. `reread`
-        asks for every card to be read again, which is what a rescan is for:
-        a parity written since the last scan is invisible otherwise.
+        so their lock, so nothing in flight on them is disturbed - but only
+        once they have been shown to be the same camera still answering, and
+        not an address another body has taken over. `reread` asks for every
+        card to be read again, which is what a rescan is for: a parity
+        written since the last scan is invisible otherwise.
         """
         with self._layout_lock:
             infos = pychdk.list_devices()
@@ -833,8 +876,12 @@ class ChdkBackend(CameraBackend):
             for key, info in present.items():
                 with self._map_lock:
                     body = self._bodies.get(key)
-                if body is not None and not body.device.is_connected:
-                    self._evict(body, "the device reports itself disconnected")
+                if body is not None and not self._is_the_same_body(body, info):
+                    self._close_body(
+                        body, "another body is at this address now"
+                    )
+                    body = None
+                if body is not None and not self._still_answering(body):
                     body = None
                 fresh = body is None
                 if fresh:
