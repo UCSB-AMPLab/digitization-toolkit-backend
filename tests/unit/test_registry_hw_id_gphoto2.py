@@ -62,7 +62,7 @@ def fake_backend(monkeypatch):
 
 
 def test_hardware_id_comes_from_the_backend_singleton(fake_backend):
-    hw_id, info = CameraRegistry._get_camera_hardware_id_gphoto2(1)
+    hw_id, info = CameraRegistry._hardware_id_from_backend(1)
 
     assert hw_id == "canoneosrebelt7_2222222"
     assert info["model"] == "Canon EOS Rebel T7"
@@ -74,14 +74,14 @@ def test_hardware_id_comes_from_the_backend_singleton(fake_backend):
 
 
 def test_unknown_index_returns_empty_info(fake_backend):
-    assert CameraRegistry._get_camera_hardware_id_gphoto2(5) == (None, {})
+    assert CameraRegistry._hardware_id_from_backend(5) == (None, {})
 
 
 def test_enumeration_failure_is_reported_as_error(monkeypatch):
     backend = _FakeBackend(exc=RuntimeError("no cameras detected"))
     monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
 
-    hw_id, info = CameraRegistry._get_camera_hardware_id_gphoto2(0)
+    hw_id, info = CameraRegistry._hardware_id_from_backend(0)
 
     assert hw_id is None
     assert info == {"error": "no cameras detected"}
@@ -97,7 +97,7 @@ def test_registry_never_imports_gphoto2(fake_backend, monkeypatch):
         return real_import(name, *args, **kwargs)
 
     monkeypatch.setattr(builtins, "__import__", spy)
-    hw_id, _info = CameraRegistry._get_camera_hardware_id_gphoto2(0)
+    hw_id, _info = CameraRegistry._hardware_id_from_backend(0)
     monkeypatch.setattr(builtins, "__import__", real_import)
 
     assert hw_id == "canoneosrebelt7_1111111"

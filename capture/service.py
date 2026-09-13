@@ -33,7 +33,13 @@ if str(backend_dir) not in sys.path:
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
 from .manifestHandler import generate_manifest_record, append_manifest_record
-from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
+from .backends import (
+    CameraBackend,
+    ChdkBackend,
+    GPhoto2Backend,
+    Picamera2Backend,
+    RpicamBackend,
+)
 from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
@@ -74,6 +80,8 @@ def get_camera_backend() -> CameraBackend:
         return RpicamBackend(subprocess_logger)
     elif backend_type == "gphoto2":
         return GPhoto2Backend(subprocess_logger)
+    elif backend_type == "chdk":
+        return ChdkBackend(subprocess_logger)
     else:
         subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
         return RpicamBackend(subprocess_logger)
@@ -490,6 +498,10 @@ def dual_capture_image(
     
     results = {}
     errors = {}
+    # Wall time for the pair, not the sum of the two captures: the comparison
+    # that matters to the bench is how long the operator waits between pages
+    # (NEH-173), and the two shutters overlap.
+    pair_started = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future1 = executor.submit(capture_with_timing, cam1_config, filename1)
         # Stagger second camera start (like bash script)
@@ -503,6 +515,8 @@ def dual_capture_image(
                 results[cfg.camera_index] = fut.result()
             except Exception as e:
                 errors[cfg.camera_index] = e
+
+    pair_wall = time.time() - pair_started
 
     if errors:
         # Partial/failed pair: any file already written has no manifest entry, so
@@ -533,6 +547,7 @@ def dual_capture_image(
     
     subprocess_logger.info(
         f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, "
+        f"pair_wall={pair_wall:.3f}s, "
         f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     
