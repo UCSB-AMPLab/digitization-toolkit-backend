@@ -106,6 +106,42 @@ def get_backend() -> CameraBackend:
         return _backend
 
 
+def shutdown_backend() -> None:
+    """Close the camera backend, if one was ever built.
+
+    The DSLR and CHDK backends hold their bodies for the life of the process:
+    a PTP claim per camera, opened on first use and kept. cleanup() is what
+    waits for whatever is running on them and releases them, so it has to be
+    called when the application stops - see app/main.py's lifespan, which is
+    the only caller in production.
+
+    Never builds a backend: opening the cameras in order to close them would
+    be absurd, and on a machine with none attached it would fail the
+    shutdown. Never raises either - a backend that cannot be closed cleanly
+    is logged and let go, because the process is leaving anyway and a
+    shutdown that fails is worse than a session the kernel reclaims.
+
+    The global is cleared, so a process that keeps running after this (a test,
+    or a backend switch) builds a fresh one on the next call rather than
+    handing out the closed one.
+    """
+    global _backend
+    with _backend_lock:
+        backend = _backend
+        _backend = None
+    if backend is None:
+        return
+    try:
+        backend.cleanup()
+        subprocess_logger.info(
+            f"Closed camera backend: {backend.get_backend_name()}"
+        )
+    except Exception as exc:
+        subprocess_logger.warning(
+            f"Error while closing the camera backend: {exc!r}"
+        )
+
+
 def is_camera_connected(camera_index: int = 0) -> bool:
     """
     Check if the camera is connected using --list-cameras (fast, no initialization).
