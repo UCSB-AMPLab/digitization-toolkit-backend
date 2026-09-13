@@ -55,8 +55,11 @@ it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 """
 
+import os
 import re
+import secrets
 import struct
+import tempfile
 import threading
 import time
 from pathlib import Path
@@ -143,6 +146,20 @@ _PTP_GENERAL_ERROR = 0x2002
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
 _SIDE_ROUTE = "POST /cameras/side/{camera_index}"
+
+# Hex characters in a minted body id. The library's parser accepts twelve to
+# thirty-two, and the flasher mints twelve, so a body keeps the same shape of
+# id whether the card was prepared at a workbench or assigned here.
+_CAMERA_ID_BYTES = 6
+
+
+class SideConflictError(RuntimeError):
+    """The parity asked for is already another connected body's.
+
+    Its own class because the route answers it with a 409 rather than a 500:
+    nothing has gone wrong, the operator has asked for something that would
+    leave two bodies shooting the same pages.
+    """
 
 
 def parse_live_view(data):
@@ -1002,6 +1019,92 @@ class ChdkBackend(CameraBackend):
         body.device.switch_mode("record")
         body.in_record_mode = True
         self.logger.info(f"[chdk] {body.port}: switched to record mode")
+
+    def assign_side(self, camera_index: int, side: str) -> list:
+        """Write a page parity onto the card of the body at this index.
+
+        The parity lives on the camera's own card, so this is the only way to
+        change it without a card reader: A/OWN.TXT is rewritten with the
+        parity and the body's id, and every body is re-enumerated afterwards
+        so the caller sees the layout the write produced rather than the one
+        that went into it.
+
+        The body's existing id is kept. A body that has none is given one,
+        which is the point of assigning a parity to a compact whose USB serial
+        pyusb cannot read: it is what lifts it out of provisional and lets it
+        capture.
+
+        Args:
+            camera_index: Which body, as the device list numbers them.
+            side: "odd" or "even", in any case.
+
+        Returns:
+            The device rows a rescan produced, the same shape list_devices
+            returns. The body will usually have moved index.
+
+        Raises:
+            ValueError: side is not a page parity.
+            SideConflictError: another connected body already shoots it.
+            RuntimeError: no body at that index, or the write failed.
+        """
+        parity = str(side).strip().lower()
+        if parity not in _SIDE_INDEX:
+            raise ValueError(
+                f"page parity must be one of {sorted(_SIDE_INDEX)}; got {side!r}"
+            )
+
+        # The check and the identity it is based on are read under the map
+        # lock, so a rescan cannot move a body between deciding there is no
+        # conflict and writing the card.
+        with self._map_lock:
+            key = self._indices.get(camera_index)
+            body = self._bodies.get(key) if key is not None else None
+            if body is None:
+                raise RuntimeError(
+                    f"Camera {camera_index} is not connected. Detected "
+                    f"indices: {sorted(self._indices)}."
+                )
+            holder = next(
+                (
+                    other for other in self._bodies.values()
+                    if other.side == parity and other.key != body.key
+                ),
+                None,
+            )
+            if holder is not None:
+                who = holder.serial or holder.camera_id or "no identity"
+                raise SideConflictError(
+                    f"{holder.port} ({who}) already shoots {parity} pages; "
+                    "give that body the other parity first"
+                )
+            camera_id = body.camera_id or secrets.token_hex(_CAMERA_ID_BYTES)
+
+        payload = pychdk.format_own_txt(parity.upper(), camera_id).encode("utf-8")
+        with body.lock:
+            handle, temp_path = tempfile.mkstemp(prefix="dtk_own_", suffix=".txt")
+            try:
+                with os.fdopen(handle, "wb") as scratch:
+                    scratch.write(payload)
+                body.device.upload_file(temp_path, SIDE_FILE)
+            except Exception as exc:
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): writing "
+                    f"{SIDE_FILE} failed ({exc!r})"
+                )
+                raise RuntimeError(
+                    f"Could not write {SIDE_FILE} on {body.port}: {exc}"
+                ) from exc
+            finally:
+                try:
+                    os.unlink(temp_path)
+                except OSError:
+                    pass
+
+        self.logger.info(
+            f"[chdk] body {camera_index} ({body.port}): now shoots {parity} "
+            f"pages, id {camera_id}"
+        )
+        return self.rescan()
 
     def supports_streaming(self) -> bool:
         return False
