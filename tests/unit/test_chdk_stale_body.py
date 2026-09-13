@@ -26,9 +26,11 @@ from capture.camera import CameraConfig
 
 from .chdk_fakes import (
     Body,
+    Gate,
     make_backend,
     make_pychdk,
     park_at_lock,
+    parse_own_txt,
     viewport_frame,
 )
 
@@ -222,3 +224,63 @@ def test_no_layout_is_published_while_a_capture_is_running(monkeypatch, tmp_path
     assert backend._body_at(1).serial == "AAA111", "the rescan never published"
     assert (tmp_path / "page.jpg").read_bytes() == JPEG
     assert len(one.shots) == 1
+
+
+@pytest.mark.unit
+def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
+    """Reading a card is a download and then publishing what it said.
+
+    A capture reads a body's identity before the shutter and files the frame
+    against it afterwards, so a capture that started between those two halves
+    would be checked against the card the rescan replaced and filed against
+    the one it found. Here the rewritten card has lost its id line, so the
+    body has no identity to record and may not capture at all: the outcome to
+    assert is that no page is written, not that some check ran.
+    """
+    body = Body(serial=None, card=EVEN_CARD, image=JPEG)
+    fake = make_pychdk(body)
+    backend = make_backend(monkeypatch, fake)
+    assert backend.list_devices()[0]["error"] is None, "the body cannot capture"
+
+    # The card is rewritten - by hand, or by a card reader - with its id line
+    # gone, which leaves the body provisional and refused for capture.
+    body.card = b"EVEN\n"
+
+    # Park the rescan after the download and before it publishes what it read.
+    parsing = Gate("parse_own_txt")
+
+    def gated_parse(raw):
+        parsing.arrive()
+        return parse_own_txt(raw)
+
+    fake.parse_own_txt = gated_parse
+    rescan = _thread(backend.rescan)
+    parsing.wait_until_entered()
+
+    shooting = body.gate("shoot")
+    shot = {}
+
+    def capture():
+        try:
+            shot["outcome"] = backend.capture_image(
+                tmp_path / "page.jpg", CameraConfig(camera_index=0)
+            )
+        except RuntimeError as exc:
+            shot["outcome"] = str(exc)
+
+    shooter = _thread(capture)
+    # Long enough for a capture that is not held back to reach the shutter,
+    # and no assertion either way: one that is held back never arrives.
+    shooting.entered.wait(2)
+
+    parsing.release()
+    rescan.join(timeout=1)
+    shooting.release()
+    shooter.join(timeout=10)
+    rescan.join(timeout=10)
+
+    assert not (tmp_path / "page.jpg").exists(), (
+        "a page was filed for a body whose card gives it no identity"
+    )
+    assert "/side/" in str(shot.get("outcome")), shot
+    assert body.shots == [], "the shutter fired inside the card read"

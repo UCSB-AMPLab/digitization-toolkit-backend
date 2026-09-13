@@ -714,6 +714,15 @@ class ChdkBackend(CameraBackend):
         file, which is an unassigned body and perfectly normal. Anything else
         is a body that has stopped answering properly, and reading that as
         "unassigned" would quietly put it on whichever index was free.
+
+        The download and what it publishes onto the body are one operation
+        under the body's own lock. A capture reads a body's parity and its
+        identity before the shutter and files the frame against them
+        afterwards, so a read that published between those two moments would
+        have the capture checked against the card being replaced and filed
+        against the card that replaced it. Holding the lock across both
+        leaves a capture either wholly before the new card state or wholly
+        after it.
         """
         with body.lock:
             try:
@@ -734,11 +743,11 @@ class ChdkBackend(CameraBackend):
                     f"({exc!r}); dropping the body"
                 )
                 return False
-        side, camera_id = pychdk.parse_own_txt(raw)
-        body.side = side.lower() if side else None
-        body.camera_id = camera_id
-        body.card_read = True
-        return True
+            side, camera_id = pychdk.parse_own_txt(raw)
+            body.side = side.lower() if side else None
+            body.camera_id = camera_id
+            body.card_read = True
+            return True
 
     # ------------------------------------------------------------------
     # Enumeration
