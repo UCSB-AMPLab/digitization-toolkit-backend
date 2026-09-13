@@ -44,14 +44,42 @@ def test_a_capture_writes_the_bytes_and_reports_the_path(monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
-def test_the_saved_file_is_a_jpeg_whatever_it_was_asked_for(monkeypatch, tmp_path):
+def test_an_output_name_that_is_not_a_jpeg_is_refused(monkeypatch, tmp_path):
+    """Two places deciding a filename is how a page gets overwritten.
+
+    The capture service picks the name and guarantees it does not already
+    exist. Renaming it here to the only format remote capture returns would
+    move the write to a name nothing checked - page.cr2 comes in, page.jpg
+    goes out, and the page already under that name is replaced by an atomic
+    write that is atomic about the wrong thing. The service owns the name, so
+    a name this backend cannot honour is refused before the shutter fires.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+    (tmp_path / "page.jpg").write_bytes(b"a page that already exists")
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_image(tmp_path / "page.cr2", _config())
+
+    assert ".cr2" in str(exc.value)
+    assert body.shots == [], "the shutter fired for a file that was refused"
+    assert (tmp_path / "page.jpg").read_bytes() == b"a page that already exists"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["page.jpg", "page.JPG", "page.jpeg"])
+def test_the_file_is_written_under_the_name_it_was_given(
+    monkeypatch, tmp_path, name
+):
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
     backend = make_backend(monkeypatch, make_pychdk(body))
     backend.list_devices()
 
-    path, _ = backend.capture_image(tmp_path / "page.cr2", _config())
+    path, _ = backend.capture_image(tmp_path / name, _config())
 
-    assert path.endswith("page.jpg")
+    assert path == str(tmp_path / name)
+    assert (tmp_path / name).read_bytes() == JPEG
 
 
 @pytest.mark.unit

@@ -143,6 +143,12 @@ _SIDE_INDEX = {"even": 0, "odd": 1}
 # body that has gone wrong and is evicted rather than read as unassigned.
 _PTP_GENERAL_ERROR = 0x2002
 
+# What remote capture returns, and so the only output name this backend can
+# honour. The capture service picks the name and guarantees it is free; a
+# name that would have to be changed here is refused rather than written
+# somewhere nothing checked.
+_CAPTURE_SUFFIXES = (".jpg", ".jpeg")
+
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
 _SIDE_ROUTE = "POST /cameras/side/{camera_index}"
@@ -1076,8 +1082,10 @@ class ChdkBackend(CameraBackend):
         is picamera2's and is ignored.
 
         Args:
-            output_path: Destination for the JPEG; the suffix is forced to
-                .jpg, because remote capture only ever returns one.
+            output_path: Destination for the JPEG, written exactly as given.
+                A name that is not a JPEG is refused: remote capture returns
+                nothing else, and renaming it here would put the file where
+                the capture service never checked for a collision.
             camera_config: CameraConfig; camera_index routes it.
             capture_output: Unused - kept for interface compatibility.
 
@@ -1086,12 +1094,23 @@ class ChdkBackend(CameraBackend):
 
         Raises:
             CaptureTimeoutError: The camera never delivered the bytes.
-            RuntimeError: Anything else, including a body that is refused.
+            RuntimeError: Anything else - a body that is refused, or an
+                output name this backend cannot honour.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
         shutter = _shutter_seconds(getattr(camera_config, "shutter_speed", None))
         iso = getattr(camera_config, "iso", None)
-        destination = Path(output_path).with_suffix(".jpg")
+        destination = Path(output_path)
+        if destination.suffix.lower() not in _CAPTURE_SUFFIXES:
+            raise RuntimeError(
+                f"CHDK remote capture returns a JPEG, so it cannot be saved "
+                f"as {destination.suffix or 'a file with no suffix'} "
+                f"({destination.name}). The camera's configured encoding and "
+                "the name the capture service chose have to agree, and this "
+                "backend must not choose a different one: the service checks "
+                "that the name it picked is free, and a name chosen here "
+                "would not have been checked."
+            )
 
         with self._in_use(camera_index, "capture", refuse_unusable=True) as body:
             started = time.perf_counter()
