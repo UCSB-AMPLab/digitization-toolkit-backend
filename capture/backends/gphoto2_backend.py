@@ -49,6 +49,10 @@ except ImportError:
     _GP_AVAILABLE = False
 
 from .base import CameraBackend
+# Re-exported below for the callers that import it from here (app/api/cameras.py,
+# tests/unit/test_test_capture_route.py). The class itself is shared, so a CHDK
+# timeout and a DSLR timeout are one class and take the same route out.
+from .errors import CaptureTimeoutError
 from ..utils import atomic_write
 
 
@@ -142,10 +146,6 @@ _BINDINGS_VERSION = 1
 # above it are parking: somewhere a body that is not one of the two sides can
 # sit, visible and usable, until an explicit rescan gives it a side.
 _SIDE_COUNT = 2
-
-
-class CaptureTimeoutError(RuntimeError):
-    """No image arrived from the camera before the capture deadline."""
 
 
 class CameraIdentityError(RuntimeError):
