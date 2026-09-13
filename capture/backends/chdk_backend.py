@@ -371,6 +371,20 @@ def encode_viewport_jpeg(data, quality=_PREVIEW_JPEG_QUALITY):
     return payload, info
 
 
+def _name_failure(exc):
+    """Name a failure for a log line and an error message.
+
+    A PTP response code says exactly what the camera refused, and is the
+    thing the bench needs in the line itself. Anything else - a pyusb
+    transport error, a decode, a timeout - has no code, so its class name
+    stands in.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int):
+        return f"PTP 0x{code:04x}"
+    return type(exc).__name__
+
+
 def _shutter_seconds(value):
     """Read a CameraConfig shutter speed as seconds, or None if it says nothing.
 
@@ -514,9 +528,12 @@ class ChdkBackend(CameraBackend):
         self._bodies: dict = {}
         # camera index -> the key of the body holding it
         self._indices: dict = {}
-        # the bodies evicted by a failure, so their return can be logged as
-        # the recovery it is
+        # the bodies evicted by a failure: their return is logged as the
+        # recovery it is, and until the next scan has looked for them their
+        # index is worth re-enumerating for
         self._evicted: set = set()
+        # whether the bus has been looked at even once
+        self._scanned = False
         self._map_lock = threading.Lock()
         # Held for a whole enumeration, and for a side assignment, which is a
         # check against the layout followed by a write that changes it.
@@ -817,6 +834,13 @@ class ChdkBackend(CameraBackend):
                     for index, key in sorted(self._indices.items())
                 ]
 
+            with self._map_lock:
+                # A body a scan has looked for and not found is no longer a
+                # reason to scan again; one that is on the bus was reopened
+                # above and is not in here either.
+                self._evicted &= set(present)
+                self._scanned = True
+
             self._log_enumeration(rows)
             return rows
 
@@ -867,14 +891,19 @@ class ChdkBackend(CameraBackend):
 
         The first question enumerates, because a process that has not yet
         listed its devices would otherwise report a working rig as absent and
-        refuse every capture. Later questions read what that found; a body
-        that has gone is noticed by the failure of the next call on it, which
-        evicts it, or by the next enumeration.
+        refuse every capture. After that it reads what the last scan found,
+        with one exception: an index that is empty because a failure dropped
+        the body is worth one more look, so a body that broke off
+        mid-conversation comes back by itself rather than waiting for someone
+        to press rescan. That costs one enumeration per failure, not one per
+        question - a scan that does not find the body stops hoping for it.
         """
         try:
             with self._map_lock:
-                never_scanned = not self._indices and not self._bodies
-            if never_scanned:
+                unscanned = not self._scanned
+                missing = camera_index not in self._indices
+                dropped = bool(self._evicted)
+            if unscanned or (missing and dropped):
                 self._enumerate(reread=False)
             body = self._body_at(camera_index)
             return body is not None and bool(body.device.is_connected)
@@ -977,36 +1006,43 @@ class ChdkBackend(CameraBackend):
         destination = Path(output_path).with_suffix(".jpg")
 
         with self._in_use(camera_index, "capture", refuse_unusable=True) as body:
-            self._ensure_record_mode(body)
             started = time.perf_counter()
+            # The mode switch is part of the capture and fails the same way:
+            # on a cold start it is the likeliest thing to time out, and it
+            # has to reach the operator as a timeout rather than as a
+            # generic failure.
+            stage = "switching to record mode"
             try:
+                self._ensure_record_mode(body)
+                stage = "remote capture"
                 image = body.device.shoot(
                     stream=True, shutter_speed=shutter, market_iso=iso
                 )
             except TimeoutError as exc:
                 elapsed = time.perf_counter() - started
                 self.logger.error(
-                    f"[chdk] body {camera_index} ({body.port}): remote capture "
-                    f"timed out after {elapsed:.2f}s ({exc})"
+                    f"[chdk] body {camera_index} ({body.port}): {stage} timed "
+                    f"out after {elapsed:.2f}s ({exc})"
                 )
+                self._evict(body, f"{stage} timed out")
                 raise CaptureTimeoutError(
-                    f"{body.port}: no image after {elapsed:.1f}s"
+                    f"{body.port}: {stage} timed out after {elapsed:.1f}s"
                 ) from exc
             except Exception as exc:
                 elapsed = time.perf_counter() - started
-                code = getattr(exc, "code", None)
-                named = (
-                    f"PTP 0x{code:04x}" if isinstance(code, int)
-                    else type(exc).__name__
-                )
+                named = _name_failure(exc)
                 self.logger.error(
-                    f"[chdk] body {camera_index} ({body.port}): remote capture "
-                    f"failed with {named} after {elapsed:.2f}s: {exc}"
+                    f"[chdk] body {camera_index} ({body.port}): {stage} failed "
+                    f"with {named} after {elapsed:.2f}s: {exc}"
                 )
-                if isinstance(exc, pychdk.PTPError):
-                    self._evict(body, f"remote capture failed with {named}")
+                # Whatever the class - a PTP response code, a pyusb transport
+                # error, anything else - the conversation broke in the middle
+                # and what the camera is doing now is unknown. The body is
+                # dropped and the next scan opens it again.
+                self._evict(body, f"{stage} failed with {named}")
                 raise RuntimeError(
-                    f"CHDK capture failed on {body.port} with {named}: {exc}"
+                    f"CHDK capture failed on {body.port} during {stage} with "
+                    f"{named}: {exc}"
                 ) from exc
 
             elapsed = time.perf_counter() - started
@@ -1048,22 +1084,21 @@ class ChdkBackend(CameraBackend):
                 fetched or decoded.
         """
         with self._in_use(camera_index, "preview", refuse_unusable=False) as body:
-            self._ensure_record_mode(body)
+            stage = "switching to record mode"
             try:
+                self._ensure_record_mode(body)
+                stage = "live view"
                 frame = body.device._chdk.get_display_data(LV_TFR_VIEWPORT)
             except Exception as exc:
-                code = getattr(exc, "code", None)
-                named = (
-                    f"PTP 0x{code:04x}" if isinstance(code, int)
-                    else type(exc).__name__
-                )
+                named = _name_failure(exc)
                 self.logger.error(
-                    f"[chdk] body {camera_index} ({body.port}): live view "
-                    f"failed with {named}: {exc}"
+                    f"[chdk] body {camera_index} ({body.port}): {stage} failed "
+                    f"with {named}: {exc}"
                 )
-                self._evict(body, f"live view failed with {named}")
+                self._evict(body, f"{stage} failed with {named}")
                 raise RuntimeError(
-                    f"CHDK preview failed on {body.port} with {named}: {exc}"
+                    f"CHDK preview failed on {body.port} during {stage} with "
+                    f"{named}: {exc}"
                 ) from exc
 
             try:
@@ -1240,12 +1275,15 @@ class ChdkBackend(CameraBackend):
                         scratch.write(payload)
                     body.device.upload_file(temp_path, SIDE_FILE)
                 except Exception as exc:
+                    named = _name_failure(exc)
                     self.logger.error(
                         f"[chdk] body {camera_index} ({body.port}): writing "
-                        f"{SIDE_FILE} failed ({exc!r})"
+                        f"{SIDE_FILE} failed with {named}: {exc}"
                     )
+                    self._evict(body, f"writing {SIDE_FILE} failed with {named}")
                     raise RuntimeError(
-                        f"Could not write {SIDE_FILE} on {body.port}: {exc}"
+                        f"Could not write {SIDE_FILE} on {body.port} "
+                        f"({named}): {exc}"
                     ) from exc
                 finally:
                     try:

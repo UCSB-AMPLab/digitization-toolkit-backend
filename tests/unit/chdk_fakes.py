@@ -32,6 +32,15 @@ class PTPError(Exception):
         super().__init__(message or f"PTP error 0x{code:04x}")
 
 
+class TransportError(Exception):
+    """Stands in for usb.core.USBError, which is not a PTPError.
+
+    A cable pulled mid-transfer raises from pyusb, below the protocol layer,
+    so nothing about it carries a PTP response code and code that only
+    catches PTPError lets it straight past.
+    """
+
+
 # --- the library's own OWN.TXT text functions ------------------------------
 
 _CAMERA_ID_RE = re.compile(r"^[0-9a-f]{12,32}$")

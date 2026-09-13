@@ -111,3 +111,19 @@ def test_a_body_that_delivers_comes_back_as_a_jpeg(client, monkeypatch):
     assert resp.status_code == 200, resp.text
     assert resp.headers["content-type"] == "image/jpeg"
     assert resp.content == body.image
+
+
+@pytest.mark.unit
+def test_a_body_that_never_reaches_record_mode_is_a_504(client, monkeypatch):
+    """The commonest first-contact failure there is must not read as a crash."""
+    body = Body(
+        serial="AAA111", card=EVEN_CARD,
+        mode_error=TimeoutError("Script still running after 5s"),
+    )
+    _install(monkeypatch, body)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0")
+
+    assert resp.status_code == 504, resp.text
+    assert "record mode" in resp.json()["detail"]
