@@ -123,23 +123,29 @@ def shutdown_backend() -> None:
 
     The global is cleared, so a process that keeps running after this (a test,
     or a backend switch) builds a fresh one on the next call rather than
-    handing out the closed one.
+    handing out the closed one - but only once the close has finished. The
+    lock is held across the cleanup for that reason: a camera is not free
+    until the close that releases it returns, and clearing the global first
+    would let a request arriving in that window build a backend that claimed
+    the same bodies while the old one was still closing them. So get_backend
+    waits here, which is the cost of never handing out a camera twice.
     """
     global _backend
     with _backend_lock:
         backend = _backend
-        _backend = None
-    if backend is None:
-        return
-    try:
-        backend.cleanup()
-        subprocess_logger.info(
-            f"Closed camera backend: {backend.get_backend_name()}"
-        )
-    except Exception as exc:
-        subprocess_logger.warning(
-            f"Error while closing the camera backend: {exc!r}"
-        )
+        if backend is None:
+            return
+        try:
+            backend.cleanup()
+            subprocess_logger.info(
+                f"Closed camera backend: {backend.get_backend_name()}"
+            )
+        except Exception as exc:
+            subprocess_logger.warning(
+                f"Error while closing the camera backend: {exc!r}"
+            )
+        finally:
+            _backend = None
 
 
 def is_camera_connected(camera_index: int = 0) -> bool:

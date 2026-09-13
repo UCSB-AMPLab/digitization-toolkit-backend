@@ -105,3 +105,55 @@ def test_the_application_lifespan_closes_the_backend_on_the_way_out(monkeypatch)
     asyncio.run(serve())
 
     assert closed == [1], "the lifespan never closed the camera backend"
+
+
+@pytest.mark.unit
+def test_no_backend_is_built_while_the_old_one_is_closing(monkeypatch):
+    """Closing takes time, and the cameras are not free until it is done.
+
+    Clearing the global before the cleanup let a request arriving in that
+    window build a fresh backend, which then claimed the same bodies while
+    the old one was still closing them - a camera that cannot be opened by
+    the thing that just opened it. The documented lifecycle says a process
+    may carry on after a shutdown or switch backends, so it is reachable.
+    """
+    import threading
+
+    closing = threading.Event()
+    finish = threading.Event()
+
+    class _Slow(_Backend):
+        def cleanup(self):
+            closing.set()
+            assert finish.wait(10), "the cleanup was never released"
+            super().cleanup()
+
+    monkeypatch.setattr(capture_service, "_backend", _Slow())
+    built = []
+
+    def build():
+        built.append(_Backend())
+        return built[-1]
+
+    monkeypatch.setattr(capture_service, "get_camera_backend", build)
+
+    closer = threading.Thread(target=capture_service.shutdown_backend, daemon=True)
+    closer.start()
+    assert closing.wait(10), "the cleanup never started"
+
+    opened = {}
+    opener = threading.Thread(
+        target=lambda: opened.setdefault("backend", capture_service.get_backend()),
+        daemon=True,
+    )
+    opener.start()
+    opener.join(timeout=1)
+
+    assert not opened, "a new backend claimed the cameras while they were closing"
+    assert built == [], "a backend was built mid-close"
+
+    finish.set()
+    closer.join(timeout=10)
+    opener.join(timeout=10)
+
+    assert opened["backend"] is built[0], "the caller got the closed backend"
