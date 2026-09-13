@@ -1,8 +1,27 @@
 """
 CHDK backend for Canon compacts running the CHDK firmware add-on.
 
-Talks to the bodies over PTP/USB through pychdk. This module holds the live
-view protocol decode; the backend that uses it follows.
+Talks to the bodies over PTP/USB through pychdk. Activate it by setting
+CAMERA_BACKEND=chdk in the environment / .env.
+
+Page parity, not a side of the table
+------------------------------------
+A compact has no left and right. What it has is a page parity, written on its
+own card as ``A/OWN.TXT``: ODD or EVEN says which pages that body shoots. The
+mapping to a camera index is fixed and direction-agnostic - EVEN is index 0,
+ODD is index 1 - and which parity the operator sees on the left is the
+kiosk's swap toggle, so a right-to-left volume needs nothing from here.
+
+Identity is the other half of that file. pyusb reads a USB serial from some
+bodies and not others, so the card may carry a second line, ``id=<hex>``, and
+a body with neither is provisional: listed and previewable, but refused for
+capture until the side route gives it one, and never written to the registry.
+
+Locks belong to a body, not to an index. A rescan or a side assignment moves
+a body between indices, so a lock keyed by index would be held on one body
+and released on another. Each body carries its own; the map of which body
+holds which index is guarded separately, and is never held while waiting on a
+body's lock.
 
 Live view
 ---------
@@ -36,7 +55,11 @@ it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 """
 
+import re
 import struct
+import threading
+import time
+from pathlib import Path
 
 try:
     import numpy as np
@@ -44,6 +67,21 @@ try:
 except ImportError:  # pragma: no cover - numpy is a hard requirement on the Pi
     np = None  # type: ignore[assignment]
     _NUMPY_AVAILABLE = False
+
+# Imported as a module, never `from pychdk import ...`: every call goes
+# through this name so a test can put a fake library in its place, the way
+# the gphoto2 tests replace gp. The package resolves its own submodules
+# lazily, so this import does not pull in pyusb until a device is opened.
+try:
+    import pychdk
+    _PYCHDK_AVAILABLE = True
+except ImportError:
+    pychdk = None  # type: ignore[assignment]
+    _PYCHDK_AVAILABLE = False
+
+from .base import CameraBackend
+from .errors import CaptureTimeoutError
+from ..utils import atomic_write
 
 
 # --- CHDK live view protocol (core/live_view.h) ----------------------------
@@ -85,6 +123,26 @@ _DEFAULT_LCD_ASPECT = 4 / 3
 # JPEG quality for a preview frame. High enough to focus on, small enough to
 # poll.
 _PREVIEW_JPEG_QUALITY = 85
+
+
+# --- the side file ---------------------------------------------------------
+
+# Where the parity lives. CHDK addresses the card root as A/, and pychdk's
+# download_file/upload_file both take a card path.
+SIDE_FILE = "A/OWN.TXT"
+
+# Page parity to camera index. Fixed, and not a statement about the table:
+# which parity the operator sees on the left is the kiosk's swap toggle.
+_SIDE_INDEX = {"even": 0, "odd": 1}
+
+# PTP_RC_GeneralError. A download of a file the card does not have comes back
+# with this, and only this means "no such file"; any other response code is a
+# body that has gone wrong and is evicted rather than read as unassigned.
+_PTP_GENERAL_ERROR = 0x2002
+
+# The route that writes a parity, named in every message that asks the
+# operator to fix one.
+_SIDE_ROUTE = "POST /cameras/side/{camera_index}"
 
 
 def parse_live_view(data):
@@ -284,3 +342,588 @@ def encode_viewport_jpeg(data, quality=_PREVIEW_JPEG_QUALITY):
     info["jpeg_height"] = out_height
     info["jpeg_bytes"] = len(payload)
     return payload, info
+
+
+def _shutter_seconds(value):
+    """Read a CameraConfig shutter speed as seconds, or None if it says nothing.
+
+    CameraConfig carries the DSLR's own string ("1/250", "0.8", "30"), while
+    pychdk's shoot() takes seconds and converts them to CHDK's TV96. A value
+    that names no duration - "auto", "bulb", empty, unparseable, zero or
+    negative - returns None, which leaves the camera on whatever it is set to
+    rather than inventing an exposure for it.
+
+    Args:
+        value: CameraConfig.shutter_speed, or None.
+
+    Returns:
+        Float seconds, or None.
+    """
+    if value is None:
+        return None
+    text = str(value).strip()
+    if not text or text.lower() in ("auto", "bulb"):
+        return None
+    try:
+        if "/" in text:
+            numerator, _, denominator = text.partition("/")
+            seconds = float(numerator) / float(denominator)
+        else:
+            seconds = float(text)
+    except (ValueError, ZeroDivisionError):
+        return None
+    return seconds if seconds > 0 else None
+
+
+class _ChdkBody:
+    """One open camera, and everything the backend has learned about it.
+
+    Keyed by its USB bus and address, which is what identifies the thing on
+    the wire; the hardware id is what identifies the body across replugs and
+    is read from the card or the USB serial.
+
+    The lock is the body's own, and serialises everything that talks to it -
+    capture, preview, the card read - because pychdk assumes one thread per
+    device.
+    """
+
+    def __init__(self, info, device, model):
+        self.info = info
+        self.device = device
+        self.model = model
+        self.lock = threading.RLock()
+        # From A/OWN.TXT: the parity, lowercased, and the body's own id.
+        self.side = None
+        self.camera_id = None
+        self.card_read = False
+        # Set when another body claims the same parity; capture is refused
+        # on both until the side route settles it.
+        self.collision = None
+        # Record mode is switched once per body: a viewport and a remote
+        # capture both need it, and the switch costs seconds.
+        self.in_record_mode = False
+        # Live view instrumentation. The geometry is logged on the first frame
+        # only; the rate every _FRAME_LOG_INTERVAL frames.
+        self.geometry_logged = False
+        self.frames = 0
+        self.frames_at_last_report = 0
+        self.last_frame_at = None
+        self.interval_total = 0.0
+        self.interval_worst = 0.0
+
+    @property
+    def key(self):
+        return (self.info.bus_num, self.info.device_num)
+
+    @property
+    def serial(self):
+        return self.info.serial_num or None
+
+    @property
+    def port(self):
+        return f"usb:{self.info.bus_num:03d},{self.info.device_num:03d}"
+
+    @property
+    def slug(self):
+        return re.sub(r"[^a-z0-9]", "", self.model.lower())
+
+    @property
+    def hardware_id(self):
+        """The body's stable identity, or None when it has none to give.
+
+        The USB serial first, because it needs no card; the id line on the
+        card when pyusb reads no serial. A body with neither is provisional
+        and must not reach the registry under a made-up name.
+        """
+        identity = self.serial or self.camera_id
+        return f"{self.slug}_{identity}" if identity else None
+
+
+class ChdkBackend(CameraBackend):
+    """Camera backend for Canon compacts under CHDK, over pychdk.
+
+    Thread safety:
+      - Every body carries its own lock, and everything that talks to that
+        body holds it: capture, preview, the card read. pychdk assumes one
+        thread per device, and a dual capture runs one thread per index.
+      - _map_lock guards which bodies are open and which index each holds.
+        It is taken for short reads and for the one moment a new layout is
+        published, never while waiting on a body's lock, so a capture that
+        holds a body for thirty seconds never blocks an enumeration's view
+        of the other one.
+      - _enumerate_lock serialises whole enumerations, so two of them cannot
+        open the same body twice or publish their layouts out of order.
+      - Lock order is _enumerate_lock, then a body lock, then _map_lock. No
+        path takes _map_lock and then waits for a body.
+    """
+
+    # How often the preview rate is reported, in frames. The bench needs
+    # frames per second without a stopwatch, and a line per frame would bury
+    # everything else in the log.
+    _FRAME_LOG_INTERVAL = 100
+
+    def __init__(self, logger):
+        if not _PYCHDK_AVAILABLE:
+            raise RuntimeError(
+                "pychdk is not installed. Add it to pixi.toml and "
+                "requirements.txt, or set CAMERA_BACKEND to another backend."
+            )
+        super().__init__(logger)
+        # (usb bus, usb address) -> _ChdkBody, for every body that is open
+        self._bodies: dict = {}
+        # camera index -> the key of the body holding it
+        self._indices: dict = {}
+        # the bodies evicted by a failure, so their return can be logged as
+        # the recovery it is
+        self._evicted: set = set()
+        self._map_lock = threading.Lock()
+        self._enumerate_lock = threading.Lock()
+
+    # ------------------------------------------------------------------
+    # Bodies
+    # ------------------------------------------------------------------
+
+    def _body_at(self, camera_index):
+        """The body holding this index right now, or None."""
+        with self._map_lock:
+            key = self._indices.get(camera_index)
+            return self._bodies.get(key) if key is not None else None
+
+    def _open_body(self, info):
+        """Open one camera and read enough of it to name it. None on failure."""
+        key = (info.bus_num, info.device_num)
+        try:
+            device = pychdk.ChdkDevice(info)
+        except Exception as exc:
+            self.logger.error(
+                f"[chdk] {key}: could not open the camera ({exc!r}); "
+                "it is left out of the device list"
+            )
+            return None
+        body = _ChdkBody(info, device, self._read_model(device, info))
+        if key in self._evicted:
+            self._evicted.discard(key)
+            self.logger.info(
+                f"[chdk] {body.port}: back on the bus after an earlier "
+                "failure; re-enumeration recovered it"
+            )
+        return body
+
+    def _read_model(self, device, info):
+        """The body's model, from its USB product string if it answers one.
+
+        pyusb reads string descriptors over the wire and can fail or answer
+        nothing, so the product id stands in. The model is cosmetic except
+        that it is half of the hardware id, which is why the fallback is the
+        id of the product rather than a guess at its name.
+        """
+        try:
+            product = getattr(device._usb_device, "product", None)
+        except Exception:
+            product = None
+        if product:
+            return str(product).strip()
+        return f"Canon {info.product_id:#06x}"
+
+    def _close_body(self, body, reason):
+        """Close one body's device, whatever state it is in."""
+        try:
+            body.device.close()
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: error while closing it ({exc!r})"
+            )
+        self.logger.info(f"[chdk] {body.port}: closed ({reason})")
+
+    def _evict(self, body, reason):
+        """Drop a body that has stopped answering, so the next scan re-opens it."""
+        with self._map_lock:
+            self._bodies.pop(body.key, None)
+            self._indices = {
+                index: key for index, key in self._indices.items()
+                if key != body.key
+            }
+        self._evicted.add(body.key)
+        self._close_body(body, reason)
+
+    def _is_absent(self, exc):
+        """True when a download failed because the card has no such file."""
+        return (
+            isinstance(exc, pychdk.PTPError)
+            and getattr(exc, "code", None) == _PTP_GENERAL_ERROR
+        )
+
+    def _read_side_file(self, body):
+        """Read A/OWN.TXT into the body. False means the body has to go.
+
+        A general error from the download is the card saying it has no such
+        file, which is an unassigned body and perfectly normal. Anything else
+        is a body that has stopped answering properly, and reading that as
+        "unassigned" would quietly put it on whichever index was free.
+        """
+        with body.lock:
+            try:
+                raw = body.device.download_file(SIDE_FILE)
+            except Exception as exc:
+                if self._is_absent(exc):
+                    body.side = None
+                    body.camera_id = None
+                    body.card_read = True
+                    self.logger.warning(
+                        f"[chdk] {body.port}: no {SIDE_FILE} on the card, so "
+                        "this body has no page parity; it takes a free index "
+                        f"in USB order until {_SIDE_ROUTE} gives it one"
+                    )
+                    return True
+                self.logger.error(
+                    f"[chdk] {body.port}: reading {SIDE_FILE} failed "
+                    f"({exc!r}); dropping the body"
+                )
+                return False
+        side, camera_id = pychdk.parse_own_txt(raw)
+        body.side = side.lower() if side else None
+        body.camera_id = camera_id
+        body.card_read = True
+        return True
+
+    # ------------------------------------------------------------------
+    # Enumeration
+    # ------------------------------------------------------------------
+
+    def _assign_indices(self, bodies):
+        """Lay the open bodies out on camera indices. Callers hold _map_lock.
+
+        EVEN is index 0 and ODD is index 1. A body with no parity takes the
+        lowest index no parity has claimed, in USB order, so a single
+        unassigned body is still usable.
+
+        Two bodies claiming one parity is the case that must not be resolved
+        by guessing: they keep their USB-order indices, so both stay
+        addressable and the side route can fix either one, and both are
+        marked so capture refuses until it is fixed.
+        """
+        claimants = {}
+        for body in bodies:
+            body.collision = None
+            if body.side:
+                claimants.setdefault(body.side, []).append(body)
+
+        contested = [side for side, bs in claimants.items() if len(bs) > 1]
+        if contested:
+            for side in contested:
+                for body in claimants[side]:
+                    body.collision = (
+                        f"two bodies are set to shoot {side} pages "
+                        f"({', '.join(b.port for b in claimants[side])}); "
+                        f"give one of them the other parity with {_SIDE_ROUTE} "
+                        "before capturing"
+                    )
+            return {index: body.key for index, body in enumerate(bodies)}
+
+        taken = {}
+        for body in bodies:
+            if body.side:
+                taken[_SIDE_INDEX[body.side]] = body.key
+        for body in bodies:
+            if body.side:
+                continue
+            index = 0
+            while index in taken:
+                index += 1
+            taken[index] = body.key
+        return taken
+
+    def _row_error(self, body):
+        """Why this body may not capture, or None."""
+        if body.collision:
+            return body.collision
+        if body.hardware_id is None:
+            return (
+                f"this body answers no USB serial and its card carries no id "
+                f"line, so it has no identity to record; assign its page "
+                f"parity with {_SIDE_ROUTE} - which writes one - before "
+                "capturing"
+            )
+        return None
+
+    def _row(self, camera_index, body):
+        """One device dict, in the shape CameraBackend.list_devices promises."""
+        provisional = body.hardware_id is None
+        return {
+            "index": camera_index,
+            "model": body.model,
+            "hardware_id": body.hardware_id or f"{body.slug}_idx{camera_index}",
+            "serial": body.serial,
+            "location": f"USB {body.port}",
+            "port": body.port,
+            "has_aperture_control": False,
+            "supports_zoom": False,
+            "side": body.side,
+            "provisional": provisional,
+            "error": self._row_error(body),
+        }
+
+    def _enumerate(self, reread):
+        """Scan the bus, reconcile the open bodies with it, and lay them out.
+
+        Bodies that have left are closed and dropped; bodies that are new are
+        opened and read; bodies that were already open keep their device, and
+        so their lock, so nothing in flight on them is disturbed. `reread`
+        asks for every card to be read again, which is what a rescan is for:
+        a parity written since the last scan is invisible otherwise.
+        """
+        with self._enumerate_lock:
+            infos = pychdk.list_devices()
+            present = {
+                (info.bus_num, info.device_num): info for info in infos
+            }
+
+            with self._map_lock:
+                departed = [
+                    self._bodies.pop(key)
+                    for key in list(self._bodies)
+                    if key not in present
+                ]
+            for body in departed:
+                self._close_body(body, "no longer on the bus")
+
+            for key, info in present.items():
+                with self._map_lock:
+                    body = self._bodies.get(key)
+                if body is not None and not body.device.is_connected:
+                    self._evict(body, "the device reports itself disconnected")
+                    body = None
+                fresh = body is None
+                if fresh:
+                    body = self._open_body(info)
+                    if body is None:
+                        continue
+                if fresh or reread or not body.card_read:
+                    if not self._read_side_file(body):
+                        if not fresh:
+                            self._evict(body, "its card could not be read")
+                        else:
+                            self._close_body(body, "its card could not be read")
+                        continue
+                if fresh:
+                    with self._map_lock:
+                        self._bodies[key] = body
+
+            with self._map_lock:
+                ordered = [
+                    self._bodies[key] for key in present if key in self._bodies
+                ]
+                self._indices = self._assign_indices(ordered)
+                rows = [
+                    self._row(index, self._bodies[key])
+                    for index, key in sorted(self._indices.items())
+                ]
+
+            self._log_enumeration(rows)
+            return rows
+
+    def _log_enumeration(self, rows):
+        """Say, per body, everything the bench would otherwise have to probe."""
+        if not rows:
+            self.logger.warning("[chdk] no CHDK cameras found on the bus")
+            return
+        for row in rows:
+            serial = (
+                f"usb serial {row['serial']}" if row["serial"]
+                else "no usb serial"
+            )
+            parity = row["side"] or "unassigned"
+            body = self._body_at(row["index"])
+            card_id = (body.camera_id if body else None) or "none"
+            self.logger.info(
+                f"[chdk] body {row['index']}: {row['model']}, {serial}, "
+                f"parity {parity}, card id {card_id}, "
+                f"hardware id {row['hardware_id']}"
+                + (" (provisional)" if row["provisional"] else "")
+            )
+            if row["error"]:
+                self.logger.error(
+                    f"[chdk] body {row['index']} ({row['location']}) may not "
+                    f"capture: {row['error']}"
+                )
+
+    def list_devices(self) -> list:
+        """Enumerate the bodies, opening any that are new and reading their cards."""
+        return self._enumerate(reread=False)
+
+    def rescan(self) -> list:
+        """Enumerate, and read every card again.
+
+        The operator's lever after moving a card, rewriting a parity by hand,
+        or replugging a body: unlike list_devices, this does not trust what
+        the last scan read off the cards.
+        """
+        return self._enumerate(reread=True)
+
+    # ------------------------------------------------------------------
+    # CameraBackend interface
+    # ------------------------------------------------------------------
+
+    def is_camera_connected(self, camera_index: int = 0) -> bool:
+        """Is a body holding this index, with its device still open?
+
+        The first question enumerates, because a process that has not yet
+        listed its devices would otherwise report a working rig as absent and
+        refuse every capture. Later questions read what that found; a body
+        that has gone is noticed by the failure of the next call on it, which
+        evicts it, or by the next enumeration.
+        """
+        try:
+            with self._map_lock:
+                never_scanned = not self._indices and not self._bodies
+            if never_scanned:
+                self._enumerate(reread=False)
+            body = self._body_at(camera_index)
+            return body is not None and bool(body.device.is_connected)
+        except Exception as exc:
+            self.logger.error(f"[chdk] is_camera_connected({camera_index}): {exc!r}")
+            return False
+
+    def _body_for_use(self, camera_index):
+        """The body at this index, or a RuntimeError saying it is not there."""
+        body = self._body_at(camera_index)
+        if body is None:
+            raise RuntimeError(
+                f"Camera {camera_index} is not connected. Detected indices: "
+                f"{sorted(self._indices)}."
+            )
+        return body
+
+    def capture_image(
+        self,
+        output_path: Path,
+        camera_config,
+        capture_output: bool = False,
+    ) -> str:
+        """Capture one still over USB and write it to output_path.
+
+        The picture never touches the card: CHDK's remote capture hands the
+        JPEG straight down the wire (pychdk's shoot(stream=True)), which is
+        both faster and one less thing to go wrong in the field. The body has
+        to be in record mode for that, which is done once and remembered.
+
+        Only the two DSLR-ish fields of CameraConfig mean anything here -
+        shutter speed and ISO - and either may be left alone. Everything else
+        is picamera2's and is ignored.
+
+        Args:
+            output_path: Destination for the JPEG; the suffix is forced to
+                .jpg, because remote capture only ever returns one.
+            camera_config: CameraConfig; camera_index routes it.
+            capture_output: Unused - kept for interface compatibility.
+
+        Returns:
+            Tuple of (path string, None), the shape the capture service reads.
+
+        Raises:
+            CaptureTimeoutError: The camera never delivered the bytes.
+            RuntimeError: Anything else, including a body that is refused.
+        """
+        camera_index = getattr(camera_config, "camera_index", 0)
+        body = self._body_for_use(camera_index)
+        refusal = self._row_error(body)
+        if refusal:
+            raise RuntimeError(f"Camera {camera_index} may not capture: {refusal}")
+
+        shutter = _shutter_seconds(getattr(camera_config, "shutter_speed", None))
+        iso = getattr(camera_config, "iso", None)
+        destination = Path(output_path).with_suffix(".jpg")
+
+        with body.lock:
+            self._ensure_record_mode(body)
+            started = time.perf_counter()
+            try:
+                image = body.device.shoot(
+                    stream=True, shutter_speed=shutter, market_iso=iso
+                )
+            except TimeoutError as exc:
+                elapsed = time.perf_counter() - started
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"timed out after {elapsed:.2f}s ({exc})"
+                )
+                raise CaptureTimeoutError(
+                    f"{body.port}: no image after {elapsed:.1f}s"
+                ) from exc
+            except Exception as exc:
+                elapsed = time.perf_counter() - started
+                code = getattr(exc, "code", None)
+                named = (
+                    f"PTP 0x{code:04x}" if isinstance(code, int)
+                    else type(exc).__name__
+                )
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"failed with {named} after {elapsed:.2f}s: {exc}"
+                )
+                if isinstance(exc, pychdk.PTPError):
+                    self._evict(body, f"remote capture failed with {named}")
+                raise RuntimeError(
+                    f"CHDK capture failed on {body.port} with {named}: {exc}"
+                ) from exc
+
+            elapsed = time.perf_counter() - started
+            if not image:
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"returned no bytes after {elapsed:.2f}s"
+                )
+                raise RuntimeError(
+                    f"CHDK capture on {body.port} returned no image data"
+                )
+
+            atomic_write(
+                destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
+            )
+            self.logger.info(
+                f"[chdk] body {camera_index} ({body.port}): remote capture ok, "
+                f"{len(image)} bytes in {elapsed:.2f}s from shutter to disk, "
+                f"saved as {destination.name}"
+            )
+            return str(destination), None
+
+    def _ensure_record_mode(self, body):
+        """Put the body in record mode once; callers hold the body's lock.
+
+        A viewport and a remote capture both need it, and the switch drives
+        the lens, so it is not something to do per frame.
+        """
+        if body.in_record_mode:
+            return
+        body.device.switch_mode("record")
+        body.in_record_mode = True
+        self.logger.info(f"[chdk] {body.port}: switched to record mode")
+
+    def supports_streaming(self) -> bool:
+        return False
+
+    def supports_live_adjustment(self) -> bool:
+        return False
+
+    def get_capabilities(self) -> dict:
+        return {
+            "live_preview": True,
+            "focus_control": False,
+            "live_controls": False,
+            "zoom": False,
+            "autofocus_calibration": False,
+            "dslr_settings": False,
+        }
+
+    def get_backend_name(self) -> str:
+        return "chdk"
+
+    def cleanup(self):
+        """Close every open body and forget the layout."""
+        with self._map_lock:
+            bodies = list(self._bodies.values())
+            self._bodies = {}
+            self._indices = {}
+        for body in bodies:
+            self._close_body(body, "backend cleanup")
+        self.logger.info("[chdk] all cameras closed.")
