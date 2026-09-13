@@ -57,7 +57,6 @@ the way it looks on the camera's screen.
 
 import contextlib
 import os
-import re
 import secrets
 import struct
 import tempfile
@@ -454,7 +453,16 @@ class _ChdkBody:
 
     @property
     def slug(self):
-        return re.sub(r"[^a-z0-9]", "", self.model.lower())
+        """The prefix of the hardware id: the camera's USB product.
+
+        Deliberately not the model name. The model is a string descriptor
+        read over the wire, and a read that fails for its own reasons would
+        otherwise give this body a second hardware id and lose the
+        orientation and calibration saved under the first. The product id is
+        in the enumeration record itself, is the same for every body of a
+        model, and costs no conversation to obtain.
+        """
+        return f"canon{self.info.product_id:04x}"
 
     @property
     def hardware_id(self):
@@ -547,9 +555,10 @@ class ChdkBackend(CameraBackend):
         """The body's model, from its USB product string if it answers one.
 
         pyusb reads string descriptors over the wire and can fail or answer
-        nothing, so the product id stands in. The model is cosmetic except
-        that it is half of the hardware id, which is why the fallback is the
-        id of the product rather than a guess at its name.
+        nothing, so the product id stands in. This is for people to read -
+        the device list, the log, the registry row - and nothing depends on
+        it: the hardware id is built from the product id instead, so a
+        failed read costs a name and never an identity.
         """
         try:
             product = getattr(device._usb_device, "product", None)

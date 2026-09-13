@@ -25,7 +25,7 @@ from .chdk_fakes import Body, make_pychdk
 CHDK_DEVICE = {
     "index": 0,
     "model": "Canon PowerShot A2500",
-    "hardware_id": "canonpowershota2500_AAA111",
+    "hardware_id": "canon325b_AAA111",
     "serial": "AAA111",
     "location": "USB usb:001,004",
     "port": "usb:001,004",
@@ -39,7 +39,7 @@ CHDK_DEVICE = {
 PROVISIONAL_DEVICE = {
     **CHDK_DEVICE,
     "index": 1,
-    "hardware_id": "canonpowershota2500_idx1",
+    "hardware_id": "canon325b_idx1",
     "serial": None,
     "side": "odd",
     "provisional": True,
@@ -95,7 +95,7 @@ def test_the_registry_asks_the_backend_for_a_hardware_id(monkeypatch):
 
     hw_id, info = CameraRegistry.get_camera_hardware_id(0)
 
-    assert hw_id == "canonpowershota2500_AAA111"
+    assert hw_id == "canon325b_AAA111"
     assert info["model"] == "Canon PowerShot A2500"
     assert info["serial"] == "AAA111"
     assert info["id"] == "usb:001,004"
@@ -123,7 +123,7 @@ def test_detection_skips_the_provisional_body_and_keeps_the_other(
     detected = registry.detect_cameras()
 
     assert set(detected) == {0}
-    assert detected[0][0] == "canonpowershota2500_AAA111"
+    assert detected[0][0] == "canon325b_AAA111"
 
 
 @pytest.mark.unit

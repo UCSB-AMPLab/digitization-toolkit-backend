@@ -122,6 +122,7 @@ class Body:
         shoot_error=None,
         preview_error=None,
         mode_error=None,
+        product_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -135,6 +136,7 @@ class Body:
         self.shoot_error = shoot_error
         self.preview_error = preview_error
         self.mode_error = mode_error
+        self.product_error = product_error
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -176,8 +178,16 @@ class Body:
 
 
 class _FakeUsbDevice:
+    """pyusb reads a string descriptor over the wire, so it can fail."""
+
     def __init__(self, body):
-        self.product = body.product
+        self._body = body
+
+    @property
+    def product(self):
+        if self._body.product_error is not None:
+            raise self._body.product_error
+        return self._body.product
 
 
 class _FakeChdkPTP:

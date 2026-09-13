@@ -49,7 +49,7 @@ def test_a_serial_makes_the_hardware_id(monkeypatch):
 
     row = backend.list_devices()[0]
 
-    assert row["hardware_id"] == "canonpowershota2500_AAA111"
+    assert row["hardware_id"] == "canon325b_AAA111"
     assert row["model"] == "Canon PowerShot A2500"
     assert row["serial"] == "AAA111"
     assert row["provisional"] is False
@@ -67,7 +67,7 @@ def test_the_card_id_stands_in_when_usb_reads_no_serial(monkeypatch):
     row = backend.list_devices()[0]
 
     assert row["serial"] is None
-    assert row["hardware_id"] == "canonpowershota2500_aaaaaaaaaaaa"
+    assert row["hardware_id"] == "canon325b_aaaaaaaaaaaa"
     assert row["provisional"] is False
 
 
@@ -116,7 +116,7 @@ def test_rubbish_on_the_card_reads_as_no_parity_and_no_id(monkeypatch):
     row = backend.list_devices()[0]
 
     assert row["side"] is None
-    assert row["hardware_id"] == "canonpowershota2500_AAA111"
+    assert row["hardware_id"] == "canon325b_AAA111"
 
 
 @pytest.mark.unit
@@ -280,4 +280,28 @@ def test_enumeration_logs_what_the_bench_has_to_know(monkeypatch, caplog):
     assert "no usb serial" in line.lower()
     assert "Canon PowerShot A2500" in line
     assert "even" in line.lower()
-    assert "canonpowershota2500_aaaaaaaaaaaa" in line
+    assert "canon325b_aaaaaaaaaaaa" in line
+
+
+@pytest.mark.unit
+def test_the_identity_survives_a_product_string_that_will_not_read(monkeypatch):
+    """A descriptor read that fails must not rename the body in the registry.
+
+    The model comes off the wire, so it can fail for reasons that have
+    nothing to do with which camera this is - and if the hardware id were
+    built from it, the same body would arrive under a second identity and
+    lose the orientation and calibration saved under its first.
+    """
+    readable = Body(serial="AAA111", product="Canon PowerShot A2500",
+                    card=EVEN_CARD)
+    backend = make_backend(monkeypatch, make_pychdk(readable))
+    settled = backend.list_devices()[0]["hardware_id"]
+
+    silent = Body(serial="AAA111", product="Canon PowerShot A2500",
+                  card=EVEN_CARD, product_error=OSError("no string descriptor"))
+    other = make_backend(monkeypatch, make_pychdk(silent))
+    row = other.list_devices()[0]
+
+    assert row["hardware_id"] == settled
+    assert row["serial"] == "AAA111"
+    assert "0x325b" in row["model"], "the model still has to say something"
