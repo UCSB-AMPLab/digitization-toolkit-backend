@@ -234,3 +234,28 @@ def test_an_aspect_ratio_nobody_has_defined_falls_back_to_four_by_three():
 
     assert Image.open(BytesIO(jpeg)).size == (640, 480)
     assert info["lcd_aspect_ratio"] == 99
+
+
+@pytest.mark.unit
+def test_a_viewport_whose_width_is_not_a_multiple_of_four_still_encodes():
+    """Six bytes are four pixels, so an odd width leaves a part-used group.
+
+    The decoded array is then a view into a wider one, and the encoder has to
+    take it as it is rather than assume a contiguous buffer.
+    """
+    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * (640 // 4) * 3
+    data = _frame(rows, buffer_width=640, visible_width=602, visible_height=3,
+                  aspect=1)
+
+    rgb, _info = cb.decode_viewport_rgb(data)
+    assert rgb.shape == (3, 602, 3)
+    assert not rgb.flags["C_CONTIGUOUS"], "this test no longer covers the case"
+
+    jpeg, info = cb.encode_viewport_jpeg(data)
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    assert Image.open(BytesIO(jpeg)).size == (602, info["jpeg_height"])
+    assert info["jpeg_height"] > 0
