@@ -191,7 +191,9 @@ def parse_live_view(data):
     Raises:
         ValueError: If the frame is too short, speaks another major version
             of the protocol, carries no viewport descriptor, or describes a
-            viewport this decoder cannot read.
+            viewport this decoder cannot read - including one whose margins
+            are negative, which no screen has and which would otherwise
+            divide by zero further down.
     """
     if len(data) < _LV_HEADER_SIZE:
         raise ValueError(
@@ -233,6 +235,19 @@ def parse_live_view(data):
         raise ValueError(
             f"viewport is empty: {vp['visible_width']}x{vp['visible_height']}"
         )
+    for field in ("margin_left", "margin_top", "margin_right", "margin_bot"):
+        if vp[field] < 0:
+            # All four margins are signed int32 in lv_framebuffer_desc, and a
+            # negative one describes a screen smaller than the viewport inside
+            # it. encode_viewport_jpeg measures the screen from them and
+            # divides by its height, so margins that cancel the visible height
+            # exactly would raise ZeroDivisionError - past the except
+            # ValueError the preview path uses to report a bad frame as a
+            # failed poll. A malformed frame is refused here, where that
+            # contract is documented.
+            raise ValueError(
+                f"viewport {field} is negative: {vp[field]}"
+            )
     if vp["data_start"] <= 0:
         # CHDK sends the descriptions whether or not the data is available,
         # and zeroes the offset when it is not.

@@ -107,6 +107,29 @@ def test_a_frame_the_decoder_refuses_is_reported_not_crashed_on(monkeypatch):
 
 
 @pytest.mark.unit
+def test_a_frame_with_a_negative_margin_is_reported_as_a_failed_poll(monkeypatch):
+    """The one shape that divides by zero on its way into a JPEG.
+
+    margin_top + visible_height + margin_bot is what the viewport is
+    stretched by, and this frame cancels it to nothing. The preview path
+    reports a bad frame through ValueError; a ZeroDivisionError would escape
+    it and reach the route as something nobody wrote a handler for.
+    """
+    body = Body(
+        serial="AAA111", card=EVEN_CARD,
+        frame=viewport_frame(visible_height=1, margins=(0, 0, 0, -1)),
+    )
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_preview(0)
+
+    assert "margin_bot" in str(exc.value)
+    assert body.closes == 0, "a bad frame is not a reason to drop the body"
+
+
+@pytest.mark.unit
 def test_the_frame_geometry_is_logged_once_per_body(monkeypatch, caplog):
     body = Body(
         serial="AAA111", card=EVEN_CARD,

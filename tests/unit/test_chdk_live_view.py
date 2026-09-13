@@ -164,6 +164,42 @@ def test_a_short_frame_is_refused_rather_than_read_past_its_end():
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("field,margins", [
+    ("margin_left", (-1, 0, 0, 0)),
+    ("margin_top", (0, -1, 0, 0)),
+    ("margin_right", (0, 0, -1, 0)),
+    ("margin_bot", (0, 0, 0, -1)),
+])
+def test_a_negative_margin_is_refused_as_a_malformed_frame(field, margins):
+    """All four margins are signed int32, and a negative one is nonsense."""
+    data = _frame(_uyvyyy(0, 255, 0, 255, 255, 255), 4, 4, 1, margins=margins)
+
+    with pytest.raises(ValueError) as exc:
+        cb.parse_live_view(data)
+
+    assert field in str(exc.value)
+    assert "-1" in str(exc.value)
+
+
+@pytest.mark.unit
+def test_a_margin_that_cancels_the_visible_height_does_not_divide_by_zero():
+    """The screen height the frame is stretched by is the divisor.
+
+    margin_top + visible_height + margin_bot, with nothing guarding it the
+    way out_width is guarded. A frame that makes it zero has to arrive at the
+    preview path as the malformed frame it is - the ValueError that path
+    reports as a failed poll - rather than as a ZeroDivisionError going
+    straight past the handler.
+    """
+    data = _frame(
+        _uyvyyy(0, 255, 0, 255, 255, 255), 4, 4, 1, margins=(0, 0, 0, -1)
+    )
+
+    with pytest.raises(ValueError):
+        cb.encode_viewport_jpeg(data)
+
+
+@pytest.mark.unit
 def test_a_visible_width_wider_than_the_buffer_is_refused():
     data = _frame(_uyvyyy(0, 255, 0, 255, 255, 255) * 2, buffer_width=4,
                   visible_width=8, visible_height=1)
