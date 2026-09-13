@@ -185,7 +185,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.1#a227294d5334f2595909012496450232e1c15274
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aom-3.14.1-pl5321h8fffa31_1.conda
@@ -352,6 +354,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.1#a227294d5334f2595909012496450232e1c15274
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
   dev:
     channels:
@@ -528,7 +532,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.1#a227294d5334f2595909012496450232e1c15274
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aom-3.14.1-pl5321h8fffa31_1.conda
@@ -698,6 +704,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.1#a227294d5334f2595909012496450232e1c15274
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -4372,10 +4380,22 @@ packages:
   - pkg:pypi/zipp?source=compressed-mapping
   size: 24190
   timestamp: 1779159948016
+- pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.1#a227294d5334f2595909012496450232e1c15274
+  name: pychdk
+  version: 0.1.1
+  requires_dist:
+  - pyusb>=1.2.0
+  - pytest>=7.0 ; extra == 'dev'
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
   name: gphoto2
   version: 2.6.4
   sha256: 70011e78b6069ffca7285abab5f2bc9423cd3009a1f966cb83a574c640799a29
+- pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
+  name: pyusb
+  version: 1.3.1
+  sha256: bf9b754557af4717fe80c2b07cc2b923a9151f5c08d17bdb5345dac09d6a0430
+  requires_python: '>=3.9.0'
 - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
   name: gphoto2
   version: 2.6.4
