@@ -351,3 +351,40 @@ def test_one_body_with_one_identity_is_not_a_clash(monkeypatch):
     backend = make_backend(monkeypatch, make_pychdk(first, second))
 
     assert all(row["error"] is None for row in backend.list_devices())
+
+
+@pytest.mark.unit
+def test_the_error_names_the_body_a_card_write_can_actually_repair(monkeypatch):
+    """A clash can run between one body's serial and another's card id.
+
+    Only the body whose identity comes off its card can be repaired by
+    writing one. Naming the other would send the operator round in circles,
+    rewriting a card that was never the problem.
+    """
+    from_serial = Body(bus=1, address=4, serial="cccccccccccc",
+                       card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    from_card = Body(bus=1, address=7, serial=None,
+                     card=b"ODD\nid=cccccccccccc\n")
+    backend = make_backend(monkeypatch, make_pychdk(from_serial, from_card))
+
+    rows = backend.list_devices()
+
+    assert len({row["hardware_id"] for row in rows}) == 1
+    for row in rows:
+        assert "identity" in row["error"]
+        assert "usb:001,007" in row["error"].split("Assign")[-1]
+        assert "usb:001,004" not in row["error"].split("Assign")[-1]
+
+
+@pytest.mark.unit
+def test_a_clash_between_two_usb_serials_cannot_be_repaired_by_a_card(monkeypatch):
+    first = Body(bus=1, address=4, serial="cccccccccccc", card=EVEN_CARD)
+    second = Body(bus=1, address=7, serial="cccccccccccc", card=ODD_CARD)
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+
+    rows = backend.list_devices()
+
+    for row in rows:
+        assert "identity" in row["error"]
+        assert "USB serial" in row["error"]
+        assert "/side/" not in row["error"], "the route cannot fix this one"

@@ -734,6 +734,12 @@ class ChdkBackend(CameraBackend):
 
         A body with no identity at all is not part of this: it is provisional
         already, and refused for its own reason.
+
+        The error names the bodies a card write can actually repair, which is
+        those whose identity comes off their card. A clash can just as easily
+        run between one body's USB serial and another's card id, and then
+        only the second one can be rewritten - sending the operator at the
+        first would have them rewriting a card that was never the fault.
         """
         claimants = {}
         for body in bodies:
@@ -745,13 +751,24 @@ class ChdkBackend(CameraBackend):
             if len(sharing) < 2:
                 continue
             ports = ", ".join(other.port for other in sharing)
+            # A body with a USB serial answers to that serial whatever its
+            # card says, so writing its card cannot change what it answers to.
+            repairable = [other.port for other in sharing if other.serial is None]
+            if repairable:
+                remedy = (
+                    f"Assign a page parity to {' or '.join(repairable)} with "
+                    f"{_SIDE_ROUTE}, which writes that body a fresh id"
+                )
+            else:
+                remedy = (
+                    "Both bodies report it as their USB serial, which no card "
+                    "can change: take one of them off the rig"
+                )
             for body in sharing:
                 body.identity_clash = (
                     f"two bodies answer to the identity {identity} ({ports}), "
                     "so the appliance cannot tell them apart and neither may "
-                    f"capture. Assign a page parity with {_SIDE_ROUTE} to one "
-                    "of them, which writes it a fresh id, or give it a card "
-                    "that is not a copy of the other's"
+                    f"capture. {remedy}"
                 )
 
     def _row_error(self, body):
@@ -1254,17 +1271,23 @@ class ChdkBackend(CameraBackend):
                 camera_id = body.camera_id
                 if camera_id is None:
                     camera_id = secrets.token_hex(_CAMERA_ID_BYTES)
-                elif any(
+                elif body.serial is None and any(
                     other.key != body.key
                     and other.hardware_id is not None
                     and other.hardware_id == body.hardware_id
                     for other in self._bodies.values()
                 ):
-                    # The id on this card is another body's identity too -
-                    # two cards cut from one image. Writing it back would
-                    # leave the pair as indistinguishable as it found them,
-                    # and this route is the only repair tool the operator
-                    # has, so the body is given an identity of its own.
+                    # This body answers to its card id, and another body
+                    # answers to the same thing - two cards cut from one
+                    # image. Writing it back would leave the pair as
+                    # indistinguishable as it found them, and this route is
+                    # the only repair tool the operator has, so the body is
+                    # given an identity of its own.
+                    #
+                    # A body with a USB serial is deliberately not covered:
+                    # it answers to that serial whatever its card says, so
+                    # minting would destroy a good card id and repair
+                    # nothing. The clash it is in belongs to the other body.
                     camera_id = secrets.token_hex(_CAMERA_ID_BYTES)
                     self.logger.info(
                         f"[chdk] body {camera_index} ({body.port}): its card "

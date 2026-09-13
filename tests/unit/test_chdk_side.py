@@ -307,3 +307,41 @@ def test_assigning_a_parity_mints_a_fresh_id_for_a_duplicated_one(monkeypatch):
     assert b"id=aaaaaaaaaaaa" not in payload, "the duplicate id was kept"
     assert all(row["error"] is None for row in rows)
     assert len({row["hardware_id"] for row in rows}) == 2
+
+
+@pytest.mark.unit
+def test_a_card_id_the_clash_does_not_involve_is_left_alone(monkeypatch):
+    """Body 0 collides through its USB serial, so its card id is not the fault.
+
+    Minting over it would destroy a good identity and repair nothing: the
+    body would still answer to the serial it shares.
+    """
+    from_serial = Body(bus=1, address=4, serial="cccccccccccc",
+                       card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    from_card = Body(bus=1, address=7, serial=None,
+                     card=b"ODD\nid=cccccccccccc\n")
+    backend = make_backend(monkeypatch, make_pychdk(from_serial, from_card))
+    backend.list_devices()
+
+    rows = backend.assign_side(0, "even")
+
+    _remote, payload = from_serial.uploads[-1]
+    assert payload == b"EVEN\nid=aaaaaaaaaaaa\n", "a good card id was overwritten"
+    assert all(row["error"] for row in rows), "the clash was reported as fixed"
+
+
+@pytest.mark.unit
+def test_assigning_to_the_repairable_body_ends_the_clash(monkeypatch):
+    from_serial = Body(bus=1, address=4, serial="cccccccccccc",
+                       card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    from_card = Body(bus=1, address=7, serial=None,
+                     card=b"ODD\nid=cccccccccccc\n")
+    backend = make_backend(monkeypatch, make_pychdk(from_serial, from_card))
+    backend.list_devices()
+
+    rows = backend.assign_side(1, "odd")
+
+    _remote, payload = from_card.uploads[-1]
+    assert b"id=cccccccccccc" not in payload, "the duplicated id was kept"
+    assert all(row["error"] is None for row in rows)
+    assert len({row["hardware_id"] for row in rows}) == 2
