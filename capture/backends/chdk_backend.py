@@ -498,8 +498,17 @@ class ChdkBackend(CameraBackend):
 
     Thread safety:
       - Every body carries its own lock, and everything that talks to that
-        body holds it: capture, preview, the card read. pychdk assumes one
-        thread per device, and a dual capture runs one thread per index.
+        body holds it: capture, preview, the card read, and closing it.
+        pychdk assumes one thread per device, and a dual capture runs one
+        thread per index. The lock is re-entrant, because an operation that
+        fails drops the body it is already holding.
+      - A camera index is not an identity. An operation resolves its index to
+        a body, and resolves it again once it has the lock, because a rescan
+        or an assignment in between moves bodies from index to index; one
+        that finds the index means another body now is refused rather than
+        run on the wrong camera.
+      - A body leaves the map only after its device is closed, so its port
+        never looks free while a claim on it is still open.
       - _map_lock guards which bodies are open and which index each holds.
         It is taken for short reads and for the one moment a new layout is
         published, never while waiting on a body's lock, so a capture that
