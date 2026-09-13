@@ -236,7 +236,6 @@ class FakeChdkDevice:
             raise self._body.mode_error
 
     def download_file(self, remote_path):
-        self._body._pass("download")
         if self._body.download_error is not None:
             raise self._body.download_error
         if self._body.card is None:
@@ -304,26 +303,42 @@ class FakePychdk:
         return FakeChdkDevice(device_info, body)
 
 
-class WatchedLock:
-    """A body's lock that says when a thread has blocked on it.
+class HeldLock:
+    """A body's lock that parks the first thread to reach it.
 
     The window a stale-body test is about opens between resolving a camera
-    index and acquiring that index's lock, and it can only be held open
-    deterministically if the test knows the waiting thread has arrived. The
-    real lock is re-entrant, and this keeps that: a non-blocking acquire from
-    the thread that already holds it succeeds, so nothing that re-enters
-    counts as waiting.
+    index and acquiring that index's lock. Holding it open by pausing a
+    rescan does not work: the rescan releases each body's lock when it has
+    read that body's card, well before it publishes the new layout, so the
+    queued operation can wake, revalidate against the layout that has not
+    changed yet, and succeed - which is correct behaviour and proves nothing.
+
+    So the test parks the queued operation itself, before the lock rather
+    than behind it, runs the rescan to completion, and only then lets it
+    through. Then the operation is looking at a layout that has definitely
+    been published, and there is one reason it can fail.
+
+    Only the first arrival is parked, so the rescan takes the real lock
+    normally and a path that re-enters (a failure evicting the body it holds)
+    is not parked either.
     """
 
     def __init__(self, lock):
         self._lock = lock
-        self.waiting = threading.Event()
+        self.arrived = threading.Event()
+        self._through = threading.Event()
+        self._parked = False
 
     def acquire(self, *args, **kwargs):
-        if self._lock.acquire(blocking=False):
-            return True
-        self.waiting.set()
+        if not self._parked:
+            self._parked = True
+            self.arrived.set()
+            if not self._through.wait(10):
+                raise AssertionError("the parked thread was never let through")
         return self._lock.acquire(*args, **kwargs)
+
+    def let_through(self):
+        self._through.set()
 
     def release(self):
         self._lock.release()
@@ -336,12 +351,12 @@ class WatchedLock:
         self.release()
 
 
-def watch_lock(backend, camera_index):
-    """Replace the lock of the body at this index with a WatchedLock."""
+def park_at_lock(backend, camera_index):
+    """Park the next thread that reaches this body's lock until let through."""
     body = backend._body_at(camera_index)
-    watched = WatchedLock(body.lock)
-    body.lock = watched
-    return watched
+    held = HeldLock(body.lock)
+    body.lock = held
+    return held
 
 
 def make_pychdk(*bodies):

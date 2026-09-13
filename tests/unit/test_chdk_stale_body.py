@@ -1,6 +1,6 @@
 """A queued operation must not run on the body that replaced the one it wanted.
 
-Resolving a camera index to a body and waiting for that body's lock are two
+Resolving a camera index to a body and acquiring that body's lock are two
 different moments, and a rescan or a side assignment in between moves bodies
 from index to index. A capture that decided on index 0 before the wait and
 shot whatever held index 0 after it would file the left page as the right one
@@ -10,15 +10,15 @@ So the index is resolved again once the lock is held, and the refusal rules
 are read again with it. A body that moved, went away, or became unusable
 while the operation queued is a failure, not something to shoot anyway.
 
-Holding that window open takes some care, because the two threads contend for
-the same lock: a rescan cannot finish while a capture holds the body, and a
-capture that wins the lock first is looking at a layout nothing has changed
-yet. The order that matters, and the one reproduced here, is the other one -
-the rescan holds the body while the capture arrives and blocks, and publishes
-its new layout before the capture wakes.
+Each test here parks the queued operation before the lock, runs the rescan to
+completion, and only then lets it through, so the layout it revalidates
+against has certainly been published. Pausing the rescan instead does not
+establish that: it releases each body's lock as soon as it has read that
+body's card, long before it publishes, so the queued operation can wake and
+correctly succeed against a layout nothing has changed yet - a test built
+that way passes or fails on scheduling, which is the one thing a proof of a
+race must not do.
 """
-
-import threading
 
 import pytest
 
@@ -28,8 +28,8 @@ from .chdk_fakes import (
     Body,
     make_backend,
     make_pychdk,
+    park_at_lock,
     viewport_frame,
-    watch_lock,
 )
 
 
@@ -38,23 +38,22 @@ ODD_CARD = b"ODD\nid=bbbbbbbbbbbb\n"
 JPEG = b"\xff\xd8\xff\xe0 page \xff\xd9"
 
 
-def _run(target):
-    thread = threading.Thread(target=target, daemon=True)
+def _queue(work, held):
+    """Run `work` in a thread and wait until it has parked at the lock."""
+    import threading
+
+    result = {}
+
+    def run():
+        try:
+            result["outcome"] = work()
+        except RuntimeError as exc:
+            result["outcome"] = str(exc)
+
+    thread = threading.Thread(target=run, daemon=True)
     thread.start()
-    return thread
-
-
-def _rescan_holding(backend, body):
-    """Start a rescan and pause it inside its card read on `body`.
-
-    It holds that body's lock until the returned gate is released, which is
-    what lets an operation arrive and block on a body the rescan is about to
-    move.
-    """
-    reading = body.gate("download")
-    thread = _run(backend.rescan)
-    reading.wait_until_entered()
-    return reading, thread
+    assert held.arrived.wait(10), "the operation never reached the lock"
+    return thread, result
 
 
 @pytest.mark.unit
@@ -64,30 +63,24 @@ def test_a_capture_refuses_a_body_that_moved_while_it_waited(monkeypatch, tmp_pa
     two = Body(bus=1, address=7, serial="BBB222", card=ODD_CARD, image=JPEG)
     backend = make_backend(monkeypatch, make_pychdk(one, two))
     backend.list_devices()
-    watched = watch_lock(backend, 0)
+    held = park_at_lock(backend, 0)
 
-    # The parities are swapped on the cards, and a rescan is under way.
+    thread, result = _queue(
+        lambda: backend.capture_image(
+            tmp_path / "page.jpg", CameraConfig(camera_index=0)
+        ) and "shot",
+        held,
+    )
+
+    # The parities are swapped and the new layout is published in full while
+    # the capture is parked: index 0 is the other body before it wakes.
     one.card = ODD_CARD
     two.card = EVEN_CARD
-    reading, rescan = _rescan_holding(backend, one)
+    rows = {row["index"]: row["serial"] for row in backend.rescan()}
+    assert rows[0] == "BBB222", "the rescan did not move the bodies"
 
-    result = {}
-
-    def capture():
-        try:
-            backend.capture_image(
-                tmp_path / "page.jpg", CameraConfig(camera_index=0)
-            )
-            result["outcome"] = "shot"
-        except RuntimeError as exc:
-            result["outcome"] = str(exc)
-
-    queued = _run(capture)
-    assert watched.waiting.wait(10), "the capture never reached the lock"
-
-    reading.release()
-    rescan.join(timeout=10)
-    queued.join(timeout=10)
+    held.let_through()
+    thread.join(timeout=10)
 
     assert result.get("outcome", "").startswith("Camera 0"), result
     assert "no longer" in result["outcome"], result
@@ -104,29 +97,21 @@ def test_a_capture_refuses_a_body_that_became_unusable_while_it_waited(
     fake = make_pychdk(one)
     backend = make_backend(monkeypatch, fake)
     backend.list_devices()
-    watched = watch_lock(backend, 0)
+    held = park_at_lock(backend, 0)
+
+    thread, result = _queue(
+        lambda: backend.capture_image(
+            tmp_path / "page.jpg", CameraConfig(camera_index=0)
+        ) and "shot",
+        held,
+    )
 
     twin = Body(bus=1, address=7, serial="BBB222", card=EVEN_CARD, image=JPEG)
     fake.bodies = [one, twin]
-    reading, rescan = _rescan_holding(backend, one)
+    assert all(row["error"] for row in backend.rescan()), "the twin was not seen"
 
-    result = {}
-
-    def capture():
-        try:
-            backend.capture_image(
-                tmp_path / "page.jpg", CameraConfig(camera_index=0)
-            )
-            result["outcome"] = "shot"
-        except RuntimeError as exc:
-            result["outcome"] = str(exc)
-
-    queued = _run(capture)
-    assert watched.waiting.wait(10), "the capture never reached the lock"
-
-    reading.release()
-    rescan.join(timeout=10)
-    queued.join(timeout=10)
+    held.let_through()
+    thread.join(timeout=10)
 
     assert "even" in result.get("outcome", ""), result
     assert one.shots == [], "the queued capture shot a body that may not capture"
@@ -140,27 +125,17 @@ def test_a_preview_refuses_a_body_that_moved_while_it_waited(monkeypatch):
                frame=viewport_frame())
     backend = make_backend(monkeypatch, make_pychdk(one, two))
     backend.list_devices()
-    watched = watch_lock(backend, 0)
+    held = park_at_lock(backend, 0)
+
+    thread, result = _queue(lambda: backend.capture_preview(0) and "framed", held)
 
     one.card = ODD_CARD
     two.card = EVEN_CARD
-    reading, rescan = _rescan_holding(backend, one)
+    rows = {row["index"]: row["serial"] for row in backend.rescan()}
+    assert rows[0] == "BBB222", "the rescan did not move the bodies"
 
-    result = {}
-
-    def preview():
-        try:
-            backend.capture_preview(0)
-            result["outcome"] = "framed"
-        except RuntimeError as exc:
-            result["outcome"] = str(exc)
-
-    queued = _run(preview)
-    assert watched.waiting.wait(10), "the preview never reached the lock"
-
-    reading.release()
-    rescan.join(timeout=10)
-    queued.join(timeout=10)
+    held.let_through()
+    thread.join(timeout=10)
 
     assert "no longer" in result.get("outcome", ""), result
     assert one.frames_served == 0
@@ -176,23 +151,15 @@ def test_a_preview_still_runs_when_the_body_stayed_where_it_was(monkeypatch):
                frame=viewport_frame())
     backend = make_backend(monkeypatch, make_pychdk(one, two))
     backend.list_devices()
-    watched = watch_lock(backend, 0)
+    held = park_at_lock(backend, 0)
 
-    reading, rescan = _rescan_holding(backend, one)
+    thread, result = _queue(lambda: backend.capture_preview(0)[:2], held)
 
-    result = {}
+    rows = {row["index"]: row["serial"] for row in backend.rescan()}
+    assert rows[0] == "AAA111", "the rescan moved a body it should not have"
 
-    def preview():
-        try:
-            result["outcome"] = backend.capture_preview(0)[:2]
-        except RuntimeError as exc:  # pragma: no cover - surfaced by the assert
-            result["outcome"] = str(exc)
-
-    queued = _run(preview)
-    assert watched.waiting.wait(10), "the preview never reached the lock"
-
-    reading.release()
-    rescan.join(timeout=10)
-    queued.join(timeout=10)
+    held.let_through()
+    thread.join(timeout=10)
 
     assert result.get("outcome") == b"\xff\xd8", result
+    assert one.frames_served == 1
