@@ -160,3 +160,66 @@ def test_a_dual_capture_logs_the_pairs_wall_time(monkeypatch, tmp_path, caplog):
     )
     assert "pair_wall=" in line
     assert "cam0=" in line and "cam1=" in line
+
+
+TWIN_A = {
+    **CHDK_DEVICE,
+    "index": 0,
+    "hardware_id": "canon325b_aaaaaaaaaaaa",
+    "serial": None,
+    "identity_ambiguous": True,
+    "error": "two bodies answer to the identity canon325b_aaaaaaaaaaaa",
+}
+TWIN_B = {**TWIN_A, "index": 1, "side": "odd"}
+
+
+@pytest.mark.unit
+def test_two_bodies_sharing_an_identity_are_kept_out_of_the_registry(
+    monkeypatch, tmp_path
+):
+    """One record cannot serve two cameras.
+
+    The backend reports both rows on purpose, so the operator can see the
+    clash and repair it, but registering them would file one calibration and
+    one orientation against whichever body happened to hold an index.
+    """
+    _use_chdk(monkeypatch, [TWIN_A, TWIN_B])
+
+    registry = CameraRegistry(registry_path=tmp_path / "registry.json")
+    detected = registry.detect_cameras()
+
+    assert detected == {}
+
+
+@pytest.mark.unit
+def test_no_identity_is_handed_out_for_a_body_that_shares_one(monkeypatch):
+    _use_chdk(monkeypatch, [TWIN_A, TWIN_B])
+
+    hw_id, info = CameraRegistry.get_camera_hardware_id(0)
+
+    assert hw_id is None, "an ambiguous identity reached the registry"
+    assert info.get("identity_ambiguous") is True
+
+
+@pytest.mark.unit
+def test_the_backend_marks_the_rows_the_registry_has_to_skip(monkeypatch):
+    """The flag the registry reads has to be the one the backend sets."""
+    from .chdk_fakes import Body, make_backend, make_pychdk
+
+    first = Body(bus=1, address=4, serial=None, card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    second = Body(bus=1, address=7, serial=None, card=b"ODD\nid=aaaaaaaaaaaa\n")
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+
+    rows = backend.list_devices()
+
+    assert [row["identity_ambiguous"] for row in rows] == [True, True]
+    assert all(row["error"] for row in rows), "the rows must stay visible"
+
+
+@pytest.mark.unit
+def test_an_unambiguous_body_is_still_registered(monkeypatch, tmp_path):
+    _use_chdk(monkeypatch, [CHDK_DEVICE])
+
+    registry = CameraRegistry(registry_path=tmp_path / "registry.json")
+
+    assert set(registry.detect_cameras()) == {0}

@@ -843,6 +843,11 @@ class ChdkBackend(CameraBackend):
             "supports_zoom": False,
             "side": body.side,
             "provisional": provisional,
+            # Another connected body answers to this one's hardware id, so
+            # the id identifies two cameras and cannot be recorded against
+            # either. The row is still reported: seeing both is how the
+            # operator repairs it.
+            "identity_ambiguous": body.identity_clash is not None,
             "error": self._row_error(body),
         }
 

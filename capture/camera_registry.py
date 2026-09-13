@@ -105,11 +105,15 @@ class CameraRegistry:
         the hardware ID ("{sanitized_model}_{serial}", e.g.
         "canoneos1500d_3456789").
 
-        A body the backend marks provisional has no identity of its own - no
-        USB serial, and no id line on its card - and the id in its row exists
-        only so the API can list it. Saving a calibration or an orientation
-        under that id would attach it to whichever body was at that index, so
-        none is returned and the caller treats the body as unregistered.
+        Two kinds of row carry an id that must not be recorded. A provisional
+        body has no identity of its own - no USB serial, and no id line on its
+        card - and the id in its row exists only so the API can list it. An
+        ambiguous one has an identity that another connected body answers to
+        as well, so one record would serve two cameras. Either way a
+        calibration or an orientation saved under it would attach to
+        whichever body happened to hold that index, so none is returned and
+        the caller treats the body as unregistered. Both stay in the device
+        list, which is what the operator repairs them from.
 
         The import is function-local: capture.service reaches camera_registry
         through project_manager, so a module-level import would be circular.
@@ -129,6 +133,9 @@ class CameraRegistry:
                 }
                 if device.get("provisional"):
                     info["provisional"] = True
+                    return None, info
+                if device.get("identity_ambiguous"):
+                    info["identity_ambiguous"] = True
                     return None, info
                 return device["hardware_id"], info
             return None, {}
@@ -211,8 +218,9 @@ class CameraRegistry:
         other camera. One enumeration also means one pass over the bus, not one
         per index.
 
-        A body the backend marks provisional is left out: its id is a
-        placeholder so the API can list it, not an identity to register.
+        A body the backend marks provisional or ambiguous is left out: its id
+        is a placeholder so the API can list it, or one that two cameras
+        answer to, and neither is an identity to register.
 
         Returns:
             Dict mapping camera_index -> (hardware_id, info)
@@ -232,7 +240,11 @@ class CameraRegistry:
 
                 for device in get_backend().list_devices():
                     hw_id = device.get("hardware_id")
-                    if not hw_id or device.get("provisional"):
+                    if (
+                        not hw_id
+                        or device.get("provisional")
+                        or device.get("identity_ambiguous")
+                    ):
                         continue
                     idx = device["index"]
                     detected[idx] = (hw_id, {
