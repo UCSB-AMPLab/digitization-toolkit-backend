@@ -236,3 +236,31 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk"):
     monkeypatch.setattr(cb, "pychdk", fake)
     monkeypatch.setattr(cb, "_PYCHDK_AVAILABLE", True)
     return cb.ChdkBackend(logging.getLogger(logger_name))
+
+
+def viewport_frame(
+    visible_width=8,
+    visible_height=2,
+    buffer_width=None,
+    margins=(0, 0, 0, 0),
+    aspect=0,
+    luma=200,
+):
+    """One well-formed LV_FB_YUV8 live view frame of a flat grey viewport.
+
+    The shapes a decoder must refuse are built in test_chdk_live_view.py; this
+    is only ever the good case, for a fake body to serve.
+    """
+    import struct
+
+    buffer_width = buffer_width or visible_width
+    header_size = 28
+    desc_size = 36
+    data_start = header_size + desc_size
+    header = struct.pack("<7i", 2, 1, aspect, 0, 0, header_size, 0)
+    desc = struct.pack(
+        "<9i", 0, data_start, buffer_width, visible_width, visible_height,
+        *margins,
+    )
+    row = bytes([0, luma, 0, luma, luma, luma]) * (buffer_width // 4)
+    return header + desc + row * visible_height

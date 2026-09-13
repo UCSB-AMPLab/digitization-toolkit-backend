@@ -409,6 +409,7 @@ class _ChdkBody:
         self.frames_at_last_report = 0
         self.last_frame_at = None
         self.interval_total = 0.0
+        self.interval_count = 0
         self.interval_worst = 0.0
 
     @property
@@ -886,6 +887,109 @@ class ChdkBackend(CameraBackend):
                 f"saved as {destination.name}"
             )
             return str(destination), None
+
+    def capture_preview(self, camera_index: int) -> bytes:
+        """Return one live-preview JPEG frame from the body at this index.
+
+        The capture service routes every non-picamera2 backend here, so this
+        is the whole polling path. The body's own lock is held for the frame,
+        which is what keeps a poll from landing in the middle of a capture on
+        the same USB endpoint.
+
+        A body with no identity is previewable: it may not capture, but the
+        operator still has to be able to aim it. A frame the decoder refuses
+        is reported as a failed poll and nothing more - the body is fine, it
+        just sent something this decoder does not read - whereas a PTP failure
+        drops the body so the next enumeration re-opens it.
+
+        Raises:
+            RuntimeError: No body at this index, or the frame could not be
+                fetched or decoded.
+        """
+        body = self._body_for_use(camera_index)
+        with body.lock:
+            self._ensure_record_mode(body)
+            try:
+                frame = body.device._chdk.get_display_data(LV_TFR_VIEWPORT)
+            except Exception as exc:
+                code = getattr(exc, "code", None)
+                named = (
+                    f"PTP 0x{code:04x}" if isinstance(code, int)
+                    else type(exc).__name__
+                )
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): live view "
+                    f"failed with {named}: {exc}"
+                )
+                self._evict(body, f"live view failed with {named}")
+                raise RuntimeError(
+                    f"CHDK preview failed on {body.port} with {named}: {exc}"
+                ) from exc
+
+            try:
+                jpeg, info = encode_viewport_jpeg(frame)
+            except ValueError as exc:
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): live view "
+                    f"frame could not be decoded: {exc}"
+                )
+                raise RuntimeError(
+                    f"CHDK preview frame from {body.port} could not be "
+                    f"decoded: {exc}"
+                ) from exc
+
+            self._log_frame(camera_index, body, info)
+            return jpeg
+
+    def _log_frame(self, camera_index, body, info):
+        """Record the frame geometry once, and the frame rate every so often.
+
+        The geometry answers what the viewport actually is on this model -
+        which the bench would otherwise have to read off a hex dump - and the
+        rate answers how fast it arrives, without a stopwatch. Callers hold
+        the body's lock, so the counters need none of their own.
+        """
+        if not body.geometry_logged:
+            body.geometry_logged = True
+            self.logger.info(
+                f"[chdk] body {camera_index} ({body.port}): live view "
+                f"{info['version_major']}.{info['version_minor']}, "
+                f"lcd aspect {info['lcd_aspect_ratio']}, "
+                f"fb_type {info['fb_type']}, "
+                f"buffer {info['buffer_width']} wide, "
+                f"visible {info['visible_width']}x{info['visible_height']}, "
+                f"margins l{info['margin_left']} t{info['margin_top']} "
+                f"r{info['margin_right']} b{info['margin_bot']}, "
+                f"jpeg {info['jpeg_width']}x{info['jpeg_height']} in "
+                f"{info['jpeg_bytes']} bytes"
+            )
+
+        now = time.monotonic()
+        if body.last_frame_at is not None:
+            interval = now - body.last_frame_at
+            body.interval_total += interval
+            body.interval_count += 1
+            body.interval_worst = max(body.interval_worst, interval)
+        body.last_frame_at = now
+        body.frames += 1
+
+        counted = body.frames - body.frames_at_last_report
+        if counted < self._FRAME_LOG_INTERVAL:
+            return
+        mean = (
+            body.interval_total / body.interval_count
+            if body.interval_count else 0.0
+        )
+        rate = f"{1 / mean:.1f} fps" if mean > 0 else "faster than the clock"
+        self.logger.info(
+            f"[chdk] body {camera_index} ({body.port}): {counted} preview "
+            f"frames, mean interval {mean * 1000:.1f} ms ({rate}), "
+            f"worst {body.interval_worst * 1000:.1f} ms"
+        )
+        body.frames_at_last_report = body.frames
+        body.interval_total = 0.0
+        body.interval_count = 0
+        body.interval_worst = 0.0
 
     def _ensure_record_mode(self, body):
         """Put the body in record mode once; callers hold the body's lock.
