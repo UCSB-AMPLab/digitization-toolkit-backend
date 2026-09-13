@@ -888,6 +888,11 @@ class ChdkBackend(CameraBackend):
                 self._close_body(body, "no longer on the bus")
 
             for key, info in present.items():
+                # Read before anything below can clear it: opening a body
+                # that had been dropped counts as its recovery, so by the
+                # time a card read fails the mark that says this is already
+                # the retry would be gone.
+                retried = key in self._evicted
                 with self._map_lock:
                     body = self._bodies.get(key)
                 if body is not None and not self._is_the_same_body(body, info):
@@ -904,10 +909,25 @@ class ChdkBackend(CameraBackend):
                         continue
                 if fresh or reread or not body.card_read:
                     if not self._read_side_file(body):
-                        if not fresh:
-                            self._evict(body, "its card could not be read")
+                        if retried:
+                            # A scan has already retried this one and it has
+                            # failed again, so it is the card rather than the
+                            # moment. Drop the mark: the index stays empty
+                            # until someone asks for a rescan, instead of
+                            # every connection check scanning the bus for a
+                            # body that will not answer.
+                            self._evicted.discard(key)
+                            self._close_body(
+                                body, "its card could not be read again"
+                            )
                         else:
-                            self._close_body(body, "its card could not be read")
+                            # Marked like any other failure, including on a
+                            # body being opened for the first time, so the
+                            # next connection check looks at the bus again
+                            # and a read that failed for the moment rather
+                            # than for good is retried without anyone having
+                            # to rescan by hand.
+                            self._evict(body, "its card could not be read")
                         continue
                 if fresh:
                     with self._map_lock:

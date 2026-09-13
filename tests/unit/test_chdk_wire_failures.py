@@ -248,3 +248,47 @@ def test_a_mode_check_that_times_out_is_a_capture_timeout(monkeypatch, tmp_path)
         backend.capture_image(tmp_path / "page.jpg", _config())
 
     assert "record mode" in str(exc.value)
+
+
+@pytest.mark.unit
+def test_a_new_body_whose_card_would_not_read_is_tried_again(monkeypatch):
+    """A read can fail once for reasons that pass.
+
+    A body already in the map is marked as dropped when something goes wrong
+    with it, which is what makes the next connection check look at the bus
+    again. A body failing its very first card read was closed without that
+    mark, so the scan finished, the index stayed empty, and nothing retried:
+    the camera was unavailable until someone rescanned by hand.
+    """
+    from .chdk_fakes import PTPError
+
+    body = Body(serial="AAA111", download_error=PTPError(0x2003))
+    fake = make_pychdk(body)
+    backend = make_backend(monkeypatch, fake)
+
+    assert backend.list_devices() == []
+    assert body.closes == 1
+
+    body.download_error = None
+    body.card = EVEN_CARD
+
+    assert backend.is_camera_connected(0) is True, "nothing ever tried again"
+    assert body.opens == 2
+
+
+@pytest.mark.unit
+def test_a_card_that_keeps_failing_is_not_retried_for_ever(monkeypatch):
+    """One retry is a transient read; a second failure is the card."""
+    from .chdk_fakes import PTPError
+
+    body = Body(serial="AAA111", download_error=PTPError(0x2003))
+    fake = make_pychdk(body)
+    backend = make_backend(monkeypatch, fake)
+    backend.list_devices()
+
+    assert backend.is_camera_connected(0) is False
+    scans = fake.list_calls
+
+    assert backend.is_camera_connected(0) is False
+    assert backend.is_camera_connected(0) is False
+    assert fake.list_calls == scans, "every question re-scanned the whole bus"
