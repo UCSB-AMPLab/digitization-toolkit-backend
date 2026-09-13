@@ -515,6 +515,9 @@ class ChdkBackend(CameraBackend):
         run on the wrong camera.
       - A body leaves the map only after its device is closed, so its port
         never looks free while a claim on it is still open.
+      - A new layout is published while every open body is held, so it never
+        lands under a capture that is running on the index it is about to
+        change.
       - _map_lock guards which bodies are open and which index each holds.
         It is taken for short reads and for the one moment a new layout is
         published, never while waiting on a body's lock, so a capture that
@@ -910,15 +913,37 @@ class ChdkBackend(CameraBackend):
                     with self._map_lock:
                         self._bodies[key] = body
 
-            with self._map_lock:
-                ordered = [
-                    self._bodies[key] for key in present if key in self._bodies
-                ]
-                self._indices = self._assign_indices(ordered)
-                rows = [
-                    self._row(index, self._bodies[key])
-                    for index, key in sorted(self._indices.items())
-                ]
+            # Publishing is where a body changes index, and a capture that is
+            # already running on one is using the index it had when it
+            # started. Revalidating before the shutter cannot cover that: the
+            # capture has passed the check and is holding the body while this
+            # runs. So the new layout waits for every body in hand. Nothing
+            # is in flight when it lands, and anything that arrives after it
+            # revalidates against it.
+            #
+            # The locks are taken in key order, and only an enumeration ever
+            # holds more than one: a capture or a preview holds exactly the
+            # body it is using and reaches for nothing else, and enumerations
+            # are serialised by the layout lock, so there is no pair of
+            # threads that can each hold what the other wants.
+            with contextlib.ExitStack() as held:
+                with self._map_lock:
+                    in_hand = [
+                        self._bodies[key] for key in sorted(self._bodies)
+                    ]
+                for body in in_hand:
+                    held.enter_context(body.lock)
+
+                with self._map_lock:
+                    ordered = [
+                        self._bodies[key]
+                        for key in present if key in self._bodies
+                    ]
+                    self._indices = self._assign_indices(ordered)
+                    rows = [
+                        self._row(index, self._bodies[key])
+                        for index, key in sorted(self._indices.items())
+                    ]
 
             with self._map_lock:
                 # A body a scan has looked for and not found is no longer a

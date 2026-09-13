@@ -266,6 +266,7 @@ class FakeChdkDevice:
         return None
 
     def download_file(self, remote_path):
+        self._body._pass("download")
         if self._body.download_error is not None:
             raise self._body.download_error
         if self._body.card is None:

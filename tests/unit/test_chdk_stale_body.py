@@ -163,3 +163,62 @@ def test_a_preview_still_runs_when_the_body_stayed_where_it_was(monkeypatch):
 
     assert result.get("outcome") == b"\xff\xd8", result
     assert one.frames_served == 1
+
+
+def _thread(target):
+    import threading
+
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.mark.unit
+def test_no_layout_is_published_while_a_capture_is_running(monkeypatch, tmp_path):
+    """Revalidating before the shutter is not enough on its own.
+
+    A capture holds one body, and publishing a layout moves bodies between
+    indices. Checking the index at the start and then running for seconds
+    against a map anything may replace leaves the same wrong-camera failure
+    one level out: the picture is taken correctly and filed under an index
+    its body no longer has, with nothing failing and nothing to show for it
+    in the manifest.
+    """
+    one = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD, image=JPEG)
+    two = Body(bus=1, address=7, serial="BBB222", card=ODD_CARD, image=JPEG)
+    backend = make_backend(monkeypatch, make_pychdk(one, two))
+    backend.list_devices()
+
+    # The parities are swapped, so publishing would move the first body from
+    # index 0 to index 1.
+    one.card = ODD_CARD
+    two.card = EVEN_CARD
+
+    # Park the rescan after it has finished with the first body, so that
+    # body's lock is free and a capture can start on it.
+    reading = two.gate("download")
+    rescan = _thread(backend.rescan)
+    reading.wait_until_entered()
+
+    shooting = one.gate("shoot")
+    shooter = _thread(
+        lambda: backend.capture_image(
+            tmp_path / "page.jpg", CameraConfig(camera_index=0)
+        )
+    )
+    shooting.wait_until_entered()
+
+    reading.release()
+    rescan.join(timeout=1)
+
+    assert backend._body_at(0).serial == "AAA111", (
+        "the layout moved under a running capture"
+    )
+
+    shooting.release()
+    shooter.join(timeout=10)
+    rescan.join(timeout=10)
+
+    assert backend._body_at(1).serial == "AAA111", "the rescan never published"
+    assert (tmp_path / "page.jpg").read_bytes() == JPEG
+    assert len(one.shots) == 1
