@@ -381,3 +381,50 @@ def test_an_assignment_refuses_a_body_that_was_dropped_while_it_waited(monkeypat
 
     assert "not connected" in result.get("outcome", ""), result
     assert body.uploads == [], "the card was written through a closed session"
+
+
+@pytest.mark.unit
+def test_no_capture_lands_between_the_card_write_and_the_new_layout(
+    monkeypatch, tmp_path
+):
+    """The window that corrupts the record rather than failing.
+
+    Once the card has been rewritten the body shoots the other parity, but
+    until the rescan publishes, the old layout still says it holds the old
+    index. A capture that ran in between would pass revalidation against that
+    old layout and file its page under an index the body no longer has -
+    silently, with nothing in the manifest to show for it.
+    """
+    from capture.camera import CameraConfig
+
+    body = Body(serial="AAA111", card=EVEN_CARD, image=b"\xff\xd8\xff\xd9")
+    fake = make_pychdk(body)
+    backend = make_backend(monkeypatch, fake)
+    backend.list_devices()
+
+    scanning = fake.gate_list()
+    writer = _run(lambda: backend.assign_side(0, "odd"))
+    scanning.wait_until_entered()
+    assert body.uploads, "the card was not written before the rescan"
+
+    result = {}
+
+    def capture():
+        try:
+            backend.capture_image(
+                tmp_path / "page.jpg", CameraConfig(camera_index=0)
+            )
+            result["outcome"] = "shot"
+        except RuntimeError as exc:
+            result["outcome"] = str(exc)
+
+    shooter = _run(capture)
+    shooter.join(timeout=1)
+
+    scanning.release()
+    writer.join(timeout=10)
+    shooter.join(timeout=10)
+
+    assert body.shots == [], "a page was shot against the layout being replaced"
+    assert result.get("outcome", "").startswith("Camera 0"), result
+    assert not (tmp_path / "page.jpg").exists()

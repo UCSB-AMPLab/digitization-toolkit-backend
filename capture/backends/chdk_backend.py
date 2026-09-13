@@ -1275,6 +1275,10 @@ class ChdkBackend(CameraBackend):
         pyusb cannot read: it is what lifts it out of provisional and lets it
         capture.
 
+        The body is held from before the write until the new layout has been
+        published, so nothing can use it while its card and its index
+        disagree.
+
         Args:
             camera_index: Which body, as the device list numbers them.
             side: "odd" or "even", in any case.
@@ -1389,11 +1393,21 @@ class ChdkBackend(CameraBackend):
                     except OSError:
                         pass
 
-            self.logger.info(
-                f"[chdk] body {camera_index} ({body.port}): now shoots "
-                f"{parity} pages, id {camera_id}"
-            )
-            return self.rescan()
+                self.logger.info(
+                    f"[chdk] body {camera_index} ({body.port}): now shoots "
+                    f"{parity} pages, id {camera_id}"
+                )
+                # The body stays reserved across the rescan, and that is the
+                # point of doing it here rather than after. Between the write
+                # and the new layout the card says one parity while the
+                # published indices still say the other, and a capture that
+                # got the body in that gap would pass its revalidation
+                # against the layout being replaced and file its page under
+                # an index the body no longer has. It would not fail; it
+                # would quietly be wrong. The rescan re-enters this lock on
+                # this thread, so holding it costs nothing but the wait it is
+                # there to impose.
+                return self.rescan()
 
     def supports_streaming(self) -> bool:
         return False
