@@ -217,6 +217,7 @@ class FakeChdkDevice:
             raise self._body.mode_error
 
     def download_file(self, remote_path):
+        self._body._pass("download")
         if self._body.download_error is not None:
             raise self._body.download_error
         if self._body.card is None:
@@ -282,6 +283,46 @@ class FakePychdk:
     def ChdkDevice(self, device_info, _usb_device=None):
         body = self.by_key((device_info.bus_num, device_info.device_num))
         return FakeChdkDevice(device_info, body)
+
+
+class WatchedLock:
+    """A body's lock that says when a thread has blocked on it.
+
+    The window a stale-body test is about opens between resolving a camera
+    index and acquiring that index's lock, and it can only be held open
+    deterministically if the test knows the waiting thread has arrived. The
+    real lock is re-entrant, and this keeps that: a non-blocking acquire from
+    the thread that already holds it succeeds, so nothing that re-enters
+    counts as waiting.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.waiting = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        if self._lock.acquire(blocking=False):
+            return True
+        self.waiting.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+def watch_lock(backend, camera_index):
+    """Replace the lock of the body at this index with a WatchedLock."""
+    body = backend._body_at(camera_index)
+    watched = WatchedLock(body.lock)
+    body.lock = watched
+    return watched
 
 
 def make_pychdk(*bodies):

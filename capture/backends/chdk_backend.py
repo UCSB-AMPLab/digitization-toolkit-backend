@@ -55,6 +55,7 @@ it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 """
 
+import contextlib
 import os
 import re
 import secrets
@@ -151,6 +152,16 @@ _SIDE_ROUTE = "POST /cameras/side/{camera_index}"
 # thirty-two, and the flasher mints twelve, so a body keeps the same shape of
 # id whether the card was prepared at a workbench or assigned here.
 _CAMERA_ID_BYTES = 6
+
+
+class CameraMovedError(RuntimeError):
+    """The body that held this index when the operation started no longer does.
+
+    A rescan or a side assignment moves bodies between indices, and an
+    operation that resolved an index before waiting for a lock would
+    otherwise run on whichever body holds that index now. Filing the left
+    page as the right one is a silent data error, so this is raised instead.
+    """
 
 
 class SideConflictError(RuntimeError):
@@ -818,15 +829,64 @@ class ChdkBackend(CameraBackend):
             self.logger.error(f"[chdk] is_camera_connected({camera_index}): {exc!r}")
             return False
 
-    def _body_for_use(self, camera_index):
-        """The body at this index, or a RuntimeError saying it is not there."""
+    @contextlib.contextmanager
+    def _in_use(self, camera_index, operation, refuse_unusable):
+        """Hold the body at this index, having checked it is still that body.
+
+        Resolving an index to a body and acquiring that body's lock are two
+        moments, and a rescan or a side assignment in between moves bodies
+        from index to index. So the index is resolved a second time once the
+        lock is held: if it no longer means this body, the operation is
+        refused rather than run on the camera that took its place, which
+        would file one page as the other with nothing to show for it
+        afterwards.
+
+        The refusal rules are read inside the lock for the same reason - a
+        second body can arrive on this one's parity while a capture waits -
+        and only for the operations they apply to. A preview is not one of
+        them: an operator has to be able to aim a body that may not yet
+        capture.
+
+        Args:
+            camera_index: Which body, as the device list numbers them.
+            operation: Named in the message when the body has moved.
+            refuse_unusable: Apply the capture refusal rules.
+
+        Yields:
+            The body, with its lock held.
+
+        Raises:
+            CameraMovedError: The index means another body now.
+            RuntimeError: No body at the index, its device has gone, or it
+                may not be used for this.
+        """
         body = self._body_at(camera_index)
         if body is None:
             raise RuntimeError(
                 f"Camera {camera_index} is not connected. Detected indices: "
                 f"{sorted(self._indices)}."
             )
-        return body
+        with body.lock:
+            current = self._body_at(camera_index)
+            if current is not body:
+                raise CameraMovedError(
+                    f"Camera {camera_index} is no longer {body.port}; the "
+                    f"cameras were re-laid out while this {operation} was "
+                    "waiting, so it was refused rather than run on the wrong "
+                    "body. Reload the device list and try again."
+                )
+            if not body.device.is_connected:
+                raise RuntimeError(
+                    f"Camera {camera_index} ({body.port}) is no longer "
+                    "connected."
+                )
+            if refuse_unusable:
+                refusal = self._row_error(body)
+                if refusal:
+                    raise RuntimeError(
+                        f"Camera {camera_index} may not capture: {refusal}"
+                    )
+            yield body
 
     def capture_image(
         self,
@@ -859,16 +919,11 @@ class ChdkBackend(CameraBackend):
             RuntimeError: Anything else, including a body that is refused.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
-        body = self._body_for_use(camera_index)
-        refusal = self._row_error(body)
-        if refusal:
-            raise RuntimeError(f"Camera {camera_index} may not capture: {refusal}")
-
         shutter = _shutter_seconds(getattr(camera_config, "shutter_speed", None))
         iso = getattr(camera_config, "iso", None)
         destination = Path(output_path).with_suffix(".jpg")
 
-        with body.lock:
+        with self._in_use(camera_index, "capture", refuse_unusable=True) as body:
             self._ensure_record_mode(body)
             started = time.perf_counter()
             try:
@@ -939,8 +994,7 @@ class ChdkBackend(CameraBackend):
             RuntimeError: No body at this index, or the frame could not be
                 fetched or decoded.
         """
-        body = self._body_for_use(camera_index)
-        with body.lock:
+        with self._in_use(camera_index, "preview", refuse_unusable=False) as body:
             self._ensure_record_mode(body)
             try:
                 frame = body.device._chdk.get_display_data(LV_TFR_VIEWPORT)
