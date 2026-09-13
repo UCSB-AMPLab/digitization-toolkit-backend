@@ -544,23 +544,38 @@ class ChdkBackend(CameraBackend):
         return f"Canon {info.product_id:#06x}"
 
     def _close_body(self, body, reason):
-        """Close one body's device, whatever state it is in."""
-        try:
-            body.device.close()
-        except Exception as exc:
-            self.logger.warning(
-                f"[chdk] {body.port}: error while closing it ({exc!r})"
-            )
-        self.logger.info(f"[chdk] {body.port}: closed ({reason})")
+        """Close one body and drop it from the map, under the body's own lock.
+
+        The order matters in both directions. The device is closed while the
+        body's lock is held, so a capture or a preview is never cut off
+        mid-conversation - whoever wants to close a body waits for whoever is
+        using it. And the map entry is removed only once the close has
+        returned, so there is no moment in which the port looks free while a
+        claim on it is still open: an enumeration racing this either sees the
+        body and waits on its lock, or sees nothing and opens the one
+        replacement there should ever be.
+
+        The lock is re-entrant, so the paths that already hold it - a capture
+        evicting the body it is holding - can call this directly.
+        """
+        with body.lock:
+            try:
+                body.device.close()
+            except Exception as exc:
+                self.logger.warning(
+                    f"[chdk] {body.port}: error while closing it ({exc!r})"
+                )
+            with self._map_lock:
+                if self._bodies.get(body.key) is body:
+                    del self._bodies[body.key]
+                    self._indices = {
+                        index: key for index, key in self._indices.items()
+                        if key != body.key
+                    }
+            self.logger.info(f"[chdk] {body.port}: closed ({reason})")
 
     def _evict(self, body, reason):
         """Drop a body that has stopped answering, so the next scan re-opens it."""
-        with self._map_lock:
-            self._bodies.pop(body.key, None)
-            self._indices = {
-                index: key for index, key in self._indices.items()
-                if key != body.key
-            }
         self._evicted.add(body.key)
         self._close_body(body, reason)
 
@@ -698,11 +713,12 @@ class ChdkBackend(CameraBackend):
 
             with self._map_lock:
                 departed = [
-                    self._bodies.pop(key)
-                    for key in list(self._bodies)
+                    body for key, body in self._bodies.items()
                     if key not in present
                 ]
             for body in departed:
+                # Closing waits for anything still using the body, so an
+                # enumeration can be as slow as the capture it interrupts.
                 self._close_body(body, "no longer on the bus")
 
             for key, info in present.items():
@@ -1126,11 +1142,16 @@ class ChdkBackend(CameraBackend):
         return "chdk"
 
     def cleanup(self):
-        """Close every open body and forget the layout."""
+        """Close every open body, waiting for whatever is using it.
+
+        Each body is dropped by its own close, rather than by clearing the
+        map first: a shutdown that emptied the map and then closed the
+        devices would let a capture keep shooting a camera that was already
+        being closed, and would let an enumeration racing it open a second
+        claim on the same body.
+        """
         with self._map_lock:
             bodies = list(self._bodies.values())
-            self._bodies = {}
-            self._indices = {}
         for body in bodies:
             self._close_body(body, "backend cleanup")
         self.logger.info("[chdk] all cameras closed.")

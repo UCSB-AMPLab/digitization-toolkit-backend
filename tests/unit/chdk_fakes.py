@@ -15,6 +15,7 @@ themselves while disagreeing with the library.
 """
 
 import re
+import threading
 from collections import namedtuple
 
 
@@ -74,6 +75,31 @@ def format_own_txt(side, camera_id=None):
 
 # --- the scripted hardware ------------------------------------------------
 
+class Gate:
+    """A scripted pause inside one call on a body.
+
+    A lifetime race needs one thread stopped mid-call while another runs, so
+    a test asks a body to pause in close(), shoot() or a frame, waits for it
+    to arrive, does its other work, and then lets it go.
+    """
+
+    def __init__(self, name):
+        self.name = name
+        self.entered = threading.Event()
+        self.released = threading.Event()
+
+    def arrive(self, timeout=10):
+        self.entered.set()
+        if not self.released.wait(timeout):
+            raise AssertionError(f"the {self.name} gate was never released")
+
+    def wait_until_entered(self, timeout=10):
+        assert self.entered.wait(timeout), f"nothing reached the {self.name} gate"
+
+    def release(self):
+        self.released.set()
+
+
 class Body:
     """One scripted camera: what it answers, and what it was asked.
 
@@ -95,6 +121,7 @@ class Body:
         image=b"",
         shoot_error=None,
         preview_error=None,
+        mode_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -107,6 +134,7 @@ class Body:
         self.image = image
         self.shoot_error = shoot_error
         self.preview_error = preview_error
+        self.mode_error = mode_error
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -115,6 +143,32 @@ class Body:
         self.uploads = []
         self.frames_served = 0
         self.device = None
+        # Open devices for this one camera, now and at the worst moment. Two
+        # at once is the failure a lifetime test is looking for.
+        self.live = 0
+        self.max_live = 0
+        self._live_lock = threading.Lock()
+        self.gates = {}
+
+    def gate(self, name):
+        """Pause the next call to `name` on this body until it is released."""
+        gate = Gate(name)
+        self.gates[name] = gate
+        return gate
+
+    def _pass(self, name):
+        gate = self.gates.pop(name, None)
+        if gate is not None:
+            gate.arrive()
+
+    def _opened(self):
+        with self._live_lock:
+            self.live += 1
+            self.max_live = max(self.max_live, self.live)
+
+    def _closed(self):
+        with self._live_lock:
+            self.live -= 1
 
     @property
     def key(self):
@@ -134,6 +188,7 @@ class _FakeChdkPTP:
 
     def get_display_data(self, flags=0):
         self._body.frames_served += 1
+        self._body._pass("frame")
         if self._body.preview_error is not None:
             raise self._body.preview_error
         self.last_flags = flags
@@ -148,6 +203,7 @@ class FakeChdkDevice:
         self._chdk = _FakeChdkPTP(body)
         self._connected = True
         body.opens += 1
+        body._opened()
         body.device = self
 
     @property
@@ -156,6 +212,9 @@ class FakeChdkDevice:
 
     def switch_mode(self, mode):
         self._body.mode_switches.append(mode)
+        self._body._pass("switch_mode")
+        if self._body.mode_error is not None:
+            raise self._body.mode_error
 
     def download_file(self, remote_path):
         if self._body.download_error is not None:
@@ -174,13 +233,16 @@ class FakeChdkDevice:
 
     def shoot(self, **kwargs):
         self._body.shots.append(kwargs)
+        self._body._pass("shoot")
         if self._body.shoot_error is not None:
             raise self._body.shoot_error
         return self._body.image
 
     def close(self):
         self._connected = False
+        self._body._pass("close")
         self._body.closes += 1
+        self._body._closed()
 
 
 class FakePychdk:
