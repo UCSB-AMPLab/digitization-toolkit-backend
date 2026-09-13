@@ -136,7 +136,8 @@ def test_a_read_failure_that_is_not_absence_evicts_the_body(monkeypatch):
 
 
 @pytest.mark.unit
-def test_two_bodies_claiming_one_parity_keep_their_usb_indices(monkeypatch):
+def test_two_bodies_claiming_one_parity_both_stay_addressable(monkeypatch):
+    """Neither is guessed at, and both keep an index the side route can reach."""
     first = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD)
     second = Body(bus=1, address=7, serial="BBB222", card=b"EVEN\nid=cccccccccccc\n")
     backend = make_backend(monkeypatch, make_pychdk(first, second))
@@ -149,6 +150,37 @@ def test_two_bodies_claiming_one_parity_keep_their_usb_indices(monkeypatch):
         assert row["error"] is not None
         assert "even" in row["error"]
         assert "/side/" in row["error"]
+
+
+@pytest.mark.unit
+def test_a_contested_parity_does_not_move_the_body_that_is_not_in_it(monkeypatch):
+    """An ODD body keeps index 1 while two EVEN bodies argue over index 0.
+
+    The contest is the EVEN pair's. The ODD body carries no refusal of its
+    own, so it will shoot: laying every body back out in USB order because of
+    somebody else's fault puts it on index 0, and the service then files its
+    pages as even ones. Nothing fails and nothing is logged; the pages are
+    simply in the wrong place.
+    """
+    odd = Body(bus=1, address=4, serial="AAA111", card=ODD_CARD)
+    first_even = Body(bus=1, address=7, serial="BBB222", card=EVEN_CARD)
+    second_even = Body(
+        bus=1, address=9, serial="CCC333", card=b"EVEN\nid=cccccccccccc\n"
+    )
+    backend = make_backend(
+        monkeypatch, make_pychdk(odd, first_even, second_even)
+    )
+
+    rows = _rows_by_index(backend.list_devices())
+
+    assert rows[1]["serial"] == "AAA111", "the healthy ODD body left index 1"
+    assert rows[0]["serial"] != "AAA111", "the ODD body took the EVEN index"
+    assert rows[1]["error"] is None
+    assert rows[0]["serial"] == "BBB222"
+    assert rows[2]["serial"] == "CCC333"
+    assert rows[0]["error"] and rows[2]["error"], (
+        "a body in the contested parity was left free to capture"
+    )
 
 
 @pytest.mark.unit

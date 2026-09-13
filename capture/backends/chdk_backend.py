@@ -732,14 +732,24 @@ class ChdkBackend(CameraBackend):
     def _assign_indices(self, bodies):
         """Lay the open bodies out on camera indices. Callers hold _map_lock.
 
-        EVEN is index 0 and ODD is index 1. A body with no parity takes the
-        lowest index no parity has claimed, in USB order, so a single
-        unassigned body is still usable.
+        EVEN is index 0 and ODD is index 1, and a parity any connected body
+        claims holds its index whatever else is on the bus. Every other body
+        - one with no parity, and the second and later claimants of a
+        contested one - takes the lowest index that no parity has claimed and
+        nothing else has taken, in USB order. So a single unassigned body is
+        still usable, and no body is ever laid on top of a parity in use.
 
         Two bodies claiming one parity is the case that must not be resolved
-        by guessing: they keep their USB-order indices, so both stay
-        addressable and the side route can fix either one, and both are
-        marked so capture refuses until it is fixed.
+        by guessing. The first of them in USB order keeps the parity's index
+        and the rest take free indices above the reserved ones, so both stay
+        addressable and the side route can fix either; both are marked, and
+        capture refuses them until it is.
+
+        What a contest must not do is move the bodies that are not in it. A
+        layout that fell back to USB order for everything put a healthy ODD
+        body on index 0, where it carried no refusal of its own and shot odd
+        pages the service filed as even ones - no failure, no log line, the
+        pages simply in the wrong place.
         """
         self._mark_identity_clashes(bodies)
 
@@ -749,27 +759,34 @@ class ChdkBackend(CameraBackend):
             if body.side:
                 claimants.setdefault(body.side, []).append(body)
 
-        contested = [side for side, bs in claimants.items() if len(bs) > 1]
-        if contested:
-            for side in contested:
-                for body in claimants[side]:
-                    body.collision = (
-                        f"two bodies are set to shoot {side} pages "
-                        f"({', '.join(b.port for b in claimants[side])}); "
-                        f"give one of them the other parity with {_SIDE_ROUTE} "
-                        "before capturing"
-                    )
-            return {index: body.key for index, body in enumerate(bodies)}
-
-        taken = {}
-        for body in bodies:
-            if body.side:
-                taken[_SIDE_INDEX[body.side]] = body.key
-        for body in bodies:
-            if body.side:
+        for side, sharing in claimants.items():
+            if len(sharing) < 2:
                 continue
+            for body in sharing:
+                body.collision = (
+                    f"two bodies are set to shoot {side} pages "
+                    f"({', '.join(b.port for b in sharing)}); "
+                    f"give one of them the other parity with {_SIDE_ROUTE} "
+                    "before capturing"
+                )
+
+        # Reserved for a parity that has a claimant, contested or not, so
+        # nothing else can be laid on an index a parity is using.
+        reserved = {_SIDE_INDEX[side] for side in claimants}
+        taken = {}
+        overflow = []
+        for body in bodies:
+            if not body.side:
+                continue
+            if claimants[body.side][0] is body:
+                taken[_SIDE_INDEX[body.side]] = body.key
+            else:
+                overflow.append(body)
+
+        floating = [body for body in bodies if not body.side]
+        for body in overflow + floating:
             index = 0
-            while index in taken:
+            while index in reserved or index in taken:
                 index += 1
             taken[index] = body.key
         return taken

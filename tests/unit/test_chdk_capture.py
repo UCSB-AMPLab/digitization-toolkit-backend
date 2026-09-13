@@ -22,6 +22,7 @@ from .chdk_fakes import Body, PTPError, make_backend, make_pychdk
 EVEN_CARD = b"EVEN\nid=aaaaaaaaaaaa\n"
 ODD_CARD = b"ODD\nid=bbbbbbbbbbbb\n"
 JPEG = b"\xff\xd8\xff\xe0 pretend this is a page \xff\xd9"
+ODD_JPEG = b"\xff\xd8\xff\xe0 pretend this is an odd page \xff\xd9"
 
 
 def _config(index=0, **kwargs):
@@ -205,6 +206,44 @@ def test_two_bodies_on_one_parity_refuse_to_capture(monkeypatch, tmp_path):
         assert "even" in str(exc.value)
 
     assert first.shots == [] and second.shots == []
+
+
+@pytest.mark.unit
+def test_a_contested_parity_does_not_file_an_odd_body_at_the_even_index(
+    monkeypatch, tmp_path
+):
+    """Two EVEN bodies argue; the ODD body must not be pulled into the row.
+
+    The ODD body's parity is its own and it carries no refusal, so whatever
+    index it holds is the index the service captures from. On index 0 it
+    shoots an odd page and the service files it as an even one - which is the
+    whole failure this backend exists to prevent, arriving through a fault
+    that belongs to two other bodies.
+    """
+    odd = Body(bus=1, address=4, serial="AAA111", card=ODD_CARD, image=ODD_JPEG)
+    first_even = Body(
+        bus=1, address=7, serial="BBB222", card=EVEN_CARD, image=JPEG
+    )
+    second_even = Body(
+        bus=1, address=9, serial="CCC333",
+        card=b"EVEN\nid=cccccccccccc\n", image=JPEG,
+    )
+    backend = make_backend(
+        monkeypatch, make_pychdk(odd, first_even, second_even)
+    )
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_image(tmp_path / "even.jpg", _config(0))
+
+    assert "even" in str(exc.value)
+    assert not (tmp_path / "even.jpg").exists()
+
+    backend.capture_image(tmp_path / "odd.jpg", _config(1))
+
+    assert (tmp_path / "odd.jpg").read_bytes() == ODD_JPEG
+    assert len(odd.shots) == 1
+    assert first_even.shots == [] and second_even.shots == []
 
 
 @pytest.mark.unit
