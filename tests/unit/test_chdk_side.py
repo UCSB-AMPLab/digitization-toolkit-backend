@@ -345,3 +345,39 @@ def test_assigning_to_the_repairable_body_ends_the_clash(monkeypatch):
     assert b"id=cccccccccccc" not in payload, "the duplicated id was kept"
     assert all(row["error"] is None for row in rows)
     assert len({row["hardware_id"] for row in rows}) == 2
+
+
+@pytest.mark.unit
+def test_an_assignment_refuses_a_body_that_was_dropped_while_it_waited(monkeypatch, tmp_path):
+    """A capture can fail, evict and close the body while the write queues."""
+    from capture.camera import CameraConfig
+
+    from .chdk_fakes import TransportError, park_at_lock
+
+    body = Body(serial="AAA111", card=EVEN_CARD,
+                shoot_error=TransportError("[Errno 19] No such device"))
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+    held = park_at_lock(backend, 0)
+
+    result = {}
+
+    def assign():
+        try:
+            backend.assign_side(0, "odd")
+            result["outcome"] = "written"
+        except RuntimeError as exc:
+            result["outcome"] = str(exc)
+
+    writer = _run(assign)
+    assert held.arrived.wait(10), "the assignment never reached the lock"
+
+    with pytest.raises(RuntimeError):
+        backend.capture_image(tmp_path / "page.jpg", CameraConfig(camera_index=0))
+    assert body.closes == 1, "the capture did not drop the body"
+
+    held.let_through()
+    writer.join(timeout=10)
+
+    assert "not connected" in result.get("outcome", ""), result
+    assert body.uploads == [], "the card was written through a closed session"

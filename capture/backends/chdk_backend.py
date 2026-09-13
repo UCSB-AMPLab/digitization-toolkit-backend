@@ -1025,6 +1025,14 @@ class ChdkBackend(CameraBackend):
             )
         with body.lock:
             current = self._body_at(camera_index)
+            if current is None:
+                # The body did not move; it went. A failing operation on
+                # another thread drops the body it was using, and that is
+                # what this looks like from here.
+                raise RuntimeError(
+                    f"Camera {camera_index} is not connected: {body.port} was "
+                    f"dropped while this {operation} was waiting for it."
+                )
             if current is not body:
                 raise CameraMovedError(
                     f"Camera {camera_index} is no longer {body.port}; the "
@@ -1280,7 +1288,9 @@ class ChdkBackend(CameraBackend):
             SideConflictError: another connected body already shoots it.
                 Two connected bodies cannot exchange parities directly; the
                 error says how to do it in two steps.
-            RuntimeError: no body at that index, or the write failed.
+            RuntimeError: no body at that index - including one dropped by a
+                failing capture while this was waiting for it - or the write
+                failed.
         """
         parity = str(side).strip().lower()
         if parity not in _SIDE_INDEX:
@@ -1347,7 +1357,14 @@ class ChdkBackend(CameraBackend):
             payload = pychdk.format_own_txt(
                 parity.upper(), camera_id
             ).encode("utf-8")
-            with body.lock:
+            # Waiting for the body is waiting, and a capture that fails in
+            # that window evicts and closes it. So the same revalidation a
+            # capture does: the index still has to mean this body, and its
+            # device still has to be open, or the upload would go through a
+            # session that is already closed.
+            with self._in_use(
+                camera_index, "side assignment", refuse_unusable=False
+            ) as body:
                 handle, temp_path = tempfile.mkstemp(
                     prefix="dtk_own_", suffix=".txt"
                 )
