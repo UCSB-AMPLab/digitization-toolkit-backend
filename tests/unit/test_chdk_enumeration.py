@@ -305,3 +305,49 @@ def test_the_identity_survives_a_product_string_that_will_not_read(monkeypatch):
     assert row["hardware_id"] == settled
     assert row["serial"] == "AAA111"
     assert "0x325b" in row["model"], "the model still has to say something"
+
+
+@pytest.mark.unit
+def test_two_bodies_answering_to_one_identity_are_both_refused(monkeypatch):
+    """Two cards cloned from one image carry the same id line.
+
+    The appliance cannot tell those bodies apart: both resolve to a single
+    registry entry and would share one orientation and one calibration, and
+    whichever shot a page would be recorded as the other. It is a different
+    fault from two bodies on one parity, and says so.
+    """
+    first = Body(bus=1, address=4, serial=None, card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    second = Body(bus=1, address=7, serial=None, card=b"ODD\nid=aaaaaaaaaaaa\n")
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+
+    rows = _rows_by_index(backend.list_devices())
+
+    assert {row["side"] for row in rows.values()} == {"even", "odd"}
+    for row in rows.values():
+        assert row["error"] is not None
+        assert "identity" in row["error"]
+        assert "aaaaaaaaaaaa" in row["error"]
+        assert "parity" not in row["error"].split(".")[0]
+
+
+@pytest.mark.unit
+def test_a_card_id_that_matches_another_bodys_serial_is_a_clash_too(monkeypatch):
+    """A serial and a card id are both identities, in one namespace."""
+    with_serial = Body(bus=1, address=4, serial="aaaaaaaaaaaa", card=EVEN_CARD)
+    with_card_id = Body(bus=1, address=7, serial=None,
+                        card=b"ODD\nid=aaaaaaaaaaaa\n")
+    backend = make_backend(monkeypatch, make_pychdk(with_serial, with_card_id))
+
+    rows = backend.list_devices()
+
+    assert len({row["hardware_id"] for row in rows}) == 1
+    assert all("identity" in row["error"] for row in rows)
+
+
+@pytest.mark.unit
+def test_one_body_with_one_identity_is_not_a_clash(monkeypatch):
+    first = Body(bus=1, address=4, serial=None, card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    second = Body(bus=1, address=7, serial=None, card=b"ODD\nid=bbbbbbbbbbbb\n")
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+
+    assert all(row["error"] is None for row in backend.list_devices())

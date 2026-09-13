@@ -290,3 +290,20 @@ def test_two_assignments_cannot_both_take_the_same_parity(monkeypatch):
         if body.card is not None and body.card.startswith(b"ODD")
     ]
     assert len(odd_cards) == 1, "two cards were written with the same parity"
+
+
+@pytest.mark.unit
+def test_assigning_a_parity_mints_a_fresh_id_for_a_duplicated_one(monkeypatch):
+    """The route is the repair tool, so it has to be able to break the tie."""
+    first = Body(bus=1, address=4, serial=None, card=b"EVEN\nid=aaaaaaaaaaaa\n")
+    second = Body(bus=1, address=7, serial=None, card=b"ODD\nid=aaaaaaaaaaaa\n")
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+    assert all(row["error"] for row in backend.list_devices())
+
+    rows = backend.assign_side(1, "odd")
+
+    _remote, payload = second.uploads[-1]
+    assert payload.startswith(b"ODD\n")
+    assert b"id=aaaaaaaaaaaa" not in payload, "the duplicate id was kept"
+    assert all(row["error"] is None for row in rows)
+    assert len({row["hardware_id"] for row in rows}) == 2

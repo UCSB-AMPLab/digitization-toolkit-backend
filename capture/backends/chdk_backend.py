@@ -423,9 +423,12 @@ class _ChdkBody:
         self.side = None
         self.camera_id = None
         self.card_read = False
-        # Set when another body claims the same parity; capture is refused
-        # on both until the side route settles it.
+        # Set when another body claims the same parity, and when another
+        # body answers to the same hardware id. Either refuses capture on
+        # both bodies until the side route settles it; they are different
+        # faults and say so.
         self.collision = None
+        self.identity_clash = None
         # Record mode is switched once per body: a viewport and a remote
         # capture both need it, and the switch costs seconds.
         self.in_record_mode = False
@@ -660,6 +663,8 @@ class ChdkBackend(CameraBackend):
         addressable and the side route can fix either one, and both are
         marked so capture refuses until it is fixed.
         """
+        self._mark_identity_clashes(bodies)
+
         claimants = {}
         for body in bodies:
             body.collision = None
@@ -691,8 +696,42 @@ class ChdkBackend(CameraBackend):
             taken[index] = body.key
         return taken
 
+    def _mark_identity_clashes(self, bodies):
+        """Flag every body that shares its hardware id with another.
+
+        Two cards cloned from one image carry the same id line, and the
+        appliance then has one identity for two cameras: they collapse onto a
+        single registry entry, share its orientation and calibration, and
+        whichever shoots a page is recorded as the other. Nothing about that
+        is recoverable after the fact, so both are refused until one of them
+        is given an identity of its own.
+
+        A body with no identity at all is not part of this: it is provisional
+        already, and refused for its own reason.
+        """
+        claimants = {}
+        for body in bodies:
+            body.identity_clash = None
+            identity = body.hardware_id
+            if identity is not None:
+                claimants.setdefault(identity, []).append(body)
+        for identity, sharing in claimants.items():
+            if len(sharing) < 2:
+                continue
+            ports = ", ".join(other.port for other in sharing)
+            for body in sharing:
+                body.identity_clash = (
+                    f"two bodies answer to the identity {identity} ({ports}), "
+                    "so the appliance cannot tell them apart and neither may "
+                    f"capture. Assign a page parity with {_SIDE_ROUTE} to one "
+                    "of them, which writes it a fresh id, or give it a card "
+                    "that is not a copy of the other's"
+                )
+
     def _row_error(self, body):
         """Why this body may not capture, or None."""
+        if body.identity_clash:
+            return body.identity_clash
         if body.collision:
             return body.collision
         if body.hardware_id is None:
@@ -1168,7 +1207,26 @@ class ChdkBackend(CameraBackend):
                         "the body that is still connected, then reconnect the "
                         "other and give it the parity it should have."
                     )
-                camera_id = body.camera_id or secrets.token_hex(_CAMERA_ID_BYTES)
+                camera_id = body.camera_id
+                if camera_id is None:
+                    camera_id = secrets.token_hex(_CAMERA_ID_BYTES)
+                elif any(
+                    other.key != body.key
+                    and other.hardware_id is not None
+                    and other.hardware_id == body.hardware_id
+                    for other in self._bodies.values()
+                ):
+                    # The id on this card is another body's identity too -
+                    # two cards cut from one image. Writing it back would
+                    # leave the pair as indistinguishable as it found them,
+                    # and this route is the only repair tool the operator
+                    # has, so the body is given an identity of its own.
+                    camera_id = secrets.token_hex(_CAMERA_ID_BYTES)
+                    self.logger.info(
+                        f"[chdk] body {camera_index} ({body.port}): its card "
+                        f"id {body.camera_id} is another connected body's "
+                        "identity as well; writing it a fresh one"
+                    )
 
             payload = pychdk.format_own_txt(
                 parity.upper(), camera_id

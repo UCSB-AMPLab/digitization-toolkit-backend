@@ -218,3 +218,20 @@ def test_the_backend_reports_what_it_can_do(monkeypatch):
     assert not any(
         value for key, value in capabilities.items() if key != "live_preview"
     )
+
+
+@pytest.mark.unit
+def test_two_bodies_with_one_identity_refuse_to_capture(monkeypatch, tmp_path):
+    first = Body(bus=1, address=4, serial=None,
+                 card=b"EVEN\nid=aaaaaaaaaaaa\n", image=JPEG)
+    second = Body(bus=1, address=7, serial=None,
+                  card=b"ODD\nid=aaaaaaaaaaaa\n", image=JPEG)
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+    backend.list_devices()
+
+    for index in (0, 1):
+        with pytest.raises(RuntimeError) as exc:
+            backend.capture_image(tmp_path / f"page{index}.jpg", _config(index))
+        assert "identity" in str(exc.value)
+
+    assert first.shots == [] and second.shots == []
