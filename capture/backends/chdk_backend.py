@@ -1384,8 +1384,10 @@ class ChdkBackend(CameraBackend):
                 Two connected bodies cannot exchange parities directly; the
                 error says how to do it in two steps.
             RuntimeError: no body at that index - including one dropped by a
-                failing capture while this was waiting for it - or the write
-                failed.
+                failing capture while this was waiting for it - the write
+                failed, or the write landed but the rig could not be
+                re-enumerated afterwards, in which case the body is dropped
+                rather than left on a layout its card has left.
         """
         parity = str(side).strip().lower()
         if parity not in _SIDE_INDEX:
@@ -1498,7 +1500,36 @@ class ChdkBackend(CameraBackend):
                 # would quietly be wrong. The rescan re-enters this lock on
                 # this thread, so holding it costs nothing but the wait it is
                 # there to impose.
-                return self.rescan()
+                try:
+                    return self.rescan()
+                except Exception as exc:
+                    # The card has already changed, so the published layout
+                    # is now a statement about a body that has left it. A
+                    # rescan that fails leaves no way to correct that here,
+                    # and leaving the body usable would accept a capture
+                    # against an index it no longer has - the same wrong
+                    # camera, reached through an error path. So it is
+                    # dropped, which unmaps it and marks it for the retry
+                    # every other failure gets, and the operator is told
+                    # plainly that the write landed and the rig has not been
+                    # re-read.
+                    self.logger.error(
+                        f"[chdk] body {camera_index} ({body.port}): "
+                        f"{SIDE_FILE} was written but the rig could not be "
+                        f"re-enumerated ({_name_failure(exc)}: {exc}); "
+                        "dropping the body rather than leaving it on a layout "
+                        "it has left"
+                    )
+                    self._evict(
+                        body, f"{SIDE_FILE} was written but the rescan failed"
+                    )
+                    raise RuntimeError(
+                        f"{SIDE_FILE} on {body.port} now says {parity}, but "
+                        f"the cameras could not be re-enumerated afterwards "
+                        f"({_name_failure(exc)}: {exc}), so the body was "
+                        "dropped rather than left on the layout it has left. "
+                        "Rescan once the bus is answering again."
+                    ) from exc
 
     def supports_streaming(self) -> bool:
         return False

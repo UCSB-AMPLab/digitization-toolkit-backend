@@ -428,3 +428,40 @@ def test_no_capture_lands_between_the_card_write_and_the_new_layout(
     assert body.shots == [], "a page was shot against the layout being replaced"
     assert result.get("outcome", "").startswith("Camera 0"), result
     assert not (tmp_path / "page.jpg").exists()
+
+
+@pytest.mark.unit
+def test_a_rescan_that_fails_after_the_write_does_not_leave_the_old_layout(
+    monkeypatch, tmp_path
+):
+    """The card has already changed, so the published layout is now a lie.
+
+    Once A/OWN.TXT is written the body shoots the other parity, and the
+    indices only catch up when the rescan publishes. If that rescan fails -
+    the bus enumeration goes wrong, say - the old layout stays live and a
+    capture is accepted and recorded under an index the body no longer has.
+    Same wrong-camera outcome as the races, reached through an error path.
+    """
+    from capture.camera import CameraConfig
+
+    from .chdk_fakes import TransportError
+
+    body = Body(serial="AAA111", card=EVEN_CARD, image=b"\xff\xd8\xff\xd9")
+    fake = make_pychdk(body)
+    backend = make_backend(monkeypatch, fake)
+    backend.list_devices()
+
+    fake.list_error = TransportError("[Errno 19] No such device")
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.assign_side(0, "odd")
+
+    assert body.uploads, "the test needs the card to have been written"
+    assert "re-enumerated" in str(exc.value), exc.value
+    assert "not connected" not in str(exc.value), "that would read as a 404"
+    assert body.closes == 1, "the body stayed usable on a layout it had left"
+    assert backend._body_at(0) is None
+
+    with pytest.raises(RuntimeError):
+        backend.capture_image(tmp_path / "page.jpg", CameraConfig(camera_index=0))
+    assert body.shots == []
