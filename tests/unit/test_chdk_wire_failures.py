@@ -156,3 +156,95 @@ def test_a_body_that_is_really_gone_is_not_looked_for_every_time(monkeypatch):
     assert backend.is_camera_connected(0) is False
     assert backend.is_camera_connected(0) is False
     assert fake.list_calls == scans, "every question re-enumerated the whole bus"
+
+
+@pytest.mark.unit
+def test_a_body_that_never_reaches_record_mode_does_not_capture(monkeypatch, tmp_path):
+    """The library's switch_mode returns whether or not the camera arrived.
+
+    Its confirmation loop can simply run out, and it reports that the same
+    way it reports success - by returning nothing. A backend that took the
+    call as proof would run every later capture and live view from playback,
+    with its own flag suppressing any further attempt to switch.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_image(tmp_path / "page.jpg", _config())
+
+    assert "play mode" in str(exc.value)
+    assert body.shots == [], "a page was shot from playback"
+    assert body.closes == 1
+
+
+@pytest.mark.unit
+def test_a_body_that_never_reaches_record_mode_shows_no_live_view(monkeypatch):
+    from .chdk_fakes import viewport_frame
+
+    body = Body(serial="AAA111", card=EVEN_CARD, frame=viewport_frame(),
+                stuck_in_play=True)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_preview(0)
+
+    assert "play mode" in str(exc.value)
+    assert body.frames_served == 0
+
+
+@pytest.mark.unit
+def test_the_mode_is_confirmed_once_and_then_trusted(monkeypatch, tmp_path):
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+    backend.capture_image(tmp_path / "two.jpg", _config())
+
+    assert body.mode_switches == ["record"]
+    assert len(body.lua_calls) == 1, "the mode was asked for on every capture"
+    assert len(body.shots) == 2
+
+
+@pytest.mark.unit
+def test_a_switch_that_did_not_arrive_is_not_remembered_as_done(
+    monkeypatch, tmp_path
+):
+    """A body that never reached record mode has to be switched again.
+
+    The failure drops the body like any other failed conversation, so the
+    retry comes back through the ordinary recovery path - the next question
+    about the camera looks at the bus again and opens it. What must not
+    happen is the mode being taken as settled either way round: by the flag
+    surviving, or by the reopened body inheriting it.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError):
+        backend.capture_image(tmp_path / "one.jpg", _config())
+
+    body.stuck_in_play = False
+    assert backend.is_camera_connected(0) is True, "the body never came back"
+    backend.capture_image(tmp_path / "two.jpg", _config())
+
+    assert body.mode_switches == ["record", "record"]
+    assert len(body.shots) == 1
+    assert (tmp_path / "two.jpg").read_bytes() == JPEG
+
+
+@pytest.mark.unit
+def test_a_mode_check_that_times_out_is_a_capture_timeout(monkeypatch, tmp_path):
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG,
+                lua_error=TimeoutError("Script did not complete within 10.0s"))
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(CaptureTimeoutError) as exc:
+        backend.capture_image(tmp_path / "page.jpg", _config())
+
+    assert "record mode" in str(exc.value)

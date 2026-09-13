@@ -133,6 +133,8 @@ class Body:
         mode_error=None,
         product_error=None,
         version_error=None,
+        stuck_in_play=False,
+        lua_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -149,6 +151,14 @@ class Body:
         self.product_error = product_error
         self.version_error = version_error
         self.version_calls = 0
+        # get_mode() is falsy in record and nonzero in play, the convention
+        # the library's own switch_mode polls on. A body stuck in play never
+        # arrives, which its switch_mode cannot report: it returns nothing
+        # whether the camera got there or not.
+        self.stuck_in_play = stuck_in_play
+        self.mode_value = 1
+        self.lua_error = lua_error
+        self.lua_calls = []
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -244,6 +254,16 @@ class FakeChdkDevice:
         self._body._pass("switch_mode")
         if self._body.mode_error is not None:
             raise self._body.mode_error
+        if not self._body.stuck_in_play:
+            self._body.mode_value = 0 if mode == "record" else 1
+
+    def lua_execute(self, lua_code, do_return=True, timeout=10.0):
+        self._body.lua_calls.append(lua_code)
+        if self._body.lua_error is not None:
+            raise self._body.lua_error
+        if "get_mode" in lua_code:
+            return self._body.mode_value
+        return None
 
     def download_file(self, remote_path):
         if self._body.download_error is not None:

@@ -1255,14 +1255,36 @@ class ChdkBackend(CameraBackend):
         body.interval_worst = 0.0
 
     def _ensure_record_mode(self, body):
-        """Put the body in record mode once; callers hold the body's lock.
+        """Put the body in record mode once, and confirm it got there.
 
-        A viewport and a remote capture both need it, and the switch drives
-        the lens, so it is not something to do per frame.
+        A viewport and a remote capture both need record mode, and the switch
+        drives the lens, so it is done once per body rather than per frame -
+        which is exactly why it has to be confirmed. The library's
+        switch_mode polls for the camera to arrive and then returns whether
+        or not it did: its loop can run out and it reports that the same way
+        it reports success, by returning nothing. Taking the call as proof
+        would leave every later capture and live view running from playback,
+        with the flag set here suppressing any further attempt.
+
+        So the camera is asked, on the convention the library's own loop
+        polls on: get_mode() is falsy in record and nonzero in play. The flag
+        is set only on that answer, so a switch that did not arrive is tried
+        again by the next capture instead of being remembered as done.
+
+        Callers hold the body's lock, and call this inside their own failure
+        handling: a mode switch that times out is a capture timeout, and one
+        that fails on the wire drops the body like any other failed
+        conversation.
         """
         if body.in_record_mode:
             return
         body.device.switch_mode("record")
+        if body.device.lua_execute("return get_mode()"):
+            raise RuntimeError(
+                f"{body.port}: the camera is still in play mode after being "
+                "switched to record, so it can neither capture nor show a "
+                "live view"
+            )
         body.in_record_mode = True
         self.logger.info(f"[chdk] {body.port}: switched to record mode")
 
