@@ -131,3 +131,55 @@ def test_an_enumeration_waits_for_a_capture_on_a_body_that_has_left(
     assert scanned.is_set()
     assert body.closes == 1
     assert (tmp_path / "page.jpg").read_bytes() == JPEG
+
+
+@pytest.mark.unit
+def test_cleanup_leaves_nothing_open_when_a_body_arrives_as_it_runs(monkeypatch):
+    """A body opened after cleanup was asked for still has to be closed.
+
+    Cleanup used to take one snapshot of the map and close what was in it, so
+    an enumeration that opened a newly arrived body in the meantime left that
+    body mapped with a live claim while cleanup reported every camera closed.
+    Cleanup now runs under the same lock as an enumeration and drains the map
+    rather than a copy of it, so the two cannot overlap and nothing can be
+    open when it returns.
+
+    The enumeration is paused inside the bus scan, where it holds that lock,
+    so cleanup provably cannot be running alongside it rather than merely
+    not being observed to.
+    """
+    staying = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD)
+    arriving = Body(bus=1, address=7, serial="BBB222", card=ODD_CARD)
+    fake = make_pychdk(staying)
+    backend = make_backend(monkeypatch, fake)
+    backend.list_devices()
+
+    fake.bodies = [staying, arriving]
+    scanning = fake.gate_list()
+    scan = _run(backend.list_devices)
+    scanning.wait_until_entered()
+
+    done = threading.Event()
+    cleaner = _run(lambda: (backend.cleanup(), done.set()))
+    cleaner.join(timeout=1)
+    assert not done.is_set(), "cleanup ran while an enumeration was in flight"
+
+    scanning.release()
+    scan.join(timeout=10)
+    cleaner.join(timeout=10)
+
+    assert done.is_set(), "cleanup never finished"
+    assert arriving.opens == 1, "the enumeration never opened the new body"
+    assert (staying.live, arriving.live) == (0, 0), "a camera was left open"
+    assert backend._bodies == {}, "a body was left mapped after cleanup"
+
+
+@pytest.mark.unit
+def test_the_backend_looks_at_the_bus_again_after_a_cleanup(monkeypatch):
+    body = Body(serial="AAA111", card=EVEN_CARD)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+    backend.cleanup()
+
+    assert backend.is_camera_connected(0) is True
+    assert body.opens == 2

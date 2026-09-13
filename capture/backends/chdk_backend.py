@@ -514,9 +514,11 @@ class ChdkBackend(CameraBackend):
         published, never while waiting on a body's lock, so a capture that
         holds a body for thirty seconds never blocks an enumeration's view
         of the other one.
-      - _layout_lock serialises whole enumerations and side assignments, so
-        two of them cannot open the same body twice, publish their layouts
-        out of order, or both decide a parity is free and both write it.
+      - _layout_lock serialises whole enumerations, side assignments and
+        cleanup - everything that opens bodies, closes them all, or changes
+        where they belong - so two of them cannot open the same body twice,
+        publish their layouts out of order, both decide a parity is free and
+        both write it, or leave a body open behind a shutdown.
       - Lock order is _layout_lock, then a body lock, then _map_lock. No path
         takes _map_lock and then waits for a body.
     """
@@ -1351,14 +1353,34 @@ class ChdkBackend(CameraBackend):
     def cleanup(self):
         """Close every open body, waiting for whatever is using it.
 
-        Each body is dropped by its own close, rather than by clearing the
-        map first: a shutdown that emptied the map and then closed the
-        devices would let a capture keep shooting a camera that was already
-        being closed, and would let an enumeration racing it open a second
-        claim on the same body.
+        When this returns, nothing is open. Two things are needed for that to
+        be true rather than merely likely. It runs under the layout lock, so
+        an enumeration cannot be in flight across it - a snapshot of the map
+        taken here would otherwise miss a body that arrived while cleanup
+        waited behind a capture, and leave it mapped with a live claim under
+        a line saying every camera was closed. And it drains the map rather
+        than walking a copy of it, so the invariant is enforced by the loop
+        instead of assumed: nothing can add a body while the layout lock is
+        held, and each close removes the one it closed.
+
+        Each body is dropped by its own close, for the same reason as
+        everywhere else: emptying the map first would let a capture keep
+        shooting a camera that was already being closed.
+
+        The backend stays usable afterwards. Forgetting that the bus was ever
+        scanned is part of that: the next question about a camera looks at
+        the hardware again rather than reporting the rig it has just closed
+        as absent.
         """
-        with self._map_lock:
-            bodies = list(self._bodies.values())
-        for body in bodies:
-            self._close_body(body, "backend cleanup")
+        with self._layout_lock:
+            while True:
+                with self._map_lock:
+                    bodies = list(self._bodies.values())
+                if not bodies:
+                    break
+                for body in bodies:
+                    self._close_body(body, "backend cleanup")
+            with self._map_lock:
+                self._scanned = False
+                self._evicted.clear()
         self.logger.info("[chdk] all cameras closed.")

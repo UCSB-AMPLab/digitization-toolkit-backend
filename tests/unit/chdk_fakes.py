@@ -276,6 +276,12 @@ class FakePychdk:
         self.bodies = list(bodies)
         self.list_calls = 0
         self.list_error = None
+        self.list_gate = None
+
+    def gate_list(self):
+        """Pause the next bus scan, which holds the backend's layout lock."""
+        self.list_gate = Gate("list_devices")
+        return self.list_gate
 
     def by_key(self, key):
         for body in self.bodies:
@@ -285,6 +291,9 @@ class FakePychdk:
 
     def list_devices(self):
         self.list_calls += 1
+        gate, self.list_gate = self.list_gate, None
+        if gate is not None:
+            gate.arrive()
         if self.list_error is not None:
             raise self.list_error
         return [
