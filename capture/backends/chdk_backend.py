@@ -480,10 +480,11 @@ class ChdkBackend(CameraBackend):
         published, never while waiting on a body's lock, so a capture that
         holds a body for thirty seconds never blocks an enumeration's view
         of the other one.
-      - _enumerate_lock serialises whole enumerations, so two of them cannot
-        open the same body twice or publish their layouts out of order.
-      - Lock order is _enumerate_lock, then a body lock, then _map_lock. No
-        path takes _map_lock and then waits for a body.
+      - _layout_lock serialises whole enumerations and side assignments, so
+        two of them cannot open the same body twice, publish their layouts
+        out of order, or both decide a parity is free and both write it.
+      - Lock order is _layout_lock, then a body lock, then _map_lock. No path
+        takes _map_lock and then waits for a body.
     """
 
     # How often the preview rate is reported, in frames. The bench needs
@@ -506,7 +507,11 @@ class ChdkBackend(CameraBackend):
         # the recovery it is
         self._evicted: set = set()
         self._map_lock = threading.Lock()
-        self._enumerate_lock = threading.Lock()
+        # Held for a whole enumeration, and for a side assignment, which is a
+        # check against the layout followed by a write that changes it.
+        # Re-entrant so an assignment can republish through rescan() without
+        # handing the lock over in between.
+        self._layout_lock = threading.RLock()
 
     # ------------------------------------------------------------------
     # Bodies
@@ -716,7 +721,7 @@ class ChdkBackend(CameraBackend):
         asks for every card to be read again, which is what a rescan is for:
         a parity written since the last scan is invisible otherwise.
         """
-        with self._enumerate_lock:
+        with self._layout_lock:
             infos = pychdk.list_devices()
             present = {
                 (info.bus_num, info.device_num): info for info in infos
@@ -1115,6 +1120,8 @@ class ChdkBackend(CameraBackend):
         Raises:
             ValueError: side is not a page parity.
             SideConflictError: another connected body already shoots it.
+                Two connected bodies cannot exchange parities directly; the
+                error says how to do it in two steps.
             RuntimeError: no body at that index, or the write failed.
         """
         parity = str(side).strip().lower()
@@ -1123,58 +1130,67 @@ class ChdkBackend(CameraBackend):
                 f"page parity must be one of {sorted(_SIDE_INDEX)}; got {side!r}"
             )
 
-        # The check and the identity it is based on are read under the map
-        # lock, so a rescan cannot move a body between deciding there is no
-        # conflict and writing the card.
-        with self._map_lock:
-            key = self._indices.get(camera_index)
-            body = self._bodies.get(key) if key is not None else None
-            if body is None:
-                raise RuntimeError(
-                    f"Camera {camera_index} is not connected. Detected "
-                    f"indices: {sorted(self._indices)}."
+        # The check, the write and the republished layout are one operation.
+        # Two requests for two unassigned bodies would otherwise both find the
+        # parity free and both write it, and an enumeration landing in between
+        # would publish a layout the write had already made wrong.
+        with self._layout_lock:
+            with self._map_lock:
+                key = self._indices.get(camera_index)
+                body = self._bodies.get(key) if key is not None else None
+                if body is None:
+                    raise RuntimeError(
+                        f"Camera {camera_index} is not connected. Detected "
+                        f"indices: {sorted(self._indices)}."
+                    )
+                holder = next(
+                    (
+                        other for other in self._bodies.values()
+                        if other.side == parity and other.key != body.key
+                    ),
+                    None,
                 )
-            holder = next(
-                (
-                    other for other in self._bodies.values()
-                    if other.side == parity and other.key != body.key
-                ),
-                None,
-            )
-            if holder is not None:
-                who = holder.serial or holder.camera_id or "no identity"
-                raise SideConflictError(
-                    f"{holder.port} ({who}) already shoots {parity} pages; "
-                    "give that body the other parity first"
-                )
-            camera_id = body.camera_id or secrets.token_hex(_CAMERA_ID_BYTES)
+                if holder is not None:
+                    who = holder.serial or holder.camera_id or "no identity"
+                    raise SideConflictError(
+                        f"{holder.port} ({who}) already shoots {parity} pages. "
+                        "Two connected bodies cannot exchange parities "
+                        "directly: disconnect one, rescan, give the parity to "
+                        "the body that is still connected, then reconnect the "
+                        "other and give it the parity it should have."
+                    )
+                camera_id = body.camera_id or secrets.token_hex(_CAMERA_ID_BYTES)
 
-        payload = pychdk.format_own_txt(parity.upper(), camera_id).encode("utf-8")
-        with body.lock:
-            handle, temp_path = tempfile.mkstemp(prefix="dtk_own_", suffix=".txt")
-            try:
-                with os.fdopen(handle, "wb") as scratch:
-                    scratch.write(payload)
-                body.device.upload_file(temp_path, SIDE_FILE)
-            except Exception as exc:
-                self.logger.error(
-                    f"[chdk] body {camera_index} ({body.port}): writing "
-                    f"{SIDE_FILE} failed ({exc!r})"
+            payload = pychdk.format_own_txt(
+                parity.upper(), camera_id
+            ).encode("utf-8")
+            with body.lock:
+                handle, temp_path = tempfile.mkstemp(
+                    prefix="dtk_own_", suffix=".txt"
                 )
-                raise RuntimeError(
-                    f"Could not write {SIDE_FILE} on {body.port}: {exc}"
-                ) from exc
-            finally:
                 try:
-                    os.unlink(temp_path)
-                except OSError:
-                    pass
+                    with os.fdopen(handle, "wb") as scratch:
+                        scratch.write(payload)
+                    body.device.upload_file(temp_path, SIDE_FILE)
+                except Exception as exc:
+                    self.logger.error(
+                        f"[chdk] body {camera_index} ({body.port}): writing "
+                        f"{SIDE_FILE} failed ({exc!r})"
+                    )
+                    raise RuntimeError(
+                        f"Could not write {SIDE_FILE} on {body.port}: {exc}"
+                    ) from exc
+                finally:
+                    try:
+                        os.unlink(temp_path)
+                    except OSError:
+                        pass
 
-        self.logger.info(
-            f"[chdk] body {camera_index} ({body.port}): now shoots {parity} "
-            f"pages, id {camera_id}"
-        )
-        return self.rescan()
+            self.logger.info(
+                f"[chdk] body {camera_index} ({body.port}): now shoots "
+                f"{parity} pages, id {camera_id}"
+            )
+            return self.rescan()
 
     def supports_streaming(self) -> bool:
         return False

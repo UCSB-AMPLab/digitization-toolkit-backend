@@ -347,9 +347,16 @@ def set_camera_side(
 	serial capture at all.
 
 	Only the CHDK backend has cards to write, so another backend is a 501. A
-	parity another connected body already shoots is a 409: assigning it would
-	leave two bodies shooting the same pages, and the fix is to give that
-	other body its parity first.
+	parity another connected body already shoots is a 409, because assigning
+	it would leave two bodies shooting the same pages.
+
+	Two connected bodies therefore cannot exchange parities in one step, and
+	there is no order of requests that does it: each is refused by the other.
+	The procedure is to take one body out of the picture first - disconnect
+	it, POST /cameras/rescan so the appliance stops counting it, assign the
+	parity to the body that is still connected, then reconnect the first body,
+	rescan again and assign it the parity it should have. Both cards are
+	written, and the pair comes back with one ODD and one EVEN.
 	"""
 	try:
 		from capture.service import get_backend

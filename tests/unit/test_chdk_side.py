@@ -11,6 +11,8 @@ for a body that has none, which is what lifts that body out of provisional
 and lets it capture.
 """
 
+import threading
+
 import pytest
 
 import capture.service as capture_service
@@ -249,3 +251,42 @@ def test_the_device_list_carries_the_parity_and_the_reason_a_body_is_refused(
     body = resp.json()
     assert [row["side"] for row in body] == ["even", "even"]
     assert all("even" in row["error"] for row in body)
+
+
+def _run(target):
+    thread = threading.Thread(target=target, daemon=True)
+    thread.start()
+    return thread
+
+
+@pytest.mark.unit
+def test_two_assignments_cannot_both_take_the_same_parity(monkeypatch):
+    """Both bodies are unassigned; both requests see odd free at the same time."""
+    one = Body(bus=1, address=4, serial="AAA111", card=None)
+    two = Body(bus=1, address=7, serial="BBB222", card=None)
+    backend = make_backend(monkeypatch, make_pychdk(one, two))
+    backend.list_devices()
+
+    started = threading.Barrier(2, timeout=10)
+    outcomes = []
+
+    def assign(index):
+        started.wait()
+        try:
+            backend.assign_side(index, "odd")
+            outcomes.append(("ok", index))
+        except RuntimeError as exc:
+            outcomes.append(("refused", str(exc)))
+
+    first = _run(lambda: assign(0))
+    second = _run(lambda: assign(1))
+    first.join(timeout=10)
+    second.join(timeout=10)
+
+    accepted = [entry for entry in outcomes if entry[0] == "ok"]
+    assert len(accepted) == 1, f"both writes were accepted: {outcomes}"
+    odd_cards = [
+        body for body in (one, two)
+        if body.card is not None and body.card.startswith(b"ODD")
+    ]
+    assert len(odd_cards) == 1, "two cards were written with the same parity"
