@@ -1235,6 +1235,14 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] body {camera_index} ({body.port}): remote capture "
                     f"returned no bytes after {elapsed:.2f}s"
                 )
+                # The call returned, so nothing says where the conversation
+                # ended - only that a shutter was asked for and nothing came
+                # back. That is the same unknown camera state as any other
+                # post-wire failure, and keeping the session would hand the
+                # next capture a body whose CHDK capture state nobody has
+                # established. The body is dropped and the next scan opens it
+                # again.
+                self._evict(body, "remote capture returned no bytes")
                 raise RuntimeError(
                     f"CHDK capture on {body.port} returned no image data"
                 )

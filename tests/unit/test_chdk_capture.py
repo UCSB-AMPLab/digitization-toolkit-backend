@@ -247,6 +247,37 @@ def test_a_contested_parity_does_not_file_an_odd_body_at_the_even_index(
 
 
 @pytest.mark.unit
+def test_a_shot_that_comes_back_empty_drops_the_body(monkeypatch, tmp_path):
+    """shoot() returned and nothing came with it: an unknown camera state.
+
+    Every other failure after the wire has been touched evicts the body,
+    because what the camera is doing now cannot be known from here. A
+    successful call that produced no bytes is the same class of unknown, so
+    keeping the session would hand the next capture a body whose CHDK capture
+    state nobody has established.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD, image=b"")
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_image(tmp_path / "page.jpg", _config())
+
+    assert "no image data" in str(exc.value)
+    assert not list(tmp_path.iterdir()), "a failed capture left a file behind"
+    assert backend._body_at(0) is None, "the empty capture kept the session"
+    assert body.closes == 1, "the body was left open on an unknown state"
+
+    body.image = JPEG
+    assert backend.is_camera_connected(0) is True
+    assert body.opens == 2, "the session was reused rather than reopened"
+
+    backend.capture_image(tmp_path / "page.jpg", _config())
+
+    assert (tmp_path / "page.jpg").read_bytes() == JPEG
+
+
+@pytest.mark.unit
 def test_capturing_from_an_index_with_no_body_says_so(monkeypatch, tmp_path):
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
     backend = make_backend(monkeypatch, make_pychdk(body))
