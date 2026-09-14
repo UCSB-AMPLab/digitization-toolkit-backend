@@ -33,7 +33,13 @@ if str(backend_dir) not in sys.path:
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
 from .manifestHandler import generate_manifest_record, append_manifest_record
-from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
+from .backends import (
+    CameraBackend,
+    ChdkBackend,
+    GPhoto2Backend,
+    Picamera2Backend,
+    RpicamBackend,
+)
 from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
@@ -74,6 +80,8 @@ def get_camera_backend() -> CameraBackend:
         return RpicamBackend(subprocess_logger)
     elif backend_type == "gphoto2":
         return GPhoto2Backend(subprocess_logger)
+    elif backend_type == "chdk":
+        return ChdkBackend(subprocess_logger)
     else:
         subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
         return RpicamBackend(subprocess_logger)
@@ -96,6 +104,48 @@ def get_backend() -> CameraBackend:
             _backend = get_camera_backend()
             subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
         return _backend
+
+
+def shutdown_backend() -> None:
+    """Close the camera backend, if one was ever built.
+
+    The DSLR and CHDK backends hold their bodies for the life of the process:
+    a PTP claim per camera, opened on first use and kept. cleanup() is what
+    waits for whatever is running on them and releases them, so it has to be
+    called when the application stops - see app/main.py's lifespan, which is
+    the only caller in production.
+
+    Never builds a backend: opening the cameras in order to close them would
+    be absurd, and on a machine with none attached it would fail the
+    shutdown. Never raises either - a backend that cannot be closed cleanly
+    is logged and let go, because the process is leaving anyway and a
+    shutdown that fails is worse than a session the kernel reclaims.
+
+    The global is cleared, so a process that keeps running after this (a test,
+    or a backend switch) builds a fresh one on the next call rather than
+    handing out the closed one - but only once the close has finished. The
+    lock is held across the cleanup for that reason: a camera is not free
+    until the close that releases it returns, and clearing the global first
+    would let a request arriving in that window build a backend that claimed
+    the same bodies while the old one was still closing them. So get_backend
+    waits here, which is the cost of never handing out a camera twice.
+    """
+    global _backend
+    with _backend_lock:
+        backend = _backend
+        if backend is None:
+            return
+        try:
+            backend.cleanup()
+            subprocess_logger.info(
+                f"Closed camera backend: {backend.get_backend_name()}"
+            )
+        except Exception as exc:
+            subprocess_logger.warning(
+                f"Error while closing the camera backend: {exc!r}"
+            )
+        finally:
+            _backend = None
 
 
 def is_camera_connected(camera_index: int = 0) -> bool:
@@ -490,6 +540,10 @@ def dual_capture_image(
     
     results = {}
     errors = {}
+    # Wall time for the pair, not the sum of the two captures: the comparison
+    # that matters to the bench is how long the operator waits between pages
+    # (NEH-173), and the two shutters overlap.
+    pair_started = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future1 = executor.submit(capture_with_timing, cam1_config, filename1)
         # Stagger second camera start (like bash script)
@@ -503,6 +557,8 @@ def dual_capture_image(
                 results[cfg.camera_index] = fut.result()
             except Exception as e:
                 errors[cfg.camera_index] = e
+
+    pair_wall = time.time() - pair_started
 
     if errors:
         # Partial/failed pair: any file already written has no manifest entry, so
@@ -533,6 +589,7 @@ def dual_capture_image(
     
     subprocess_logger.info(
         f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, "
+        f"pair_wall={pair_wall:.3f}s, "
         f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     

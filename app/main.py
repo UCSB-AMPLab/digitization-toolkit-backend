@@ -30,6 +30,13 @@ async def lifespan(app: FastAPI):
     finally:
         db.close()
     yield
+    # The camera backends hold a PTP claim on each body for the life of the
+    # process. Closing them here waits for whatever capture is still running
+    # and releases the cameras, so a restart finds them free rather than
+    # claimed by a process that has gone.
+    from capture.service import shutdown_backend
+
+    shutdown_backend()
 
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)

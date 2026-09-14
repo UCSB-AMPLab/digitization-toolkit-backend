@@ -95,15 +95,25 @@ class CameraRegistry:
 
 
     @staticmethod
-    def _get_camera_hardware_id_gphoto2(camera_index: int) -> Tuple[Optional[str], Dict]:
-        """Hardware ID resolution for gphoto2 (DSLR) cameras.
+    def _hardware_id_from_backend(camera_index: int) -> Tuple[Optional[str], Dict]:
+        """Hardware ID resolution for the backends that own their own devices.
 
-        Delegates to the process-wide camera backend rather than opening its
-        own PTP session: a DSLR can only be claimed once, so a private
-        init()/exit() here is a second claim on a camera the live preview may
-        already hold. The backend owns the one session per camera, serialises
-        access to it, and reports the same hardware ID format
-        ("{sanitized_model}_{serial}", e.g. "canoneos1500d_3456789").
+        Both the DSLR and the CHDK backends claim a camera over USB, and a
+        camera can only be claimed once, so a private session here would be a
+        second claim on a body the live preview may already hold. The backend
+        owns the one session per camera, serialises access to it, and reports
+        the hardware ID ("{sanitized_model}_{serial}", e.g.
+        "canoneos1500d_3456789").
+
+        Two kinds of row carry an id that must not be recorded. A provisional
+        body has no identity of its own - no USB serial, and no id line on its
+        card - and the id in its row exists only so the API can list it. An
+        ambiguous one has an identity that another connected body answers to
+        as well, so one record would serve two cameras. Either way a
+        calibration or an orientation saved under it would attach to
+        whichever body happened to hold that index, so none is returned and
+        the caller treats the body as unregistered. Both stay in the device
+        list, which is what the operator repairs them from.
 
         The import is function-local: capture.service reaches camera_registry
         through project_manager, so a module-level import would be circular.
@@ -114,13 +124,20 @@ class CameraRegistry:
             for device in get_backend().list_devices():
                 if device["index"] != camera_index:
                     continue
-                return device["hardware_id"], {
+                info = {
                     "model": device["model"],
                     "serial": device.get("serial"),
                     "location": device.get("location"),
                     "id": device.get("port"),
                     "index": camera_index,
                 }
+                if device.get("provisional"):
+                    info["provisional"] = True
+                    return None, info
+                if device.get("identity_ambiguous"):
+                    info["identity_ambiguous"] = True
+                    return None, info
+                return device["hardware_id"], info
             return None, {}
         except Exception as exc:
             return None, {"error": str(exc)}
@@ -130,8 +147,9 @@ class CameraRegistry:
         """
         Get hardware ID and info for a camera at given index.
 
-        Dispatches to the picamera2 or gphoto2 helper based on the active
-        CAMERA_BACKEND setting.
+        Dispatches to the picamera2 helper, or to the backend itself for the
+        backends that own their devices, based on the active CAMERA_BACKEND
+        setting.
 
         Args:
             camera_index: Current camera index (0, 1, etc.)
@@ -141,8 +159,8 @@ class CameraRegistry:
         """
         try:
             from app.core.config import settings
-            if settings.CAMERA_BACKEND.lower() == "gphoto2":
-                return CameraRegistry._get_camera_hardware_id_gphoto2(camera_index)
+            if settings.CAMERA_BACKEND.lower() in ("gphoto2", "chdk"):
+                return CameraRegistry._hardware_id_from_backend(camera_index)
         except Exception:
             pass
 
@@ -191,14 +209,18 @@ class CameraRegistry:
         """
         Detect all connected cameras and return their hardware IDs.
 
-        The gphoto2 path asks the process-wide backend to enumerate once and
-        takes the indices it publishes, rather than counting the bodies on the
-        bus and walking range(count). The backend pins each index to a body
-        serial, so its map can have a reserved hole - one surviving body sitting
-        at index 1 while index 0 waits for the camera that is switched off -
-        and range(count) would report that body at index 0, quietly recording
-        the right-hand camera as the left-hand one. One enumeration also means
-        one pass over the bus, not one per index.
+        The gphoto2 and CHDK paths ask the process-wide backend to enumerate
+        once and take the indices it publishes, rather than counting the bodies
+        on the bus and walking range(count). Either backend's map can have a
+        hole - a gphoto2 index reserved for a body that is switched off, a CHDK
+        index reserved for the parity nobody is shooting - and range(count)
+        would report the surviving body at index 0, quietly recording it as the
+        other camera. One enumeration also means one pass over the bus, not one
+        per index.
+
+        A body the backend marks provisional or ambiguous is left out: its id
+        is a placeholder so the API can list it, or one that two cameras
+        answer to, and neither is an identity to register.
 
         Returns:
             Dict mapping camera_index -> (hardware_id, info)
@@ -210,7 +232,7 @@ class CameraRegistry:
         except Exception:
             backend = "picamera2"
 
-        if backend == "gphoto2":
+        if backend in ("gphoto2", "chdk"):
             # Function-local import: capture.service reaches camera_registry
             # through project_manager, so a module-level import is circular.
             try:
@@ -218,7 +240,11 @@ class CameraRegistry:
 
                 for device in get_backend().list_devices():
                     hw_id = device.get("hardware_id")
-                    if not hw_id:
+                    if (
+                        not hw_id
+                        or device.get("provisional")
+                        or device.get("identity_ambiguous")
+                    ):
                         continue
                     idx = device["index"]
                     detected[idx] = (hw_id, {

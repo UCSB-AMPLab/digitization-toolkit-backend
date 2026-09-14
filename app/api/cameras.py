@@ -22,6 +22,7 @@ from app.core.db_errors import integrity_conflict
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
@@ -73,6 +74,13 @@ class DeviceInfo(BaseModel):
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+	# Which pages this body shoots: "odd", "even", or null when it has no
+	# parity (CHDK backend only; the file that carries it lives on the card).
+	# Not a side of the table - left and right are the kiosk's swap toggle.
+	side: Optional[str] = None
+	# Why this body may not capture, in words for the operator: two bodies on
+	# one parity, or a body with no identity. Null when it is ready.
+	error: Optional[str] = None
 
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
@@ -255,6 +263,8 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			orientation=orientation,
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
+			side=dev.get("side"),
+			error=dev.get("error"),
 		))
 
 	return devices
@@ -307,6 +317,82 @@ def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
 	except Exception as exc:
 		logger.exception(f"Camera rescan failed: {exc}")
 		raise HTTPException(status_code=503, detail=f"Camera rescan failed: {exc}")
+
+	return _device_infos(raw_devices, registry)
+
+
+class SideRequest(BaseModel):
+	"""Request body for assigning a CHDK body's page parity (NEH-231)."""
+	side: Literal["odd", "even"]
+
+
+@router.post("/side/{camera_index}", response_model=List[DeviceInfo])
+def set_camera_side(
+	camera_index: int,
+	request: SideRequest,
+	current_user: User = Depends(allow_admin),
+):
+	"""
+	Write which pages the body at this index shoots onto its own card.
+
+	ODD or EVEN is a page parity, not a side of the table: which of the two
+	the operator sees on the left is the kiosk's swap toggle, so a
+	right-to-left volume needs nothing from here. The mapping is fixed - EVEN
+	is camera 0, ODD is camera 1 - so assigning a parity usually moves the
+	body to the other index, and the response is the re-enumerated device
+	list rather than one row.
+
+	Admin-only: it rewrites a body's identity on the card, minting an id for
+	a body that has none, which is what lets a compact with no readable USB
+	serial capture at all.
+
+	Only the CHDK backend has cards to write, so another backend is a 501. A
+	parity another connected body already shoots is a 409, because assigning
+	it would leave two bodies shooting the same pages.
+
+	Two connected bodies therefore cannot exchange parities in one step, and
+	there is no order of requests that does it: each is refused by the other.
+	The procedure is to take one body out of the picture first - disconnect
+	it, POST /cameras/rescan so the appliance stops counting it, assign the
+	parity to the body that is still connected, then reconnect the first body,
+	rescan again and assign it the parity it should have. Both cards are
+	written, and the pair comes back with one ODD and one EVEN.
+	"""
+	try:
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		backend = get_backend()
+	except Exception as exc:
+		logger.exception(f"Camera backend unavailable: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera backend unavailable: {exc}")
+
+	name = backend.get_backend_name()
+	if name != "chdk" or not hasattr(backend, "assign_side"):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {name} backend has no page parity to assign; it is "
+				"written on a CHDK camera's own card"
+			),
+		)
+
+	from capture.backends.chdk_backend import SideConflictError
+
+	registry = _get_camera_registry()
+	try:
+		raw_devices = backend.assign_side(camera_index, request.side)
+	except SideConflictError as exc:
+		raise HTTPException(status_code=409, detail=str(exc))
+	except ValueError as exc:
+		raise HTTPException(status_code=422, detail=str(exc))
+	except RuntimeError as exc:
+		if "not connected" in str(exc):
+			raise HTTPException(status_code=404, detail=str(exc))
+		logger.exception(f"Assigning a page parity to camera {camera_index} failed: {exc}")
+		raise HTTPException(status_code=502, detail=str(exc))
 
 	return _device_infos(raw_devices, registry)
 

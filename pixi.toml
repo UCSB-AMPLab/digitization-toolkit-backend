@@ -96,3 +96,8 @@ dev = { features = ["dev"], solve-group = "default" }
 
 [pypi-dependencies]
 gphoto2 = ">=2.6.3, <3"
+# CHDK bodies (NEH-231): pychdk speaks CHDK's PTP dialect over pyusb, with
+# no Lua or C on the host. Pinned to a tag rather than a range: it is ours,
+# it is pre-1.0, and the backend depends on behaviour fixed in v0.1.1.
+pychdk = { git = "https://github.com/UCSB-AMPLab/pychdk", tag = "v0.1.2" }
+pyusb = ">=1.2, <2"
