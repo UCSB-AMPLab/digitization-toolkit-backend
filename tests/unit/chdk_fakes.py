@@ -391,6 +391,48 @@ class HeldLock:
         self.release()
 
 
+class ReportingLock:
+    """A body's lock that says when a thread has had to wait for it.
+
+    A test cannot see a thread block, so one that needs to know a queued
+    operation has reached the lock would otherwise pause for a fixed time and
+    hope. This tries the lock without blocking first: a failure there is the
+    thread about to wait, which is the moment worth recording. Nothing is
+    held back - the blocking acquire follows immediately.
+
+    Re-entrant acquisition by the thread already holding it succeeds without
+    blocking, so a path that re-enters is not reported as waiting.
+    """
+
+    def __init__(self, lock):
+        self._lock = lock
+        self.blocked = threading.Event()
+
+    def acquire(self, *args, **kwargs):
+        if self._lock.acquire(blocking=False):
+            return True
+        self.blocked.set()
+        return self._lock.acquire(*args, **kwargs)
+
+    def release(self):
+        self._lock.release()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+def watch_lock(backend, camera_index):
+    """Report when a thread has to wait for this body's lock."""
+    body = backend._body_at(camera_index)
+    watched = ReportingLock(body.lock)
+    body.lock = watched
+    return watched
+
+
 def park_at_lock(backend, camera_index):
     """Park the next thread that reaches this body's lock until let through."""
     body = backend._body_at(camera_index)

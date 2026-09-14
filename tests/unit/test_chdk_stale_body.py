@@ -20,6 +20,8 @@ that way passes or fails on scheduling, which is the one thing a proof of a
 race must not do.
 """
 
+import time
+
 import pytest
 
 from capture.camera import CameraConfig
@@ -32,6 +34,7 @@ from .chdk_fakes import (
     park_at_lock,
     parse_own_txt,
     viewport_frame,
+    watch_lock,
 )
 
 
@@ -256,6 +259,7 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
         return parse_own_txt(raw)
 
     fake.parse_own_txt = gated_parse
+    watched = watch_lock(backend, 0)
     rescan = _thread(backend.rescan)
     parsing.wait_until_entered()
 
@@ -271,15 +275,20 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
             shot["outcome"] = str(exc)
 
     shooter = _thread(capture)
-    # Long enough for a capture that is not held back to reach the shutter,
-    # and no assertion either way: one that is held back never arrives.
-    shooting.entered.wait(2)
+    # The capture has arrived when one of two things is true: it reached the
+    # shutter, because nothing held it back, or it had to wait for the body's
+    # lock, because the read is holding it. Waiting for whichever happens
+    # costs no fixed pause and leaves nothing to scheduling.
+    deadline = time.monotonic() + 10
+    while not (shooting.entered.is_set() or watched.blocked.is_set()):
+        assert time.monotonic() < deadline, "the capture never reached the body"
+        time.sleep(0.005)
 
     parsing.release()
-    rescan.join(timeout=1)
+    rescan.join(timeout=10)
+    assert not rescan.is_alive(), "the rescan is still behind the capture"
     shooting.release()
     shooter.join(timeout=10)
-    rescan.join(timeout=10)
 
     assert not (tmp_path / "page.jpg").exists(), (
         "a page was filed for a body whose card gives it no identity"
