@@ -210,36 +210,43 @@ def test_a_margin_past_the_sanity_bound_is_refused(margins):
 
 
 @pytest.mark.unit
-def test_a_screen_at_the_sanity_bound_still_encodes():
-    """The limit is admitted, and the frame at it goes all the way to a JPEG.
+@pytest.mark.parametrize("width,height,expected", [
+    (4096, 1, (4096, 3072)),
+    (4, 4096, (4, 3)),
+], ids=["the width edge", "the height edge"])
+def test_a_screen_at_the_sanity_bound_still_encodes(width, height, expected):
+    """The limit is admitted in both dimensions, all the way to a JPEG.
 
-    A viewport 4096 pixels tall and four wide, which is the bound's own value
-    today, so the limit is tested at its edge without asking for a large
-    canvas: the screen is 4x4096 and the 4:3 output 4x3. The height is
-    written out rather than read from _LV_MAX_SCREEN, because a test that
-    took its frame from the constant would shrink with it and pass however
-    tight the bound became. This fails if the encoder breaks and it fails if
-    the bound is tightened below what it admits today; the frame past the
-    limit is the refusal test above.
+    4096 is the bound's own value today, and each dimension needs its own
+    case: the two comparisons are independent, so a bound tightened by a
+    pixel on one of them leaves the other's frame passing while a legitimate
+    screen at the edge is refused. The measurements are written out rather
+    than read from _LV_MAX_SCREEN, because a frame taken from the constant
+    shrinks with it and passes however tight the bound becomes.
+
+    Both cases fail if the encoder breaks and if the bound is tightened below
+    what it admits today; the frames past the limit are the refusal test
+    above. The wide one is the expensive direction - the canvas is the screen
+    width and that width over the aspect - and at this size it is still
+    fractions of a second.
     """
-    height = 4096
-    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * height
-    data = _frame(rows, 4, 4, height)
+    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * (width // 4) * height
+    data = _frame(rows, width, width, height)
 
     try:
         jpeg, info = cb.encode_viewport_jpeg(data)
     except ValueError as exc:
         raise AssertionError(
-            f"the bound refuses a {height} px screen, which it must admit: "
-            f"{exc}"
+            f"the bound refuses a {width}x{height} viewport, which it must "
+            f"admit: {exc}"
         ) from exc
 
     from io import BytesIO
 
     from PIL import Image
 
-    assert Image.open(BytesIO(jpeg)).size == (4, 3)
-    assert info["visible_height"] == height
+    assert Image.open(BytesIO(jpeg)).size == expected
+    assert (info["jpeg_width"], info["jpeg_height"]) == expected
     assert info["jpeg_bytes"] == len(jpeg)
 
 
