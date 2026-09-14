@@ -230,12 +230,14 @@ def test_no_layout_is_published_while_a_capture_is_running(monkeypatch, tmp_path
 def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
     """Reading a card is a download and then publishing what it said.
 
-    A capture reads a body's identity before the shutter and files the frame
-    against it afterwards, so a capture that started between those two halves
-    would be checked against the card the rescan replaced and filed against
-    the one it found. Here the rewritten card has lost its id line, so the
-    body has no identity to record and may not capture at all: the outcome to
-    assert is that no page is written, not that some check ran.
+    A capture is admitted by _row_error, which reads the body's hardware id,
+    and that id comes off the card when pyusb reads no USB serial. A capture
+    that started between the download and the publish was therefore admitted
+    against the card the rescan was replacing, and went on to write a page
+    for whatever the card said afterwards. Here the rewritten card has lost
+    its id line, so the body has no identity to record and may not capture at
+    all: the outcome to assert is that no page is written, not that some
+    check ran.
     """
     body = Body(serial=None, card=EVEN_CARD, image=JPEG)
     fake = make_pychdk(body)

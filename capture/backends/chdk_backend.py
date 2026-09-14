@@ -740,14 +740,31 @@ class ChdkBackend(CameraBackend):
         is a body that has stopped answering properly, and reading that as
         "unassigned" would quietly put it on whichever index was free.
 
-        The download and what it publishes onto the body are one operation
-        under the body's own lock. A capture reads a body's parity and its
-        identity before the shutter and files the frame against them
-        afterwards, so a read that published between those two moments would
-        have the capture checked against the card being replaced and filed
-        against the card that replaced it. Holding the lock across both
-        leaves a capture either wholly before the new card state or wholly
-        after it.
+        The download and the three fields it publishes - the parity, the id
+        and the flag that says the card has been read - are one operation
+        under the body's own lock. What that buys is bounded and worth
+        stating exactly. A capture is admitted by _row_error, which reads the
+        body's hardware id, and that id is the card's when pyusb reads no USB
+        serial; publishing outside the lock let a rescan clear it between the
+        check and the shutter, and a page was written for a body that by then
+        had no identity to record it under. Under the lock a capture sees the
+        card state whole: all three fields as they were before the read, or
+        all three as they are after it.
+
+        It does not make a capture safe against the rest of _row_error. A
+        body's collision and identity_clash are derived from the whole layout
+        and are recomputed only where the layout is - in _assign_indices,
+        when a scan republishes. So between a read that gives one body an id
+        another body already answers to and the publish that re-derives the
+        clashes, a capture can still be admitted against a clash nothing has
+        computed yet. Closing that needs the derivation under this lock too,
+        or the read folded into the publish; neither is done here.
+
+        The parity is not part of this. Nothing on the capture path reads
+        body.side - it is read by _assign_indices, _row and assign_side - so
+        a parity reaches a filed page only through the index the layout gives
+        the body, and the layout is what the publish barrier in _enumerate
+        holds back while a capture is running.
         """
         with body.lock:
             try:
