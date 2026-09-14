@@ -813,7 +813,17 @@ class ChdkBackend(CameraBackend):
         one: two ODD bodies reserve only index 1, so the second of them takes
         index 0, which no parity has claimed.
 
-        What a contest must not do is move the bodies that are not in it. A
+        What a contest must not do is move a body that has a parity of its
+        own. That is the whole of the guarantee, and it is narrower than it
+        sounds: a body with no parity holds no index of its own and is pushed
+        along by a claimant that arrives ahead of it - a second EVEN claimant
+        takes index 1 and an unassigned body sitting there moves to 2, with
+        nothing wrong with it and no refusal on it. That move is published by
+        the same scan that makes it, and a capture that had already resolved
+        the old index is refused by the revalidation in _in_use rather than
+        run on whichever body holds it now.
+
+        Moving a body that does have a parity is the failure this replaced: a
         layout that fell back to USB order for everything put a healthy ODD
         body on index 0, where it carried no refusal of its own and shot odd
         pages the service filed as even ones - no failure, no log line, the

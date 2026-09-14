@@ -236,6 +236,37 @@ def test_a_second_body_on_one_parity_takes_an_index_below_the_reserved_one(
 
 
 @pytest.mark.unit
+def test_a_body_with_no_parity_is_pushed_along_by_a_claimant(monkeypatch):
+    """The guarantee is about parities, not about bodies.
+
+    An uncontested parity keeps its index. A body with no parity holds no
+    index of its own, so a claimant arriving ahead of it on the bus moves it
+    along - here from 1 to 2 - with nothing wrong with it and no refusal on
+    it. The guarantee _assign_indices makes covers the first of those and not
+    the second, and this is the case that tells them apart.
+    """
+    even = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD)
+    plain = Body(bus=1, address=9, serial="CCC333", card=None)
+    fake = make_pychdk(even, plain)
+    backend = make_backend(monkeypatch, fake)
+
+    rows = _rows_by_index(backend.list_devices())
+    assert rows[1]["serial"] == "CCC333"
+
+    twin = Body(
+        bus=1, address=7, serial="BBB222", card=b"EVEN\nid=cccccccccccc\n"
+    )
+    fake.bodies = [even, twin, plain]
+
+    rows = _rows_by_index(backend.rescan())
+
+    assert rows[1]["serial"] == "BBB222"
+    assert rows[2]["serial"] == "CCC333", "the unassigned body kept an index"
+    assert rows[2]["error"] is None, "the body that moved is not the one at fault"
+    assert rows[0]["error"] and rows[1]["error"], "the contested pair may capture"
+
+
+@pytest.mark.unit
 def test_no_parity_anywhere_falls_back_to_usb_order(monkeypatch):
     first = Body(bus=1, address=4, serial="AAA111", card=b"id=aaaaaaaaaaaa\n")
     second = Body(bus=1, address=7, serial="BBB222", card=b"id=bbbbbbbbbbbb\n")
