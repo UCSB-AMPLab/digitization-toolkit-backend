@@ -807,9 +807,11 @@ class ChdkBackend(CameraBackend):
 
         Two bodies claiming one parity is the case that must not be resolved
         by guessing. The first of them in USB order keeps the parity's index
-        and the rest take free indices above the reserved ones, so both stay
+        and the rest fall in with every other unplaced body, so both stay
         addressable and the side route can fix either; both are marked, and
-        capture refuses them until it is.
+        capture refuses them until it is. A free index is not always a higher
+        one: two ODD bodies reserve only index 1, so the second of them takes
+        index 0, which no parity has claimed.
 
         What a contest must not do is move the bodies that are not in it. A
         layout that fell back to USB order for everything put a healthy ODD
@@ -838,19 +840,26 @@ class ChdkBackend(CameraBackend):
 
         # Reserved for a parity that has a claimant, contested or not, so
         # nothing else can be laid on an index a parity is using.
+        #
+        # _SIDE_INDEX is indexed directly: a side it does not hold raises here
+        # rather than being quietly laid on whichever index was free, which is
+        # the failure _read_side_file is careful about. The invariant is
+        # upstream - assign_side refuses a parity this map does not hold, and
+        # every other side is whatever pychdk.parse_own_txt answered - so a
+        # value outside it is a bug elsewhere, and a scan that stops is a
+        # better answer to that than a body placed by a rule nobody wrote.
         reserved = {_SIDE_INDEX[side] for side in claimants}
         taken = {}
-        overflow = []
-        for body in bodies:
-            if not body.side:
-                continue
-            if claimants[body.side][0] is body:
-                taken[_SIDE_INDEX[body.side]] = body.key
-            else:
-                overflow.append(body)
+        for side, sharing in claimants.items():
+            taken[_SIDE_INDEX[side]] = sharing[0].key
 
-        floating = [body for body in bodies if not body.side]
-        for body in overflow + floating:
+        # Everything not placed by its own parity, in USB order: the second
+        # and later claimants of a contested side and the bodies with no
+        # parity alike, each taking the lowest index no parity has claimed and
+        # nothing else has taken.
+        for body in bodies:
+            if body.side and claimants[body.side][0] is body:
+                continue
             index = 0
             while index in reserved or index in taken:
                 index += 1

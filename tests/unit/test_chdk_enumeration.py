@@ -184,6 +184,58 @@ def test_a_contested_parity_does_not_move_the_body_that_is_not_in_it(monkeypatch
 
 
 @pytest.mark.unit
+def test_the_bodies_no_parity_placed_are_laid_out_in_usb_order(monkeypatch):
+    """An unassigned body is not pushed behind a contested pair.
+
+    The EVEN pair claims index 0 and nothing claims index 1, so index 1 goes
+    to whichever unplaced body comes first on the bus - here the unassigned
+    one, which is also the only one of the three that may capture.
+    """
+    plain = Body(bus=1, address=4, serial="AAA111", card=None)
+    first_even = Body(bus=1, address=7, serial="BBB222", card=EVEN_CARD)
+    second_even = Body(
+        bus=1, address=9, serial="CCC333", card=b"EVEN\nid=cccccccccccc\n"
+    )
+    backend = make_backend(
+        monkeypatch, make_pychdk(plain, first_even, second_even)
+    )
+
+    rows = _rows_by_index(backend.list_devices())
+
+    assert rows[0]["serial"] == "BBB222"
+    assert rows[1]["serial"] == "AAA111", (
+        "the unassigned body was put behind a contest it is not in"
+    )
+    assert rows[2]["serial"] == "CCC333"
+    assert rows[1]["error"] is None
+
+
+@pytest.mark.unit
+def test_a_second_body_on_one_parity_takes_an_index_below_the_reserved_one(
+    monkeypatch
+):
+    """A free index is not always a higher one.
+
+    Two ODD bodies reserve index 1 and leave index 0 claimed by nobody, so
+    the second of them lands below the reserved index rather than above it.
+    Both are refused, so nothing is mis-filed either way; the layout is
+    contiguous and the side route can reach both.
+    """
+    first = Body(bus=1, address=4, serial="AAA111", card=ODD_CARD)
+    second = Body(
+        bus=1, address=7, serial="BBB222", card=b"ODD\nid=cccccccccccc\n"
+    )
+    backend = make_backend(monkeypatch, make_pychdk(first, second))
+
+    rows = _rows_by_index(backend.list_devices())
+
+    assert sorted(rows) == [0, 1], "the layout left a hole in the device list"
+    assert rows[1]["serial"] == "AAA111"
+    assert rows[0]["serial"] == "BBB222"
+    assert all(row["error"] for row in rows.values())
+
+
+@pytest.mark.unit
 def test_no_parity_anywhere_falls_back_to_usb_order(monkeypatch):
     first = Body(bus=1, address=4, serial="AAA111", card=b"id=aaaaaaaaaaaa\n")
     second = Body(bus=1, address=7, serial="BBB222", card=b"id=bbbbbbbbbbbb\n")
