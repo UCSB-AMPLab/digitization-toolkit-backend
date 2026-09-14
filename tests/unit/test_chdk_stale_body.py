@@ -275,21 +275,30 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
             shot["outcome"] = str(exc)
 
     shooter = _thread(capture)
-    # The capture has arrived when one of two things is true: it reached the
-    # shutter, because nothing held it back, or it had to wait for the body's
-    # lock, because the read is holding it. Waiting for whichever happens
-    # costs no fixed pause and leaves nothing to scheduling.
-    deadline = time.monotonic() + 10
-    while not (shooting.entered.is_set() or watched.blocked.is_set()):
-        assert time.monotonic() < deadline, "the capture never reached the body"
-        time.sleep(0.005)
+    try:
+        # The capture has arrived when one of two things is true: it reached
+        # the shutter, because nothing held it back, or it had to wait for
+        # the body's lock, because the read is holding it. Waiting for
+        # whichever happens costs no fixed pause and leaves nothing to
+        # scheduling.
+        deadline = time.monotonic() + 10
+        while not (shooting.entered.is_set() or watched.blocked.is_set()):
+            assert time.monotonic() < deadline, "the capture never reached it"
+            time.sleep(0.005)
+    finally:
+        # Both gates open before either thread is waited on, and in a finally
+        # so that a failure above does not leave a daemon thread parked for
+        # its whole timeout and report the failure from inside it. The
+        # shutter gate opens before the rescan is joined for the same reason
+        # in reverse: a capture that got through holds the body, the rescan
+        # needs it back to publish, and joining the rescan first would block
+        # for the timeout and fail on the wait rather than on the outcome.
+        parsing.release()
+        shooting.release()
+        shooter.join(timeout=10)
+        rescan.join(timeout=10)
 
-    parsing.release()
-    rescan.join(timeout=10)
-    assert not rescan.is_alive(), "the rescan is still behind the capture"
-    shooting.release()
-    shooter.join(timeout=10)
-
+    assert not shooter.is_alive() and not rescan.is_alive(), "a thread is stuck"
     assert not (tmp_path / "page.jpg").exists(), (
         "a page was filed for a body whose card gives it no identity"
     )
