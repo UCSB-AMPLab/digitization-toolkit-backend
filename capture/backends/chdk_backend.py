@@ -813,21 +813,33 @@ class ChdkBackend(CameraBackend):
         one: two ODD bodies reserve only index 1, so the second of them takes
         index 0, which no parity has claimed.
 
-        What a contest must not do is move a body that has a parity of its
-        own. That is the whole of the guarantee, and it is narrower than it
-        sounds: a body with no parity holds no index of its own and is pushed
-        along by a claimant that arrives ahead of it - a second EVEN claimant
-        takes index 1 and an unassigned body sitting there moves to 2, with
-        nothing wrong with it and no refusal on it. That move is published by
-        the same scan that makes it, and a capture that had already resolved
-        the old index is refused by the revalidation in _in_use rather than
-        run on whichever body holds it now.
+        What a contest must not do is move a body that holds an uncontested
+        parity. That is the whole of the guarantee, and it is narrower than
+        it sounds in two directions. A body with no parity holds no index of
+        its own and is pushed along by a claimant that arrives ahead of it: a
+        second EVEN claimant takes index 1 and an unassigned body sitting
+        there moves to 2, with nothing wrong with it and no refusal on it.
+        And a body whose parity becomes contested moves as readily - a
+        claimant earlier in bus order takes the parity's index, and the body
+        that held it alone until then takes the next free one - which is
+        harmless only because the contest refuses them both.
 
-        Moving a body that does have a parity is the failure this replaced: a
-        layout that fell back to USB order for everything put a healthy ODD
-        body on index 0, where it carried no refusal of its own and shot odd
-        pages the service filed as even ones - no failure, no log line, the
-        pages simply in the wrong place.
+        A move is published by the same scan that makes it, and what keeps a
+        capture off the wrong body across one is two mechanisms, neither
+        sufficient alone. A capture that resolved an index but had not yet
+        taken the body's lock revalidates once it has it, and is refused
+        rather than run on whichever body holds that index now. A capture
+        that already holds the lock is not refused at all: it runs to
+        completion against the layout it was admitted under, because
+        _enumerate takes every open body before it publishes and so waits for
+        it. Revalidation covers the captures that straddle a publication; the
+        barrier covers the ones that do not.
+
+        Moving a body that holds an uncontested parity is the failure this
+        replaced: a layout that fell back to USB order for everything put a
+        healthy ODD body on index 0, where it carried no refusal of its own
+        and shot odd pages the service filed as even ones - no failure, no
+        log line, the pages simply in the wrong place.
         """
         self._mark_identity_clashes(bodies)
 

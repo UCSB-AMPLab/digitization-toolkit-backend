@@ -267,6 +267,35 @@ def test_a_body_with_no_parity_is_pushed_along_by_a_claimant(monkeypatch):
 
 
 @pytest.mark.unit
+def test_a_body_whose_parity_becomes_contested_can_be_moved(monkeypatch):
+    """Holding a parity is not enough to keep an index; holding it alone is.
+
+    A claimant earlier in bus order takes the parity's index and the body
+    that held it alone until then takes the next free one. Both are refused
+    for the contest, so nothing either is asked for reaches a page - which is
+    the only reason the move is harmless.
+    """
+    settled = Body(bus=1, address=7, serial="AAA111", card=EVEN_CARD)
+    fake = make_pychdk(settled)
+    backend = make_backend(monkeypatch, fake)
+
+    assert _rows_by_index(backend.list_devices())[0]["serial"] == "AAA111"
+
+    earlier = Body(
+        bus=1, address=4, serial="BBB222", card=b"EVEN\nid=cccccccccccc\n"
+    )
+    fake.bodies = [earlier, settled]
+
+    rows = _rows_by_index(backend.rescan())
+
+    assert rows[0]["serial"] == "BBB222"
+    assert rows[1]["serial"] == "AAA111", "the settled body kept index 0"
+    assert all(row["error"] for row in rows.values()), (
+        "a body was moved off its parity's index and left free to capture"
+    )
+
+
+@pytest.mark.unit
 def test_no_parity_anywhere_falls_back_to_usb_order(monkeypatch):
     first = Body(bus=1, address=4, serial="AAA111", card=b"id=aaaaaaaaaaaa\n")
     second = Body(bus=1, address=7, serial="BBB222", card=b"id=bbbbbbbbbbbb\n")
