@@ -127,6 +127,23 @@ _DEFAULT_LCD_ASPECT = 4 / 3
 # poll.
 _PREVIEW_JPEG_QUALITY = 85
 
+# A sanity bound, in pixels, on the screen a viewport descriptor may describe
+# - margins included - in either dimension.
+#
+# The descriptor's four margins are signed int32 and live_view.h states no
+# range for them. Unlike the viewport itself, whose size is bounded by the
+# bytes that have to be present for it, a margin costs nothing on the wire
+# and still sizes the canvas encode_viewport_jpeg allocates: on a four-pixel
+# viewport a margin_left of 30000 asks for a 30004x22503 image, and one near
+# INT_MAX raises MemoryError. Neither is the ValueError the preview path
+# reports a bad frame with, and on the appliance the backend runs natively,
+# with nothing around it to absorb the difference.
+#
+# This number is a limit this decoder chooses, not a statement about any
+# camera's screen. A frame describing a screen past it in either dimension is
+# treated as malformed rather than allocated for.
+_LV_MAX_SCREEN = 4096
+
 
 # --- the side file ---------------------------------------------------------
 
@@ -191,9 +208,9 @@ def parse_live_view(data):
     Raises:
         ValueError: If the frame is too short, speaks another major version
             of the protocol, carries no viewport descriptor, or describes a
-            viewport this decoder cannot read - including one whose margins
-            are negative, which no screen has and which would otherwise
-            divide by zero further down.
+            viewport this decoder cannot read - which includes a margin below
+            zero and a screen, margins included, past _LV_MAX_SCREEN in
+            either dimension.
     """
     if len(data) < _LV_HEADER_SIZE:
         raise ValueError(
@@ -235,19 +252,27 @@ def parse_live_view(data):
         raise ValueError(
             f"viewport is empty: {vp['visible_width']}x{vp['visible_height']}"
         )
+    # The margins are bounded in both directions here, where the
+    # malformed-frame contract is documented, because encode_viewport_jpeg
+    # measures the camera's screen from them and neither builds nor divides
+    # by that screen safely on its own.
     for field in ("margin_left", "margin_top", "margin_right", "margin_bot"):
         if vp[field] < 0:
-            # All four margins are signed int32 in lv_framebuffer_desc, and a
-            # negative one describes a screen smaller than the viewport inside
-            # it. encode_viewport_jpeg measures the screen from them and
-            # divides by its height, so margins that cancel the visible height
-            # exactly would raise ZeroDivisionError - past the except
+            # A negative margin describes a screen smaller than the viewport
+            # inside it. The screen height is the divisor - margin_top +
+            # visible_height + margin_bot - so the one combination that
+            # cancels it exactly raises ZeroDivisionError, past the except
             # ValueError the preview path uses to report a bad frame as a
-            # failed poll. A malformed frame is refused here, where that
-            # contract is documented.
-            raise ValueError(
-                f"viewport {field} is negative: {vp[field]}"
-            )
+            # failed poll.
+            raise ValueError(f"viewport {field} is negative: {vp[field]}")
+    screen_width = vp["margin_left"] + vp["visible_width"] + vp["margin_right"]
+    screen_height = vp["margin_top"] + vp["visible_height"] + vp["margin_bot"]
+    if screen_width > _LV_MAX_SCREEN or screen_height > _LV_MAX_SCREEN:
+        raise ValueError(
+            f"viewport describes a {screen_width}x{screen_height} screen, "
+            f"past the {_LV_MAX_SCREEN} px in either dimension this decoder "
+            "will build a frame for"
+        )
     if vp["data_start"] <= 0:
         # CHDK sends the descriptions whether or not the data is available,
         # and zeroes the offset when it is not.

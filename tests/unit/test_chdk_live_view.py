@@ -182,6 +182,44 @@ def test_a_negative_margin_is_refused_as_a_malformed_frame(field, margins):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("margins", [
+    (4100, 0, 0, 0),
+    (0, 4100, 0, 0),
+    (0, 0, 4100, 0),
+    (0, 0, 0, 4100),
+    (2147483647, 0, 0, 0),
+    (0, 0, 0, 2147483647),
+])
+def test_a_margin_past_the_sanity_bound_is_refused(margins):
+    """The margins cost nothing on the wire and size the canvas.
+
+    A four-pixel viewport with a margin of 30000 asks for a 30004x22503
+    image, and one near INT_MAX raises MemoryError - which is not the
+    ValueError the preview path reports a bad frame with, and on the
+    appliance the backend is not in a container to absorb it.
+    """
+    data = _frame(_uyvyyy(0, 255, 0, 255, 255, 255), 4, 4, 1, margins=margins)
+
+    with pytest.raises(ValueError) as exc:
+        cb.encode_viewport_jpeg(data)
+
+    assert "screen" in str(exc.value)
+    assert str(cb._LV_MAX_SCREEN) in str(exc.value)
+
+
+@pytest.mark.unit
+def test_a_screen_inside_the_sanity_bound_still_encodes():
+    """The bound must not refuse the frames the decoder is there to read."""
+    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * (704 // 4) * 232
+    data = _frame(rows, 704, 704, 232, margins=(8, 4, 8, 4))
+
+    info = cb.parse_live_view(data)
+
+    assert info["visible_width"] == 704
+    assert cb._LV_MAX_SCREEN > 720, "the bound is tighter than a frame we read"
+
+
+@pytest.mark.unit
 def test_a_margin_that_cancels_the_visible_height_does_not_divide_by_zero():
     """The screen height the frame is stretched by is the divisor.
 

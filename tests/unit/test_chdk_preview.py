@@ -130,6 +130,35 @@ def test_a_frame_with_a_negative_margin_is_reported_as_a_failed_poll(monkeypatch
 
 
 @pytest.mark.unit
+def test_a_frame_with_a_huge_margin_leaves_the_backend_still_serving(monkeypatch):
+    """The property is that the poll fails and the process carries on.
+
+    A margin near INT_MAX sizes the canvas encode_viewport_jpeg allocates, so
+    before it was bounded this frame raised MemoryError - or, one order of
+    magnitude down, quietly asked for gigabytes. Neither is a ValueError, so
+    neither reaches the operator as the failed poll it is, and the backend
+    runs natively on the appliance with nothing around it to absorb the
+    difference. The next poll on a well-formed frame still has to work.
+    """
+    body = Body(
+        serial="AAA111", card=EVEN_CARD,
+        frame=viewport_frame(margins=(2147483647, 0, 0, 0)),
+    )
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+
+    with pytest.raises(RuntimeError) as exc:
+        backend.capture_preview(0)
+
+    assert "screen" in str(exc.value)
+    assert body.closes == 0, "a bad frame is not a reason to drop the body"
+
+    body.frame = viewport_frame(8, 2)
+
+    assert backend.capture_preview(0)[:2] == b"\xff\xd8"
+
+
+@pytest.mark.unit
 def test_the_frame_geometry_is_logged_once_per_body(monkeypatch, caplog):
     body = Body(
         serial="AAA111", card=EVEN_CARD,
