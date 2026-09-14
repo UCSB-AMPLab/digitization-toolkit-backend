@@ -187,6 +187,8 @@ def test_a_negative_margin_is_refused_as_a_malformed_frame(field, margins):
     (0, 4100, 0, 0),
     (0, 0, 4100, 0),
     (0, 0, 0, 4100),
+    (4093, 0, 0, 0),      # a 4097 px screen: one past the bound
+    (0, 0, 0, 4096),      # the same, in the other dimension
     (2147483647, 0, 0, 0),
     (0, 0, 0, 2147483647),
 ])
@@ -208,15 +210,37 @@ def test_a_margin_past_the_sanity_bound_is_refused(margins):
 
 
 @pytest.mark.unit
-def test_a_screen_inside_the_sanity_bound_still_encodes():
-    """The bound must not refuse the frames the decoder is there to read."""
-    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * (704 // 4) * 232
-    data = _frame(rows, 704, 704, 232, margins=(8, 4, 8, 4))
+def test_a_screen_at_the_sanity_bound_still_encodes():
+    """The limit is admitted, and the frame at it goes all the way to a JPEG.
 
-    info = cb.parse_live_view(data)
+    A viewport 4096 pixels tall and four wide, which is the bound's own value
+    today, so the limit is tested at its edge without asking for a large
+    canvas: the screen is 4x4096 and the 4:3 output 4x3. The height is
+    written out rather than read from _LV_MAX_SCREEN, because a test that
+    took its frame from the constant would shrink with it and pass however
+    tight the bound became. This fails if the encoder breaks and it fails if
+    the bound is tightened below what it admits today; the frame past the
+    limit is the refusal test above.
+    """
+    height = 4096
+    rows = _uyvyyy(0, 200, 0, 200, 200, 200) * height
+    data = _frame(rows, 4, 4, height)
 
-    assert info["visible_width"] == 704
-    assert cb._LV_MAX_SCREEN > 720, "the bound is tighter than a frame we read"
+    try:
+        jpeg, info = cb.encode_viewport_jpeg(data)
+    except ValueError as exc:
+        raise AssertionError(
+            f"the bound refuses a {height} px screen, which it must admit: "
+            f"{exc}"
+        ) from exc
+
+    from io import BytesIO
+
+    from PIL import Image
+
+    assert Image.open(BytesIO(jpeg)).size == (4, 3)
+    assert info["visible_height"] == height
+    assert info["jpeg_bytes"] == len(jpeg)
 
 
 @pytest.mark.unit
