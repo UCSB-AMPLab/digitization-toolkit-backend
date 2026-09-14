@@ -260,9 +260,6 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
 
     fake.parse_own_txt = gated_parse
     watched = watch_lock(backend, 0)
-    rescan = _thread(backend.rescan)
-    parsing.wait_until_entered()
-
     shooting = body.gate("shoot")
     shot = {}
 
@@ -274,8 +271,17 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
         except RuntimeError as exc:
             shot["outcome"] = str(exc)
 
-    shooter = _thread(capture)
+    # Every gate exists before the first thread does, and each worker joins
+    # the cleanup list in the statement that starts it, so the finally below
+    # covers all of them however far the try gets. A worker left behind runs
+    # on into fixture teardown and fails there on its own gate timeout,
+    # which reports the wrong thing from the wrong place.
+    workers = []
     try:
+        workers.append(_thread(backend.rescan))
+        parsing.wait_until_entered()
+        workers.append(_thread(capture))
+
         # The capture has arrived when one of two things is true: it reached
         # the shutter, because nothing held it back, or it had to wait for
         # the body's lock, because the read is holding it. Waiting for
@@ -286,19 +292,17 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
             assert time.monotonic() < deadline, "the capture never reached it"
             time.sleep(0.005)
     finally:
-        # Both gates open before either thread is waited on, and in a finally
-        # so that a failure above does not leave a daemon thread parked for
-        # its whole timeout and report the failure from inside it. The
-        # shutter gate opens before the rescan is joined for the same reason
-        # in reverse: a capture that got through holds the body, the rescan
-        # needs it back to publish, and joining the rescan first would block
-        # for the timeout and fail on the wait rather than on the outcome.
+        # Both gates open before any thread is waited on. The joins run in
+        # reverse order of starting, so the capture is waited for before the
+        # rescan: a capture that got through holds the body, the rescan needs
+        # it back to publish, and joining the rescan first would block for the
+        # timeout and fail on the wait rather than on the outcome.
         parsing.release()
         shooting.release()
-        shooter.join(timeout=10)
-        rescan.join(timeout=10)
+        for worker in reversed(workers):
+            worker.join(timeout=10)
 
-    assert not shooter.is_alive() and not rescan.is_alive(), "a thread is stuck"
+    assert not any(worker.is_alive() for worker in workers), "a thread is stuck"
     assert not (tmp_path / "page.jpg").exists(), (
         "a page was filed for a body whose card gives it no identity"
     )
