@@ -151,12 +151,23 @@ class Body:
         self.product_error = product_error
         self.version_error = version_error
         self.version_calls = 0
-        # get_mode() is falsy in record and nonzero in play, the convention
-        # the library's own switch_mode polls on. A body stuck in play never
-        # arrives, which its switch_mode cannot report: it returns nothing
-        # whether the camera got there or not.
+        # This is CHDK's *Lua* get_mode(), and it is the opposite way round
+        # from uBASIC's: it returns three values - is_record, is_video, mode -
+        # and the first is true in record, false in play. CHDK trunk
+        # core/luascript.c, luaCB_get_mode, pushes them in that order and
+        # the first is (mode & MODE_MASK) != MODE_PLAY; later builds write
+        # the same thing as !camera_info.state.mode_play. The library hands
+        # back the first RET message, so is_record is what a caller reads,
+        # and mode_value stands for it here.
+        #
+        # Do not carry uBASIC's convention across: it is the reason this fake
+        # once returned 0 for record, which made the polarity untestable.
+        #
+        # A body stuck in play never arrives, which the library's switch_mode
+        # cannot report: it returns nothing whether the camera got there or
+        # not.
         self.stuck_in_play = stuck_in_play
-        self.mode_value = 1
+        self.mode_value = False
         self.lua_error = lua_error
         self.lua_calls = []
         # what happened to it
@@ -255,7 +266,8 @@ class FakeChdkDevice:
         if self._body.mode_error is not None:
             raise self._body.mode_error
         if not self._body.stuck_in_play:
-            self._body.mode_value = 0 if mode == "record" else 1
+            # is_record: true once the camera has arrived in record.
+            self._body.mode_value = mode == "record"
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         self._body.lua_calls.append(lua_code)
