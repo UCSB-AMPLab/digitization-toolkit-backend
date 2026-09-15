@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON
+from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
 from sqlalchemy.orm import relationship
 
 from app.core.db import Base
@@ -27,22 +27,29 @@ class Record(Base):
 	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
 	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
 	
-	# QA workflow
-	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
+	# QA workflow — a record enters the queue as "in_review" as soon as it's
+	# captured; there is no separate "captured" resting state (NEH-208).
+	status = Column(String(20), nullable=False, default="in_review")  # in_review, rejected, approved
 	sequence = Column(Integer, nullable=True)  # ordering within a collection
-	rejection_note = Column(Text, nullable=True)  # optional note when status=rejected
+
+	# Which camera setup produced this document: "single" (one image) or
+	# "dual" (an L+R pair fired together on one shutter press). Set once at
+	# capture time and never changed — it's what rejection scope resolution
+	# and the recapture mode-match guard key off of (NEH-208).
+	capture_mode = Column(String(10), nullable=False)  # single, dual
 
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 	created_by = Column(String(255), nullable=True)
-	
+
 	# Relationships
 	images = relationship("RecordImage", back_populates="record", cascade="all, delete-orphan")
 	project = relationship("Project", back_populates="records")
 	collection = relationship("Collection", back_populates="records")
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
-	
+	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
+
 	# Constraint: must have either project_id OR collection_id (or neither, but not both)
 	__table_args__ = (
 		CheckConstraint(
@@ -50,8 +57,12 @@ class Record(Base):
 			name='check_record_single_parent'
 		),
 		CheckConstraint(
-			"status IN ('captured','in_review','rejected','approved')",
+			"status IN ('in_review','rejected','approved')",
 			name='check_record_status'
+		),
+		CheckConstraint(
+			"capture_mode IN ('single','dual')",
+			name='check_record_capture_mode'
 		),
 	)
 
@@ -90,11 +101,21 @@ class RecordImage(Base):
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 	uploaded_by = Column(String(255), nullable=True)
-	
+
+	# Rejection/recapture audit trail (NEH-208). A rejected image is never
+	# deleted or overwritten: it stays in place with is_current flipped to
+	# False and rejection_id pointing at the RecordRejection that flagged
+	# it, so it remains queryable via GET /records/{id}/rejections after a
+	# recapture installs its replacement as the new current image.
+	is_current = Column(Boolean, nullable=False, default=True)
+	superseded_at = Column(DateTime, nullable=True)
+	rejection_id = Column(Integer, ForeignKey("record_rejections.id", ondelete="SET NULL"), nullable=True, index=True)
+
 	# Relationships
 	record = relationship("Record", back_populates="images")
 	camera_settings = relationship("CameraSettings", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
 	exif_data = relationship("ExifData", back_populates="record_image", uselist=False, cascade="all, delete-orphan")
+	rejection = relationship("RecordRejection", back_populates="images")
 
 
 class RecordAnnotation(Base):
@@ -114,6 +135,40 @@ class RecordAnnotation(Base):
 	created_by = Column(String(255), nullable=True)
 
 	record = relationship("Record", back_populates="annotations")
+
+
+class RecordRejection(Base):
+	"""
+	Audit record of a single rejection event on a Record (NEH-208).
+
+	Created once per rejection with a mandatory predefined reason (the same
+	list the annotation feature's "Marcar error" uses) plus an optional
+	free-text comment. Links to every RecordImage that was current at the
+	time of rejection via RecordImage.rejection_id — those images are never
+	deleted; a later recapture supersedes them (is_current=False) without
+	touching this row, so the rejected file(s) + reason + timestamp + user
+	stay queryable indefinitely via GET /records/{id}/rejections.
+	"""
+	__tablename__ = "record_rejections"
+
+	id = Column(Integer, primary_key=True, index=True)
+	record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False, index=True)
+
+	predefined_reason = Column(String(20), nullable=False)  # blur, glare, shadow, focus, exposure, dirt
+	comment = Column(Text, nullable=True)
+
+	rejected_by = Column(String(255), nullable=True)
+	rejected_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+
+	record = relationship("Record", back_populates="rejections")
+	images = relationship("RecordImage", back_populates="rejection")
+
+	__table_args__ = (
+		CheckConstraint(
+			"predefined_reason IN ('blur','glare','shadow','focus','exposure','dirt')",
+			name='check_record_rejection_reason'
+		),
+	)
 
 
 class ExifData(Base):

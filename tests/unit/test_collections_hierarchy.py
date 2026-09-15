@@ -41,7 +41,7 @@ def test_hierarchy_returns_200_with_record_count(read_client, db_session):
     db_session.commit()
     db_session.add(Collection(name="child", parent_collection_id=col.id))
     for i in range(3):
-        db_session.add(Record(title=f"r{i}", collection_id=col.id))
+        db_session.add(Record(title=f"r{i}", collection_id=col.id, capture_mode="single"))
     db_session.commit()
 
     resp = read_client.get(f"/collections/{col.id}/hierarchy")

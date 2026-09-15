@@ -50,15 +50,19 @@ def get_system_logs(
 @router.get("/integrity")
 def integrity_check(
     verify_hashes:  bool = Query(default=True, description="Recompute sha256 and compare against the capture manifest"),
-    max_hash_checks: int = Query(default=0, ge=0, description="Cap on files hashed (0 = no cap)"),
+    full: bool = Query(default=False, description="Hash every manifested file. Off by default: a full sweep re-hashes every capture, which is I/O-punishing on a unit holding tens of thousands of images"),
+    max_hash_checks: int = Query(default=1000, ge=1, description="Upper bound on files hashed when not running a full sweep; a random sample is taken above this many eligible files"),
     current_user: User = Depends(allow_admin),
     db: Session        = Depends(get_db_dependency),
 ):
     """Reconcile the database against the image files and the capture manifest.
 
-    Reports images whose files are missing, image files no row or manifest
-    references, bytes that no longer match the capture-time sha256, and parentless
+    Reports images whose files are missing, image files with no row or manifest
+    reference, bytes that no longer match the capture-time sha256, and parentless
     records. Read-only and admin-only. Run after an SD re-clone or DB restore.
+
+    Hash verification defaults to a bounded random sample; pass full=true for the
+    exhaustive (and much slower) sweep.
     """
     from app.core.integrity import run_integrity_check
     from app.core import audit
@@ -66,7 +70,7 @@ def integrity_check(
     report = run_integrity_check(
         db,
         verify_hashes=verify_hashes,
-        max_hash_checks=(max_hash_checks or None),
+        max_hash_checks=(None if full else max_hash_checks),
     )
     summary = report["summary"]
     audit.log_event(
@@ -77,7 +81,9 @@ def integrity_check(
         actor=current_user.username,
         detail=(
             f"missing_files={summary['missing_files']} orphan_files={summary['orphan_files']} "
-            f"manifest_mismatches={summary['manifest_mismatches']} hashes_checked={summary['hashes_checked']}"
+            f"manifest_mismatches={summary['manifest_mismatches']} "
+            f"hashes_checked={summary['hashes_checked']}/{summary['hashes_eligible']} "
+            f"sampled={summary['hash_sampled']}"
         ),
     )
     return report
@@ -180,43 +186,34 @@ class ActivateStorageRequest(BaseModel):
 def get_storage_info(current_user: User = Depends(allow_read_only)):
     """Return current projects path and disk usage figures."""
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override, StorageOverrideError
+    from app.core.storage_override import get_storage_override_or_fallback
 
-    # An unreadable override is surfaced as an error, not treated as "no override"
-    try:
-        projects_path = settings.projects_dir
-        is_override = get_storage_override() is not None
-    except StorageOverrideError as e:
-        return {
-            "projects_path": None,
-            "is_override":   True,
-            "error":         str(e),
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
-        }
+    # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
+    override, override_invalid = get_storage_override_or_fallback()
+    projects_path = settings.projects_dir
 
     try:
         projects_path.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(projects_path)
     except OSError:
         return {
-            "projects_path": str(projects_path),
-            "is_override":   is_override,
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
+            "projects_path":    str(projects_path),
+            "is_override":      override is not None,
+            "override_invalid": override_invalid,
+            "total_bytes":      0,
+            "used_bytes":       0,
+            "free_bytes":       0,
+            "available":        False,
         }
 
     return {
-        "projects_path": str(projects_path),
-        "is_override":   is_override,
-        "total_bytes":   usage.total,
-        "used_bytes":    usage.used,
-        "free_bytes":    usage.free,
-        "available":     True,
+        "projects_path":    str(projects_path),
+        "is_override":      override is not None,
+        "override_invalid": override_invalid,
+        "total_bytes":      usage.total,
+        "used_bytes":       usage.used,
+        "free_bytes":       usage.free,
+        "available":        True,
     }
 
 
@@ -342,7 +339,7 @@ def unmount_device(
 
     msg = "Device unmounted successfully."
     if override_cleared:
-        msg += "Storage reverted to the default."
+        msg += " Storage reverted to the default."
     return {"message": msg, "override_cleared": override_cleared}
 
 

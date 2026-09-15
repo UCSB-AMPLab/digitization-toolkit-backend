@@ -126,7 +126,8 @@ def test_schemas():
             object_typology="book",
             author="John Doe",
             material="paper",
-            date="2024-01-01"
+            date="2024-01-01",
+            capture_mode="single"
         )
         assert doc.object_typology == "book"
         assert doc.author == "John Doe"
