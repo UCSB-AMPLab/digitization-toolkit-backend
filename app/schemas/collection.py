@@ -47,6 +47,11 @@ class CollectionRead(CollectionBase):
     # Direct record count (Record.collection_id == this collection's id).
     # None unless the endpoint explicitly populates it (list/hierarchy).
     record_count: Optional[int] = None
+    # Most recent Record.modified_at inside this collection — when it was last
+    # worked on, as opposed to updated_at, which only moves when the collection
+    # row itself is edited (renamed, re-described). Null when it has no records.
+    # None unless the endpoint explicitly populates it (list).
+    last_activity_at: Optional[datetime] = None
 
     class Config:
         from_attributes = True

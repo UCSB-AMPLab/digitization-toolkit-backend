@@ -1,6 +1,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from typing import List, Optional
+from datetime import datetime
 from sqlalchemy.orm import Session, selectinload
 from sqlalchemy import select, func
 import logging
@@ -112,20 +113,33 @@ def list_collections(
     # Bulk-count records per collection in one query (avoids N+1 — the
     # project detail page lists every collection and needs each one's
     # count for the "No. of images/records" column, NEH-179).
+    # The same pass takes MAX(modified_at): asking per collection would be the
+    # N+1 this query exists to avoid.
     counts_by_id: dict[int, int] = {}
+    last_activity_by_id: dict[int, datetime] = {}
     if items:
         rows = (
-            db.query(Record.collection_id, func.count(Record.id))
+            db.query(
+                Record.collection_id,
+                func.count(Record.id),
+                func.max(Record.modified_at),
+            )
             .filter(Record.collection_id.in_([c.id for c in items]))
             .group_by(Record.collection_id)
             .all()
         )
-        counts_by_id = {collection_id: count for collection_id, count in rows}
+        for collection_id, count, last_activity in rows:
+            counts_by_id[collection_id] = count
+            last_activity_by_id[collection_id] = last_activity
 
     results = []
     for i in items:
         r = CollectionRead.model_validate(i)
         r.record_count = counts_by_id.get(i.id, 0)
+        # Left as None for a collection with no records: "never worked on" is
+        # not the same as a date, and a caller listing volumes in progress needs
+        # to tell them apart.
+        r.last_activity_at = last_activity_by_id.get(i.id)
         results.append(r)
     return results
 
