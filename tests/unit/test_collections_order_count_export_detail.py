@@ -297,3 +297,49 @@ def test_export_blocks_approved_record_with_no_image(contributor_client, db_sess
     detail = resp.json()["detail"]
     assert r_empty.id in detail["blocking_record_ids"]
     assert r_ok.id not in detail["blocking_record_ids"]
+
+
+# ==============================================================================
+# (e) list_collections exposes last_activity_at (NEH-247)
+# ==============================================================================
+
+@pytest.mark.unit
+def test_list_collections_reports_last_record_activity(read_client, db_session):
+    """last_activity_at is MAX(record.modified_at), not the collection's own
+    updated_at — the latter only moves when the collection row is edited, so a
+    volume with 200 captures taken today would otherwise report the day it was
+    created."""
+    from datetime import datetime, timezone
+    from app.models.project import Project
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    proj = Project(name="P-activity")
+    db_session.add(proj)
+    db_session.commit()
+
+    worked = Collection(name="worked-on", project_id=proj.id)
+    untouched = Collection(name="never-captured", project_id=proj.id)
+    db_session.add_all([worked, untouched])
+    db_session.commit()
+
+    older = datetime(2026, 1, 10, 9, 0, tzinfo=timezone.utc)
+    newest = datetime(2026, 3, 22, 17, 30, tzinfo=timezone.utc)
+    db_session.add_all([
+        Record(title="r1", collection_id=worked.id, capture_mode="single", modified_at=older),
+        Record(title="r2", collection_id=worked.id, capture_mode="single", modified_at=newest),
+    ])
+    db_session.commit()
+
+    res = read_client.get(f"/collections/?project_id={proj.id}")
+    assert res.status_code == 200
+    by_name = {c["name"]: c for c in res.json()}
+
+    # The most recent record wins, not the first one nor the collection's date.
+    assert by_name["worked-on"]["last_activity_at"].startswith("2026-03-22T17:30")
+    assert by_name["worked-on"]["record_count"] == 2
+
+    # No records means no activity — null, not a date. A caller listing volumes
+    # in progress needs to tell "never worked on" from "worked on long ago".
+    assert by_name["never-captured"]["last_activity_at"] is None
+    assert by_name["never-captured"]["record_count"] == 0
