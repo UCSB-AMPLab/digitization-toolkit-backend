@@ -1,24 +1,34 @@
-"""A USB bus scan must not race the bodies it is scanning (NEH-250).
+"""A USB bus scan must not overlap the camera operations it scans past (NEH-250).
 
-`gp.Camera.autodetect()` re-enumerates the USB ports, and the frontend asks
-`is_camera_connected()` about once a second per body. An unconditional scan
-per ask is 60 bus enumerations a minute, and `_map_lock` guards the map, not
-the bodies - so such a scan overlaps whatever preview or capture is in
-flight. The Rionegro unit's `capture_service.log` for 9-15 Sep is what that
-looks like from the operator's side: 6x `[-52] Could not find the requested
-device on the USB port` (libgphoto2 re-enumerating ports while another thread
-holds that device) and 5x `[-110] I/O in progress` (two operations
-overlapping on one body). Enumeration never failed; using a body afterwards
-did.
+`gp.Camera.autodetect()` enumerates the USB devices' information, and the
+frontend asks `is_camera_connected()` about once a second per body. An
+unconditional scan per ask is 60 enumerations a minute, and `_map_lock` guards
+the map, not the bodies - so such a scan runs alongside whatever preview or
+capture is in flight. What this backend now attempts is to serialise the two.
 
-Four outcomes are asserted here, on what an operator or a caller can
+The Rionegro unit's `capture_service.log` for 9-15 Sep is what the operator
+saw: 6x `[-52] Could not find the requested device on the USB port` and 5x
+`[-110] I/O in progress`, against cameras that were otherwise working, and
+enumeration itself never failed. An unserialised enumeration is a candidate
+cause; the codes do not establish it. `-110` is also what libgphoto2 returns
+for a camera's own PTP `DeviceBusy` response, so it is not a diagnostic
+equivalent of "two operations overlapped on one body". The tests below assert
+the serialisation, not a diagnosis.
+
+Eight outcomes are asserted here, on what an operator or a caller can
 observe rather than on which locks get taken:
 
   - a scan cannot begin while an operation is in flight on a body;
+  - nor while a body that had no lock at all when the scan started is in I/O;
   - many rapid connection checks cost far fewer than that many scans, and a
     body that has genuinely gone is still reported as gone;
+  - concurrent checks that all see one stale map cost one scan between them,
+    while an operator's `rescan()` is never skipped;
+  - a successful scan that found nothing stands for the interval, and a bus
+    that has never been read is still read on the first ask;
   - a body power-cycled off the bus is reported gone within the interval;
-  - a body in use answers for itself, without the bus and without waiting.
+  - a body in use answers for itself, without the bus and without waiting;
+  - but a held lock does not outrank a newer scan that found the bus empty.
 
 The clock is faked so the scan interval can be crossed deliberately rather
 than waited out: `_PORT_MAP_TTL_S` is the real constant in every assertion.
@@ -307,6 +317,32 @@ def _two_body_backend(monkeypatch, hooks=None, log=None):
     return backend, claims, detector
 
 
+def _answer_without_waiting(backend, index, timeout=5.0):
+    """Ask is_camera_connected() off the main thread and require an answer.
+
+    Every assertion about the busy-body shortcut is also an assertion that it
+    does not wait: a check that queued behind whatever is holding the body
+    would freeze the indicator the operator is watching. Running it in its own
+    thread with a deadline makes "it waited" a failure rather than a hung test.
+    """
+    answered = {}
+
+    def ask():
+        try:
+            answered["value"] = backend.is_camera_connected(index)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            answered["error"] = exc
+
+    thread = threading.Thread(target=ask, name=f"connection-check-{index}")
+    thread.start()
+    thread.join(timeout=timeout)
+    assert not thread.is_alive(), (
+        f"is_camera_connected({index}) waited instead of answering"
+    )
+    assert "error" not in answered, answered["error"]
+    return answered["value"]
+
+
 # ----------------------------------------------------------------------
 # (a) a scan may not begin while a body is in use
 # ----------------------------------------------------------------------
@@ -534,3 +570,315 @@ def test_a_body_in_use_answers_a_connection_check_without_waiting_for_it(
     assert answered["value"] is True, (
         "a body with a preview in flight on it was not reported connected"
     )
+
+
+# ----------------------------------------------------------------------
+# (e) a body that starts up mid-scan is waited for too
+# ----------------------------------------------------------------------
+
+def test_a_body_that_starts_up_mid_scan_is_not_scanned_through(monkeypatch, clock):
+    """A body admitted after the scan began must still not be scanned through.
+
+    Test (a) proves the barrier holds a body that was already in hand when the
+    scan started. This one covers the other half, which is the half an
+    appliance actually meets: index 1 has no lock at all when the scan begins -
+    nothing has ever used it - and its first preview arrives while the scan is
+    running. Answering that from a list of the locks that happened to exist
+    when the scan started lets the scan run straight through the new body's
+    I/O.
+
+    What forces the interleaving: `_refresh_port_map` is wrapped, so the scan
+    is pinned at the point where it is inside its own barrier and about to
+    enumerate. Only there is the preview released, and the scan then waits for
+    the preview to reach the body before enumerating. So an admission rule
+    that considers only pre-existing bodies produces io-start before scan,
+    every time; one that excludes new operations too cannot let the preview in
+    at all, the wait times out, and scan comes first.
+    """
+    log = _Log()
+    hooks = types.SimpleNamespace(
+        port=PORT_1,
+        entered=threading.Event(),
+        release=threading.Event(),
+    )
+    backend, _claims, detector = _two_body_backend(monkeypatch, hooks=hooks, log=log)
+
+    # A published map, and a lock for index 0 and index 0 only: index 1 has
+    # never been touched, so nothing that enumerates the locks in existence
+    # when the scan starts can find it.
+    backend._scan_bus()
+    backend._get_camera_lock(0)
+    assert sorted(backend._session_locks) == [0], (
+        f"index 1 already had a lock: {sorted(backend._session_locks)}"
+    )
+
+    go = threading.Event()
+    locks_at_scan_start = []
+    original_refresh = backend._refresh_port_map
+
+    def refresh_once_index_1_has_had_its_chance():
+        locks_at_scan_start.append(sorted(backend._session_locks))
+        # Inside the barrier, about to enumerate: this is the window.
+        go.set()
+        hooks.entered.wait(timeout=2.0)
+        original_refresh()
+
+    monkeypatch.setattr(
+        backend, "_refresh_port_map", refresh_once_index_1_has_had_its_chance
+    )
+
+    log.clear()
+    errors = {}
+
+    def run_preview():
+        try:
+            assert go.wait(10), "the scan never reached its barrier"
+            backend.capture_preview(1)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            errors["preview"] = exc
+
+    def run_check():
+        try:
+            backend.is_camera_connected(0)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            errors["check"] = exc
+
+    # Stale, so the check has to re-detect.
+    clock.advance(gb._PORT_MAP_TTL_S + 1.0)
+
+    io = threading.Thread(target=run_preview, name="preview")
+    checker = threading.Thread(target=run_check, name="connection-check")
+    started = []
+
+    try:
+        io.start()
+        started.append(io)
+        checker.start()
+        started.append(checker)
+        checker.join(timeout=15)
+    finally:
+        hooks.release.set()
+        for thread in started:
+            thread.join(timeout=30)
+
+    assert not errors, errors
+    assert locks_at_scan_start == [[0]], (
+        f"index 1 had a lock before the scan started: {locks_at_scan_start}"
+    )
+    assert log.events == ["scan", "io-start", "io-end"], (
+        f"the scan ran while a body that started up mid-scan was in I/O: "
+        f"{log.events}"
+    )
+    assert detector.calls >= 1
+
+
+# ----------------------------------------------------------------------
+# (f) an empty bus is an answer, not the absence of one
+# ----------------------------------------------------------------------
+
+def test_an_empty_bus_is_not_re_read_on_every_poll(monkeypatch, clock):
+    """"The bus was read and had nothing on it" must stand for the interval.
+
+    Nothing plugged in is the state a rig sits in between sessions, and the
+    frontend keeps polling through it. Treating an empty published map as no
+    answer puts that rig back to one full USB enumeration per poll, which is
+    the cost this work exists to remove.
+
+    Deterministic by construction: single-threaded, on a clock that does not
+    move, so every poll after the first is inside the same interval by
+    arithmetic rather than by luck.
+    """
+    backend, _claims, detector = _two_body_backend(monkeypatch)
+
+    detector.results = []
+    backend._scan_bus()
+    assert backend._published_port_map() == {}
+    scans_after_the_successful_empty_scan = detector.calls
+
+    # Asserted on the predicate as well as on the poll count. The two fixes
+    # in this area overlap - a stale check retaken after admission would also
+    # collapse the poll count here - so freshness is checked directly, where
+    # "the bus was read and had nothing on it" either is an answer or is not.
+    assert backend._bus_read_recently() is True, (
+        "a successful scan that found nothing did not count as the bus having "
+        "been read"
+    )
+
+    for _ in range(12):
+        assert backend.is_camera_connected(0) is False
+
+    assert detector.calls == scans_after_the_successful_empty_scan, (
+        f"12 polls on an empty bus ran "
+        f"{detector.calls - scans_after_the_successful_empty_scan} more scans; "
+        f"a successful scan that found nothing is an answer and stands for "
+        f"{gb._PORT_MAP_TTL_S}s"
+    )
+
+
+def test_a_bus_that_has_never_been_read_is_read_on_the_first_ask(monkeypatch, clock):
+    """The other half of freshness: never-built is still not fresh.
+
+    An empty map that no scan has ever produced must not be mistaken for an
+    empty bus, or the first question this backend is ever asked is answered
+    without looking.
+    """
+    backend, _claims, detector = _two_body_backend(monkeypatch)
+
+    detector.results = []
+    assert detector.calls == 0
+
+    assert backend.is_camera_connected(0) is False
+    assert detector.calls == 1, (
+        "the first ask of a backend that has never scanned did not reach the bus"
+    )
+
+
+# ----------------------------------------------------------------------
+# (g) concurrent stale polls cost one scan between them
+# ----------------------------------------------------------------------
+
+def test_concurrent_stale_polls_cost_one_scan_between_them(monkeypatch, clock):
+    """N pollers that all see a stale map must still cost one scan, not N.
+
+    The interval bounds the cost only if the pollers that queue behind one
+    another reconsider it. Two bodies and a dual preview mean several callers
+    ask at once as a matter of course, and a stale check taken before the scan
+    is admitted is the same check for all of them.
+
+    What forces the interleaving: the freshness primitive is wrapped so that
+    each polling thread's *first* reading of it rendezvouses on a barrier. All
+    eight therefore compute "stale" before any of them can be admitted to
+    scan - the defect's precondition, established by the barrier rather than
+    by scheduling. With the check taken only before admission, all eight go on
+    to enumerate; with it retaken after admission, seven find the map the
+    first one published and return.
+    """
+    backend, _claims, detector = _two_body_backend(monkeypatch)
+
+    backend._get_or_open_session(0)
+    backend._get_or_open_session(1)
+    backend._scan_bus()
+    assert sorted(backend._published_port_map()) == [0, 1]
+
+    pollers = 8
+    arrived = threading.Barrier(pollers, timeout=30)
+    seen = set()
+    seen_lock = threading.Lock()
+    original_recently = backend._bus_read_recently
+
+    def rendezvous_on_the_first_reading():
+        ident = threading.get_ident()
+        with seen_lock:
+            first_reading = ident not in seen
+            if first_reading:
+                seen.add(ident)
+        answer = original_recently()
+        if first_reading:
+            # Every poller has now read freshness, and none has scanned.
+            arrived.wait()
+        return answer
+
+    monkeypatch.setattr(
+        backend, "_bus_read_recently", rendezvous_on_the_first_reading
+    )
+
+    # The map is now old enough that every poller sees it as stale.
+    clock.advance(gb._PORT_MAP_TTL_S + 1.0)
+    scans_before = detector.calls
+
+    errors = {}
+    answers = []
+    answers_lock = threading.Lock()
+
+    def poll():
+        try:
+            value = backend.is_camera_connected(0)
+            with answers_lock:
+                answers.append(value)
+        except BaseException as exc:  # noqa: BLE001 - reported to the main thread
+            errors[threading.get_ident()] = exc
+
+    threads = [
+        threading.Thread(target=poll, name=f"poller-{i}") for i in range(pollers)
+    ]
+    for thread in threads:
+        thread.start()
+    for thread in threads:
+        thread.join(timeout=30)
+
+    assert not errors, errors
+    assert all(not thread.is_alive() for thread in threads)
+    assert answers == [True] * pollers, answers
+
+    scans = detector.calls - scans_before
+    assert scans == 1, (
+        f"{pollers} pollers that all saw one stale map ran {scans} scans; "
+        "the interval is supposed to bound this at one"
+    )
+
+    # An operator's explicit rescan is never skipped, however fresh the map.
+    before_rescan = detector.calls
+    backend.rescan()
+    assert detector.calls > before_rescan, (
+        "rescan() was skipped because the map was fresh; it is the operator's "
+        "lever and must always re-detect"
+    )
+
+
+# ----------------------------------------------------------------------
+# (h) a busy body does not outrank newer absence evidence
+# ----------------------------------------------------------------------
+
+def test_a_busy_body_does_not_outrank_a_newer_scan_that_found_nothing(
+    monkeypatch, clock
+):
+    """A held lock plus a cached session is not evidence against a newer scan.
+
+    The lock is held for the length of a capture, a preview or a session open -
+    and a *disconnected* body's operation can sit inside libgphoto2's USB
+    timeouts for the better part of a minute, holding that lock the whole time.
+    So "the lock will not come free" establishes neither successful traffic nor
+    agreement with what has since been published. When a scan has landed since
+    the body's last successful traffic, the scan is the newer evidence and must
+    win.
+
+    Deterministic by construction: single-threaded except for the deadline on
+    the answer, and both timestamps are set by hand on a clock the test moves.
+    The check still may not wait, which is what `_answer_without_waiting`
+    asserts.
+    """
+    backend, _claims, detector = _two_body_backend(monkeypatch)
+
+    backend._get_or_open_session(0)
+    backend._get_or_open_session(1)
+
+    # A successful preview, one second after the scan that published the map:
+    # the body's own traffic is now the newer evidence.
+    clock.advance(1.0)
+    assert backend.capture_preview(0) == b"jpeg-preview-bytes"
+
+    lock_0 = backend._get_camera_lock(0)
+    assert lock_0.acquire(blocking=False)
+    try:
+        assert _answer_without_waiting(backend, 0) is True, (
+            "a body whose own successful traffic postdates the last scan was "
+            "not reported connected"
+        )
+
+        # Now a scan lands that found nothing, after that traffic.
+        clock.advance(1.0)
+        detector.results = []
+        scans_before = detector.calls
+        backend._scan_bus_without_waiting()
+        assert backend._published_port_map() == {}
+
+        assert _answer_without_waiting(backend, 0) is False, (
+            "a held lock and a cached session outranked a newer scan that "
+            "found the bus empty"
+        )
+        assert detector.calls == scans_before + 1, (
+            "the busy-body path reached the bus; it must answer from what is "
+            "published, without waiting and without scanning"
+        )
+    finally:
+        lock_0.release()
