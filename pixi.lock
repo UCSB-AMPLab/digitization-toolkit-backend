@@ -185,7 +185,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aom-3.14.1-pl5321h8fffa31_1.conda
@@ -352,6 +354,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
   dev:
     channels:
@@ -528,7 +532,9 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/_openmp_mutex-4.5-20_gnu.conda
       - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/aom-3.14.1-pl5321h8fffa31_1.conda
@@ -698,6 +704,8 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
 packages:
 - conda: https://conda.anaconda.org/conda-forge/linux-64/_openmp_mutex-4.5-20_gnu.conda
@@ -1734,7 +1742,7 @@ packages:
   - zlib-ng >=2.3.3,<2.4.0a0
   license: HPND
   purls:
-  - pkg:pypi/pillow?source=compressed-mapping
+  - pkg:pypi/pillow?source=hash-mapping
   size: 1081155
   timestamp: 1782912080163
 - conda: https://conda.anaconda.org/conda-forge/linux-64/psycopg-c-3.2.12-py311h7613044_1.conda
@@ -3125,7 +3133,7 @@ packages:
   - libtiff >=4.7.1,<4.8.0a0
   license: HPND
   purls:
-  - pkg:pypi/pillow?source=compressed-mapping
+  - pkg:pypi/pillow?source=hash-mapping
   size: 1051824
   timestamp: 1782912107475
 - conda: https://conda.anaconda.org/conda-forge/linux-aarch64/psycopg-c-3.2.12-py311hf3b5bb8_1.conda
@@ -3579,7 +3587,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/anyio?source=compressed-mapping
+  - pkg:pypi/anyio?source=hash-mapping
   size: 164465
   timestamp: 1783889660383
 - conda: https://conda.anaconda.org/conda-forge/noarch/bagit-1.9.0-pyhd8ed1ab_0.conda
@@ -3608,7 +3616,7 @@ packages:
   - python >=3.10
   license: ISC
   purls:
-  - pkg:pypi/certifi?source=compressed-mapping
+  - pkg:pypi/certifi?source=hash-mapping
   size: 137015
   timestamp: 1784717699092
 - conda: https://conda.anaconda.org/conda-forge/noarch/click-8.4.2-pyhc90fa1f_0.conda
@@ -3621,7 +3629,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/click?source=compressed-mapping
+  - pkg:pypi/click?source=hash-mapping
   size: 107155
   timestamp: 1783085363526
 - conda: https://conda.anaconda.org/conda-forge/noarch/colorama-0.4.6-pyhd8ed1ab_1.conda
@@ -3704,8 +3712,7 @@ packages:
   - uvicorn-standard
   license: MIT
   license_family: MIT
-  purls:
-  - pkg:pypi/fastapi?source=compressed-mapping
+  purls: []
   size: 4836
   timestamp: 1782997724066
 - conda: https://conda.anaconda.org/conda-forge/noarch/fastapi-cli-0.0.32-pyhcf101f3_0.conda
@@ -3721,7 +3728,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/fastapi-cli?source=compressed-mapping
+  - pkg:pypi/fastapi-cli?source=hash-mapping
   size: 20791
   timestamp: 1784211753962
 - conda: https://conda.anaconda.org/conda-forge/noarch/fastapi-core-0.139.0-pyhcf101f3_0.conda
@@ -3748,7 +3755,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/fastapi?source=compressed-mapping
+  - pkg:pypi/fastapi?source=hash-mapping
   size: 103957
   timestamp: 1782997724066
 - conda: https://conda.anaconda.org/conda-forge/noarch/h11-0.16.0-pyhcf101f3_1.conda
@@ -3786,7 +3793,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/hpack?source=compressed-mapping
+  - pkg:pypi/hpack?source=hash-mapping
   size: 32884
   timestamp: 1782283986153
 - conda: https://conda.anaconda.org/conda-forge/noarch/httpcore-1.0.9-pyh29332c3_0.conda
@@ -3841,7 +3848,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/idna?source=compressed-mapping
+  - pkg:pypi/idna?source=hash-mapping
   size: 163869
   timestamp: 1781620148226
 - conda: https://conda.anaconda.org/conda-forge/noarch/imageio-2.37.0-pyhfb79c49_0.conda
@@ -3867,7 +3874,7 @@ packages:
   license: Apache-2.0
   license_family: APACHE
   purls:
-  - pkg:pypi/importlib-metadata?source=compressed-mapping
+  - pkg:pypi/importlib-metadata?source=hash-mapping
   size: 34766
   timestamp: 1779714582554
 - conda: https://conda.anaconda.org/conda-forge/noarch/importlib_resources-7.1.0-pyhd8ed1ab_0.conda
@@ -4180,7 +4187,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/rich-toolkit?source=compressed-mapping
+  - pkg:pypi/rich-toolkit?source=hash-mapping
   size: 34824
   timestamp: 1784024058693
 - conda: https://conda.anaconda.org/conda-forge/noarch/setuptools-83.0.0-pyh332efcf_0.conda
@@ -4191,7 +4198,7 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/setuptools?source=compressed-mapping
+  - pkg:pypi/setuptools?source=hash-mapping
   run_exports: {}
   size: 642081
   timestamp: 1783619174976
@@ -4228,7 +4235,7 @@ packages:
   license: BSD-3-Clause
   license_family: BSD
   purls:
-  - pkg:pypi/starlette?source=compressed-mapping
+  - pkg:pypi/starlette?source=hash-mapping
   size: 64264
   timestamp: 1781447071524
 - conda: https://conda.anaconda.org/conda-forge/noarch/tifffile-2026.3.3-pyhd8ed1ab_0.conda
@@ -4305,7 +4312,7 @@ packages:
   license: PSF-2.0
   license_family: PSF
   purls:
-  - pkg:pypi/typing-extensions?source=compressed-mapping
+  - pkg:pypi/typing-extensions?source=hash-mapping
   size: 52631
   timestamp: 1783002732887
 - conda: https://conda.anaconda.org/conda-forge/noarch/tzdata-2026c-h151e31d_0.conda
@@ -4369,13 +4376,25 @@ packages:
   license: MIT
   license_family: MIT
   purls:
-  - pkg:pypi/zipp?source=compressed-mapping
+  - pkg:pypi/zipp?source=hash-mapping
   size: 24190
   timestamp: 1779159948016
+- pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+  name: pychdk
+  version: 0.1.2
+  requires_dist:
+  - pyusb>=1.2.0
+  - pytest>=7.0 ; extra == 'dev'
+  requires_python: '>=3.11'
 - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
   name: gphoto2
   version: 2.6.4
   sha256: 70011e78b6069ffca7285abab5f2bc9423cd3009a1f966cb83a574c640799a29
+- pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
+  name: pyusb
+  version: 1.3.1
+  sha256: bf9b754557af4717fe80c2b07cc2b923a9151f5c08d17bdb5345dac09d6a0430
+  requires_python: '>=3.9.0'
 - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
   name: gphoto2
   version: 2.6.4

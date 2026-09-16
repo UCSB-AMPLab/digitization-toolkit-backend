@@ -57,13 +57,20 @@ def assert_schema_at_head() -> None:
             current = set(MigrationContext.configure(conn).get_current_heads())
     except Exception as e:
         # An unreachable database is a distinct failure; surface it rather than mask it.
-        raise SchemaOutOfDateError(f"Could not read the database schema revision: {e}") from e
+        msg = (
+            f"Cannot start: the database is unreachable, so its schema revision could not be read ({e}). "
+            "Check that the database service is running and DATABASE_* settings are correct, then restart the backend."
+        )
+        logger.error(f"[ERROR] {msg}")
+        raise SchemaOutOfDateError(msg) from e
 
     if current == heads:
         logger.info(f"[OK] Database schema at head ({', '.join(sorted(heads)) or 'none'})")
         return
 
-    raise SchemaOutOfDateError(
-        f"Database schema is out of date: database at {sorted(current) or 'no revision'}, "
+    msg = (
+        f"Cannot start: database schema is out of date - database at {sorted(current) or 'no revision'}, "
         f"code expects head {sorted(heads)}. Run 'alembic upgrade head' (or update.sh) before starting the backend."
     )
+    logger.error(f"[ERROR] {msg}")
+    raise SchemaOutOfDateError(msg)

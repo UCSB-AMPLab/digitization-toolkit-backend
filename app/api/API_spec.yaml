@@ -623,7 +623,9 @@ paths:
               schema:
                 $ref: '#/components/schemas/RecordRead'
         '409':
-          description: Database integrity error
+          description: Sanitized constraint violation (constraint name and message, no SQL)
+        '422':
+          description: Validation error (e.g. a record given both a project and a collection)
 
     get:
       summary: List all records with optional filtering

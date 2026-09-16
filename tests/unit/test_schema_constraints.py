@@ -91,7 +91,7 @@ def test_second_exif_data_row_for_same_record_image_raises_integrity_error(db_se
     db_session.add(proj)
     db_session.commit()
 
-    rec = Record(title="r", project_id=proj.id)
+    rec = Record(title="r", project_id=proj.id, capture_mode="single")
     db_session.add(rec)
     db_session.commit()
 
@@ -134,7 +134,7 @@ def test_valid_rows_commit_fine(db_session):
 
     pm = ProjectMember(project_id=proj.id, user_id=user.id, role="operator")
     log = SystemLog(level="ERR", category="capture", action="capture_failed")
-    rec = Record(title="r", project_id=proj.id, status="approved")
+    rec = Record(title="r", project_id=proj.id, status="approved", capture_mode="single")
     db_session.add_all([pm, log, rec])
     db_session.commit()
 

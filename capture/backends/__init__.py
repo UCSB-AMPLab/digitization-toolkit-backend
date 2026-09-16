@@ -9,6 +9,7 @@ between implementations.
 from .base import CameraBackend
 from .subprocess_backend import RpicamBackend
 from .gphoto2_backend import GPhoto2Backend
+from .chdk_backend import ChdkBackend
 
 # picamera2 depends on simplejpeg which can raise ValueError on numpy ABI
 # mismatch at import time (e.g. pixi env vs system numpy).  Guard the import
@@ -26,4 +27,7 @@ except (ImportError, ValueError):
                 "Set CAMERA_BACKEND=gphoto2 or CAMERA_BACKEND=subprocess."
             )
 
-__all__ = ['CameraBackend', 'RpicamBackend', 'Picamera2Backend', 'GPhoto2Backend']
+__all__ = [
+    'CameraBackend', 'RpicamBackend', 'Picamera2Backend', 'GPhoto2Backend',
+    'ChdkBackend',
+]

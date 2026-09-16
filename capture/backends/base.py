@@ -119,6 +119,23 @@ class CameraBackend(ABC):
         """
         return []
 
+    def rescan(self) -> list:
+        """
+        Re-detect hardware and drop stale state, then enumerate.
+
+        Called when a body has been power-cycled, unplugged or moved between
+        USB ports mid-session and the backend's cached view of the hardware
+        has to be rebuilt without restarting the process.
+
+        Backends without persistent sessions have no stale state to drop, so
+        this just enumerates. Backends that hold open device sessions should
+        override to reconcile them against the fresh detection first.
+
+        Returns:
+            list: The same device dicts list_devices() returns.
+        """
+        return self.list_devices()
+
     def capture_preview(self, camera_index: int) -> bytes:
         """
         Capture a single live-preview frame and return raw JPEG bytes.
