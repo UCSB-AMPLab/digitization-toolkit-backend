@@ -54,8 +54,8 @@ class CameraConfig:
     # iso is the number printed in the camera's own ISO menu, not a real
     # sensitivity: gphoto2 writes it straight to the camera's iso PTP widget,
     # and the CHDK backend passes it to pychdk's shoot(market_iso=...), which
-    # hands it to CHDK's set_iso_mode to be resolved against the camera's own
-    # ISO table. Do not convert it here.
+    # converts it to a real sv96 on the camera and requests a script exposure
+    # override. Do not convert it here.
     iso: Optional[int] = None            # e.g. 400; None = camera default
     shutter_speed: Optional[str] = None  # e.g. "1/250" (PTP shutterspeed string)
     aperture: Optional[str] = None       # e.g. "5.6" (PTP aperture string)

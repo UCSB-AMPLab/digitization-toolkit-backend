@@ -163,9 +163,13 @@ class Body:
         # Do not carry uBASIC's convention across: it is the reason this fake
         # once returned 0 for record, which made the polarity untestable.
         #
-        # A body stuck in play never arrives, which the library's switch_mode
-        # cannot report: it returns nothing whether the camera got there or
-        # not.
+        # A body stuck in play never arrives. That this fake's switch_mode
+        # returns rather than raising describes the PINNED pychdk (0.1.2),
+        # whose confirmation loop fell through silently. pychdk 0.1.3 raises
+        # instead, so when the pin moves this fake should raise too - and
+        # until then it must not, or it would test a library we do not run.
+        # The direct-answer tests below are deliberately independent of which
+        # it does.
         self.stuck_in_play = stuck_in_play
         self.mode_value = False
         self.lua_error = lua_error
