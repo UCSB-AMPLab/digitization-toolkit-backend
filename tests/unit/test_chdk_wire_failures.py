@@ -196,6 +196,68 @@ def test_a_body_that_never_reaches_record_mode_shows_no_live_view(monkeypatch):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "is_record, arrived",
+    [(True, True), (1, True), (False, False), (0, False)],
+)
+def test_the_polarity_of_get_mode_is_true_for_record_and_false_for_play(
+    monkeypatch, tmp_path, is_record, arrived
+):
+    """Pin which way round the answer reads, which no other test here does.
+
+    CHDK's Lua get_mode() returns is_record, is_video, mode, and the library
+    hands back the first of the three, so a truthy answer is the body saying
+    it is in record. uBASIC's get_mode reads the other way round, and a
+    backend that took its convention would reject exactly the bodies that
+    arrived and shoot pages from the ones still in playback - which is why
+    the answer is set here directly instead of being switched into.
+
+    What this pins is the backend's reading of an answer it is handed. It
+    does not pin how the fake produces one: stuck_in_play=True is what lets
+    mode_value be set directly, and it bypasses the fake's own switch, so
+    inverting that assignment leaves these cases green. The test below
+    pins the fake instead, and the two together cover both halves.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+    body.mode_value = is_record
+
+    if arrived:
+        backend.capture_image(tmp_path / "page.jpg", _config())
+        assert len(body.shots) == 1, "a body reporting record mode was refused"
+    else:
+        with pytest.raises(RuntimeError) as exc:
+            backend.capture_image(tmp_path / "page.jpg", _config())
+        assert "play mode" in str(exc.value)
+        assert body.shots == [], "a page was shot from playback"
+
+
+@pytest.mark.unit
+def test_the_fake_reports_record_the_way_chdk_does_after_a_switch(monkeypatch):
+    """Pin the fake's own polarity, which the test above cannot.
+
+    The test above hands the backend an answer directly. This one lets the
+    fake produce it: after switch_mode("record") the body must report a
+    truthy is_record, and after "play" a falsy one. Invert the fake's
+    assignment and this fails, which is the half the direct test misses.
+    """
+    body = Body(serial="AAA111", card=EVEN_CARD)
+    backend = make_backend(monkeypatch, make_pychdk(body))
+    backend.list_devices()
+    device = body.device
+
+    device.switch_mode("record")
+    assert device.lua_execute("return get_mode()"), (
+        "the fake says play after switching to record"
+    )
+    device.switch_mode("play")
+    assert not device.lua_execute("return get_mode()"), (
+        "the fake says record after switching to play"
+    )
+
+
+@pytest.mark.unit
 def test_the_mode_is_confirmed_once_and_then_trusted(monkeypatch, tmp_path):
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
     backend = make_backend(monkeypatch, make_pychdk(body))
