@@ -166,10 +166,15 @@ class Body:
         # A body stuck in play never arrives. That this fake's switch_mode
         # returns rather than raising describes the PINNED pychdk (0.1.2),
         # whose confirmation loop fell through silently. pychdk 0.1.3 raises
-        # instead, so when the pin moves this fake should raise too - and
-        # until then it must not, or it would test a library we do not run.
-        # The direct-answer tests below are deliberately independent of which
-        # it does.
+        # instead, so this has to change when the pin moves - and until then
+        # it must not, or it would test a library we do not run.
+        #
+        # That change is not local to this file. The tests that set
+        # mode_value directly pass stuck_in_play=True and still call through
+        # switch_mode(), so a raising switch_mode stops them reaching the
+        # answer they exist to test: make this raise on its own and all four
+        # polarity cases fail. Fake and tests move together, in the same
+        # commit as the pin.
         self.stuck_in_play = stuck_in_play
         self.mode_value = False
         self.lua_error = lua_error
