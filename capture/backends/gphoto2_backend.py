@@ -8,6 +8,10 @@ Key design decisions:
   - capturetarget=Internal RAM, reviewtime=None, autopoweroff=0 applied at init.
   - Port map built lazily from gp.Camera.autodetect(); rebuilt automatically on
     session failure (handles USB re-enumeration after camera power-cycle).
+  - A bus scan is a USB re-enumeration, so it runs only when no camera
+    operation is admitted, and only when the map has aged past
+    _PORT_MAP_TTL_S. See _BusGate, GPhoto2Backend's thread safety note,
+    _bus_quiet() and is_camera_connected().
   - Camera index means a body, not a position in autodetect(): the first
     serial read at an index pins that index to that body, and only an
     explicit rescan() may drop or move a pin. See GPhoto2Backend's thread
@@ -30,6 +34,7 @@ Future hooks (wire up when DSLRCameraConfig is introduced):
   - Aperture control via `aperture` PTP widget
 """
 
+import contextlib
 import json
 import threading
 import time
@@ -139,6 +144,27 @@ _UNKNOWN_EXPOSURE_S = 30.0
 # equivalent because a CSI camera's index is its physical connector.
 _BINDINGS_FILENAME = "camera-bindings.json"
 _BINDINGS_VERSION = 1
+
+# How long a published port map may stand before a connection check
+# re-detects the bus. The frontend polls is_camera_connected() about once a
+# second per body, and one gp.Camera.autodetect() per poll is 60 USB bus
+# enumerations a minute, each overlapping whatever preview or capture is in
+# flight (NEH-250). Re-detecting only once the last scan is older than this
+# bounds the cost at one scan per interval per process - the interval is
+# re-examined after scan admission as well as before it, so concurrent
+# pollers cost one scan between them (see _scan_bus_unless_refreshed).
+#
+# In the other direction, what it bounds is when a fresh scan is *requested*:
+# once the interval has expired, the next eligible connection check asks for
+# one, with nobody pressing anything. It is not a bound on detection latency.
+# A body whose own successful traffic postdates the last scan answers for
+# itself and never reaches the interval at all, and a scan waits for the
+# operations in flight, so an operation's duration can delay the answer
+# beyond the interval. Five seconds is short next to how long a Canon EOS
+# takes to come back on USB after a power-cycle, so an idle rig's map is not
+# a staler answer than the body itself gives, and an operator's explicit
+# rescan() re-detects immediately regardless.
+_PORT_MAP_TTL_S = 5.0
 
 # How many camera indices are sides of the rig. Indices below this are the
 # operator's left and right - a dual capture asks for exactly 0 and 1 (see
@@ -550,6 +576,78 @@ class _PTPSession:
             self._logger.info(f"[gphoto2] Closed session: {self.model} on {self.port}")
 
 
+class _BusGate:
+    """Admission control between a bus scan and the camera operations.
+
+    The invariant this establishes, and the only one it establishes:
+
+        For as long as a scan is admitted, no camera operation is admitted;
+        and a scan is not admitted until every operation already admitted
+        has finished.
+
+    That is deliberately a statement about *admission*, not about a set of
+    locks. The lock table cannot be the answer here: an admission rule built
+    from the camera locks that exist at some instant cannot cover a body whose
+    first operation - and therefore whose lock - arrives after that instant,
+    and holding _map_lock across the wait to stop the table changing would
+    invert the documented lock order (camera locks, then _map_lock) and
+    deadlock against every path that takes them the documented way. Counting
+    admitted operations instead needs no lock table and no such inversion,
+    because a new operation has to pass the same gate.
+
+    Shape: many operations at once (they are serialised per body by the camera
+    locks, and two bodies may be used together), one scan at a time, and never
+    both. A waiting scan holds off new operations so a steady poll cannot
+    starve it - a preview at ~33fps would otherwise re-admit itself between
+    every attempt.
+
+    Nothing here is reentrant. A thread that holds operation admission must
+    not ask for scan admission: it would wait for itself. That is the same
+    discipline the camera locks already carry - the paths that must scan while
+    holding a body go through _scan_bus_without_waiting, which waits for
+    nothing.
+    """
+
+    def __init__(self):
+        self._cv = threading.Condition()
+        self._operations = 0
+        self._scanning = False
+        self._scans_waiting = 0
+
+    @contextlib.contextmanager
+    def operation(self):
+        """Admit one camera operation, waiting out any scan."""
+        with self._cv:
+            while self._scanning or self._scans_waiting:
+                self._cv.wait()
+            self._operations += 1
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._operations -= 1
+                if self._operations == 0:
+                    self._cv.notify_all()
+
+    @contextlib.contextmanager
+    def scan(self):
+        """Admit one scan, waiting out every operation in flight."""
+        with self._cv:
+            self._scans_waiting += 1
+            try:
+                while self._scanning or self._operations:
+                    self._cv.wait()
+            finally:
+                self._scans_waiting -= 1
+            self._scanning = True
+        try:
+            yield
+        finally:
+            with self._cv:
+                self._scanning = False
+                self._cv.notify_all()
+
+
 class GPhoto2Backend(CameraBackend):
     """
     DSLR camera backend using python-gphoto2 with persistent PTP sessions.
@@ -568,6 +666,25 @@ class GPhoto2Backend(CameraBackend):
         try in the ownership rule (a port may not be opened under one index
         while a cached session under another index still holds it), so that
         pairing cannot deadlock.
+      - A bus scan and a camera operation pass one admission gate (see
+        _BusGate), and never hold it at once: a scan waits for every
+        operation in flight, and no new operation is admitted while a scan
+        is. That is what keeps a gp.Camera.autodetect() - which
+        re-enumerates the USB ports underneath whatever is talking to a
+        body - from overlapping backend camera operations, including
+        operations on a body that had never been used when the scan
+        started. Admission comes first, then the body's own lock, then
+        map_lock; the gate is the caller's to establish, which is why
+        _refresh_port_map takes no camera lock of its own - reaching for
+        them from inside map_lock would invert the order above. The paths
+        that must scan while already holding a body take what they can
+        non-blocking instead (see _scan_bus_without_waiting), for the same
+        reason the ownership rule does.
+      - A scan also takes every camera lock that exists, in index order,
+        for the length of the enumeration (see _bus_quiet). Under the gate
+        those locks are all free by construction; they are still taken so
+        that a path holding a body without admission - the non-blocking
+        tries below - cannot be enumerated over.
       - A serial is published to the cache only after the PTP claim that read
         it has been released: a brief identification read caches after
         cam.exit() returns, and a session that contradicted its pin caches
@@ -595,6 +712,17 @@ class GPhoto2Backend(CameraBackend):
         # the last autodetect() result, so the map can be rebuilt against new
         # identity knowledge without a second USB enumeration
         self._last_detected: list[tuple[str, str]] = []
+        # when the bus was last enumerated, on the monotonic clock, so a
+        # connection check can tell a map that still reflects the bus from one
+        # that is old enough to be worth re-reading (see _PORT_MAP_TTL_S). 0.0
+        # means never, which every comparison treats as stale.
+        self._last_scanned_at: float = 0.0
+        # camera_index -> when this index's body last answered an operation
+        # successfully, on the monotonic clock. This is what lets a body in
+        # use be weighed against the published map rather than simply
+        # outranking it (see is_camera_connected). A missing entry means no
+        # successful traffic since this index's session was last opened.
+        self._last_traffic_at: dict[int, float] = {}
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
         # usb port -> the index that currently holds a PTP claim on it. This
@@ -605,6 +733,9 @@ class GPhoto2Backend(CameraBackend):
         # per-camera lock for capture serialisation
         self._session_locks: dict[int, threading.Lock] = {}
         self._map_lock = threading.Lock()
+        # keeps a bus scan and the camera operations out of each other's way,
+        # new operations included (see _BusGate)
+        self._bus_gate = _BusGate()
         # serialises rescan() so overlapping snapshots publish in order
         self._rescan_lock = threading.Lock()
         # serialises saves of the bindings file, snapshot and write together
@@ -827,6 +958,10 @@ class GPhoto2Backend(CameraBackend):
             raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
             self._last_detected = list(detected)
+            # Stamped here because this is the single place the bus is ever
+            # enumerated, so every scan is dated no matter which caller asked
+            # for it. Callers hold _map_lock, which is what guards the stamp.
+            self._last_scanned_at = time.monotonic()
 
         present = {port for _model, port in detected}
         for port in list(serial_by_port):
@@ -852,7 +987,199 @@ class GPhoto2Backend(CameraBackend):
             self.logger.warning("[gphoto2] No cameras detected by autodetect().")
         return port_map
 
+    @contextlib.contextmanager
+    def _bus_quiet(self):
+        """Take the bus to ourselves, so a scan cannot race device I/O.
+
+        gp.Camera.autodetect() enumerates the USB devices' information, and
+        libgphoto2 does that without reference to whatever else this process
+        is talking to. What this attempts is to serialise that enumeration
+        against the backend's own camera operations, so that the two are never
+        in flight together.
+
+        The appliance's -52 (the device was not found at the port it was
+        looked for on) and -110 errors arrived against cameras that were
+        otherwise working, and an unserialised enumeration is one candidate
+        for them - but the error codes do not by themselves establish that
+        cause. -110 in particular is also what libgphoto2 returns for a
+        camera's own PTP DeviceBusy response, so it is not a diagnostic
+        equivalent of "two operations overlapped on one body". Serialising is
+        worth doing on its own terms; the log is not proof it was the
+        culprit.
+
+        Revalidating the map before the shutter cannot cover it either: a
+        capture has already passed that check and is holding the body while
+        the scan runs.
+
+        The invariant established here is _BusGate's, and only that one: for
+        the length of the yield, no camera operation is admitted, and every
+        operation that was admitted when this was called has finished. It
+        holds for a body that had never been used when the scan started as
+        much as for one already in hand, because a new operation has to pass
+        the same gate - which is the whole reason the gate exists rather than
+        a snapshot of the camera locks.
+
+        The camera locks that do exist are then taken too, in index order.
+        Under the gate they are free by construction; taking them still covers
+        the paths that hold a body without admission, all of which take it
+        non-blocking and give it straight back (see _session_in_use and
+        _take_port). Order is preserved throughout - admission, then camera
+        locks, then _map_lock, never the reverse - and _map_lock is released
+        before any camera lock is acquired.
+
+        Callers must hold neither operation admission nor a camera lock: a
+        thread that holds either would wait for itself. The paths that must
+        scan from inside a body go through _scan_bus_without_waiting instead,
+        which takes what it can without blocking.
+        """
+        with self._bus_gate.scan():
+            with contextlib.ExitStack() as held:
+                with self._map_lock:
+                    locks = [
+                        self._session_locks[index]
+                        for index in sorted(self._session_locks)
+                    ]
+                for lock in locks:
+                    held.enter_context(lock)
+                yield
+
+    @contextlib.contextmanager
+    def _camera_in_hand(self, camera_index: int):
+        """Admit one camera operation, then take that body's lock.
+
+        Every path that talks to a body through libgphoto2 goes through here.
+        Admission comes first and the body's lock second, which is what closes
+        the gap a lock-table barrier leaves: the lock may not exist yet, but
+        the gate does, so an operation on a body nothing has ever used still
+        cannot start underneath a scan.
+
+        Callers must hold no camera lock and no admission of their own; see
+        _BusGate.
+        """
+        with self._bus_gate.operation():
+            with self._get_camera_lock(camera_index):
+                yield
+
+    def _scan_bus(self):
+        """Re-enumerate the bus and publish the map, with the bus to ourselves.
+
+        The entry point for every scan that is asked for unconditionally and
+        can afford to wait. Callers must hold no camera lock and no operation
+        admission; see _bus_quiet.
+        """
+        with self._bus_quiet():
+            self._refresh_port_map()
+
+    def _scan_bus_unless_refreshed(self):
+        """Re-enumerate, unless another thread refreshed the map while we queued.
+
+        The freshness question has to be asked twice. Asking it only before
+        admission is asking it of a map that any number of other callers are
+        about to replace: two bodies polled about once a second each means
+        several callers routinely observe the same stale map, queue at the
+        gate, and then enumerate one after another without reconsidering the
+        timestamp the one in front of them just wrote. Retaking the question
+        under admission is what actually bounds the cost at one scan per
+        interval per process.
+
+        This is for the callers whose scan is conditional on the interval. An
+        explicitly forced re-detection - the operator's rescan() - does not
+        come through here and is never skipped.
+        """
+        with self._bus_quiet():
+            if self._bus_read_recently():
+                return
+            self._refresh_port_map()
+
+    def _scan_bus_without_waiting(self, skip: "int | None" = None):
+        """Re-enumerate now, quieting every body that can be had for free.
+
+        For the scans that must happen even though a body is in use, of which
+        there are two kinds:
+
+          - rescan(), the operator's lever. It is the recovery path for a
+            body that has wedged or dropped off USB, and a lever that waits
+            on the very body it is meant to recover is no lever at all - so
+            it publishes without waiting, which is the property its own
+            docstring turns on.
+          - a path that is already holding a body (`skip` is that index): the
+            first open at an index nothing has published for yet, and the
+            -105 recovery, where the ports really have changed underneath an
+            open. Neither may wait for the other bodies - a thread holding
+            one body and waiting for another is the deadlock the class's lock
+            order rules out - so they take what they can, the same way the
+            ownership rule in _take_port takes a second lock.
+
+        A body that is busy is named in the log and scanned around, which
+        leaves its operation overlapping the enumeration - exactly what
+        _bus_quiet exists to prevent. That is the deliberate trade on these
+        paths and on these paths only: they are rare and either
+        operator-initiated or already recovering from a failure. The
+        once-a-second poll that made this a problem passes the gate instead
+        (see is_camera_connected).
+        """
+        with contextlib.ExitStack() as held:
+            with self._map_lock:
+                others = [
+                    (index, self._session_locks[index])
+                    for index in sorted(self._session_locks)
+                    if index != skip
+                ]
+            busy = []
+            for index, lock in others:
+                if lock.acquire(blocking=False):
+                    held.callback(lock.release)
+                else:
+                    busy.append(index)
+            if busy:
+                self.logger.warning(
+                    f"[gphoto2] re-detecting the bus while {busy} are in use; "
+                    "this scan may disturb them, and cannot wait for them"
+                )
+            self._refresh_port_map()
+
+    def _bus_read_recently(self) -> bool:
+        """Has a scan succeeded inside the last interval?
+
+        This is the whole of freshness, and it is deliberately a question
+        about the last successful scan rather than about the map that scan
+        produced. "The bus was read and had nothing on it" is an answer, and
+        the state a rig sits in between sessions; asking whether anything is
+        published instead treats it as no answer, and puts a rig with nothing
+        plugged in - or one mid-way through a power-cycle - back to a full USB
+        enumeration on every poll, which is the cost _PORT_MAP_TTL_S exists to
+        remove.
+
+        The other half is kept: a map that has never been built has no
+        successful scan behind it (_last_scanned_at is still 0.0), so the
+        first question asked of this backend always reaches the bus.
+        """
+        with self._map_lock:
+            return self._last_scanned_at > 0.0 and (
+                time.monotonic() - self._last_scanned_at < _PORT_MAP_TTL_S
+            )
+
+    def _ensure_scanned(self):
+        """Publish a map before the caller takes a body's lock.
+
+        The lazy first scan belongs here, ahead of the per-camera lock, and
+        not inside _get_or_open_session: a scan under a body's lock is a scan
+        that cannot wait for the other body (see _bus_quiet), which is the
+        race this is all about. Every public entry point that goes on to hold
+        a body calls this first.
+        """
+        self._get_port_map()
+
     def _refresh_port_map(self):
+        """Enumerate the bus and publish what it says.
+
+        The scan happens under _map_lock, so callers must have established
+        the barrier first - _scan_bus for anything holding no body,
+        _scan_bus_without_waiting for the paths that cannot wait.
+        Taking camera locks in here instead would invert the documented lock
+        order and deadlock against any thread that holds a body and then
+        reaches for the map.
+        """
         with self._map_lock:
             self._port_map = self._build_port_map(self._pins, self._serial_by_port)
 
@@ -870,13 +1197,35 @@ class GPhoto2Backend(CameraBackend):
                 self._pins, self._serial_by_port, self._last_detected
             )
 
-    def _get_port_map(self) -> dict[int, tuple[str, str]]:
+    def _published_port_map(self) -> dict[int, tuple[str, str]]:
+        """The map as it stands, with no bus scan of its own.
+
+        This is the read for anything that already holds a body: a scan from
+        such a path cannot establish the barrier every scan needs (see
+        _bus_quiet), so a path holding a camera lock must never reach a read
+        that might scan. "As it stands" is also what those callers actually
+        want - they are checking their own session against what is published
+        now, not asking what is on the bus.
+        """
         with self._map_lock:
-            if not self._port_map:
-                self._port_map = self._build_port_map(
-                    self._pins, self._serial_by_port
-                )
             return dict(self._port_map)
+
+    def _get_port_map(self) -> dict[int, tuple[str, str]]:
+        """The map, detecting the bus if nothing is published and none was read.
+
+        The scan here is the lazy first one, so it is guarded on the interval
+        as well as on the map being empty: an empty map the bus was just read
+        for is an answer, and re-reading it would put the rescan() tail - and
+        a rig with nothing plugged in - back to a scan per call.
+
+        Callers must hold no camera lock, because that scan takes the
+        blocking barrier (see _bus_quiet).
+        """
+        published = self._published_port_map()
+        if published or self._bus_read_recently():
+            return published
+        self._scan_bus()
+        return self._published_port_map()
 
     def _learn_serial(self, camera_index: int, port: str, serial: str) -> bool:
         """Record that `port` answered `serial`, and pin the index if it is free.
@@ -974,8 +1323,9 @@ class GPhoto2Backend(CameraBackend):
     def _session_matches_map(self, camera_index: int) -> "_PTPSession | None":
         """Return the cached session for camera_index if the current map still backs it.
 
-        Reads the port map fresh on every call - via self._get_port_map() -
-        rather than accepting a map the caller copied earlier, because
+        Reads the port map fresh on every call - via
+        self._published_port_map() - rather than accepting a map the caller
+        copied earlier, because
         _refresh_port_map() can publish a new map at any time, outside
         _rescan_lock, and a caller's snapshot can predate that publish. A
         session validated against a stale snapshot could be closed for no
@@ -994,7 +1344,7 @@ class GPhoto2Backend(CameraBackend):
         session = self._sessions.get(camera_index)
         if session is None:
             return None
-        entry = self._get_port_map().get(camera_index)
+        entry = self._published_port_map().get(camera_index)
         if session._cam is not None and entry == (session.model, session.port):
             return session
         self.logger.info(
@@ -1004,6 +1354,62 @@ class GPhoto2Backend(CameraBackend):
         )
         self._close_session(camera_index)
         return None
+
+    def _session_in_use(self, camera_index: int) -> bool:
+        """Is something talking to this index's body right now?
+
+        The per-camera lock is the evidence: it is held for the length of a
+        capture, a preview or a session open, and nothing else takes it. A
+        body in the middle of that traffic is present - libgphoto2 would not
+        still be carrying the conversation otherwise - so the question is
+        answered from the lock and the cached session, and the bus is left
+        alone.
+
+        Which is the point twice over. A scan must not interrupt that traffic
+        (see _bus_quiet), and the frontend's once-a-second poll must not queue
+        behind it either: a capture can sit inside libgphoto2's USB timeouts
+        for the better part of a minute, and a status call that waits that
+        long is a frozen indicator on the one screen the operator is watching.
+
+        The lock is taken without blocking, so this never waits. A False means
+        "not answered from traffic in flight", not "not connected" - an idle
+        index falls through to the map, which is the better answer for it.
+
+        A True is weaker than it looks, and its caller must treat it as such.
+        What it establishes is that this index has a cached session and its
+        lock will not come free right now; it establishes neither successful
+        traffic nor agreement with the published map. A *disconnected* body's
+        operation can sit inside libgphoto2's USB timeouts holding that lock
+        for the better part of a minute, and a scan takes these locks too. So
+        is_camera_connected weighs it against the last scan rather than
+        letting it stand on its own.
+        """
+        lock = self._get_camera_lock(camera_index)
+        if lock.acquire(blocking=False):
+            lock.release()
+            return False
+        return camera_index in self._sessions
+
+    def _note_traffic(self, camera_index: int):
+        """Record that this index's body answered an operation successfully.
+
+        Stamped on completion, not on entry: what is being dated is evidence
+        that the body was there and talking, which an operation that has not
+        come back yet has not produced. Called with the body's own lock held,
+        so the order is camera lock then _map_lock as documented.
+        """
+        with self._map_lock:
+            self._last_traffic_at[camera_index] = time.monotonic()
+
+    def _traffic_outranks_last_scan(self, camera_index: int) -> bool:
+        """Is this index's last successful traffic newer than the last scan?
+
+        The tie goes to the scan. A scan that found nothing and a body that
+        answered at the same instant are not equally good evidence about the
+        present: the scan is the one that just looked at the whole bus.
+        """
+        with self._map_lock:
+            return self._last_traffic_at.get(camera_index, 0.0) > self._last_scanned_at
 
     def _claim_port(self, camera_index: int, port: str) -> "int | None":
         """Register a PTP claim on `port` for `camera_index`, or report the holder.
@@ -1121,12 +1527,18 @@ class GPhoto2Backend(CameraBackend):
             return session
 
         # The body is not the one this index is for. Release the claim first,
-        # then publish what was learned, then republish the map so the body
-        # turns up at the index it belongs to.
+        # then publish what was learned, then lay the map out again so the
+        # body turns up at the index it belongs to.
+        #
+        # Laid out from the detection already in hand, not from a new one:
+        # what changed here is identity knowledge, not which bodies are on
+        # the bus, so a fresh enumeration would be wasted - and this runs
+        # with this index's lock held, where a scan cannot take the barrier
+        # every scan needs (see _bus_quiet).
         session.close()
         self._release_port(camera_index, port)
         self._learn_serial(camera_index, port, serial)
-        self._refresh_port_map()
+        self._republish_port_map()
         raise CameraIdentityError(
             f"Camera {camera_index}: expected body {pinned!r}, found {serial!r}"
             + (f" (pinned to index {elsewhere})" if elsewhere is not None else "")
@@ -1169,7 +1581,10 @@ class GPhoto2Backend(CameraBackend):
             if port in known:
                 continue
             serial = ""
-            with self._get_camera_lock(camera_index):
+            # Admission per index, not for the whole pass: this loop can block
+            # on another index's lock, and holding the gate across that would
+            # hold off every scan for as long as that body is busy.
+            with self._camera_in_hand(camera_index):
                 session = self._session_matches_map(camera_index)
                 if session is not None:
                     serial = getattr(session, "serial", "") or ""
@@ -1190,7 +1605,7 @@ class GPhoto2Backend(CameraBackend):
                             session.serial = serial
                 else:
                     read_port = port
-                    if self._get_port_map().get(camera_index) != (model, port):
+                    if self._published_port_map().get(camera_index) != (model, port):
                         # The map moved on while this loop was waiting for the
                         # lock; opening (model, port) would claim a port
                         # nothing backs any more.
@@ -1262,7 +1677,14 @@ class GPhoto2Backend(CameraBackend):
         if existing is not None:
             return existing
 
-        port_map = self._get_port_map()
+        port_map = self._published_port_map()
+        if not port_map:
+            # Nothing published yet. Every public entry point scans through
+            # _ensure_scanned before it takes a body's lock, so this is the
+            # direct-caller path; the scan can only take the other bodies
+            # without blocking, because this thread is already holding one.
+            self._scan_bus_without_waiting(skip=camera_index)
+            port_map = self._published_port_map()
         if camera_index not in port_map:
             raise RuntimeError(
                 f"Camera index {camera_index} not found. "
@@ -1274,6 +1696,9 @@ class GPhoto2Backend(CameraBackend):
         try:
             session = self._open_identified_session(camera_index, model, port)
             self._sessions[camera_index] = session
+            # A session open is a PTP claim the body answered, so it dates
+            # this index's evidence (see _note_traffic).
+            self._note_traffic(camera_index)
             return session
         except gp.GPhoto2Error as exc:
             # -105 Unknown model usually means ports changed (USB re-enumeration
@@ -1283,8 +1708,11 @@ class GPhoto2Backend(CameraBackend):
                     f"[gphoto2] Camera {camera_index}: session init failed ({exc}). "
                     "Refreshing port map and retrying ..."
                 )
-                self._refresh_port_map()
-                port_map = self._get_port_map()
+                # A real re-enumeration, so the bus has to be read again -
+                # and this runs with this index's lock held, so it is read
+                # around whatever else is busy rather than waiting for it.
+                self._scan_bus_without_waiting(skip=camera_index)
+                port_map = self._published_port_map()
                 if camera_index not in port_map:
                     raise RuntimeError(
                         f"Camera index {camera_index} not found after port map refresh."
@@ -1292,11 +1720,17 @@ class GPhoto2Backend(CameraBackend):
                 model, port = port_map[camera_index]
                 session = self._open_identified_session(camera_index, model, port)
                 self._sessions[camera_index] = session
+                self._note_traffic(camera_index)
                 return session
             raise
 
     def _close_session(self, camera_index: int):
         session = self._sessions.pop(camera_index, None)
+        # Whatever this index's body last said, it said it through a session
+        # that is going away; the record of it must not outlive the session
+        # and vouch for whatever opens here next.
+        with self._map_lock:
+            self._last_traffic_at.pop(camera_index, None)
         if session is None:
             return
         try:
@@ -1314,26 +1748,62 @@ class GPhoto2Backend(CameraBackend):
     def is_camera_connected(self, camera_index: int = 0) -> bool:
         """Is a body present at this index right now?
 
-        Always re-detects, so a power-cycle since the last call is reflected.
-        A body that came back on a new port is unidentified at that point, so
-        the fresh map can only place it provisionally and this index would
-        read as disconnected. When - and only when - this index is pinned,
-        absent from the fresh map, and at least one published port has no
-        known body, the unidentified ports are read once and the map is laid
-        out again. That costs one brief PTP claim per re-enumeration, not one
-        per call, because the answer is cached; and it can only ever move a
-        body onto the index its own serial is pinned to. The one exception is
-        a rig in which not a single body from the saved bindings is present
-        (see _drop_seeded_pins_if_none_present): those reservations cannot
-        confuse anyone's left and right, so they are dropped rather than left
-        holding a working pair of cameras on provisional indices. A pin
-        learned in this process is never dropped here - only rescan(), which
-        the operator asks for, may do that.
+        The frontend asks this about once a second per body, so what it costs
+        matters as much as what it answers. Four cases, cheapest first:
+
+          - A body whose lock will not come free and whose own last
+            successful traffic postdates the last scan answers for itself:
+            the newest evidence about that index is its own, and reading it
+            costs nothing and waits for nothing (see _session_in_use and
+            _traffic_outranks_last_scan).
+          - A body whose lock will not come free but whose last successful
+            traffic predates the last scan is answered from the map as
+            published. A held lock is not evidence of presence on its own - a
+            disconnected body's operation can sit inside a USB timeout
+            holding it - so the scan, being newer, wins. This path still
+            neither waits nor scans: queueing here is the frozen indicator
+            the shortcut exists to avoid.
+          - While a scan has succeeded inside the interval
+            (_PORT_MAP_TTL_S) the answer comes from the map, with no scan.
+          - When the last scan has aged past the interval, a new one is
+            requested, behind the gate every scan takes (see _bus_quiet) and
+            with the interval re-examined once admitted, so concurrent
+            pollers cost one scan between them rather than one each. What
+            this bounds is how long a stale answer may stand before an
+            eligible check asks for a fresh one: a body that has been
+            power-cycled or unplugged is reported gone once the interval has
+            expired and a check asks. It is not a bound on detection latency
+            in general - a body in use bypasses the interval entirely by the
+            rule above, and a scan waits for the operations in flight, so a
+            long operation can delay the answer past the interval.
+          - A body that came back on a new port is unidentified at that
+            point, so the fresh map can only place it provisionally and this
+            index would read as disconnected. When - and only when - this
+            index is pinned, absent from the fresh map, and at least one
+            published port has no known body, the unidentified ports are read
+            once and the map is laid out again. That costs one brief PTP
+            claim per re-enumeration, not one per call, because the answer is
+            cached; and it can only ever move a body onto the index its own
+            serial is pinned to.
+
+        The one exception to that last rule is a rig in which not a single
+        body from the saved bindings is present (see
+        _drop_seeded_pins_if_none_present): those reservations cannot confuse
+        anyone's left and right, so they are dropped rather than left holding
+        a working pair of cameras on provisional indices. A pin learned in
+        this process is never dropped here - only rescan(), which the operator
+        asks for, may do that.
         """
         try:
-            # Always do a fresh detection so this method reflects reality even
-            # if cameras have been power-cycled since last call.
-            self._refresh_port_map()
+            if self._session_in_use(camera_index):
+                if self._traffic_outranks_last_scan(camera_index):
+                    return True
+                # The published map is the newer evidence. Answered from it as
+                # it stands, with no scan: a scan here would wait for the very
+                # operation that is holding this body.
+                return camera_index in self._published_port_map()
+            if not self._bus_read_recently():
+                self._scan_bus_unless_refreshed()
             with self._map_lock:
                 pinned = camera_index in self._pins
                 absent = camera_index not in self._port_map
@@ -1352,7 +1822,7 @@ class GPhoto2Backend(CameraBackend):
                     self._identify_unknown_ports()
                     self._drop_seeded_pins_if_none_present()
                 self._republish_port_map()
-            return camera_index in self._get_port_map()
+            return camera_index in self._published_port_map()
         except Exception as exc:
             self.logger.error(f"[gphoto2] is_camera_connected({camera_index}): {exc}")
             return False
@@ -1382,13 +1852,15 @@ class GPhoto2Backend(CameraBackend):
             RuntimeError: If the capture fails.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
-        lock = self._get_camera_lock(camera_index)
+        # Before admission and the lock, never inside them: see _ensure_scanned.
+        self._ensure_scanned()
 
-        with lock:
+        with self._camera_in_hand(camera_index):
             session = self._get_or_open_session(camera_index)
             try:
                 session.apply_dslr_config(camera_config)
                 elapsed, actual_path = session.capture(output_path)
+                self._note_traffic(camera_index)
                 self.logger.info(
                     f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"
@@ -1493,7 +1965,7 @@ class GPhoto2Backend(CameraBackend):
             serial = ""
             row_port = port
             row_model = model_raw
-            with self._get_camera_lock(idx):
+            with self._camera_in_hand(idx):
                 # Re-use an existing session, but only while the current map
                 # still backs it; a session on a stale port is closed here
                 # and the temporary read path below runs instead.
@@ -1523,7 +1995,7 @@ class GPhoto2Backend(CameraBackend):
                             idx, session.port, serial
                         ) or learned
                 else:
-                    current_entry = self._get_port_map().get(idx)
+                    current_entry = self._published_port_map().get(idx)
                     if current_entry != (model_raw, port):
                         # The current map disagrees with this row's
                         # snapshot; opening against (model_raw, port) would
@@ -1619,11 +2091,15 @@ class GPhoto2Backend(CameraBackend):
         constructor, and publishing first is what makes that harmless.
         Reconcile, and the list_devices() enumeration returned below, both
         read the port map fresh at the point of each check (see
-        _session_matches_map); a _refresh_port_map() from another caller
-        landing between this rescan's own publish and its reconcile is
-        honoured on that fresh read rather than masked by this rescan's own
-        snapshot. The rescan lock serialises overlapping rescans so their
-        snapshots publish in order rather than racing.
+        _session_matches_map); a publish from another caller landing between
+        this rescan's own publish and its reconcile is honoured on that fresh
+        read rather than masked by this rescan's own snapshot. The rescan lock
+        serialises overlapping rescans so their snapshots publish in order
+        rather than racing.
+
+        The operator asked for this, so it re-detects the bus whatever the
+        map's age - the scan interval in is_camera_connected is about not
+        scanning behind their back, not about making rescan wait.
 
         This is also the only place a pin may be dropped or moved. The order
         is: publish a provisional map; read a serial from every port whose
@@ -1641,7 +2117,9 @@ class GPhoto2Backend(CameraBackend):
             shape list_devices() returns.
         """
         with self._rescan_lock:
-            self._refresh_port_map()
+            # Without waiting: see _scan_bus_without_waiting for why the
+            # operator's lever does not queue behind a body in use.
+            self._scan_bus_without_waiting()
             self._identify_unknown_ports()
             self._drop_seeded_pins_if_none_present()
 
@@ -1682,7 +2160,7 @@ class GPhoto2Backend(CameraBackend):
 
             closed = []
             for idx in list(self._sessions):
-                with self._get_camera_lock(idx):
+                with self._camera_in_hand(idx):
                     if self._session_matches_map(idx) is None:
                         closed.append(idx)
 
@@ -1706,12 +2184,14 @@ class GPhoto2Backend(CameraBackend):
         The per-camera lock serialises preview and full-capture calls so they
         never interleave on the same session.
         """
-        lock = self._get_camera_lock(camera_index)
-        with lock:
+        # Before admission and the lock, never inside them: see _ensure_scanned.
+        self._ensure_scanned()
+        with self._camera_in_hand(camera_index):
             session = self._get_or_open_session(camera_index)
             try:
                 camera_file = session._cam.capture_preview()
                 data = camera_file.get_data_and_size()
+                self._note_traffic(camera_index)
                 return bytes(data)
             except gp.GPhoto2Error as exc:
                 self.logger.error(
@@ -1729,11 +2209,13 @@ class GPhoto2Backend(CameraBackend):
             iso (str | None), shutter_speed (str | None), aperture (str | None),
             image_format (str | None), focus_mode (str | None), flash_mode (str | None)
         """
-        lock = self._get_camera_lock(camera_index)
-        with lock:
+        # Before admission and the lock, never inside them: see _ensure_scanned.
+        self._ensure_scanned()
+        with self._camera_in_hand(camera_index):
             session = self._get_or_open_session(camera_index)
             try:
                 raw = session.get_info()
+                self._note_traffic(camera_index)
                 return {
                     "iso": raw.get("iso"),
                     "shutter_speed": raw.get("shutterspeed"),
@@ -1762,8 +2244,9 @@ class GPhoto2Backend(CameraBackend):
         Returns the full settings dict (same shape as get_dslr_settings) after
         applying the requested changes.
         """
-        lock = self._get_camera_lock(camera_index)
-        with lock:
+        # Before admission and the lock, never inside them: see _ensure_scanned.
+        self._ensure_scanned()
+        with self._camera_in_hand(camera_index):
             session = self._get_or_open_session(camera_index)
             try:
                 if settings.get("iso") is not None:
@@ -1779,6 +2262,7 @@ class GPhoto2Backend(CameraBackend):
                     session._set_config("imageformat", ptp_fmt)
                 # Return updated state
                 raw = session.get_info()
+                self._note_traffic(camera_index)
                 return {
                     "iso": raw.get("iso"),
                     "shutter_speed": raw.get("shutterspeed"),
