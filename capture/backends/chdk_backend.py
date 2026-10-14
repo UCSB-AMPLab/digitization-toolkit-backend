@@ -1445,12 +1445,16 @@ class ChdkBackend(CameraBackend):
 
         A viewport and a remote capture both need record mode, and the switch
         drives the lens, so it is done once per body rather than per frame -
-        which is exactly why it has to be confirmed. The library's
-        switch_mode polls for the camera to arrive and then returns whether
-        or not it did: its loop can run out and it reports that the same way
-        it reports success, by returning nothing. Taking the call as proof
-        would leave every later capture and live view running from playback,
-        with the flag set here suppressing any further attempt.
+        which is exactly why it has to be confirmed. pychdk 0.1.3's
+        switch_mode polls get_mode itself and raises once its retries run
+        out, so a switch that never arrived reaches this method as an
+        exception. 0.1.2, which this backend ran until the pin moved, did
+        not: its loop ran out and reported that the same way it reported
+        success, by returning nothing, which left every later capture and
+        live view running from playback with the flag set here suppressing
+        any further attempt. The second read below is what caught that, and
+        it stays - not against a camera, but against a library that returns
+        without the camera having arrived.
 
         So the camera is asked directly. The question is Lua, not uBASIC, and
         the two read opposite ways round: CHDK's Lua get_mode() returns three
