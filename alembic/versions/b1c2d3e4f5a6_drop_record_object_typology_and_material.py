@@ -1,28 +1,41 @@
 """drop records.object_typology and records.material
 
-Revision ID: b1c2d3e4f5a6
-Revises: a4b5c6d7e8f9
-Create Date: 2026-10-15 00:00:00.000000
+Removes two descriptive columns the interface never wrote (NEH-259).
 
-Removes the two descriptive columns an operator never filled (NEH-259).
+What the code establishes. The capture path is the only writer that sets
+object_typology to a fixed value: "document" for a single capture
+(app/api/cameras.py:798) and "book" for a dual one (:978). Both are restatements
+of capture_mode under another name, and the dual value is sometimes wrong -- a
+loose bifolium shot as an L+R pair came out as "book". Beyond that, POST
+/records/ accepted a client-supplied value for BOTH columns
+(app/api/records.py:91-93, app/schemas/record.py:153-155), so the model's wider
+vocabulary -- book, dossier, document, map, planimetry, other -- was reachable
+through the API. object_typology also had a query filter (records.py:131-132)
+and both columns went into the export dict (app/core/export_service.py:151).
+Neither name appears anywhere in the frontend source, so no value ever reached
+either column from the interface.
 
-object_typology was written only by the capture path, which hard-coded
-"document" for a single capture and "book" for a dual one. So it carried no
-information capture_mode did not already carry under its own name, and it was
-sometimes wrong: a loose bifolium shot as an L+R pair came out as "book".
-material had no writer, no UI and no reader, so it is NULL on every row of
-every unit.
+What the code cannot establish, and the data must. Whether any row on any unit
+holds an object_typology outside {document, book}, or a non-null material. Check
+before applying this to a unit that holds real captures:
 
-The loose/bound distinction that mattered stays, in capture_mode, which
-records how an item was shot rather than claiming what it is. Exported bags
-carry capture_mode in metadata.json from this revision on, so the preservation
-package does not lose the single-vs-dual distinction with the column.
+    SELECT object_typology, count(*) FROM records GROUP BY object_typology;
+    SELECT count(*) FROM records WHERE material IS NOT NULL;
 
-Downgrade restores both columns exactly as 19e2aefe5b17 created them, nullable
-and empty. It cannot restore object_typology's values, and since every value
-was derived from capture_mode, a caller that needs them can recompute them:
-"document" where capture_mode = 'single', "book" where it is 'dual'. material
-had no values to lose.
+A value outside that set is information this migration destroys, and the
+rehearsal against a restored appliance database is where that is settled -- see
+docs/releases/0.1.0-beta/migration-rehearsal.md in the workspace.
+
+The loose/bound distinction that mattered stays in capture_mode, which records
+how an item was shot rather than claiming what it is. Exported bags carry
+capture_mode in metadata.json from this revision on, so the preservation package
+does not lose the single-vs-dual distinction with the column.
+
+Downgrade restores both columns as 19e2aefe5b17 created them, nullable and
+empty. It cannot restore any value. For rows the capture path created the values
+are recomputable -- "document" where capture_mode = 'single', "book" where it is
+'dual' -- but that does not hold for a row created through POST /records/, whose
+value was whatever the caller sent.
 """
 from typing import Sequence, Union
 
