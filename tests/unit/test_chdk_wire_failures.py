@@ -160,12 +160,12 @@ def test_a_body_that_is_really_gone_is_not_looked_for_every_time(monkeypatch):
 
 @pytest.mark.unit
 def test_a_body_that_never_reaches_record_mode_does_not_capture(monkeypatch, tmp_path):
-    """The library's switch_mode returns whether or not the camera arrived.
+    """A body that never arrives must not be shot from playback.
 
-    Its confirmation loop can simply run out, and it reports that the same
-    way it reports success - by returning nothing. A backend that took the
-    call as proof would run every later capture and live view from playback,
-    with its own flag suppressing any further attempt to switch.
+    pychdk 0.1.3's switch_mode polls get_mode until its retries run out and
+    then raises, so this reaches the backend as a failed conversation during
+    the mode switch: the capture fails, no page is shot, and the body is
+    dropped like any other.
     """
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
     backend = make_backend(monkeypatch, make_pychdk(body))
@@ -174,7 +174,7 @@ def test_a_body_that_never_reaches_record_mode_does_not_capture(monkeypatch, tmp
     with pytest.raises(RuntimeError) as exc:
         backend.capture_image(tmp_path / "page.jpg", _config())
 
-    assert "play mode" in str(exc.value)
+    assert "did not switch to record" in str(exc.value)
     assert body.shots == [], "a page was shot from playback"
     assert body.closes == 1
 
@@ -191,7 +191,7 @@ def test_a_body_that_never_reaches_record_mode_shows_no_live_view(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         backend.capture_preview(0)
 
-    assert "play mode" in str(exc.value)
+    assert "did not switch to record" in str(exc.value)
     assert body.frames_served == 0
 
 
@@ -213,12 +213,20 @@ def test_the_polarity_of_get_mode_is_true_for_record_and_false_for_play(
     the answer is set here directly instead of being switched into.
 
     What this pins is the backend's reading of an answer it is handed. It
-    does not pin how the fake produces one: stuck_in_play=True is what lets
-    mode_value be set directly, and it bypasses the fake's own switch, so
-    inverting that assignment leaves these cases green. The test below
-    pins the fake instead, and the two together cover both halves.
+    does not pin how the fake produces one: switch_without_arriving=True
+    makes the fake's switch_mode return without touching mode_value, so the
+    answer read here is the one set below, and inverting the fake's own
+    assignment leaves these cases green. The test after this one pins the
+    fake instead, and the two together cover both halves.
+
+    That returning-without-arriving is also the only way to reach the
+    backend's second read at all. pychdk 0.1.3 raises instead, so what is
+    pinned here is the guard against a library that stops doing that.
     """
-    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
+    body = Body(
+        serial="AAA111", card=EVEN_CARD, image=JPEG,
+        switch_without_arriving=True,
+    )
     backend = make_backend(monkeypatch, make_pychdk(body))
     backend.list_devices()
     body.mode_value = is_record
