@@ -14,17 +14,18 @@ behaviours that decide whether that can happen again:
 * a failed run leaves no "verified today" marker, so the next tick retries it
   instead of silently skipping to tomorrow.
 
-The two external binaries are stubs written to tmp_path and injected through
-settings, so nothing here needs a real rclone, a real docker, or a real
-Postgres. Everything else — the gzip stream, the SHA1, the subprocess, the
-unlink — is the production path.
+The dump command is a stub written to tmp_path and injected through settings,
+and the offsite transport is faked at its two seam functions, upload() and
+listing_sha1(), over an in-memory bucket. Nothing here needs a real docker, a
+real Postgres or a real bucket, and nothing depends on how a transport is
+built. Everything else — the gzip stream, the SHA1, the subprocess, the unlink —
+is the production path.
 
     python -m pytest tests/unit/test_catalogue_backup.py
 """
 
 import gzip
 import hashlib
-import json
 import stat
 import textwrap
 from pathlib import Path
@@ -33,61 +34,8 @@ import pytest
 
 
 # ---------------------------------------------------------------------------
-# Stub binaries, injected by configuration
+# The dump stub, injected by configuration
 # ---------------------------------------------------------------------------
-
-_RCLONE_STUB = '''#!/usr/bin/env python3
-"""Stand-in for rclone. Serves one fake bucket directory out of STUB_BUCKET.
-
-Behaviour is steered by STUB_FAIL, a comma-separated set of:
-    copy    -> the upload fails
-    lsjson  -> the listing fails (the case that must abort the run)
-    corrupt -> the listing reports a SHA1 that is not the file's
-    absent  -> the listing omits the uploaded object
-"""
-import hashlib, json, os, shutil, sys
-
-bucket = os.environ["STUB_BUCKET"]
-fail = set(filter(None, os.environ.get("STUB_FAIL", "").split(",")))
-log = os.environ.get("STUB_LOG")
-if log:
-    with open(log, "a") as fh:
-        fh.write(json.dumps(sys.argv[1:]) + "\\n")
-
-verb = sys.argv[1] if len(sys.argv) > 1 else ""
-
-if verb == "copy":
-    if "copy" in fail:
-        sys.stderr.write("stub: upload refused\\n")
-        sys.exit(1)
-    src = sys.argv[2]
-    os.makedirs(bucket, exist_ok=True)
-    shutil.copy2(src, os.path.join(bucket, os.path.basename(src)))
-    sys.exit(0)
-
-if verb == "lsjson":
-    if "lsjson" in fail:
-        sys.stderr.write("stub: 401 Unauthorized\\n")
-        sys.exit(1)
-    rows = []
-    if not ("absent" in fail) and os.path.isdir(bucket):
-        for name in sorted(os.listdir(bucket)):
-            path = os.path.join(bucket, name)
-            h = hashlib.sha1()
-            with open(path, "rb") as fh:
-                for chunk in iter(lambda: fh.read(1 << 20), b""):
-                    h.update(chunk)
-            digest = "0" * 40 if "corrupt" in fail else h.hexdigest()
-            rows.append({
-                "Path": name, "Name": name, "Size": os.path.getsize(path),
-                "IsDir": False, "Hashes": {"sha1": digest},
-            })
-    sys.stdout.write(json.dumps(rows))
-    sys.exit(0)
-
-sys.stderr.write("stub: unsupported verb %r\\n" % verb)
-sys.exit(2)
-'''
 
 _PG_DUMP_STUB = '''#!/usr/bin/env python3
 """Stand-in for `docker compose exec -T db pg_dumpall`.
@@ -117,9 +65,60 @@ def _install(tmp_path: Path, name: str, source: str) -> Path:
     return path
 
 
+class FakeBucket:
+    """An in-memory bucket behind the two seam functions.
+
+    `objects` maps name -> sha1 of the bytes stored; `received` maps name -> the
+    bytes upload() was handed. Every change to the bucket is appended to
+    `mutations` as (operation, name), where an upload to a name that is already
+    present is recorded as "overwrite". The seam has no delete, so "delete" can
+    only appear if a future transport adds one.
+
+    Failure is steered by `fail(*modes)`:
+        upload   -> upload() raises BackupError
+        listing  -> listing_sha1() raises VerificationUnavailable (must abort)
+        corrupt  -> the listing reports a SHA1 that is not the object's
+        absent   -> the listing reports the uploaded object as missing
+    """
+
+    def __init__(self, module):
+        self.module = module
+        self.objects = {}
+        self.received = {}
+        self.mutations = []
+        self.upload_calls = []
+        self.listing_calls = []
+        self.modes = set()
+
+    def fail(self, *modes):
+        self.modes = set(modes)
+
+    def upload(self, local):
+        self.upload_calls.append(Path(local).name)
+        if "upload" in self.modes:
+            raise self.module.BackupError("fake: upload refused")
+        name = Path(local).name
+        data = Path(local).read_bytes()
+        self.mutations.append(("overwrite" if name in self.objects else "put", name))
+        self.received[name] = data
+        self.objects[name] = hashlib.sha1(data).hexdigest()
+
+    def listing_sha1(self, name):
+        self.listing_calls.append(name)
+        if "listing" in self.modes:
+            raise self.module.VerificationUnavailable(
+                "fake: could not list the bucket (401 Unauthorized)"
+            )
+        if "absent" in self.modes:
+            return None
+        if "corrupt" in self.modes:
+            return "0" * 40
+        return self.objects.get(name)
+
+
 @pytest.fixture
 def offsite(tmp_path, monkeypatch, db_session):
-    """Wire the backup module to stub binaries and a fake bucket directory.
+    """Wire the backup module to a stub dump command and a fake bucket.
 
     Depends on db_session so it runs *after* override_projects_root's
     importlib.reload of app.core.config — otherwise it would patch a Settings
@@ -127,45 +126,52 @@ def offsite(tmp_path, monkeypatch, db_session):
     """
     from app.core.config import settings
 
-    bucket = tmp_path / "bucket" / "db-backups"
     dump_tmp = tmp_path / "dtk" / "tmp"
     dump_tmp.mkdir(parents=True)
-    calls = tmp_path / "rclone-calls.jsonl"
 
-    rclone = _install(tmp_path, "rclone-stub", _RCLONE_STUB)
     pg_dump = _install(tmp_path, "pg-dump-stub", _PG_DUMP_STUB)
 
-    monkeypatch.setenv("STUB_BUCKET", str(bucket))
-    monkeypatch.setenv("STUB_LOG", str(calls))
-    monkeypatch.setenv("STUB_FAIL", "")
     monkeypatch.delenv("STUB_DUMP_FAIL", raising=False)
     monkeypatch.delenv("STUB_DUMP_EMPTY", raising=False)
 
     monkeypatch.setattr(settings, "OFFSITE_REMOTE", "b2stub:bucket", raising=False)
     monkeypatch.setattr(settings, "OFFSITE_DB_PREFIX", "db-backups", raising=False)
     monkeypatch.setattr(settings, "OFFSITE_BWLIMIT", "750k", raising=False)
-    monkeypatch.setattr(settings, "RCLONE_BIN", str(rclone), raising=False)
-    monkeypatch.setattr(settings, "RCLONE_CONFIG", "", raising=False)
     monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(pg_dump), raising=False)
 
     import app.core.catalogue_backup as cb
 
     monkeypatch.setattr(cb, "_dump_dir", lambda: dump_tmp)
 
+    # Kept so a test can put the module's own, unbuilt transport back.
+    unbuilt_upload, unbuilt_listing = cb.upload, cb.listing_sha1
+
+    bucket = FakeBucket(cb)
+    monkeypatch.setattr(cb, "upload", bucket.upload)
+    monkeypatch.setattr(cb, "listing_sha1", bucket.listing_sha1)
+
     class Harness:
         module = cb
-        bucket_dir = bucket
         dump_dir = dump_tmp
+        fail = staticmethod(bucket.fail)
+        real_upload = staticmethod(unbuilt_upload)
+        real_listing_sha1 = staticmethod(unbuilt_listing)
 
         @staticmethod
-        def fail(*modes):
-            monkeypatch.setenv("STUB_FAIL", ",".join(modes))
+        def objects():
+            return dict(bucket.objects)
 
         @staticmethod
-        def rclone_calls():
-            if not calls.exists():
-                return []
-            return [json.loads(line) for line in calls.read_text().splitlines()]
+        def received():
+            return dict(bucket.received)
+
+        @staticmethod
+        def mutations():
+            return list(bucket.mutations)
+
+        @staticmethod
+        def upload_calls():
+            return list(bucket.upload_calls)
 
         @staticmethod
         def leftovers():
@@ -182,7 +188,7 @@ def offsite(tmp_path, monkeypatch, db_session):
 def test_a_failed_listing_aborts_the_run(offsite, db_session):
     """A refused listing must abort, not be read as "the object is missing"."""
     cb = offsite.module
-    offsite.fail("lsjson")
+    offsite.fail("listing")
 
     result = cb.run_catalogue_backup(db_session)
 
@@ -202,7 +208,7 @@ def test_a_failed_listing_aborts_before_the_dump_is_removed(offsite, db_session,
     a "verified" path.
     """
     cb = offsite.module
-    offsite.fail("lsjson")
+    offsite.fail("listing")
 
     order = []
     real_unlink = Path.unlink
@@ -267,15 +273,15 @@ def test_a_verified_run_leaves_no_dump_on_the_card(offsite, db_session):
 
     assert result["status"] == "verified", result
     assert offsite.leftovers() == []
-    assert len(list(offsite.bucket_dir.iterdir())) == 1
+    assert len(offsite.objects()) == 1
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize(
     "arrange",
     [
-        pytest.param(lambda h, mp: h.fail("copy"), id="upload-refused"),
-        pytest.param(lambda h, mp: h.fail("lsjson"), id="listing-refused"),
+        pytest.param(lambda h, mp: h.fail("upload"), id="upload-refused"),
+        pytest.param(lambda h, mp: h.fail("listing"), id="listing-refused"),
         pytest.param(lambda h, mp: h.fail("corrupt"), id="digest-mismatch"),
         pytest.param(lambda h, mp: mp.setenv("STUB_DUMP_FAIL", "1"), id="dump-failed"),
         pytest.param(lambda h, mp: mp.setenv("STUB_DUMP_EMPTY", "1"), id="dump-empty"),
@@ -301,7 +307,7 @@ def test_an_empty_dump_is_refused_before_it_is_uploaded(offsite, db_session, mon
 
     assert result["status"] == "failed"
     assert "empty" in result["error"].lower()
-    assert [c for c in offsite.rclone_calls() if c and c[0] == "copy"] == []
+    assert offsite.upload_calls() == []
 
 
 # ---------------------------------------------------------------------------
@@ -317,14 +323,14 @@ def test_a_verified_run_is_not_repeated_the_same_day(offsite, db_session):
 
     assert first["status"] == "verified"
     assert second["status"] == "up-to-date"
-    assert len([c for c in offsite.rclone_calls() if c and c[0] == "copy"]) == 1
+    assert len(offsite.upload_calls()) == 1
 
 
 @pytest.mark.unit
 def test_a_failed_run_is_retried_on_the_next_tick(offsite, db_session):
     """No verified marker for today means the next run tries again."""
     cb = offsite.module
-    offsite.fail("lsjson")
+    offsite.fail("listing")
     assert cb.run_catalogue_backup(db_session)["status"] == "aborted"
 
     offsite.fail()
@@ -352,47 +358,84 @@ def test_a_verified_dump_from_an_earlier_day_does_not_satisfy_today(offsite, db_
 
 
 # ---------------------------------------------------------------------------
-# The commands we hand to rclone
+# The rule: nothing already offsite is removed or replaced
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, db_session):
-    """The scoped key is write + list: rclone's default destination HEAD 401s."""
+def test_nothing_in_a_run_removes_or_replaces_an_object_already_in_the_bucket(
+    offsite, db_session, monkeypatch
+):
+    """The key cannot delete or overwrite. Neither may the code try, on any path.
+
+    Runs the whole pipeline through success, a refused upload, a mismatched
+    digest, an absent object and a refused listing, with an object already in
+    the bucket, and asserts that the fake recorded only first-time puts of new
+    names and that the pre-existing object is untouched.
+    """
+    from datetime import datetime, timezone
+
     cb = offsite.module
-    cb.run_catalogue_backup(db_session)
+    pre_existing = "catalogue-19990101-000000.sql.gz"
+    # Seeded through the fake's own upload path so it is a genuine stored object.
+    seed = offsite.dump_dir / pre_existing
+    seed.write_bytes(b"an earlier dump")
+    cb.upload(seed)
+    seed.unlink()
+    before = offsite.objects()[pre_existing]
+    seeded = len(offsite.mutations())
 
-    copy = next(c for c in offsite.rclone_calls() if c and c[0] == "copy")
-    assert "--no-check-dest" in copy
-    assert "--bwlimit" in copy
-    assert copy[copy.index("--bwlimit") + 1] == "750k"
+    # A distinct name per run, as in production where runs are separate ticks.
+    ticks = iter(range(100))
 
+    class _Clock(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 1, 12, 0, next(ticks), tzinfo=tz or timezone.utc)
 
-@pytest.mark.unit
-def test_the_listing_asks_for_sha1_hashes(offsite, db_session):
-    cb = offsite.module
-    cb.run_catalogue_backup(db_session)
+    monkeypatch.setattr(cb, "datetime", _Clock)
 
-    ls = next(c for c in offsite.rclone_calls() if c and c[0] == "lsjson")
-    assert "--hash" in ls
-    assert ls[ls.index("--hash-type") + 1] == "sha1"
-
-
-@pytest.mark.unit
-def test_nothing_in_the_pipeline_asks_rclone_to_remove_anything(offsite, db_session):
-    """The key cannot delete. Neither may the code try, on any path."""
-    cb = offsite.module
-    forbidden = {
-        "delete", "deletefile", "purge", "rmdir", "rmdirs", "sync", "move",
-        "moveto", "--delete-before", "--delete-during", "--delete-after",
-        "--delete-excluded",
-    }
-
-    for arrange in (lambda: None, lambda: offsite.fail("corrupt"), lambda: offsite.fail("absent")):
-        arrange()
+    for mode in ((), ("corrupt",), ("absent",), ("listing",), ("upload",)):
+        offsite.fail(*mode)
         cb.run_catalogue_backup(db_session)
+    offsite.fail()
+    cb.run_catalogue_backup(db_session)
 
-    for call in offsite.rclone_calls():
-        assert not (set(call) & forbidden), call
+    recorded = offsite.mutations()[seeded:]
+    assert recorded, "the runs should have uploaded something"
+    assert {op for op, _ in recorded} == {"put"}, recorded
+    assert pre_existing not in {name for _, name in recorded}
+    assert offsite.objects()[pre_existing] == before
+
+
+# ---------------------------------------------------------------------------
+# The transport that is not built yet fails through the module's own contracts
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_unbuilt_upload_is_a_failed_run_that_leaves_no_marker(offsite, db_session, monkeypatch):
+    cb = offsite.module
+    monkeypatch.setattr(cb, "upload", offsite.real_upload)
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "failed", result
+    assert "not built" in result["error"]
+    assert cb.last_verified_backup(db_session) is None
+    assert cb.needs_run_today(db_session) is True
+    assert offsite.leftovers() == []
+
+
+@pytest.mark.unit
+def test_the_unbuilt_listing_aborts_the_run_and_leaves_no_dump(offsite, db_session, monkeypatch):
+    cb = offsite.module
+    monkeypatch.setattr(cb, "listing_sha1", offsite.real_listing_sha1)
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "aborted", result
+    assert "not built" in result["error"]
+    assert cb.last_verified_backup(db_session) is None
+    assert offsite.leftovers() == []
 
 
 @pytest.mark.unit
@@ -448,14 +491,19 @@ def test_an_explicit_dump_command_overrides_the_default(monkeypatch):
 
 @pytest.mark.unit
 def test_the_uploaded_object_is_the_gzipped_dump(offsite, db_session):
+    """The bytes handed to upload() are the dump, and their digest is the one
+    verification compares against the listing."""
     cb = offsite.module
     result = cb.run_catalogue_backup(db_session)
 
-    uploaded = next(offsite.bucket_dir.iterdir())
-    assert uploaded.name.endswith(".sql.gz")
-    body = gzip.decompress(uploaded.read_bytes()).decode()
+    assert result["status"] == "verified", result
+    received = offsite.received()
+    assert list(received) == [result["object"]]
+    assert result["object"].endswith(".sql.gz")
+    body = gzip.decompress(received[result["object"]]).decode()
     assert "stub catalogue dump" in body
-    assert hashlib.sha1(uploaded.read_bytes()).hexdigest() == result["sha1"]
+    assert hashlib.sha1(received[result["object"]]).hexdigest() == result["sha1"]
+    assert offsite.objects()[result["object"]] == result["sha1"]
 
 
 @pytest.mark.unit
@@ -466,7 +514,7 @@ def test_the_run_is_disabled_without_a_configured_remote(offsite, db_session, mo
     monkeypatch.setattr(settings, "OFFSITE_REMOTE", "", raising=False)
 
     assert cb.run_catalogue_backup(db_session)["status"] == "disabled"
-    assert offsite.rclone_calls() == []
+    assert offsite.upload_calls() == []
 
 
 @pytest.mark.unit
