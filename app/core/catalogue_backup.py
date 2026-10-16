@@ -9,7 +9,7 @@ only on a card that was failing writes.
 Shape of a run:
 
 1. dump the catalogue through gzip to a temporary file under the data dir;
-2. upload it on the images' credential, under the shared bandwidth cap;
+2. upload it on the images' credential and bandwidth cap, through rclone;
 3. verify the local digest against the SHA1 the bucket listing reports;
 4. record the verified run in ``system_logs``, which is both the operator's
    view and the date marker that decides whether today still needs a run;
@@ -31,17 +31,11 @@ Three rules it is built around:
 
 Nothing here deletes or overwrites anything on the remote, and the key is
 scoped so that it could not.
-
-**The transport is not built yet.** ``upload`` and ``listing_sha1`` are the
-only two operations this module needs from it, and both raise until they are
-implemented against b2sdk, which the 2026-09-14 decision settled on and
-which is not yet a pinned dependency. Everything else here — the dump, the
-digest, the marker, the ordering rules above — is transport-agnostic and
-tested. Do not schedule this module until those two functions exist.
 """
 
 import gzip
 import hashlib
+import json
 import logging
 import shlex
 import subprocess
@@ -79,6 +73,8 @@ _COMPOSE_FILES = ("../docker-compose.yml", "../docker-compose.pi.yml")
 _MIN_DUMP_BYTES = 100
 
 _DUMP_TIMEOUT_SECONDS = 15 * 60
+_UPLOAD_TIMEOUT_SECONDS = 60 * 60
+_LISTING_TIMEOUT_SECONDS = 120
 
 
 class BackupError(Exception):
@@ -120,8 +116,15 @@ def dump_argv() -> list[str]:
     return argv
 
 
+def _rclone_argv(*args: str) -> list[str]:
+    argv = [config.settings.RCLONE_BIN, *args]
+    config_path = config.settings.RCLONE_CONFIG.strip()
+    if config_path:
+        argv += ["--config", config_path]
+    return argv
+
+
 def remote_dir() -> str:
-    """Bucket and key prefix the dumps land under."""
     prefix = config.settings.OFFSITE_DB_PREFIX.strip("/")
     remote = config.settings.OFFSITE_REMOTE.rstrip("/")
     return f"{remote}/{prefix}" if prefix else remote
@@ -203,32 +206,58 @@ def write_dump(dest: Path) -> tuple[int, str]:
 
 
 def upload(local: Path) -> None:
-    """Copy one file to the bucket. Copy only: nothing here may remove anything.
+    """Copy one file to the bucket. Copy only: nothing here can remove anything.
 
-    Not implemented. The b2sdk upload goes here, needing only `writeFiles`, and
-    carrying the OFFSITE_BWLIMIT cap itself because b2sdk has no bandwidth
-    limiting of its own. It is blocking and threaded, so it must not run on the
-    event loop.
+    --no-check-dest because rclone's default destination HEAD needs readFiles
+    and answers 401 against this write+list key. It cost the first attempt.
     """
-    raise BackupError(
-        "the offsite transport is not built: upload() has no implementation "
-        "(NEH-249, pending the b2sdk dependency)"
+    argv = _rclone_argv(
+        "copy",
+        str(local),
+        remote_dir() + "/",
+        "--no-check-dest",
+        "--bwlimit",
+        config.settings.OFFSITE_BWLIMIT,
     )
+    result = subprocess.run(
+        argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=_UPLOAD_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise BackupError(f"the upload failed (rc={result.returncode}): {stderr[:300]}")
 
 
 def listing_sha1(name: str) -> Optional[str]:
     """The SHA1 the bucket listing reports for `name`, or None if absent.
 
-    Not implemented. It must raise VerificationUnavailable whenever the listing
-    does not answer, because an empty result from a refused call looks exactly
-    like an absent object. b2sdk's ``get_content_sha1()`` reads the stored SHA1
-    and falls back to the ``large_file_sha1`` fileInfo key when B2 stores
-    ``none``, which is the awkward half of this check.
+    Raises VerificationUnavailable when the listing itself does not answer: an
+    empty result from a refused call looks exactly like an absent object.
     """
-    raise VerificationUnavailable(
-        "the offsite transport is not built: listing_sha1() has no "
-        "implementation (NEH-249, pending the b2sdk dependency)"
+    argv = _rclone_argv(
+        "lsjson", "--hash", "--hash-type", "sha1", remote_dir() + "/",
     )
+    result = subprocess.run(
+        argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+        timeout=_LISTING_TIMEOUT_SECONDS,
+    )
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise VerificationUnavailable(
+            f"could not list {remote_dir()} (rc={result.returncode}): {stderr[:300]}"
+        )
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise VerificationUnavailable(
+            f"unreadable listing for {remote_dir()}: {exc}"
+        ) from exc
+    for row in rows:
+        if row.get("IsDir"):
+            continue
+        if row.get("Name") == name:
+            return (row.get("Hashes") or {}).get("sha1")
+    return None
 
 
 def verify_against_listing(name: str, local_sha1: str) -> None:

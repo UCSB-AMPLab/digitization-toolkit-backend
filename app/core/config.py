@@ -28,16 +28,16 @@ class Settings(BaseSettings):
 
     # Offsite catalogue backup (NEH-249). Empty OFFSITE_REMOTE disables the
     # whole path, so a unit without provisioned credentials does nothing rather
-    # than failing a timer every half hour. The value is the destination bucket;
-    # the scoped key behind it is write + list only, with no read and no delete,
-    # which is why verification reads the SHA1 from a listing.
+    # than failing a timer every half hour. The remote name is an rclone remote
+    # plus bucket, e.g. "b2unit:neogranadina-rionegro"; the scoped key behind it
+    # is write + list only, which is why the upload skips the destination check.
     OFFSITE_REMOTE: str = Field(default="", validation_alias="DTK_OFFSITE_REMOTE")
     OFFSITE_DB_PREFIX: str = Field(default="db-backups", validation_alias="DTK_OFFSITE_DB_PREFIX")
     # The interim push on the Rionegro unit has run at 750 KB/s since 2026-08-20
     # over a ~12 Mbps link without starving the UI; its settings are the defaults.
-    # b2sdk has no bandwidth limiting of its own, so this cap is ours to apply on
-    # the read side. The unit becomes bytes/second when that lands.
     OFFSITE_BWLIMIT: str = Field(default="750k", validation_alias="DTK_OFFSITE_BWLIMIT")
+    RCLONE_BIN: str = Field(default="rclone", validation_alias="DTK_RCLONE_BIN")
+    RCLONE_CONFIG: str = Field(default="", validation_alias="DTK_RCLONE_CONFIG")
     # Overrides the default `docker compose exec -T db pg_dumpall` argv. Needed
     # anywhere the appliance's compose overlay is not one directory up — a dev
     # box, a container, or a host with a real postgres client on PATH.
@@ -50,7 +50,22 @@ class Settings(BaseSettings):
     app_version: str = "0.0.0-dev"
 
     model_config = SettingsConfigDict(
-        env_file="../.env",  # Load .env from project root when running from backend/
+        # Two files, and the LATER one wins on a conflict. Verified on the pinned
+        # pydantic-settings 2.7.0: both are read, a key in the second overrides
+        # the first, and a missing file in the tuple is tolerated silently.
+        #
+        # The split exists because generate-secrets.sh rotates DATABASE_PASSWORD
+        # and republishes .env per unit. A provisioner holding an older snapshot
+        # of that file could restore the old password with every key name still
+        # matching, so every check would pass and the next start could not
+        # authenticate. Two writers to one file cannot be made safe from inside
+        # one of them, so provisioning owns a file of its own.
+        #
+        # offsite.env is written WHOLE by scripts/provision-rclone.sh alone, and
+        # holds only DTK_OFFSITE_* and DTK_RCLONE_* keys. Absent on a unit that
+        # has never been provisioned, which is why a missing file must not be an
+        # error.
+        env_file=("../.env", "/var/lib/dtk/offsite.env"),
         env_file_encoding="utf-8",
         extra="ignore"  # Ignore extra fields from .env like uvicorn_host
     )

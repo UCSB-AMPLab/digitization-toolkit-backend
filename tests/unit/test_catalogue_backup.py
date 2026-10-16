@@ -143,8 +143,9 @@ def offsite(tmp_path, monkeypatch, db_session):
 
     monkeypatch.setattr(cb, "_dump_dir", lambda: dump_tmp)
 
-    # Kept so a test can put the module's own, unbuilt transport back.
-    unbuilt_upload, unbuilt_listing = cb.upload, cb.listing_sha1
+    # Kept so a test can call the module's own rclone transport directly,
+    # with subprocess captured, instead of going through the fake bucket.
+    real_upload_fn, real_listing_fn = cb.upload, cb.listing_sha1
 
     bucket = FakeBucket(cb)
     monkeypatch.setattr(cb, "upload", bucket.upload)
@@ -154,8 +155,8 @@ def offsite(tmp_path, monkeypatch, db_session):
         module = cb
         dump_dir = dump_tmp
         fail = staticmethod(bucket.fail)
-        real_upload = staticmethod(unbuilt_upload)
-        real_listing_sha1 = staticmethod(unbuilt_listing)
+        real_upload = staticmethod(real_upload_fn)
+        real_listing_sha1 = staticmethod(real_listing_fn)
 
         @staticmethod
         def objects():
@@ -408,35 +409,8 @@ def test_nothing_in_a_run_removes_or_replaces_an_object_already_in_the_bucket(
 
 
 # ---------------------------------------------------------------------------
-# The transport that is not built yet fails through the module's own contracts
+# The rclone invocation itself, called directly with subprocess captured
 # ---------------------------------------------------------------------------
-
-@pytest.mark.unit
-def test_the_unbuilt_upload_is_a_failed_run_that_leaves_no_marker(offsite, db_session, monkeypatch):
-    cb = offsite.module
-    monkeypatch.setattr(cb, "upload", offsite.real_upload)
-
-    result = cb.run_catalogue_backup(db_session)
-
-    assert result["status"] == "failed", result
-    assert "not built" in result["error"]
-    assert cb.last_verified_backup(db_session) is None
-    assert cb.needs_run_today(db_session) is True
-    assert offsite.leftovers() == []
-
-
-@pytest.mark.unit
-def test_the_unbuilt_listing_aborts_the_run_and_leaves_no_dump(offsite, db_session, monkeypatch):
-    cb = offsite.module
-    monkeypatch.setattr(cb, "listing_sha1", offsite.real_listing_sha1)
-
-    result = cb.run_catalogue_backup(db_session)
-
-    assert result["status"] == "aborted", result
-    assert "not built" in result["error"]
-    assert cb.last_verified_backup(db_session) is None
-    assert offsite.leftovers() == []
-
 
 @pytest.mark.unit
 def test_the_default_dump_goes_through_the_database_container(monkeypatch):
@@ -587,3 +561,62 @@ def test_the_status_endpoint_is_read_only(offsite, reader_client):
     for method in ("post", "put", "patch", "delete"):
         response = getattr(reader_client, method)("/system/catalogue-backup")
         assert response.status_code == 405, (method, response.status_code)
+
+@pytest.fixture
+def rclone_argv(offsite, monkeypatch):
+    """Capture the argv of every rclone call the real transport makes."""
+    cb = offsite.module
+    calls = []
+
+    class Result:
+        returncode = 0
+        stdout = "[]"
+        stderr = ""
+
+    def fake_run(argv, **kwargs):
+        calls.append(list(argv))
+        return Result()
+
+    monkeypatch.setattr(cb.subprocess, "run", fake_run)
+    return calls
+
+
+@pytest.mark.unit
+def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, rclone_argv):
+    """The scoped key is write + list: rclone's default destination HEAD 401s."""
+    dump = offsite.dump_dir / "dtk-catalogue-20261016-000000.sql.gz"
+    dump.write_bytes(b"x")
+
+    offsite.real_upload(dump)
+
+    copy = next(c for c in rclone_argv if "copy" in c)
+    assert "--no-check-dest" in copy
+    assert copy[copy.index("--bwlimit") + 1] == "750k"
+
+
+@pytest.mark.unit
+def test_the_listing_asks_for_sha1_hashes(offsite, rclone_argv):
+    offsite.real_listing_sha1("dtk-catalogue-20261016-000000.sql.gz")
+
+    ls = next(c for c in rclone_argv if "lsjson" in c)
+    assert "--hash" in ls
+    assert ls[ls.index("--hash-type") + 1] == "sha1"
+
+
+@pytest.mark.unit
+def test_neither_transport_call_asks_rclone_to_remove_anything(offsite, rclone_argv):
+    """The key cannot delete. Neither may the code ask it to, on any path."""
+    forbidden = {
+        "delete", "deletefile", "purge", "rmdir", "rmdirs", "sync", "move",
+        "moveto", "--delete-before", "--delete-during", "--delete-after",
+        "--delete-excluded",
+    }
+
+    dump = offsite.dump_dir / "dtk-catalogue-20261016-000000.sql.gz"
+    dump.write_bytes(b"x")
+    offsite.real_upload(dump)
+    offsite.real_listing_sha1(dump.name)
+
+    assert rclone_argv
+    for call in rclone_argv:
+        assert not (set(call) & forbidden), call
