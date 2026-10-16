@@ -25,6 +25,12 @@ logger = logging.getLogger(__name__)
 EXPORT_KEEP = 3
 # Free-space safety margin on top of the estimated bag size.
 FREE_SPACE_MARGIN = 100 * 1024 * 1024
+# Shape of metadata.json inside an exported bag. Bump it whenever a key is
+# added, removed or re-typed, so a receiving institution can tell which shape
+# a bag holds. Bags already exported are never rewritten: a bag with no
+# schema_version at all predates NEH-259, when the field was introduced
+# alongside the removal of object_typology and material.
+METADATA_SCHEMA_VERSION = 1
 
 
 def run_export(job: ExportJob, collection_id: int) -> None:
@@ -134,6 +140,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
 
 def _metadata_payload(collection, project, records, timestamp) -> dict:
     return {
+        "schema_version": METADATA_SCHEMA_VERSION,
         "exported_at": timestamp,
         "collection": {
             "id": collection.id,
@@ -148,8 +155,12 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
         "records": [
             {
                 "id": r.id, "sequence": r.sequence, "title": r.title, "description": r.description,
-                "object_typology": r.object_typology, "author": r.author, "material": r.material,
-                "date": r.date, "status": r.status, "created_by": r.created_by,
+                "author": r.author, "date": r.date, "status": r.status,
+                # NEH-259: object_typology and material are gone. capture_mode
+                # takes their place here because it is the only record of
+                # whether an item was shot as one image or as an L+R pair, and
+                # a receiving institution needs that to read the images.
+                "capture_mode": r.capture_mode, "created_by": r.created_by,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "images": [
                     {

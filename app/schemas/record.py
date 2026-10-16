@@ -150,9 +150,7 @@ class RecordImageRead(RecordImageBase):
 class RecordBase(BaseModel):
 	title: str
 	description: Optional[str] = None
-	object_typology: Optional[str] = None  # book, dossier, document, map, planimetry, other
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
 	status: RecordStatus = "in_review"
@@ -179,9 +177,7 @@ class RecordCreate(RecordBase):
 class RecordUpdate(BaseModel):
 	title: Optional[str] = None
 	description: Optional[str] = None
-	object_typology: Optional[str] = None
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None
 	project_id: Optional[int] = None

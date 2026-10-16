@@ -88,9 +88,7 @@ def create_record(
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
-		object_typology=rec_in.object_typology,
 		author=rec_in.author,
-		material=rec_in.material,
 		date=rec_in.date,
 		custom_attributes=rec_in.custom_attributes,
 		project_id=rec_in.project_id,
@@ -115,7 +113,6 @@ def list_records(
 	limit: int = Query(default=100, ge=1, le=1000),
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
-	object_typology: Optional[str] = Query(default=None, description="Filter by object type"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
@@ -128,8 +125,6 @@ def list_records(
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
 		query = query.filter(Record.collection_id == collection_id)
-	if object_typology is not None:
-		query = query.filter(Record.object_typology == object_typology)
 	if orphaned is True:
 		query = query.filter(Record.project_id == None, Record.collection_id == None)
 	

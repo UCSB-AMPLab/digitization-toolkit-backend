@@ -16,10 +16,10 @@ class Record(Base):
 	title = Column(String(255), nullable=False)
 	description = Column(Text, nullable=True)
 	
-	# Archival/descriptive metadata
-	object_typology = Column(String(50), nullable=True)  # book, dossier, document, map, planimetry, other
+	# Archival/descriptive metadata. object_typology and material were dropped
+	# in NEH-259: the first was hard-coded by the capture path and duplicated
+	# capture_mode, the second never had a writer or a UI.
 	author = Column(String(255), nullable=True)
-	material = Column(String(255), nullable=True)
 	date = Column(String(50), nullable=True)
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
 	
