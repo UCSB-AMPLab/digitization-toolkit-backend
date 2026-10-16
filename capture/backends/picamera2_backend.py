@@ -4,12 +4,27 @@ Picamera2-based camera backend.
 This backend uses the official picamera2 Python library which provides
 direct access to libcamera. It supports advanced features like streaming,
 live preview, and dynamic settings adjustment.
+
+The unzoomed crop
+-----------------
+"Unzoomed" here means the *configuration's own default ScalerCrop*, not the
+pixel array. libcamera's rpi pipeline shapes the initial crop to the output's
+aspect ratio, so a 16:9 output configuration taken off a 4:3 readout starts on
+a centred 16:9 band and can never reach the full array. Preview, zoom and
+still therefore all reference that default rectangle: ``_ensure_configured``
+reads it from ``camera_controls["ScalerCrop"][2]`` and pins it explicitly on
+every (re)configure, ``apply_zoom`` crops inside it, and a still waits for a
+frame actually exposed at it. Bench item B14 confirms the band on the
+appliance.
 """
 
+import os
 import sys
+import tempfile
 import time
 import threading
 from pathlib import Path
+from typing import Optional, Tuple
 
 # Only import picamera2/libcamera on Linux (inside Docker/Raspberry Pi).
 # Catch ValueError too: a numpy ABI mismatch in simplejpeg raises ValueError
@@ -35,7 +50,77 @@ if sys.platform == "linux":
 
 
 from .base import CameraBackend
+from ..camera import CameraConfig, IMG_SIZES
 from ..utils import atomic_write
+
+# Per-value slack, in sensor pixels, when comparing a reported ScalerCrop with
+# the rectangle that was asked for. libcamera aligns crop rectangles to
+# hardware granularity, so an accepted crop can come back a few pixels off in
+# any of the four values. Small enough to reject the 1.005x that apply_zoom
+# permits, which moves the width of a 4656-wide array by 24 px.
+_CROP_ALIGN_PX = 16
+
+# Frames a still may discard while waiting for the unzoomed reset to take
+# effect. Controls apply with a pipeline delay, so the first request handed
+# back can still be a frame completed under the preview's zoom.
+_UNZOOMED_MAX_FRAMES = 8
+
+
+def _crop_rect(crop) -> Tuple[int, int, int, int]:
+    """(x, y, width, height) of a ScalerCrop value, however the build reports it.
+
+    picamera2 normally hands rectangles back as (x, y, w, h) sequences, but a
+    libcamera Rectangle object with x/y/width/height attributes is accepted
+    too, so the crop comparison never fails on the shape of the value.
+    """
+    width = getattr(crop, "width", None)
+    height = getattr(crop, "height", None)
+    if width is not None and height is not None:
+        return (int(getattr(crop, "x", 0)), int(getattr(crop, "y", 0)),
+                int(width), int(height))
+    return (int(crop[0]), int(crop[1]), int(crop[2]), int(crop[3]))
+
+
+def _crop_size(crop) -> Tuple[int, int]:
+    """(width, height) of a ScalerCrop value, however the build reports it."""
+    return _crop_rect(crop)[2:]
+
+
+def _crops_match(a, b, tolerance: int = _CROP_ALIGN_PX) -> bool:
+    """True when two rectangles agree on all four values within ``tolerance``.
+
+    All four, not just the dimensions: a crop of the right size in the wrong
+    place is a different field of view.
+    """
+    return all(abs(int(a[i]) - int(b[i])) <= tolerance for i in range(4))
+
+
+def preview_stream_size(
+    img_size: Tuple[int, int], max_width: int = 1280
+) -> Tuple[int, int]:
+    """Size of the preview stream that rides alongside a still of ``img_size``.
+
+    The preview keeps the still's aspect ratio so the operator frames the page
+    against exactly what the capture records. Both dimensions are rounded down
+    to even numbers because YUV420 subsamples chroma 2x2, and the result is
+    never larger than the still itself.
+
+    Args:
+        img_size: The still's (width, height).
+        max_width: Widest preview to produce.
+
+    Returns:
+        The preview (width, height); ``img_size`` unchanged when the still is
+        already no wider than ``max_width``.
+    """
+    width, height = int(img_size[0]), int(img_size[1])
+    if width <= max_width:
+        return (width, height)
+
+    scaled_height = (height * max_width) // width
+    even_width = max_width - (max_width % 2)
+    even_height = scaled_height - (scaled_height % 2)
+    return (max(even_width, 2), max(even_height, 2))
 
 
 class Picamera2Backend(CameraBackend):
@@ -74,6 +159,9 @@ class Picamera2Backend(CameraBackend):
         self._camera_info = None
         self._last_configs = {}  # Track last configuration for each camera
         self._format_mode = {}  # Track format mode per camera (YUV420 vs RGB888)
+        # The configuration's own default ScalerCrop per camera - see the
+        # module docstring. Preview, zoom and still all reference it.
+        self._unzoomed_crop: dict = {}
         # Per-camera mutex: serialises preview polling and full captures so they
         # never call capture_request() on the same Picamera2 instance simultaneously.
         self._camera_locks: dict = {}
@@ -297,6 +385,237 @@ class Picamera2Backend(CameraBackend):
         with lock:
             return self._capture_image_locked(output_path, camera_config, capture_output)
 
+    @staticmethod
+    def _uses_yuv(camera_config) -> bool:
+        """True when the capture goes out as YUV420 rather than RGB888.
+
+        YUV420 is faster and uses less memory for JPEG; RGB888 is needed for
+        PNG or whenever a raw/DNG stream is also requested.
+        """
+        return camera_config.encoding in ["jpg", "jpeg"] and not camera_config.raw
+
+    def _still_config_args(self, camera_config) -> dict:
+        """Build the create_still_configuration() keyword arguments.
+
+        Every still configuration also declares a ``lores`` stream sized by
+        ``preview_stream_size``. The lores stream shares the sensor mode and
+        the ScalerCrop of ``main``, so a preview read from it shows exactly the
+        field of view the capture records, and a preview and a still of the
+        same size need only one configuration between them.
+        """
+        use_yuv = self._uses_yuv(camera_config)
+
+        config_args = {
+            "main": {
+                "size": camera_config.img_size,
+                "format": "YUV420" if use_yuv else "RGB888"
+            },
+            "lores": {
+                "size": preview_stream_size(camera_config.img_size),
+                "format": "YUV420",
+            },
+            "buffer_count": camera_config.buffer_count,
+        }
+
+        # Add raw stream if DNG capture requested
+        if camera_config.raw:
+            config_args["raw"] = {}  # Enable raw stream for DNG
+
+        # Apply transformations (flip)
+        if camera_config.hflip or camera_config.vflip:
+            if Transform is None:
+                raise RuntimeError("Transform requires Linux")
+            hflip = 1 if camera_config.hflip else 0
+            vflip = 1 if camera_config.vflip else 0
+            config_args["transform"] = Transform(hflip=hflip, vflip=vflip)
+
+        return config_args
+
+    def _invalidate_camera_caches(self, camera_index: int) -> None:
+        """Drop everything cached about a camera's current configuration.
+
+        The three caches describe one configuration between them, so they are
+        always dropped together and always *before* the configuration they
+        describe is disturbed. Anything that reconfigures a body calls this
+        first, so a failure part-way through leaves no entry claiming a mode
+        that is no longer in force.
+        """
+        self._last_configs.pop(camera_index, None)
+        self._format_mode.pop(camera_index, None)
+        self._unzoomed_crop.pop(camera_index, None)
+
+    def _default_crop(self, picam2) -> Optional[Tuple[int, int, int, int]]:
+        """The ScalerCrop libcamera starts the *current* configuration on.
+
+        picamera2 exposes each control as a (min, max, default) tuple that
+        reflects the configuration in force, so the default is the reachable
+        unzoomed rectangle for this output aspect. On a build that does not
+        report the control, falls back to the mode's ScalerCropMaximum
+        property, and only then to the whole pixel array.
+
+        Returns:
+            (x, y, width, height), or None if neither source is available.
+        """
+        controls = getattr(picam2, "camera_controls", None)
+        entry = controls.get("ScalerCrop") if hasattr(controls, "get") else None
+        if entry is not None:
+            try:
+                return _crop_rect(entry[2])
+            except (IndexError, TypeError, ValueError) as e:
+                self.logger.warning(f"Unreadable ScalerCrop control range: {e}")
+
+        # No control range: the mode's own maximum crop is the reachable
+        # rectangle (a banded mode cannot deliver the pixel array), so it
+        # comes before the pixel array as a fallback.
+        crop_maximum = picam2.camera_properties.get('ScalerCropMaximum')
+        if crop_maximum is not None:
+            try:
+                return _crop_rect(crop_maximum)
+            except (IndexError, TypeError, ValueError) as e:
+                self.logger.warning(f"Unreadable ScalerCropMaximum: {e}")
+
+        pixel_array_size = picam2.camera_properties.get('PixelArraySize')
+        if pixel_array_size is None:
+            return None
+        return (0, 0, int(pixel_array_size[0]), int(pixel_array_size[1]))
+
+    def _unzoomed_rect(self, picam2, camera_index: int) -> Optional[Tuple[int, int, int, int]]:
+        """The stored unzoomed rectangle, computing and caching it if unset."""
+        rect = self._unzoomed_crop.get(camera_index)
+        if rect is None:
+            rect = self._default_crop(picam2)
+            if rect is not None:
+                self._unzoomed_crop[camera_index] = rect
+        return rect
+
+    def _ensure_configured(self, picam2, camera_config) -> bool:
+        """Configure (only when something changed), start, set quality, pin the crop.
+
+        The reconfigure test keys on the CameraConfig fields that alter the
+        stream layout, so paths that differ only in AF/AE/quality settings -
+        a preview poll and a still of the same size - reuse the running
+        configuration and preserve its AE/AF state.
+
+        On a (re)configure the configuration's own default ScalerCrop is read
+        and pinned explicitly, so preview, zoom and still all start from the
+        same stated rectangle rather than from libcamera's implicit one. A
+        cached configuration is left alone, keeping whatever zoom the operator
+        set.
+
+        The three per-camera caches are dropped before the camera is touched
+        and recorded only once the new configuration is fully in force, so a
+        failure anywhere in between leaves nothing behind: the next call
+        reconfigures from scratch instead of reusing a target rectangle that
+        describes a mode the body is no longer in.
+
+        Args:
+            picam2: The Picamera2 instance for this body.
+            camera_config: CameraConfig describing the wanted configuration.
+
+        Returns:
+            True if the camera was reconfigured by this call.
+        """
+        use_yuv = self._uses_yuv(camera_config)
+        still_config = picam2.create_still_configuration(
+            **self._still_config_args(camera_config)
+        )
+
+        last_config = self._last_configs.get(camera_config.camera_index)
+        last_format = self._format_mode.get(camera_config.camera_index)
+        needs_reconfigure = (
+            last_config is None or
+            last_format != use_yuv or
+            last_config.img_size != camera_config.img_size or
+            last_config.raw != camera_config.raw or
+            last_config.hflip != camera_config.hflip or
+            last_config.vflip != camera_config.vflip or
+            last_config.buffer_count != camera_config.buffer_count
+        )
+
+        if needs_reconfigure:
+            self._invalidate_camera_caches(camera_config.camera_index)
+
+            if picam2.started:
+                self.logger.debug(f"Stopping camera {camera_config.camera_index} to reconfigure")
+                picam2.stop()
+
+            picam2.configure(still_config)
+            self.logger.debug(f"Camera {camera_config.camera_index} configured: {camera_config.img_size}, format={'YUV420' if use_yuv else 'RGB888'}")
+        else:
+            self.logger.debug(f"Camera {camera_config.camera_index} using cached configuration")
+
+        # Start camera if not already running
+        if not picam2.started:
+            picam2.start()
+            self.logger.debug(f"Camera {camera_config.camera_index} started")
+
+        # Set JPEG quality via options (applies to capture_file and to
+        # CompletedRequest.save)
+        picam2.options["quality"] = camera_config.quality
+
+        if needs_reconfigure:
+            rect = self._unzoomed_rect(picam2, camera_config.camera_index)
+            if rect is None:
+                self.logger.warning(
+                    f"Camera {camera_config.camera_index}: no ScalerCrop default "
+                    "available; zoom and the still's frame check are unavailable"
+                )
+            else:
+                picam2.set_controls({"ScalerCrop": rect})
+                self.logger.debug(
+                    f"Camera {camera_config.camera_index} unzoomed crop pinned: {rect}"
+                )
+
+            # The configuration is in force only now; recording earlier would
+            # let a failed start() or pin be mistaken for a working camera.
+            self._last_configs[camera_config.camera_index] = camera_config
+            self._format_mode[camera_config.camera_index] = use_yuv
+
+        return needs_reconfigure
+
+    def _capture_unzoomed_request(self, picam2, target_rect, max_frames: int = _UNZOOMED_MAX_FRAMES):
+        """Return a completed request whose frame was taken at ``target_rect``.
+
+        Zoom is preview-only, so a still resets ScalerCrop to the
+        configuration's unzoomed rectangle first. That reset is not enough on
+        its own: libcamera applies controls with a pipeline delay and hands
+        back frames that completed earlier, so the first request after the
+        reset can still carry the preview's zoomed crop. Discard requests until
+        the metadata reports a crop matching the target on all four values
+        within the alignment slack, or reports no crop at all (a build that
+        does not surface ScalerCrop).
+
+        Args:
+            picam2: The Picamera2 instance, already started.
+            target_rect: (x, y, width, height) the frame must have been taken at.
+            max_frames: How many requests may be discarded before giving up.
+
+        Returns:
+            The accepted CompletedRequest; the caller owns its release().
+
+        Raises:
+            RuntimeError: If no matching frame arrives within max_frames.
+        """
+        target = _crop_rect(target_rect)
+        picam2.set_controls({"ScalerCrop": target})
+
+        skipped = 0
+        for _ in range(max_frames):
+            request = picam2.capture_request()
+            crop = request.get_metadata().get("ScalerCrop")
+            if crop is None or _crops_match(_crop_rect(crop), target):
+                if skipped:
+                    self.logger.debug(
+                        f"Discarded {skipped} queued frame(s) before an unzoomed capture"
+                    )
+                return request
+            request.release()
+            skipped += 1
+
+        raise RuntimeError(
+            f"could not obtain an unzoomed capture at {target} after {max_frames} frames"
+        )
+
     def _capture_image_locked(
         self,
         output_path: Path,
@@ -306,74 +625,13 @@ class Picamera2Backend(CameraBackend):
         """Internal capture implementation - must be called with the camera lock held."""
         try:
             picam2 = self._get_camera(camera_config.camera_index)
-            
-            # Determine if we need to reconfigure
-            # For now, we'll configure each time to ensure settings match
-            # In future optimization, we could cache configurations
-            
-            # Use YUV420 format for JPEG captures (faster, less memory)
-            # Use RGB888 for PNG or when raw/DNG is needed
-            use_yuv = camera_config.encoding in ["jpg", "jpeg"] and not camera_config.raw
-            
-            # Create still configuration with transform if needed
-            config_args = {
-                "main": {
-                    "size": camera_config.img_size,
-                    "format": "YUV420" if use_yuv else "RGB888"
-                },
-                "buffer_count": camera_config.buffer_count,
-            }
-            
-            # Add raw stream if DNG capture requested
-            if camera_config.raw:
-                config_args["raw"] = {}  # Enable raw stream for DNG
-            
-            # Apply transformations (flip)
-            if camera_config.hflip or camera_config.vflip:
-                if Transform is None:
-                    raise RuntimeError("Transform requires Linux")
-                hflip = 1 if camera_config.hflip else 0
-                vflip = 1 if camera_config.vflip else 0
-                config_args["transform"] = Transform(hflip=hflip, vflip=vflip)
-            
-            still_config = picam2.create_still_configuration(**config_args)
-            
-            # Check if camera is already running with the same config
-            # Only reconfigure if settings changed - this preserves AE/AF state
-            last_config = self._last_configs.get(camera_config.camera_index)
-            last_format = self._format_mode.get(camera_config.camera_index)
-            needs_reconfigure = (
-                last_config is None or
-                last_format != use_yuv or
-                last_config.img_size != camera_config.img_size or
-                last_config.hflip != camera_config.hflip or
-                last_config.vflip != camera_config.vflip or
-                last_config.buffer_count != camera_config.buffer_count
-            )
-            
-            if needs_reconfigure:
-                if picam2.started:
-                    self.logger.debug(f"Stopping camera {camera_config.camera_index} to reconfigure")
-                    picam2.stop()
-                
-                picam2.configure(still_config)
-                self.logger.debug(f"Camera {camera_config.camera_index} configured: {camera_config.img_size}, format={'YUV420' if use_yuv else 'RGB888'}")
-                self._last_configs[camera_config.camera_index] = camera_config
-                self._format_mode[camera_config.camera_index] = use_yuv
-            else:
-                self.logger.debug(f"Camera {camera_config.camera_index} using cached configuration")
-            
+
+            use_yuv = self._uses_yuv(camera_config)
+            needs_reconfigure = self._ensure_configured(picam2, camera_config)
+
             # Apply controls
             controls = self._config_to_picamera2_controls(camera_config)
-            
-            # Start camera if not already running
-            if not picam2.started:
-                picam2.start()
-                self.logger.debug(f"Camera {camera_config.camera_index} started")
-            
-            # Set JPEG quality via options (applies to capture_file)
-            picam2.options["quality"] = camera_config.quality
-            
+
             # Apply controls after start
             if controls:
                 picam2.set_controls(controls)
@@ -414,17 +672,17 @@ class Picamera2Backend(CameraBackend):
             # No manual PIL conversion needed
             self.logger.info(f"Capturing image to: {output_path}")
 
-            # Reset ScalerCrop to full sensor - zoom is preview-only.
-            # Ensures captures always use the full pixel array regardless of
-            # whatever zoom the user had applied to the live preview.
-            _pixel_array_size = picam2.camera_properties.get('PixelArraySize')
-            if _pixel_array_size:
-                picam2.set_controls(
-                    {"ScalerCrop": (0, 0, _pixel_array_size[0], _pixel_array_size[1])}
-                )
-
-            # Use request-based capture to get metadata and save files
-            request = picam2.capture_request()
+            # Reset ScalerCrop to the configuration's unzoomed rectangle -
+            # zoom is preview-only - and take the first frame actually exposed
+            # at it, not one the pipeline had already completed under the
+            # preview's zoom.
+            _unzoomed_rect = self._unzoomed_rect(picam2, camera_config.camera_index)
+            if _unzoomed_rect is not None:
+                request = self._capture_unzoomed_request(picam2, _unzoomed_rect)
+            else:
+                # Nothing to reset to and nothing to check against; take the
+                # next request as it comes.
+                request = picam2.capture_request()
             try:
                 # Extract metadata first
                 metadata = request.get_metadata()
@@ -476,6 +734,83 @@ class Picamera2Backend(CameraBackend):
             self.logger.error(f"Failed to capture image: {e}")
             raise RuntimeError(f"Picamera2 capture failed: {e}")
     
+    def capture_preview(
+        self,
+        camera_index: int,
+        img_size: Optional[Tuple[int, int]] = None,
+        tmp_path: Optional[Path] = None,
+    ) -> bytes:
+        """Capture one live-preview frame from the still's own configuration.
+
+        The frame comes off the ``lores`` stream that ``_still_config_args``
+        declares on every still configuration. That stream shares the sensor
+        mode and the ScalerCrop of ``main``, which is what makes the preview's
+        field of view the capture's: the operator frames the page against
+        exactly what a still would record, and no reconfiguration happens
+        between a poll and a capture of the same size.
+
+        Nothing here disturbs the live camera state: no autofocus cycle, no
+        AE stabilisation wait, no denoise warmup and no ScalerCrop change, so
+        whatever zoom the operator set stays in force.
+
+        Args:
+            camera_index: The camera index.
+            img_size: The still size whose configuration to preview from.
+                Defaults to the medium preset.
+            tmp_path: Where to write the encoded frame. A caller that owns a
+                stable per-body path (the capture service) passes it in;
+                otherwise a temporary file is used and removed.
+
+        Returns:
+            JPEG bytes of the preview frame.
+
+        Raises:
+            RuntimeError: If the capture fails.
+        """
+        own_tmp = tmp_path is None
+        if own_tmp:
+            handle, generated = tempfile.mkstemp(
+                prefix=f"dtk_preview_frame_c{camera_index}_", suffix=".jpg"
+            )
+            os.close(handle)
+            tmp_path = Path(generated)
+        else:
+            tmp_path = Path(tmp_path)
+
+        try:
+            lock = self._get_camera_lock(camera_index)
+            with lock:
+                picam2 = self._get_camera(camera_index)
+
+                preview_config = CameraConfig(
+                    camera_index=camera_index,
+                    img_size=img_size or IMG_SIZES["medium"],
+                    autofocus_on_capture=False,  # Skip AF cycle for live preview
+                    timeout=0,                   # No AE stabilisation wait
+                    denoise_frames=0,            # No temporal denoise warmup
+                    encoding="jpg",
+                    raw=False,
+                    quality=75,                  # Smaller payload for polling
+                )
+                self._ensure_configured(picam2, preview_config)
+
+                request = picam2.capture_request()
+                try:
+                    request.save("lores", str(tmp_path))
+                finally:
+                    request.release()
+
+                return tmp_path.read_bytes()
+        except Exception as e:
+            self.logger.error(f"Failed to capture preview frame: {e}")
+            raise RuntimeError(f"Picamera2 preview capture failed: {e}")
+        finally:
+            if own_tmp:
+                try:
+                    tmp_path.unlink(missing_ok=True)
+                except OSError:
+                    pass
+
     def supports_streaming(self) -> bool:
         """
         Check if this backend supports video streaming/preview.
@@ -524,8 +859,7 @@ class Picamera2Backend(CameraBackend):
             camera_index: The camera index to reset.
         """
         picam2 = self._cameras.pop(camera_index, None)
-        self._last_configs.pop(camera_index, None)
-        self._format_mode.pop(camera_index, None)
+        self._invalidate_camera_caches(camera_index)
         if picam2 is not None:
             try:
                 if picam2.started:
@@ -562,6 +896,11 @@ class Picamera2Backend(CameraBackend):
         lock = self._get_camera_lock(camera_index)
         with lock:
             picam2 = self._get_camera(camera_index)
+
+            # Drop the caches before the body's configuration changes: the AF
+            # cycle can raise, and a target left over from the previous mode
+            # would be applied to this one.
+            self._invalidate_camera_caches(camera_index)
 
             # Reconfigure to high-res still mode for the AF cycle
             if picam2.started:
@@ -604,11 +943,10 @@ class Picamera2Backend(CameraBackend):
                     f"after {af_time:.2f}s"
                 )
 
-            # Leave camera stopped; clear cached config so the next
-            # capture_image() / preview call reconfigures cleanly.
+            # Leave the camera stopped. The caches were cleared on the way
+            # in, so the next capture_image() / preview call reconfigures
+            # cleanly whether or not this routine got here.
             picam2.stop()
-            self._last_configs.pop(camera_index, None)
-            self._format_mode.pop(camera_index, None)
 
             return result
 
@@ -638,6 +976,11 @@ class Picamera2Backend(CameraBackend):
         lock = self._get_camera_lock(camera_index)
         with lock:
             picam2 = self._get_camera(camera_index)
+
+            # Drop the caches before the body's configuration changes: the
+            # metadata reads below can raise, and this preview configuration
+            # has its own unzoomed rectangle.
+            self._invalidate_camera_caches(camera_index)
 
             if picam2.started:
                 picam2.stop()
@@ -698,8 +1041,6 @@ class Picamera2Backend(CameraBackend):
                 )
 
             picam2.stop()
-            self._last_configs.pop(camera_index, None)
-            self._format_mode.pop(camera_index, None)
 
             return result
 
@@ -707,50 +1048,58 @@ class Picamera2Backend(CameraBackend):
         """
         Apply digital zoom via ScalerCrop on the running preview stream.
 
-        Sets the sensor Region of Interest to a centred crop of 1/zoom_factor
-        of the full pixel array.  zoom_factor=1.0 restores the full sensor.
-        Zoom is preview-only: capture_image() always resets ScalerCrop to the
-        full sensor before taking the shot.
+        Sets the sensor Region of Interest to a crop of 1/zoom_factor of the
+        configuration's own unzoomed rectangle, centred inside it (see the
+        module docstring - on a 16:9 configuration off a 4:3 readout that
+        rectangle is a band, not the pixel array). zoom_factor=1.0 restores
+        that rectangle exactly. Zoom is preview-only: capture_image() resets
+        ScalerCrop to it and then waits for a frame actually exposed at it.
+
+        Takes the per-camera lock for the whole body, so a zoom change cannot
+        interleave with that frame selection and re-crop the sensor between
+        the reset and the request the still keeps.
 
         Args:
             camera_index: The camera index.
             zoom_factor:  Zoom multiplier in the range [1.0, 8.0].
         """
-        picam2 = self._cameras.get(camera_index)
-        if picam2 is None:
-            self.logger.debug(
-                f"apply_zoom: camera {camera_index} not yet open, skipping"
-            )
-            return
-        if not picam2.started:
-            self.logger.debug(
-                f"apply_zoom: camera {camera_index} not started, skipping"
-            )
-            return
+        lock = self._get_camera_lock(camera_index)
+        with lock:
+            picam2 = self._cameras.get(camera_index)
+            if picam2 is None:
+                self.logger.debug(
+                    f"apply_zoom: camera {camera_index} not yet open, skipping"
+                )
+                return
+            if not picam2.started:
+                self.logger.debug(
+                    f"apply_zoom: camera {camera_index} not started, skipping"
+                )
+                return
 
-        zoom = max(1.0, min(float(zoom_factor), 8.0))
-        pixel_array_size = picam2.camera_properties.get('PixelArraySize')
-        if pixel_array_size is None:
-            self.logger.warning(
-                f"apply_zoom: PixelArraySize not available for camera {camera_index}"
-            )
-            return
+            zoom = max(1.0, min(float(zoom_factor), 8.0))
+            unzoomed = self._unzoomed_rect(picam2, camera_index)
+            if unzoomed is None:
+                self.logger.warning(
+                    f"apply_zoom: no unzoomed ScalerCrop known for camera {camera_index}"
+                )
+                return
 
-        sensor_w, sensor_h = pixel_array_size
-        crop_w = int(sensor_w / zoom)
-        crop_h = int(sensor_h / zoom)
-        crop_x = (sensor_w - crop_w) // 2
-        crop_y = (sensor_h - crop_h) // 2
-        try:
-            picam2.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
-            self.logger.debug(
-                f"Camera {camera_index} zoom {zoom:.1f}x: "
-                f"ScalerCrop=({crop_x},{crop_y},{crop_w},{crop_h})"
-            )
-        except Exception as e:
-            self.logger.warning(
-                f"Failed to apply zoom to camera {camera_index}: {e}"
-            )
+            base_x, base_y, base_w, base_h = unzoomed
+            crop_w = int(base_w / zoom)
+            crop_h = int(base_h / zoom)
+            crop_x = base_x + (base_w - crop_w) // 2
+            crop_y = base_y + (base_h - crop_h) // 2
+            try:
+                picam2.set_controls({"ScalerCrop": (crop_x, crop_y, crop_w, crop_h)})
+                self.logger.debug(
+                    f"Camera {camera_index} zoom {zoom:.1f}x: "
+                    f"ScalerCrop=({crop_x},{crop_y},{crop_w},{crop_h})"
+                )
+            except Exception as e:
+                self.logger.warning(
+                    f"Failed to apply zoom to camera {camera_index}: {e}"
+                )
 
     def apply_controls(self, camera_index: int, controls: dict) -> None:
         """

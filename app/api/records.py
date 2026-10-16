@@ -9,7 +9,9 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.record import Record, RecordImage, ExifData, RecordAnnotation
+from datetime import datetime, timezone
+
+from app.models.record import Record, RecordImage, ExifData, RecordAnnotation, RecordRejection
 from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.record import (
@@ -17,8 +19,10 @@ from app.schemas.record import (
 	RecordImageCreate, RecordImageRead, RecordImageUpdate,
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
+	RecordRejectRequest, RecordRejectionRead,
 )
 from app.core.config import settings
+from app.core.db_errors import integrity_conflict
 from app.core.paths import resolve_within_storage
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
@@ -28,6 +32,7 @@ logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+allow_reviewer = RoleChecker(["admin", "reviewer"])
 
 # Streamed uploads are copied in 1 MiB chunks so the size cap is enforced as bytes arrive, even when Content-Length is missing or wrong (e.g. chunked encoding).
 _UPLOAD_CHUNK = 1024 * 1024
@@ -52,6 +57,23 @@ def _save_upload_capped(src, dst_path: Path, max_bytes: int) -> int:
 	return total
 
 
+def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRead:
+	"""RecordRead.model_validate(rec), with images narrowed to current-only by default (NEH-208)."""
+	data = RecordRead.model_validate(rec)
+	if not include_superseded:
+		data.images = [img for img in data.images if img.is_current]
+	return data
+
+
+def _supersede_current_images(record: Record) -> None:
+	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
+	now = datetime.now(timezone.utc)
+	for img in record.images:
+		if img.is_current:
+			img.is_current = False
+			img.superseded_at = now
+
+
 # ==============================================================================
 # Record endpoints (archival documents/objects)
 # ==============================================================================
@@ -74,6 +96,7 @@ def create_record(
 		project_id=rec_in.project_id,
 		collection_id=rec_in.collection_id,
 		created_by=rec_in.created_by or current_user.username,
+		capture_mode=rec_in.capture_mode,
 	)
 	try:
 		db.add(rec)
@@ -81,7 +104,7 @@ def create_record(
 		db.refresh(rec)
 	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail=f"Database integrity error: {str(e)}")
+		raise integrity_conflict(e)
 	
 	return RecordRead.model_validate(rec)
 
@@ -126,7 +149,7 @@ def list_records(
 	else:
 		query = query.order_by(Record.id)
 	recs = query.offset(skip).limit(limit).all()
-	return [RecordRead.model_validate(r) for r in recs]
+	return [_serialize_record(r) for r in recs]
 
 
 @router.get("/count")
@@ -155,7 +178,7 @@ def get_record(
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.patch("/{rec_id}", response_model=RecordRead)
@@ -188,11 +211,11 @@ def update_record(
 	db.add(rec)
 	try:
 		db.commit()
-	except IntegrityError:
+	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
+		raise integrity_conflict(e)
 	db.refresh(rec)
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.delete("/{rec_id}")
@@ -344,19 +367,21 @@ async def add_image_to_record(
 @router.get("/{rec_id}/images", response_model=List[RecordImageRead])
 def list_record_images(
 	rec_id: int,
+	include_superseded: bool = Query(default=False, description="Include images superseded by a recapture (NEH-208)"),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Get all images for a specific record, ordered by sequence."""
+	"""Get all images for a specific record, ordered by sequence. Superseded (rejected-and-replaced) images are excluded by default."""
 	# Verify record exists
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
-	images = db.query(RecordImage).filter(
-		RecordImage.record_id == rec_id
-	).order_by(RecordImage.sequence.nullslast(), RecordImage.created_at).all()
-	
+
+	query = db.query(RecordImage).filter(RecordImage.record_id == rec_id)
+	if not include_superseded:
+		query = query.filter(RecordImage.is_current.is_(True))
+	images = query.order_by(RecordImage.sequence.nullslast(), RecordImage.created_at).all()
+
 	return [RecordImageRead.model_validate(img) for img in images]
 
 
@@ -416,8 +441,15 @@ def delete_image(
 	if thumbnail_path:
 		delete_thumbnail(str(thumbnail_path))
 	
+	record_id = img.record_id
 	db.delete(img)
 	db.commit()
+
+	record = db.query(Record).filter(Record.id == record_id).first()
+	if record and record.status == "approved" and not any(i.is_current for i in record.images):
+		record.status = "in_review"
+		db.add(record)
+		db.commit()
 	return {"detail": "Image deleted"}
 
 
@@ -596,14 +628,13 @@ def delete_record_annotation(
 def _apply_status_change(
 	rec: Record,
 	new_status: str,
-	rejection_note: Optional[str],
 	user_role: str,
 ) -> None:
 	"""
 	Validate and apply a status transition on a Record.
 	Raises HTTPException on invalid transition or insufficient role.
 	"""
-	current_status = rec.status or "captured"
+	current_status = rec.status
 	if current_status == new_status:
 		return  # no-op
 
@@ -620,7 +651,6 @@ def _apply_status_change(
 		)
 
 	rec.status = new_status
-	rec.rejection_note = rejection_note if new_status == "rejected" else None
 
 
 @router.patch("/{rec_id}/status", response_model=RecordRead)
@@ -634,23 +664,26 @@ def update_record_status(
 	Change the QA status of a record.
 
 	Valid transitions and required roles:
-	- captured  > in_review : operator, admin, reviewer
-	- in_review > rejected  : reviewer, admin
 	- in_review > approved  : reviewer, admin
-	- in_review > captured  : operator, admin  (cancel review)
-	- rejected  > captured  : operator, admin  (prepare for retake)
-	- approved  > rejected  : reviewer, admin  (flag for rework)
-	- approved  > captured  : admin only       (full reset)
+	- approved  > in_review : reviewer, admin  (undo a mistaken approve, NEH-209)
+	- rejected  > in_review : reviewer, admin  (undo a mistaken reject, NEH-209)
+
+	Formal rejection is not reachable through this endpoint — use POST
+	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
+	Recapture (rejected -> in_review as a side effect of a new capture
+	arriving) only happens via the capture endpoints in app/api/cameras.py —
+	the undo transition above is a plain status reset with no new image, no
+	reason, and no audit entry.
 	"""
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
-	_apply_status_change(rec, payload.status, payload.rejection_note, current_user.role)
+	_apply_status_change(rec, payload.status, current_user.role)
 
 	db.commit()
 	db.refresh(rec)
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.post("/bulk-status", response_model=List[RecordRead])
@@ -678,18 +711,11 @@ def bulk_update_status(
 	updated: list[Record] = []
 
 	for rec in records:
-		current_status = rec.status or "captured"
-		if current_status == payload.status:
-			updated.append(rec)
-			continue
-
-		allowed_roles = STATUS_TRANSITIONS.get((current_status, payload.status))
-		if allowed_roles is None or current_user.role not in allowed_roles:
+		try:
+			_apply_status_change(rec, payload.status, current_user.role)
+		except HTTPException:
 			skipped.append(rec.id)
 			continue
-
-		rec.status = payload.status
-		rec.rejection_note = payload.rejection_note if payload.status == "rejected" else None
 		updated.append(rec)
 
 	db.commit()
@@ -699,4 +725,75 @@ def bulk_update_status(
 	if skipped:
 		logger.info(f"bulk-status: skipped {len(skipped)} records (invalid transition or insufficient role): {skipped}")
 
-	return [RecordRead.model_validate(r) for r in updated]
+	return [_serialize_record(r) for r in updated]
+
+
+# ==============================================================================
+# Rejection endpoints (NEH-208)
+# ==============================================================================
+
+@router.post("/{rec_id}/reject", response_model=RecordRead)
+def reject_record(
+	rec_id: int,
+	payload: RecordRejectRequest,
+	current_user: User = Depends(allow_reviewer),
+	db: Session = Depends(get_db_dependency)
+):
+	"""
+	Reject a record's current capture with a mandatory predefined reason.
+
+	Flags every current image as part of this rejection's audit trail (for a
+	dual-mode record that's both L and R — a dual-camera pair can only ever be
+	redone together, never one side alone) and moves the record to
+	'rejected'. Rejected images are never deleted or overwritten; they stay
+	queryable via GET /{rec_id}/rejections after a recapture supersedes them.
+	"""
+	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	if rec.status != "in_review":
+		raise HTTPException(
+			status_code=422,
+			detail=f"Cannot reject a record with status '{rec.status}'. Only 'in_review' records can be rejected."
+		)
+
+	current_images = [img for img in rec.images if img.is_current]
+
+	rejection = RecordRejection(
+		record_id=rec.id,
+		predefined_reason=payload.predefined_reason,
+		comment=payload.comment,
+		rejected_by=current_user.username,
+	)
+	db.add(rejection)
+	db.flush()  # assign rejection.id before linking images
+
+	for img in current_images:
+		img.rejection_id = rejection.id
+
+	rec.status = "rejected"
+
+	db.commit()
+	db.refresh(rec)
+	return _serialize_record(rec)
+
+
+@router.get("/{rec_id}/rejections", response_model=List[RecordRejectionRead])
+def list_record_rejections(
+	rec_id: int,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""List a record's rejection history, newest first, each with the image(s) it flagged."""
+	rec = db.query(Record).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+
+	rejections = (
+		db.query(RecordRejection)
+		.options(joinedload(RecordRejection.images))
+		.filter(RecordRejection.record_id == rec_id)
+		.order_by(RecordRejection.rejected_at.desc())
+		.all()
+	)
+	return [RecordRejectionRead.model_validate(r) for r in rejections]
