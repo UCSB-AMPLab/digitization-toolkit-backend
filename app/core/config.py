@@ -25,6 +25,28 @@ class Settings(BaseSettings):
     EXPORTS_ROOT: str = Field(default="", validation_alias="DTK_EXPORTS_DIR")
     # Application-level cap on uploaded image size. Defends the SD even if nginx (client_max_body_size 100m) is not in front of the app. Enforced while streaming.
     MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, validation_alias="DTK_MAX_UPLOAD_BYTES")
+
+    # Offsite catalogue backup (NEH-249). Empty OFFSITE_REMOTE disables the
+    # whole path, so a unit without provisioned credentials does nothing rather
+    # than failing a timer every half hour. The remote name is an rclone remote
+    # plus bucket, e.g. "b2unit:neogranadina-rionegro"; the scoped key behind it
+    # is write + list only, which is why the upload skips the destination check.
+    OFFSITE_REMOTE: str = Field(default="", validation_alias="DTK_OFFSITE_REMOTE")
+    OFFSITE_DB_PREFIX: str = Field(default="db-backups", validation_alias="DTK_OFFSITE_DB_PREFIX")
+    # The interim push on the Rionegro unit has run at 750 KB/s since 2026-08-20
+    # over a ~12 Mbps link without starving the UI; its settings are the defaults.
+    OFFSITE_BWLIMIT: str = Field(default="750k", validation_alias="DTK_OFFSITE_BWLIMIT")
+    RCLONE_BIN: str = Field(default="rclone", validation_alias="DTK_RCLONE_BIN")
+    RCLONE_CONFIG: str = Field(default="", validation_alias="DTK_RCLONE_CONFIG")
+    # Overrides the default `docker compose exec -T db pg_dumpall` argv. Needed
+    # anywhere the appliance's compose overlay is not one directory up — a dev
+    # box, a container, or a host with a real postgres client on PATH.
+    PG_DUMP_COMMAND: str = Field(default="", validation_alias="DTK_PG_DUMP_COMMAND")
+    # Matches the interim timer: first attempt shortly after boot, then every
+    # half hour while the unit is powered.
+    OFFSITE_BACKUP_DELAY_SECONDS: int = Field(default=300, validation_alias="DTK_OFFSITE_BACKUP_DELAY")
+    OFFSITE_BACKUP_INTERVAL_SECONDS: int = Field(default=1800, validation_alias="DTK_OFFSITE_BACKUP_INTERVAL")
+
     app_version: str = "0.0.0-dev"
 
     model_config = SettingsConfigDict(
