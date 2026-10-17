@@ -166,7 +166,7 @@ def test_dual_capture_records_only_capture_mode(client, db_session, test_project
 
 @pytest.mark.unit
 def test_metadata_payload_carries_capture_mode_and_a_schema_version(db_session):
-    from app.core.export_service import _metadata_payload, METADATA_SCHEMA_VERSION
+    from app.core.export_service import _metadata_payload
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record
@@ -188,7 +188,11 @@ def test_metadata_payload_carries_capture_mode_and_a_schema_version(db_session):
 
     payload = _metadata_payload(col, proj, recs, "20260101T000000Z")
 
-    assert payload["schema_version"] == METADATA_SCHEMA_VERSION
+    # Asserted against the literal, not the constant: comparing the payload to the
+    # same constant the serializer reads passes for any value the constant holds.
+    # `type(...) is int` rather than isinstance, because True == 1 is also True.
+    assert type(payload["schema_version"]) is int
+    assert payload["schema_version"] == 1
     assert [r["capture_mode"] for r in payload["records"]] == ["single", "dual"]
     for r in payload["records"]:
         for field in DROPPED:

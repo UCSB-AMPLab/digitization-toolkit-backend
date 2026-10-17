@@ -170,7 +170,7 @@ def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
     written after; bags already exported are not rewritten."""
     import hashlib, zipfile
     from app.core import config
-    from app.core.export_service import METADATA_SCHEMA_VERSION
+
     from app.models.record import RecordImage
     from capture.project_manager import secure_project_filename
 
@@ -203,7 +203,11 @@ def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
         meta_name = next(n for n in zf.namelist() if n.endswith("data/metadata.json"))
         meta = json.loads(zf.read(meta_name).decode("utf-8"))
 
-    assert meta["schema_version"] == METADATA_SCHEMA_VERSION
+    # The literal, not the constant -- see test_record_typology_dropped.py. Here it
+    # also pins what a receiving institution reads out of the bag, and JSON round-trips
+    # True as `true`, which no equality check against the constant would catch.
+    assert type(meta["schema_version"]) is int
+    assert meta["schema_version"] == 1
     assert len(meta["records"]) == 1
     entry = meta["records"][0]
     assert entry["capture_mode"] == "single"

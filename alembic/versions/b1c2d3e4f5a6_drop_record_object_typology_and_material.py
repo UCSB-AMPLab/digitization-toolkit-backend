@@ -32,10 +32,15 @@ capture_mode in metadata.json from this revision on, so the preservation package
 does not lose the single-vs-dual distinction with the column.
 
 Downgrade restores both columns as 19e2aefe5b17 created them, nullable and
-empty. It cannot restore any value. For rows the capture path created the values
-are recomputable -- "document" where capture_mode = 'single', "book" where it is
-'dual' -- but that does not hold for a row created through POST /records/, whose
-value was whatever the caller sent.
+empty. It cannot restore any value, and it cannot be trusted to recompute one
+either. Two API writers existed: POST /records/ accepted both columns from the
+caller, and RecordUpdate accepted both as well, so PATCH /records/{id} could
+edit either one on any row -- including a row the capture path had created. So
+the rule "document" where capture_mode = 'single', "book" where it is 'dual'
+holds only where the two columns actually agree on the unit in front of you.
+Where they disagree, recomputing overwrites a value somebody chose. The
+rehearsal gate therefore groups on capture_mode and object_typology together,
+not on typology alone; see docs/releases/0.1.0-beta/migration-rehearsal.md.
 """
 from typing import Sequence, Union
 
