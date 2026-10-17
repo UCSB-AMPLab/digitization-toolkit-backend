@@ -26,9 +26,15 @@ is the production path.
 
 import gzip
 import hashlib
+import json
+import logging
 import stat
+import subprocess
 import textwrap
+import threading
+import time
 from pathlib import Path
+from types import SimpleNamespace
 
 import pytest
 
@@ -56,6 +62,24 @@ for i in range(200):
     sys.stdout.write("INSERT INTO records VALUES (%d, 'folio %dr');\\n" % (i, i))
 sys.exit(0)
 '''
+
+_PG_DUMP_STALL_STUB = '''#!/usr/bin/env python3
+"""A dump that writes nothing and does not exit.
+
+The sleep is bounded only so that a test run cannot leave a process behind for
+ever; it is far longer than any deadline a test gives the module, so from the
+module's side this child never finishes on its own.
+"""
+import time
+
+time.sleep(20)
+'''
+
+# The one object the fake listing carries, and the checksum the module is
+# supposed to read out of it. A transport that drops matching objects'
+# checksums fails every test that reads one.
+_LISTED_NAME = "catalogue-20261016-000000-a1b2c3.sql.gz"
+_LISTED_SHA1 = "6f" * 20
 
 
 def _install(tmp_path: Path, name: str, source: str) -> Path:
@@ -363,8 +387,18 @@ def test_a_verified_dump_from_an_earlier_day_does_not_satisfy_today(offsite, db_
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+@pytest.mark.parametrize(
+    "seconds_apart",
+    [
+        pytest.param(1, id="a-second-apart"),
+        # The collision the one-second stamp actually permits: two ticks inside
+        # the same second. Excluding this case was what let the old name scheme
+        # pass its own no-overwrite test.
+        pytest.param(0, id="same-second"),
+    ],
+)
 def test_nothing_in_a_run_removes_or_replaces_an_object_already_in_the_bucket(
-    offsite, db_session, monkeypatch
+    offsite, db_session, monkeypatch, seconds_apart
 ):
     """The key cannot delete or overwrite. Neither may the code try, on any path.
 
@@ -385,21 +419,27 @@ def test_nothing_in_a_run_removes_or_replaces_an_object_already_in_the_bucket(
     before = offsite.objects()[pre_existing]
     seeded = len(offsite.mutations())
 
-    # A distinct name per run, as in production where runs are separate ticks.
-    ticks = iter(range(100))
+    offsets = iter(range(0, 100 * seconds_apart + 1, seconds_apart)) \
+        if seconds_apart else iter(lambda: 0, 1)
 
     class _Clock(datetime):
         @classmethod
         def now(cls, tz=None):
-            return datetime(2026, 10, 1, 12, 0, next(ticks), tzinfo=tz or timezone.utc)
+            return datetime(
+                2026, 10, 1, 12, 0, next(offsets), tzinfo=tz or timezone.utc
+            )
 
     monkeypatch.setattr(cb, "datetime", _Clock)
 
-    for mode in ((), ("corrupt",), ("absent",), ("listing",), ("upload",)):
+    # The failure modes first and the success last: a verified run marks the
+    # frozen day as done, and every run after it would return up-to-date
+    # without uploading anything, which would leave this assertion with one
+    # object to look at instead of five.
+    for mode in (("corrupt",), ("absent",), ("listing",), ("upload",)):
         offsite.fail(*mode)
         cb.run_catalogue_backup(db_session)
     offsite.fail()
-    cb.run_catalogue_backup(db_session)
+    assert cb.run_catalogue_backup(db_session)["status"] == "verified"
 
     recorded = offsite.mutations()[seeded:]
     assert recorded, "the runs should have uploaded something"
@@ -454,9 +494,12 @@ def test_an_explicit_dump_command_overrides_the_default(monkeypatch):
     from app.core.config import settings
     import app.core.catalogue_backup as cb
 
-    monkeypatch.setattr(settings, "PG_DUMP_COMMAND", "/usr/bin/pg_dumpall -U me", raising=False)
+    monkeypatch.setattr(
+        settings, "PG_DUMP_COMMAND", "/opt/dtk/bin/dump-catalogue --stdout",
+        raising=False,
+    )
 
-    assert cb.dump_argv() == ["/usr/bin/pg_dumpall", "-U", "me"]
+    assert cb.dump_argv() == ["/opt/dtk/bin/dump-catalogue", "--stdout"]
 
 
 # ---------------------------------------------------------------------------
@@ -509,13 +552,31 @@ def test_the_scheduler_does_not_start_without_a_configured_remote(offsite, monke
 
 @pytest.mark.unit
 def test_last_verified_backup_reports_the_most_recent_verified_run(offsite, db_session):
+    """Two verified rows, so "most recent" is a claim the test can check. With
+    one row the assertion held whichever way the ordering ran."""
+    from datetime import datetime, timezone
+
+    from app.models.system_log import SystemLog
+
     cb = offsite.module
     assert cb.last_verified_backup(db_session) is None
 
-    cb.run_catalogue_backup(db_session)
+    earlier = SystemLog(
+        level="INFO", category=cb.BACKUP_CATEGORY, action=cb.VERIFIED_ACTION,
+        subject="catalogue-20260901-030000-eeeeee.sql.gz",
+        detail="a verified run from six weeks ago",
+        created_at=datetime(2026, 9, 1, 3, 0, tzinfo=timezone.utc),
+    )
+    db_session.add(earlier)
+    db_session.commit()
+
+    result = cb.run_catalogue_backup(db_session)
+    assert result["status"] == "verified", result
 
     state = cb.last_verified_backup(db_session)
     assert state is not None
+    assert state["object"] == result["object"]
+    assert state["object"] != earlier.subject
     assert state["object"].endswith(".sql.gz")
     assert state["verified_at"] is not None
 
@@ -563,48 +624,75 @@ def test_the_status_endpoint_is_read_only(offsite, reader_client):
         assert response.status_code == 405, (method, response.status_code)
 
 @pytest.fixture
-def rclone_argv(offsite, monkeypatch):
-    """Capture the argv of every rclone call the real transport makes."""
+def rclone(offsite, monkeypatch):
+    """Capture every rclone call the real transport makes, and answer listings.
+
+    The listing answers with a real row carrying a real checksum, so a test that
+    reads a checksum out of it is testing the extraction rather than agreeing
+    with an empty list. `rows` and `raises` are settable per test.
+    """
     cb = offsite.module
-    calls = []
 
-    class Result:
-        returncode = 0
-        stdout = "[]"
-        stderr = ""
+    class Rclone:
+        def __init__(self):
+            self.calls = []
+            self.returncode = 0
+            self.raises = None
+            self.rows = [
+                {
+                    "Path": _LISTED_NAME, "Name": _LISTED_NAME, "IsDir": False,
+                    "Size": 4096, "Hashes": {"sha1": _LISTED_SHA1},
+                },
+                # A directory and a different object, so a match is a match on
+                # the name rather than on being the only row.
+                {"Path": "older", "Name": "older", "IsDir": True, "Hashes": {}},
+                {
+                    "Path": "catalogue-19990101-000000-zzzzzz.sql.gz",
+                    "Name": "catalogue-19990101-000000-zzzzzz.sql.gz",
+                    "IsDir": False, "Hashes": {"sha1": "00" * 20},
+                },
+            ]
 
-    def fake_run(argv, **kwargs):
-        calls.append(list(argv))
-        return Result()
+        def run(self, argv, **kwargs):
+            self.calls.append(list(argv))
+            if self.raises is not None:
+                raise self.raises
+            stdout = json.dumps(self.rows) if "lsjson" in argv else ""
+            return SimpleNamespace(
+                returncode=self.returncode, stdout=stdout, stderr=""
+            )
 
-    monkeypatch.setattr(cb.subprocess, "run", fake_run)
-    return calls
+    fake = Rclone()
+    monkeypatch.setattr(cb.subprocess, "run", fake.run)
+    return fake
 
 
 @pytest.mark.unit
-def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, rclone_argv):
+def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, rclone):
     """The scoped key is write + list: rclone's default destination HEAD 401s."""
-    dump = offsite.dump_dir / "dtk-catalogue-20261016-000000.sql.gz"
+    dump = offsite.dump_dir / _LISTED_NAME
     dump.write_bytes(b"x")
 
     offsite.real_upload(dump)
 
-    copy = next(c for c in rclone_argv if "copy" in c)
+    copy = next(c for c in rclone.calls if "copy" in c)
     assert "--no-check-dest" in copy
     assert copy[copy.index("--bwlimit") + 1] == "750k"
 
 
 @pytest.mark.unit
-def test_the_listing_asks_for_sha1_hashes(offsite, rclone_argv):
-    offsite.real_listing_sha1("dtk-catalogue-20261016-000000.sql.gz")
+def test_the_listing_asks_for_sha1_hashes_and_reads_the_one_it_gets(offsite, rclone):
+    found = offsite.real_listing_sha1(_LISTED_NAME)
 
-    ls = next(c for c in rclone_argv if "lsjson" in c)
+    ls = next(c for c in rclone.calls if "lsjson" in c)
     assert "--hash" in ls
     assert ls[ls.index("--hash-type") + 1] == "sha1"
+    # Asking for the hash is half of it; the answer has to come back out.
+    assert found == _LISTED_SHA1
 
 
 @pytest.mark.unit
-def test_neither_transport_call_asks_rclone_to_remove_anything(offsite, rclone_argv):
+def test_neither_transport_call_asks_rclone_to_remove_anything(offsite, rclone):
     """The key cannot delete. Neither may the code ask it to, on any path."""
     forbidden = {
         "delete", "deletefile", "purge", "rmdir", "rmdirs", "sync", "move",
@@ -612,11 +700,520 @@ def test_neither_transport_call_asks_rclone_to_remove_anything(offsite, rclone_a
         "--delete-excluded",
     }
 
-    dump = offsite.dump_dir / "dtk-catalogue-20261016-000000.sql.gz"
+    dump = offsite.dump_dir / _LISTED_NAME
     dump.write_bytes(b"x")
     offsite.real_upload(dump)
-    offsite.real_listing_sha1(dump.name)
 
-    assert rclone_argv
-    for call in rclone_argv:
+    assert offsite.real_listing_sha1(dump.name) == _LISTED_SHA1
+    assert rclone.calls
+    for call in rclone.calls:
         assert not (set(call) & forbidden), call
+
+
+def test_a_dump_command_whose_binary_is_missing_is_a_plain_failure(tmp_path, monkeypatch):
+    """A missing binary is a failed run, not an exception out of the run.
+
+    Sibling of the transport timeouts: run_catalogue_backup promises its caller
+    a status, and Popen raises FileNotFoundError before any error path inside
+    write_dump can see it. The likeliest way there is a PG_DUMP_COMMAND naming
+    a wrapper that is not on this unit.
+    """
+    from app.core.config import settings
+    import app.core.catalogue_backup as cb
+
+    missing = tmp_path / "pg_dump_wrapper"
+    monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(missing), raising=False)
+
+    with pytest.raises(cb.BackupError) as exc:
+        cb.write_dump(tmp_path / "out.sql.gz")
+
+    assert str(missing) in str(exc.value)
+
+
+# ---------------------------------------------------------------------------
+# A listing row with no checksum is not an absent object (R1)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_listed_object_with_no_checksum_does_not_read_as_absent(offsite, rclone):
+    """A row matching the name but carrying no SHA1 means the listing could not
+    answer. Absence and silence are different answers and only one of them is
+    evidence about the object."""
+    cb = offsite.module
+    rclone.rows = [{"Name": _LISTED_NAME, "IsDir": False, "Hashes": {}}]
+
+    with pytest.raises(cb.VerificationUnavailable):
+        offsite.real_listing_sha1(_LISTED_NAME)
+
+
+@pytest.mark.unit
+def test_an_empty_checksum_in_the_listing_aborts_rather_than_fails(
+    offsite, rclone, monkeypatch
+):
+    cb = offsite.module
+    rclone.rows = [{"Name": _LISTED_NAME, "IsDir": False, "Hashes": {"sha1": ""}}]
+    monkeypatch.setattr(cb, "listing_sha1", offsite.real_listing_sha1)
+
+    with pytest.raises(cb.VerificationUnavailable):
+        cb.verify_against_listing(_LISTED_NAME, "a" * 40)
+
+
+@pytest.mark.unit
+def test_a_genuinely_absent_object_is_still_a_plain_failure(
+    offsite, rclone, monkeypatch
+):
+    """The other half of the distinction: nothing matching the name is a real
+    negative answer, and must stay a BackupError rather than an abort."""
+    cb = offsite.module
+    rclone.rows = []
+    monkeypatch.setattr(cb, "listing_sha1", offsite.real_listing_sha1)
+
+    with pytest.raises(cb.BackupError) as excinfo:
+        cb.verify_against_listing(_LISTED_NAME, "a" * 40)
+
+    assert not isinstance(excinfo.value, cb.VerificationUnavailable)
+
+
+# ---------------------------------------------------------------------------
+# Cleanup is idempotent, not one finally (R2, R10)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_stale_dump_is_swept_before_the_up_to_date_check(offsite, db_session):
+    """An unlink that failed, or a process that exited mid-run, leaves a dump on
+    the card. The next tick returns up-to-date without ever reaching the old
+    cleanup, so the sweep has to come first and has to run on every tick."""
+    cb = offsite.module
+    assert cb.run_catalogue_backup(db_session)["status"] == "verified"
+
+    stale = offsite.dump_dir / "catalogue-19990101-000000-abc123.sql.gz"
+    stale.write_bytes(b"left behind by a run that died")
+    unrelated = offsite.dump_dir / "keep-me.txt"
+    unrelated.write_text("not a dump")
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "up-to-date", result
+    assert offsite.leftovers() == ["keep-me.txt"]
+
+
+@pytest.mark.unit
+def test_the_scheduler_sweeps_an_abandoned_dump_at_startup(offsite, monkeypatch):
+    """Shutdown joins a daemon thread for five seconds and then lets the process
+    go, so a run can die before its own cleanup. Boot is the second chance."""
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(
+        settings, "OFFSITE_BACKUP_DELAY_SECONDS", 3600, raising=False
+    )
+    stale = offsite.dump_dir / "catalogue-19990101-000000-abc123.sql.gz"
+    stale.write_bytes(b"abandoned when the process exited")
+
+    scheduler = cb.CatalogueBackupScheduler()
+    assert scheduler.start() is True
+    try:
+        assert offsite.leftovers() == []
+    finally:
+        scheduler.stop()
+
+
+# ---------------------------------------------------------------------------
+# The object name is collision-proof (R3)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_two_runs_in_the_same_second_do_not_share_an_object_name(
+    offsite, db_session, monkeypatch
+):
+    """A one-second stamp is not a unique name, and the upload is
+    --no-check-dest, so two runs inside one second would write two versions of
+    one object."""
+    from datetime import datetime, timezone
+
+    cb = offsite.module
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return datetime(2026, 10, 1, 12, 0, 0, tzinfo=tz or timezone.utc)
+
+    monkeypatch.setattr(cb, "datetime", _Frozen)
+    # Both attempts fail at verification, so neither leaves a marker that would
+    # turn the second one into "up-to-date".
+    offsite.fail("absent")
+
+    first = cb.run_catalogue_backup(db_session)
+    second = cb.run_catalogue_backup(db_session)
+
+    assert first["object"] != second["object"], (first, second)
+    assert {op for op, _ in offsite.mutations()} == {"put"}, offsite.mutations()
+
+
+# ---------------------------------------------------------------------------
+# The override may not quietly ship role passwords (R4)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_an_override_running_pg_dumpall_without_the_flag_is_refused(monkeypatch):
+    """The module's assurance is that no SCRAM verifier leaves the appliance.
+    An override that runs pg_dumpall without --no-role-passwords breaks it, and
+    the answer is to refuse the run, not to edit an operator's argv."""
+    from app.core.config import settings
+    import app.core.catalogue_backup as cb
+
+    monkeypatch.setattr(
+        settings, "PG_DUMP_COMMAND", "/usr/bin/pg_dumpall -U me", raising=False
+    )
+
+    with pytest.raises(cb.BackupError) as excinfo:
+        cb.dump_argv()
+
+    assert "--no-role-passwords" in str(excinfo.value)
+
+
+@pytest.mark.unit
+def test_an_override_carrying_the_flag_is_passed_through_untouched(monkeypatch):
+    from app.core.config import settings
+    import app.core.catalogue_backup as cb
+
+    monkeypatch.setattr(
+        settings,
+        "PG_DUMP_COMMAND",
+        "/usr/bin/pg_dumpall -U me --no-role-passwords",
+        raising=False,
+    )
+
+    assert cb.dump_argv() == [
+        "/usr/bin/pg_dumpall", "-U", "me", "--no-role-passwords",
+    ]
+
+
+@pytest.mark.unit
+def test_an_override_that_is_not_pg_dumpall_is_accepted_as_given(monkeypatch):
+    """A wrapper or a pg_dump is the operator's own arrangement; the module has
+    no business guessing at its flags."""
+    from app.core.config import settings
+    import app.core.catalogue_backup as cb
+
+    monkeypatch.setattr(
+        settings, "PG_DUMP_COMMAND", "/usr/local/bin/dump-catalogue --stdout",
+        raising=False,
+    )
+
+    assert cb.dump_argv() == ["/usr/local/bin/dump-catalogue", "--stdout"]
+
+
+@pytest.mark.unit
+def test_a_run_with_an_unsafe_override_uploads_nothing(
+    offsite, db_session, monkeypatch
+):
+    from app.core.config import settings
+
+    cb = offsite.module
+    # /usr/bin/env exists, so the refusal has to come from the check rather
+    # than from a missing binary.
+    monkeypatch.setattr(
+        settings, "PG_DUMP_COMMAND", "/usr/bin/env pg_dumpall -U me", raising=False
+    )
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "failed", result
+    assert "--no-role-passwords" in result["error"]
+    assert offsite.upload_calls() == []
+    assert offsite.leftovers() == []
+
+
+# ---------------------------------------------------------------------------
+# The dump timeout actually bounds the dump (R5)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_stalled_dump_is_killed_and_reported(offsite, tmp_path, monkeypatch):
+    """A blocking read has no timeout, and process.wait is only reached once the
+    read loop ends, so a child that neither writes nor exits held the scheduler
+    thread for ever. The deadline has to kill the child."""
+    from app.core.config import settings
+
+    cb = offsite.module
+    stub = _install(tmp_path, "pg-dump-stall", _PG_DUMP_STALL_STUB)
+    monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(stub), raising=False)
+    monkeypatch.setattr(cb, "_DUMP_TIMEOUT_SECONDS", 0.5)
+
+    outcome = {}
+
+    def attempt():
+        try:
+            cb.write_dump(offsite.dump_dir / "catalogue-stalled.sql.gz")
+        except BaseException as exc:  # noqa: BLE001 - recorded, then asserted on
+            outcome["raised"] = exc
+        else:
+            outcome["raised"] = None
+
+    worker = threading.Thread(target=attempt, name="stalled-dump", daemon=True)
+    worker.start()
+    worker.join(10)
+
+    assert not worker.is_alive(), "the stalled dump was never bounded"
+    assert isinstance(outcome["raised"], cb.BackupError), outcome
+
+
+# ---------------------------------------------------------------------------
+# verified_at is the verification time, not the transaction's (R6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_recorded_time_is_when_verification_succeeded(
+    offsite, db_session, monkeypatch
+):
+    """created_at defaults to now(), which in PostgreSQL is the transaction's
+    start. The session is already open before the dump begins, so a long run
+    would book itself to the hour it started - or to the previous day."""
+    from datetime import datetime, timezone
+
+    from app.models.system_log import SystemLog
+
+    cb = offsite.module
+    moment = datetime(2026, 10, 1, 12, 34, 56, tzinfo=timezone.utc)
+
+    class _Frozen(datetime):
+        @classmethod
+        def now(cls, tz=None):
+            return moment if tz is not None else moment.replace(tzinfo=None)
+
+    monkeypatch.setattr(cb, "datetime", _Frozen)
+
+    result = cb.run_catalogue_backup(db_session)
+    assert result["status"] == "verified", result
+
+    row = (
+        db_session.query(SystemLog)
+        .filter(SystemLog.action == cb.VERIFIED_ACTION)
+        .one()
+    )
+    stored = row.created_at
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    assert stored == moment
+
+
+@pytest.mark.unit
+def test_an_audit_call_without_a_timestamp_still_takes_the_database_default(
+    db_session,
+):
+    """The timestamp parameter is additive: every existing caller must behave
+    exactly as it did, which means the column's own default still fills it in
+    and fills it in with the time of the call."""
+    from datetime import datetime, timedelta, timezone
+
+    from app.core import audit
+    from app.models.system_log import SystemLog
+
+    before = datetime.now(timezone.utc)
+
+    audit.log_event(
+        db_session, level="INFO", category="system", action="storage_mount",
+        actor="someone", subject="/mnt/offsite", detail="no timestamp given",
+    )
+
+    row = (
+        db_session.query(SystemLog)
+        .filter(SystemLog.action == "storage_mount")
+        .one()
+    )
+    stored = row.created_at
+    if stored.tzinfo is None:
+        stored = stored.replace(tzinfo=timezone.utc)
+    # A minute of slack: the point is that the default ran, not its precision.
+    assert abs(stored - before) < timedelta(minutes=1), stored
+
+
+# ---------------------------------------------------------------------------
+# A swallowed commit does not read as verified (R7)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_lost_verified_record_is_not_reported_as_verified(
+    offsite, db_session, monkeypatch
+):
+    """audit.log_event swallows its own commit failure, so _record cannot report
+    one. With the marker unwritten, needs_run_today stays true and the unit
+    would dump and upload again on every interval, each under a new name, on a
+    key that cannot delete."""
+    cb = offsite.module
+    real_commit = db_session.commit
+
+    def losing_commit(*a, **kw):
+        if any(
+            getattr(obj, "action", None) == cb.VERIFIED_ACTION
+            for obj in db_session.new
+        ):
+            raise RuntimeError("fake: the commit was lost")
+        return real_commit(*a, **kw)
+
+    monkeypatch.setattr(db_session, "commit", losing_commit)
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "failed", result
+    assert result.get("error")
+    assert cb.last_verified_backup(db_session) is None
+    assert cb.needs_run_today(db_session) is True
+
+
+# ---------------------------------------------------------------------------
+# What the single-process assumption rests on (R8)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_single_process_assumption_names_the_worker_count_variable(offsite):
+    """The pinned uvicorn reads its worker count from WEB_CONCURRENCY as well as
+    from --workers, so the absence of the flag is not the whole assurance."""
+    cb = offsite.module
+
+    assert "WEB_CONCURRENCY" in cb.CatalogueBackupScheduler.start.__doc__
+
+
+# ---------------------------------------------------------------------------
+# Name the configured destination, do not claim a bucket (R9)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_verified_run_names_the_configured_destination(
+    offsite, db_session, monkeypatch, caplog
+):
+    """A local path is an accepted destination, so "verified in the bucket" can
+    be false while every byte is still on the card. Report where it went."""
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_REMOTE", "/mnt/offsite-dump", raising=False)
+
+    with caplog.at_level(logging.INFO, logger="app.core.catalogue_backup"):
+        result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "verified", result
+
+    state = cb.last_verified_backup(db_session)
+    assert "/mnt/offsite-dump/db-backups" in state["detail"], state
+    assert "bucket" not in state["detail"].lower(), state
+
+    logged = " ".join(record.getMessage() for record in caplog.records)
+    assert "/mnt/offsite-dump/db-backups" in logged, logged
+    assert "in the bucket" not in logged, logged
+
+
+# ---------------------------------------------------------------------------
+# A timeout becomes the right error (R12)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_timed_out_upload_is_a_plain_failure(offsite, rclone):
+    cb = offsite.module
+    rclone.raises = subprocess.TimeoutExpired(cmd=["rclone", "copy"], timeout=1)
+    dump = offsite.dump_dir / _LISTED_NAME
+    dump.write_bytes(b"x")
+
+    with pytest.raises(cb.BackupError) as excinfo:
+        offsite.real_upload(dump)
+
+    assert not isinstance(excinfo.value, cb.VerificationUnavailable)
+
+
+@pytest.mark.unit
+def test_a_timed_out_listing_is_not_a_negative_answer(offsite, rclone):
+    """A listing that did not answer in time has said nothing about the object."""
+    cb = offsite.module
+    rclone.raises = subprocess.TimeoutExpired(cmd=["rclone", "lsjson"], timeout=1)
+
+    with pytest.raises(cb.VerificationUnavailable):
+        offsite.real_listing_sha1(_LISTED_NAME)
+
+
+@pytest.mark.unit
+def test_a_transport_timeout_does_not_escape_the_run(
+    offsite, db_session, monkeypatch, rclone
+):
+    """run_catalogue_backup promises never to raise, and the scheduler would
+    otherwise swallow the escape with a log line and no failure row."""
+    cb = offsite.module
+    monkeypatch.setattr(cb, "upload", offsite.real_upload)
+    rclone.raises = subprocess.TimeoutExpired(cmd=["rclone", "copy"], timeout=1)
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "failed", result
+    assert offsite.leftovers() == []
+    assert cb.last_verified_backup(db_session) is None
+
+
+# ---------------------------------------------------------------------------
+# The daily boundary is the appliance's local day (R13)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def local_zone_utc_minus_5(monkeypatch):
+    """Run the body in the zone the deployed units sit in."""
+    monkeypatch.setenv("TZ", "America/Bogota")
+    time.tzset()
+    yield
+    monkeypatch.undo()
+    time.tzset()
+
+
+def _seed_verified(db_session, cb, *, created_at, subject):
+    from app.models.system_log import SystemLog
+
+    db_session.add(
+        SystemLog(
+            level="INFO", category=cb.BACKUP_CATEGORY, action=cb.VERIFIED_ACTION,
+            subject=subject, detail="seeded", created_at=created_at,
+        )
+    )
+    db_session.commit()
+
+
+@pytest.mark.unit
+def test_a_run_late_in_the_local_evening_satisfies_that_local_day(
+    offsite, db_session, local_zone_utc_minus_5
+):
+    """21:00 on 1 October in Bogota is already 2 October by UTC date, so a UTC
+    comparison would let a second run happen the same local day."""
+    from datetime import date, datetime, timezone
+
+    cb = offsite.module
+    _seed_verified(
+        db_session, cb,
+        created_at=datetime(2026, 10, 2, 2, 0, tzinfo=timezone.utc),
+        subject="catalogue-20261002-020000-aaaaaa.sql.gz",
+    )
+
+    assert cb.needs_run_today(db_session, date(2026, 10, 1)) is False
+
+
+@pytest.mark.unit
+def test_a_run_just_before_local_midnight_does_not_satisfy_the_next_day(
+    offsite, db_session, local_zone_utc_minus_5
+):
+    """And the other way: 23:00 on 30 September in Bogota is 1 October by UTC
+    date, which would have the unit skip 1 October altogether."""
+    from datetime import date, datetime, timezone
+
+    cb = offsite.module
+    _seed_verified(
+        db_session, cb,
+        created_at=datetime(2026, 10, 1, 4, 0, tzinfo=timezone.utc),
+        subject="catalogue-20261001-040000-aaaaaa.sql.gz",
+    )
+
+    assert cb.needs_run_today(db_session, date(2026, 10, 1)) is True
+
+
+@pytest.mark.unit
+def test_a_naive_timestamp_is_still_read_as_utc(offsite, local_zone_utc_minus_5):
+    from datetime import date, datetime
+
+    cb = offsite.module
+
+    assert cb._as_local_date(datetime(2026, 10, 2, 2, 0)) == date(2026, 10, 1)

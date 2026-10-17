@@ -1,4 +1,5 @@
 import logging
+from datetime import datetime
 
 from sqlalchemy.orm import Session
 
@@ -14,6 +15,7 @@ def log_event(
     actor: str | None = None,
     subject: str | None = None,
     detail: str | None = None,
+    created_at: datetime | None = None,
 ) -> None:
     """
     Record an audit event in system_logs. Always commits immediately.
@@ -30,6 +32,11 @@ def log_event(
     actor    : username (or None for system-triggered events)
     subject  : affected entity name (project name, username, ...)
     detail   : free-form extra context (IP address, record count, ...)
+    created_at : when the event happened, if that is not "now". Left out, the
+               column takes its server default, now(), which in PostgreSQL is
+               the start of the transaction - fine for a route that records an
+               event it just performed, wrong for a long job whose session
+               opened before the work began.
     """
     try:
         from app.models.system_log import SystemLog  # late import avoids circular refs
@@ -42,6 +49,8 @@ def log_event(
             subject=subject[:300] if subject else None,
             detail=detail[:500]  if detail  else None,
         )
+        if created_at is not None:
+            entry.created_at = created_at
         db.add(entry)
         db.commit()
     except Exception:

@@ -10,33 +10,45 @@ Shape of a run:
 
 1. dump the catalogue through gzip to a temporary file under the data dir;
 2. upload it on the images' credential and bandwidth cap, through rclone;
-3. verify the local digest against the SHA1 the bucket listing reports;
+3. verify the local digest against the SHA1 the destination's listing reports;
 4. record the verified run in ``system_logs``, which is both the operator's
    view and the date marker that decides whether today still needs a run;
 5. remove the temporary file — always, on every path.
 
+``OFFSITE_REMOTE`` is whatever rclone destination the unit is configured with,
+and that is deliberately not validated as remote-shaped: a venue with no usable
+uplink may be given a local path or a mounted disk. So nothing here asserts
+where the dump ended up. A verified run reports the configured destination by
+name and says the digest matched there; it does not claim the data left the
+appliance, because on some units it will not have.
+
 Three rules it is built around:
 
-* **A listing that fails aborts the run.** The scoped key is write + list with
-  no read, so a single-object lookup answers 401 and an empty result from a
-  refused call is indistinguishable from an absent object. A check that cannot
+* **A listing that fails aborts the run.** The scoped B2 key is write + list
+  with no read, so a single-object lookup answers 401 and an empty result from
+  a refused call is indistinguishable from an absent object. A matching row
+  that carries no checksum is the same kind of silence. A check that cannot
   answer is not a negative answer. This is the rule ``free-masters.py`` is
   built around, for the same key.
 * **A dump never survives the run.** The failure being guarded against is
   precisely a card with no room, so cleanup is the point rather than tidiness.
   The dump is a copy of live data, so removing an unverified one loses nothing;
-  what an unverified run must never do is advance the marker.
+  what an unverified run must never do is advance the marker. Cleanup is also
+  idempotent: every run and every boot sweeps the dump directory first, because
+  a process that exits mid-run never reaches its own cleanup.
 * **Retry rather than skip.** A failed run leaves no verified marker for today,
-  so the next tick tries again instead of waiting for tomorrow.
+  so the next tick tries again instead of waiting for tomorrow. "Today" is the
+  appliance's local day, which is the day an operator means.
 
-Nothing here deletes or overwrites anything on the remote, and the key is
-scoped so that it could not.
+Nothing here deletes or overwrites anything at the destination, and the B2 key
+is scoped so that it could not.
 """
 
 import gzip
 import hashlib
 import json
 import logging
+import secrets
 import shlex
 import subprocess
 import tempfile
@@ -89,11 +101,34 @@ class VerificationUnavailable(BackupError):
 # Commands
 # ---------------------------------------------------------------------------
 
+def _invokes_pg_dumpall(argv: list[str]) -> bool:
+    """Whether this argv runs pg_dumpall, directly or through a container."""
+    return any(Path(word).name == "pg_dumpall" for word in argv)
+
+
 def dump_argv() -> list[str]:
-    """argv that writes the whole catalogue to stdout as SQL."""
+    """argv that writes the whole catalogue to stdout as SQL.
+
+    On the default path below, --no-role-passwords is part of the argv this
+    builds, so the module's own assurance holds: no role password leaves the
+    appliance. An operator override (PG_DUMP_COMMAND) is run exactly as
+    written — a wrapper script or a pg_dump is their arrangement, and on that
+    path the assurance is theirs, since nothing here can know what a wrapper
+    does. The single exception is an override that itself invokes pg_dumpall
+    without --no-role-passwords: that would carry the per-unit database
+    password's SCRAM verifier offsite on a timer, so the run is refused by
+    name. Flags are never appended to an operator's argv.
+    """
     override = config.settings.PG_DUMP_COMMAND.strip()
     if override:
-        return shlex.split(override)
+        argv = shlex.split(override)
+        if _invokes_pg_dumpall(argv) and "--no-role-passwords" not in argv:
+            raise BackupError(
+                "PG_DUMP_COMMAND runs pg_dumpall without --no-role-passwords, "
+                "which would carry the database password's SCRAM verifier off "
+                "the appliance; add --no-role-passwords to the command"
+            )
+        return argv
     argv = ["docker", "compose"]
     for compose_file in _COMPOSE_FILES:
         argv += ["-f", compose_file]
@@ -143,6 +178,49 @@ def _dump_dir() -> Path:
     return path
 
 
+def _object_name() -> str:
+    """The name this run's dump is stored under.
+
+    The timestamp is for whoever reads a listing; uniqueness comes from the
+    random token. A one-second stamp is not a unique name — two ticks inside
+    one second would agree on it — and the upload runs --no-check-dest, so the
+    second of them would write another version of the same object rather than
+    fail. With the token, a retry adds an object and can never land on one that
+    is already there.
+    """
+    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
+    return f"catalogue-{stamp}-{secrets.token_hex(3)}.sql.gz"
+
+
+def _sweep_stale_dumps() -> int:
+    """Remove every catalogue dump found in the dump directory. Returns a count.
+
+    A run removes its own dump in a `finally`, but that is one attempt: an
+    unlink that fails leaves the file behind, and the next tick can return
+    up-to-date without reaching the cleanup at all. A process killed mid-run
+    never reaches it either. So the sweep runs before every attempt and at every
+    boot, and is safe to repeat. It is called before this run's dump exists, so
+    it never removes a file that is in use — which holds because there is one
+    backend process and one schedule in it (see CatalogueBackupScheduler.start,
+    where the same single-process assumption is set out and its limits named).
+    """
+    try:
+        stale = sorted(_dump_dir().glob("catalogue-*.sql.gz"))
+    except OSError:
+        logger.exception("Could not scan the dump directory for stale dumps")
+        return 0
+    removed = 0
+    for path in stale:
+        try:
+            path.unlink()
+        except OSError:
+            logger.exception("Could not remove the stale catalogue dump %s", path)
+        else:
+            removed += 1
+            logger.warning("Removed a stale catalogue dump: %s", path)
+    return removed
+
+
 # ---------------------------------------------------------------------------
 # Steps
 # ---------------------------------------------------------------------------
@@ -159,12 +237,38 @@ def write_dump(dest: Path) -> tuple[int, str]:
     raw_bytes = 0
 
     with tempfile.TemporaryFile() as errfile:
-        process = subprocess.Popen(
-            argv,
-            stdout=subprocess.PIPE,
-            stderr=errfile,
-            stdin=subprocess.DEVNULL,
-        )
+        try:
+            process = subprocess.Popen(
+                argv,
+                stdout=subprocess.PIPE,
+                stderr=errfile,
+                stdin=subprocess.DEVNULL,
+            )
+        except OSError as exc:
+            # A binary that is missing or not executable fails here, before any
+            # path below can report it, and the caller is promised a status
+            # rather than an exception. The likeliest route is a
+            # PG_DUMP_COMMAND naming a wrapper that is not on this unit.
+            raise BackupError(
+                f"the catalogue dump could not be started ({argv[0]}): {exc}"
+            ) from exc
+        # The read below blocks with no timeout of its own, and the wait after
+        # the loop is only reached once the loop ends, so a child that neither
+        # writes nor exits would hold the scheduler thread for the life of the
+        # process. The deadline kills the child instead: the read then returns
+        # EOF, the loop ends, and the error path below runs.
+        deadline_passed = threading.Event()
+
+        def _kill_on_deadline() -> None:
+            deadline_passed.set()
+            try:
+                process.kill()
+            except OSError:
+                logger.exception("Could not kill the stalled catalogue dump")
+
+        watchdog = threading.Timer(_DUMP_TIMEOUT_SECONDS, _kill_on_deadline)
+        watchdog.daemon = True
+        watchdog.start()
         try:
             with gzip.open(dest, "wb") as out:
                 while True:
@@ -174,6 +278,7 @@ def write_dump(dest: Path) -> tuple[int, str]:
                     raw_bytes += len(chunk)
                     out.write(chunk)
         finally:
+            watchdog.cancel()
             if process.stdout is not None:
                 process.stdout.close()
             try:
@@ -187,6 +292,14 @@ def write_dump(dest: Path) -> tuple[int, str]:
                 ) from None
 
         if returncode != 0:
+            if deadline_passed.is_set():
+                # Checked inside this branch, not before it: a child that
+                # finished in the instant before the timer fired exits 0 and the
+                # kill is a no-op, and that run is not a timeout.
+                raise BackupError(
+                    f"the catalogue dump did not finish within "
+                    f"{_DUMP_TIMEOUT_SECONDS}s and was killed"
+                )
             errfile.seek(0)
             stderr = errfile.read().decode("utf-8", "replace").strip()
             raise BackupError(
@@ -206,7 +319,7 @@ def write_dump(dest: Path) -> tuple[int, str]:
 
 
 def upload(local: Path) -> None:
-    """Copy one file to the bucket. Copy only: nothing here can remove anything.
+    """Copy one file to the destination. Copy only: nothing here can remove.
 
     --no-check-dest because rclone's default destination HEAD needs readFiles
     and answers 401 against this write+list key. It cost the first attempt.
@@ -219,28 +332,45 @@ def upload(local: Path) -> None:
         "--bwlimit",
         config.settings.OFFSITE_BWLIMIT,
     )
-    result = subprocess.run(
-        argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        timeout=_UPLOAD_TIMEOUT_SECONDS,
-    )
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_UPLOAD_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        # An upload that ran out of time is a failed upload, and the caller
+        # promises not to raise anything but BackupError.
+        raise BackupError(
+            f"the upload did not finish within {_UPLOAD_TIMEOUT_SECONDS}s"
+        ) from exc
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise BackupError(f"the upload failed (rc={result.returncode}): {stderr[:300]}")
 
 
 def listing_sha1(name: str) -> Optional[str]:
-    """The SHA1 the bucket listing reports for `name`, or None if absent.
+    """The SHA1 the destination's listing reports for `name`, or None if absent.
 
-    Raises VerificationUnavailable when the listing itself does not answer: an
-    empty result from a refused call looks exactly like an absent object.
+    None means one thing only: nothing in the listing carries that name.
+
+    Raises VerificationUnavailable when the listing did not answer — a refused
+    call, an unreadable or timed-out one, or a row that matches the name but
+    carries no checksum. All of those are silence, and silence about an object
+    is not a report that the object is missing.
     """
     argv = _rclone_argv(
         "lsjson", "--hash", "--hash-type", "sha1", remote_dir() + "/",
     )
-    result = subprocess.run(
-        argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-        timeout=_LISTING_TIMEOUT_SECONDS,
-    )
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_LISTING_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VerificationUnavailable(
+            f"could not list {remote_dir()} within "
+            f"{_LISTING_TIMEOUT_SECONDS}s"
+        ) from exc
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise VerificationUnavailable(
@@ -256,12 +386,20 @@ def listing_sha1(name: str) -> Optional[str]:
         if row.get("IsDir"):
             continue
         if row.get("Name") == name:
-            return (row.get("Hashes") or {}).get("sha1")
+            sha1 = (row.get("Hashes") or {}).get("sha1")
+            if not sha1:
+                # The object is there; it is the checksum that is missing. The
+                # same return value for this and for an absent name would turn
+                # a present object into "not in the listing".
+                raise VerificationUnavailable(
+                    f"the listing of {remote_dir()} reports no sha1 for {name}"
+                )
+            return sha1
     return None
 
 
 def verify_against_listing(name: str, local_sha1: str) -> None:
-    """Confirm the bucket holds `name` with the digest we uploaded.
+    """Confirm the destination holds `name` with the digest we uploaded.
 
     Raises VerificationUnavailable if the listing cannot answer and BackupError
     if it answers and disagrees. The two are different: only the second is
@@ -269,7 +407,7 @@ def verify_against_listing(name: str, local_sha1: str) -> None:
     """
     remote = listing_sha1(name)
     if remote is None:
-        raise BackupError(f"{name} is not in the bucket listing")
+        raise BackupError(f"{name} is not in the listing of {remote_dir()}")
     if remote != local_sha1:
         raise BackupError(
             f"sha1 differs for {name}: local {local_sha1}, remote {remote}"
@@ -302,10 +440,15 @@ def last_verified_backup(db: Session) -> Optional[dict]:
     }
 
 
-def _as_utc_date(value: datetime) -> date:
+def _as_local_date(value: datetime) -> date:
+    """The appliance's local calendar day for `value`.
+
+    A naive value is still assumed to be UTC, which is what both PostgreSQL's
+    now() and this module's own timestamps give.
+    """
     if value.tzinfo is None:
-        return value.replace(tzinfo=timezone.utc).date()
-    return value.astimezone(timezone.utc).date()
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone().date()
 
 
 def needs_run_today(db: Session, today: Optional[date] = None) -> bool:
@@ -315,12 +458,17 @@ def needs_run_today(db: Session, today: Optional[date] = None) -> bool:
     from a separate file means a run that failed anywhere — dump, upload, or a
     listing that would not answer — leaves nothing behind and is retried on the
     next tick, which is the interim script's behaviour.
+
+    The day is the appliance's local day. The deployed units run at UTC−5, so a
+    UTC comparison would let two runs happen in one local day — a run after
+    19:00 local is already tomorrow by UTC date — and skip another local day
+    entirely.
     """
-    today = today or datetime.now(timezone.utc).date()
+    today = today or datetime.now(timezone.utc).astimezone().date()
     state = last_verified_backup(db)
     if state is None:
         return True
-    return _as_utc_date(state["verified_at"]) != today
+    return _as_local_date(state["verified_at"]) != today
 
 
 # ---------------------------------------------------------------------------
@@ -328,12 +476,12 @@ def needs_run_today(db: Session, today: Optional[date] = None) -> bool:
 # ---------------------------------------------------------------------------
 
 def _record(db: Session, *, action: str, level: str, subject: Optional[str],
-            detail: Optional[str]) -> None:
+            detail: Optional[str], created_at: Optional[datetime] = None) -> None:
     from app.core import audit
 
     audit.log_event(
         db, level=level, category=BACKUP_CATEGORY, action=action,
-        actor=None, subject=subject, detail=detail,
+        actor=None, subject=subject, detail=detail, created_at=created_at,
     )
 
 
@@ -347,6 +495,11 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     if not config.settings.OFFSITE_REMOTE.strip():
         return {"status": "disabled"}
 
+    # Before the up-to-date check, not after it: an up-to-date tick returns
+    # early, and a dump left behind by a failed unlink or a killed process has
+    # to be cleared by some tick that does not run.
+    _sweep_stale_dumps()
+
     if not needs_run_today(db, today):
         state = last_verified_backup(db)
         return {
@@ -355,10 +508,10 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
             "verified_at": state["verified_at"],
         }
 
-    stamp = datetime.now(timezone.utc).strftime("%Y%m%d-%H%M%S")
-    name = f"catalogue-{stamp}.sql.gz"
-    # A fresh name per run: a retry adds an object rather than overwriting one,
-    # so nothing in this path can destroy a dump that is already offsite.
+    # A fresh name per run, unique by its random token: a retry adds an object
+    # rather than overwriting one, so nothing in this path can destroy a dump
+    # that is already at the destination.
+    name = _object_name()
     dump = _dump_dir() / name
 
     try:
@@ -366,6 +519,12 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
             raw_bytes, sha1 = write_dump(dump)
             upload(dump)
             verify_against_listing(name, sha1)
+            # Captured here, at the moment verification succeeded, rather than
+            # left to the column's server default: now() in PostgreSQL is the
+            # transaction's start, and this session opened and queried before
+            # the dump began. A long run would otherwise book itself to the
+            # hour it started, and a run spanning midnight to the day before.
+            verified_at = datetime.now(timezone.utc)
         except VerificationUnavailable as exc:
             # Abort, not a negative answer. No marker is advanced, so the next
             # tick retries. Declared a failure here, before any cleanup runs.
@@ -379,22 +538,46 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
                     detail=str(exc)[:500])
             return {"status": "failed", "object": name, "error": str(exc)}
 
-        detail = f"{dump.stat().st_size} bytes gzipped, {raw_bytes} raw, sha1 {sha1}"
-        _record(db, action=VERIFIED_ACTION, level="INFO", subject=name, detail=detail)
-        logger.info("Catalogue backup verified in the bucket: %s", name)
+        # The destination by name, not a claim about its nature: OFFSITE_REMOTE
+        # may be a bucket, a mounted disk or a local path.
+        detail = (
+            f"verified at {remote_dir()}: {dump.stat().st_size} bytes gzipped, "
+            f"{raw_bytes} raw, sha1 {sha1}"
+        )
+        _record(db, action=VERIFIED_ACTION, level="INFO", subject=name,
+                detail=detail, created_at=verified_at)
+
+        # audit.log_event swallows a failed commit by design, so _record cannot
+        # report one and this is the only way to know the marker landed. It
+        # matters because needs_run_today reads that same marker: unread, a lost
+        # commit would have the unit dump and upload again on every interval,
+        # each time under a new name, on a key that cannot delete.
         state = last_verified_backup(db)
+        if state is None or state["object"] != name:
+            error = (
+                f"the verified run was not recorded: system_logs does not "
+                f"report {name} as the most recent verified backup"
+            )
+            logger.error("Catalogue backup could not be recorded: %s", error)
+            _record(db, action=FAILED_ACTION, level="ERR", subject=name,
+                    detail=error[:500])
+            return {"status": "failed", "object": name, "error": error}
+
+        logger.info("Catalogue backup verified at %s: %s", remote_dir(), name)
         return {
             "status": "verified",
             "object": name,
             "sha1": sha1,
             "bytes": dump.stat().st_size,
             "raw_bytes": raw_bytes,
-            "verified_at": state["verified_at"] if state else None,
+            "verified_at": state["verified_at"],
         }
     finally:
         # Unconditional: a filling card must never accumulate dumps, and the
         # live database is the authoritative copy, so an unverified dump is
-        # nothing to keep. Reached only after the run's outcome is decided.
+        # nothing to keep. Reached only after the run's outcome is decided. If
+        # this unlink fails, or the process dies before reaching it, the sweep
+        # at the head of the next run and at the next boot clears what is left.
         try:
             dump.unlink(missing_ok=True)
         except OSError:
@@ -428,16 +611,25 @@ class CatalogueBackupScheduler:
         scripts/start.sh under a Type=simple systemd unit. Adding --workers, or
         starting a second uvicorn, would run this schedule once per process:
         concurrent dumps of the same database, competing for the bandwidth cap,
-        each writing its own verified marker. There is no process lock to catch
-        that — export_jobs.py and login_throttle.py rest on the same assumption
-        for their module-level singletons. If the appliance ever needs more than
-        one worker, this has to move to a lock or to a timer first.
+        each writing its own verified marker. The absent flag is not the whole
+        assurance, either: the pinned uvicorn also reads its worker count from
+        the WEB_CONCURRENCY environment variable, so a unit that sets it in the
+        service environment gets multiple workers with no --workers anywhere.
+        There is no process lock to catch that — export_jobs.py and
+        login_throttle.py rest on the same assumption for their module-level
+        singletons. If the appliance ever needs more than one worker, this has
+        to move to a lock or to a timer first.
+
+        Startup also sweeps the dump directory. stop() joins a daemon thread for
+        five seconds and then lets the process exit, so a run can die between
+        writing its dump and removing it; boot is where that one gets cleared.
         """
         if not config.settings.OFFSITE_REMOTE.strip():
             logger.info(
                 "Offsite catalogue backup is not configured; no schedule started"
             )
             return False
+        _sweep_stale_dumps()
         if self._thread is not None and self._thread.is_alive():
             return True
         self._stop.clear()
