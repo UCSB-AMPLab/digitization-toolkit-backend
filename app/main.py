@@ -29,7 +29,13 @@ async def lifespan(app: FastAPI):
         reconcile_pending_rename(db)
     finally:
         db.close()
+    # Schedule the offsite catalogue dump (NEH-249). A no-op on a unit with no
+    # offsite remote configured.
+    from app.core.catalogue_backup import catalogue_backup_scheduler
+
+    catalogue_backup_scheduler.start()
     yield
+    catalogue_backup_scheduler.stop()
     # The camera backends hold a PTP claim on each body for the life of the
     # process. Closing them here waits for whatever capture is still running
     # and releases the cameras, so a restart finds them free rather than
