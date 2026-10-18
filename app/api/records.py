@@ -65,6 +65,38 @@ def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRe
 	return data
 
 
+def _unlink_image_file_and_sidecar(raw_path: Optional[str]) -> None:
+	"""Unlink a stored image file together with the `_preview.jpg` beside it (NEH-257).
+
+	A RAW capture occupies two files on the card: the master the row points at,
+	and a JPEG preview the RAW backend writes next to it as `<stem>_preview.jpg`,
+	which is what the review UI and the thumbnail generator can read. Unlinking
+	only the master leaves the preview with nothing referencing it, about 2.3 MB
+	per capture; on the Rionegro unit 2,403 such previews hold 5.5 GB of a 115 GB
+	card that reached 100% on 2026-10-14 and stopped capture. They also make the
+	card unreadable as evidence: a preview with no master and no row looks, on
+	the filesystem, exactly like a master that was lost.
+
+	The sidecar's name is derived from the *resolved* path, so it stays inside
+	the storage roots `resolve_within_storage` confines the master to; a row
+	pointing outside them loses neither file. The name is the whole rule, with
+	no suffix check: a `_preview.jpg` beside a JPEG master is an orphan in the
+	same way, and a suffix list here would be a second copy of the backends'
+	RAW formats to keep in step.
+
+	`capture/service.py` applies the same rule when it rolls back a capture that
+	never reached the manifest, but its helper is private to the capture package,
+	documents itself as safe only for manifest-less files — the opposite of what
+	these handlers delete — and swallows the OSError they surface as a 500. So
+	the line of path arithmetic lives here instead of being imported from it.
+	"""
+	path = resolve_within_storage(raw_path)
+	if path is None:
+		return
+	path.unlink(missing_ok=True)
+	path.with_name(path.stem + "_preview.jpg").unlink(missing_ok=True)
+
+
 def _supersede_current_images(record: Record) -> None:
 	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
 	now = datetime.now(timezone.utc)
@@ -234,11 +266,9 @@ def delete_record(
 	# Count images before delete/commit; rec.images is unusable once the row is expired
 	image_count = len(rec.images)
 
-	# Clean up image files and thumbnails; only unlink paths inside storage
+	# Clean up image files, their preview sidecars and thumbnails; only unlink paths inside storage
 	for img in rec.images:
-		file_path = resolve_within_storage(img.file_path)
-		if file_path:
-			file_path.unlink(missing_ok=True)
+		_unlink_image_file_and_sidecar(img.file_path)
 		thumbnail_path = resolve_within_storage(img.thumbnail_path)
 		if thumbnail_path:
 			delete_thumbnail(str(thumbnail_path))
@@ -428,10 +458,8 @@ def delete_image(
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
 	
-	# Clean up files; only unlink paths inside storage
-	file_path = resolve_within_storage(img.file_path)
-	if file_path:
-		file_path.unlink(missing_ok=True)
+	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths inside storage
+	_unlink_image_file_and_sidecar(img.file_path)
 	thumbnail_path = resolve_within_storage(img.thumbnail_path)
 	if thumbnail_path:
 		delete_thumbnail(str(thumbnail_path))
