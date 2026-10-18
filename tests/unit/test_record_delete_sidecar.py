@@ -18,6 +18,14 @@ master's own directory, which is the rule `capture/service.py`'s rollback path
 already applies. Nothing else in the directory is touched, and a master whose
 stored path escapes the storage roots loses neither master nor sidecar.
 
+Deriving the name from the stem means two masters of one frame that differ only
+in extension name the same sidecar, so the single-image delete has to leave a
+sidecar a surviving row still points at. The record delete has no such
+survivor and keeps deleting everything. Both halves are asserted below,
+against pairs that share a stem rather than pairs that merely share a
+directory — the distinct-stem case passes whatever the handler does with the
+siblings, so on its own it does not test the property it names.
+
 Every file these tests create lives under the per-test temporary projects root
 from the `override_projects_root` fixture. `_must_be_inside_storage` asserts that
 before any delete runs, so a misconfigured root fails the test rather than
@@ -81,6 +89,27 @@ def _capture(capture_dir, thumbs_dir, stem, suffix=".CR2", sidecar=True):
     thumb = thumbs_dir / f"{stem}_thumb.jpg"
     thumb.write_bytes(b"thumb-bytes")
     return master, preview, thumb
+
+
+def _shared_stem_pair(capture_dir, thumbs_dir, stem):
+    """Two masters of one frame differing only in extension, over one sidecar.
+
+    A multi-format capture writes both a JPEG and a RAW master for the same
+    frame, and the RAW backend writes one `<stem>_preview.jpg` beside them.
+    Each row gets its own thumbnail, so a deleted thumbnail cannot be mistaken
+    for the shared sidecar.
+    """
+    jpeg = capture_dir / f"{stem}.jpg"
+    jpeg.write_bytes(b"jpeg-master-bytes")
+    raw = capture_dir / f"{stem}.CR2"
+    raw.write_bytes(b"raw-master-bytes")
+    preview = capture_dir / f"{stem}_preview.jpg"
+    preview.write_bytes(b"preview-bytes")
+    jpeg_thumb = thumbs_dir / f"{stem}_jpg_thumb.jpg"
+    jpeg_thumb.write_bytes(b"thumb-bytes")
+    raw_thumb = thumbs_dir / f"{stem}_raw_thumb.jpg"
+    raw_thumb.write_bytes(b"thumb-bytes")
+    return jpeg, jpeg_thumb, raw, raw_thumb, preview
 
 
 def _record(db_session, status="rejected", capture_mode="single"):
@@ -220,11 +249,17 @@ def test_deleting_an_image_still_removes_the_master_and_the_thumbnail(client, db
 
 
 @pytest.mark.unit
-def test_deleting_one_image_of_a_record_leaves_its_siblings_sidecar(client, db_session, capture_dir, thumbs_dir):
+def test_deleting_one_image_leaves_a_siblings_sidecar_under_a_distinct_stem(client, db_session, capture_dir, thumbs_dir):
     """The sidecar that goes is the deleted master's own, not the directory's.
 
     Guards against a fix that globs `*_preview.jpg` beside the master: the
-    second half of a pair lives in the same directory and is still referenced.
+    second half of a dual pair lives in the same directory, carries its own
+    stem and its own sidecar, and is still referenced.
+
+    This is the easy half of the property. Distinct stems mean distinct sidecar
+    names, so the survivor's file is never the one named for the deleted
+    master. The hard half — two masters that share a stem and therefore share
+    one sidecar — is the test below.
     """
     left = _capture(capture_dir, thumbs_dir, "IMG_0007_L")
     right = _capture(capture_dir, thumbs_dir, "IMG_0007_R")
@@ -240,6 +275,130 @@ def test_deleting_one_image_of_a_record_leaves_its_siblings_sidecar(client, db_s
     assert not left[1].exists(), f"{left[1].name} survived the image delete"
     assert right[0].exists(), "the sibling's master was deleted"
     assert right[1].exists(), f"{right[1].name} was deleted with its sibling"
+
+
+@pytest.mark.unit
+def test_deleting_one_of_two_masters_that_share_a_stem_leaves_the_shared_sidecar(client, db_session, capture_dir, thumbs_dir):
+    """Masters differing only in extension share one sidecar, and the survivor needs it.
+
+    A multi-format capture of one frame produces `folio.jpg` and `folio.CR2`
+    and a single `folio_preview.jpg`. The sidecar's name is derived from the
+    master's stem, so both rows derive the same name, and an unconditional
+    unlink on either delete takes the preview the other row still points at.
+    What is left behind then looks exactly like a capture whose preview was
+    never written.
+    """
+    jpeg, jpeg_thumb, raw, raw_thumb, preview = _shared_stem_pair(
+        capture_dir, thumbs_dir, "IMG_0011")
+    _must_be_inside_storage(jpeg, raw, preview)
+    rec = _record(db_session)
+    jpeg_img = _image(db_session, rec, jpeg, jpeg_thumb)
+    _image(db_session, rec, raw, raw_thumb)
+
+    api = _client_as(client, "op", "operator")
+    resp = api.delete(f"/records/images/{jpeg_img.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert not jpeg.exists(), "the deleted master survived"
+    assert raw.exists(), "the surviving master was deleted"
+    assert preview.exists(), (
+        f"{preview.name} was deleted while {raw.name} still points at it")
+
+
+@pytest.mark.unit
+def test_a_shared_sidecar_is_protected_whichever_master_is_deleted(client, db_session, capture_dir, thumbs_dir):
+    """The check cannot depend on which of the pair happens to be deleted first."""
+    jpeg, jpeg_thumb, raw, raw_thumb, preview = _shared_stem_pair(
+        capture_dir, thumbs_dir, "IMG_0012")
+    _must_be_inside_storage(jpeg, raw, preview)
+    rec = _record(db_session)
+    _image(db_session, rec, jpeg, jpeg_thumb)
+    raw_img = _image(db_session, rec, raw, raw_thumb)
+
+    api = _client_as(client, "op", "operator")
+    resp = api.delete(f"/records/images/{raw_img.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert not raw.exists(), "the deleted master survived"
+    assert jpeg.exists(), "the surviving master was deleted"
+    assert preview.exists(), (
+        f"{preview.name} was deleted while {jpeg.name} still points at it")
+
+
+@pytest.mark.unit
+def test_a_superseded_sibling_also_protects_a_shared_sidecar(client, db_session, capture_dir, thumbs_dir):
+    """A superseded row still points at its master, so its sidecar is still referenced.
+
+    A rejected image is not deleted; it stays with `is_current` False
+    (NEH-208) and remains queryable through GET /records/{id}/rejections,
+    which is a view that reads previews. So what protects the sidecar is any
+    surviving row sharing the stem, current or not — the same rule the record
+    delete applies when it clears superseded files along with current ones.
+    """
+    jpeg, jpeg_thumb, raw, raw_thumb, preview = _shared_stem_pair(
+        capture_dir, thumbs_dir, "IMG_0013")
+    _must_be_inside_storage(jpeg, raw, preview)
+    rec = _record(db_session)
+    jpeg_img = _image(db_session, rec, jpeg, jpeg_thumb)
+    _image(db_session, rec, raw, raw_thumb, is_current=False)
+
+    api = _client_as(client, "op", "operator")
+    resp = api.delete(f"/records/images/{jpeg_img.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert raw.exists(), "a superseded master was deleted"
+    assert preview.exists(), (
+        f"{preview.name} was deleted while a superseded {raw.name} points at it")
+
+
+@pytest.mark.unit
+def test_deleting_the_last_master_of_a_shared_stem_removes_the_sidecar(client, db_session, capture_dir, thumbs_dir):
+    """Protecting the sidecar must not turn into leaving it behind for good.
+
+    Once no row points at a master sharing the stem, the preview is the orphan
+    NEH-257 is about and it goes with the last delete.
+    """
+    jpeg, jpeg_thumb, raw, raw_thumb, preview = _shared_stem_pair(
+        capture_dir, thumbs_dir, "IMG_0014")
+    _must_be_inside_storage(jpeg, raw, preview)
+    rec = _record(db_session)
+    jpeg_img = _image(db_session, rec, jpeg, jpeg_thumb)
+    raw_img = _image(db_session, rec, raw, raw_thumb)
+
+    api = _client_as(client, "op", "operator")
+    first = api.delete(f"/records/images/{jpeg_img.id}")
+    assert first.status_code == 200, first.text
+    assert preview.exists(), "the sidecar went with the first of the pair"
+
+    second = api.delete(f"/records/images/{raw_img.id}")
+
+    assert second.status_code == 200, second.text
+    assert not raw.exists(), "the last master survived"
+    assert not preview.exists(), f"{preview.name} outlived every row pointing at it"
+
+
+@pytest.mark.unit
+def test_deleting_a_record_removes_a_sidecar_two_of_its_masters_share(client, db_session, capture_dir, thumbs_dir):
+    """The record delete takes every image, so the shared sidecar has no survivor.
+
+    Asserted because the single-image delete now protects a sidecar a sibling
+    still needs, and the record delete must not inherit that protection: there
+    is nothing left to protect it for.
+    """
+    jpeg, jpeg_thumb, raw, raw_thumb, preview = _shared_stem_pair(
+        capture_dir, thumbs_dir, "IMG_0015")
+    _must_be_inside_storage(jpeg, raw, preview)
+    rec = _record(db_session)
+    _image(db_session, rec, jpeg, jpeg_thumb)
+    _image(db_session, rec, raw, raw_thumb)
+
+    api = _client_as(client, "op", "operator")
+    resp = api.delete(f"/records/{rec.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert not jpeg.exists(), "a master survived the record delete"
+    assert not raw.exists(), "a master survived the record delete"
+    assert not preview.exists(), f"{preview.name} survived the record delete"
 
 
 @pytest.mark.unit

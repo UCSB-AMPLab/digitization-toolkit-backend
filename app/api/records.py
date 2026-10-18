@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
@@ -65,7 +65,12 @@ def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRe
 	return data
 
 
-def _unlink_image_file_and_sidecar(raw_path: Optional[str]) -> None:
+def _preview_sidecar_of(master: Path) -> Path:
+	"""The `_preview.jpg` a master's stem names, in the master's own directory."""
+	return master.with_name(master.stem + "_preview.jpg")
+
+
+def _unlink_image_file_and_sidecar(raw_path: Optional[str], sibling_paths: Iterable[Optional[str]] = ()) -> None:
 	"""Unlink a stored image file together with the `_preview.jpg` beside it (NEH-257).
 
 	A RAW capture occupies two files on the card: the master the row points at,
@@ -84,6 +89,14 @@ def _unlink_image_file_and_sidecar(raw_path: Optional[str]) -> None:
 	same way, and a suffix list here would be a second copy of the backends'
 	RAW formats to keep in step.
 
+	Because the name comes from the stem, two masters of one frame that differ
+	only in extension — `folio.jpg` and `folio.CR2`, which a multi-format
+	capture writes — name the same sidecar, and deleting either would take the
+	preview the other still needs. `sibling_paths` carries the stored paths of
+	the rows that will survive this delete; the sidecar is kept if any of them
+	resolves to a master naming it. The master itself is unlinked either way,
+	since the row pointing at it is going.
+
 	`capture/service.py` applies the same rule when it rolls back a capture that
 	never reached the manifest, but its helper is private to the capture package,
 	documents itself as safe only for manifest-less files — the opposite of what
@@ -93,8 +106,13 @@ def _unlink_image_file_and_sidecar(raw_path: Optional[str]) -> None:
 	path = resolve_within_storage(raw_path)
 	if path is None:
 		return
+	sidecar = _preview_sidecar_of(path)
 	path.unlink(missing_ok=True)
-	path.with_name(path.stem + "_preview.jpg").unlink(missing_ok=True)
+	for raw_sibling in sibling_paths:
+		sibling = resolve_within_storage(raw_sibling)
+		if sibling is not None and _preview_sidecar_of(sibling) == sidecar:
+			return
+	sidecar.unlink(missing_ok=True)
 
 
 def _supersede_current_images(record: Record) -> None:
@@ -266,7 +284,10 @@ def delete_record(
 	# Count images before delete/commit; rec.images is unusable once the row is expired
 	image_count = len(rec.images)
 
-	# Clean up image files, their preview sidecars and thumbnails; only unlink paths inside storage
+	# Clean up image files, their preview sidecars and thumbnails; only unlink
+	# paths inside storage. No sibling check here, unlike the single-image
+	# delete: every image of the record is going, so no surviving row can still
+	# need a sidecar two of these masters share.
 	for img in rec.images:
 		_unlink_image_file_and_sidecar(img.file_path)
 		thumbnail_path = resolve_within_storage(img.thumbnail_path)
@@ -458,8 +479,20 @@ def delete_image(
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
 	
-	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths inside storage
-	_unlink_image_file_and_sidecar(img.file_path)
+	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths
+	# inside storage. The record's other images survive this delete, and one of
+	# them may be a master of the same frame in another format, sharing this
+	# master's stem and therefore its `_preview.jpg` — so they are passed in and
+	# the sidecar is kept if any of them still names it. Superseded images count:
+	# their rows still point at files on the card (NEH-208).
+	siblings = [
+		other.file_path
+		for other in db.query(RecordImage).filter(
+			RecordImage.record_id == img.record_id,
+			RecordImage.id != img.id,
+		)
+	]
+	_unlink_image_file_and_sidecar(img.file_path, siblings)
 	thumbnail_path = resolve_within_storage(img.thumbnail_path)
 	if thumbnail_path:
 		delete_thumbnail(str(thumbnail_path))
