@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
@@ -65,6 +65,56 @@ def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRe
 	return data
 
 
+def _preview_sidecar_of(master: Path) -> Path:
+	"""The `_preview.jpg` a master's stem names, in the master's own directory."""
+	return master.with_name(master.stem + "_preview.jpg")
+
+
+def _unlink_image_file_and_sidecar(raw_path: Optional[str], sibling_paths: Iterable[Optional[str]] = ()) -> None:
+	"""Unlink a stored image file together with the `_preview.jpg` beside it (NEH-257).
+
+	A RAW capture occupies two files on the card: the master the row points at,
+	and a JPEG preview the RAW backend writes next to it as `<stem>_preview.jpg`,
+	which is what the review UI and the thumbnail generator can read. Unlinking
+	only the master leaves the preview with nothing referencing it, about 2.3 MB
+	per capture; on the Rionegro unit 2,403 such previews hold 5.5 GB of a 115 GB
+	card that reached 100% on 2026-10-14 and stopped capture. They also make the
+	card unreadable as evidence: a preview with no master and no row looks, on
+	the filesystem, exactly like a master that was lost.
+
+	The sidecar's name is derived from the *resolved* path, so it stays inside
+	the storage roots `resolve_within_storage` confines the master to; a row
+	pointing outside them loses neither file. The name is the whole rule, with
+	no suffix check: a `_preview.jpg` beside a JPEG master is an orphan in the
+	same way, and a suffix list here would be a second copy of the backends'
+	RAW formats to keep in step.
+
+	Because the name comes from the stem, two masters of one frame that differ
+	only in extension — `folio.jpg` and `folio.CR2`, which a multi-format
+	capture writes — name the same sidecar, and deleting either would take the
+	preview the other still needs. `sibling_paths` carries the stored paths of
+	the rows that will survive this delete; the sidecar is kept if any of them
+	resolves to a master naming it. The master itself is unlinked either way,
+	since the row pointing at it is going.
+
+	`capture/service.py` applies the same rule when it rolls back a capture that
+	never reached the manifest, but its helper is private to the capture package,
+	documents itself as safe only for manifest-less files — the opposite of what
+	these handlers delete — and swallows the OSError they surface as a 500. So
+	the line of path arithmetic lives here instead of being imported from it.
+	"""
+	path = resolve_within_storage(raw_path)
+	if path is None:
+		return
+	sidecar = _preview_sidecar_of(path)
+	path.unlink(missing_ok=True)
+	for raw_sibling in sibling_paths:
+		sibling = resolve_within_storage(raw_sibling)
+		if sibling is not None and _preview_sidecar_of(sibling) == sidecar:
+			return
+	sidecar.unlink(missing_ok=True)
+
+
 def _supersede_current_images(record: Record) -> None:
 	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
 	now = datetime.now(timezone.utc)
@@ -88,9 +138,7 @@ def create_record(
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
-		object_typology=rec_in.object_typology,
 		author=rec_in.author,
-		material=rec_in.material,
 		date=rec_in.date,
 		custom_attributes=rec_in.custom_attributes,
 		project_id=rec_in.project_id,
@@ -115,7 +163,6 @@ def list_records(
 	limit: int = Query(default=100, ge=1, le=1000),
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
-	object_typology: Optional[str] = Query(default=None, description="Filter by object type"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
@@ -128,8 +175,6 @@ def list_records(
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
 		query = query.filter(Record.collection_id == collection_id)
-	if object_typology is not None:
-		query = query.filter(Record.object_typology == object_typology)
 	if orphaned is True:
 		query = query.filter(Record.project_id == None, Record.collection_id == None)
 	
@@ -239,11 +284,12 @@ def delete_record(
 	# Count images before delete/commit; rec.images is unusable once the row is expired
 	image_count = len(rec.images)
 
-	# Clean up image files and thumbnails; only unlink paths inside storage
+	# Clean up image files, their preview sidecars and thumbnails; only unlink
+	# paths inside storage. No sibling check here, unlike the single-image
+	# delete: every image of the record is going, so no surviving row can still
+	# need a sidecar two of these masters share.
 	for img in rec.images:
-		file_path = resolve_within_storage(img.file_path)
-		if file_path:
-			file_path.unlink(missing_ok=True)
+		_unlink_image_file_and_sidecar(img.file_path)
 		thumbnail_path = resolve_within_storage(img.thumbnail_path)
 		if thumbnail_path:
 			delete_thumbnail(str(thumbnail_path))
@@ -433,10 +479,20 @@ def delete_image(
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
 	
-	# Clean up files; only unlink paths inside storage
-	file_path = resolve_within_storage(img.file_path)
-	if file_path:
-		file_path.unlink(missing_ok=True)
+	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths
+	# inside storage. The record's other images survive this delete, and one of
+	# them may be a master of the same frame in another format, sharing this
+	# master's stem and therefore its `_preview.jpg` — so they are passed in and
+	# the sidecar is kept if any of them still names it. Superseded images count:
+	# their rows still point at files on the card (NEH-208).
+	siblings = [
+		other.file_path
+		for other in db.query(RecordImage).filter(
+			RecordImage.record_id == img.record_id,
+			RecordImage.id != img.id,
+		)
+	]
+	_unlink_image_file_and_sidecar(img.file_path, siblings)
 	thumbnail_path = resolve_within_storage(img.thumbnail_path)
 	if thumbnail_path:
 		delete_thumbnail(str(thumbnail_path))

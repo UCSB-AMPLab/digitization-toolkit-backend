@@ -159,3 +159,57 @@ def test_prune_exports_keeps_newest(tmp_path):
                          "collection_7_20260104T000000Z.zip"]
     # stale .part cleaned
     assert list(tmp_path.glob("*.part")) == []
+
+
+def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
+    export_client, db_session, override_projects_root, monkeypatch, tmp_path
+):
+    """NEH-259: the bag's metadata.json is what a receiving institution reads,
+    so dropping object_typology must not take single-vs-dual with it. The
+    schema version is how a bag written before this change is told from one
+    written after; bags already exported are not rewritten."""
+    import hashlib, zipfile
+    from app.core import config
+
+    from app.models.record import RecordImage
+    from capture.project_manager import secure_project_filename
+
+    exports = tmp_path / "exp"
+    exports.mkdir()
+    monkeypatch.setattr(config.settings, "EXPORTS_ROOT", str(exports))
+
+    proot = override_projects_root / secure_project_filename("P")
+    (proot / "images").mkdir(parents=True)
+    (proot / "metadata").mkdir(parents=True)
+    f = proot / "images" / "cap.jpg"
+    f.write_bytes(b"captured bytes here")
+    sha = hashlib.sha256(b"captured bytes here").hexdigest()
+    (proot / "metadata" / "manifest.jsonl").write_text(
+        json.dumps({"capture_id": "cid1", "files": [
+            {"role": "single", "relative_path": "images/cap.jpg", "sha256": sha}]}) + "\n")
+
+    col, rec = _approved_collection(db_session)
+    db_session.add(RecordImage(record_id=rec.id, filename="cap.jpg", file_path=str(f),
+                               format="jpg", role="single", capture_id="cid1", is_current=True))
+    db_session.commit()
+
+    resp = export_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 202, resp.text
+    st = _run_to_completion(export_client, col.id, resp.json()["job_id"])
+    assert st["state"] == "done", st
+
+    zname = st["zip_filename"]
+    with zipfile.ZipFile(exports / zname) as zf:
+        meta_name = next(n for n in zf.namelist() if n.endswith("data/metadata.json"))
+        meta = json.loads(zf.read(meta_name).decode("utf-8"))
+
+    # The literal, not the constant -- see test_record_typology_dropped.py. Here it
+    # also pins what a receiving institution reads out of the bag, and JSON round-trips
+    # True as `true`, which no equality check against the constant would catch.
+    assert type(meta["schema_version"]) is int
+    assert meta["schema_version"] == 1
+    assert len(meta["records"]) == 1
+    entry = meta["records"][0]
+    assert entry["capture_mode"] == "single"
+    assert "object_typology" not in entry
+    assert "material" not in entry
