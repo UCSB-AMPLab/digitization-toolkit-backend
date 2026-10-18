@@ -186,6 +186,11 @@ class RecordUpdate(BaseModel):
 
 class RecordRead(RecordBase):
 	id: int
+	# The catalogue entry's own identifier (Fisqua's `reference_code`). Read
+	# only: it is deliberately absent from RecordCreate and RecordUpdate, so a
+	# client cannot set or change it, and Record enforces that it is written
+	# once on the model as well.
+	external_id: Optional[str] = None
 	project_id: Optional[int] = None
 	collection_id: Optional[int] = None
 	created_by: Optional[str] = None

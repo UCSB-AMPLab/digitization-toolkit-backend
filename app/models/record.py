@@ -1,8 +1,12 @@
 from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy.orm import relationship, validates
 
 from app.core.db import Base
+
+
+class ImmutableFieldError(ValueError):
+	"""A write would change a value that is set once and never again."""
 
 
 class Record(Base):
@@ -22,7 +26,16 @@ class Record(Base):
 	author = Column(String(255), nullable=True)
 	date = Column(String(50), nullable=True)
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
-	
+
+	# The identifier of the catalogue entry this record was captured for —
+	# Fisqua's `reference_code`. Unique, so two records cannot claim the same
+	# catalogue entry; nullable, because a record captured without a catalogue
+	# entry has none; indexed, because the exchange looks records up by it.
+	# Absent from every request schema, so no client can set it: the only
+	# writer is an importer assigning the attribute. Immutable once set — see
+	# _external_id_is_write_once.
+	external_id = Column(String(255), nullable=True, unique=True, index=True)
+
 	# Organizational hierarchy
 	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
 	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -49,6 +62,30 @@ class Record(Base):
 	collection = relationship("Collection", back_populates="records")
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
+
+	@validates("external_id")
+	def _external_id_is_write_once(self, key, value):
+		"""Refuse any assignment that would change an external_id already stored.
+
+		A reference code that can be reassigned is worse than no reference
+		code: every trace drawn from the appliance back to the catalogue
+		through it becomes unverifiable, and nothing in the data says which
+		of the two codes was the real one. Assigning the identical value is
+		allowed, since it changes nothing — an importer re-running over a
+		record it already stamped is not a second write. Clearing it to NULL
+		is a change like any other and is refused.
+
+		Scope: this is an ORM attribute guard, so it covers every writer that
+		assigns the attribute, which is all of them. `query().update()` and
+		raw SQL go around it and would need their own check.
+		"""
+		current = self.external_id
+		if current is not None and value != current:
+			raise ImmutableFieldError(
+				f"records.external_id is written once and cannot be changed "
+				f"(record {self.id}: {current!r} -> {value!r})"
+			)
+		return value
 
 	# Constraint: must have either project_id OR collection_id (or neither, but not both)
 	__table_args__ = (
