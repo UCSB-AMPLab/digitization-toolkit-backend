@@ -89,9 +89,9 @@ class Record(Base):
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
 
-	@validates("external_id")
-	def _external_id_is_write_once(self, key, value):
-		"""Refuse any assignment that would change an external_id already stored.
+	@validates("external_id", include_removes=True)
+	def _external_id_is_write_once(self, key, value, is_remove):
+		"""Refuse any assignment or removal that would change a stored external_id.
 
 		A reference code that can be reassigned is worse than no reference
 		code: every trace drawn from the appliance back to the catalogue
@@ -101,11 +101,31 @@ class Record(Base):
 		record it already stamped is not a second write. Clearing it to NULL
 		is a change like any other and is refused.
 
+		`include_removes` is what makes `del rec.external_id` reach this
+		method, and it is the reason the method takes a fourth argument:
+		without it SQLAlchemy sends set events only, the removal goes through
+		unchecked, and the next assignment reads an empty attribute and is
+		allowed as a first write. A removal is treated as a change and refused
+		on the same terms as a clear to NULL, which is where it ends up
+		anyway: a record that carried a reference code no longer carrying one.
+		With nothing stored there is nothing to protect, so a removal is
+		permitted — the symmetry with the same-value rewrite. On a removal the
+		`value` argument is SQLAlchemy's NO_VALUE sentinel rather than
+		anything a caller passed, so it stays out of the message.
+
 		Scope: this is an ORM attribute guard, so it covers every writer that
-		assigns the attribute, which is all of them. `query().update()` and
-		raw SQL go around it and would need their own check.
+		assigns or removes the attribute, which is all of them.
+		`query().update()` and raw SQL go around it and would need their own
+		check.
 		"""
 		current = self.external_id
+		if is_remove:
+			if current is not None:
+				raise ImmutableFieldError(
+					f"records.external_id is written once and cannot be removed "
+					f"(record {self.id}: {current!r})"
+				)
+			return value
 		if current is not None and value != current:
 			raise ImmutableFieldError(
 				f"records.external_id is written once and cannot be changed "

@@ -262,6 +262,80 @@ def test_the_guard_holds_on_a_record_loaded_in_a_fresh_identity_map(db_session):
 
 
 @pytest.mark.unit
+def test_removing_a_set_external_id_is_refused(db_session):
+    """`del rec.external_id` is a change like any other, so it is refused.
+
+    Removing the attribute and clearing it to NULL end in the same place: a
+    record that carried a reference code no longer carries one. The refusal is
+    the same refusal.
+    """
+    from app.models.record import ImmutableFieldError, Record
+
+    rec = Record(title="t", status="in_review", capture_mode="single",
+                 external_id="CO-NG-0014")
+    db_session.add(rec)
+    db_session.commit()
+
+    with pytest.raises(ImmutableFieldError):
+        del rec.external_id
+
+    db_session.rollback()
+    db_session.refresh(rec)
+    assert rec.external_id == "CO-NG-0014"
+
+
+@pytest.mark.unit
+def test_a_removal_cannot_be_used_to_reassign_an_external_id(db_session):
+    """The removal path has to be closed or the write-once guarantee is false.
+
+    A `validates` guard receives set events and, unless it asks for them, not
+    removes. A removal that goes through unchecked leaves the attribute empty,
+    and the next assignment then reads nothing stored and is allowed through as
+    a first write — two lines, no bulk update, no raw SQL, and the stored
+    reference code has changed.
+    """
+    from app.models.record import ImmutableFieldError, Record
+
+    rec = Record(title="t", status="in_review", capture_mode="single",
+                 external_id="CO-NG-0015")
+    db_session.add(rec)
+    db_session.commit()
+
+    with pytest.raises(ImmutableFieldError):
+        del rec.external_id
+    with pytest.raises(ImmutableFieldError):
+        rec.external_id = "CO-NG-0016"
+
+    db_session.rollback()
+    db_session.refresh(rec)
+    assert rec.external_id == "CO-NG-0015"
+
+
+@pytest.mark.unit
+def test_removing_an_unset_external_id_is_not_refused(db_session):
+    """With nothing stored there is nothing to protect, so the guard stands aside.
+
+    The symmetry is with the same-value rewrite the guard already allows: a
+    removal that takes nothing away is not a write. On a record loaded from a
+    row where the column is NULL the attribute holds a value of None, so the
+    removal simply succeeds; on an instance that never held one at all
+    SQLAlchemy raises its own AttributeError, which is not the guard's doing
+    and is not changed here.
+    """
+    from app.models.record import Record
+
+    rec = Record(title="t", status="in_review", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+
+    del rec.external_id
+
+    db_session.rollback()
+    db_session.refresh(rec)
+    assert rec.external_id is None
+
+
+@pytest.mark.unit
 def test_a_bulk_update_is_not_covered_by_the_guard(db_session):
     """The scope of the guard, asserted so a reader is not misled about it.
 
