@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
+from sqlalchemy import Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
 from sqlalchemy.orm import relationship, validates
 
 from app.core.db import Base
@@ -26,6 +26,32 @@ class Record(Base):
 	author = Column(String(255), nullable=True)
 	date = Column(String(50), nullable=True)
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
+
+	# The queryable form of the same date `date` holds verbally. `date` is a
+	# display field — "1750", "c. 1750", "mediados del siglo XVIII" — and none
+	# of that can be compared, sorted or filtered in SQL; parking a structured
+	# range in custom_attributes would not help, since that column is Text
+	# holding encoded JSON rather than a JSON column. So the range gets two
+	# real DATE columns beside the display field, and `date` stays.
+	#
+	# A span with day resolution. A document known only to its year is the
+	# whole of that year, one known to its month the whole of that month, one
+	# dated to a day a span of one day. What the pair cannot express is the
+	# precision of what is known — "sometime in 1750" and "throughout 1750"
+	# are the same two values — or approximation; `date` carries that.
+	#
+	# Independently nullable, because "after 1750" and "before 1800" are real
+	# archival dates and both ends are not always known. An end before its
+	# start is refused by check_record_date_range below — a database
+	# constraint rather than an ORM guard like external_id's, because an
+	# ordering rule compares two columns of one row, which is what a CHECK
+	# does, so it holds against a bulk UPDATE and raw SQL as well.
+	#
+	# Nothing writes them yet. Absent from every request schema, exposed
+	# read-only on RecordRead; the importer that will fill them is blocked on
+	# the exchange contract.
+	date_start = Column(Date, nullable=True)
+	date_end = Column(Date, nullable=True)
 
 	# The identifier of the catalogue entry this record was captured for —
 	# Fisqua's `reference_code`. Unique, so two records cannot claim the same
@@ -100,6 +126,17 @@ class Record(Base):
 		CheckConstraint(
 			"capture_mode IN ('single','dual')",
 			name='check_record_capture_mode'
+		),
+		# An end before its start. A half-open range passes: with either end
+		# NULL there is nothing to compare. The two NULL clauses say so
+		# explicitly, which a bare `date_end >= date_start` would also do —
+		# that comparison is NULL when either end is NULL, and a CHECK accepts
+		# NULL — so the explicit form is for a reader, not for the database,
+		# and the two are interchangeable. `>=` and not `>` is not: a document
+		# dated to a single day has a start equal to its end.
+		CheckConstraint(
+			'date_start IS NULL OR date_end IS NULL OR date_end >= date_start',
+			name='check_record_date_range'
 		),
 	)
 
