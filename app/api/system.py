@@ -113,6 +113,32 @@ def get_temperature(current_user: User = Depends(allow_read_only)):
         return {"temperature": None, "unit": "C", "available": False}
 
 
+@router.get("/catalogue-backup")
+def get_catalogue_backup_state(
+    current_user: User = Depends(allow_read_only),
+    db: Session      = Depends(get_db_dependency),
+):
+    """Report when the catalogue was last verified offsite (NEH-249).
+
+    Read-only, and deliberately visible to every role that can see the rest of
+    the system panel: a backup whose state nobody can see is a backup nobody
+    knows has stopped. `last_verified_at` is null on a unit that has never
+    completed a verified dump, which is the condition worth noticing — it is
+    what was true of the Rionegro unit for the six weeks before its card
+    filled.
+    """
+    from app.core.catalogue_backup import last_verified_backup
+    from app.core.config import settings
+
+    state = last_verified_backup(db)
+    return {
+        "enabled":          bool(settings.OFFSITE_REMOTE.strip()),
+        "last_verified_at": state["verified_at"] if state else None,
+        "object":           state["object"] if state else None,
+        "detail":           state["detail"] if state else None,
+    }
+
+
 # ---------------------------------------------------------------------------
 # Storage management
 # ---------------------------------------------------------------------------
