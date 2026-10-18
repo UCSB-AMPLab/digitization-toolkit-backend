@@ -24,10 +24,12 @@ is the production path.
     python -m pytest tests/unit/test_catalogue_backup.py
 """
 
+import errno
 import gzip
 import hashlib
 import json
 import logging
+import os
 import stat
 import subprocess
 import textwrap
@@ -1217,3 +1219,163 @@ def test_a_naive_timestamp_is_still_read_as_utc(offsite, local_zone_utc_minus_5)
     cb = offsite.module
 
     assert cb._as_local_date(datetime(2026, 10, 2, 2, 0)) == date(2026, 10, 1)
+
+
+# ---------------------------------------------------------------------------
+# The deadline bounds the read, not only the direct child (R14)
+# ---------------------------------------------------------------------------
+
+# A wrapper script, which PG_DUMP_COMMAND may name: it starts a child that
+# inherits stdout, then execs a second process that also neither writes nor
+# exits. Killing only the direct child leaves the first one holding the write
+# end of the pipe. The sleeps are bounded so a failing run cannot leave
+# processes behind for ever, and are far longer than the test's deadline.
+_PG_DUMP_WRAPPER_STALL_STUB = """#!/bin/sh
+sleep 20 &
+exec sleep 20
+"""
+
+
+@pytest.mark.unit
+def test_a_stalled_wrapper_with_a_child_is_killed_and_reported(
+    offsite, tmp_path, monkeypatch
+):
+    """A wrapper's child inherits the dump's stdout. The read only sees EOF once
+    every holder of the write end is gone, so the deadline has to signal the
+    whole process group, not just the process the module started."""
+    from app.core.config import settings
+
+    cb = offsite.module
+    stub = _install(tmp_path, "pg-dump-wrapper-stall", _PG_DUMP_WRAPPER_STALL_STUB)
+    monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(stub), raising=False)
+    monkeypatch.setattr(cb, "_DUMP_TIMEOUT_SECONDS", 0.5)
+
+    outcome = {}
+
+    def attempt():
+        try:
+            cb.write_dump(offsite.dump_dir / "catalogue-wrapper-stalled.sql.gz")
+        except BaseException as exc:  # noqa: BLE001 - recorded, then asserted on
+            outcome["raised"] = exc
+        else:
+            outcome["raised"] = None
+
+    worker = threading.Thread(target=attempt, name="stalled-wrapper", daemon=True)
+    worker.start()
+    worker.join(8)
+
+    assert not worker.is_alive(), "a child holding the pipe kept the dump unbounded"
+    assert isinstance(outcome["raised"], cb.BackupError), outcome
+    assert "did not finish within" in str(outcome["raised"])
+
+
+# ---------------------------------------------------------------------------
+# The dump is not readable by other local users (R15)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_dump_is_created_owner_only(offsite, db_session, monkeypatch):
+    """The dump carries users.hashed_password for every account, which
+    --no-role-passwords does not touch. The mode is checked while the file
+    exists, from inside upload(), because the run removes it."""
+    cb = offsite.module
+    seen = {}
+    real_upload = cb.upload
+
+    def capturing_upload(local):
+        seen["mode"] = stat.S_IMODE(Path(local).stat().st_mode)
+        real_upload(local)
+
+    monkeypatch.setattr(cb, "upload", capturing_upload)
+
+    assert cb.run_catalogue_backup(db_session)["status"] == "verified"
+    assert seen["mode"] == 0o600, oct(seen["mode"])
+
+
+@pytest.mark.unit
+def test_the_dump_directory_is_created_owner_only(db_session, tmp_path, monkeypatch):
+    from app.core import config
+    import app.core.catalogue_backup as cb
+
+    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    old_umask = os.umask(0o022)
+    try:
+        created = cb._dump_dir()
+    finally:
+        os.umask(old_umask)
+
+    assert stat.S_IMODE(created.stat().st_mode) == 0o700
+
+
+# ---------------------------------------------------------------------------
+# A filesystem error during the dump is a failed status (R16)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_full_card_during_the_dump_is_a_recorded_failure(
+    offsite, db_session, monkeypatch
+):
+    """ENOSPC is the condition this feature exists for. It must reach the
+    operator as catalogue_backup_failed, not escape a function that promises a
+    status."""
+    from app.models.system_log import SystemLog
+
+    cb = offsite.module
+
+    def full_card(self, data):
+        raise OSError(errno.ENOSPC, os.strerror(errno.ENOSPC))
+
+    monkeypatch.setattr(gzip.GzipFile, "write", full_card)
+
+    result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "failed", result
+    assert "space" in result["error"].lower()
+    rows = (
+        db_session.query(SystemLog)
+        .filter(SystemLog.action == cb.FAILED_ACTION)
+        .all()
+    )
+    assert len(rows) == 1
+    assert offsite.upload_calls() == []
+    assert offsite.leftovers() == []
+
+
+# ---------------------------------------------------------------------------
+# The stale sweep does not sit behind the enabled check (R17)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_stale_dump_is_swept_when_the_remote_is_no_longer_configured(
+    offsite, db_session, monkeypatch
+):
+    """A unit that died mid-dump and then lost OFFSITE_REMOTE keeps the dump on
+    its card unless the sweep runs ahead of the disabled return."""
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_REMOTE", "", raising=False)
+    stale = offsite.dump_dir / "catalogue-19990101-000000-abc123.sql.gz"
+    stale.write_bytes(b"left behind before the remote was cleared")
+
+    assert cb.run_catalogue_backup(db_session)["status"] == "disabled"
+    assert offsite.leftovers() == []
+
+
+@pytest.mark.unit
+def test_the_scheduler_sweeps_at_startup_when_it_has_nothing_to_schedule(
+    offsite, monkeypatch
+):
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_REMOTE", "", raising=False)
+    stale = offsite.dump_dir / "catalogue-19990101-000000-abc123.sql.gz"
+    stale.write_bytes(b"abandoned before the remote was cleared")
+
+    scheduler = cb.CatalogueBackupScheduler()
+    try:
+        assert scheduler.start() is False
+        assert offsite.leftovers() == []
+    finally:
+        scheduler.stop()

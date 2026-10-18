@@ -48,8 +48,10 @@ import gzip
 import hashlib
 import json
 import logging
+import os
 import secrets
 import shlex
+import signal
 import subprocess
 import tempfile
 import threading
@@ -174,7 +176,9 @@ def _dump_dir() -> Path:
     does not depend on what /tmp is backed by on a given image.
     """
     path = config.settings.data_dir / "tmp"
-    path.mkdir(parents=True, exist_ok=True)
+    # 0700: the dump holds every account's password hash, so no other local
+    # user has any business listing this directory.
+    path.mkdir(mode=0o700, parents=True, exist_ok=True)
     return path
 
 
@@ -225,6 +229,37 @@ def _sweep_stale_dumps() -> int:
 # Steps
 # ---------------------------------------------------------------------------
 
+def _kill_dump(process: subprocess.Popen) -> None:
+    """SIGKILL the dump's process group, or the process alone if it shares ours.
+
+    The dump is started in its own session, so its group holds the argv's first
+    process and anything that process started. Signalling only the first leaves
+    a wrapper's children alive, and they hold the write end of the stdout pipe
+    open: the read never returns EOF.
+
+    The group is compared with this process's own before anything is signalled.
+    A dump started without start_new_session=True shares the backend's group,
+    and killing that group kills the backend: uvicorn, the API, the schedule.
+    Removing start_new_session=True from the Popen above and running the
+    stalled-wrapper test killed the test runner, which is how this guard came
+    to be written. The two settings are one mechanism, and
+    a future edit that separates them must not be able to take the backend
+    down, so the fallback kills only the child and lets the caller's existing
+    timeout path report the stall.
+
+    Raises OSError if the group is already gone; callers guard it.
+    """
+    pgid = os.getpgid(process.pid)
+    if pgid == os.getpgid(0):
+        logger.error(
+            "The catalogue dump shares this process's group; killing the dump "
+            "process alone. A wrapper's children may hold the pipe open."
+        )
+        process.kill()
+        return
+    os.killpg(pgid, signal.SIGKILL)
+
+
 def write_dump(dest: Path) -> tuple[int, str]:
     """Stream the catalogue dump through gzip into `dest`.
 
@@ -243,6 +278,9 @@ def write_dump(dest: Path) -> tuple[int, str]:
                 stdout=subprocess.PIPE,
                 stderr=errfile,
                 stdin=subprocess.DEVNULL,
+                # Its own process group, so the deadline can signal a wrapper
+                # and the children it started together (see _kill_dump).
+                start_new_session=True,
             )
         except OSError as exc:
             # A binary that is missing or not executable fails here, before any
@@ -255,14 +293,16 @@ def write_dump(dest: Path) -> tuple[int, str]:
         # The read below blocks with no timeout of its own, and the wait after
         # the loop is only reached once the loop ends, so a child that neither
         # writes nor exits would hold the scheduler thread for the life of the
-        # process. The deadline kills the child instead: the read then returns
-        # EOF, the loop ends, and the error path below runs.
+        # process. The deadline kills the child's whole process group instead:
+        # a wrapper's children inherit stdout and would keep the pipe open
+        # after the wrapper itself died. With every holder gone the read
+        # returns EOF, the loop ends, and the error path below runs.
         deadline_passed = threading.Event()
 
         def _kill_on_deadline() -> None:
             deadline_passed.set()
             try:
-                process.kill()
+                _kill_dump(process)
             except OSError:
                 logger.exception("Could not kill the stalled catalogue dump")
 
@@ -270,26 +310,44 @@ def write_dump(dest: Path) -> tuple[int, str]:
         watchdog.daemon = True
         watchdog.start()
         try:
-            with gzip.open(dest, "wb") as out:
-                while True:
-                    chunk = process.stdout.read(1 << 20)
-                    if not chunk:
-                        break
-                    raw_bytes += len(chunk)
-                    out.write(chunk)
-        finally:
-            watchdog.cancel()
-            if process.stdout is not None:
-                process.stdout.close()
             try:
-                returncode = process.wait(timeout=_DUMP_TIMEOUT_SECONDS)
-            except subprocess.TimeoutExpired:
-                process.kill()
-                process.wait()
-                raise BackupError(
-                    f"the catalogue dump did not finish within "
-                    f"{_DUMP_TIMEOUT_SECONDS}s"
-                ) from None
+                # Created 0600 at open, not chmod'd afterwards: there is no
+                # moment at which another local user could read it. O_EXCL
+                # because the name is unique per run, so an existing file here
+                # is not one to write into.
+                fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+                with os.fdopen(fd, "wb") as raw, \
+                        gzip.GzipFile(fileobj=raw, mode="wb") as out:
+                    while True:
+                        chunk = process.stdout.read(1 << 20)
+                        if not chunk:
+                            break
+                        raw_bytes += len(chunk)
+                        out.write(chunk)
+            finally:
+                watchdog.cancel()
+                if process.stdout is not None:
+                    process.stdout.close()
+                try:
+                    returncode = process.wait(timeout=_DUMP_TIMEOUT_SECONDS)
+                except subprocess.TimeoutExpired:
+                    try:
+                        _kill_dump(process)
+                    except OSError:
+                        logger.exception("Could not kill the stalled catalogue dump")
+                    process.wait()
+                    raise BackupError(
+                        f"the catalogue dump did not finish within "
+                        f"{_DUMP_TIMEOUT_SECONDS}s"
+                    ) from None
+        except OSError as exc:
+            # A full card fails creating, writing or closing the file with
+            # OSError (ENOSPC), and ENOSPC is the condition this module exists
+            # for. Converted here so run_catalogue_backup records it as a
+            # failed run, as it promises to.
+            raise BackupError(
+                f"the catalogue dump could not be written to {dest}: {exc}"
+            ) from exc
 
         if returncode != 0:
             if deadline_passed.is_set():
@@ -312,9 +370,14 @@ def write_dump(dest: Path) -> tuple[int, str]:
             "compression); refusing to treat it as a backup"
         )
 
-    with dest.open("rb") as fh:
-        for chunk in iter(lambda: fh.read(1 << 20), b""):
-            digest.update(chunk)
+    try:
+        with dest.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    except OSError as exc:
+        raise BackupError(
+            f"the catalogue dump could not be read back from {dest}: {exc}"
+        ) from exc
     return raw_bytes, digest.hexdigest()
 
 
@@ -492,13 +555,14 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     today), "verified", "failed" (the bucket answered and the answer was bad, or
     the dump or upload failed), "aborted" (verification could not answer).
     """
+    # Before the disabled and up-to-date checks, not after them: both return
+    # early, and a dump left behind by a failed unlink or a killed process has
+    # to be cleared by some tick that does not run. A unit that died mid-dump
+    # and then lost OFFSITE_REMOTE would otherwise keep the dump on its card.
+    _sweep_stale_dumps()
+
     if not config.settings.OFFSITE_REMOTE.strip():
         return {"status": "disabled"}
-
-    # Before the up-to-date check, not after it: an up-to-date tick returns
-    # early, and a dump left behind by a failed unlink or a killed process has
-    # to be cleared by some tick that does not run.
-    _sweep_stale_dumps()
 
     if not needs_run_today(db, today):
         state = last_verified_backup(db)
@@ -624,12 +688,14 @@ class CatalogueBackupScheduler:
         five seconds and then lets the process exit, so a run can die between
         writing its dump and removing it; boot is where that one gets cleared.
         """
+        # Ahead of the configured check: an abandoned dump is cleared even on
+        # a unit whose remote has since been removed.
+        _sweep_stale_dumps()
         if not config.settings.OFFSITE_REMOTE.strip():
             logger.info(
                 "Offsite catalogue backup is not configured; no schedule started"
             )
             return False
-        _sweep_stale_dumps()
         if self._thread is not None and self._thread.is_alive():
             return True
         self._stop.clear()
