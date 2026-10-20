@@ -270,7 +270,7 @@ def delete_record(
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Delete a record and all its associated images (CASCADE)."""
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
@@ -484,7 +484,14 @@ def delete_image(
 	# a locked record. 'rejected' stays unlocked by design, so an emptied
 	# rejected record is still reachable — which is why the promotion
 	# invariant also insists on at least one current image.
-	rec = db.query(Record).filter(Record.id == img.record_id).first()
+	#
+	# The row is locked, not just read. Unlinking a master is not something a
+	# transaction can take back, and against the unlocked version a concurrent
+	# promotion and approval between this check and the unlink was reproduced:
+	# the file of an approved record was removed on the strength of a status
+	# that had already changed. The lock also stops this delete emptying a
+	# record that another request is promoting (see _apply_status_change).
+	rec = _locked_record(db, img.record_id, with_images=False)
 	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
@@ -511,13 +518,27 @@ def delete_image(
 	
 	record_id = img.record_id
 	db.delete(img)
-	db.commit()
 
-	record = db.query(Record).filter(Record.id == record_id).first()
-	if record and record.status == "approved" and not any(i.is_current for i in record.images):
-		record.status = "in_review"
-		db.add(record)
-		db.commit()
+	# An emptied approved record goes back to the queue, in the same
+	# transaction and under the same row lock as the delete that emptied it.
+	# It used to be a second read-and-write after the commit, which is the
+	# pattern this whole guard exists to remove: the status it read could
+	# already have moved. Counting the siblings rather than reading
+	# rec.images keeps the answer independent of when the delete is flushed.
+	remaining_current = (
+		db.query(RecordImage)
+		.filter(
+			RecordImage.record_id == record_id,
+			RecordImage.is_current.is_(True),
+			RecordImage.id != img_id,
+		)
+		.count()
+	)
+	if rec and rec.status == "approved" and remaining_current == 0:
+		rec.status = "in_review"
+		db.add(rec)
+
+	db.commit()
 	return {"detail": "Image deleted"}
 
 
@@ -693,6 +714,33 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def _locked_record(db: Session, rec_id: int, with_images: bool = True):
+	"""Load a record with its row locked for the rest of the transaction.
+
+	The record row is the mutex for its own workflow state: status moves and
+	changes to which images are current both take it, so a check made under it
+	is still true at commit. `of=Record` keeps the lock off the images, which
+	arrive through a LEFT OUTER JOIN — PostgreSQL refuses FOR UPDATE on the
+	nullable side of one.
+
+	On SQLite, which the test suite runs on, SQLAlchemy emits no FOR UPDATE at
+	all, so the tests exercise the surrounding logic and cannot demonstrate the
+	locking. That is verified by reading the emitted SQL, not by the suite.
+	"""
+	return _locked_record_query(db, rec_id, with_images).first()
+
+
+def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
+	"""The query _locked_record runs. Split out so a test can compile it
+	against the PostgreSQL dialect and read the lock clause off the SQL, which
+	is the only way to check it without a server — see
+	tests/unit/test_workflow_row_locking.py."""
+	query = db.query(Record)
+	if with_images:
+		query = query.options(joinedload(Record.images))
+	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+
+
 def _assert_promotable(rec: Record) -> None:
 	"""
 	Refuse to let a record leave 'captured' unless the work is there to hand
@@ -741,8 +789,17 @@ def _apply_status_change(
 
 	Every promotion goes through here — PATCH /{id}/status, POST /bulk-status
 	and POST /collections/{id}/promote all call it — so the invariant on
-	leaving 'captured' is enforced here rather than at each endpoint. Callers
-	must have the record's images loaded; the three above use joinedload.
+	leaving 'captured' is enforced here rather than at each endpoint.
+
+	Callers must have the record's images loaded AND must hold the record row
+	under SELECT ... FOR UPDATE. Validating a snapshot is not enough: the
+	check and the write have to be one atomic step, or a second request can
+	change what was checked in between. Two sequences were reproduced against
+	the unlocked version — a concurrent reject landing a rejected image back
+	on a record this call then promoted, and a concurrent delete emptying a
+	record this call then promoted. Locking the record row serialises both,
+	because every path that moves a record's status or changes which of its
+	images are current takes the same lock first.
 	"""
 	current_status = rec.status
 	if current_status == new_status:
@@ -796,7 +853,7 @@ def update_record_status(
 	moves a rejected one to in_review. The undo transitions above are plain
 	status resets with no new image, no reason, and no audit entry.
 	"""
-	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
+	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
@@ -819,10 +876,15 @@ def bulk_update_status(
 
 	Returns the updated records.
 	"""
+	# Locked for the same reason the single-record path is, and ordered by id
+	# so two bulk calls over overlapping sets take the rows in the same order
+	# and cannot deadlock against each other.
 	records = (
 		db.query(Record)
 		.options(joinedload(Record.images))
 		.filter(Record.id.in_(payload.record_ids))
+		.order_by(Record.id)
+		.with_for_update(of=Record)
 		.all()
 	)
 	if not records:
@@ -869,7 +931,9 @@ def reject_record(
 	'rejected'. Rejected images are never deleted or overwritten; they stay
 	queryable via GET /{rec_id}/rejections after a recapture supersedes them.
 	"""
-	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
+	# Locked: this writes rejection_id onto the current images and moves the
+	# status, both of which the promotion invariant reads (NEH-260).
+	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 	if rec.status != "in_review":

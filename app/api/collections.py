@@ -489,10 +489,17 @@ def promote_collection(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
+    # Locked for the rest of the transaction, and in id order so this and the
+    # bulk endpoint take overlapping rows the same way round. Without the lock
+    # the pre-check below validates a snapshot: a reject arriving between the
+    # check and the commit puts a rejected image back on a record this call
+    # then hands over (NEH-260, reproduced).
     records = (
         db.query(Record)
         .options(joinedload(Record.images))
         .filter(Record.collection_id == collection_id, Record.status == "captured")
+        .order_by(Record.id)
+        .with_for_update(of=Record)
         .all()
     )
     if not records:
@@ -551,27 +558,31 @@ def take_back_collection(
     ruled on them, and a ruling is not undone by taking the handover back.
     The accepted cost is that a reviewer working the queue can see items
     disappear from it; promoting again returns them.
+
+    One statement, so the predicate and the write are evaluated together by
+    the database. Selecting the in_review records and then assigning to each
+    of them is not the same thing: an approval committed in between was
+    overwritten with 'captured', which undid a reviewer's ruling and handed
+    the work back to the operator (reproduced). A collection can hold 825
+    records, so that window is as long as the transaction.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    records = (
+    taken_back = (
         db.query(Record)
         .filter(Record.collection_id == collection_id, Record.status == "in_review")
-        .all()
+        .update({Record.status: "captured"}, synchronize_session=False)
     )
-    if not records:
-        return {"collection_id": collection_id, "taken_back": 0}
-
-    for rec in records:
-        rec.status = "captured"
     db.commit()
+    if not taken_back:
+        return {"collection_id": collection_id, "taken_back": 0}
 
     log_event(db, level="INFO", category="activity", action="collection_taken_back",
               actor=current_user.username, subject=collection.name,
-              detail=f"{len(records)} records")
-    return {"collection_id": collection_id, "taken_back": len(records)}
+              detail=f"{taken_back} records")
+    return {"collection_id": collection_id, "taken_back": taken_back}
 
 
 # ==============================================================================
