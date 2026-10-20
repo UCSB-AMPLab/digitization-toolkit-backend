@@ -33,6 +33,35 @@ FREE_SPACE_MARGIN = 100 * 1024 * 1024
 METADATA_SCHEMA_VERSION = 1
 
 
+def workflow_blockers(records) -> tuple[str, list[int]] | None:
+    """Why a collection's workflow state forbids an export, or None.
+
+    One definition with two callers, deliberately: the request-time gate in
+    app/api/collections.py and _do_export below. They are separated by however
+    long the export queue is, and the worker reloads the records, so checking
+    only at request time let a collection taken back in the gap export anyway —
+    the bag's metadata then described the work as `captured` (NEH-260,
+    reproduced). The approval half of that gap predates the handover gate.
+
+    Handover is reported before approval because they are different things to
+    tell an operator: a collection she has not handed over is work in progress,
+    not work that failed review.
+    """
+    not_handed_over = [r.id for r in records if r.status == "captured"]
+    if not_handed_over:
+        return (
+            f"Cannot export: {len(not_handed_over)} record(s) have not been handed over for review yet: {not_handed_over}",
+            not_handed_over,
+        )
+    non_approved = [r.id for r in records if r.status != "approved"]
+    if non_approved:
+        return (
+            f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
+            non_approved,
+        )
+    return None
+
+
 def run_export(job: ExportJob, collection_id: int) -> None:
     from app.core.db import SessionLocal
     db = SessionLocal()
@@ -53,6 +82,12 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
+    # Re-checked here, not just at request time. Nothing is built before this.
+    blocker = workflow_blockers(records)
+    if blocker:
+        message, blocking_ids = blocker
+        raise ExportError(message, detail={"blocking_record_ids": blocking_ids})
+
     project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
 
     exports_dir = config.settings.exports_dir
