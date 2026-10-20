@@ -108,11 +108,23 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
     """
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "rpicam")
     built = []
-    for name, cls in capture_service._BACKEND_CONSTRUCTORS.items():
+    # Both the registry values AND the names in the module namespace. Patching
+    # only the registry left a hole: a construction written directly above the
+    # dispatch -- RpicamBackend(subprocess_logger) -- never touches the mapping,
+    # so the recorder stayed empty and this test passed with the forbidden
+    # fallback being built.
+    for name in list(capture_service._BACKEND_CONSTRUCTORS):
         monkeypatch.setitem(
             capture_service._BACKEND_CONSTRUCTORS,
             name,
             lambda *a, _n=name, **k: built.append(_n),
+        )
+    for cls_name in ("Picamera2Backend", "RpicamBackend", "GPhoto2Backend", "ChdkBackend"):
+        assert hasattr(capture_service, cls_name), cls_name
+        monkeypatch.setattr(
+            capture_service,
+            cls_name,
+            lambda *a, _n=cls_name, **k: built.append(_n),
         )
     with pytest.raises(capture_service.UnknownCameraBackend):
         capture_service.get_camera_backend()
@@ -142,8 +154,12 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
 
     served = []
 
+    # Entered through the app's REGISTERED lifespan, not by calling the
+    # function. Calling app_main.lifespan directly passes even if the
+    # registration is dropped -- a mutation to `FastAPI()` with no lifespan=
+    # left all 17 cases in this file green while the protection was gone.
     async def serve():
-        async with app_main.lifespan(app_main.app):
+        async with app_main.app.router.lifespan_context(app_main.app):
             served.append(1)
 
     with pytest.raises(capture_service.UnknownCameraBackend):
@@ -172,11 +188,40 @@ def test_the_lifespan_still_starts_on_a_value_it_has(monkeypatch):
     served = []
 
     async def serve():
-        async with app_main.lifespan(app_main.app):
+        async with app_main.app.router.lifespan_context(app_main.app):
             served.append(1)
 
     asyncio.run(serve())
     assert served == [1]
+
+
+@pytest.mark.unit
+def test_the_registry_reads_the_same_canonical_name(monkeypatch):
+    """A value the guard accepts must not route somewhere else downstream.
+
+    Accepting surrounding whitespace in the guard while camera_registry.py
+    still did a bare `.lower()` meant `" gphoto2 "` passed startup and then
+    selected the picamera2 path, so a DSLR rig detected nothing -- a worse
+    failure than the one the tolerance prevents.
+
+    The second half is a source assertion rather than a call, deliberately:
+    both registry sites lead into hardware detection, which has nothing to
+    detect on a runner, so exercising them would test the absence of cameras.
+    What the defect turned on is which name those sites read, and that is
+    exactly what is asserted.
+    """
+    import inspect
+
+    import capture.camera_registry as registry
+
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", " GPhoto2 ")
+    assert capture_service.configured_camera_backend() == "gphoto2"
+
+    source = inspect.getsource(registry)
+    assert "settings.CAMERA_BACKEND" not in source, (
+        "camera_registry reads the raw setting; it must read the canonical name"
+    )
+    assert source.count("configured_camera_backend()") >= 2
 
 
 if __name__ == "__main__":

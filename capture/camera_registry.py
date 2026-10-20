@@ -158,8 +158,11 @@ class CameraRegistry:
             Tuple of (hardware_id, camera_info_dict)
         """
         try:
-            from app.core.config import settings
-            if settings.CAMERA_BACKEND.lower() in ("gphoto2", "chdk"):
+            # The canonical name, so a value with surrounding whitespace does
+            # not pass the startup assertion and then select another backend
+            # here (NEH-268).
+            from .service import configured_camera_backend
+            if configured_camera_backend() in ("gphoto2", "chdk"):
                 return CameraRegistry._hardware_id_from_backend(camera_index)
         except Exception:
             pass
@@ -227,8 +230,8 @@ class CameraRegistry:
         """
         detected = {}
         try:
-            from app.core.config import settings
-            backend = settings.CAMERA_BACKEND.lower()
+            from .service import configured_camera_backend
+            backend = configured_camera_backend()
         except Exception:
             backend = "picamera2"
 

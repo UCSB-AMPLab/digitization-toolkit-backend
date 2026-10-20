@@ -83,6 +83,18 @@ _BACKEND_CONSTRUCTORS = {
 KNOWN_CAMERA_BACKENDS = tuple(sorted(_BACKEND_CONSTRUCTORS))
 
 
+def configured_camera_backend() -> str:
+    """The configured backend's name, canonicalised, without judging it.
+
+    Every reader of CAMERA_BACKEND goes through this. Tolerating surrounding
+    whitespace here and not in camera_registry.py made `" gphoto2 "` pass the
+    assertion below and then select the picamera2 path in the registry, so a
+    DSLR rig detected no cameras at all -- a worse failure than the one the
+    tolerance was added to prevent.
+    """
+    return settings.CAMERA_BACKEND.strip().lower()
+
+
 def assert_camera_backend_configured() -> str:
     """Return the configured backend's canonical name, or refuse.
 
@@ -98,7 +110,7 @@ def assert_camera_backend_configured() -> str:
     answer /health, and fail at the moment someone tried to photograph
     something.
     """
-    configured = settings.CAMERA_BACKEND.strip().lower()
+    configured = configured_camera_backend()
     if configured not in _BACKEND_CONSTRUCTORS:
         raise UnknownCameraBackend(
             f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
