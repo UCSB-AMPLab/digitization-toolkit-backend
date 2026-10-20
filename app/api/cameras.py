@@ -773,21 +773,40 @@ def trigger_capture(
 
 		# Get or create Record
 		is_recapture = False
+		# A retake promotes only a rejected record, moving it into the review
+		# queue. A captured one stays in the operator's hands until she promotes
+		# its collection (NEH-260); without this flag every retake would promote
+		# the record it was meant to leave with her.
+		recapture_promotes = False
 		if request.record_id:
 			# Link to existing record
 			record = db.query(Record).filter(Record.id == request.record_id).first()
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
-			if record.status == "rejected":
-				# Recapture (NEH-208): a rejected record can only be redone with
-				# the same capture mode it was originally taken with — a single
-				# capture can't turn a dual-mode record's pair back into one image.
+			if record.status in ("captured", "rejected"):
+				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
+				# can redo a frame she can see is bad instead of waiting for a
+				# reviewer to reject it and pick one of six image faults). An
+				# approved record is deliberately not retakeable: approved is the
+				# only state meaning something may already have left the appliance,
+				# so the path is reviewer undoes, reviewer rejects, operator retakes.
+				#
+				# Either way the record can only be redone in the capture mode it was
+				# originally taken with — a single capture can't turn a dual-mode
+				# record's pair back into one image.
+				#
+				# record_id is the only signal this endpoint has, and it now means
+				# "retake" in the two states an operator can act in and "add an
+				# image to this record" in the two she cannot. No client uses the
+				# second: the frontend passes record_id only from its retake handler,
+				# and every folio is captured as its own record.
 				if record.capture_mode != "single":
 					raise HTTPException(
 						status_code=422,
 						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
 					)
 				is_recapture = True
+				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
 				_supersede_current_images(record)
 		else:
@@ -858,7 +877,7 @@ def trigger_capture(
 			)
 			db.add(ex)
 
-		if is_recapture:
+		if is_recapture and recapture_promotes:
 			record.status = "in_review"
 
 		db.commit()
@@ -952,21 +971,28 @@ def trigger_dual_capture(
 		
 		# Get or create Record
 		is_recapture = False
+		# A retake promotes only a rejected record, moving it into the review
+		# queue. A captured one stays in the operator's hands until she promotes
+		# its collection (NEH-260); without this flag every retake would promote
+		# the record it was meant to leave with her.
+		recapture_promotes = False
 		if request.record_id:
-			# Link to existing record (adding new pages to multi-page document)
+			# Link to existing record
 			record = db.query(Record).filter(Record.id == request.record_id).first()
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
-			if record.status == "rejected":
-				# Recapture (NEH-208): a rejected record can only be redone with
-				# the same capture mode it was originally taken with — a dual
-				# pair can't turn a single-mode record into two images.
+			if record.status in ("captured", "rejected"):
+				# Retake, on the same terms as the single-capture endpoint above
+				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
+				# be redone as a pair, and can't turn a single-mode record into two
+				# images.
 				if record.capture_mode != "dual":
 					raise HTTPException(
 						status_code=422,
 						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the single-capture endpoint to recapture it."
 					)
 				is_recapture = True
+				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
 				_supersede_current_images(record)
 		else:
@@ -1072,7 +1098,7 @@ def trigger_dual_capture(
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
 
-		if is_recapture:
+		if is_recapture and recapture_promotes:
 			record.status = "in_review"
 
 		db.commit()
