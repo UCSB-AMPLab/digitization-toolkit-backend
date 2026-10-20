@@ -65,6 +65,51 @@ if not _picamera2_logger.handlers:
         _picamera2_logger.addHandler(_rfh)
 
 # Initialize camera backend based on configuration
+class UnknownCameraBackend(RuntimeError):
+    """CAMERA_BACKEND names a backend this build cannot serve."""
+
+
+# The backends this build has, and the ONE place the list exists. Both the
+# dispatch and the startup assertion read this mapping, so a backend cannot be
+# added to a list and forgotten in a conditional -- which is how the silent
+# fallback below survived: the names were enumerated in one place and the
+# fallback handled "everything else" in another.
+_BACKEND_CONSTRUCTORS = {
+    "picamera2": Picamera2Backend,
+    "subprocess": RpicamBackend,
+    "gphoto2": GPhoto2Backend,
+    "chdk": ChdkBackend,
+}
+KNOWN_CAMERA_BACKENDS = tuple(sorted(_BACKEND_CONSTRUCTORS))
+
+
+def assert_camera_backend_configured() -> str:
+    """Return the configured backend's canonical name, or refuse.
+
+    This used to log "Unknown backend '<value>', defaulting to subprocess" and
+    return RpicamBackend -- a third backend that is neither the one configured
+    nor the one intended. On a DSLR rig that yields no cameras and presents as
+    a hardware fault, on the machine furthest from help, so a typo in one line
+    of .env was indistinguishable from a dead camera (NEH-268).
+
+    Called from the application's lifespan as well as from the dispatch below.
+    The dispatch alone is not enough: the backend is constructed lazily on the
+    first capture, so a check that lived only here would let the service start,
+    answer /health, and fail at the moment someone tried to photograph
+    something.
+    """
+    configured = settings.CAMERA_BACKEND.strip().lower()
+    if configured not in _BACKEND_CONSTRUCTORS:
+        raise UnknownCameraBackend(
+            f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
+            f"a backend this build has. Valid values: "
+            f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env and restart. "
+            f"The service refuses to start rather than fall back, because a "
+            f"fallback to another backend presents as a dead camera."
+        )
+    return configured
+
+
 def get_camera_backend() -> CameraBackend:
     """
     Get the configured camera backend instance.
@@ -72,19 +117,7 @@ def get_camera_backend() -> CameraBackend:
     Returns:
         CameraBackend: The active camera backend implementation.
     """
-    backend_type = settings.CAMERA_BACKEND.lower()
-    
-    if backend_type == "picamera2":
-        return Picamera2Backend(subprocess_logger)
-    elif backend_type == "subprocess":
-        return RpicamBackend(subprocess_logger)
-    elif backend_type == "gphoto2":
-        return GPhoto2Backend(subprocess_logger)
-    elif backend_type == "chdk":
-        return ChdkBackend(subprocess_logger)
-    else:
-        subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
-        return RpicamBackend(subprocess_logger)
+    return _BACKEND_CONSTRUCTORS[assert_camera_backend_configured()](subprocess_logger)
 
 # Global backend instance (lazy initialization)
 _backend: Optional[CameraBackend] = None
