@@ -2,7 +2,7 @@ from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.responses import FileResponse
 from typing import List, Optional
 from datetime import datetime
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import select, func
 import logging
 
@@ -14,6 +14,10 @@ from app.models.record import Record, RecordImage
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 from app.schemas.record import ReorderRecords
+# The one place a status transition is validated and applied, so the
+# promotion invariant cannot be skipped by reaching a record from here
+# (NEH-260). cameras.py imports _supersede_current_images the same way.
+from app.api.records import _apply_status_change, _assert_promotable
 from app.core.audit import log_event
 from app.core.config import settings
 from app.core.export_jobs import export_jobs
@@ -454,6 +458,123 @@ def renumber_images(
 
 
 # ==============================================================================
+# Handover (NEH-260)
+# ==============================================================================
+
+@router.post("/{collection_id}/promote", status_code=200)
+def promote_collection(
+    collection_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Hand a finished collection over for review: apply captured -> in_review to
+    every captured record in it.
+
+    The act is per collection — an operator promotes a tomo when she has
+    finished it — while the transition itself stays per record, which is what
+    the exchange contract requires for v1. The collection is what travels in
+    the URL because Tomo 7 holds 825 records and that is not a request body.
+
+    All or nothing. A collection reads as handed over when none of its records
+    is captured, so promoting some of them would leave it unsubmitted while
+    reporting success; the records that cannot go are named instead and
+    nothing changes.
+
+    Submitted state is derived, never stored. Capture another folio into a
+    promoted collection and it is no longer submitted, which is the right
+    answer: there is work in it nobody has looked at.
+    """
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    records = (
+        db.query(Record)
+        .options(joinedload(Record.images))
+        .filter(Record.collection_id == collection_id, Record.status == "captured")
+        .all()
+    )
+    if not records:
+        # Already handed over, or empty. Idempotent rather than an error: she
+        # asked for a state that holds.
+        return {"collection_id": collection_id, "promoted": 0}
+
+    # Check every record before changing any, so the refusal names the whole
+    # problem and the collection is left exactly as it was.
+    blocking: list[int] = []
+    for rec in records:
+        try:
+            _assert_promotable(rec)
+        except HTTPException:
+            blocking.append(rec.id)
+    if blocking:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": (
+                    f"Cannot hand over: {len(blocking)} record(s) still carry a rejected "
+                    f"image or have no image at all: {blocking}"
+                ),
+                "blocking_record_ids": blocking,
+            },
+        )
+
+    for rec in records:
+        _apply_status_change(rec, "in_review", current_user.role)
+    db.commit()
+
+    log_event(db, level="INFO", category="activity", action="collection_promoted",
+              actor=current_user.username, subject=collection.name,
+              detail=f"{len(records)} records")
+    return {"collection_id": collection_id, "promoted": len(records)}
+
+
+@router.post("/{collection_id}/take-back", status_code=200)
+def take_back_collection(
+    collection_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Take a handover back: return the collection's in_review records to
+    captured, so an operator who promoted a tomo too early can carry on with
+    it.
+
+    in_review -> captured is deliberately absent from STATUS_TRANSITIONS, so
+    it is reachable neither per record nor through the bulk endpoint. What is
+    being undone is the promotion of a whole collection; withdrawing one
+    record from under a reviewer is not an act this API offers. That is why
+    the status is set here rather than through _apply_status_change.
+
+    Rejected and approved records are left where they are: a reviewer has
+    ruled on them, and a ruling is not undone by taking the handover back.
+    The accepted cost is that a reviewer working the queue can see items
+    disappear from it; promoting again returns them.
+    """
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    records = (
+        db.query(Record)
+        .filter(Record.collection_id == collection_id, Record.status == "in_review")
+        .all()
+    )
+    if not records:
+        return {"collection_id": collection_id, "taken_back": 0}
+
+    for rec in records:
+        rec.status = "captured"
+    db.commit()
+
+    log_event(db, level="INFO", category="activity", action="collection_taken_back",
+              actor=current_user.username, subject=collection.name,
+              detail=f"{len(records)} records")
+    return {"collection_id": collection_id, "taken_back": len(records)}
+
+
+# ==============================================================================
 # BagIt export
 # ==============================================================================
 
@@ -486,6 +607,20 @@ def export_collection_bagit(
             status_code=422,
             detail={"message": "Collection has no records to export.", "blocking_record_ids": []},
         )
+    # Handover first, approval second — two different things to tell her.
+    # A collection she has not promoted is work in progress, not work that
+    # failed review (NEH-260). The approval check below would catch these
+    # records too, but it would report them as unreviewed.
+    not_handed_over = [r.id for r in records if r.status == "captured"]
+    if not_handed_over:
+        raise HTTPException(
+            status_code=422,
+            detail={
+                "message": f"Cannot export: {len(not_handed_over)} record(s) have not been handed over for review yet: {not_handed_over}",
+                "blocking_record_ids": not_handed_over,
+            },
+        )
+
     non_approved = [r.id for r in records if r.status != "approved"]
     if non_approved:
         raise HTTPException(
