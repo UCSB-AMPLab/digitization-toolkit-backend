@@ -21,6 +21,15 @@ async def lifespan(app: FastAPI):
     init_db()
     # Refuse to serve against an un-migrated schema so the failure is loud at startup rather than a later 500 in the field
     assert_schema_at_head()
+    # Refuse to serve with a CAMERA_BACKEND this build does not have. Checked
+    # here rather than where the backend is built, because that happens lazily
+    # on the first capture: the service would otherwise start, answer /health,
+    # and fail only when an operator tried to take a photograph (NEH-268).
+    # Imported inside the lifespan, as shutdown_backend is, so importing the
+    # application does not pull in the capture stack.
+    from capture.service import assert_camera_backend_configured
+
+    assert_camera_backend_configured()
     # Finish or discard any project rename interrupted by a crash/power loss before serving requests
     from app.core.db import SessionLocal
     from app.core.storage_ops import reconcile_pending_rename
