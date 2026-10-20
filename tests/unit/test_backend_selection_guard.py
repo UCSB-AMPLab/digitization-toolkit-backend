@@ -55,14 +55,26 @@ def test_the_registry_is_the_only_list_of_names():
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", ["picamera2", "subprocess", "gphoto2", "chdk"])
+@pytest.mark.parametrize(
+    "value",
+    ["picamera2", "subprocess", "gphoto2", "chdk"],
+    # Explicit ids because the VALUES go into the node id, and "picamera2"
+    # contains "camera" -- which conftest.py auto-marks and CI deselects. The
+    # first version of this file lost exactly this case that way: 17 cases were
+    # written, 16 ran, and only the deselected count showed it.
+    ids=["pi_still_port", "subprocess", "gphoto2", "chdk"],
+)
 def test_every_known_value_is_accepted(monkeypatch, value):
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
     assert capture_service.assert_camera_backend_configured() == value
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", [" gphoto2 ", "GPhoto2", "\tCHDK\n"])
+@pytest.mark.parametrize(
+    "value",
+    [" gphoto2 ", "GPhoto2", "\tCHDK\n"],
+    ids=["surrounding_spaces", "mixed_case", "tab_and_newline"],
+)
 def test_case_and_surrounding_whitespace_are_normalised(monkeypatch, value):
     """A trailing space in .env is a typo that should not stop a unit."""
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
@@ -70,7 +82,11 @@ def test_case_and_surrounding_whitespace_are_normalised(monkeypatch, value):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("value", ["gphoto", "gphoto3", "libgphoto2", "", "   ", "none"])
+@pytest.mark.parametrize(
+    "value",
+    ["gphoto", "gphoto3", "libgphoto2", "", "   ", "none"],
+    ids=["near_miss", "wrong_version", "library_name", "empty", "whitespace", "none"],
+)
 def test_an_unrecognised_value_is_refused(monkeypatch, value):
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
     with pytest.raises(capture_service.UnknownCameraBackend) as exc:
