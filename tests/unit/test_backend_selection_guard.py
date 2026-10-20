@@ -24,8 +24,16 @@ Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 
 import pytest
 
-from app.core import config
 from capture import service as capture_service
+
+# The settings instance is patched through `capture_service.settings` rather
+# than through `app.core.config.settings`, and the difference is not cosmetic.
+# conftest.py's `set_camera_backend` fixture calls `importlib.reload(config)`,
+# which rebinds `app.core.config.settings` to a NEW Settings object while every
+# module that did `from app.core.config import settings` -- capture.service
+# among them -- goes on holding the old one. Patching the name in config then
+# changes an object nobody reads. The first version of this file did exactly
+# that and all fourteen cases failed by reading the default.
 
 
 @pytest.mark.unit
@@ -49,7 +57,7 @@ def test_the_registry_is_the_only_list_of_names():
 @pytest.mark.unit
 @pytest.mark.parametrize("value", ["picamera2", "subprocess", "gphoto2", "chdk"])
 def test_every_known_value_is_accepted(monkeypatch, value):
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
     assert capture_service.assert_camera_backend_configured() == value
 
 
@@ -57,14 +65,14 @@ def test_every_known_value_is_accepted(monkeypatch, value):
 @pytest.mark.parametrize("value", [" gphoto2 ", "GPhoto2", "\tCHDK\n"])
 def test_case_and_surrounding_whitespace_are_normalised(monkeypatch, value):
     """A trailing space in .env is a typo that should not stop a unit."""
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
     assert capture_service.assert_camera_backend_configured() == value.strip().lower()
 
 
 @pytest.mark.unit
 @pytest.mark.parametrize("value", ["gphoto", "gphoto3", "libgphoto2", "", "   ", "none"])
 def test_an_unrecognised_value_is_refused(monkeypatch, value):
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
     with pytest.raises(capture_service.UnknownCameraBackend) as exc:
         capture_service.assert_camera_backend_configured()
     message = str(exc.value)
@@ -82,7 +90,7 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
     dispatch logged and returned RpicamBackend, so this asserts that no
     constructor in the registry is reached.
     """
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "rpicam")
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "rpicam")
     built = []
     for name, cls in capture_service._BACKEND_CONSTRUCTORS.items():
         monkeypatch.setitem(
@@ -114,7 +122,7 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
         core_db, "SessionLocal", lambda: type("S", (), {"close": lambda self: None})()
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "gphoto")
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto")
 
     served = []
 
@@ -143,7 +151,7 @@ def test_the_lifespan_still_starts_on_a_value_it_has(monkeypatch):
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
     monkeypatch.setattr(capture_service, "shutdown_backend", lambda: None)
-    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "gphoto2")
+    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto2")
 
     served = []
 
