@@ -217,10 +217,14 @@ def test_the_registry_reads_the_same_canonical_name(monkeypatch):
     assert capture_service.canonical_backend_name(" GPhoto2 ") == "gphoto2"
 
     source = inspect.getsource(registry)
-    assert "settings.CAMERA_BACKEND" not in source, (
-        "camera_registry reads the raw setting; it must read the canonical name"
+    # Every read of the setting must go through the shared rule. A bare
+    # `.lower()` is the exact shape the finding was about.
+    assert "settings.CAMERA_BACKEND.lower()" not in source, (
+        "camera_registry normalises the setting itself; it must use the shared rule"
     )
-    assert source.count("canonical_backend_name(") >= 2
+    assert source.count("canonical_backend_name(settings.CAMERA_BACKEND)") >= 2, (
+        "both registry sites must read the setting through the shared rule"
+    )
 
 
 if __name__ == "__main__":

@@ -122,14 +122,11 @@ def assert_camera_backend_configured() -> str:
     """
     configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
-        # The RAW value in the message, not the canonicalised one: an operator
-        # needs to see what is in the file, and the difference between
-        # "gphoto2 " and "gphoto2" is the kind of thing this message exists to
-        # make visible.
-        from app.core.config import settings as live_settings
-
+        # The RAW value, from THE SAME object the check above read. Quoting it
+        # from a freshly imported `settings` reported the other live instance's
+        # value -- so the message named a backend nobody had configured.
         raise UnknownCameraBackend(
-            f"CAMERA_BACKEND is set to {live_settings.CAMERA_BACKEND!r}, which is not "
+            f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
             f"a backend this build has. Valid values: "
             f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env and restart. "
             f"The service refuses to start rather than fall back, because a "
