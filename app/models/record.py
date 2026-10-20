@@ -66,9 +66,11 @@ class Record(Base):
 	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
 	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
 	
-	# QA workflow — a record enters the queue as "in_review" as soon as it's
-	# captured; there is no separate "captured" resting state (NEH-208).
-	status = Column(String(20), nullable=False, default="in_review")  # in_review, rejected, approved
+	# QA workflow. A record is born "captured" and stays there until the
+	# operator promotes the collection it belongs to (NEH-260); "in_review"
+	# means handed over for review, which is why deletion is locked from that
+	# point on. See app/schemas/record.py for the transition table.
+	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
 	sequence = Column(Integer, nullable=True)  # ordering within a collection
 
 	# Which camera setup produced this document: "single" (one image) or
@@ -140,7 +142,7 @@ class Record(Base):
 			name='check_record_single_parent'
 		),
 		CheckConstraint(
-			"status IN ('in_review','rejected','approved')",
+			"status IN ('captured','in_review','rejected','approved')",
 			name='check_record_status'
 		),
 		CheckConstraint(

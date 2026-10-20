@@ -1,23 +1,35 @@
-"""migrate 'captured' record status to 'in_review' (NEH-208)
+"""keep 'captured' as a record status (NEH-260 supersedes NEH-208 here)
 
 Revision ID: e11b1fbb07e1
 Revises: 7e0b2c73bda1
 Create Date: 2026-07-28 12:05:00.000000
 
-Part 2 of the NEH-208 review-workflow redesign. "captured" stops being a
-persisted/exposed status entirely — a record now enters the queue as
-"in_review" the instant it's captured (see app/api/cameras.py), with no
-manual promotion step. This maps every existing 'captured' row to
-'in_review' and narrows the CHECK constraint accordingly.
+This revision has been emptied. As written for NEH-208 it mapped every
+'captured' record to 'in_review', narrowed the CHECK constraint to three
+values and moved the column's server default, on the reading that a record
+enters the review queue the instant it is taken.
 
-Downgrade restores the wider constraint but does not attempt to reverse
-the data migration — which rows were 'captured' vs. legitimately already
-'in_review' is not recoverable, same reasoning as this repo's other lossy
-downgrades (e.g. f6a7b8c9d0e1).
+NEH-260 restores 'captured': a record is the operator's until she promotes the
+collection she has finished, and the state machine the Fisqua exchange
+contract describes has it. So the collapse must not happen, and 2525f43a4661
+already creates the four-value constraint with 'captured' among them while
+5e9345333809 already sets the column's server default to 'captured'. Nothing
+is left for this revision to do.
+
+It is emptied rather than reversed by a later migration because reversing it
+is lossy in one direction: by the time a new migration ran, the records that
+were 'captured' could no longer be told from those genuinely in review. On
+the appliance in service that is 2,648 rows against one. Ruled 2026-10-17 on
+the evidence that no real database has this revision stamped — the one
+deployed unit is at 2525f43a4661 — so editing the body costs nothing. The
+revision id does not change, so nothing downstream moves.
+
+If a unit turns up having applied the original body, its database holds no
+'captured' rows and is inconsistent with this file. It gets rebuilt from a
+dump rather than patched: the distinction this revision used to destroy is
+not recoverable from the database it left behind.
 """
 from typing import Sequence, Union
-
-from alembic import op
 
 
 # revision identifiers, used by Alembic.
@@ -28,21 +40,11 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    op.execute("UPDATE records SET status = 'in_review' WHERE status = 'captured'")
-    op.drop_constraint('check_record_status', 'records', type_='check')
-    op.create_check_constraint(
-        'check_record_status',
-        'records',
-        "status IN ('in_review','rejected','approved')",
-    )
-    op.alter_column('records', 'status', server_default='in_review')
+    # Deliberately empty — see the module docstring.
+    pass
 
 
 def downgrade() -> None:
-    op.drop_constraint('check_record_status', 'records', type_='check')
-    op.create_check_constraint(
-        'check_record_status',
-        'records',
-        "status IN ('captured','in_review','rejected','approved')",
-    )
-    op.alter_column('records', 'status', server_default='captured')
+    # Deliberately empty. There is nothing to undo, and the wider constraint
+    # this used to restore on the way down is what 2525f43a4661 creates.
+    pass

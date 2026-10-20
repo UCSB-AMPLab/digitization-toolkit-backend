@@ -478,7 +478,19 @@ def delete_image(
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	
+
+	# The same lock delete_record carries, for the same reason (NEH-260).
+	# Until both guards say the same thing, emptying a record is a way around
+	# a locked record. 'rejected' stays unlocked by design, so an emptied
+	# rejected record is still reachable — which is why the promotion
+	# invariant also insists on at least one current image.
+	rec = db.query(Record).filter(Record.id == img.record_id).first()
+	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
+		raise HTTPException(
+			status_code=409,
+			detail=f"Cannot delete an image from a record with status '{rec.status}'. Move it to 'rejected' first."
+		)
+
 	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths
 	# inside storage. The record's other images survive this delete, and one of
 	# them may be a master of the same frame in another format, sharing this
@@ -681,6 +693,43 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def _assert_promotable(rec: Record) -> None:
+	"""
+	Refuse to let a record leave 'captured' unless the work is there to hand
+	over: at least one current image, and no current image carrying a
+	rejection_id (NEH-260).
+
+	The second clause is the substantive test. rejection_id is written in
+	reject_record below, on the images current at the moment of rejection, and
+	a retake supersedes those while the replacements carry none — so a marked
+	current image means the rejection has not been answered. The first clause
+	closes a vacuous pass: delete every current image and a purely negative
+	predicate holds on a record with nothing in it.
+
+	Two limits, stated rather than left to be found. This proves that no marked
+	image is still current, not that the work was redone — nothing links a
+	replacement image back to the rejection it answers. And rejection_id is
+	declared ondelete="SET NULL", so deleting a RecordRejection row would null
+	the link on images that are still current and still the rejected bytes. No
+	endpoint deletes rejections today; one added later has to account for it.
+	"""
+	current = [img for img in rec.images if img.is_current]
+	if not current:
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {rec.id} has no current image, so there is nothing to hand over."
+		)
+	marked = sorted(img.id for img in current if img.rejection_id is not None)
+	if marked:
+		raise HTTPException(
+			status_code=422,
+			detail=(
+				f"Record {rec.id} still carries the rejected image(s) {marked}. "
+				f"Retake it before handing it over."
+			)
+		)
+
+
 def _apply_status_change(
 	rec: Record,
 	new_status: str,
@@ -689,6 +738,11 @@ def _apply_status_change(
 	"""
 	Validate and apply a status transition on a Record.
 	Raises HTTPException on invalid transition or insufficient role.
+
+	Every promotion goes through here — PATCH /{id}/status, POST /bulk-status
+	and POST /collections/{id}/promote all call it — so the invariant on
+	leaving 'captured' is enforced here rather than at each endpoint. Callers
+	must have the record's images loaded; the three above use joinedload.
 	"""
 	current_status = rec.status
 	if current_status == new_status:
@@ -705,6 +759,9 @@ def _apply_status_change(
 			status_code=403,
 			detail=f"Your role '{user_role}' cannot perform the '{current_status}' -> '{new_status}' transition."
 		)
+	# Role first, then state: the wrong role learns nothing about the record.
+	if current_status == "captured":
+		_assert_promotable(rec)
 
 	rec.status = new_status
 
@@ -720,16 +777,24 @@ def update_record_status(
 	Change the QA status of a record.
 
 	Valid transitions and required roles:
+	- captured  > in_review : operator, admin  (promotion, NEH-260)
 	- in_review > approved  : reviewer, admin
 	- approved  > in_review : reviewer, admin  (undo a mistaken approve, NEH-209)
 	- rejected  > in_review : reviewer, admin  (undo a mistaken reject, NEH-209)
+	- rejected  > captured  : operator, admin  (prepare for retake, NEH-260)
+
+	Promotion is per record here, but the act an operator performs is per
+	collection: POST /collections/{id}/promote applies it across a
+	collection's captured records, and its inverse takes a handover back.
+	Leaving 'captured' also requires a current image carrying no rejection_id
+	— see _assert_promotable.
 
 	Formal rejection is not reachable through this endpoint — use POST
 	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
-	Recapture (rejected -> in_review as a side effect of a new capture
-	arriving) only happens via the capture endpoints in app/api/cameras.py —
-	the undo transition above is a plain status reset with no new image, no
-	reason, and no audit entry.
+	A retake only happens via the capture endpoints in app/api/cameras.py: it
+	supersedes the current images, leaves a captured record captured, and
+	moves a rejected one to in_review. The undo transitions above are plain
+	status resets with no new image, no reason, and no audit entry.
 	"""
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:

@@ -6,30 +6,58 @@ from datetime import datetime
 # date), so importing the type under its own name would shadow it.
 from datetime import date as dt_date
 
-# Valid status values. A record has no "captured" resting state — it enters
-# the queue as "in_review" the moment it's captured (NEH-208). A reviewer can
-# undo a mistaken approve/reject back to "in_review" (see STATUS_TRANSITIONS
-# below) — that's a plain status reset, not a recapture and not a formal
-# rejection, so it carries no reason/audit entry.
-RecordStatus = Literal["in_review", "rejected", "approved"]
+# Valid status values. A record is born "captured", the state in which it is
+# still the operator's, and leaves it when she promotes the collection she has
+# finished (NEH-260).
+#
+# NEH-208 removed that state on the reading that a record enters the review
+# queue the instant it is taken. Three things followed: a fresh capture became
+# indistinguishable from work handed over for review, the operator could
+# neither redo nor delete her own frame until a reviewer formally rejected it,
+# and the state machine stopped matching the one the Fisqua exchange contract
+# describes, which is captured -> in_review -> approved | rejected.
+#
+# A reviewer can undo a mistaken approve or reject back to "in_review" (see
+# STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
+# formal rejection, so it carries no reason and no audit entry.
+RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 
 # Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
 #
-# Formal rejection is deliberately NOT here — it's its own endpoint (POST
-# /records/{id}/reject) with a mandatory predefined_reason, not reachable
-# through this generic status-update path. Recapture (rejected -> in_review
-# as a side effect of a new capture actually arriving) is also not here —
-# that's driven entirely by app/api/cameras.py, not a client-chosen status
-# value.
+# captured -> in_review is promotion: the operator handing finished work over.
+# It is reachable per record, but the act she performs is per collection, so
+# the endpoint she uses is POST /collections/{id}/promote, which applies this
+# transition across the collection's captured records.
+#
+# rejected -> captured is prepare-for-retake: a rejected record returns to her
+# worklist, and is promoted again with its collection. Leaving captured is
+# guarded by the replacement-image invariant in app/api/records.py — the
+# table checks only the pair and the role.
+#
+# Three transitions are deliberately absent:
+#
+# - in_review -> rejected. Formal rejection is its own endpoint (POST
+#   /records/{id}/reject) with a mandatory predefined_reason. RecordStatusUpdate
+#   types its status as RecordStatus rather than a restricted literal, so this
+#   table is the only thing keeping the generic and bulk endpoints from writing
+#   "rejected" with no reason and no record_rejections row.
+# - in_review -> captured. Taking a handover back is a collection-level act
+#   (POST /collections/{id}/take-back) and stays out of the per-record and bulk
+#   paths, so one record cannot be withdrawn from a reviewer on its own.
+# - A retake, which supersedes the current images and is driven entirely by
+#   app/api/cameras.py rather than by a client-chosen status value. It leaves a
+#   captured record captured, and moves a rejected one to in_review.
 #
 # approved -> in_review and rejected -> in_review ARE here: these are the
 # "undo my mistake" resets a reviewer can trigger directly from the record
 # view (NEH-209) — no reason required since nothing formal is being
 # recorded, just moving the record back into the review queue.
 STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
+	("captured", "in_review"): {"operator", "admin"},
 	("in_review", "approved"): {"reviewer", "admin"},
 	("approved", "in_review"): {"reviewer", "admin"},
 	("rejected", "in_review"): {"reviewer", "admin"},
+	("rejected", "captured"): {"operator", "admin"},
 }
 
 # The predefined rejection reasons, mirroring the list the annotation
@@ -156,7 +184,9 @@ class RecordBase(BaseModel):
 	author: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
-	status: RecordStatus = "in_review"
+	# The birth state. The create path ignores it — create_record builds the
+	# Record without a status, so the model default governs there too.
+	status: RecordStatus = "captured"
 	sequence: Optional[int] = None
 	# Required: the camera capture endpoints always set this explicitly;
 	# manual record creation (POST /records/) must declare it up front since

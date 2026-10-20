@@ -1,11 +1,15 @@
 #!/usr/bin/env python3
 """
-Tests for NEH-208's narrowed status state machine.
+Tests for the status state machine reachable through PATCH /{id}/status and
+POST /records/bulk-status.
 
-Only in_review -> approved remains reachable through PATCH /{id}/status and
-POST /records/bulk-status. Rejection has its own endpoint (see
-test_record_reject_endpoint.py); approved is terminal; "captured" is not a
-valid status anywhere anymore.
+Five transitions are in the table: promotion (captured -> in_review),
+approval, the two undo resets, and prepare-for-retake (rejected -> captured).
+Rejection has its own endpoint (see test_record_reject_endpoint.py), taking a
+handover back is per collection (see test_collection_handover.py), and
+leaving `captured` also has to satisfy the replacement-image invariant (see
+test_promotion_invariant.py).
+
 Run with: python -m pytest tests/unit/test_record_status_transitions.py
 """
 
@@ -30,6 +34,18 @@ def _make_record(db_session, status="in_review", capture_mode="single"):
 
     rec = Record(title="r", status=status, capture_mode=capture_mode)
     db_session.add(rec)
+    db_session.commit()
+    db_session.refresh(rec)
+    return rec
+
+
+def _with_image(db_session, rec):
+    """Leaving `captured` needs a current image carrying no rejection_id."""
+    from app.models.record import RecordImage
+
+    db_session.add(RecordImage(record_id=rec.id, filename="f.jpg",
+                               file_path="/f.jpg", format="jpg",
+                               role="single", is_current=True))
     db_session.commit()
     db_session.refresh(rec)
     return rec
@@ -75,12 +91,58 @@ def test_rejected_is_not_reachable_via_generic_status_endpoint(client, db_sessio
 
 
 @pytest.mark.unit
-def test_captured_is_not_a_valid_status_value(client, db_session):
-    rec = _make_record(db_session, status="in_review")
+def test_captured_to_in_review_allowed_for_operator(client, db_session):
+    """Promotion. The operator hands her own work over (NEH-260)."""
+    rec = _with_image(db_session, _make_record(db_session, status="captured"))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.patch(f"/records/{rec.id}/status", json={"status": "in_review"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "in_review"
+
+
+@pytest.mark.unit
+def test_captured_to_in_review_forbidden_for_reviewer(client, db_session):
+    rec = _with_image(db_session, _make_record(db_session, status="captured"))
+    api = _client_as(client, "rev", "reviewer")
+
+    resp = api.patch(f"/records/{rec.id}/status", json={"status": "in_review"})
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.unit
+def test_rejected_to_captured_allowed_for_operator(client, db_session):
+    """Prepare for retake: a rejected record returns to her worklist (NEH-260)."""
+    rec = _make_record(db_session, status="rejected")
+    api = _client_as(client, "op", "operator")
+
+    resp = api.patch(f"/records/{rec.id}/status", json={"status": "captured"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "captured"
+
+
+@pytest.mark.unit
+def test_rejected_to_captured_forbidden_for_reviewer(client, db_session):
+    rec = _make_record(db_session, status="rejected")
     api = _client_as(client, "rev", "reviewer")
 
     resp = api.patch(f"/records/{rec.id}/status", json={"status": "captured"})
+    assert resp.status_code == 403, resp.text
+
+
+@pytest.mark.unit
+def test_in_review_to_captured_is_not_in_the_table(client, db_session):
+    """Taking a handover back is per collection, never per record (NEH-260).
+
+    The value validates — `captured` is a real status again — so the refusal
+    has to come from the transition table rather than from the schema.
+    """
+    rec = _make_record(db_session, status="in_review")
+    api = _client_as(client, "op", "operator")
+
+    resp = api.patch(f"/records/{rec.id}/status", json={"status": "captured"})
     assert resp.status_code == 422, resp.text
+    assert "not allowed" in resp.json()["detail"], resp.text
 
 
 @pytest.mark.unit
