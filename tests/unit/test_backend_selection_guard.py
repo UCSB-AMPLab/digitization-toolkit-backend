@@ -119,13 +119,38 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
             name,
             lambda *a, _n=name, **k: built.append(_n),
         )
-    for cls_name in ("Picamera2Backend", "RpicamBackend", "GPhoto2Backend", "ChdkBackend"):
+    # Three namespaces, because two were not enough. The registry mapping and
+    # the names in capture.service both miss a constructor imported locally
+    # from its own module at the point of use, which a review reproduced.
+    import importlib
+
+    defining_modules = {
+        "Picamera2Backend": "capture.backends.picamera2_backend",
+        "RpicamBackend": "capture.backends.subprocess_backend",
+        "GPhoto2Backend": "capture.backends.gphoto2_backend",
+        "ChdkBackend": "capture.backends.chdk_backend",
+    }
+    for cls_name, module_name in defining_modules.items():
         assert hasattr(capture_service, cls_name), cls_name
         monkeypatch.setattr(
             capture_service,
             cls_name,
             lambda *a, _n=cls_name, **k: built.append(_n),
         )
+        module = importlib.import_module(module_name)
+        assert hasattr(module, cls_name), f"{module_name}.{cls_name}"
+        monkeypatch.setattr(
+            module,
+            cls_name,
+            lambda *a, _n=cls_name, **k: built.append(_n),
+        )
+        package = importlib.import_module("capture.backends")
+        if hasattr(package, cls_name):
+            monkeypatch.setattr(
+                package,
+                cls_name,
+                lambda *a, _n=cls_name, **k: built.append(_n),
+            )
     with pytest.raises(capture_service.UnknownCameraBackend):
         capture_service.get_camera_backend()
     assert built == [], f"a backend was constructed anyway: {built}"
@@ -195,36 +220,87 @@ def test_the_lifespan_still_starts_on_a_value_it_has(monkeypatch):
     assert served == [1]
 
 
+class _FakeBackend:
+    """Enough of a backend for the registry to enumerate, with no hardware.
+
+    The same shape tests/unit/test_registry_hw_id_gphoto2.py uses: the registry
+    asks capture_service.get_backend() for devices, so a fake there exercises
+    the real dispatch without a camera attached.
+    """
+
+    def __init__(self, devices):
+        self._devices = devices
+        self.calls = 0
+
+    def list_devices(self):
+        self.calls += 1
+        return [dict(d) for d in self._devices]
+
+
+_FAKE_DEVICE = {
+    "index": 0,
+    "id": "usb:001,004",
+    "model": "Canon EOS Rebel T7",
+    "serial": "1111111",
+    "location": "USB usb:001,004",
+}
+
+
 @pytest.mark.unit
-def test_the_registry_reads_the_same_canonical_name(monkeypatch):
-    """A value the guard accepts must not route somewhere else downstream.
+@pytest.mark.parametrize(
+    "value",
+    ["gphoto2", " gphoto2 ", "GPhoto2", "\tGPHOTO2\n"],
+    ids=["plain", "padded", "mixed_case", "tabs"],
+)
+def test_the_registry_dispatches_on_the_normalised_value(monkeypatch, value):
+    """A value the guard accepts must route to the same backend downstream.
 
     Accepting surrounding whitespace in the guard while camera_registry.py
-    still did a bare `.lower()` meant `" gphoto2 "` passed startup and then
-    selected the picamera2 path, so a DSLR rig detected nothing -- a worse
-    failure than the one the tolerance prevents.
+    normalised differently meant `" gphoto2 "` passed startup and then selected
+    the picamera2 path, so a DSLR rig produced no hardware id and detected
+    nothing.
 
-    The second half is a source assertion rather than a call, deliberately:
-    both registry sites lead into hardware detection, which has nothing to
-    detect on a runner, so exercising them would test the absence of cameras.
-    What the defect turned on is which name those sites read, and that is
-    exactly what is asserted.
+    This goes through the registry's real dispatch rather than asserting on its
+    source. An earlier version of this test read the source instead, on the
+    grounds that both registry sites lead into hardware detection -- a review
+    pointed out that the suite already enumerates a fake backend this way, and
+    that a source assertion passes a mutation which adds a raw-value equality
+    check beside the normalised one.
     """
-    import inspect
+    from app.core.config import settings
+    from capture.camera_registry import CameraRegistry
 
-    import capture.camera_registry as registry
+    backend = _FakeBackend([_FAKE_DEVICE])
+    monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(settings, "CAMERA_BACKEND", value)
 
-    assert capture_service.canonical_backend_name(" GPhoto2 ") == "gphoto2"
+    hw_id, info = CameraRegistry.get_camera_hardware_id(0)
 
-    source = inspect.getsource(registry)
-    # Every read of the setting must go through the shared rule. A bare
-    # `.lower()` is the exact shape the finding was about.
-    assert "settings.CAMERA_BACKEND.lower()" not in source, (
-        "camera_registry normalises the setting itself; it must use the shared rule"
+    assert hw_id == "canoneosrebelt7_1111111", (
+        f"CAMERA_BACKEND={value!r} did not reach the gphoto2 path"
     )
-    assert source.count("canonical_backend_name(settings.CAMERA_BACKEND)") >= 2, (
-        "both registry sites must read the setting through the shared rule"
+    assert info["id"] == "usb:001,004"
+    assert backend.calls == 1
+
+
+@pytest.mark.unit
+def test_detection_also_dispatches_on_the_normalised_value(monkeypatch, tmp_path):
+    """The registry's other reader of the setting, through the same fake."""
+    from app.core.config import settings
+    from capture.camera_registry import CameraRegistry
+
+    backend = _FakeBackend([_FAKE_DEVICE])
+    monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
+    monkeypatch.setattr(settings, "CAMERA_BACKEND", " GPhoto2 ")
+
+    registry = CameraRegistry(registry_path=tmp_path / "registry.json")
+    detected = registry.detect_cameras()
+
+    assert set(detected) == {0}, (
+        "a padded CAMERA_BACKEND did not reach the gphoto2 detection path"
     )
+    hw_id, _info = detected[0]
+    assert hw_id == "canoneosrebelt7_1111111"
 
 
 if __name__ == "__main__":
