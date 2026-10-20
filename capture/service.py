@@ -87,12 +87,23 @@ def configured_camera_backend() -> str:
     """The configured backend's name, canonicalised, without judging it.
 
     Every reader of CAMERA_BACKEND goes through this. Tolerating surrounding
-    whitespace here and not in camera_registry.py made `" gphoto2 "` pass the
-    assertion below and then select the picamera2 path in the registry, so a
-    DSLR rig detected no cameras at all -- a worse failure than the one the
-    tolerance was added to prevent.
+    whitespace in the assertion below and not in camera_registry.py made
+    `" gphoto2 "` pass startup and then select the picamera2 path in the
+    registry, so a DSLR rig detected no cameras at all -- a worse failure than
+    the one the tolerance was added to prevent.
+
+    `settings` is imported HERE rather than used from the module global, and
+    that is load-bearing. tests/conftest.py's set_camera_backend fixture calls
+    importlib.reload(app.core.config), which rebinds that module's `settings`
+    to a new object while every module that did `from app.core.config import
+    settings` at import time goes on holding the old one. A call-time import
+    always reads whichever object is live, so this function cannot disagree
+    with camera_registry.py about what the setting currently says -- which is
+    the whole point of there being one reader.
     """
-    return settings.CAMERA_BACKEND.strip().lower()
+    from app.core.config import settings as live_settings
+
+    return live_settings.CAMERA_BACKEND.strip().lower()
 
 
 def assert_camera_backend_configured() -> str:
@@ -112,8 +123,14 @@ def assert_camera_backend_configured() -> str:
     """
     configured = configured_camera_backend()
     if configured not in _BACKEND_CONSTRUCTORS:
+        # The RAW value in the message, not the canonicalised one: an operator
+        # needs to see what is in the file, and the difference between
+        # "gphoto2 " and "gphoto2" is the kind of thing this message exists to
+        # make visible.
+        from app.core.config import settings as live_settings
+
         raise UnknownCameraBackend(
-            f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
+            f"CAMERA_BACKEND is set to {live_settings.CAMERA_BACKEND!r}, which is not "
             f"a backend this build has. Valid values: "
             f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env and restart. "
             f"The service refuses to start rather than fall back, because a "

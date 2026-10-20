@@ -24,9 +24,10 @@ Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 
 import pytest
 
+from app.core import config
 from capture import service as capture_service
 
-# The settings instance is patched through `capture_service.settings` rather
+# The settings instance is patched through `config.settings` rather
 # than through `app.core.config.settings`, and the difference is not cosmetic.
 # conftest.py's `set_camera_backend` fixture calls `importlib.reload(config)`,
 # which rebinds `app.core.config.settings` to a NEW Settings object while every
@@ -65,7 +66,7 @@ def test_the_registry_is_the_only_list_of_names():
     ids=["pi_still_port", "subprocess", "gphoto2", "chdk"],
 )
 def test_every_known_value_is_accepted(monkeypatch, value):
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
     assert capture_service.assert_camera_backend_configured() == value
 
 
@@ -77,7 +78,7 @@ def test_every_known_value_is_accepted(monkeypatch, value):
 )
 def test_case_and_surrounding_whitespace_are_normalised(monkeypatch, value):
     """A trailing space in .env is a typo that should not stop a unit."""
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
     assert capture_service.assert_camera_backend_configured() == value.strip().lower()
 
 
@@ -88,7 +89,7 @@ def test_case_and_surrounding_whitespace_are_normalised(monkeypatch, value):
     ids=["near_miss", "wrong_version", "library_name", "empty", "whitespace", "none"],
 )
 def test_an_unrecognised_value_is_refused(monkeypatch, value):
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", value)
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", value)
     with pytest.raises(capture_service.UnknownCameraBackend) as exc:
         capture_service.assert_camera_backend_configured()
     message = str(exc.value)
@@ -106,7 +107,7 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
     dispatch logged and returned RpicamBackend, so this asserts that no
     constructor in the registry is reached.
     """
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "rpicam")
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "rpicam")
     built = []
     # Both the registry values AND the names in the module namespace. Patching
     # only the registry left a hole: a construction written directly above the
@@ -150,7 +151,7 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
         core_db, "SessionLocal", lambda: type("S", (), {"close": lambda self: None})()
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto")
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "gphoto")
 
     served = []
 
@@ -183,7 +184,7 @@ def test_the_lifespan_still_starts_on_a_value_it_has(monkeypatch):
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
     monkeypatch.setattr(capture_service, "shutdown_backend", lambda: None)
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto2")
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", "gphoto2")
 
     served = []
 
@@ -214,7 +215,7 @@ def test_the_registry_reads_the_same_canonical_name(monkeypatch):
 
     import capture.camera_registry as registry
 
-    monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", " GPhoto2 ")
+    monkeypatch.setattr(config.settings, "CAMERA_BACKEND", " GPhoto2 ")
     assert capture_service.configured_camera_backend() == "gphoto2"
 
     source = inspect.getsource(registry)
