@@ -119,38 +119,36 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
             name,
             lambda *a, _n=name, **k: built.append(_n),
         )
-    # Three namespaces, because two were not enough. The registry mapping and
-    # the names in capture.service both miss a constructor imported locally
-    # from its own module at the point of use, which a review reproduced.
+    # Instrument the CLASS OBJECTS, not the names that point at them. Patching
+    # namespaces turned into whack-a-mole: the registry mapping and
+    # capture.service missed a local import from the defining module, adding
+    # that missed capture/__init__.py's re-export, and there is no reason to
+    # think that was the last alias. Every alias shares one class object, so
+    # replacing __init__ on the class records a construction through any of
+    # them -- including one written before the validation runs.
     import importlib
 
-    defining_modules = {
-        "Picamera2Backend": "capture.backends.picamera2_backend",
-        "RpicamBackend": "capture.backends.subprocess_backend",
-        "GPhoto2Backend": "capture.backends.gphoto2_backend",
-        "ChdkBackend": "capture.backends.chdk_backend",
-    }
-    for cls_name, module_name in defining_modules.items():
-        assert hasattr(capture_service, cls_name), cls_name
-        monkeypatch.setattr(
-            capture_service,
-            cls_name,
-            lambda *a, _n=cls_name, **k: built.append(_n),
-        )
+    classes = {}
+    for cls_name, module_name in (
+        ("Picamera2Backend", "capture.backends.picamera2_backend"),
+        ("RpicamBackend", "capture.backends.subprocess_backend"),
+        ("GPhoto2Backend", "capture.backends.gphoto2_backend"),
+        ("ChdkBackend", "capture.backends.chdk_backend"),
+    ):
         module = importlib.import_module(module_name)
-        assert hasattr(module, cls_name), f"{module_name}.{cls_name}"
+        cls = getattr(module, cls_name)
+        classes[cls_name] = cls
+        # The registry's own values must be the same objects, or the mapping
+        # points somewhere this instrumentation does not reach.
+        assert capture_service._BACKEND_CONSTRUCTORS[
+            {"Picamera2Backend": "picamera2", "RpicamBackend": "subprocess",
+             "GPhoto2Backend": "gphoto2", "ChdkBackend": "chdk"}[cls_name]
+        ] is cls, f"{cls_name} is not the object the registry dispatches to"
         monkeypatch.setattr(
-            module,
-            cls_name,
-            lambda *a, _n=cls_name, **k: built.append(_n),
+            cls, "__init__",
+            lambda self, *a, _n=cls_name, **k: built.append(_n),
         )
-        package = importlib.import_module("capture.backends")
-        if hasattr(package, cls_name):
-            monkeypatch.setattr(
-                package,
-                cls_name,
-                lambda *a, _n=cls_name, **k: built.append(_n),
-            )
+
     with pytest.raises(capture_service.UnknownCameraBackend):
         capture_service.get_camera_backend()
     assert built == [], f"a backend was constructed anyway: {built}"
