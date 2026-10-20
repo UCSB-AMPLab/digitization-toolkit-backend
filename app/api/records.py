@@ -24,6 +24,7 @@ from app.schemas.record import (
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.paths import resolve_within_storage
+from app.core.export_guard import assert_collection_writable
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 
@@ -294,6 +295,11 @@ def delete_record(
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
+	# Refused here rather than at the flush, because the files are unlinked below
+	# and a 409 arriving after that would leave an export's masters gone with
+	# nothing in the database to show it (NEH-260).
+	assert_collection_writable(rec.collection_id)
+
 	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first
 	if rec.status in ("in_review", "approved") and current_user.role != "admin":
 		raise HTTPException(
@@ -342,7 +348,11 @@ async def add_image_to_record(
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+
+	# A retake lands in the bag as a new current image, so it waits for the
+	# export. Refused before the file is written, not at the flush (NEH-260).
+	assert_collection_writable(rec.collection_id)
+
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
@@ -512,6 +522,9 @@ def delete_image(
 	# that had already changed. The lock also stops this delete emptying a
 	# record that another request is promoting (see _apply_status_change).
 	rec = _locked_record(db, img.record_id, with_images=False)
+	# Before the unlink, for the reason delete_record carries it (NEH-260).
+	if rec:
+		assert_collection_writable(rec.collection_id)
 	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,

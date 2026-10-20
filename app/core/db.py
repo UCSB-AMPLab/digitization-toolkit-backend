@@ -1,6 +1,6 @@
 from typing import Generator
 
-from sqlalchemy import create_engine
+from sqlalchemy import create_engine, event
 from sqlalchemy.orm import sessionmaker, declarative_base
 from sqlalchemy.pool import QueuePool
 
@@ -31,6 +31,23 @@ engine = create_engine(
 
 # Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
+
+
+# An export is a statement about a collection at an instant, so while one is
+# being assembled the collection does not change (NEH-260). Sixteen routes can
+# change something a bag asserts, and the previous attempt at a rule spread over
+# many routes was defeated through the ones nobody had edited -- so the rule is
+# here, where every write passes, rather than in each of them.
+#
+# Registered against SessionLocal itself, which the test suite rebinds to its
+# SQLite engine rather than replacing (tests/conftest.py), so the guard is in
+# force where it is tested. The import is inside the body because the guard
+# imports the models and the models import this module.
+@event.listens_for(SessionLocal, "before_flush")
+def _refuse_writes_to_an_exporting_collection(session, flush_context, instances):
+	from app.core.export_guard import assert_no_export_holds
+
+	assert_no_export_holds(session)
 
 # Base for models
 Base = declarative_base()

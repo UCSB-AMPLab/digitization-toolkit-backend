@@ -101,13 +101,6 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     if blocker:
         message, blocking_ids = blocker
         raise ExportError(message, detail={"blocking_record_ids": blocking_ids})
-    # What the gate passed on, kept so it can be checked again once the payload
-    # is planned: an export is a statement about a state, and if that state
-    # moved while the bag was being assembled the bag is not about anything.
-    gated_state = {rec.id: (rec.status,
-                            tuple(sorted(i.id for i in rec.images if i.is_current)))
-                   for rec in records}
-
     project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
 
     exports_dir = config.settings.exports_dir
@@ -159,34 +152,14 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             detail={"reason": "low_disk", "needed_bytes": total_src + FREE_SPACE_MARGIN, "free_bytes": free},
         )
 
-    # The payload is planned; nothing has been written yet. Check that the state
-    # the gate passed on is still the state, because the bag is a statement about
-    # it. A reviewer undoing an approval, or an operator retaking a record, in the
-    # time it took to resolve the files leaves a bag that claims a review that no
-    # longer stands. populate_existing() because a plain re-query returns the
-    # instances already in the identity map without refreshing their columns,
-    # which would compare the snapshot against itself.
-    rechecked = (
-        db.query(Record)
-        .options(joinedload(Record.images))
-        .filter(Record.collection_id == collection_id)
-        .populate_existing()
-        .all()
-    )
-    now_state = {rec.id: (rec.status,
-                          tuple(sorted(i.id for i in rec.images if i.is_current)))
-                 for rec in rechecked}
-    if now_state != gated_state:
-        moved = sorted(
-            set(gated_state) ^ set(now_state)
-            | {rid for rid in set(gated_state) & set(now_state)
-               if gated_state[rid] != now_state[rid]}
-        )
-        raise ExportError(
-            "Cannot export: the collection changed while the archive was being "
-            f"assembled ({len(moved)} record(s) affected). Try again.",
-            detail={"blocking_record_ids": moved},
-        )
+    # Nothing is re-read here on purpose. The snapshot this replaced compared
+    # (status, current image ids) at the gate against the same tuple once the
+    # payload was planned -- two of the eleven fields the metadata asserts, and
+    # it spent the whole assembly before noticing. app/core/export_guard.py
+    # holds the collection instead: while this job is in the registry, no write
+    # to its records, their images or the collection itself reaches the
+    # database. The state read above is therefore the state throughout
+    # (NEH-260, ruling of 2026-10-20).
 
     metadata_payload = _metadata_payload(collection, project, records, timestamp)
     blobs = [(json.dumps(metadata_payload, indent=2, ensure_ascii=False).encode("utf-8"), "metadata.json")]

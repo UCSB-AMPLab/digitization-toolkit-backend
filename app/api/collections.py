@@ -22,6 +22,7 @@ from app.core.audit import log_event
 from app.core.config import settings
 from app.core.export_jobs import export_jobs
 from app.core.export_service import run_export, workflow_blockers
+from app.core.export_guard import assert_collection_writable
 from app.core.storage_ops import (
     collection_and_descendants,
     relocate_image,
@@ -358,6 +359,10 @@ def delete_collection(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
+    # Before remove_tree below, which is the most destructive thing in this
+    # module and cannot be taken back by a rollback (NEH-260).
+    assert_collection_writable(collection_id)
+
     collection_name = collection.name
 
     # Refuse to delete a non-empty collection; report the blocking counts
@@ -459,6 +464,10 @@ def renumber_images(
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    # Renumbering renames every master on disk and commits afterwards, so a
+    # refusal has to come first: the bag names the filenames (NEH-260).
+    assert_collection_writable(collection_id)
 
     try:
         result = renumber_collection_images(db, collection)
