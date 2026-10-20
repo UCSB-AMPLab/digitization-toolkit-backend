@@ -795,7 +795,6 @@ def trigger_capture(
 			record = Record(
 				title=request.record_title or f"{project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
-				object_typology="document",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
@@ -975,7 +974,6 @@ def trigger_dual_capture(
 			record = Record(
 				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
-				object_typology="book",  # Default to book for dual captures
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),

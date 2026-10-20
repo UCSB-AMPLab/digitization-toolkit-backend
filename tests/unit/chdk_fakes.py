@@ -134,6 +134,7 @@ class Body:
         product_error=None,
         version_error=None,
         stuck_in_play=False,
+        switch_without_arriving=False,
         lua_error=None,
     ):
         self.bus = bus
@@ -151,12 +152,34 @@ class Body:
         self.product_error = product_error
         self.version_error = version_error
         self.version_calls = 0
-        # get_mode() is falsy in record and nonzero in play, the convention
-        # the library's own switch_mode polls on. A body stuck in play never
-        # arrives, which its switch_mode cannot report: it returns nothing
-        # whether the camera got there or not.
+        # This is CHDK's *Lua* get_mode(), and it is the opposite way round
+        # from uBASIC's: it returns three values - is_record, is_video, mode -
+        # and the first is true in record, false in play. CHDK trunk
+        # core/luascript.c, luaCB_get_mode, pushes them in that order and
+        # the first is (mode & MODE_MASK) != MODE_PLAY; later builds write
+        # the same thing as !camera_info.state.mode_play. The library hands
+        # back the first RET message, so is_record is what a caller reads,
+        # and mode_value stands for it here.
+        #
+        # Do not carry uBASIC's convention across: it is the reason this fake
+        # once returned 0 for record, which made the polarity untestable.
+        #
+        # The two ways a switch can fail are separate knobs, because the
+        # pinned library produces only one of them. stuck_in_play is a body
+        # that never arrives: pychdk 0.1.3 polls get_mode itself and raises
+        # once its retries run out, so that is what this fake does, with the
+        # library's own message.
+        #
+        # switch_without_arriving produces the other state - switch_mode
+        # returns, and mode_value is left at whatever the test set. That is
+        # what 0.1.2 did when its confirmation loop fell through silently,
+        # and it is the state the backend's own second read of get_mode
+        # exists to catch. No camera makes 0.1.3 behave this way; a library
+        # that regressed would, which is the whole reason the backend does
+        # not take switch_mode's return as proof.
         self.stuck_in_play = stuck_in_play
-        self.mode_value = 1
+        self.switch_without_arriving = switch_without_arriving
+        self.mode_value = False
         self.lua_error = lua_error
         self.lua_calls = []
         # what happened to it
@@ -254,8 +277,18 @@ class FakeChdkDevice:
         self._body._pass("switch_mode")
         if self._body.mode_error is not None:
             raise self._body.mode_error
-        if not self._body.stuck_in_play:
-            self._body.mode_value = 0 if mode == "record" else 1
+        if self._body.switch_without_arriving:
+            # A library that returned without the camera having arrived.
+            # mode_value is untouched, so the caller reads what the test set.
+            return
+        if self._body.stuck_in_play:
+            # What pychdk 0.1.3 does when its own poll runs out of retries.
+            raise RuntimeError(
+                f"The camera did not switch to {mode} mode: get_mode() last "
+                f"reported is_record={self._body.mode_value!r}"
+            )
+        # is_record: true once the camera has arrived in record.
+        self._body.mode_value = mode == "record"
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         self._body.lua_calls.append(lua_code)

@@ -3,9 +3,11 @@
 FROM python:3.11-slim@sha256:e031123e3d85762b141ad1cbc56452ba69c6e722ebf2f042cc0dc86c47c0d8b3
 WORKDIR /app
 
-# System deps if you add any libs later
+# System deps. git es obligatorio: requirements.txt instala pychdk desde
+# git+https, y sin git pip falla con "Cannot find command 'git'" y la imagen
+# no se construye.
 RUN apt-get update && apt-get install -y --no-install-recommends \
-    build-essential curl libcap-dev && rm -rf /var/lib/apt/lists/*
+    build-essential curl git libcap-dev && rm -rf /var/lib/apt/lists/*
 
 COPY requirements.txt .
 RUN pip install --no-cache-dir -r requirements.txt

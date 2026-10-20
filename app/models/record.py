@@ -1,8 +1,12 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
-from sqlalchemy.orm import relationship
+from sqlalchemy import Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
+from sqlalchemy.orm import relationship, validates
 
 from app.core.db import Base
+
+
+class ImmutableFieldError(ValueError):
+	"""A write would change a value that is set once and never again."""
 
 
 class Record(Base):
@@ -16,13 +20,48 @@ class Record(Base):
 	title = Column(String(255), nullable=False)
 	description = Column(Text, nullable=True)
 	
-	# Archival/descriptive metadata
-	object_typology = Column(String(50), nullable=True)  # book, dossier, document, map, planimetry, other
+	# Archival/descriptive metadata. object_typology and material were dropped
+	# in NEH-259: the first was hard-coded by the capture path and duplicated
+	# capture_mode, the second never had a writer or a UI.
 	author = Column(String(255), nullable=True)
-	material = Column(String(255), nullable=True)
 	date = Column(String(50), nullable=True)
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
-	
+
+	# The queryable form of the same date `date` holds verbally. `date` is a
+	# display field — "1750", "c. 1750", "mediados del siglo XVIII" — and none
+	# of that can be compared, sorted or filtered in SQL; parking a structured
+	# range in custom_attributes would not help, since that column is Text
+	# holding encoded JSON rather than a JSON column. So the range gets two
+	# real DATE columns beside the display field, and `date` stays.
+	#
+	# A span with day resolution. A document known only to its year is the
+	# whole of that year, one known to its month the whole of that month, one
+	# dated to a day a span of one day. What the pair cannot express is the
+	# precision of what is known — "sometime in 1750" and "throughout 1750"
+	# are the same two values — or approximation; `date` carries that.
+	#
+	# Independently nullable, because "after 1750" and "before 1800" are real
+	# archival dates and both ends are not always known. An end before its
+	# start is refused by check_record_date_range below — a database
+	# constraint rather than an ORM guard like external_id's, because an
+	# ordering rule compares two columns of one row, which is what a CHECK
+	# does, so it holds against a bulk UPDATE and raw SQL as well.
+	#
+	# Nothing writes them yet. Absent from every request schema, exposed
+	# read-only on RecordRead; the importer that will fill them is blocked on
+	# the exchange contract.
+	date_start = Column(Date, nullable=True)
+	date_end = Column(Date, nullable=True)
+
+	# The identifier of the catalogue entry this record was captured for —
+	# Fisqua's `reference_code`. Unique, so two records cannot claim the same
+	# catalogue entry; nullable, because a record captured without a catalogue
+	# entry has none; indexed, because the exchange looks records up by it.
+	# Absent from every request schema, so no client can set it: the only
+	# writer is an importer assigning the attribute. Immutable once set — see
+	# _external_id_is_write_once.
+	external_id = Column(String(255), nullable=True, unique=True, index=True)
+
 	# Organizational hierarchy
 	project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True, index=True)
 	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
@@ -50,6 +89,50 @@ class Record(Base):
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
 
+	@validates("external_id", include_removes=True)
+	def _external_id_is_write_once(self, key, value, is_remove):
+		"""Refuse any assignment or removal that would change a stored external_id.
+
+		A reference code that can be reassigned is worse than no reference
+		code: every trace drawn from the appliance back to the catalogue
+		through it becomes unverifiable, and nothing in the data says which
+		of the two codes was the real one. Assigning the identical value is
+		allowed, since it changes nothing — an importer re-running over a
+		record it already stamped is not a second write. Clearing it to NULL
+		is a change like any other and is refused.
+
+		`include_removes` is what makes `del rec.external_id` reach this
+		method, and it is the reason the method takes a fourth argument:
+		without it SQLAlchemy sends set events only, the removal goes through
+		unchecked, and the next assignment reads an empty attribute and is
+		allowed as a first write. A removal is treated as a change and refused
+		on the same terms as a clear to NULL, which is where it ends up
+		anyway: a record that carried a reference code no longer carrying one.
+		With nothing stored there is nothing to protect, so a removal is
+		permitted — the symmetry with the same-value rewrite. On a removal the
+		`value` argument is SQLAlchemy's NO_VALUE sentinel rather than
+		anything a caller passed, so it stays out of the message.
+
+		Scope: this is an ORM attribute guard, so it covers every writer that
+		assigns or removes the attribute, which is all of them.
+		`query().update()` and raw SQL go around it and would need their own
+		check.
+		"""
+		current = self.external_id
+		if is_remove:
+			if current is not None:
+				raise ImmutableFieldError(
+					f"records.external_id is written once and cannot be removed "
+					f"(record {self.id}: {current!r})"
+				)
+			return value
+		if current is not None and value != current:
+			raise ImmutableFieldError(
+				f"records.external_id is written once and cannot be changed "
+				f"(record {self.id}: {current!r} -> {value!r})"
+			)
+		return value
+
 	# Constraint: must have either project_id OR collection_id (or neither, but not both)
 	__table_args__ = (
 		CheckConstraint(
@@ -63,6 +146,17 @@ class Record(Base):
 		CheckConstraint(
 			"capture_mode IN ('single','dual')",
 			name='check_record_capture_mode'
+		),
+		# An end before its start. A half-open range passes: with either end
+		# NULL there is nothing to compare. The two NULL clauses say so
+		# explicitly, which a bare `date_end >= date_start` would also do —
+		# that comparison is NULL when either end is NULL, and a CHECK accepts
+		# NULL — so the explicit form is for a reader, not for the database,
+		# and the two are interchangeable. `>=` and not `>` is not: a document
+		# dated to a single day has a start equal to its end.
+		CheckConstraint(
+			'date_start IS NULL OR date_end IS NULL OR date_end >= date_start',
+			name='check_record_date_range'
 		),
 	)
 

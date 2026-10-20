@@ -2,6 +2,9 @@ from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel, field_validator, model_validator
 from datetime import datetime
+# Aliased: `date` is already a field name on RecordBase (the free-text display
+# date), so importing the type under its own name would shadow it.
+from datetime import date as dt_date
 
 # Valid status values. A record has no "captured" resting state — it enters
 # the queue as "in_review" the moment it's captured (NEH-208). A reviewer can
@@ -150,9 +153,7 @@ class RecordImageRead(RecordImageBase):
 class RecordBase(BaseModel):
 	title: str
 	description: Optional[str] = None
-	object_typology: Optional[str] = None  # book, dossier, document, map, planimetry, other
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
 	status: RecordStatus = "in_review"
@@ -179,9 +180,7 @@ class RecordCreate(RecordBase):
 class RecordUpdate(BaseModel):
 	title: Optional[str] = None
 	description: Optional[str] = None
-	object_typology: Optional[str] = None
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None
 	project_id: Optional[int] = None
@@ -190,6 +189,18 @@ class RecordUpdate(BaseModel):
 
 class RecordRead(RecordBase):
 	id: int
+	# The catalogue entry's own identifier (Fisqua's `reference_code`). Read
+	# only: it is deliberately absent from RecordCreate and RecordUpdate, so a
+	# client cannot set or change it, and Record enforces that it is written
+	# once on the model as well.
+	external_id: Optional[str] = None
+	# The queryable form of `date`: the span the record's date covers, with
+	# day resolution. Read only for the same reason external_id is — no writer
+	# exists yet, and who may set a range, and in what form, is not settled.
+	# Either end may be absent ("after 1750", "before 1800"); an end before
+	# its start is refused by the database.
+	date_start: Optional[dt_date] = None
+	date_end: Optional[dt_date] = None
 	project_id: Optional[int] = None
 	collection_id: Optional[int] = None
 	created_by: Optional[str] = None

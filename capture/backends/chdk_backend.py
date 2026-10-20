@@ -1445,17 +1445,25 @@ class ChdkBackend(CameraBackend):
 
         A viewport and a remote capture both need record mode, and the switch
         drives the lens, so it is done once per body rather than per frame -
-        which is exactly why it has to be confirmed. The library's
-        switch_mode polls for the camera to arrive and then returns whether
-        or not it did: its loop can run out and it reports that the same way
-        it reports success, by returning nothing. Taking the call as proof
-        would leave every later capture and live view running from playback,
-        with the flag set here suppressing any further attempt.
+        which is exactly why it has to be confirmed. pychdk 0.1.3's
+        switch_mode polls get_mode itself and raises once its retries run
+        out, so a switch that never arrived reaches this method as an
+        exception. 0.1.2, which this backend ran until the pin moved, did
+        not: its loop ran out and reported that the same way it reported
+        success, by returning nothing, which left every later capture and
+        live view running from playback with the flag set here suppressing
+        any further attempt. The second read below is what caught that, and
+        it stays - not against a camera, but against a library that returns
+        without the camera having arrived.
 
-        So the camera is asked, on the convention the library's own loop
-        polls on: get_mode() is falsy in record and nonzero in play. The flag
-        is set only on that answer, so a switch that did not arrive is tried
-        again by the next capture instead of being remembered as done.
+        So the camera is asked directly. The question is Lua, not uBASIC, and
+        the two read opposite ways round: CHDK's Lua get_mode() returns three
+        values - is_record, is_video, mode - and the first of them is true in
+        record and false in play. The library returns the script's first
+        return value, so what comes back here is is_record, and a truthy
+        answer is the camera confirming it arrived. The flag is set only on
+        that answer, so a switch that did not arrive is tried again by the
+        next capture instead of being remembered as done.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -1465,7 +1473,8 @@ class ChdkBackend(CameraBackend):
         if body.in_record_mode:
             return
         body.device.switch_mode("record")
-        if body.device.lua_execute("return get_mode()"):
+        is_record = body.device.lua_execute("return get_mode()")
+        if not is_record:
             raise RuntimeError(
                 f"{body.port}: the camera is still in play mode after being "
                 "switched to record, so it can neither capture nor show a "

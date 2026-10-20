@@ -185,7 +185,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.3#49a6f2ef70ff74178f33cc3ab5d56eda1780c919
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
@@ -354,7 +354,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.3#49a6f2ef70ff74178f33cc3ab5d56eda1780c919
       - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
   dev:
@@ -532,7 +532,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.3#49a6f2ef70ff74178f33cc3ab5d56eda1780c919
       - pypi: https://files.pythonhosted.org/packages/24/ae/6312fef58fea07eb9d9457205e85980ef24be2b2679d928eb4c608027a99/gphoto2-2.6.4-cp311-cp311-manylinux2014_x86_64.manylinux_2_17_x86_64.whl
       - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       linux-aarch64:
@@ -704,7 +704,7 @@ environments:
       - conda: https://conda.anaconda.org/conda-forge/noarch/uvicorn-standard-0.35.0-h31011fe_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/wheel-0.47.0-pyhd8ed1ab_0.conda
       - conda: https://conda.anaconda.org/conda-forge/noarch/zipp-4.1.0-pyhcf101f3_0.conda
-      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+      - pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.3#49a6f2ef70ff74178f33cc3ab5d56eda1780c919
       - pypi: https://files.pythonhosted.org/packages/28/b8/27e6312e86408a44fe16bd28ee12dd98608b39f7e7e57884a24e8f29b573/pyusb-1.3.1-py3-none-any.whl
       - pypi: https://files.pythonhosted.org/packages/65/f2/6df445520c1a4d7fd2336105e8cb8ac2a0cb4e4231f93834073b8e7a1366/gphoto2-2.6.4-cp311-cp311-manylinux_2_28_aarch64.whl
 packages:
@@ -4379,9 +4379,9 @@ packages:
   - pkg:pypi/zipp?source=hash-mapping
   size: 24190
   timestamp: 1779159948016
-- pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.2#3f1788e16657d800cb6eabf8cb7fa1fd7b43ddc3
+- pypi: git+https://github.com/UCSB-AMPLab/pychdk?tag=v0.1.3#49a6f2ef70ff74178f33cc3ab5d56eda1780c919
   name: pychdk
-  version: 0.1.2
+  version: 0.1.3
   requires_dist:
   - pyusb>=1.2.0
   - pytest>=7.0 ; extra == 'dev'
