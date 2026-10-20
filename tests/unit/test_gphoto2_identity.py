@@ -316,6 +316,34 @@ def bindings_dir(monkeypatch, tmp_path):
     return root
 
 
+@pytest.fixture(autouse=True)
+def every_poll_is_a_new_interval(monkeypatch):
+    """Make every connection check in this file re-detect the bus.
+
+    A published port map stands for _PORT_MAP_TTL_S before the next
+    is_camera_connected() re-enumerates (NEH-250), so on a clock that barely
+    moves a burst of checks shares one detection. These tests are about which
+    body lands on which index, not about what a poll costs, and each of their
+    checks stands for "the next poll after the rig changed" - so the clock
+    here steps a whole interval on every read, which is that poll.
+    """
+    ticks = iter(range(1, 1_000_000))
+
+    def monotonic():
+        return next(ticks) * (gb._PORT_MAP_TTL_S + 1.0)
+
+    monkeypatch.setattr(
+        gb,
+        "time",
+        types.SimpleNamespace(
+            monotonic=monotonic,
+            perf_counter=time.perf_counter,
+            sleep=time.sleep,
+            time=time.time,
+        ),
+    )
+
+
 def _write_bindings(bindings_dir, pins, raw=None):
     text = raw if raw is not None else json.dumps({"version": 1, "pins": pins})
     (bindings_dir / BINDINGS).write_text(text)
@@ -984,6 +1012,12 @@ def test_identification_never_opens_a_port_another_index_still_holds(monkeypatch
     pass would brief-open a body another index is already holding. It must
     take the same ownership rule the enumeration takes: refuse while index 1
     is busy, and go ahead once it is free.
+
+    A bus scan holds every body for the length of the enumeration (NEH-250),
+    so the re-detection happens here with the rig idle and the clock is then
+    held inside the interval. The connection check under test works from the
+    map that landed - the one that puts an unidentified port at index 0 - and
+    the only thing holding lock 1 is this test.
     """
     backend, claims, detector, _bodies, _cls = _backend_with(
         monkeypatch, [(MODEL, PORT_S1), (MODEL, PORT_S2), (MODEL, PORT_C)]
@@ -991,12 +1025,29 @@ def test_identification_never_opens_a_port_another_index_still_holds(monkeypatch
 
     session_s1 = backend._get_or_open_session(0)
     session_s2 = backend._get_or_open_session(1)
-    session_c = backend._get_or_open_session(2)
+    backend._get_or_open_session(2)
     assert (session_s1.serial, session_s2.serial) == ("", "")
     assert backend._pins == {2: SERIAL_C}
 
     # S1 is unplugged; C power-cycles onto a new port.
     detector.results = [(MODEL, PORT_S2), (MODEL, PORT_C_NEW)]
+    backend._scan_bus()
+    assert backend._published_port_map() == {
+        0: (MODEL, PORT_S2),
+        1: (MODEL, PORT_C_NEW),
+    }, "S2 was not laid provisionally on the index S1 vacated"
+
+    frozen = backend._last_scanned_at
+    monkeypatch.setattr(
+        gb,
+        "time",
+        types.SimpleNamespace(
+            monotonic=lambda: frozen,
+            perf_counter=time.perf_counter,
+            sleep=time.sleep,
+            time=time.time,
+        ),
+    )
 
     results = {}
     errors = {}
