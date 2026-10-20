@@ -237,12 +237,20 @@ class _FakeBackend:
         return [dict(d) for d in self._devices]
 
 
+# The real device-row shape, which the registry reads by key:
+# `device["hardware_id"]` and `device.get("port")`. A row missing either raised
+# into _hardware_id_from_backend's `except Exception`, which returns
+# (None, {"error": ...}) -- so the first version of these tests failed even on
+# an unpadded "gphoto2" and looked like a normalisation bug.
 _FAKE_DEVICE = {
     "index": 0,
-    "id": "usb:001,004",
     "model": "Canon EOS Rebel T7",
+    "hardware_id": "canoneosrebelt7_1111111",
     "serial": "1111111",
     "location": "USB usb:001,004",
+    "port": "usb:001,004",
+    "has_aperture_control": True,
+    "supports_zoom": False,
 }
 
 
