@@ -17,7 +17,7 @@ from app.schemas.record import ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
 # (NEH-260). cameras.py imports _supersede_current_images the same way.
-from app.api.records import _apply_status_change, _assert_promotable
+from app.api.records import _apply_status_change, _assert_promotable, is_movable
 from app.core.audit import log_event
 from app.core.config import settings
 from app.core.export_jobs import export_jobs
@@ -316,7 +316,7 @@ def move_collection_records(
     # handed over is not moved out from under the review it is waiting for.
     # All or nothing, because moving some of a collection's records and
     # refusing the rest leaves the operator with no way to tell which went.
-    handed_over = [r.id for r in records if r.status != "captured"]
+    handed_over = [r.id for r in records if not is_movable(r)]
     if handed_over:
         raise HTTPException(
             status_code=409,
@@ -596,11 +596,26 @@ def take_back_collection(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    taken_back = (
-        db.query(Record)
+    # The rows are locked in id order first, and only then written. A bare
+    # conditional UPDATE is atomic but visits rows in whatever order the planner
+    # chooses, which can interleave with move-records — that locks by id — into a
+    # deadlock. The predicate stays on the write, so a row approved between the
+    # two statements is still not matched.
+    locked_ids = [
+        row.id
+        for row in db.query(Record.id)
         .filter(Record.collection_id == collection_id, Record.status == "in_review")
-        .update({Record.status: "captured"}, synchronize_session=False)
-    )
+        .order_by(Record.id)
+        .with_for_update(of=Record)
+        .all()
+    ]
+    taken_back = 0
+    if locked_ids:
+        taken_back = (
+            db.query(Record)
+            .filter(Record.id.in_(locked_ids), Record.status == "in_review")
+            .update({Record.status: "captured"}, synchronize_session=False)
+        )
     db.commit()
     if not taken_back:
         return {"collection_id": collection_id, "taken_back": 0}
@@ -639,11 +654,6 @@ def export_collection_bagit(
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
-    if not records:
-        raise HTTPException(
-            status_code=422,
-            detail={"message": "Collection has no records to export.", "blocking_record_ids": []},
-        )
     # Handover first, approval second — two different things to tell her. A
     # collection she has not promoted is work in progress, not work that failed
     # review (NEH-260). The predicate lives in export_service beside the worker

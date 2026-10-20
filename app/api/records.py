@@ -267,15 +267,8 @@ def update_record(
 	if "project_id" in data or "collection_id" in data:
 		new_parent = (data.get("project_id", rec.project_id),
 		              data.get("collection_id", rec.collection_id))
-		if new_parent != (rec.project_id, rec.collection_id) and rec.status != "captured":
-			raise HTTPException(
-				status_code=409,
-				detail=(
-					f"Record {rec.id} has status '{rec.status}' and cannot be moved. "
-					f"Take its collection back first, which returns the whole handover "
-					f"to the operator, then move it."
-				)
-			)
+		if new_parent != (rec.project_id, rec.collection_id):
+			assert_movable(rec)
 
 	for field, value in data.items():
 		setattr(rec, field, value)
@@ -766,6 +759,38 @@ def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
 	if with_images:
 		query = query.options(joinedload(Record.images))
 	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+
+
+def is_movable(rec: Record) -> bool:
+	"""May this record change parents?
+
+	Only while it is still the operator's. Moving a handed-over record out of
+	its collection withdraws it from the review it is waiting for, and the
+	ruling of 2026-10-17 is that a withdrawal is a per-collection act
+	(NEH-260).
+	"""
+	return rec.status == "captured"
+
+
+def assert_movable(rec: Record) -> None:
+	"""Refuse a parent change on a record that is no longer the operator's.
+
+	Four routes change an existing record's parent: PATCH /records/{id},
+	POST /collections/{id}/move-records, and the two project attach/detach
+	routes. They all call this. The first version of this guard covered only
+	the two that were being edited at the time, and an adversarial round
+	defeated the rule through the project routes in two calls — so the
+	enumeration matters more than the check does.
+	"""
+	if not is_movable(rec):
+		raise HTTPException(
+			status_code=409,
+			detail=(
+				f"Record {rec.id} has status '{rec.status}' and cannot be moved. "
+				f"Take its collection back first, which returns the whole handover "
+				f"to the operator, then move it."
+			)
+		)
 
 
 def _assert_promotable(rec: Record) -> None:

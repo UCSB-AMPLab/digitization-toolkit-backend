@@ -16,6 +16,8 @@ from app.core.paths import resolve_within_storage
 from app.core.storage_ops import resolve_project_name
 from app.models.collection import Collection
 from app.models.project import Project
+from sqlalchemy.orm import joinedload
+
 from app.models.record import Record
 
 logger = logging.getLogger(__name__)
@@ -46,7 +48,13 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
     Handover is reported before approval because they are different things to
     tell an operator: a collection she has not handed over is work in progress,
     not work that failed review.
+
+    An empty collection is reported here too. It used to be checked only at the
+    request, so the worker would bag a collection whose last record had been
+    deleted in between and write `"records": []` into the metadata.
     """
+    if not records:
+        return ("Collection has no records to export.", [])
     not_handed_over = [r.id for r in records if r.status == "captured"]
     if not_handed_over:
         return (
@@ -76,8 +84,14 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     if not collection:
         raise ExportError(f"Collection {collection_id} not found")
 
+    # Statuses and images are read in one statement, so the gate below and the
+    # payload built further down see the same instant. Loading the images lazily
+    # per record afterwards let a retake land in between: the record's cached
+    # status still said `approved` while its image query returned the
+    # replacement, and the bag then labelled a new unreviewed image as approved.
     records = (
         db.query(Record)
+        .options(joinedload(Record.images))
         .filter(Record.collection_id == collection_id)
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
@@ -87,6 +101,12 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     if blocker:
         message, blocking_ids = blocker
         raise ExportError(message, detail={"blocking_record_ids": blocking_ids})
+    # What the gate passed on, kept so it can be checked again once the payload
+    # is planned: an export is a statement about a state, and if that state
+    # moved while the bag was being assembled the bag is not about anything.
+    gated_state = {rec.id: (rec.status,
+                            tuple(sorted(i.id for i in rec.images if i.is_current)))
+                   for rec in records}
 
     project = db.query(Project).filter(Project.id == collection.project_id).first() if collection.project_id else None
 
@@ -137,6 +157,35 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         raise ExportError(
             "Not enough free space on the exports filesystem to build this archive.",
             detail={"reason": "low_disk", "needed_bytes": total_src + FREE_SPACE_MARGIN, "free_bytes": free},
+        )
+
+    # The payload is planned; nothing has been written yet. Check that the state
+    # the gate passed on is still the state, because the bag is a statement about
+    # it. A reviewer undoing an approval, or an operator retaking a record, in the
+    # time it took to resolve the files leaves a bag that claims a review that no
+    # longer stands. populate_existing() because a plain re-query returns the
+    # instances already in the identity map without refreshing their columns,
+    # which would compare the snapshot against itself.
+    rechecked = (
+        db.query(Record)
+        .options(joinedload(Record.images))
+        .filter(Record.collection_id == collection_id)
+        .populate_existing()
+        .all()
+    )
+    now_state = {rec.id: (rec.status,
+                          tuple(sorted(i.id for i in rec.images if i.is_current)))
+                 for rec in rechecked}
+    if now_state != gated_state:
+        moved = sorted(
+            set(gated_state) ^ set(now_state)
+            | {rid for rid in set(gated_state) & set(now_state)
+               if gated_state[rid] != now_state[rid]}
+        )
+        raise ExportError(
+            "Cannot export: the collection changed while the archive was being "
+            f"assembled ({len(moved)} record(s) affected). Try again.",
+            detail={"blocking_record_ids": moved},
         )
 
     metadata_payload = _metadata_payload(collection, project, records, timestamp)

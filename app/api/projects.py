@@ -19,7 +19,10 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.project import Project
 from app.models.project_member import ProjectMember
-from app.models.record import Record, RecordImage
+from app.models.record import Record
+# One definition of whether a record may change parents, and the loader that
+# locks the row the decision is made from (NEH-260).
+from app.api.records import _locked_record, assert_movable, RecordImage
 from app.models.collection import Collection
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
@@ -98,9 +101,16 @@ def add_record_to_project(
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    r = db.query(Record).filter(Record.id == rec_id).first()
+    # Locked and guarded for the same reason the other move routes are: this
+    # changes a record's parent, and doing that to a handed-over record
+    # withdraws it from review one record at a time (NEH-260). An adversarial
+    # round reached the rule through here in two calls while the other two
+    # routes were guarded.
+    r = _locked_record(db, rec_id, with_images=False)
     if not r:
         raise HTTPException(status_code=404, detail="Record not found")
+    if (r.project_id, r.collection_id) != (p.id, None):
+        assert_movable(r)
     # A record has one parent: attaching it to a project detaches it from any collection
     r.project_id = p.id
     r.collection_id = None
@@ -123,9 +133,13 @@ def remove_record_from_project(
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
-    r = db.query(Record).filter(Record.id == rec_id, Record.project_id == p.id).first()
+    r = db.query(Record).filter(
+        Record.id == rec_id, Record.project_id == p.id
+    ).with_for_update(of=Record).first()
     if not r:
         raise HTTPException(status_code=404, detail="Record not found on this project")
+    # Detaching is a parent change too, and it orphans the record (NEH-260).
+    assert_movable(r)
     r.project_id = None
     db.add(r)
     db.commit()

@@ -133,13 +133,119 @@ def test_cataloguing_a_record_under_review_is_still_allowed(client, db_session):
 
 @pytest.mark.unit
 def test_resending_the_same_parent_is_not_a_move(client, db_session):
-    """A PATCH that changes nothing about the parent must not be refused."""
+    """A PATCH that changes nothing about the parent must not be refused —
+    and must also not change the parent.
+
+    The first version of this test asserted only the 200. A mutation that
+    detached the record after validation passed it, and passed every other case
+    in this file too, which is what an adversarial round demonstrated. A test
+    that constrains only the status code constrains almost nothing.
+    """
     a = _collection(db_session, "A")
     rec = _record(db_session, a, status="in_review")
     api = _client_as(client, "op", "operator")
 
     resp = api.patch(f"/records/{rec.id}", json={"collection_id": a.id})
     assert resp.status_code == 200, resp.text
+    db_session.refresh(rec)
+    assert rec.collection_id == a.id, "the parent must be exactly where it was"
+    assert rec.project_id is None
+    assert rec.status == "in_review", "and nothing else may have moved either"
+
+
+# ---------------------------------------------------------------------------
+# The project routes, which the first version of this guard did not cover
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_attaching_a_queued_record_to_a_project_is_refused(client, db_session):
+    """An adversarial round reached the whole-collection rule through here.
+
+    POST /projects/{id}/add_record/{rec} sets project_id and nulls
+    collection_id, which is a move, and it carried no status check.
+    """
+    a = _collection(db_session, "A")
+    rec = _record(db_session, a, status="in_review")
+    proj = _project(db_session)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post(f"/projects/{proj.id}/add_record/{rec.id}")
+    assert resp.status_code == 409, resp.text
+    db_session.refresh(rec)
+    assert rec.collection_id == a.id
+    assert rec.project_id is None
+
+
+@pytest.mark.unit
+def test_attaching_a_captured_record_to_a_project_is_allowed(client, db_session):
+    a = _collection(db_session, "A")
+    rec = _record(db_session, a)
+    proj = _project(db_session)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post(f"/projects/{proj.id}/add_record/{rec.id}")
+    assert resp.status_code == 200, resp.text
+    db_session.refresh(rec)
+    assert rec.project_id == proj.id
+    assert rec.collection_id is None
+
+
+@pytest.mark.unit
+def test_detaching_a_queued_record_from_a_project_is_refused(client, db_session):
+    from app.models.record import Record
+
+    proj = _project(db_session)
+    rec = Record(title="r.jpg", project_id=proj.id, status="in_review",
+                 capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.refresh(rec)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post(f"/projects/{proj.id}/remove_record/{rec.id}")
+    assert resp.status_code == 409, resp.text
+    db_session.refresh(rec)
+    assert rec.project_id == proj.id
+
+
+@pytest.mark.unit
+def test_the_two_call_project_sequence_no_longer_withdraws_one_record(client, db_session):
+    """The round's reproduction: attach S to a project, then take A back."""
+    a = _collection(db_session, "A")
+    r = _record(db_session, a, name="r.jpg")
+    s_rec = _record(db_session, a, name="s.jpg")
+    proj = _project(db_session)
+    api = _client_as(client, "op", "operator")
+
+    assert api.post(f"/collections/{a.id}/promote").status_code == 200
+
+    assert api.post(f"/projects/{proj.id}/add_record/{s_rec.id}").status_code == 409
+    assert api.post(f"/collections/{a.id}/take-back").status_code == 200
+
+    db_session.refresh(r)
+    db_session.refresh(s_rec)
+    assert (r.status, s_rec.status) == ("captured", "captured"), \
+        "the whole handover comes back, or none of it"
+    assert s_rec.collection_id == a.id
+
+
+# ---------------------------------------------------------------------------
+# The export worker's remaining gaps
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_an_emptied_collection_is_refused_by_the_worker(db_session):
+    """The request refuses an empty collection; the worker used not to."""
+    from app.core.export_jobs import ExportError, ExportJob
+    from app.core.export_service import _do_export, workflow_blockers
+
+    assert workflow_blockers([])[0] == "Collection has no records to export."
+
+    col = _collection(db_session, "A")
+    job = ExportJob(col.id)
+    with pytest.raises(ExportError) as excinfo:
+        _do_export(db_session, job, col.id)
+    assert "no records" in str(excinfo.value)
 
 
 # ---------------------------------------------------------------------------
