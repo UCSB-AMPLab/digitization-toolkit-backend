@@ -233,11 +233,15 @@ def update_record(
 	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Update a record's descriptive metadata."""
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	"""Update a record's descriptive metadata, and its parent while it is still
+	the operator's.
+
+	The row is locked because the decision below reads the status (NEH-260).
+	"""
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+
 	data = payload.model_dump(exclude_unset=True)
 
 	# A record has at most one parent: reject setting both, null the opposite when one is set
@@ -249,6 +253,22 @@ def update_record(
 		data["collection_id"] = None
 	elif set_collection:
 		data["project_id"] = None
+
+	# Moving a record between collections is a withdrawal once it has been
+	# handed over, and the handover is a per-collection act by ruling
+	# (NEH-260): take the collection back, move what you like, promote it
+	# again. Without this check the whole-collection rule was reachable one
+	# record at a time — move it out, take the collection it landed in back,
+	# move it home — and it came back as the operator's while its siblings
+	# stayed in the queue. No race needed, three ordinary calls.
+	#
+	# Only a move is refused. Retitling or redating a record under review is
+	# ordinary cataloguing work and stays open to whoever may edit it.
+	if "project_id" in data or "collection_id" in data:
+		new_parent = (data.get("project_id", rec.project_id),
+		              data.get("collection_id", rec.collection_id))
+		if new_parent != (rec.project_id, rec.collection_id):
+			assert_movable(rec)
 
 	for field, value in data.items():
 		setattr(rec, field, value)
@@ -739,6 +759,38 @@ def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
 	if with_images:
 		query = query.options(joinedload(Record.images))
 	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+
+
+def is_movable(rec: Record) -> bool:
+	"""May this record change parents?
+
+	Only while it is still the operator's. Moving a handed-over record out of
+	its collection withdraws it from the review it is waiting for, and the
+	ruling of 2026-10-17 is that a withdrawal is a per-collection act
+	(NEH-260).
+	"""
+	return rec.status == "captured"
+
+
+def assert_movable(rec: Record) -> None:
+	"""Refuse a parent change on a record that is no longer the operator's.
+
+	Four routes change an existing record's parent: PATCH /records/{id},
+	POST /collections/{id}/move-records, and the two project attach/detach
+	routes. They all call this. The first version of this guard covered only
+	the two that were being edited at the time, and an adversarial round
+	defeated the rule through the project routes in two calls — so the
+	enumeration matters more than the check does.
+	"""
+	if not is_movable(rec):
+		raise HTTPException(
+			status_code=409,
+			detail=(
+				f"Record {rec.id} has status '{rec.status}' and cannot be moved. "
+				f"Take its collection back first, which returns the whole handover "
+				f"to the operator, then move it."
+			)
+		)
 
 
 def _assert_promotable(rec: Record) -> None:
