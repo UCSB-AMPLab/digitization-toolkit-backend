@@ -83,27 +83,26 @@ _BACKEND_CONSTRUCTORS = {
 KNOWN_CAMERA_BACKENDS = tuple(sorted(_BACKEND_CONSTRUCTORS))
 
 
-def configured_camera_backend() -> str:
-    """The configured backend's name, canonicalised, without judging it.
+def canonical_backend_name(value: str) -> str:
+    """The one definition of how a CAMERA_BACKEND value is read.
 
-    Every reader of CAMERA_BACKEND goes through this. Tolerating surrounding
-    whitespace in the assertion below and not in camera_registry.py made
-    `" gphoto2 "` pass startup and then select the picamera2 path in the
-    registry, so a DSLR rig detected no cameras at all -- a worse failure than
+    What is shared here is the RULE, not the source. Tolerating surrounding
+    whitespace in the startup assertion while camera_registry.py did a bare
+    `.lower()` meant `" gphoto2 "` passed startup and then selected the
+    picamera2 path, so a DSLR rig detected no cameras -- a worse failure than
     the one the tolerance was added to prevent.
 
-    `settings` is imported HERE rather than used from the module global, and
-    that is load-bearing. tests/conftest.py's set_camera_backend fixture calls
-    importlib.reload(app.core.config), which rebinds that module's `settings`
-    to a new object while every module that did `from app.core.config import
-    settings` at import time goes on holding the old one. A call-time import
-    always reads whichever object is live, so this function cannot disagree
-    with camera_registry.py about what the setting currently says -- which is
-    the whole point of there being one reader.
+    It deliberately does NOT read `settings` itself. There are two live
+    settings objects in a test run: conftest.py's set_camera_backend fixture
+    calls importlib.reload(app.core.config), which rebinds that module's
+    `settings` while every module holding `from app.core.config import
+    settings` keeps the one it imported. Existing tests patch both --
+    test_chdk_wiring.py patches this module's, the registry's tests patch
+    config's -- so a function that picked one of them would silently move
+    which object a caller consults. Each site keeps reading the object it
+    always read, and they agree because they normalise the same way.
     """
-    from app.core.config import settings as live_settings
-
-    return live_settings.CAMERA_BACKEND.strip().lower()
+    return value.strip().lower()
 
 
 def assert_camera_backend_configured() -> str:
@@ -121,7 +120,7 @@ def assert_camera_backend_configured() -> str:
     answer /health, and fail at the moment someone tried to photograph
     something.
     """
-    configured = configured_camera_backend()
+    configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
         # The RAW value in the message, not the canonicalised one: an operator
         # needs to see what is in the file, and the difference between

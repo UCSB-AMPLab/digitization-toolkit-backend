@@ -158,11 +158,12 @@ class CameraRegistry:
             Tuple of (hardware_id, camera_info_dict)
         """
         try:
-            # The canonical name, so a value with surrounding whitespace does
-            # not pass the startup assertion and then select another backend
-            # here (NEH-268).
-            from .service import configured_camera_backend
-            if configured_camera_backend() in ("gphoto2", "chdk"):
+            # Normalised the same way the startup assertion normalises, so a
+            # value with surrounding whitespace cannot pass there and select a
+            # different backend here (NEH-268).
+            from app.core.config import settings
+            from .service import canonical_backend_name
+            if canonical_backend_name(settings.CAMERA_BACKEND) in ("gphoto2", "chdk"):
                 return CameraRegistry._hardware_id_from_backend(camera_index)
         except Exception:
             pass
@@ -230,8 +231,9 @@ class CameraRegistry:
         """
         detected = {}
         try:
-            from .service import configured_camera_backend
-            backend = configured_camera_backend()
+            from app.core.config import settings
+            from .service import canonical_backend_name
+            backend = canonical_backend_name(settings.CAMERA_BACKEND)
         except Exception:
             backend = "picamera2"
 
