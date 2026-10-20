@@ -21,7 +21,7 @@ from app.api.records import _apply_status_change, _assert_promotable
 from app.core.audit import log_event
 from app.core.config import settings
 from app.core.export_jobs import export_jobs
-from app.core.export_service import run_export
+from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
     relocate_image,
@@ -302,7 +302,33 @@ def move_collection_records(
         raise HTTPException(status_code=422, detail="Target collection is not attached to a project")
     target_dir = image_output_dir(target_project_name, target.name)
 
-    records = db.query(Record).filter(Record.collection_id == collection_id).all()
+    # Locked, because the refusal below reads each record's status and the
+    # relocation that follows is a filesystem move no transaction takes back.
+    records = (
+        db.query(Record)
+        .filter(Record.collection_id == collection_id)
+        .order_by(Record.id)
+        .with_for_update(of=Record)
+        .all()
+    )
+
+    # Same rule as the single-record move (NEH-260): a record that has been
+    # handed over is not moved out from under the review it is waiting for.
+    # All or nothing, because moving some of a collection's records and
+    # refusing the rest leaves the operator with no way to tell which went.
+    handed_over = [r.id for r in records if r.status != "captured"]
+    if handed_over:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Cannot move: {len(handed_over)} record(s) have been handed over "
+                    f"for review: {handed_over}. Take this collection back first."
+                ),
+                "blocking_record_ids": handed_over,
+            },
+        )
+
     for r in records:
         r.collection_id = target_collection_id
         for img in r.images:
@@ -618,28 +644,16 @@ def export_collection_bagit(
             status_code=422,
             detail={"message": "Collection has no records to export.", "blocking_record_ids": []},
         )
-    # Handover first, approval second — two different things to tell her.
-    # A collection she has not promoted is work in progress, not work that
-    # failed review (NEH-260). The approval check below would catch these
-    # records too, but it would report them as unreviewed.
-    not_handed_over = [r.id for r in records if r.status == "captured"]
-    if not_handed_over:
+    # Handover first, approval second — two different things to tell her. A
+    # collection she has not promoted is work in progress, not work that failed
+    # review (NEH-260). The predicate lives in export_service beside the worker
+    # that re-checks it, so the two cannot drift apart.
+    blocker = workflow_blockers(records)
+    if blocker:
+        message, blocking_ids = blocker
         raise HTTPException(
             status_code=422,
-            detail={
-                "message": f"Cannot export: {len(not_handed_over)} record(s) have not been handed over for review yet: {not_handed_over}",
-                "blocking_record_ids": not_handed_over,
-            },
-        )
-
-    non_approved = [r.id for r in records if r.status != "approved"]
-    if non_approved:
-        raise HTTPException(
-            status_code=422,
-            detail={
-                "message": f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
-                "blocking_record_ids": non_approved,
-            },
+            detail={"message": message, "blocking_record_ids": blocking_ids},
         )
 
     image_less = [r.id for r in records if not any(i.is_current for i in r.images)]

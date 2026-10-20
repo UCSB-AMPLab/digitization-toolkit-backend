@@ -233,11 +233,15 @@ def update_record(
 	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Update a record's descriptive metadata."""
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	"""Update a record's descriptive metadata, and its parent while it is still
+	the operator's.
+
+	The row is locked because the decision below reads the status (NEH-260).
+	"""
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+
 	data = payload.model_dump(exclude_unset=True)
 
 	# A record has at most one parent: reject setting both, null the opposite when one is set
@@ -249,6 +253,29 @@ def update_record(
 		data["collection_id"] = None
 	elif set_collection:
 		data["project_id"] = None
+
+	# Moving a record between collections is a withdrawal once it has been
+	# handed over, and the handover is a per-collection act by ruling
+	# (NEH-260): take the collection back, move what you like, promote it
+	# again. Without this check the whole-collection rule was reachable one
+	# record at a time — move it out, take the collection it landed in back,
+	# move it home — and it came back as the operator's while its siblings
+	# stayed in the queue. No race needed, three ordinary calls.
+	#
+	# Only a move is refused. Retitling or redating a record under review is
+	# ordinary cataloguing work and stays open to whoever may edit it.
+	if "project_id" in data or "collection_id" in data:
+		new_parent = (data.get("project_id", rec.project_id),
+		              data.get("collection_id", rec.collection_id))
+		if new_parent != (rec.project_id, rec.collection_id) and rec.status != "captured":
+			raise HTTPException(
+				status_code=409,
+				detail=(
+					f"Record {rec.id} has status '{rec.status}' and cannot be moved. "
+					f"Take its collection back first, which returns the whole handover "
+					f"to the operator, then move it."
+				)
+			)
 
 	for field, value in data.items():
 		setattr(rec, field, value)
