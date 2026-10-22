@@ -373,3 +373,21 @@ def test_image_delete_keeps_a_sidecar_a_surviving_sibling_shares(client, db_sess
     assert preview.exists(), f"{preview.name} was deleted while {raw.name} still points at it"
     assert raw.exists() and raw_thumb.exists(), "the surviving sibling lost a file"
     assert not jpeg.exists() and not jpeg_thumb.exists()
+
+
+@pytest.mark.unit
+def test_a_thumbnail_path_outside_storage_is_never_unlinked(client, db_session, tmp_path, capture_dir, thumbs_dir):
+    """Every unlinked path is confined to storage, the thumbnail's included."""
+    master, preview, _ = _capture(capture_dir, thumbs_dir, "IMG_1010", suffix=".jpg")
+    outside = tmp_path / "outside"
+    outside.mkdir()
+    stray = outside / "not_ours.jpg"
+    stray.write_bytes(b"someone else's file")
+    rec = _record(db_session)
+    img = _image(db_session, rec, master, stray)
+
+    resp = _client_as("op", "operator").delete(f"/records/images/{img.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert not master.exists()
+    assert stray.exists(), "a thumbnail_path outside storage was unlinked"

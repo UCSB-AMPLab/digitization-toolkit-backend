@@ -552,6 +552,17 @@ def delete_image(
 	# The files are chosen under this lock and unlinked only once the commit
 	# that removes the row has succeeded (NEH-262).
 	rec = _locked_record(db, img.record_id, with_images=False)
+	# Read the image again now the record is locked: a move that relocated
+	# its file and committed between the first read and the lock would
+	# otherwise leave the old paths in the list below.
+	img = (
+		db.query(RecordImage)
+		.filter(RecordImage.id == img_id)
+		.populate_existing()
+		.first()
+	)
+	if not img:
+		raise HTTPException(status_code=404, detail="Image not found")
 	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
