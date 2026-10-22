@@ -269,6 +269,7 @@ def move_collections(
     )
 
     # Relocate the image files so they physically live under the target project
+    not_moved: list[str] = []
     if moved_collection_ids:
         names = {
             c.id: c.name
@@ -278,13 +279,17 @@ def move_collections(
         for r in records:
             target_dir = image_output_dir(target.name, names.get(r.collection_id))
             for img in r.images:
-                relocate_image(img, target_dir)
+                relocate_image(img, target_dir, not_moved)
 
     db.commit()
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
               subject=f"{source.name} -> {target.name} ({moved} collections)")
-    return {"moved": moved, "target_project_id": payload.target_project_id}
+    body = {"moved": moved, "target_project_id": payload.target_project_id}
+    if not_moved:
+        # Preview sidecars that stayed in the old directory (see relocate_image)
+        body["not_moved"] = not_moved
+    return body
 
 
 @router.delete("/{project_id}")

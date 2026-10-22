@@ -366,3 +366,356 @@ def test_integrity_scans_every_raw_suffix_for_orphans(db_session, override_proje
     report = run_integrity_check(db_session, verify_hashes=False)
 
     assert report["orphan_files"] == [str(stray.resolve())]
+
+
+# ---------------------------------------------------------------------------
+# Review follow-ups
+# ---------------------------------------------------------------------------
+
+import hashlib
+
+
+def _digest(path):
+    return hashlib.sha256(path.read_bytes()).hexdigest()
+
+
+@pytest.mark.unit
+def test_integrity_reports_the_sidecar_of_a_deleted_master_still_in_the_manifest(db_session, override_projects_root):
+    """The manifest keeps a deleted capture's line, so a manifest path does not vouch for its sidecar."""
+    import json
+    from app.core.integrity import run_integrity_check
+    from app.models.record import Record, RecordImage
+
+    proj_dir = override_projects_root / "proj"
+    (proj_dir / "images").mkdir(parents=True)
+    (proj_dir / "metadata").mkdir(parents=True)
+    master = proj_dir / "images" / "IMG_0001.CR2"
+    master.write_bytes(b"raw")
+    sidecar = proj_dir / "images" / "IMG_0001_preview.jpg"
+    sidecar.write_bytes(b"preview")
+    (proj_dir / "metadata" / "manifest.jsonl").write_text(json.dumps({
+        "capture_id": "c1",
+        "files": [{"sha256": _digest(master), "relative_path": "images/IMG_0001.CR2"}],
+    }), encoding="utf-8")
+    rec = Record(title="r", status="rejected", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    img = RecordImage(record_id=rec.id, filename=master.name, file_path=str(master),
+                      capture_id="c1", format="cr2")
+    db_session.add(img)
+    db_session.commit()
+
+    db_session.delete(img)
+    db_session.commit()
+    master.unlink()
+
+    report = run_integrity_check(db_session, verify_hashes=False)
+
+    assert report["orphan_files"] == [str(sidecar.resolve())]
+
+
+def _fail_nth_phase2_replace(monkeypatch, n):
+    """Raise on the nth os.replace from a `.renumber_` temp to a final name, once."""
+    import os
+    real_replace = os.replace
+    state = {"count": 0, "fired": False}
+
+    def replace(src, dst):
+        if not state["fired"] and Path(src).name.startswith(".renumber_") and not Path(dst).name.startswith(".renumber_"):
+            state["count"] += 1
+            if state["count"] == n:
+                state["fired"] = True
+                raise PermissionError(13, "Permission denied", str(dst))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("app.core.storage_ops.os.replace", replace)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("fail_at", [1, 2, 3, 4, 5, 6])
+def test_renumber_failure_restores_every_original_name(db_session, override_projects_root, monkeypatch, fail_at):
+    """X 0003->0001, Y 0001->0002, Z 0002->0003: each original name is another file's final name.
+
+    Six phase-2 renames (three masters, then three sidecars); the failure is
+    injected at each in turn.
+    """
+    from app.core.storage_ops import renumber_collection_images
+
+    image_dir = override_projects_root / "proj" / "images" / "caja_1"
+    image_dir.mkdir(parents=True)
+    order = ["caja_1_0003.CR2", "caja_1_0001.CR2", "caja_1_0002.CR2"]
+    for name in order:
+        (image_dir / name).write_bytes(f"raw {name}".encode())
+        (image_dir / (Path(name).stem + "_preview.jpg")).write_bytes(f"preview {name}".encode())
+    before = {p.name: _digest(p) for p in image_dir.iterdir()}
+    coll = _collection_with_images(db_session, image_dir, order)
+
+    _fail_nth_phase2_replace(monkeypatch, fail_at)
+    with pytest.raises(OSError):
+        renumber_collection_images(db_session, coll)
+
+    after = {p.name: _digest(p) for p in image_dir.iterdir()}
+    assert after == before
+
+
+@pytest.mark.unit
+def test_restore_original_names_never_overwrites_a_taken_name(tmp_path):
+    from app.core.storage_ops import restore_original_names
+
+    a = tmp_path / "a.jpg"
+    moved = tmp_path / "moved.jpg"
+    moved.write_bytes(b"mine")
+    a.write_bytes(b"someone else")
+
+    failed = restore_original_names([(a, moved)])
+
+    assert failed == [a]
+    assert a.read_bytes() == b"someone else"
+    leftovers = [p for p in tmp_path.iterdir() if p.name.startswith(".renumber_")]
+    assert len(leftovers) == 1 and leftovers[0].read_bytes() == b"mine"
+
+
+@pytest.mark.unit
+def test_renumber_refuses_a_stray_preview_at_a_sidecarless_raw_masters_new_name(db_session, override_projects_root):
+    from app.core.storage_ops import renumber_collection_images
+
+    image_dir = override_projects_root / "proj" / "images" / "caja_1"
+    image_dir.mkdir(parents=True)
+    (image_dir / "IMG_0001.CR2").write_bytes(b"raw")
+    (image_dir / "caja_1_0001_preview.jpg").write_bytes(b"stray")
+    coll = _collection_with_images(db_session, image_dir, ["IMG_0001.CR2"])
+
+    with pytest.raises(ValueError, match="caja_1_0001_preview.jpg"):
+        renumber_collection_images(db_session, coll)
+    assert (image_dir / "IMG_0001.CR2").exists()
+
+
+@pytest.mark.unit
+def test_relocate_reports_a_sidecar_that_could_not_follow(dirs, monkeypatch):
+    import shutil
+    from app.core.storage_ops import relocate_image
+
+    src_dir, dst_dir = dirs
+    master = src_dir / "IMG_0010.CR2"
+    master.write_bytes(b"raw")
+    (src_dir / "IMG_0010_preview.jpg").write_bytes(b"preview")
+    img = _row(master)
+    real_move = shutil.move
+
+    def move(src, dst, *a, **kw):
+        if src.endswith("_preview.jpg"):
+            raise PermissionError(13, "Permission denied", src)
+        return real_move(src, dst, *a, **kw)
+
+    monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
+    not_moved = []
+    assert relocate_image(img, dst_dir, not_moved) is True
+    assert not_moved == ["IMG_0010_preview.jpg"]
+
+
+@pytest.mark.unit
+def test_relocate_renames_a_sidecarless_raw_master_beside_a_stray_preview(dirs):
+    from app.core.storage_ops import relocate_image
+
+    src_dir, dst_dir = dirs
+    dst_dir.mkdir(parents=True)
+    master = src_dir / "IMG_0011.CR2"
+    master.write_bytes(b"raw")
+    stray = dst_dir / "IMG_0011_preview.jpg"
+    stray.write_bytes(b"stray")
+    img = _row(master)
+
+    assert relocate_image(img, dst_dir) is True
+    new_master = Path(img.file_path)
+    assert new_master.name != "IMG_0011.CR2"
+    assert img.filename == new_master.name
+    assert not new_master.with_name(new_master.stem + "_preview.jpg").exists()
+    assert stray.read_bytes() == b"stray"
+
+
+@pytest.mark.unit
+def test_relocate_renames_beside_an_unrelated_master_of_the_same_stem(dirs):
+    from app.core.storage_ops import relocate_image
+
+    src_dir, dst_dir = dirs
+    dst_dir.mkdir(parents=True)
+    master = src_dir / "folio.jpg"
+    master.write_bytes(b"jpeg")
+    (dst_dir / "folio.CR2").write_bytes(b"another record's raw")
+    img = _row(master)
+
+    assert relocate_image(img, dst_dir) is True
+    assert Path(img.file_path).stem != "folio"
+
+
+@pytest.mark.unit
+def test_relocate_keeps_a_jpeg_and_raw_pair_together(db_session, dirs):
+    """The pair's CR2, moved first, is a sibling of the jpg, not a clash."""
+    from app.core.storage_ops import relocate_image
+    from app.models.record import Record, RecordImage
+
+    src_dir, dst_dir = dirs
+    raw = src_dir / "folio.CR2"
+    raw.write_bytes(b"raw")
+    (src_dir / "folio_preview.jpg").write_bytes(b"preview")
+    jpeg = src_dir / "folio.jpg"
+    jpeg.write_bytes(b"jpeg")
+    rec = Record(title="r", status="rejected", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    raw_img = RecordImage(record_id=rec.id, filename=raw.name, file_path=str(raw), format="cr2")
+    jpeg_img = RecordImage(record_id=rec.id, filename=jpeg.name, file_path=str(jpeg), format="jpg")
+    db_session.add_all([raw_img, jpeg_img])
+    db_session.commit()
+    db_session.refresh(rec)
+
+    relocate_image(raw_img, dst_dir)
+    relocate_image(jpeg_img, dst_dir)
+
+    assert sorted(p.name for p in dst_dir.iterdir()) == ["folio.CR2", "folio.jpg", "folio_preview.jpg"]
+
+
+@pytest.mark.unit
+def test_relocate_keeps_an_uploads_original_filename_on_a_uuid_rename(dirs):
+    from app.core.storage_ops import relocate_image
+
+    src_dir, dst_dir = dirs
+    dst_dir.mkdir(parents=True)
+    stored = src_dir / "3f2a9c.jpg"
+    stored.write_bytes(b"upload")
+    (dst_dir / "3f2a9c.jpg").write_bytes(b"occupant")
+    img = _row(stored)
+    img.filename = "carta de 1810.jpg"
+
+    assert relocate_image(img, dst_dir) is True
+    assert Path(img.file_path).name != "3f2a9c.jpg"
+    assert img.filename == "carta de 1810.jpg"
+
+
+# Endpoints -----------------------------------------------------------------
+
+def _as_operator(client):
+    from app.main import app
+    from app.api.auth import get_current_user
+    from app.models.user import User
+
+    app.dependency_overrides[get_current_user] = lambda: User(
+        username="op", email="op@example.com", hashed_password="x", role="operator", is_active=True)
+    return client
+
+
+@pytest.fixture
+def capture_settings(override_projects_root, monkeypatch):
+    """Point capture.project_manager at this test's projects root.
+
+    It binds `settings` at import, so the reload `override_projects_root`
+    does is not seen there; without this the endpoints' target directories
+    land under whichever test imported it first.
+    """
+    import capture.project_manager as pm
+    from app.core import config
+
+    monkeypatch.setattr(pm, "settings", config.settings)
+
+
+def _two_collections_with_a_raw_capture(db_session):
+    from capture.project_manager import image_output_dir
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+
+    project = Project(name="proj")
+    db_session.add(project)
+    db_session.commit()
+    a = Collection(name="A", project_id=project.id)
+    b = Collection(name="B", project_id=project.id)
+    db_session.add_all([a, b])
+    db_session.commit()
+    src_dir = image_output_dir("proj", "A")
+    src_dir.mkdir(parents=True)
+    master = src_dir / "IMG_0020.CR2"
+    master.write_bytes(b"raw")
+    sidecar = src_dir / "IMG_0020_preview.jpg"
+    sidecar.write_bytes(b"preview")
+    rec = Record(title="r", collection_id=a.id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=rec.id, filename=master.name, file_path=str(master), format="cr2"))
+    db_session.commit()
+    return a, b, sidecar
+
+
+@pytest.mark.unit
+def test_move_records_lists_a_sidecar_left_behind(client, db_session, monkeypatch, capture_settings):
+    import shutil
+
+    a, b, sidecar = _two_collections_with_a_raw_capture(db_session)
+    real_move = shutil.move
+
+    def move(src, dst, *args, **kw):
+        if src.endswith("_preview.jpg"):
+            raise PermissionError(13, "Permission denied", src)
+        return real_move(src, dst, *args, **kw)
+
+    monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
+    resp = _as_operator(client).post(f"/collections/{a.id}/move-records?target_collection_id={b.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"moved": 1, "target_collection_id": b.id, "not_moved": [sidecar.name]}
+    assert sidecar.exists()
+
+
+@pytest.mark.unit
+def test_move_records_has_no_not_moved_key_when_everything_moved(client, db_session, capture_settings):
+    from capture.project_manager import image_output_dir
+
+    a, b, sidecar = _two_collections_with_a_raw_capture(db_session)
+    resp = _as_operator(client).post(f"/collections/{a.id}/move-records?target_collection_id={b.id}")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"moved": 1, "target_collection_id": b.id}
+    assert (image_output_dir("proj", "B") / sidecar.name).exists()
+
+
+@pytest.mark.unit
+def test_rename_collection_lists_a_sidecar_left_behind(client, db_session, monkeypatch, capture_settings):
+    import shutil
+
+    a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
+    real_move = shutil.move
+
+    def move(src, dst, *args, **kw):
+        if src.endswith("_preview.jpg"):
+            raise PermissionError(13, "Permission denied", src)
+        return real_move(src, dst, *args, **kw)
+
+    monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
+    resp = _as_operator(client).patch(f"/collections/{a.id}", json={"name": "A2"})
+
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["name"] == "A2"
+    assert body["not_moved"] == [sidecar.name]
+
+
+@pytest.mark.unit
+def test_renumber_whose_commit_fails_puts_the_files_back(client, db_session, monkeypatch, capture_settings):
+    from sqlalchemy.exc import OperationalError
+    from capture.project_manager import image_output_dir
+    from app.models.record import RecordImage
+
+    a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
+    image_dir = image_output_dir("proj", "A")
+    before = {p.name: _digest(p) for p in image_dir.iterdir()}
+
+    def failing_commit():
+        raise OperationalError("COMMIT", {}, Exception("disk I/O error"))
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    resp = _as_operator(client).post(f"/collections/{a.id}/images/renumber")
+
+    assert resp.status_code == 500, resp.text
+    assert "back under their old names" in resp.json()["detail"]
+    assert {p.name: _digest(p) for p in image_dir.iterdir()} == before
+    db_session.rollback()
+    assert db_session.query(RecordImage).one().filename == "IMG_0020.CR2"

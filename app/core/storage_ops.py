@@ -6,6 +6,7 @@ records are re-parented (move) or their container is removed (delete), and
 provide the guard that stops a delete from erasing files still referenced by surviving records.
 """
 
+import glob
 import json
 import logging
 import os
@@ -127,17 +128,43 @@ def _raw_sidecar_to_carry(master: Path) -> Optional[Path]:
     return sidecar
 
 
-def relocate_image(img: RecordImage, target_dir: Path) -> bool:
+def _name_taken(dst: Path, src: Path, sibling_masters: set) -> bool:
+    """True if moving `src` to `dst` would clash with something already in dst's directory.
+
+    A clash is a file at `dst`; a `<stem>_preview.jpg` there when `src` is RAW,
+    which the moved master would then claim as its own preview; or a master of
+    the same stem with another suffix, which names the same sidecar, so that a
+    later delete or move of either would take the other's preview. A same-stem
+    file that is one of `sibling_masters` (the resolved current paths of the
+    record's other images, such as the CR2 of a jpg + CR2 pair moved first)
+    is the pair itself and is no clash.
+    """
+    if dst.exists():
+        return True
+    if is_raw_suffix(src) and preview_sidecar_of(dst).exists():
+        return True
+    for other in dst.parent.glob(glob.escape(dst.stem) + ".*"):
+        if other.stem == dst.stem and other != dst and other.resolve() not in sibling_masters:
+            return True
+    return False
+
+
+def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[str]] = None) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
     A RAW master's `_preview.jpg` sidecar moves with it and is named from the
     master's final name, so it keeps sitting beside the master under the name
     the preview endpoint and later deletes derive (NEH-267). The master is moved
-    first; if the sidecar then cannot be moved, the failure is logged at WARNING
-    and the sidecar stays in the old directory, because the master and the row
-    already agree on the new path. Raising there would make the caller roll
-    back, and the row would point at the old path while the master sat at the
-    new one.
+    first; if the sidecar then cannot be moved, the failure is logged at WARNING,
+    the sidecar's file name is appended to `not_moved` when the caller passes a
+    list, and the sidecar stays in the old directory. Raising there would make
+    the caller roll back, and the row would point at the old path while the
+    master sat at the new one.
+
+    When the master's name clashes in the target (see `_name_taken`), it is
+    moved as `{stem}_{uuid8}{suffix}` instead; `img.filename` follows when it
+    held the stored file's name, and is left alone when it holds an upload's
+    original name.
 
     The thumbnail is dropped (set to None) so it is regenerated on demand from
     the new location. Returns True if a file was physically moved.
@@ -150,13 +177,22 @@ def relocate_image(img: RecordImage, target_dir: Path) -> bool:
     dst = target_dir / src.name
     if src.resolve() == dst.resolve():
         return False  # already in place
+    sibling_masters: set = set()
+    if img.record is not None:
+        for other in img.record.images:
+            if other is img:
+                continue
+            resolved = resolve_within_storage(other.file_path)
+            if resolved is not None:
+                sibling_masters.add(resolved)
     sidecar = _raw_sidecar_to_carry(src)
-    if dst.exists() or (sidecar is not None and preview_sidecar_of(dst).exists()):
-        # Avoid clobbering an unrelated file with the same name, master or sidecar
+    if _name_taken(dst, src, sibling_masters):
         dst = target_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
 
     shutil.move(str(src), str(dst))
     img.file_path = str(dst)
+    if img.filename == src.name:
+        img.filename = dst.name
 
     if sidecar is not None:
         sidecar_dst = preview_sidecar_of(dst)
@@ -164,6 +200,8 @@ def relocate_image(img: RecordImage, target_dir: Path) -> bool:
             shutil.move(str(sidecar), str(sidecar_dst))
         except OSError as e:
             logger.warning(f"Moved {src} to {dst} but its preview sidecar could not follow, left at {sidecar}: {e}")
+            if not_moved is not None:
+                not_moved.append(sidecar.name)
 
     old_thumb = resolve_within_storage(img.thumbnail_path)
     img.thumbnail_path = None
@@ -340,7 +378,47 @@ def _do_renames(moves: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
     return done
 
 
-def renumber_collection_images(db: Session, collection: Collection) -> dict:
+def restore_original_names(entries: List[Tuple[Path, Path]]) -> List[Path]:
+    """Put renamed files back under their original names; return the originals not restored.
+
+    `entries` are (original path, current path) pairs. Every file is first
+    moved to a fresh temporary name and only then to its original name, so a
+    file's original name that is another file's current name is vacated before
+    anything is moved into it. No step consults whether a planned name exists
+    to guess where a file is: each file's current path is tracked. A file is
+    never moved onto an existing file; one that cannot be restored is logged at
+    ERROR with where it was left.
+    """
+    staged: List[Tuple[Path, Path]] = []
+    failed: List[Path] = []
+    for orig, current in entries:
+        if current == orig:
+            continue
+        temp = current.parent / f".renumber_{uuid.uuid4().hex}{current.suffix}"
+        try:
+            os.replace(current, temp)
+            staged.append((orig, temp))
+        except OSError as e:
+            logger.error(f"Renumber rollback could not stage {current} for restoring to {orig}; left at {current}: {e}")
+            failed.append(orig)
+    for orig, temp in staged:
+        if orig.exists():
+            logger.error(f"Renumber rollback could not restore {orig}: the name is taken; left at {temp}")
+            failed.append(orig)
+            continue
+        try:
+            os.replace(temp, orig)
+        except OSError as e:
+            logger.error(f"Renumber rollback could not restore {orig}; left at {temp}: {e}")
+            failed.append(orig)
+    return failed
+
+
+def renumber_collection_images(
+    db: Session,
+    collection: Collection,
+    applied: Optional[List[Tuple[Path, Path]]] = None,
+) -> dict:
     """Renumber every image file in a collection (documentary unit) sequentially
     from 1, zero-padded to the total capture count (min width 4).
 
@@ -361,8 +439,14 @@ def renumber_collection_images(db: Session, collection: Collection) -> dict:
     master's final name derives (NEH-267), in the same two phases and under
     the same rollback, so a master is never renumbered away from its sidecar.
 
-    Raises ValueError if an image's file is missing on disk or the computed
-    plan would produce duplicate filenames (defensive; should not happen).
+    When the caller passes `applied`, it receives the (original path, final
+    path) pair of every file renamed, so that a caller whose commit fails can
+    hand them to `restore_original_names`.
+
+    Raises ValueError if an image's file is missing on disk, the computed
+    plan would produce duplicate filenames (defensive; should not happen), or
+    a RAW master's new sidecar name already holds a `_preview.jpg` that no
+    image in the collection owns.
     Raises OSError if a filesystem rename fails after the plan validated.
     """
     from capture.project_manager import secure_project_filename
@@ -412,10 +496,14 @@ def renumber_collection_images(db: Session, collection: Collection) -> dict:
             carried.add(sidecar)
             sidecar_moves.append((sidecar, preview_sidecar_of(final)))
     sources = {src for src, _ in file_moves} | carried
-    for _, sidecar_final in sidecar_moves:
+    for _, src, final in plan:
+        if not is_raw_suffix(src):
+            continue
+        sidecar_final = preview_sidecar_of(final)
         if sidecar_final.exists() and sidecar_final not in sources:
             # A `_preview.jpg` already there belongs to no image of this
-            # collection; os.replace would overwrite it without a trace.
+            # collection: os.replace would overwrite it without a trace, or,
+            # for a RAW master with no sidecar, the master would claim it.
             raise ValueError(f"Renumbering would overwrite {sidecar_final.name}, which no image in this collection owns")
     file_moves.extend(sidecar_moves)
 
@@ -427,23 +515,19 @@ def renumber_collection_images(db: Session, collection: Collection) -> dict:
     to_temp = [(src, src.parent / f".renumber_{uuid.uuid4().hex}{src.suffix}") for src, _ in file_moves]
     _do_renames(to_temp)
 
-    # Phase 2: move each temp file to its final sequential name.
-    to_final = [(temp, final) for (_, temp), (_, final) in zip(to_temp, file_moves)]
+    # Phase 2: move each temp file to its final sequential name. Where each
+    # file is at is tracked, so a failure partway restores every file to its
+    # ORIGINAL name, whether it sits under its temp name or its final one.
+    current = [temp for _, temp in to_temp]
     try:
-        _do_renames(to_final)
+        for i, (_, final) in enumerate(file_moves):
+            os.replace(current[i], final)
+            current[i] = final
     except OSError:
-        # Phase 2 failed partway through: restore everything to its
-        # ORIGINAL name (not just undo phase 2), whether a given file is
-        # still sitting under its temp name or already at its final name.
-        for (orig, temp), (_, final) in zip(to_temp, to_final):
-            try:
-                if final.exists():
-                    os.replace(final, orig)
-                elif temp.exists():
-                    os.replace(temp, orig)
-            except OSError:
-                logger.error(f"Renumber rollback could not restore {orig}; manual recovery needed")
+        restore_original_names([(orig, cur) for (orig, _), cur in zip(to_temp, current)])
         raise
+    if applied is not None:
+        applied.extend((orig, final) for (orig, _), (_, final) in zip(to_temp, file_moves))
 
     for idx, (img, _, final_path) in enumerate(plan, start=1):
         old_thumb = resolve_within_storage(img.thumbnail_path)
