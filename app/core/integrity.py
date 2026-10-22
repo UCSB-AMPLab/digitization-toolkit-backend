@@ -189,10 +189,16 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         manifest_paths.update(paths.keys())
     known = referenced | manifest_paths
     # A RAW master's `_preview.jpg` sidecar has no row and no manifest entry of
-    # its own, so it counts as known when its master does. A sidecar whose
-    # master is unknown is reported: that is the orphan a delete that ignored
-    # sidecars leaves (NEH-257).
-    known |= {str(preview_sidecar_of(Path(k))) for k in known if is_raw_suffix(Path(k))}
+    # its own, so it counts as known when its master is known and still on
+    # disk. The manifest is append-only and keeps the lines of deleted
+    # captures, so a known path alone does not mean the master exists; a
+    # sidecar whose master is gone is the orphan a delete that ignored
+    # sidecars leaves (NEH-257), and it is reported.
+    known |= {
+        str(preview_sidecar_of(Path(k)))
+        for k in known
+        if is_raw_suffix(Path(k)) and Path(k).is_file()
+    }
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []
