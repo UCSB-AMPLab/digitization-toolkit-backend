@@ -359,9 +359,10 @@ def capture_image(
     rotate_deg = getattr(camera_config, "rotate_deg", 0)
     if rotate_deg:
         _apply_rotation(Path(str(actual_path)), rotate_deg)
-        # Also rotate the _preview.jpg extracted from CR2 if present
-        preview = preview_sidecar_of(Path(str(actual_path)))
-        if preview.exists():
+        # Also rotate the _preview.jpg extracted from a RAW master, if present
+        master = Path(str(actual_path))
+        preview = preview_sidecar_of(master)
+        if is_raw_suffix(master) and preview.exists():
             _apply_rotation(preview, rotate_deg)
 
     return actual_path, metadata
@@ -506,7 +507,7 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
             for p in paths:
                 _apply_rotation(p, rotate_deg)
                 preview = preview_sidecar_of(p)
-                if preview.exists():
+                if is_raw_suffix(p) and preview.exists():
                     _apply_rotation(preview, rotate_deg)
 
         # Pick the bytes to return.
