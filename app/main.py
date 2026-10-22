@@ -14,6 +14,7 @@ from app.api.projects import router as projects_router
 from app.api.collections import router as collections_router
 from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
+from app.api.activity import router as activity_router
 
 # Define lifespan event to initialize the database
 @asynccontextmanager
@@ -56,8 +57,12 @@ async def lifespan(app: FastAPI):
 # Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
-# Allow Svelte frontend API access. Production is same-origin via nginx;
-# CORS applies only to the dev server. Origins use a deployment allowlist.
+# Allow Svelte frontend API access. Origins use a deployment allowlist. On an
+# appliance the kiosk opens the frontend container at http://localhost:3000
+# while the API is reached through nginx at http://<host>/api, so the kiosk is
+# cross-origin too, not only the dev server. A response header the frontend
+# reads must be listed in expose_headers: Retry-After is, so the login page
+# can say how long a lockout lasts.
 # Methods and headers are restricted to those required by the app.
 app.add_middleware(
     CORSMiddleware,
@@ -65,7 +70,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token"],
-    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes"],
+    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "Retry-After"],
 )
 
 app.include_router(records_router, prefix="/records", tags=["records"])
@@ -75,6 +80,7 @@ app.include_router(collections_router, prefix="/collections", tags=["collections
 app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(system_router, prefix="/system", tags=["system"])
+app.include_router(activity_router, prefix="/activity", tags=["activity"])
 
 
 @app.get("/health")
