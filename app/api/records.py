@@ -24,6 +24,7 @@ from app.schemas.record import (
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.paths import resolve_within_storage
+from app.core.record_status import change_record_status
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 
@@ -555,7 +556,7 @@ def delete_image(
 		.count()
 	)
 	if rec and rec.status == "approved" and remaining_current == 0:
-		rec.status = "in_review"
+		change_record_status(db, rec, "in_review", current_user.username)
 		db.add(rec)
 
 	db.commit()
@@ -831,9 +832,10 @@ def _assert_promotable(rec: Record) -> None:
 
 
 def _apply_status_change(
+	db: Session,
 	rec: Record,
 	new_status: str,
-	user_role: str,
+	user: User,
 ) -> None:
 	"""
 	Validate and apply a status transition on a Record.
@@ -863,16 +865,16 @@ def _apply_status_change(
 			status_code=422,
 			detail=f"Transition '{current_status}' -> '{new_status}' is not allowed."
 		)
-	if user_role not in allowed_roles:
+	if user.role not in allowed_roles:
 		raise HTTPException(
 			status_code=403,
-			detail=f"Your role '{user_role}' cannot perform the '{current_status}' -> '{new_status}' transition."
+			detail=f"Your role '{user.role}' cannot perform the '{current_status}' -> '{new_status}' transition."
 		)
 	# Role first, then state: the wrong role learns nothing about the record.
 	if current_status == "captured":
 		_assert_promotable(rec)
 
-	rec.status = new_status
+	change_record_status(db, rec, new_status, user.username)
 
 
 @router.patch("/{rec_id}/status", response_model=RecordRead)
@@ -903,13 +905,14 @@ def update_record_status(
 	A retake only happens via the capture endpoints in app/api/cameras.py: it
 	supersedes the current images, leaves a captured record captured, and
 	moves a rejected one to in_review. The undo transitions above are plain
-	status resets with no new image, no reason, and no audit entry.
+	status resets with no new image, no reason and no rejection record; the
+	change itself is dated in record_status_changes, like every other.
 	"""
 	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
-	_apply_status_change(rec, payload.status, current_user.role)
+	_apply_status_change(db, rec, payload.status, current_user)
 
 	db.commit()
 	db.refresh(rec)
@@ -947,7 +950,7 @@ def bulk_update_status(
 
 	for rec in records:
 		try:
-			_apply_status_change(rec, payload.status, current_user.role)
+			_apply_status_change(db, rec, payload.status, current_user)
 		except HTTPException:
 			skipped.append(rec.id)
 			continue
@@ -1008,7 +1011,7 @@ def reject_record(
 	for img in current_images:
 		img.rejection_id = rejection.id
 
-	rec.status = "rejected"
+	change_record_status(db, rec, "rejected", current_user.username)
 
 	db.commit()
 	db.refresh(rec)
