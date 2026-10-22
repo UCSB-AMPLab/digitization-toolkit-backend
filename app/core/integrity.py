@@ -19,13 +19,14 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
 
 # Original capture/upload formats. Thumbnails are derived artifacts and are excluded from the orphan scan by path (see _iter_image_files)
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".cr2", ".dng", ".raw"}
+# RAW members come from RAW_SUFFIXES, the set the preview endpoint and the sidecar rule use.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"} | RAW_SUFFIXES
 _SHA_CHUNK = 1024 * 1024
 
 

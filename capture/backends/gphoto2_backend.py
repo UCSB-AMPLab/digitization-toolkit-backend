@@ -524,9 +524,13 @@ class _PTPSession:
 
         # Extract embedded JPEG from CR2 for thumbnail/review pipeline
         if is_raw:
+            # Function-local, as for the app config below: a module-level app
+            # import from this module would be circular through capture.service.
+            from app.core.paths import preview_sidecar_of
+
             _write_raw_preview(
                 actual_outpath,
-                actual_outpath.with_name(actual_outpath.stem + "_preview.jpg"),
+                preview_sidecar_of(actual_outpath),
                 self._logger,
             )
 

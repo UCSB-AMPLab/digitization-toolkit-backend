@@ -208,6 +208,7 @@ def test_preview_is_404_for_a_tiff_master(client, db_session, capture_dir):
     resp = _client_as(client, "rev", "reviewer").get(f"/records/images/{img.id}/preview")
 
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "No browser-displayable preview for .tif images"}
 
 
 @pytest.mark.unit
@@ -226,6 +227,7 @@ def test_preview_refuses_a_master_outside_storage(client, db_session, tmp_path):
 
     assert resp.status_code == 404
     assert resp.content != SIDECAR_BYTES
+    assert resp.json() == {"detail": "File not found on disk"}
 
 
 @pytest.mark.unit
@@ -244,6 +246,7 @@ def test_preview_refuses_a_sidecar_symlinked_outside_storage(client, db_session,
 
     assert resp.status_code == 404
     assert b"not-for-serving" not in resp.content
+    assert resp.json() == {"detail": "No JPEG preview exists for this RAW image"}
 
 
 @pytest.mark.unit
@@ -251,6 +254,7 @@ def test_preview_is_404_for_an_unknown_image(client, db_session):
     resp = _client_as(client, "rev", "reviewer").get("/records/images/999999/preview")
 
     assert resp.status_code == 404
+    assert resp.json() == {"detail": "Image not found"}
 
 
 # ---------------------------------------------------------------------------

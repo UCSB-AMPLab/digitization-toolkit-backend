@@ -350,3 +350,19 @@ def test_integrity_does_not_report_a_known_raw_masters_sidecar_as_orphan(db_sess
     assert str(lost_sidecar.resolve()) in orphans
     assert str(jpeg_preview.resolve()) in orphans
     assert report["summary"]["orphan_files"] == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("suffix", [".NEF", ".arw", ".raf"])
+def test_integrity_scans_every_raw_suffix_for_orphans(db_session, override_projects_root, suffix):
+    """The orphan scan's RAW members are RAW_SUFFIXES, so a stray .NEF is reported like a stray .CR2."""
+    from app.core.integrity import run_integrity_check
+
+    image_dir = override_projects_root / "proj" / "images"
+    image_dir.mkdir(parents=True)
+    stray = image_dir / f"IMG_0001{suffix}"
+    stray.write_bytes(b"raw with no row")
+
+    report = run_integrity_check(db_session, verify_hashes=False)
+
+    assert report["orphan_files"] == [str(stray.resolve())]
