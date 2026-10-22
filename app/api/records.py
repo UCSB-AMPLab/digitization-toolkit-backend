@@ -71,17 +71,26 @@ def _preview_sidecar_of(master: Path) -> Path:
 	return master.with_name(master.stem + "_preview.jpg")
 
 
-def _unlink_image_file_and_sidecar(raw_path: Optional[str], sibling_paths: Iterable[Optional[str]] = ()) -> None:
-	"""Unlink a stored image file together with the `_preview.jpg` beside it (NEH-257).
+def _image_files_to_unlink(
+	raw_path: Optional[str],
+	raw_thumbnail_path: Optional[str],
+	sibling_paths: Iterable[Optional[str]] = (),
+) -> List[Path]:
+	"""The files on the card an image row's delete removes: master, `_preview.jpg` sidecar, thumbnail.
+
+	Nothing is unlinked here. The delete handlers call this while they hold the
+	record's row lock, commit the row deletion, and only then pass the list to
+	`_unlink_after_commit` (NEH-262). Unlinking first meant a commit that failed
+	left rows pointing at masters that were already gone.
 
 	A RAW capture occupies two files on the card: the master the row points at,
 	and a JPEG preview the RAW backend writes next to it as `<stem>_preview.jpg`,
-	which is what the review UI and the thumbnail generator can read. Unlinking
+	which is what the review UI and the thumbnail generator can read. Removing
 	only the master leaves the preview with nothing referencing it, about 2.3 MB
 	per capture; on the Rionegro unit 2,403 such previews hold 5.5 GB of a 115 GB
-	card that reached 100% on 2026-10-14 and stopped capture. They also make the
-	card unreadable as evidence: a preview with no master and no row looks, on
-	the filesystem, exactly like a master that was lost.
+	card that reached 100% on 2026-10-14 and stopped capture (NEH-257). They also
+	make the card unreadable as evidence: a preview with no master and no row
+	looks, on the filesystem, exactly like a master that was lost.
 
 	The sidecar's name is derived from the *resolved* path, so it stays inside
 	the storage roots `resolve_within_storage` confines the master to; a row
@@ -94,26 +103,53 @@ def _unlink_image_file_and_sidecar(raw_path: Optional[str], sibling_paths: Itera
 	only in extension — `folio.jpg` and `folio.CR2`, which a multi-format
 	capture writes — name the same sidecar, and deleting either would take the
 	preview the other still needs. `sibling_paths` carries the stored paths of
-	the rows that will survive this delete; the sidecar is kept if any of them
-	resolves to a master naming it. The master itself is unlinked either way,
-	since the row pointing at it is going.
+	the rows that will survive this delete; the sidecar is left out of the list
+	if any of them resolves to a master naming it. The master is in the list
+	either way, since the row pointing at it is going.
 
-	`capture/service.py` applies the same rule when it rolls back a capture that
-	never reached the manifest, but its helper is private to the capture package,
-	documents itself as safe only for manifest-less files — the opposite of what
-	these handlers delete — and swallows the OSError they surface as a 500. So
-	the line of path arithmetic lives here instead of being imported from it.
+	The thumbnail is included only when its stored path resolves inside the
+	storage roots, the same confinement the master gets.
+
+	`capture/service.py` applies the same sidecar rule when it rolls back a
+	capture that never reached the manifest, but its helper is private to the
+	capture package and documents itself as safe only for manifest-less files —
+	the opposite of what these handlers delete. So the line of path arithmetic
+	lives here instead of being imported from it.
 	"""
-	path = resolve_within_storage(raw_path)
-	if path is None:
-		return
-	sidecar = _preview_sidecar_of(path)
-	path.unlink(missing_ok=True)
-	for raw_sibling in sibling_paths:
-		sibling = resolve_within_storage(raw_sibling)
-		if sibling is not None and _preview_sidecar_of(sibling) == sidecar:
-			return
-	sidecar.unlink(missing_ok=True)
+	paths: List[Path] = []
+	master = resolve_within_storage(raw_path)
+	if master is not None:
+		paths.append(master)
+		sidecar = _preview_sidecar_of(master)
+		shared = False
+		for raw_sibling in sibling_paths:
+			sibling = resolve_within_storage(raw_sibling)
+			if sibling is not None and _preview_sidecar_of(sibling) == sidecar:
+				shared = True
+				break
+		if not shared:
+			paths.append(sidecar)
+	thumbnail = resolve_within_storage(raw_thumbnail_path)
+	if thumbnail is not None:
+		paths.append(thumbnail)
+	return paths
+
+
+def _unlink_after_commit(paths: Iterable[Path]) -> None:
+	"""Unlink files whose rows a committed transaction has already removed (NEH-262).
+
+	Called only after the commit succeeds. A file that cannot be unlinked is
+	logged at WARNING with its path and the next one is tried; the request still
+	succeeds, because the rows are gone and cannot be brought back from here.
+	That leaves a file on the card with no row, which can be found and removed
+	later. The opposite order left a row pointing at a master that no longer
+	existed, which cannot be repaired. A file already missing is not an error.
+	"""
+	for path in paths:
+		try:
+			path.unlink(missing_ok=True)
+		except OSError as e:
+			logger.warning(f"Row deleted but file could not be unlinked, left on disk: {path}: {e}")
 
 
 def _supersede_current_images(record: Record) -> None:
@@ -305,18 +341,19 @@ def delete_record(
 	# Count images before delete/commit; rec.images is unusable once the row is expired
 	image_count = len(rec.images)
 
-	# Clean up image files, their preview sidecars and thumbnails; only unlink
-	# paths inside storage. No sibling check here, unlike the single-image
-	# delete: every image of the record is going, so no surviving row can still
-	# need a sidecar two of these masters share.
+	# Collect the image files, their preview sidecars and thumbnails while the
+	# row lock is held; only paths inside storage are collected. They are
+	# unlinked after the commit, so a failed commit leaves every file in place
+	# (NEH-262). No sibling check here, unlike the single-image delete: every
+	# image of the record is going, so no surviving row can still need a
+	# sidecar two of these masters share.
+	files_to_unlink: List[Path] = []
 	for img in rec.images:
-		_unlink_image_file_and_sidecar(img.file_path)
-		thumbnail_path = resolve_within_storage(img.thumbnail_path)
-		if thumbnail_path:
-			delete_thumbnail(str(thumbnail_path))
+		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
 
 	db.delete(rec)
 	db.commit()
+	_unlink_after_commit(files_to_unlink)
 	return {"detail": f"Record {rec_id} and {image_count} images deleted"}
 
 
@@ -512,6 +549,8 @@ def delete_image(
 	# the file of an approved record was removed on the strength of a status
 	# that had already changed. The lock also stops this delete emptying a
 	# record that another request is promoting (see _apply_status_change).
+	# The files are chosen under this lock and unlinked only once the commit
+	# that removes the row has succeeded (NEH-262).
 	rec = _locked_record(db, img.record_id, with_images=False)
 	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
 		raise HTTPException(
@@ -519,8 +558,8 @@ def delete_image(
 			detail=f"Cannot delete an image from a record with status '{rec.status}'. Move it to 'rejected' first."
 		)
 
-	# Clean up the file, its preview sidecar and the thumbnail; only unlink paths
-	# inside storage. The record's other images survive this delete, and one of
+	# Collect the file, its preview sidecar and the thumbnail; only paths inside
+	# storage are collected. The record's other images survive this delete, and one of
 	# them may be a master of the same frame in another format, sharing this
 	# master's stem and therefore its `_preview.jpg` — so they are passed in and
 	# the sidecar is kept if any of them still names it. Superseded images count:
@@ -532,11 +571,8 @@ def delete_image(
 			RecordImage.id != img.id,
 		)
 	]
-	_unlink_image_file_and_sidecar(img.file_path, siblings)
-	thumbnail_path = resolve_within_storage(img.thumbnail_path)
-	if thumbnail_path:
-		delete_thumbnail(str(thumbnail_path))
-	
+	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
+
 	record_id = img.record_id
 	db.delete(img)
 
@@ -560,6 +596,7 @@ def delete_image(
 		db.add(rec)
 
 	db.commit()
+	_unlink_after_commit(files_to_unlink)
 	return {"detail": "Image deleted"}
 
 
