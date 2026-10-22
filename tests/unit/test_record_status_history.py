@@ -300,16 +300,39 @@ def test_a_moved_record_takes_its_history_with_it(client, db_session):
 
 
 @pytest.mark.unit
-def test_deleting_a_record_deletes_its_history(client, db_session):
-    """Decided: history goes with its record, as rejections do."""
+def test_deleting_a_record_keeps_its_history(client, db_session):
+    """The rows stay, so the day's count keeps the work; record_id goes NULL."""
     from app.models.record import RecordStatusChange
     rec, _ = _record(db_session, status="in_review")
     api = _client_as(client, "adm", "admin")
     assert api.patch(f"/records/{rec.id}/status", json={"status": "approved"}).status_code == 200
+    assert api.patch(f"/records/{rec.id}/status", json={"status": "in_review"}).status_code == 200
     rec_id = rec.id
+    db_session.expire_all()
 
     resp = api.delete(f"/records/{rec_id}")
     assert resp.status_code in (200, 204), resp.text
 
     db_session.expire_all()
-    assert db_session.query(RecordStatusChange).filter_by(record_id=rec_id).count() == 0
+    rows = db_session.query(RecordStatusChange).order_by(RecordStatusChange.id).all()
+    assert [(r.record_id, r.from_status, r.to_status, r.changed_by) for r in rows] == [
+        (None, "in_review", "approved", "adm"),
+        (None, "approved", "in_review", "adm"),
+    ]
+
+
+@pytest.mark.unit
+def test_a_deleted_records_history_stays_listed_under_its_collection(client, db_session):
+    col = _collection(db_session)
+    other = _collection(db_session, name="Tomo 2")
+    rec, _ = _record(db_session, status="in_review", col=col, name="gone.jpg")
+    api = _client_as(client, "adm", "admin")
+    assert api.patch(f"/records/{rec.id}/status", json={"status": "approved"}).status_code == 200
+    db_session.expire_all()
+    assert api.delete(f"/records/{rec.id}").status_code in (200, 204)
+
+    rows = api.get(f"/collections/{col.id}/status-changes").json()
+    assert [(r["record_id"], r["collection_id"], r["to_status"]) for r in rows] == [
+        (None, col.id, "approved"),
+    ]
+    assert api.get(f"/collections/{other.id}/status-changes").json() == []

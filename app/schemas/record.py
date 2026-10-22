@@ -289,7 +289,9 @@ class RecordRejectionRead(BaseModel):
 
 class RecordStatusChangeRead(BaseModel):
 	id: int
-	record_id: int
+	# None once the record has been deleted; its history is kept.
+	record_id: Optional[int] = None
+	collection_id: Optional[int] = None
 	from_status: RecordStatus
 	to_status: RecordStatus
 	changed_by: Optional[str] = None

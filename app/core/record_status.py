@@ -27,6 +27,7 @@ def change_record_status(db: Session, rec: Record, new_status: str, actor: str |
 		return
 	db.add(RecordStatusChange(
 		record_id=rec.id,
+		collection_id=rec.collection_id,
 		from_status=rec.status,
 		to_status=new_status,
 		changed_by=actor,
@@ -37,6 +38,7 @@ def change_record_status(db: Session, rec: Record, new_status: str, actor: str |
 def record_bulk_status_changes(
 	db: Session,
 	record_ids: Iterable[int],
+	collection_id: int | None,
 	from_status: str,
 	to_status: str,
 	actor: str | None,
@@ -50,6 +52,7 @@ def record_bulk_status_changes(
 	db.add_all(
 		RecordStatusChange(
 			record_id=record_id,
+			collection_id=collection_id,
 			from_status=from_status,
 			to_status=to_status,
 			changed_by=actor,
