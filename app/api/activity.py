@@ -91,13 +91,14 @@ def collection_activity(
         (RecordStatusChange.record_id.is_(None), RecordStatusChange.collection_id),
         else_=Record.collection_id,
     )
-    last_change: dict[int, datetime] = dict(
-        db.query(owner, func.max(RecordStatusChange.changed_at))
+    last_change: dict[int, datetime] = {
+        cid: _as_naive_utc(t)
+        for cid, t in db.query(owner, func.max(RecordStatusChange.changed_at))
         .outerjoin(Record, RecordStatusChange.record_id == Record.id)
         .filter(owner.in_(ids))
         .group_by(owner)
         .all()
-    )
+    }
 
     results = []
     for cid in ids:

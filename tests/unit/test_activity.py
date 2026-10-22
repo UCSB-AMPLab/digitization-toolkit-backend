@@ -177,6 +177,16 @@ def test_daily_leaves_out_what_falls_outside_the_window(client, db_session, cloc
 
 
 @pytest.mark.unit
+def test_daily_counts_an_image_at_exactly_the_first_local_midnight(client, db_session, clock):
+    rec, _ = _record(db_session)
+    _image(db_session, rec, datetime(2026, 10, 21, 5, 0), "edge.jpg")  # 00:00 at offset 300
+    rows = _client_as(client, "op", "operator").get(
+        "/activity/daily", params={"days": 2, "tz_offset_minutes": 300}).json()
+    assert rows[0]["date"] == "2026-10-21"
+    assert rows[0]["captured_images"] == 1
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("params", [
     {"days": 0}, {"days": 401}, {"tz_offset_minutes": 841}, {"tz_offset_minutes": -841},
 ])
