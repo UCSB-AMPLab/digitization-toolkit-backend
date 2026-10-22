@@ -18,6 +18,7 @@ from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraS
 from app.core.thumbnail import generate_thumbnail
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
+from app.core.record_status import change_record_status
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -779,8 +780,12 @@ def trigger_capture(
 		# the record it was meant to leave with her.
 		recapture_promotes = False
 		if request.record_id:
-			# Link to existing record
-			record = db.query(Record).filter(Record.id == request.record_id).first()
+			# Link to existing record. Locked, as every path that moves a
+			# record's status or changes which of its images are current is:
+			# the status read here is what the retake writes over and what its
+			# history row names as the old status.
+			from app.api.records import _locked_record
+			record = _locked_record(db, request.record_id)
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 			if record.status in ("captured", "rejected"):
@@ -878,7 +883,7 @@ def trigger_capture(
 			db.add(ex)
 
 		if is_recapture and recapture_promotes:
-			record.status = "in_review"
+			change_record_status(db, record, "in_review", current_user.username)
 
 		db.commit()
 		db.refresh(record)
@@ -977,8 +982,12 @@ def trigger_dual_capture(
 		# the record it was meant to leave with her.
 		recapture_promotes = False
 		if request.record_id:
-			# Link to existing record
-			record = db.query(Record).filter(Record.id == request.record_id).first()
+			# Link to existing record. Locked, as every path that moves a
+			# record's status or changes which of its images are current is:
+			# the status read here is what the retake writes over and what its
+			# history row names as the old status.
+			from app.api.records import _locked_record
+			record = _locked_record(db, request.record_id)
 			if not record:
 				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 			if record.status in ("captured", "rejected"):
@@ -1099,7 +1108,7 @@ def trigger_dual_capture(
 		img1 = create_image_record(str(path1), 1, role1)
 
 		if is_recapture and recapture_promotes:
-			record.status = "in_review"
+			change_record_status(db, record, "in_review", current_user.username)
 
 		db.commit()
 		db.refresh(record)

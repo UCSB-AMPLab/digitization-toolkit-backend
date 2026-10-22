@@ -3,22 +3,23 @@ from fastapi.responses import FileResponse
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload, selectinload
-from sqlalchemy import select, func
+from sqlalchemy import select, func, update
 import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.collection import Collection
 from app.models.project import Project
-from app.models.record import Record, RecordImage
+from app.models.record import Record, RecordImage, RecordStatusChange
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
-from app.schemas.record import ReorderRecords
+from app.schemas.record import RecordStatusChangeRead, ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
 # (NEH-260). cameras.py imports _supersede_current_images the same way.
 from app.api.records import _apply_status_change, _assert_promotable, is_movable
 from app.core.audit import log_event
+from app.core.record_status import record_bulk_status_changes
 from app.core.config import settings
 from app.core.export_jobs import export_jobs
 from app.core.export_service import run_export, workflow_blockers
@@ -554,7 +555,7 @@ def promote_collection(
         )
 
     for rec in records:
-        _apply_status_change(rec, "in_review", current_user.role)
+        _apply_status_change(db, rec, "in_review", current_user)
     db.commit()
 
     log_event(db, level="INFO", category="activity", action="collection_promoted",
@@ -611,11 +612,17 @@ def take_back_collection(
     ]
     taken_back = 0
     if locked_ids:
-        taken_back = (
-            db.query(Record)
-            .filter(Record.id.in_(locked_ids), Record.status == "in_review")
-            .update({Record.status: "captured"}, synchronize_session=False)
-        )
+        # RETURNING names the rows the predicate actually matched, so the
+        # history rows below are written for those and no others.
+        moved_ids = db.execute(
+            update(Record)
+            .where(Record.id.in_(locked_ids), Record.status == "in_review")
+            .values(status="captured")
+            .returning(Record.id)
+            .execution_options(synchronize_session=False)
+        ).scalars().all()
+        record_bulk_status_changes(db, moved_ids, "in_review", "captured", current_user.username)
+        taken_back = len(moved_ids)
     db.commit()
     if not taken_back:
         return {"collection_id": collection_id, "taken_back": 0}
@@ -624,6 +631,34 @@ def take_back_collection(
               actor=current_user.username, subject=collection.name,
               detail=f"{taken_back} records")
     return {"collection_id": collection_id, "taken_back": taken_back}
+
+
+@router.get("/{collection_id}/status-changes", response_model=List[RecordStatusChangeRead])
+def list_collection_status_changes(
+    collection_id: int,
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    The status history of the records in a collection, newest first.
+
+    One row per change, so an approval that was undone shows as two rows.
+    Records that existed before the history table was added have no rows for
+    their earlier changes. A record moved to another collection takes its
+    history with it: rows are looked up through the record's current
+    collection.
+    """
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    return (
+        db.query(RecordStatusChange)
+        .join(Record, RecordStatusChange.record_id == Record.id)
+        .filter(Record.collection_id == collection_id)
+        .order_by(RecordStatusChange.changed_at.desc(), RecordStatusChange.id.desc())
+        .all()
+    )
 
 
 # ==============================================================================

@@ -97,6 +97,17 @@ def test_every_workflow_path_loads_the_record_through_the_locked_loader():
             f"{name} does not take the record row lock"
         )
 
+    from app.api import cameras as cameras_api
+
+    for name in ("trigger_capture", "trigger_dual_capture"):
+        src = inspect.getsource(getattr(cameras_api, name))
+        assert "db.query(Record).filter(Record.id == request.record_id)" not in src, (
+            f"{name} loads the record it retakes without the row lock"
+        )
+        assert "_locked_record(db, request.record_id)" in src, (
+            f"{name} does not take the record row lock"
+        )
+
 
 @pytest.mark.unit
 def test_promote_and_bulk_take_their_rows_in_id_order():
@@ -120,7 +131,10 @@ def test_take_back_is_a_single_statement():
     from app.api.collections import take_back_collection
 
     src = inspect.getsource(take_back_collection)
-    assert ".update({Record.status: \"captured\"}" in src, src
+    assert '.values(status="captured")' in src, src
+    assert 'Record.status == "in_review")' in src.split(".values(")[0].rsplit("update(Record)", 1)[1], (
+        "the in_review predicate must sit on the UPDATE itself"
+    )
     assert 'rec.status = "captured"' not in src, (
         "take-back assigns per object again; the predicate and the write must "
         "be one statement"

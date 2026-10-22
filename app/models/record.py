@@ -90,6 +90,7 @@ class Record(Base):
 	collection = relationship("Collection", back_populates="records")
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
+	status_changes = relationship("RecordStatusChange", back_populates="record", cascade="all, delete-orphan", order_by="RecordStatusChange.id.desc()")
 
 	@validates("external_id", include_removes=True)
 	def _external_id_is_write_once(self, key, value, is_remove):
@@ -263,6 +264,51 @@ class RecordRejection(Base):
 		CheckConstraint(
 			"predefined_reason IN ('blur','glare','shadow','focus','exposure','dirt')",
 			name='check_record_rejection_reason'
+		),
+	)
+
+
+class RecordStatusChange(Base):
+	"""
+	One row per change of a Record's QA status: from what, to what, by whom
+	and when.
+
+	records.status holds only where a record is now, and modified_at moves
+	with any edit, so before this table nothing said when a record was
+	approved. A row is written by
+	app.core.record_status.change_record_status, which every writer of
+	records.status goes through; take-back writes its rows in bulk beside its
+	single UPDATE. Rows are never edited: undoing an approval is a second
+	row, not a correction of the first.
+
+	A record's history is deleted with the record, as its rejections are, so
+	a day's review count drops a record that was later deleted.
+
+	Records that existed before this table have no rows for their earlier
+	changes. Nothing is backfilled, because the only candidate, modified_at,
+	dates the last edit rather than the change.
+	"""
+	__tablename__ = "record_status_changes"
+
+	id = Column(Integer, primary_key=True, index=True)
+	record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False, index=True)
+
+	from_status = Column(String(20), nullable=False)
+	to_status = Column(String(20), nullable=False)
+
+	changed_by = Column(String(255), nullable=True)
+	changed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+
+	record = relationship("Record", back_populates="status_changes")
+
+	__table_args__ = (
+		CheckConstraint(
+			"from_status IN ('captured','in_review','rejected','approved')",
+			name='check_record_status_change_from'
+		),
+		CheckConstraint(
+			"to_status IN ('captured','in_review','rejected','approved')",
+			name='check_record_status_change_to'
 		),
 	)
 

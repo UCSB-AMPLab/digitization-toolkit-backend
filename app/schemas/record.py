@@ -19,7 +19,8 @@ from datetime import date as dt_date
 #
 # A reviewer can undo a mistaken approve or reject back to "in_review" (see
 # STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
-# formal rejection, so it carries no reason and no audit entry.
+# formal rejection, so it carries no reason and no rejection record. The
+# change itself is dated in record_status_changes, like every other.
 RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 
 # Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
@@ -281,6 +282,18 @@ class RecordRejectionRead(BaseModel):
 	# The image(s) this specific rejection flagged — both L and R for a
 	# dual-mode document, the one image for single-mode.
 	images: List[RecordImageRead] = []
+
+	class Config:
+		from_attributes = True
+
+
+class RecordStatusChangeRead(BaseModel):
+	id: int
+	record_id: int
+	from_status: RecordStatus
+	to_status: RecordStatus
+	changed_by: Optional[str] = None
+	changed_at: datetime
 
 	class Config:
 		from_attributes = True
