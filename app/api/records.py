@@ -23,7 +23,7 @@ from app.schemas.record import (
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
-from app.core.paths import resolve_within_storage
+from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
@@ -66,11 +66,6 @@ def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRe
 	return data
 
 
-def _preview_sidecar_of(master: Path) -> Path:
-	"""The `_preview.jpg` a master's stem names, in the master's own directory."""
-	return master.with_name(master.stem + "_preview.jpg")
-
-
 def _image_files_to_unlink(
 	raw_path: Optional[str],
 	raw_thumbnail_path: Optional[str],
@@ -110,21 +105,20 @@ def _image_files_to_unlink(
 	The thumbnail is included only when its stored path resolves inside the
 	storage roots, the same confinement the master gets.
 
-	`capture/service.py` applies the same sidecar rule when it rolls back a
-	capture that never reached the manifest, but its helper is private to the
-	capture package and documents itself as safe only for manifest-less files —
-	the opposite of what these handlers delete. So the line of path arithmetic
-	lives here instead of being imported from it.
+	The sidecar's name comes from `preview_sidecar_of` in app/core/paths.py,
+	which every site that derives it shares (NEH-264). `capture/service.py`
+	uses it too when it rolls back a capture that never reached the manifest;
+	that rollback and these handlers share the name rule and nothing else.
 	"""
 	paths: List[Path] = []
 	master = resolve_within_storage(raw_path)
 	if master is not None:
 		paths.append(master)
-		sidecar = _preview_sidecar_of(master)
+		sidecar = preview_sidecar_of(master)
 		shared = False
 		for raw_sibling in sibling_paths:
 			sibling = resolve_within_storage(raw_sibling)
-			if sibling is not None and _preview_sidecar_of(sibling) == sidecar:
+			if sibling is not None and preview_sidecar_of(sibling) == sidecar:
 				shared = True
 				break
 		if not shared:
@@ -135,7 +129,7 @@ def _image_files_to_unlink(
 	return paths
 
 
-def _unlink_after_commit(paths: Iterable[Path]) -> None:
+def _unlink_after_commit(paths: Iterable[Path]) -> List[str]:
 	"""Unlink files whose rows a committed transaction has already removed (NEH-262).
 
 	Called only after the commit succeeds. A file that cannot be unlinked is
@@ -144,12 +138,26 @@ def _unlink_after_commit(paths: Iterable[Path]) -> None:
 	That leaves a file on the card with no row, which can be found and removed
 	later. The opposite order left a row pointing at a master that no longer
 	existed, which cannot be repaired. A file already missing is not an error.
+
+	Returns the names of the files that could not be unlinked, in order, so the
+	handler can report them to the client (NEH-263); empty when every file went.
 	"""
+	not_removed: List[str] = []
 	for path in paths:
 		try:
 			path.unlink(missing_ok=True)
 		except OSError as e:
 			logger.warning(f"Row deleted but file could not be unlinked, left on disk: {path}: {e}")
+			not_removed.append(path.name)
+	return not_removed
+
+
+def _delete_response(detail: str, not_removed: List[str]) -> dict:
+	"""A delete endpoint's JSON body: `detail`, plus `not_removed` only when a file stayed on disk."""
+	body = {"detail": detail}
+	if not_removed:
+		body["not_removed"] = not_removed
+	return body
 
 
 def _supersede_current_images(record: Record) -> None:
@@ -353,8 +361,8 @@ def delete_record(
 
 	db.delete(rec)
 	db.commit()
-	_unlink_after_commit(files_to_unlink)
-	return {"detail": f"Record {rec_id} and {image_count} images deleted"}
+	not_removed = _unlink_after_commit(files_to_unlink)
+	return _delete_response(f"Record {rec_id} and {image_count} images deleted", not_removed)
 
 
 # ==============================================================================
@@ -458,9 +466,15 @@ async def add_image_to_record(
 	except Exception as e:
 		db.rollback()
 		# The DB row never persisted, so unlink the saved file and thumbnail to avoid orphaned files no record will reference.
-		file_path.unlink(missing_ok=True)
-		if thumbnail_path:
-			delete_thumbnail(str(thumbnail_path))
+		# A file that cannot be unlinked is logged at WARNING with its path and left on disk; the response is the 500 below either way.
+		try:
+			file_path.unlink(missing_ok=True)
+		except OSError as unlink_error:
+			logger.warning(f"Upload not recorded and its file could not be unlinked, left on disk: {file_path}: {unlink_error}")
+		try:
+			delete_thumbnail(thumbnail_path)
+		except OSError as unlink_error:
+			logger.warning(f"Upload not recorded and its thumbnail could not be unlinked, left on disk: {thumbnail_path}: {unlink_error}")
 		logger.exception(f"Failed to persist image record: {e}")
 		raise HTTPException(status_code=500, detail="Failed to save image record")
 	db.refresh(img)
@@ -607,13 +621,13 @@ def delete_image(
 		db.add(rec)
 
 	db.commit()
-	_unlink_after_commit(files_to_unlink)
-	return {"detail": "Image deleted"}
+	not_removed = _unlink_after_commit(files_to_unlink)
+	return _delete_response("Image deleted", not_removed)
 
 
-# Masters whose bytes a browser cannot display; the RAW backend writes a
+# Masters whose bytes a browser cannot display are recognised by
+# `is_raw_suffix` (app/core/paths.py); the RAW backend writes a
 # `<stem>_preview.jpg` sidecar beside each one (capture/backends/gphoto2_backend.py).
-_RAW_SUFFIXES = (".cr2", ".nef", ".arw", ".raf", ".dng", ".raw")
 
 # Masters a browser displays as they are, so they are their own preview.
 _BROWSER_DISPLAYABLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
@@ -656,9 +670,9 @@ def _raw_preview_sidecar(master: Path) -> Optional[Path]:
 	Returns None for a master that is not RAW, and for a sidecar that is
 	missing or (through a symlink) resolves outside the storage roots.
 	"""
-	if master.suffix.lower() not in _RAW_SUFFIXES:
+	if not is_raw_suffix(master):
 		return None
-	sidecar = resolve_within_storage(str(_preview_sidecar_of(master)))
+	sidecar = resolve_within_storage(str(preview_sidecar_of(master)))
 	if sidecar is None or not sidecar.is_file():
 		return None
 	return sidecar
@@ -709,7 +723,7 @@ def get_image_preview(
 			content_disposition_type="inline",
 		)
 
-	if suffix in _RAW_SUFFIXES:
+	if is_raw_suffix(file_path):
 		sidecar = _raw_preview_sidecar(file_path)
 		if sidecar is None:
 			raise HTTPException(
@@ -718,7 +732,7 @@ def get_image_preview(
 			)
 		return FileResponse(
 			path=sidecar,
-			filename=f"{Path(img.filename).stem}_preview.jpg",
+			filename=preview_sidecar_of(Path(img.filename)).name,
 			media_type="image/jpeg",
 			content_disposition_type="inline",
 		)
