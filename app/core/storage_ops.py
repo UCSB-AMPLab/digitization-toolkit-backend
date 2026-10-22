@@ -19,7 +19,7 @@ from sqlalchemy.orm import Session
 from app.models.collection import Collection
 from app.models.project import Project
 from app.models.record import Record, RecordImage
-from app.core.paths import resolve_within_storage
+from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 
 logger = logging.getLogger(__name__)
 
@@ -108,8 +108,36 @@ def surviving_images_under(
     return hits
 
 
+def _raw_sidecar_to_carry(master: Path) -> Optional[Path]:
+    """The `_preview.jpg` sidecar that moves or is renamed with `master`, or None.
+
+    Only a RAW master carries one: the RAW backend writes the sidecar for it,
+    and `/records/images/{id}/preview` and the thumbnail generator look for it
+    beside a RAW master only. A JPEG master is left alone even when a
+    `<stem>_preview.jpg` sits beside it, because in a multi-format capture
+    `folio.jpg` and `folio.CR2` name the same sidecar and it belongs to the
+    CR2. The sidecar is returned only when it is a file inside the storage
+    roots, the confinement the master gets.
+    """
+    if not is_raw_suffix(master):
+        return None
+    sidecar = resolve_within_storage(str(preview_sidecar_of(master)))
+    if sidecar is None or not sidecar.is_file():
+        return None
+    return sidecar
+
+
 def relocate_image(img: RecordImage, target_dir: Path) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
+
+    A RAW master's `_preview.jpg` sidecar moves with it and is named from the
+    master's final name, so it keeps sitting beside the master under the name
+    the preview endpoint and later deletes derive (NEH-267). The master is moved
+    first; if the sidecar then cannot be moved, the failure is logged at WARNING
+    and the sidecar stays in the old directory, because the master and the row
+    already agree on the new path. Raising there would make the caller roll
+    back, and the row would point at the old path while the master sat at the
+    new one.
 
     The thumbnail is dropped (set to None) so it is regenerated on demand from
     the new location. Returns True if a file was physically moved.
@@ -122,12 +150,20 @@ def relocate_image(img: RecordImage, target_dir: Path) -> bool:
     dst = target_dir / src.name
     if src.resolve() == dst.resolve():
         return False  # already in place
-    if dst.exists():
-        # Avoid clobbering an unrelated file with the same name
+    sidecar = _raw_sidecar_to_carry(src)
+    if dst.exists() or (sidecar is not None and preview_sidecar_of(dst).exists()):
+        # Avoid clobbering an unrelated file with the same name, master or sidecar
         dst = target_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
 
     shutil.move(str(src), str(dst))
     img.file_path = str(dst)
+
+    if sidecar is not None:
+        sidecar_dst = preview_sidecar_of(dst)
+        try:
+            shutil.move(str(sidecar), str(sidecar_dst))
+        except OSError as e:
+            logger.warning(f"Moved {src} to {dst} but its preview sidecar could not follow, left at {sidecar}: {e}")
 
     old_thumb = resolve_within_storage(img.thumbnail_path)
     img.thumbnail_path = None
@@ -321,6 +357,10 @@ def renumber_collection_images(db: Session, collection: Collection) -> dict:
     during either phase unwinds every rename already applied. The caller is
     responsible for committing (or rolling back) the DB session afterwards.
 
+    A RAW master's `_preview.jpg` sidecar is renamed with it, to the name the
+    master's final name derives (NEH-267), in the same two phases and under
+    the same rollback, so a master is never renumbered away from its sidecar.
+
     Raises ValueError if an image's file is missing on disk or the computed
     plan would produce duplicate filenames (defensive; should not happen).
     Raises OSError if a filesystem rename fails after the plan validated.
@@ -359,16 +399,36 @@ def renumber_collection_images(db: Session, collection: Collection) -> dict:
         final_path = src.parent / f"{prefix}_{seq_str}{src.suffix}"
         plan.append((img, src, final_path))
 
-    if len({str(p) for _, _, p in plan}) != len(plan):
+    # Every file to rename, (current path, final path): each master, then
+    # each RAW master's sidecar under the name its final master derives. A
+    # sidecar two RAW masters name (stems equal, suffixes differing only in
+    # case) follows the first of them in display order.
+    file_moves: List[Tuple[Path, Path]] = [(src, final) for _, src, final in plan]
+    sidecar_moves: List[Tuple[Path, Path]] = []
+    carried: set = set()
+    for _, src, final in plan:
+        sidecar = _raw_sidecar_to_carry(src)
+        if sidecar is not None and sidecar not in carried:
+            carried.add(sidecar)
+            sidecar_moves.append((sidecar, preview_sidecar_of(final)))
+    sources = {src for src, _ in file_moves} | carried
+    for _, sidecar_final in sidecar_moves:
+        if sidecar_final.exists() and sidecar_final not in sources:
+            # A `_preview.jpg` already there belongs to no image of this
+            # collection; os.replace would overwrite it without a trace.
+            raise ValueError(f"Renumbering would overwrite {sidecar_final.name}, which no image in this collection owns")
+    file_moves.extend(sidecar_moves)
+
+    if len({str(final) for _, final in file_moves}) != len(file_moves):
         raise ValueError("Renumber plan produced duplicate filenames")
 
     # Phase 1: move every source to a unique temp name so the old and new
     # numbering schemes never collide with each other.
-    to_temp = [(src, src.parent / f".renumber_{uuid.uuid4().hex}{src.suffix}") for _, src, _ in plan]
+    to_temp = [(src, src.parent / f".renumber_{uuid.uuid4().hex}{src.suffix}") for src, _ in file_moves]
     _do_renames(to_temp)
 
     # Phase 2: move each temp file to its final sequential name.
-    to_final = [(temp, final) for (_, temp), (_, _, final) in zip(to_temp, plan)]
+    to_final = [(temp, final) for (_, temp), (_, final) in zip(to_temp, file_moves)]
     try:
         _do_renames(to_final)
     except OSError:

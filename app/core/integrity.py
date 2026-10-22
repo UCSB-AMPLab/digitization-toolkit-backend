@@ -19,7 +19,7 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import resolve_within_storage
+from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
@@ -187,6 +187,11 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     for paths in by_path.values():
         manifest_paths.update(paths.keys())
     known = referenced | manifest_paths
+    # A RAW master's `_preview.jpg` sidecar has no row and no manifest entry of
+    # its own, so it counts as known when its master does. A sidecar whose
+    # master is unknown is reported: that is the orphan a delete that ignored
+    # sidecars leaves (NEH-257).
+    known |= {str(preview_sidecar_of(Path(k))) for k in known if is_raw_suffix(Path(k))}
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []
