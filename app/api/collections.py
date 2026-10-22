@@ -3,7 +3,7 @@ from fastapi.responses import FileResponse
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload, selectinload
-from sqlalchemy import select, func, update
+from sqlalchemy import and_, or_, select, func, update
 import logging
 
 from app.api.deps import get_db_dependency
@@ -621,7 +621,7 @@ def take_back_collection(
             .returning(Record.id)
             .execution_options(synchronize_session=False)
         ).scalars().all()
-        record_bulk_status_changes(db, moved_ids, "in_review", "captured", current_user.username)
+        record_bulk_status_changes(db, moved_ids, collection_id, "in_review", "captured", current_user.username)
         taken_back = len(moved_ids)
     db.commit()
     if not taken_back:
@@ -646,7 +646,8 @@ def list_collection_status_changes(
     Records that existed before the history table was added have no rows for
     their earlier changes. A record moved to another collection takes its
     history with it: rows are looked up through the record's current
-    collection.
+    collection. A deleted record's rows stay, with record_id null, listed
+    under the collection the record was in when each change was made.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -654,8 +655,12 @@ def list_collection_status_changes(
 
     return (
         db.query(RecordStatusChange)
-        .join(Record, RecordStatusChange.record_id == Record.id)
-        .filter(Record.collection_id == collection_id)
+        .outerjoin(Record, RecordStatusChange.record_id == Record.id)
+        .filter(or_(
+            Record.collection_id == collection_id,
+            and_(RecordStatusChange.record_id.is_(None),
+                 RecordStatusChange.collection_id == collection_id),
+        ))
         .order_by(RecordStatusChange.changed_at.desc(), RecordStatusChange.id.desc())
         .all()
     )

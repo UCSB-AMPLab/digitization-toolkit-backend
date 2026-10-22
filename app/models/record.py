@@ -90,7 +90,10 @@ class Record(Base):
 	collection = relationship("Collection", back_populates="records")
 	annotations = relationship("RecordAnnotation", back_populates="record", cascade="all, delete-orphan", order_by="RecordAnnotation.created_at.desc()")
 	rejections = relationship("RecordRejection", back_populates="record", cascade="all, delete-orphan", order_by="RecordRejection.rejected_at.desc()")
-	status_changes = relationship("RecordStatusChange", back_populates="record", cascade="all, delete-orphan", order_by="RecordStatusChange.id.desc()")
+	# No delete cascade: a deleted record's history is kept. On delete the ORM
+	# sets record_id to NULL on these rows, as the FK's ON DELETE SET NULL does
+	# in the database.
+	status_changes = relationship("RecordStatusChange", back_populates="record", order_by="RecordStatusChange.id.desc()")
 
 	@validates("external_id", include_removes=True)
 	def _external_id_is_write_once(self, key, value, is_remove):
@@ -278,11 +281,14 @@ class RecordStatusChange(Base):
 	approved. A row is written by
 	app.core.record_status.change_record_status, which every writer of
 	records.status goes through; take-back writes its rows in bulk beside its
-	single UPDATE. Rows are never edited: undoing an approval is a second
-	row, not a correction of the first.
+	single UPDATE. Rows are not corrected: undoing an approval is a second
+	row, not an edit of the first. The one change a row takes is record_id
+	going NULL when its record is deleted.
 
-	A record's history is deleted with the record, as its rejections are, so
-	a day's review count drops a record that was later deleted.
+	A record's history outlives the record. Deleting it sets record_id to
+	NULL on its rows; collection_id, stored at each change, keeps them
+	listed under the collection the record was in, so a count of that
+	collection's reviews still includes the work done on it.
 
 	Records that existed before this table have no rows for their earlier
 	changes. Nothing is backfilled, because the only candidate, modified_at,
@@ -291,7 +297,11 @@ class RecordStatusChange(Base):
 	__tablename__ = "record_status_changes"
 
 	id = Column(Integer, primary_key=True, index=True)
-	record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False, index=True)
+	record_id = Column(Integer, ForeignKey("records.id", ondelete="SET NULL"), nullable=True, index=True)
+	# The collection the record was in when the change was made. Read only
+	# once the record is deleted: a live record's history follows the record
+	# to its current collection.
+	collection_id = Column(Integer, ForeignKey("collections.id", ondelete="SET NULL"), nullable=True, index=True)
 
 	from_status = Column(String(20), nullable=False)
 	to_status = Column(String(20), nullable=False)
