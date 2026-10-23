@@ -8,8 +8,9 @@ and the dashboard calls them on every visit.
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
 from typing import List, Optional
+from zoneinfo import ZoneInfo, ZoneInfoNotFoundError
 
-from fastapi import APIRouter, Depends, Query
+from fastapi import APIRouter, Depends, HTTPException, Query
 from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
@@ -124,12 +125,41 @@ def _as_naive_utc(t: datetime) -> datetime:
     return t
 
 
+def _zone(tz: Optional[str], tz_offset_minutes: int):
+    """The zone whose local dates the days are counted in: the named IANA
+    zone when one is given, else a fixed offset of -tz_offset_minutes.
+
+    An unknown or malformed zone name is refused with 422 rather than counted
+    in UTC, which would put every day's totals on the wrong dates without
+    saying so.
+    """
+    if tz is None:
+        return timezone(-timedelta(minutes=tz_offset_minutes))
+    try:
+        return ZoneInfo(tz)
+    except (ZoneInfoNotFoundError, ValueError):
+        # ValueError covers keys ZoneInfo will not look up at all, such as an
+        # absolute path or one with ".." components.
+        raise HTTPException(status_code=422, detail=f"Unknown time zone: {tz!r}")
+
+
 @router.get("/daily", response_model=List[DailyActivity])
 def daily_activity(
     days: int = Query(182, ge=1, le=400, description="How many local days, ending today"),
+    tz: Optional[str] = Query(
+        None, min_length=1, max_length=64,
+        description=(
+            "The browser's IANA time zone, from "
+            "Intl.DateTimeFormat().resolvedOptions().timeZone, e.g. America/Bogota. "
+            "When given, tz_offset_minutes is ignored."
+        ),
+    ),
     tz_offset_minutes: int = Query(
         0, ge=-840, le=840,
-        description="The browser's Date.getTimezoneOffset(): minutes to add to local time to get UTC",
+        description=(
+            "The browser's Date.getTimezoneOffset(): minutes to add to local time "
+            "to get UTC. Used only when tz is not given."
+        ),
     ),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
@@ -137,26 +167,36 @@ def daily_activity(
     """Images captured and records reviewed on each of the last `days` local
     days, oldest first, with a zero for a day on which nothing was done.
 
-    The local day of a stored naive-UTC timestamp t is the date of
-    t - tz_offset_minutes minutes.
+    With `tz`, the local day of a stored naive-UTC timestamp t is its date in
+    that zone, with the zone's offset at t, so an event on either side of a
+    daylight-saving change lands on its own local date. Without `tz`, it is
+    the date of t - tz_offset_minutes minutes, one offset for the whole
+    window, as before `tz` existed.
 
-    Bucketing is done in Python, not SQL. Shifting a timestamp by a
-    parameterised number of minutes and taking its date is written differently
-    in SQLite (datetime(t, '-300 minutes')) and Postgres (t - interval), and
-    the unit tests run on the one while production runs on the other. Instead
-    the window's UTC bounds are computed here and the database returns only
-    the timestamp columns inside them, which are bounded by what one unit can
-    capture and review in `days` days.
+    Bucketing is done in Python, not SQL. Converting a timestamp to a named
+    zone needs a time zone database, which Postgres has (AT TIME ZONE) and
+    SQLite, on which the unit tests run, does not; a fixed shift is also
+    written differently in each (datetime(t, '-300 minutes') against
+    t - interval). Instead the window's UTC bounds are computed here and the
+    database returns only the timestamp columns inside them, which are
+    bounded by what one unit can capture and review in `days` days.
     """
-    offset = timedelta(minutes=tz_offset_minutes)
-    today = (_utcnow() - offset).date()
-    first = today - timedelta(days=days - 1)
-    # Local midnight at the start of `first` and after `today`, in UTC.
-    start_utc = datetime.combine(first, time.min) + offset
-    end_utc = datetime.combine(today + timedelta(days=1), time.min) + offset
+    zone = _zone(tz, tz_offset_minutes)
 
     def local_day(t: datetime) -> date:
-        return (_as_naive_utc(t) - offset).date()
+        return _as_naive_utc(t).replace(tzinfo=timezone.utc).astimezone(zone).date()
+
+    def local_midnight_utc(d: date) -> datetime:
+        # A midnight that a daylight-saving gap skips resolves, with fold=0,
+        # to the offset before the change, which is the instant the gap
+        # starts: still the first instant of that local day.
+        return (datetime.combine(d, time.min, tzinfo=zone)
+                .astimezone(timezone.utc).replace(tzinfo=None))
+
+    today = local_day(_utcnow())
+    first = today - timedelta(days=days - 1)
+    start_utc = local_midnight_utc(first)
+    end_utc = local_midnight_utc(today + timedelta(days=1))
 
     captured: dict[date, int] = defaultdict(int)
     for (created_at,) in (

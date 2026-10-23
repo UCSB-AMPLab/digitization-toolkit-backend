@@ -207,6 +207,113 @@ def test_daily_accepts_the_bounds(client, db_session, clock, params):
     assert len(resp.json()) == params.get("days", 182)
 
 
+# --- named time zone (tz) --------------------------------------------------
+
+def _pin(monkeypatch, now):
+    import app.api.activity as activity
+    monkeypatch.setattr(activity, "_utcnow", lambda: now)
+
+
+def _captured(api, **params):
+    resp = api.get("/activity/daily", params=params)
+    assert resp.status_code == 200, resp.text
+    return {r["date"]: r["captured_images"] for r in resp.json()}
+
+
+@pytest.mark.unit
+def test_daily_tz_across_the_november_change_in_los_angeles(client, db_session, monkeypatch):
+    """DST ends 2026-11-01 02:00 PDT (UTC-7), clocks back to 01:00 PST (UTC-8).
+    Today is in PST, so a single offset of 480 would move 00:30 PDT on
+    31 Oct back to 30 Oct."""
+    _pin(monkeypatch, datetime(2026, 11, 3, 20, 0))
+    rec, _ = _record(db_session)
+    _image(db_session, rec, datetime(2026, 10, 31, 7, 30), "a.jpg")   # 31 Oct 00:30 PDT
+    _image(db_session, rec, datetime(2026, 11, 1, 6, 30), "b.jpg")    # 31 Oct 23:30 PDT
+    _image(db_session, rec, datetime(2026, 11, 2, 7, 30), "c.jpg")    # 1 Nov 23:30 PST
+    _image(db_session, rec, datetime(2026, 11, 2, 8, 30), "d.jpg")    # 2 Nov 00:30 PST
+    other, _ = _record(db_session, name="o.jpg")
+    _change(db_session, rec.id, "approved", datetime(2026, 11, 1, 6, 30))    # 31 Oct 23:30 PDT
+    _change(db_session, other.id, "approved", datetime(2026, 11, 2, 7, 30))  # 1 Nov 23:30 PST
+
+    api = _client_as(client, "op", "operator")
+    rows = _by_date(api.get("/activity/daily", params={
+        "days": 6, "tz": "America/Los_Angeles"}).json())
+    assert rows["2026-10-30"]["captured_images"] == 0
+    assert rows["2026-10-31"]["captured_images"] == 2
+    assert rows["2026-11-01"]["captured_images"] == 1
+    assert rows["2026-11-02"]["captured_images"] == 1
+    assert rows["2026-10-31"]["reviewed_records"] == 1
+    assert rows["2026-11-01"]["reviewed_records"] == 1
+    assert max(rows) == "2026-11-03"
+
+
+@pytest.mark.unit
+def test_daily_tz_across_the_march_change_in_los_angeles(client, db_session, monkeypatch):
+    """DST starts 2026-03-08 02:00 PST (UTC-8), clocks forward to 03:00 PDT
+    (UTC-7). Today is in PDT, so a single offset of 420 would move 23:30 PST
+    on 7 Mar forward to 8 Mar."""
+    _pin(monkeypatch, datetime(2026, 3, 10, 20, 0))
+    rec, _ = _record(db_session)
+    _image(db_session, rec, datetime(2026, 3, 8, 7, 30), "a.jpg")   # 7 Mar 23:30 PST
+    _image(db_session, rec, datetime(2026, 3, 9, 6, 30), "b.jpg")   # 8 Mar 23:30 PDT
+    _image(db_session, rec, datetime(2026, 3, 9, 7, 30), "c.jpg")   # 9 Mar 00:30 PDT
+
+    api = _client_as(client, "op", "operator")
+    by_zone = _captured(api, days=5, tz="America/Los_Angeles")
+    assert by_zone["2026-03-07"] == 1
+    assert by_zone["2026-03-08"] == 1
+    assert by_zone["2026-03-09"] == 1
+    # The fixed-offset fallback still counts with one offset, as it always has.
+    by_offset = _captured(api, days=5, tz_offset_minutes=420)
+    assert by_offset["2026-03-07"] == 0
+    assert by_offset["2026-03-08"] == 2
+
+
+@pytest.mark.unit
+def test_daily_tz_window_starts_at_the_first_local_midnight(client, db_session, monkeypatch):
+    """The window's first instant is local midnight in the zone, here PST on
+    7 Mar (08:00 UTC), though today is in PDT."""
+    _pin(monkeypatch, datetime(2026, 3, 10, 20, 0))
+    rec, _ = _record(db_session)
+    _image(db_session, rec, datetime(2026, 3, 7, 7, 59, 59), "before.jpg")
+    _image(db_session, rec, datetime(2026, 3, 7, 8, 0), "edge.jpg")
+    rows = _client_as(client, "op", "operator").get(
+        "/activity/daily", params={"days": 4, "tz": "America/Los_Angeles"}).json()
+    assert rows[0]["date"] == "2026-03-07"
+    assert sum(r["captured_images"] for r in rows) == 1
+    assert rows[0]["captured_images"] == 1
+
+
+@pytest.mark.unit
+def test_daily_tz_bogota(client, db_session, clock):
+    """Colombia keeps UTC-5 all year. NOW (04:30 UTC on 22 Oct) is 23:30 on
+    21 Oct there, so today is the 21st."""
+    rec, _ = _record(db_session)
+    _image(db_session, rec, datetime(2026, 10, 21, 4, 30), "a.jpg")   # 20 Oct 23:30
+    _image(db_session, rec, datetime(2026, 10, 21, 5, 30), "b.jpg")   # 21 Oct 00:30
+    rows = _client_as(client, "op", "operator").get(
+        "/activity/daily", params={"days": 3, "tz": "America/Bogota"}).json()
+    assert [r["date"] for r in rows] == ["2026-10-19", "2026-10-20", "2026-10-21"]
+    by_date = _by_date(rows)
+    assert by_date["2026-10-20"]["captured_images"] == 1
+    assert by_date["2026-10-21"]["captured_images"] == 1
+
+
+@pytest.mark.unit
+def test_daily_tz_takes_precedence_over_the_offset(client, db_session, clock):
+    rows = _client_as(client, "op", "operator").get("/activity/daily", params={
+        "days": 1, "tz": "America/Bogota", "tz_offset_minutes": -840}).json()
+    assert [r["date"] for r in rows] == ["2026-10-21"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tz", ["Mars/Olympus_Mons", "../../etc/passwd", "/etc/localtime", "", "x" * 65])
+def test_daily_rejects_an_unknown_zone(client, db_session, clock, tz):
+    resp = _client_as(client, "op", "operator").get(
+        "/activity/daily", params={"days": 3, "tz": tz})
+    assert resp.status_code == 422, resp.text
+
+
 # ---------------------------------------------------------------------------
 # /activity/collections
 # ---------------------------------------------------------------------------
