@@ -155,6 +155,7 @@ def relocate_image(
     target_dir: Path,
     not_moved: Optional[List[str]] = None,
     moved: Optional[List[Tuple[Path, Path]]] = None,
+    old_thumbnails: Optional[List[Path]] = None,
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
@@ -172,8 +173,12 @@ def relocate_image(
     held the stored file's name, and is left alone when it holds an upload's
     original name.
 
-    The thumbnail is dropped (set to None) so it is regenerated on demand from
-    the new location. Returns True if a file was physically moved.
+    The row's thumbnail is dropped (set to None) so it is regenerated on demand
+    from the new location. The old thumbnail file is not deleted here: its
+    path is appended to `old_thumbnails` when the caller passes a list, for
+    the caller to unlink once the commit has landed, so that a rolled-back
+    row still names a thumbnail that exists. Returns True if a file was
+    physically moved.
 
     When the caller passes `moved`, each file moved is appended to it as an
     (original path, new path) pair as soon as it has moved: the master, then
@@ -220,11 +225,8 @@ def relocate_image(
 
     old_thumb = resolve_within_storage(img.thumbnail_path)
     img.thumbnail_path = None
-    if old_thumb is not None and old_thumb.exists():
-        try:
-            old_thumb.unlink()
-        except OSError:
-            pass
+    if old_thumb is not None and old_thumbnails is not None:
+        old_thumbnails.append(old_thumb)
 
     return True
 
@@ -253,6 +255,54 @@ def undo_relocations(moved: List[Tuple[Path, Path]]) -> List[Path]:
     return not_restored
 
 
+def _rollback_logged(db: Session, operation: str) -> None:
+    """Roll the session back; a rollback that fails is logged at ERROR and not raised.
+
+    The callers roll back on their way to putting files back, and a failed
+    rollback must neither stop that nor replace the error being reported.
+    """
+    try:
+        db.rollback()
+    except Exception:
+        logger.exception(f"{operation}: rollback failed")
+
+
+def _relocation_landed(db: Session, new_paths: dict) -> Optional[bool]:
+    """Whether the rows of the moved images hold their new paths, read with a fresh query.
+
+    `new_paths` maps image id to the file_path `relocate_image` set. Every
+    moved image is checked, in one query: a transaction lands whole or not at
+    all, so all rows agreeing is expected, and a mix is treated as unknown
+    rather than guessed from one row. Returns True when every row holds its
+    new path, False when none does, and None when they disagree or the query
+    fails.
+    """
+    try:
+        rows = dict(
+            db.query(RecordImage.id, RecordImage.file_path)
+            .filter(RecordImage.id.in_(list(new_paths)))
+            .all()
+        )
+    except Exception:
+        logger.exception("Could not read the moved images' rows to check whether the commit landed")
+        return None
+    hits = [rows.get(img_id) == path for img_id, path in new_paths.items()]
+    if all(hits):
+        return True
+    if not any(hits):
+        return False
+    return None
+
+
+def _unlink_old_thumbnails(paths: List[Path]) -> None:
+    """Unlink thumbnails whose rows a committed relocation has cleared; a failure is logged at WARNING."""
+    for path in paths:
+        try:
+            path.unlink(missing_ok=True)
+        except OSError as e:
+            logger.warning(f"Thumbnail of a moved image could not be unlinked, left on disk: {path}: {e}")
+
+
 def relocate_images_and_commit(
     db: Session,
     moves: Iterable[Tuple[RecordImage, Path]],
@@ -262,25 +312,42 @@ def relocate_images_and_commit(
     """Relocate each (image, target directory) pair with `relocate_image`, then commit.
 
     The rows' new paths and the files' new places cannot share one
-    transaction. If a move raises, or the commit does, the session is rolled
-    back, so every row keeps its old path, and `undo_relocations` moves every
-    file already moved back to that path. The error becomes a 500 whose detail
-    says whether every file went back; a file that could not be put back is
-    logged at ERROR by `undo_relocations`. A commit that fails when no file
-    moved is rolled back and its error re-raised unchanged. `operation` names
-    the request in the log.
+    transaction, so a failure is handled in the order the two can disagree:
+
+    - A move raises: the session is rolled back, so every row keeps its old
+      path, and `undo_relocations` moves every file already moved back to that
+      path. An Exception becomes a 500; any other BaseException (an interrupt,
+      SystemExit) is re-raised as it is after the undo.
+    - The commit raises: it may have landed before the error (a connection
+      lost after COMMIT), so after the rollback the moved images' rows are
+      read again (`_relocation_landed`). If they hold the new paths, the files
+      stay where they are, a WARNING is logged, and the call returns as if the
+      commit had succeeded. If they hold the old paths, the files are moved
+      back and a 500 is raised. If the check cannot tell, no file is moved,
+      every (original, new) pair is logged at ERROR for recovery by hand, and
+      a 500 says the outcome could not be determined.
+    - A commit that fails when no file moved is rolled back and its error
+      re-raised unchanged.
+
+    A rollback that fails is logged and does not stop the undo. A file that
+    could not be put back is logged at ERROR by `undo_relocations`, and the
+    500's detail says so. Error text and paths go to the log, not to the
+    detail. `operation` names the request in the log.
 
     Sidecars that could not follow their master are appended to `not_moved`,
-    as `relocate_image` does. The old thumbnails `relocate_image` deletes are
-    not restored on failure: the rolled-back row names the deleted file, and
-    the thumbnail endpoint regenerates a missing one on demand.
+    as `relocate_image` does. The moved images' old thumbnails are unlinked
+    only once the commit is known to have landed; until then the files stay,
+    so a rolled-back row's thumbnail_path still names an existing file.
     """
     moved: List[Tuple[Path, Path]] = []
+    old_thumbnails: List[Path] = []
+    new_paths: dict = {}
     try:
         for img, target_dir in moves:
-            relocate_image(img, target_dir, not_moved, moved)
+            if relocate_image(img, target_dir, not_moved, moved, old_thumbnails):
+                new_paths[img.id] = img.file_path
     except Exception as e:
-        db.rollback()
+        _rollback_logged(db, operation)
         # The rows still name the old paths, so the moves are reversed to match them.
         not_restored = undo_relocations(moved)
         if not_restored:
@@ -290,20 +357,40 @@ def relocate_images_and_commit(
             )
             raise HTTPException(
                 status_code=500,
-                detail=f"Failed to move image files on disk: {e}. Some files could not be put back where they were",
+                detail="Failed to move the image files on disk, and some files could not be put back where they were",
             ) from e
         logger.exception(f"{operation} failed on disk; the files moved so far are back where they were")
         raise HTTPException(
             status_code=500,
-            detail=f"Failed to move image files on disk: {e}. The files are back where they were",
+            detail="Failed to move the image files on disk. The files are back where they were",
         ) from e
+    except BaseException:
+        _rollback_logged(db, operation)
+        undo_relocations(moved)
+        raise
 
     try:
         db.commit()
     except Exception as e:
-        db.rollback()
+        _rollback_logged(db, operation)
         if not moved:
             raise  # no file moved (a metadata-only update, say), so nothing to put back
+        landed = _relocation_landed(db, new_paths)
+        if landed:
+            logger.warning(
+                f"{operation}: the commit raised but its rows hold the new paths, so it landed; "
+                f"the files stay where they were moved: {e}"
+            )
+            _unlink_old_thumbnails(old_thumbnails)
+            return
+        if landed is None:
+            for orig, current in moved:
+                logger.error(f"{operation}: commit outcome unknown; file left at {current}, originally at {orig}")
+            logger.exception(f"{operation} DB commit failed and its outcome could not be determined; no file was moved back")
+            raise HTTPException(
+                status_code=500,
+                detail="The database update failed and its outcome could not be determined; the files were left at their new paths",
+            ) from e
         not_restored = undo_relocations(moved)
         if not_restored:
             logger.exception(
@@ -319,6 +406,8 @@ def relocate_images_and_commit(
             status_code=500,
             detail="The database update failed; the files are back where they were. Please retry",
         ) from e
+
+    _unlink_old_thumbnails(old_thumbnails)
 
 
 def remove_tree(directory: Path) -> None:

@@ -42,7 +42,7 @@ def layout(db_session, capture_settings):
     """Projects "proj" and "proj2"; collections A and B in proj; three records in A.
 
     Two records hold a RAW master with its `_preview.jpg` sidecar, the third a
-    JPEG master.
+    JPEG master. Every image has a thumbnail file in `images/thumbnails`.
     """
     from capture.project_manager import image_output_dir
     from app.models.collection import Collection
@@ -60,6 +60,8 @@ def layout(db_session, capture_settings):
 
     src_dir = image_output_dir("proj", "A")
     src_dir.mkdir(parents=True)
+    thumb_dir = src_dir.parent / "thumbnails"
+    thumb_dir.mkdir()
     for name in ("IMG_0001.CR2", "IMG_0002.CR2", "IMG_0003.jpg"):
         master = src_dir / name
         master.write_bytes(f"master {name}".encode())
@@ -68,10 +70,12 @@ def layout(db_session, capture_settings):
         rec = Record(title=name, collection_id=a.id, status="captured", capture_mode="single")
         db_session.add(rec)
         db_session.commit()
+        thumb = thumb_dir / f"{master.stem}_thumb.jpg"
+        thumb.write_bytes(f"thumb {name}".encode())
         db_session.add(RecordImage(record_id=rec.id, filename=name, file_path=str(master),
-                                   format=master.suffix.lstrip(".").lower()))
+                                   thumbnail_path=str(thumb), format=master.suffix.lstrip(".").lower()))
         db_session.commit()
-    return {"proj": proj, "proj2": proj2, "a": a, "b": b, "src_dir": src_dir}
+    return {"proj": proj, "proj2": proj2, "a": a, "b": b, "src_dir": src_dir, "thumb_dir": thumb_dir}
 
 
 # Each route: how to call it, and the directory it moves A's images into.
@@ -193,6 +197,9 @@ def test_a_move_that_succeeds_relocates_masters_and_sidecars(route, client, db_s
     for img in db_session.query(RecordImage).all():
         assert Path(img.file_path) == (new_dir / img.filename).resolve()
         assert Path(img.file_path).read_bytes() == f"master {img.filename}".encode()
+        assert img.thumbnail_path is None
+    # The old thumbnails go once the commit has landed; they regenerate on demand.
+    assert list(layout["thumb_dir"].iterdir()) == []
 
 
 @pytest.mark.unit
@@ -220,8 +227,8 @@ def test_a_move_back_that_fails_is_logged_and_the_original_error_still_reported(
 
     assert resp.status_code == 500, resp.text
     detail = resp.json()["detail"]
-    assert "Permission denied" in detail
     assert "could not be put back" in detail
+    assert str(override_projects_root) not in detail and "Permission denied" not in detail
     stranded = [p.resolve() for p in new_dir.iterdir() if p.suffix == ".CR2"]
     assert len(stranded) == 1
     original = layout["src_dir"].resolve() / stranded[0].name
@@ -229,3 +236,145 @@ def test_a_move_back_that_fails_is_logged_and_the_original_error_still_reported(
     assert any(str(stranded[0]) in m and str(original) in m for m in errors), errors
     # The sidecar moved after its master, so it went back first and sits in the old directory.
     assert (layout["src_dir"] / f"{stranded[0].stem}_preview.jpg").exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", sorted(ROUTES))
+def test_a_failed_move_keeps_paths_and_errors_out_of_the_detail(route, client, layout,
+                                                               override_projects_root, monkeypatch, caplog):
+    call, _ = ROUTES[route]
+    _fail_nth_master_move(monkeypatch, 1)
+    with caplog.at_level(logging.ERROR, logger="app.core.storage_ops"):
+        resp = call(_as_operator(client), layout)
+
+    assert resp.status_code == 500, resp.text
+    detail = resp.json()["detail"]
+    assert str(override_projects_root) not in detail and "/images/main/" not in detail, detail
+    assert "Permission denied" not in detail
+    assert any("Permission denied" in r.getMessage() or (r.exc_text and "Permission denied" in r.exc_text)
+               or (r.exc_info and "Permission denied" in str(r.exc_info[1]))
+               for r in caplog.records), "the error belongs in the log"
+
+
+def _commit_lands_then_raises(monkeypatch, db_session):
+    """The first commit applies the transaction, then reports a lost connection."""
+    from sqlalchemy.exc import OperationalError
+
+    real_commit = db_session.commit
+    state = {"n": 0}
+
+    def commit_then_raise():
+        real_commit()
+        state["n"] += 1
+        if state["n"] == 1:
+            raise OperationalError("COMMIT", {}, Exception("server closed the connection unexpectedly"))
+
+    monkeypatch.setattr(db_session, "commit", commit_then_raise)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", sorted(ROUTES))
+def test_a_commit_that_landed_before_raising_keeps_the_files_moved(route, client, db_session, layout,
+                                                                    monkeypatch, caplog):
+    from capture.project_manager import image_output_dir
+    from app.models.record import RecordImage
+
+    call, (project_name, collection_name) = ROUTES[route]
+    _commit_lands_then_raises(monkeypatch, db_session)
+    with caplog.at_level(logging.WARNING, logger="app.core.storage_ops"):
+        resp = call(_as_operator(client), layout)
+
+    assert resp.status_code == 200, resp.text
+    assert "not_moved" not in resp.json()
+    new_dir = image_output_dir(project_name, collection_name)
+    db_session.expire_all()
+    for img in db_session.query(RecordImage).all():
+        assert Path(img.file_path) == (new_dir / img.filename).resolve()
+        assert Path(img.file_path).exists()
+    assert any(r.levelno == logging.WARNING and "landed" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", sorted(ROUTES))
+def test_a_commit_whose_outcome_cannot_be_checked_leaves_the_files_moved(route, client, db_session, layout,
+                                                                          monkeypatch, caplog):
+    from sqlalchemy.exc import OperationalError
+    from capture.project_manager import image_output_dir
+
+    call, (project_name, collection_name) = ROUTES[route]
+    real_query = db_session.query
+    state = {"down": False}
+
+    def failing_commit():
+        state["down"] = True
+        raise OperationalError("COMMIT", {}, Exception("server closed the connection unexpectedly"))
+
+    def query(*args, **kw):
+        if state["down"]:
+            raise OperationalError("SELECT", {}, Exception("could not connect to server"))
+        return real_query(*args, **kw)
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    monkeypatch.setattr(db_session, "query", query)
+    with caplog.at_level(logging.ERROR, logger="app.core.storage_ops"):
+        resp = call(_as_operator(client), layout)
+
+    assert resp.status_code == 500, resp.text
+    detail = resp.json()["detail"]
+    assert "could not be determined" in detail
+    new_dir = image_output_dir(project_name, collection_name)
+    assert sorted(p.name for p in new_dir.iterdir()) == [
+        "IMG_0001.CR2", "IMG_0001_preview.jpg", "IMG_0002.CR2", "IMG_0002_preview.jpg", "IMG_0003.jpg",
+    ]
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    src = layout["src_dir"].resolve()
+    for name in ("IMG_0001.CR2", "IMG_0001_preview.jpg", "IMG_0002.CR2", "IMG_0002_preview.jpg", "IMG_0003.jpg"):
+        assert any(str(src / name) in m and str(new_dir.resolve() / name) in m for m in errors), name
+    # Nothing was deleted while the outcome is unknown.
+    assert len(list(layout["thumb_dir"].iterdir())) == 3
+
+
+@pytest.mark.unit
+def test_a_rollback_that_raises_does_not_skip_the_undo(client, db_session, layout,
+                                                       override_projects_root, monkeypatch):
+    call, _ = ROUTES["move_records"]
+    files_before = _files(override_projects_root)
+    _fail_nth_master_move(monkeypatch, 2)
+    real_rollback = db_session.rollback
+
+    def bad_rollback():
+        raise RuntimeError("rollback failed: connection gone")
+
+    monkeypatch.setattr(db_session, "rollback", bad_rollback)
+    resp = call(_as_operator(client), layout)
+
+    assert resp.status_code == 500, resp.text
+    assert "back where they were" in resp.json()["detail"]
+    assert _files(override_projects_root) == files_before
+    real_rollback()
+
+
+@pytest.mark.unit
+def test_an_interrupt_mid_loop_puts_the_files_back_and_propagates(db_session, layout,
+                                                                  override_projects_root, monkeypatch):
+    from capture.project_manager import image_output_dir
+    from app.core.storage_ops import relocate_images_and_commit
+    from app.models.record import RecordImage
+
+    files_before = _files(override_projects_root)
+    real_move = shutil.move
+    count = {"masters": 0}
+
+    def move(src, dst, *args, **kw):
+        if not str(src).endswith("_preview.jpg"):
+            count["masters"] += 1
+            if count["masters"] == 2:
+                raise KeyboardInterrupt()
+        return real_move(src, dst, *args, **kw)
+
+    monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
+    target = image_output_dir("proj", "B")
+    moves = [(i, target) for i in db_session.query(RecordImage).order_by(RecordImage.id).all()]
+    with pytest.raises(KeyboardInterrupt):
+        relocate_images_and_commit(db_session, moves, [], "test move")
+    assert _files(override_projects_root) == files_before
