@@ -442,6 +442,26 @@ def remove_tree(directory: Path) -> None:
         shutil.rmtree(directory)
 
 
+def remove_empty_dirs(directory: Path) -> List[Path]:
+    """Remove `directory` and the directories under it that hold no file; return the files found.
+
+    No file is removed. A directory that still holds a file, at any depth,
+    stays, with the directories above it. The files are returned, in path
+    order, for the caller to report. Raises OSError if a directory that holds
+    no file cannot be removed.
+    """
+    if not directory.is_dir():
+        return []
+    left: List[Path] = []
+    for current, dirnames, filenames in os.walk(directory, topdown=False):
+        left.extend(Path(current) / f for f in filenames)
+        with os.scandir(current) as entries:
+            empty = next(entries, None) is None
+        if empty:
+            os.rmdir(current)
+    return sorted(left)
+
+
 def move_project_tree(old_root: Path, new_root: Path) -> bool:
     """Move an entire project directory tree from old_root to new_root.
 

@@ -29,7 +29,7 @@ from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
     relocate_images_and_commit,
-    remove_tree,
+    remove_empty_dirs,
     renumber_collection_images,
     restore_original_names,
     resolve_project,
@@ -429,13 +429,17 @@ def delete_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete an empty collection and its (now unused) directory.
+    Delete an empty collection and the empty directories of its own.
 
     Refuses (409) if the volume has a file name stem and has captured, even
     once emptied: its row keeps the stem so the names issued under it are
     never issued again. Also refuses (409) if the collection still has
     sub-collections or records (those must be moved or deleted first) or if
-    its directory still holds files that a surviving record points at.
+    its directory still holds files that a surviving record points at. An
+    empty collection has no files of its own, so no file is removed: a file
+    found in its directory (one no row references, such as a file the volume
+    layout migration left there) stays, with the directories above it, and is
+    logged at WARNING.
     """
     from capture.project_manager import collection_capture_root
 
@@ -467,12 +471,17 @@ def delete_collection(
                 status_code=409,
                 detail="Collection directory still holds files referenced by other records. Move those records first.",
             )
-        # Remove files first so a filesystem failure aborts before touching the DB
+        # Remove the directories first so a filesystem failure aborts before touching the DB
         try:
-            remove_tree(col_dir)
+            left = remove_empty_dirs(col_dir)
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
             raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
+        if left:
+            logger.warning(
+                f"Deleting collection {collection_id}: {len(left)} file(s) no record references were left in "
+                f"{col_dir}: {[str(p) for p in left]}"
+            )
 
     db.delete(collection)
     db.commit()
