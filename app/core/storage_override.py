@@ -8,10 +8,20 @@ A missing override file means "no override" and is normal. An override file that
 exists but cannot be read raises StorageOverrideError from the low-level reader;
 callers use get_storage_override_or_fallback to log it and revert to internal
 storage rather than let one corrupt file 500 the whole app.
+
+An override file that can be read is kept as the projects root even when the
+path it names is not usable (the drive is not mounted, or the directory is
+gone). Falling back to internal storage then would put new work on the SD card
+while the rest of the project is on the drive. Instead, everything that writes
+into the projects tree gets its root from writable_projects_dir, which raises
+StorageUnavailableError for such a root.
 """
 import json
 import logging
+import os
+import stat
 from pathlib import Path
+from typing import Optional
 
 logger = logging.getLogger(__name__)
 
@@ -64,3 +74,64 @@ def clear_storage_override() -> None:
         _OVERRIDE_FILE.unlink(missing_ok=True)
     except Exception:
         logger.exception("[ERROR] Failed to clear storage override")
+
+
+class StorageUnavailableError(RuntimeError):
+    """The storage override names a projects root that cannot be written to.
+
+    The message is meant for the operator. The app answers it with 503.
+    """
+
+
+def _internal_device() -> int:
+    """Device number of the root filesystem, which holds the internal SD card's storage."""
+    return os.stat("/").st_dev
+
+
+def _same_device_as_internal(st: os.stat_result) -> bool:
+    return st.st_dev == _internal_device()
+
+
+def override_root_problem(root: Path) -> Optional[str]:
+    """Why an override root cannot take writes, or None if it can.
+
+    The root must be an existing directory on a filesystem other than the root
+    one. The check compares device numbers rather than calling
+    os.path.ismount: activation stores `<mount point>/dtk-projects`, and
+    accepts any existing directory as the mount point, so the root itself is
+    never a mount point and its parent need not be one either. A directory with
+    the root filesystem's device number is on the SD card, whatever its path,
+    which is the case of a mount point with no drive mounted on it.
+    """
+    try:
+        st = os.stat(root)
+    except OSError:
+        return "The storage drive set for projects is not available. Connect and activate the drive, or revert to internal storage, then try again."
+    if not stat.S_ISDIR(st.st_mode):
+        return "The storage path set for projects is not a directory. Activate the drive again, or revert to internal storage, then try again."
+    if _same_device_as_internal(st):
+        return "The storage path set for projects is not on a mounted drive. Connect and activate the drive, or revert to internal storage, then try again."
+    return None
+
+
+def writable_projects_dir(settings=None) -> Path:
+    """The projects root to write into; raises StorageUnavailableError if it is not usable.
+
+    With no override (or an unreadable override file, which falls back to
+    internal storage as get_storage_override_or_fallback describes) this is the
+    default root of `settings` (the app's settings when not given), unchecked.
+    With an override, the override's root is returned only if
+    override_root_problem finds nothing wrong with it. Nothing is created here.
+    """
+    if settings is None:
+        from app.core.config import settings
+
+    override, _corrupt = get_storage_override_or_fallback()
+    if not override:
+        return settings.default_projects_dir
+    root = Path(override)
+    problem = override_root_problem(root)
+    if problem:
+        logger.error("Storage override root %s refused for writing: %s", root, problem)
+        raise StorageUnavailableError(problem)
+    return root

@@ -1,5 +1,6 @@
-from fastapi import FastAPI
+from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
+from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
 # initialize DB tables
@@ -81,6 +82,15 @@ app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(system_router, prefix="/system", tags=["system"])
 app.include_router(activity_router, prefix="/activity", tags=["activity"])
+
+
+from app.core.storage_override import StorageUnavailableError
+
+
+@app.exception_handler(StorageUnavailableError)
+async def storage_unavailable(request: Request, exc: StorageUnavailableError):
+    """A write into the projects tree refused because the override root is not usable."""
+    return JSONResponse(status_code=503, content={"detail": str(exc)})
 
 
 @app.get("/health")

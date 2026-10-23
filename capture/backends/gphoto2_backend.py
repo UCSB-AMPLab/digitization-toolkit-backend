@@ -625,12 +625,16 @@ class GPhoto2Backend(CameraBackend):
         The import is function-local, exactly as camera_registry does it: this
         module is reached from capture.service, so a module-level import of the
         app config would be circular. When it fails - a test process with no
-        app config - persistence is simply off.
+        app config - persistence is simply off. It is off too while the storage
+        override names a root that cannot take writes (writable_projects_dir
+        raises StorageUnavailableError), so the save's mkdir never builds the
+        projects tree on the SD card.
         """
         try:
             from app.core.config import settings
+            from app.core.storage_override import writable_projects_dir
 
-            return Path(settings.projects_dir) / _BINDINGS_FILENAME
+            return writable_projects_dir(settings) / _BINDINGS_FILENAME
         except Exception:
             return None
 

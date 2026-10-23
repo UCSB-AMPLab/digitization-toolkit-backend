@@ -48,8 +48,11 @@ class CameraRegistry:
             registry_path: Path to cameras.json. Defaults to PROJECTS_ROOT/cameras.json
         """
         if registry_path is None:
+            # Raises StorageUnavailableError, before the mkdir below, when the
+            # storage override names a root that cannot take writes.
             from app.core.config import settings
-            registry_path = Path(settings.projects_dir) / "cameras.json"
+            from app.core.storage_override import writable_projects_dir
+            registry_path = writable_projects_dir(settings) / "cameras.json"
         
         self.registry_path = Path(registry_path)
         self.registry_path.parent.mkdir(parents=True, exist_ok=True)

@@ -27,6 +27,16 @@ _TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="dtk-test-logs-"))
 settings.DTK_LOG_DIR = str(_TEST_LOG_DIR)
 
 import capture.project_manager as pm  # noqa: E402
+import pytest  # noqa: E402
+
+
+@pytest.fixture(autouse=True)
+def _roots_count_as_mounted_drives(monkeypatch):
+    """The override roots here are plain tmp_path directories. _projects_root
+    refuses an override root on the root filesystem (see
+    test_storage_root_unusable.py), and whether tmp_path shares a device with
+    `/` depends on the machine, so every directory counts as a separate drive."""
+    monkeypatch.setattr("app.core.storage_override._internal_device", lambda: -1)
 
 
 def test_project_capture_root_follows_runtime_override(tmp_path, monkeypatch):
