@@ -5,7 +5,7 @@ NEH-267: `relocate_image` and `renumber_collection_images` carry
 preview endpoint and deletes look for the sidecar beside the master's current
 path. NEH-264: the name rule is `preview_sidecar_of` in app/core/paths.py.
 NEH-263: `delete_thumbnail` raises when the unlink fails. The integrity scan
-counts a sidecar of a known RAW master as known, not orphaned.
+counts a sidecar as known only while its RAW master is known and on disk.
 
 Files are real, under the per-test projects root from `override_projects_root`.
 """
@@ -719,3 +719,131 @@ def test_renumber_whose_commit_fails_puts_the_files_back(client, db_session, mon
     assert {p.name: _digest(p) for p in image_dir.iterdir()} == before
     db_session.rollback()
     assert db_session.query(RecordImage).one().filename == "IMG_0020.CR2"
+
+
+# Two collections of one name share a directory --------------------------------
+
+def _same_named_collections(db_session, image_dir):
+    """Collections A and B, both named "Tomo 1", whose masters share `image_dir`."""
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+
+    project = Project(name="proj")
+    db_session.add(project)
+    db_session.commit()
+    colls = []
+    for _ in range(2):
+        c = Collection(name="Tomo 1", project_id=project.id)
+        db_session.add(c)
+        db_session.commit()
+        colls.append(c)
+
+    def add(coll, name, seq):
+        rec = Record(title=name, collection_id=coll.id, sequence=seq,
+                     status="in_review", capture_mode="single")
+        db_session.add(rec)
+        db_session.commit()
+        db_session.add(RecordImage(record_id=rec.id, filename=name, file_path=str(image_dir / name),
+                                   role="single", format=Path(name).suffix.lstrip(".").lower()))
+        db_session.commit()
+
+    return colls, add
+
+
+@pytest.mark.unit
+def test_renumber_refuses_to_overwrite_a_same_named_collections_master(db_session, override_projects_root):
+    from app.core.storage_ops import renumber_collection_images
+
+    image_dir = override_projects_root / "proj" / "tomo_1" / "images" / "main"
+    image_dir.mkdir(parents=True)
+    (a, b), add = _same_named_collections(db_session, image_dir)
+    (image_dir / "tomo_1_0001.jpg").write_bytes(b"B's renumbered master")
+    add(b, "tomo_1_0001.jpg", 1)
+    (image_dir / "IMG_0001.jpg").write_bytes(b"A's master")
+    add(a, "IMG_0001.jpg", 1)
+    before = {p.name: _digest(p) for p in image_dir.iterdir()}
+
+    db_session.refresh(a)
+    with pytest.raises(ValueError, match="tomo_1_0001.jpg"):
+        renumber_collection_images(db_session, a)
+
+    assert {p.name: _digest(p) for p in image_dir.iterdir()} == before
+
+
+@pytest.mark.unit
+def test_renumber_refuses_a_new_name_whose_stem_another_collection_holds(db_session, override_projects_root):
+    from app.core.storage_ops import renumber_collection_images
+
+    image_dir = override_projects_root / "proj" / "tomo_1" / "images" / "main"
+    image_dir.mkdir(parents=True)
+    (a, b), add = _same_named_collections(db_session, image_dir)
+    (image_dir / "tomo_1_0001.tif").write_bytes(b"B's tiff")
+    add(b, "tomo_1_0001.tif", 1)
+    (image_dir / "IMG_0001.jpg").write_bytes(b"A's master")
+    add(a, "IMG_0001.jpg", 1)
+    before = {p.name: _digest(p) for p in image_dir.iterdir()}
+
+    db_session.refresh(a)
+    with pytest.raises(ValueError, match="tomo_1_0001.tif"):
+        renumber_collection_images(db_session, a)
+
+    assert {p.name: _digest(p) for p in image_dir.iterdir()} == before
+
+
+@pytest.mark.unit
+def test_renumber_of_one_collection_in_a_shared_directory_still_runs(db_session, override_projects_root):
+    """Names the other collection does not hold are free to take."""
+    from app.core.storage_ops import renumber_collection_images
+
+    image_dir = override_projects_root / "proj" / "tomo_1" / "images" / "main"
+    image_dir.mkdir(parents=True)
+    (a, b), add = _same_named_collections(db_session, image_dir)
+    (image_dir / "other_0001.jpg").write_bytes(b"B's master")
+    add(b, "other_0001.jpg", 1)
+    (image_dir / "IMG_0001.jpg").write_bytes(b"A's master")
+    add(a, "IMG_0001.jpg", 1)
+
+    db_session.refresh(a)
+    renumber_collection_images(db_session, a)
+
+    assert (image_dir / "tomo_1_0001.jpg").read_bytes() == b"A's master"
+    assert (image_dir / "other_0001.jpg").read_bytes() == b"B's master"
+
+
+# The endpoint's 500 for an on-disk failure -------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("unwind_fails", [False, True])
+def test_renumber_500_says_whether_every_file_went_back(client, db_session, monkeypatch, capture_settings, unwind_fails):
+    import os
+    from capture.project_manager import image_output_dir
+
+    a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
+    image_dir = image_output_dir("proj", "A")
+    real_replace = os.replace
+    state = {"phase2": 0}
+
+    def replace(src, dst):
+        src, dst = Path(src), Path(dst)
+        if src.name.startswith(".renumber_") and not dst.name.startswith(".renumber_"):
+            state["phase2"] += 1
+            # Fail the second phase-2 rename (the sidecar's); when asked, also
+            # fail every step of the unwind that moves the master back.
+            if state["phase2"] == 2:
+                raise PermissionError(13, "Permission denied", str(dst))
+        if unwind_fails and src.name.endswith(".CR2") and src.name.startswith("a_0001"):
+            raise PermissionError(13, "Permission denied", str(src))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr("app.core.storage_ops.os.replace", replace)
+    resp = _as_operator(client).post(f"/collections/{a.id}/images/renumber")
+
+    assert resp.status_code == 500, resp.text
+    detail = resp.json()["detail"]
+    if unwind_fails:
+        assert detail.endswith("Some files could not be put back under their old names")
+        assert (image_dir / "a_0001.CR2").exists()
+    else:
+        assert detail.endswith("The files are back under their old names")
+        assert sorted(p.name for p in image_dir.iterdir()) == ["IMG_0020.CR2", sidecar.name]

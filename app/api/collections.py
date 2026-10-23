@@ -467,9 +467,11 @@ def renumber_images(
     Physically renumber every image file in a collection (documentary unit),
     sequentially from 1, zero-padded to the total capture count. Never
     renames anything else — only assigns fresh sequential filenames based on
-    current display order. All-or-nothing: if any file operation fails,
-    every rename already applied is rolled back and the database is left
-    untouched.
+    current display order. If a file operation fails, or the commit after
+    the renames does, every renamed file is put back under its old name and
+    the database is left untouched; a file the unwind could not put back is
+    logged at ERROR and left under a temporary name, and the 500's detail
+    says that not every file went back.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -481,7 +483,21 @@ def renumber_images(
     except ValueError as e:
         raise HTTPException(status_code=422, detail=str(e))
     except OSError as e:
-        raise HTTPException(status_code=500, detail=f"Failed to renumber images on disk: {e}")
+        not_restored = getattr(e, "not_restored", [])
+        if not_restored:
+            logger.error(
+                f"Renumber of collection {collection_id} failed on disk; "
+                f"{len(not_restored)} file(s) could not be put back under their old names: "
+                f"{[p.name for p in not_restored]}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to renumber images on disk: {e}. Some files could not be put back under their old names",
+            )
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to renumber images on disk: {e}. The files are back under their old names",
+        )
 
     try:
         db.commit()

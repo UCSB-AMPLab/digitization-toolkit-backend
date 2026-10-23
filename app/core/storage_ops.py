@@ -358,22 +358,26 @@ def _do_renames(moves: List[Tuple[Path, Path]]) -> List[Tuple[Path, Path]]:
     """Execute a list of (src, dst) renames in order.
 
     If any rename fails partway through, every rename that already succeeded
-    is reversed (in reverse order) before the exception is re-raised, so a
-    partial filesystem failure never leaves files scattered under a mix of
-    old and new names. Returns the list of renames that ended up applied
-    (only relevant on the success path — on failure everything is undone).
+    is reversed (in reverse order) before the exception is re-raised. A
+    reversal that itself fails is logged at ERROR and leaves that file at its
+    renamed path; the original paths not put back are set on the raised
+    exception as `not_restored` (empty when every reversal succeeded).
+    Returns the list of renames applied.
     """
     done: List[Tuple[Path, Path]] = []
     try:
         for src, dst in moves:
             os.replace(src, dst)
             done.append((src, dst))
-    except OSError:
+    except OSError as e:
+        not_restored: List[Path] = []
         for src, dst in reversed(done):
             try:
                 os.replace(dst, src)
             except OSError:
-                logger.error(f"Renumber rollback failed to restore {dst} -> {src}; manual recovery needed")
+                logger.error(f"Renumber rollback failed to restore {dst} -> {src}; left at {dst}, manual recovery needed")
+                not_restored.append(src)
+        e.not_restored = not_restored
         raise
     return done
 
@@ -428,26 +432,35 @@ def renumber_collection_images(
     (Record.sequence, then creation time; within a record, left/single
     before right, then image id as a stable tie-breaker).
 
-    All-or-nothing on the filesystem: renames go through a two-phase
-    old-name -> unique temp name -> final sequential name sequence so the
-    old and new numbering schemes can never collide (e.g. file "0002"
-    becoming "0001" while "0001" hasn't been vacated yet), and any OSError
-    during either phase unwinds every rename already applied. The caller is
-    responsible for committing (or rolling back) the DB session afterwards.
+    Renames go through a two-phase old-name -> unique temp name -> final
+    sequential name sequence so the old and new numbering schemes can never
+    collide (e.g. file "0002" becoming "0001" while "0001" hasn't been
+    vacated yet). An OSError during either phase starts an unwind that puts
+    every renamed file back under its original name. A step of the unwind
+    that itself fails is logged at ERROR and leaves that file under a
+    `.renumber_*` temp name (or, in phase 2, wherever the failed step left
+    it); those originals are listed on the raised exception's
+    `not_restored`. The caller is responsible for committing (or rolling
+    back) the DB session afterwards.
 
     A RAW master's `_preview.jpg` sidecar is renamed with it, to the name the
     master's final name derives (NEH-267), in the same two phases and under
-    the same rollback, so a master is never renumbered away from its sidecar.
+    the same unwind, so a renumber that completes leaves each master and its
+    sidecar under the same new number.
 
     When the caller passes `applied`, it receives the (original path, final
     path) pair of every file renamed, so that a caller whose commit fails can
     hand them to `restore_original_names`.
 
-    Raises ValueError if an image's file is missing on disk, the computed
-    plan would produce duplicate filenames (defensive; should not happen), or
-    a RAW master's new sidecar name already holds a `_preview.jpg` that no
-    image in the collection owns.
-    Raises OSError if a filesystem rename fails after the plan validated.
+    Raises ValueError, before anything is renamed, if an image's file is
+    missing on disk, the computed plan would produce duplicate filenames
+    (defensive; should not happen), a new name is already held by a file no
+    image in the collection owns, a new name's stem is shared by such a file
+    with another suffix, or a RAW master's new sidecar name already holds a
+    `_preview.jpg` that no image in the collection owns.
+    Raises OSError if a filesystem rename fails after the plan validated. The
+    exception carries `not_restored`, the original paths the unwind could not
+    put back (empty when every file went back).
     """
     from capture.project_manager import secure_project_filename
 
@@ -496,6 +509,20 @@ def renumber_collection_images(
             carried.add(sidecar)
             sidecar_moves.append((sidecar, preview_sidecar_of(final)))
     sources = {src for src, _ in file_moves} | carried
+    # Every image of every record in the collection is a source, so a file
+    # that is not one belongs elsewhere: two collections of the same name share
+    # one directory (collection_capture_root uses only the name) and derive the
+    # same `<prefix>_NNNN` names, and os.replace would overwrite the other
+    # collection's master without a trace. A same-stem file with another suffix
+    # names the same sidecar, the clash relocate_image refuses as well.
+    for _, _, final in plan:
+        if final.exists() and final.resolve() not in sources:
+            raise ValueError(f"Renumbering would overwrite {final.name}, which no image in this collection owns")
+        for other in final.parent.glob(glob.escape(final.stem) + ".*"):
+            if other.stem == final.stem and other != final and other.resolve() not in sources:
+                raise ValueError(
+                    f"Renumbering would name {final.name} beside {other.name}, which no image in this collection owns"
+                )
     for _, src, final in plan:
         if not is_raw_suffix(src):
             continue
@@ -516,15 +543,16 @@ def renumber_collection_images(
     _do_renames(to_temp)
 
     # Phase 2: move each temp file to its final sequential name. Where each
-    # file is at is tracked, so a failure partway restores every file to its
-    # ORIGINAL name, whether it sits under its temp name or its final one.
+    # file is at is tracked, so a failure partway hands every file, at its
+    # temp name or its final one, to restore_original_names; the originals it
+    # could not put back go out on the exception.
     current = [temp for _, temp in to_temp]
     try:
         for i, (_, final) in enumerate(file_moves):
             os.replace(current[i], final)
             current[i] = final
-    except OSError:
-        restore_original_names([(orig, cur) for (orig, _), cur in zip(to_temp, current)])
+    except OSError as e:
+        e.not_restored = restore_original_names([(orig, cur) for (orig, _), cur in zip(to_temp, current)])
         raise
     if applied is not None:
         applied.extend((orig, final) for (orig, _), (_, final) in zip(to_temp, file_moves))
