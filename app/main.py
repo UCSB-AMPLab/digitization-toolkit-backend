@@ -38,6 +38,11 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         reconcile_pending_rename(db)
+        # Move files from the name-based collection directories into the
+        # id-based ones, completing a batch a crash interrupted; a no-op once
+        # the active root is done (app.core.volume_layout).
+        from app.core.volume_layout import migrate_volume_layout_at_startup
+        migrate_volume_layout_at_startup(db)
     finally:
         db.close()
     # Schedule the offsite catalogue dump (NEH-249). A no-op on a unit with no
