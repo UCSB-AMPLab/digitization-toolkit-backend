@@ -41,3 +41,91 @@ def test_a_v1_journal_left_by_the_earlier_commits_is_completed(db_session, legac
     assert Path(row.file_path) == dst
     assert dst.read_bytes() == b"bytes of IMG_0002.jpg"
     assert not (data_dir / JOURNAL_NAME).exists()
+
+
+# ---------------------------------------------------------------------------
+# A pending sidecar whose master was renamed after the sidecar failed to follow
+# ---------------------------------------------------------------------------
+
+def _fail_sidecars_once(vl, monkeypatch, db):
+    """Run the migration at startup with every sidecar move failing, then restore the real move."""
+    real = vl._move
+
+    def flaky(src, dst):
+        if Path(dst).name.endswith("_preview.jpg"):
+            raise OSError(5, "Input/output error")
+        real(src, dst)
+
+    monkeypatch.setattr(vl, "_move", flaky)
+    vl.migrate_volume_layout_at_startup(db)
+    monkeypatch.setattr(vl, "_move", real)
+    return real
+
+
+@pytest.mark.unit
+def test_a_pending_sidecar_whose_master_is_renumbered_meanwhile_is_not_silently_dropped(db_session, legacy, monkeypatch):
+    """The backend serves while a sidecar is pending, and a renumber renames its master."""
+    import app.core.volume_layout as vl
+    from app.core.paths import preview_sidecar_of
+    from app.core.storage_ops import renumber_collection_images
+    from app.models.record import RecordImage
+
+    _fail_sidecars_once(vl, monkeypatch, db_session)
+    renumber_collection_images(db_session, legacy["a1"])
+    db_session.commit()
+
+    report = vl.migrate_volume_layout(db_session)
+
+    db_session.expire_all()
+    master = Path(db_session.get(RecordImage, legacy["i1"].id).file_path)
+    assert master.name != "IMG_0001.CR2"
+    sidecar = preview_sidecar_of(master)
+    assert sidecar.read_bytes() == b"preview of IMG_0001"
+    assert not (legacy["shared"] / "IMG_0001_preview.jpg").exists()
+    assert {"from": str((legacy["shared"] / "IMG_0001_preview.jpg").resolve()), "to": str(sidecar)} in report["sidecars_moved"]
+    assert all(s["image_id"] != legacy["i1"].id for s in vl._read_pending_sidecars())
+
+
+@pytest.mark.unit
+def test_a_pending_sidecar_whose_new_name_is_taken_is_kept_and_logged_with_both_paths(
+        db_session, legacy, monkeypatch, caplog):
+    import app.core.volume_layout as vl
+    from app.core.paths import preview_sidecar_of
+    from app.core.storage_ops import renumber_collection_images
+    from app.models.record import RecordImage
+
+    _fail_sidecars_once(vl, monkeypatch, db_session)
+    renumber_collection_images(db_session, legacy["a1"])
+    db_session.commit()
+    db_session.expire_all()
+    master = Path(db_session.get(RecordImage, legacy["i1"].id).file_path)
+    taken = preview_sidecar_of(master)
+    taken.write_bytes(b"someone else's preview")
+    old = (legacy["shared"] / "IMG_0001_preview.jpg").resolve()
+
+    with caplog.at_level("WARNING"):
+        report = vl.migrate_volume_layout(db_session)
+
+    assert taken.read_bytes() == b"someone else's preview"
+    assert old.read_bytes() == b"preview of IMG_0001"
+    assert [s["from"] for s in report["sidecars_pending"] if s["image_id"] == legacy["i1"].id] == [str(old)]
+    assert any(s["image_id"] == legacy["i1"].id for s in vl._read_pending_sidecars())
+    assert str(old) in caplog.text and str(taken) in caplog.text
+
+
+@pytest.mark.unit
+def test_a_pending_sidecar_whose_master_row_is_gone_is_kept_and_logged(db_session, legacy, monkeypatch, caplog):
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    _fail_sidecars_once(vl, monkeypatch, db_session)
+    db_session.delete(db_session.get(RecordImage, legacy["i1"].id))
+    db_session.commit()
+    old = (legacy["shared"] / "IMG_0001_preview.jpg").resolve()
+
+    with caplog.at_level("WARNING"):
+        report = vl.migrate_volume_layout(db_session)
+
+    assert old.read_bytes() == b"preview of IMG_0001"
+    assert [s["from"] for s in report["sidecars_pending"] if s["image_id"] == legacy["i1"].id] == [str(old)]
+    assert str(old) in caplog.text

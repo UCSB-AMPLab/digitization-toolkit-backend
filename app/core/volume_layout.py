@@ -721,31 +721,61 @@ def _commit_batch(db: Session, root: Path, batch: dict, report: dict) -> None:
 
 
 def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> None:
-    """Move each sidecar a previous run could not move, if its master is still where it was put.
+    """Move each sidecar a previous run could not move to beside its master's current file.
 
     The sidecar's old and new paths were recorded when its move failed,
     because only then are both known: the capture manifest holds capture-time
     paths, which a later relocation makes stale, and a sidecar need not be in
-    it. An entry is dropped when the sidecar has moved, when its master's row
-    names another file, or when the sidecar is gone (logged); the others are
-    kept and reported under "sidecars_pending".
+    it. The entry is keyed by image id. When the master's row names another
+    file than the one recorded (a renumber renamed it while the sidecar
+    waited), the sidecar goes beside that file, under the name its stem
+    derives (preview_sidecar_of), as a renumber would have named it, and the
+    entry is updated to match. An entry is dropped when the sidecar is at its
+    destination and gone from its old path, or when it is gone from both
+    (logged). An entry whose master row is gone, whose master file is
+    missing or is not RAW, whose destination is taken or outside the root, or
+    whose move fails is kept, logged with both paths, and reported under
+    "sidecars_pending"; nothing is dropped without a log line.
     """
     entries = _read_pending_sidecars()
     if not entries:
         return
     keep: List[dict] = []
     originals: List[Path] = []
+
+    def pending(s: dict, why: str) -> None:
+        logger.warning(f"Volume layout: sidecar {s['from']} of image {s['image_id']} not moved to {s['to']}: {why}; "
+                       "kept for the next run")
+        keep.append(s)
+        report["sidecars_pending"].append(s)
+
     for s in entries:
+        frm = Path(s["from"])
         img = db.get(RecordImage, s["image_id"])
-        frm, to, master = Path(s["from"]), Path(s["to"]), Path(s["master"])
-        if img is None or img.file_path != s["master"] or not master.is_file():
+        if img is None:
+            pending(s, "the image's row is gone")
             continue
-        if to.exists():
+        master = resolve_within_storage(img.file_path)
+        if master is None or not master.is_file():
+            pending(s, f"its master is not at {img.file_path}")
             continue
+        if img.file_path != s["master"]:
+            if not is_raw_suffix(master):
+                pending(s, f"its master's row now names {img.file_path}, which is not a RAW master")
+                continue
+            logger.warning(f"Volume layout: the master of pending sidecar {frm} was renamed from {s['master']} "
+                           f"to {img.file_path}; the sidecar follows it")
+            s = dict(s, master=img.file_path, to=str(preview_sidecar_of(master)))
+        to = Path(s["to"])
         if not frm.exists():
-            logger.warning(f"Volume layout: the sidecar of {master} is gone from {frm}; no longer retried")
+            if not to.exists():
+                logger.warning(f"Volume layout: the sidecar of {master} is gone from {frm} and is not at {to}; "
+                               "no longer retried")
             continue
-        if dry_run or not to.is_relative_to(root):
+        if not to.is_relative_to(root):
+            pending(s, f"{to} is outside the projects root {root}")
+            continue
+        if dry_run:
             keep.append(s)
             report["sidecars_pending"].append(s)
             continue
@@ -756,9 +786,7 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
             _fsync_dir(frm.parent)
             _fsync_dir(to.parent)
         except OSError as err:
-            logger.warning(f"Volume layout: sidecar {frm} still cannot be moved to {to}: {err}")
-            keep.append(s)
-            report["sidecars_pending"].append(s)
+            pending(s, str(err))
             continue
         originals.append(frm)
         report["sidecars_moved"].append({"from": s["from"], "to": s["to"]})
