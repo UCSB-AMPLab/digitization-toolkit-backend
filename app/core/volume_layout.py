@@ -18,8 +18,12 @@ What is moved, and how:
 - A row whose old path is gone but whose file is already in its collection's
   directory, under its own name or under the name the migration gives a
   clashing file (`<stem>_img<image id>`), and that no other row names, is
-  pointed at that file. This is the state after a database restored from
-  before the migration (rollback-update.sh) on files the migration moved.
+  pointed at that file, but only when the file's sha256 matches the one its
+  capture record in the project manifest holds (the only checksum the
+  system keeps for an image). This is the state after a database restored
+  from before the migration (rollback-update.sh) on files the migration
+  moved. A row with no such checksum, or whose candidate does not match, is
+  reported as missing and the candidate as a file no row references.
 - A RAW master's `_preview.jpg` sidecar moves with it and keeps the name its
   master's final name derives. A sidecar that cannot follow is recorded in a
   second file in the data directory, retried at every run, and reported until
@@ -335,22 +339,52 @@ def _owners(db: Session) -> Dict[Path, int]:
     return owners
 
 
-def _adoptable(target: Path, src: Path, image_id: int, owners: Dict[Path, int]) -> Optional[Path]:
-    """The file in `target` a row whose old path is gone already has, or None.
+def _capture_checksum(index: Tuple[dict, dict], capture_id: Optional[str], src: Path) -> Optional[str]:
+    """The capture-time sha256 the manifest holds for the file a row stored at `src`, or None.
 
-    Its own name, or one of the names the migration gives a clashing master,
-    held by a file no row references.
+    The capture manifest is the only checksum the system holds for an image
+    (the image row has no checksum column), so a row with no capture id, or
+    whose capture record does not list the file, has none. The lookup is the
+    one app.core.integrity makes: by resolved path, then by file name, after
+    the relocation records have been followed.
     """
+    if not capture_id:
+        return None
+    by_path, by_name = index
+    return by_path.get(capture_id, {}).get(str(src)) or by_name.get(capture_id, {}).get(src.name)
+
+
+def _adoptable(target: Path, src: Path, image_id: int, owners: Dict[Path, int],
+               checksum: Optional[str]) -> Tuple[Optional[Path], List[Path]]:
+    """The file in `target` a row whose old path is gone already has, and the candidates refused.
+
+    A candidate is a file no row references under the row's own name or one
+    of the names the migration gives a clashing master. It is adopted only
+    when its bytes hash to `checksum`, the capture-time sha256 held for the
+    row; with no checksum nothing is adopted, since a file of the same name
+    may be another page. Returns (the adopted file or None, the candidates
+    looked at and refused), the latter for reporting as unreferenced.
+    """
+    from app.core.integrity import _sha256
+
     names = [src.name]
     for i, stem in enumerate(_suffixed_stems(src.stem, image_id)):
         if i >= 20:
             break
         names.append(f"{stem}{src.suffix}")
+    refused: List[Path] = []
     for name in names:
         cand = target / name
-        if cand.is_file() and cand.resolve() not in owners:
-            return cand
-    return None
+        if not cand.is_file() or cand.resolve() in owners:
+            continue
+        if checksum is not None:
+            try:
+                if _sha256(cand) == checksum:
+                    return cand, refused
+            except OSError as e:
+                logger.warning(f"Volume layout: could not read {cand} to compare it with the capture checksum: {e}")
+        refused.append(cand)
+    return None, refused
 
 
 def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple[List[dict], List[dict], List[str]]:
@@ -365,6 +399,8 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     from app.core.storage_ops import resolve_project
 
     owners = _owners(db)
+    manifest_index: List[Tuple[dict, dict]] = []  # built on the first row whose file is missing
+    refused: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
     dirs: Dict[Path, _Dir] = {}
     stem_for: Dict[Tuple[Path, int, str], str] = {}
@@ -418,10 +454,16 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         thumb_dir = target.parent / "thumbnails"
 
         if not src.is_file():
-            found = _adoptable(target, src, iid, owners)
+            if not manifest_index:
+                from app.core.integrity import _build_manifest_index
+                manifest_index.append(_build_manifest_index(root))
+            checksum = _capture_checksum(manifest_index[0], img.capture_id, src)
+            found, not_taken = _adoptable(target, src, iid, owners, checksum)
+            refused.update(p.resolve() for p in not_taken)
             if found is None:
                 skipped.append({"image_id": iid, "path": str(src), "reason": "missing"})
                 continue
+            refused.discard(found.resolve())
             entry["adopt"], entry["to"] = True, str(found)
             owners[found.resolve()] = img.record_id
             if img.thumbnail_path and (thumb is None or not thumb.is_file()):
@@ -475,6 +517,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         batches.setdefault(cid, []).append(entry)
 
     left = _unreferenced_in_collection_dirs(db, root, owners, sources)
+    # A refused candidate sits in an id-based directory, which the scan above
+    # does not walk, so it is added here unless a row has since claimed it.
+    left += [str(p) for p in sorted(refused) if p not in owners and str(p) not in left]
     return ([{"collection_id": cid, "entries": e} for cid, e in batches.items()], skipped, left)
 
 

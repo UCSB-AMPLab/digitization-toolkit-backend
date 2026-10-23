@@ -321,7 +321,7 @@ def legacy(db_session, capture_settings, data_dir, override_projects_root):
     }
 
 
-def _expected_end_state(L) -> dict:
+def _expected_end_state(L, manifest: bytes = b"{}\n") -> dict:
     """Where each file is after a complete migration, relative to the root, with its bytes."""
     a1, a2, tomo = (f"proj/collection-{L[k].id}" for k in ("a1", "a2", "tomo"))
     return {
@@ -336,7 +336,7 @@ def _expected_end_state(L) -> dict:
         f"{tomo}/images/main/0001.jpg": b"bytes of 0001.jpg",
         "proj/images/main/p.jpg": b"bytes of p.jpg",
         "proj/fondo_a/images/main/stray.jpg": b"no row",
-        "proj/metadata/manifest.jsonl": b"{}\n",
+        "proj/metadata/manifest.jsonl": manifest,
     }
 
 
@@ -344,11 +344,11 @@ def _on_disk(root: Path) -> dict:
     return {str(p.relative_to(root)): p.read_bytes() for p in sorted(root.rglob("*")) if p.is_file()}
 
 
-def _assert_migrated(db_session, L):
+def _assert_migrated(db_session, L, manifest: bytes = b"{}\n"):
     from app.models.record import RecordImage
 
     root = L["root"]
-    assert _on_disk(root) == _expected_end_state(L)
+    assert _on_disk(root) == _expected_end_state(L, manifest)
     db_session.expire_all()
     by_id = {i.id: i for i in db_session.query(RecordImage).all()}
 
@@ -686,11 +686,32 @@ def test_deleting_an_empty_collection_removes_its_id_directory(client, db_sessio
 # Rows decide; restores, retries, clashes, durability, fixity
 # ---------------------------------------------------------------------------
 
+def _capture_records(db_session, L) -> bytes:
+    """Give each collection image a capture id and its capture record in the project manifest; return the manifest."""
+    import json
+    from app.models.record import RecordImage
+
+    lines = []
+    for key in ("i1", "i2", "i3a", "i3b", "i4"):
+        img = db_session.get(RecordImage, L[key].id)
+        img.capture_id = f"cap-{key}"
+        path = Path(img.file_path)
+        rel = str(path.relative_to(L["root"] / "proj"))
+        lines.append(json.dumps({"capture_id": img.capture_id, "files": [
+            {"relative_path": rel, "sha256": hashlib.sha256(path.read_bytes()).hexdigest()}]}))
+    db_session.commit()
+    manifest = ("\n".join(lines) + "\n").encode()
+    (L["root"] / "proj" / "metadata" / "manifest.jsonl").write_bytes(manifest)
+    return manifest
+
+
 @pytest.mark.unit
 def test_a_database_restored_from_before_the_migration_is_pointed_at_the_moved_files(db_session, legacy):
+    """Each row is pointed at the moved file whose bytes match its capture record's checksum."""
     import app.core.volume_layout as vl
     from app.models.record import RecordImage
 
+    manifest = _capture_records(db_session, legacy)
     before = {i.id: (i.file_path, i.filename, i.thumbnail_path) for i in db_session.query(RecordImage).all()}
     vl.migrate_volume_layout_at_startup(db_session)
     files = _files(legacy["root"])
@@ -703,7 +724,34 @@ def test_a_database_restored_from_before_the_migration_is_pointed_at_the_moved_f
     assert _files(legacy["root"]) == files  # no file moved
     assert sorted(a["image_id"] for a in report["adopted"]) == sorted(
         legacy[k].id for k in ("i1", "i2", "i3a", "i3b", "i4"))
-    _assert_migrated(db_session, legacy)
+    _assert_migrated(db_session, legacy, manifest)
+
+
+@pytest.mark.unit
+def test_a_restored_database_with_no_capture_checksums_is_not_pointed_at_files_by_name(db_session, legacy):
+    """With no checksum to compare, a file of the row's name may be another page: the rows are reported missing."""
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    before = {i.id: (i.file_path, i.filename, i.thumbnail_path) for i in db_session.query(RecordImage).all()}
+    vl.migrate_volume_layout_at_startup(db_session)
+    files = _files(legacy["root"])
+    for img in db_session.query(RecordImage).all():
+        img.file_path, img.filename, img.thumbnail_path = before[img.id]
+    db_session.commit()
+
+    report = vl.migrate_volume_layout(db_session)
+
+    assert _files(legacy["root"]) == files
+    assert report["adopted"] == []
+    keys = ("i1", "i2", "i3a", "i3b", "i4")
+    assert sorted(s["image_id"] for s in report["skipped"] if s["reason"] == "missing") == sorted(legacy[k].id for k in keys)
+    assert {i.id: i.file_path for i in db_session.query(RecordImage).all()} == {k: v[0] for k, v in before.items()}
+    root = legacy["root"].resolve()
+    for key, rel in (("i1", f"collection-{legacy['a1'].id}/images/main/IMG_0001.CR2"),
+                     ("i2", f"collection-{legacy['a2'].id}/images/main/IMG_0002.jpg"),
+                     ("i4", f"collection-{legacy['tomo'].id}/images/main/0001.jpg")):
+        assert str(root / "proj" / rel) in report["left_unreferenced"], key
 
 
 @pytest.mark.unit
