@@ -22,7 +22,7 @@ from app.api.records import _apply_status_change, _assert_promotable, is_movable
 from app.core.audit import log_event
 from app.core.record_status import record_bulk_status_changes
 from app.core.config import settings
-from app.core.export_jobs import export_jobs
+from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
@@ -39,6 +39,11 @@ logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+EXPORT_IN_SUBTREE_MESSAGE = (
+    "An export of this collection, or of a collection inside it, is running. "
+    "Wait for it to finish, then try again."
+)
 
 
 @router.post("/", response_model=CollectionRead, status_code=201)
@@ -218,6 +223,10 @@ def update_collection(
     Update a collection.
     
     Can update name, description, type, metadata, or move to different parent collection.
+
+    A rename or re-parent moves the files of every record in the collection and
+    its sub-collections, so it is refused with 409 while an export of any of
+    them is queued or running. Other edits are not refused.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -242,41 +251,46 @@ def update_collection(
             if not current:
                 break
     
-    # Update fields
+    # A rename or cross-project re-parent changes the on-disk dir; relocate files
     old_name = collection.name
     old_parent = collection.parent_collection_id
     update_data = payload.model_dump(exclude_unset=True)
-    for field, value in update_data.items():
-        setattr(collection, field, value)
-
-    # A collection has exactly one parent: nesting it clears its direct project link
-    if collection.parent_collection_id is not None:
-        collection.project_id = None
-
-    # A rename or cross-project re-parent changes the on-disk dir; relocate files
     layout_changed = (
         ("name" in update_data and update_data["name"] != old_name)
         or ("parent_collection_id" in update_data and update_data["parent_collection_id"] != old_parent)
     )
     not_moved: List[str] = []
     moves: List = []
-    if layout_changed:
-        from capture.project_manager import image_output_dir
+    # A layout change relocates the files of every record in the subtree, and
+    # an export of any collection in it reads those files by path, so the
+    # whole subtree is held against exports, before anything is changed, until
+    # the files have moved and the commit is done.
+    held_ids = collection_and_descendants(db, collection.id) if layout_changed else []
+    with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_SUBTREE_MESSAGE):
+        # Update fields
+        for field, value in update_data.items():
+            setattr(collection, field, value)
 
-        project_name = resolve_project_name(db, collection)
-        if project_name:
-            subtree_ids = collection_and_descendants(db, collection.id)
-            names = {
-                c.id: c.name
-                for c in db.query(Collection).filter(Collection.id.in_(subtree_ids)).all()
-            }
-            records = db.query(Record).filter(Record.collection_id.in_(subtree_ids)).all()
-            for r in records:
-                target_dir = image_output_dir(project_name, names.get(r.collection_id))
-                moves.extend((img, target_dir) for img in r.images)
+        # A collection has exactly one parent: nesting it clears its direct project link
+        if collection.parent_collection_id is not None:
+            collection.project_id = None
 
-    # A failed move or commit puts every file already moved back.
-    relocate_images_and_commit(db, moves, not_moved, f"Update of collection {collection_id}")
+        if layout_changed:
+            from capture.project_manager import image_output_dir
+
+            project_name = resolve_project_name(db, collection)
+            if project_name:
+                names = {
+                    c.id: c.name
+                    for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all()
+                }
+                records = db.query(Record).filter(Record.collection_id.in_(held_ids)).all()
+                for r in records:
+                    target_dir = image_output_dir(project_name, names.get(r.collection_id))
+                    moves.extend((img, target_dir) for img in r.images)
+
+        # A failed move or commit puts every file already moved back.
+        relocate_images_and_commit(db, moves, not_moved, f"Update of collection {collection_id}")
     db.refresh(collection)
     if not_moved:
         # Preview sidecars that stayed in the old directory (see relocate_image).
@@ -345,11 +359,15 @@ def move_collection_records(
     for r in records:
         r.collection_id = target_collection_id
         moves.extend((img, target_dir) for img in r.images)
-    # A failed move or commit puts every file already moved back.
-    relocate_images_and_commit(
-        db, moves, not_moved,
-        f"Move of records from collection {collection_id} to {target_collection_id}",
-    )
+    # Only the source is held: its records' files leave the paths an export of
+    # it would read. The target's existing files are not touched, because
+    # relocate_image never moves a file onto one that is there.
+    with export_jobs.hold_for_file_changes([collection_id]):
+        # A failed move or commit puts every file already moved back.
+        relocate_images_and_commit(
+            db, moves, not_moved,
+            f"Move of records from collection {collection_id} to {target_collection_id}",
+        )
 
     logger.info(f"Moved {len(records)} records from collection {collection_id} to {target_collection_id}")
     body = {"moved": len(records), "target_collection_id": target_collection_id}
@@ -477,11 +495,20 @@ def renumber_images(
     the database is left untouched; a file the unwind could not put back is
     logged at ERROR and left under a temporary name, and the 500's detail
     says that not every file went back.
+
+    Refused with 409 while an export of the collection is queued or running,
+    since the export reads the files by their current names.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
+    with export_jobs.hold_for_file_changes([collection_id]):
+        return _renumber_held(db, collection, collection_id, current_user)
+
+
+def _renumber_held(db: Session, collection: Collection, collection_id: int, current_user: User) -> dict:
+    """The body of renumber_images, run while the collection is held against exports."""
     applied: List = []
     try:
         result = renumber_collection_images(db, collection, applied)
@@ -767,7 +794,10 @@ def export_collection_bagit(
     # One export per collection at a time: a retry returns the running job instead of
     # stacking a second export that doubles disk pressure. Integrity checks and the
     # zip build happen in the job, surfaced via the status endpoint.
-    job = export_jobs.start(collection_id, lambda j: run_export(j, collection_id))
+    try:
+        job = export_jobs.start(collection_id, lambda j: run_export(j, collection_id))
+    except ExportBlockedError as e:
+        raise HTTPException(status_code=409, detail=str(e))
     log_event(db, level="INFO", category="activity", action="export_started",
               actor=current_user.username, subject=collection.name)
     return {

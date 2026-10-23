@@ -6,8 +6,10 @@ from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
 import logging
 
+from app.core.export_jobs import export_jobs
 from app.core.storage_ops import (
     collection_and_descendants,
+    collection_ids_under_project,
     move_project_tree,
     rebase_stored_path,
     relocate_images_and_commit,
@@ -37,6 +39,11 @@ logger = logging.getLogger(__name__)
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+EXPORT_IN_PROJECT_MESSAGE = (
+    "An export of a collection in this project is running. "
+    "Wait for it to finish, then try again."
+)
 
 
 class ProjectInitRequest(BaseModel):
@@ -153,7 +160,11 @@ def update_project(
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
-    """Update a project's details, moving its on-disk tree if the name changes."""
+    """Update a project's details, moving its on-disk tree if the name changes.
+
+    A rename is refused with 409 while an export of any collection in the
+    project is queued or running.
+    """
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
@@ -166,6 +177,15 @@ def update_project(
         if existing:
             raise HTTPException(status_code=409, detail="Project with this name already exists")
 
+    # A rename moves the whole tree, so every collection of the project is held
+    # against exports from before the change until the commit.
+    held_ids = collection_ids_under_project(db, p.id) if name_changed else []
+    with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_PROJECT_MESSAGE):
+        return _update_project_held(db, p, payload, old_name, name_changed)
+
+
+def _update_project_held(db: Session, p: Project, payload: ProjectUpdate, old_name: str, name_changed: bool) -> ProjectRead:
+    """The body of update_project, run while the project's collections are held against exports."""
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, field, value)
 
@@ -244,6 +264,9 @@ def move_collections(
     """
     Move all top-level collections from this project to another project.
     Sub-collections follow automatically through their parent FK.
+
+    Refused with 409 while an export of any of the moved collections is
+    queued or running.
     """
     from capture.project_manager import image_output_dir
 
@@ -261,31 +284,35 @@ def move_collections(
     for c in db.query(Collection).filter(Collection.project_id == project_id).all():
         moved_collection_ids.extend(collection_and_descendants(db, c.id))
 
-    # Re-parent the top-level collections; descendants follow via parent FK
-    moved = (
-        db.query(Collection)
-        .filter(Collection.project_id == project_id)
-        .update({"project_id": payload.target_project_id}, synchronize_session=False)
-    )
+    # The moved collections' files leave the paths an export of any of them
+    # reads, so they are held against exports until the move is committed.
+    with export_jobs.hold_for_file_changes(moved_collection_ids, EXPORT_IN_PROJECT_MESSAGE):
+        # Re-parent the top-level collections; descendants follow via parent FK
+        moved = (
+            db.query(Collection)
+            .filter(Collection.project_id == project_id)
+            .update({"project_id": payload.target_project_id}, synchronize_session=False)
+        )
 
-    # Relocate the image files so they physically live under the target project
-    not_moved: list[str] = []
-    moves: list = []
-    if moved_collection_ids:
-        names = {
-            c.id: c.name
-            for c in db.query(Collection).filter(Collection.id.in_(moved_collection_ids)).all()
-        }
-        records = db.query(Record).filter(Record.collection_id.in_(moved_collection_ids)).all()
-        for r in records:
-            target_dir = image_output_dir(target.name, names.get(r.collection_id))
-            moves.extend((img, target_dir) for img in r.images)
+        # Relocate the image files so they physically live under the target project
+        not_moved: list[str] = []
+        moves: list = []
+        if moved_collection_ids:
+            names = {
+                c.id: c.name
+                for c in db.query(Collection).filter(Collection.id.in_(moved_collection_ids)).all()
+            }
+            records = db.query(Record).filter(Record.collection_id.in_(moved_collection_ids)).all()
+            for r in records:
+                target_dir = image_output_dir(target.name, names.get(r.collection_id))
+                moves.extend((img, target_dir) for img in r.images)
 
-    # A failed move or commit puts every file already moved back.
-    relocate_images_and_commit(
-        db, moves, not_moved,
-        f"Move of collections from project {project_id} to {payload.target_project_id}",
-    )
+        # A failed move or commit puts every file already moved back.
+        relocate_images_and_commit(
+            db, moves, not_moved,
+            f"Move of collections from project {project_id} to {payload.target_project_id}",
+        )
+
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
               subject=f"{source.name} -> {target.name} ({moved} collections)")

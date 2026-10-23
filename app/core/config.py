@@ -80,12 +80,22 @@ class Settings(BaseSettings):
     
     @property
     def projects_dir(self) -> Path:
-        # A corrupt override value (e.g. a path to a non-existent disk) is treated as "no override" so the fallback root is used instead. 
-        # This avoids splitting a project across two disks if the operator accidentally removes the external drive.
+        # The active projects root, for reading. An override file that cannot be
+        # parsed is treated as no override, so the default root is used (and
+        # GET /system/storage reports override_invalid). An override that can be
+        # parsed is used as it is, even when its path does not exist or is not
+        # on a mounted drive: falling back to the SD card there would split a
+        # project across two disks. Writers get their root from
+        # storage_override.writable_projects_dir, which refuses such a path.
         from app.core.storage_override import get_storage_override_or_fallback
         override, _corrupt = get_storage_override_or_fallback()
         if override:
             return Path(override)
+        return self.default_projects_dir
+
+    @property
+    def default_projects_dir(self) -> Path:
+        """The projects root when no storage override is in effect."""
         return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
     
     @property

@@ -27,6 +27,8 @@ from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_sto
 from app.core.record_status import change_record_status
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
+from app.core.export_jobs import export_jobs
+from app.core.storage_override import refuse_writes_under_unusable_root
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -158,6 +160,11 @@ def _delete_response(detail: str, not_removed: List[str]) -> dict:
 	if not_removed:
 		body["not_removed"] = not_removed
 	return body
+
+
+def _collection_of(rec: Optional[Record]) -> List[int]:
+	"""The record's collection id as a list for export_jobs.hold_for_file_changes; empty when it has none."""
+	return [rec.collection_id] if rec is not None and rec.collection_id is not None else []
 
 
 def _supersede_current_images(record: Record) -> None:
@@ -359,9 +366,12 @@ def delete_record(
 	for img in rec.images:
 		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
 
-	db.delete(rec)
-	db.commit()
-	not_removed = _unlink_after_commit(files_to_unlink)
+	# An export of the record's collection reads these files; refused while one
+	# runs. No check of the storage root here: a delete creates nothing.
+	with export_jobs.hold_for_file_changes(_collection_of(rec)):
+		db.delete(rec)
+		db.commit()
+		not_removed = _unlink_after_commit(files_to_unlink)
 	return _delete_response(f"Record {rec_id} and {image_count} images deleted", not_removed)
 
 
@@ -598,30 +608,35 @@ def delete_image(
 	]
 	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
 
-	record_id = img.record_id
-	db.delete(img)
+	# An export of the record's collection reads this file if it is current;
+	# refused while one runs, and held from before the delete until the file
+	# is unlinked. A superseded image is not read by an export, so it is not
+	# held. No check of the storage root here: a delete creates nothing.
+	with export_jobs.hold_for_file_changes(_collection_of(rec) if img.is_current else []):
+		record_id = img.record_id
+		db.delete(img)
 
-	# An emptied approved record goes back to the queue, in the same
-	# transaction and under the same row lock as the delete that emptied it.
-	# It used to be a second read-and-write after the commit, which is the
-	# pattern this whole guard exists to remove: the status it read could
-	# already have moved. Counting the siblings rather than reading
-	# rec.images keeps the answer independent of when the delete is flushed.
-	remaining_current = (
-		db.query(RecordImage)
-		.filter(
-			RecordImage.record_id == record_id,
-			RecordImage.is_current.is_(True),
-			RecordImage.id != img_id,
+		# An emptied approved record goes back to the queue, in the same
+		# transaction and under the same row lock as the delete that emptied it.
+		# It used to be a second read-and-write after the commit, which is the
+		# pattern this whole guard exists to remove: the status it read could
+		# already have moved. Counting the siblings rather than reading
+		# rec.images keeps the answer independent of when the delete is flushed.
+		remaining_current = (
+			db.query(RecordImage)
+			.filter(
+				RecordImage.record_id == record_id,
+				RecordImage.is_current.is_(True),
+				RecordImage.id != img_id,
+			)
+			.count()
 		)
-		.count()
-	)
-	if rec and rec.status == "approved" and remaining_current == 0:
-		change_record_status(db, rec, "in_review", current_user.username)
-		db.add(rec)
+		if rec and rec.status == "approved" and remaining_current == 0:
+			change_record_status(db, rec, "in_review", current_user.username)
+			db.add(rec)
 
-	db.commit()
-	not_removed = _unlink_after_commit(files_to_unlink)
+		db.commit()
+		not_removed = _unlink_after_commit(files_to_unlink)
 	return _delete_response("Image deleted", not_removed)
 
 
@@ -767,6 +782,10 @@ def get_image_thumbnail(
 		if source_path is None or not source_path.exists():
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
 		thumb_source = _raw_preview_sidecar(source_path) or source_path
+		# The thumbnail is written beside the source. A source under an
+		# override root that cannot take writes is refused (503) before the
+		# thumbnail's mkdir, rather than writing onto the SD card.
+		refuse_writes_under_unusable_root([source_path])
 		try:
 			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
 			thumbnails_dir = source_path.parent.parent / "thumbnails"

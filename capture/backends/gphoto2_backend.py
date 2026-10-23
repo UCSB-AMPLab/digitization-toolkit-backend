@@ -625,12 +625,16 @@ class GPhoto2Backend(CameraBackend):
         The import is function-local, exactly as camera_registry does it: this
         module is reached from capture.service, so a module-level import of the
         app config would be circular. When it fails - a test process with no
-        app config - persistence is simply off.
+        app config - persistence is simply off. It is off too while the storage
+        override names a root that cannot take writes (writable_projects_dir
+        raises StorageUnavailableError), so the save's mkdir never builds the
+        projects tree on the SD card.
         """
         try:
             from app.core.config import settings
+            from app.core.storage_override import writable_projects_dir
 
-            return Path(settings.projects_dir) / _BINDINGS_FILENAME
+            return writable_projects_dir(settings) / _BINDINGS_FILENAME
         except Exception:
             return None
 
@@ -652,34 +656,14 @@ class GPhoto2Backend(CameraBackend):
         camera backend that is about to be asked for a preview.
         """
         path = self._bindings_path()
+        # No path means the file could not be read at all (no app config, or
+        # a storage root that cannot take writes); _save_pins then merges
+        # with whatever the file holds by the time it can be written.
+        self._bindings_unread = path is None
         if path is None or not path.exists():
             return
         try:
-            data = json.loads(path.read_text(encoding="utf-8"))
-            if data.get("version") != _BINDINGS_VERSION:
-                raise ValueError(
-                    f"version {data.get('version')!r} is not {_BINDINGS_VERSION}"
-                )
-            pins = {}
-            for key, serial in data["pins"].items():
-                # The file is only ever written by _save_pins, in canonical
-                # form: decimal index strings and stripped serials. Anything
-                # else is a hand edit or corruption, and a key that is not
-                # canonical can collapse onto another index ("00" onto 0) or
-                # a serial can never match the stripped value a body answers.
-                if not isinstance(serial, str) or not serial or serial != serial.strip():
-                    raise ValueError(f"binding {key!r} has no canonical serial")
-                index = int(key)
-                if index < 0 or str(index) != key:
-                    raise ValueError(f"binding {key!r} is not a camera index")
-                if index in pins:
-                    raise ValueError(f"index {index} is bound twice")
-                if serial in pins.values():
-                    # Two indices bound to one body would reserve a side for
-                    # a body that can only ever be laid on the other one;
-                    # that is not a binding set, it is a corrupt one.
-                    raise ValueError(f"serial {serial!r} is bound to two indices")
-                pins[index] = serial
+            pins = self._parse_bindings(path)
         except Exception as exc:
             self.logger.warning(
                 f"[gphoto2] {path} is unreadable ({exc}); starting with no "
@@ -692,6 +676,36 @@ class GPhoto2Backend(CameraBackend):
         self._pins = pins
         self._seeded_serials = set(pins.values())
         self.logger.info(f"[gphoto2] seeded camera bindings from {path}: {pins}")
+
+    @staticmethod
+    def _parse_bindings(path) -> dict:
+        """The pins a bindings file holds; raises on any file that is not in canonical form."""
+        data = json.loads(path.read_text(encoding="utf-8"))
+        if data.get("version") != _BINDINGS_VERSION:
+            raise ValueError(
+                f"version {data.get('version')!r} is not {_BINDINGS_VERSION}"
+            )
+        pins = {}
+        for key, serial in data["pins"].items():
+            # The file is only ever written by _save_pins, in canonical
+            # form: decimal index strings and stripped serials. Anything
+            # else is a hand edit or corruption, and a key that is not
+            # canonical can collapse onto another index ("00" onto 0) or
+            # a serial can never match the stripped value a body answers.
+            if not isinstance(serial, str) or not serial or serial != serial.strip():
+                raise ValueError(f"binding {key!r} has no canonical serial")
+            index = int(key)
+            if index < 0 or str(index) != key:
+                raise ValueError(f"binding {key!r} is not a camera index")
+            if index in pins:
+                raise ValueError(f"index {index} is bound twice")
+            if serial in pins.values():
+                # Two indices bound to one body would reserve a side for
+                # a body that can only ever be laid on the other one;
+                # that is not a binding set, it is a corrupt one.
+                raise ValueError(f"serial {serial!r} is bound to two indices")
+            pins[index] = serial
+        return pins
 
     def _save_pins(self):
         """Persist the pins after any change, so a restart keeps left and right.
@@ -719,6 +733,25 @@ class GPhoto2Backend(CameraBackend):
                 snapshot = {
                     str(index): serial for index, serial in self._pins.items()
                 }
+            if getattr(self, "_bindings_unread", False):
+                # This backend never read the file (the root could not take
+                # writes when it started), so its pins were seeded from
+                # nothing. The file is read now, under the same lock, and its
+                # pins kept wherever neither the index nor the body is one of
+                # this backend's: the current pins win, and the operator's
+                # bindings for the rest are not overwritten. The pins in
+                # memory are left as they are.
+                try:
+                    on_disk = self._parse_bindings(path) if path.exists() else {}
+                except Exception as exc:
+                    self.logger.warning(f"[gphoto2] {path} is unreadable ({exc}); not merged")
+                    on_disk = {}
+                taken = set(snapshot.values())
+                for index, serial in on_disk.items():
+                    if str(index) not in snapshot and serial not in taken:
+                        snapshot[str(index)] = serial
+                        taken.add(serial)
+                snapshot = dict(sorted(snapshot.items(), key=lambda kv: int(kv[0])))
             payload = json.dumps(
                 {"version": _BINDINGS_VERSION, "pins": snapshot}, indent=2
             )

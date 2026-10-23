@@ -210,36 +210,53 @@ class ActivateStorageRequest(BaseModel):
 
 @router.get("/storage")
 def get_storage_info(current_user: User = Depends(allow_read_only)):
-    """Return current projects path and disk usage figures."""
+    """Return current projects path and disk usage figures.
+
+    The default root is created if it is missing. An override root never is:
+    when it is missing or not on a mounted drive (see
+    storage_override.override_root_problem) the response says available:false
+    and gives the reason in unavailable_reason, which is null otherwise.
+    """
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override_or_fallback
+    from app.core.storage_override import get_storage_override_or_fallback, override_root_problem
 
     # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
     override, override_invalid = get_storage_override_or_fallback()
     projects_path = settings.projects_dir
 
-    try:
-        projects_path.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(projects_path)
-    except OSError:
+    def unavailable(reason: str) -> dict:
         return {
-            "projects_path":    str(projects_path),
-            "is_override":      override is not None,
-            "override_invalid": override_invalid,
-            "total_bytes":      0,
-            "used_bytes":       0,
-            "free_bytes":       0,
-            "available":        False,
+            "projects_path":      str(projects_path),
+            "is_override":        override is not None,
+            "override_invalid":   override_invalid,
+            "total_bytes":        0,
+            "used_bytes":         0,
+            "free_bytes":         0,
+            "available":          False,
+            "unavailable_reason": reason,
         }
 
+    if override is not None:
+        problem = override_root_problem(projects_path)
+        if problem:
+            return unavailable(problem)
+
+    try:
+        if override is None:
+            projects_path.mkdir(parents=True, exist_ok=True)
+        usage = shutil.disk_usage(projects_path)
+    except OSError:
+        return unavailable("The storage path for projects cannot be read.")
+
     return {
-        "projects_path":    str(projects_path),
-        "is_override":      override is not None,
-        "override_invalid": override_invalid,
-        "total_bytes":      usage.total,
-        "used_bytes":       usage.used,
-        "free_bytes":       usage.free,
-        "available":        True,
+        "projects_path":      str(projects_path),
+        "is_override":        override is not None,
+        "override_invalid":   override_invalid,
+        "total_bytes":        usage.total,
+        "used_bytes":         usage.used,
+        "free_bytes":         usage.free,
+        "available":          True,
+        "unavailable_reason": None,
     }
 
 
@@ -385,6 +402,13 @@ def activate_storage(
         raise HTTPException(status_code=400, detail="The path does not exist.")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="The path is not a directory.")
+    # The same test every writer applies to the stored root (see
+    # storage_override.override_root_problem), applied to the target before
+    # anything is created in it: a directory on the root filesystem is on the
+    # SD card, as an empty mount point with no drive mounted is.
+    from app.core.storage_override import override_root_problem
+    if override_root_problem(target):
+        raise HTTPException(status_code=400, detail="The path is not on a mounted drive.")
 
     # Use a clearly-labelled subdirectory so files aren't dumped into the root.
     projects_path = target / "dtk-projects"

@@ -17,6 +17,20 @@ PayloadFile = Tuple[Path, str]
 PayloadBlob = Tuple[bytes, str]
 
 
+class SourceReadError(Exception):
+    """A payload source could not be opened or read.
+
+    `source_path` names the source and `error` is the OSError raised. An error
+    from writing the zip is not wrapped, so the caller can tell a source it
+    could not read from an exports filesystem it could not write.
+    """
+
+    def __init__(self, source_path: Path, error: OSError):
+        super().__init__(f"Could not read {source_path}: {error}")
+        self.source_path = source_path
+        self.error = error
+
+
 def _manifest_lines(entries: List[Tuple[str, str]]) -> str:
     # BagIt manifest line: "<checksum>  <path-relative-to-bag>"
     return "".join(f"{checksum}  {path}\n" for path, checksum in entries)
@@ -47,8 +61,19 @@ def write_bag_zip(
             rel = rel.replace("\\", "/")
             sha, md5 = hashlib.sha256(), hashlib.md5()
             size = 0
-            with open(source_path, "rb") as src, zf.open(f"{bag_name}/data/{rel}", "w") as dst:
-                for chunk in iter(lambda: src.read(_CHUNK), b""):
+            try:
+                src = open(source_path, "rb")
+            except OSError as e:
+                raise SourceReadError(source_path, e) from e
+
+            def read_chunk(src=src):
+                try:
+                    return src.read(_CHUNK)
+                except OSError as e:
+                    raise SourceReadError(source_path, e) from e
+
+            with src, zf.open(f"{bag_name}/data/{rel}", "w") as dst:
+                for chunk in iter(read_chunk, b""):
                     dst.write(chunk)
                     sha.update(chunk)
                     md5.update(chunk)

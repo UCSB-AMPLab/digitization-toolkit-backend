@@ -31,15 +31,23 @@ def secure_project_filename(project_name):
 
 
 def _projects_root() -> Path:
-    """Resolve the active projects root at call time.
+    """Resolve the active projects root at call time, refusing one that cannot take writes.
 
     Read from settings on every call (rather than a module-level constant
     captured at import) so a runtime storage-drive switch - POST
     /system/storage/activate flips the storage override in
     app.core.config.Settings.projects_dir - takes effect immediately for new
     captures, keeping writes and reads on the same disk.
+
+    Every path into the projects tree is built here, and the callers are the
+    ones that create, move, rename or delete files in it, so the root comes
+    from writable_projects_dir: an override naming a missing directory, or one
+    that is not on a mounted drive, raises StorageUnavailableError instead of
+    letting a later mkdir(parents=True) build the tree on the SD card.
     """
-    return settings.projects_dir
+    from app.core.storage_override import writable_projects_dir
+
+    return writable_projects_dir(settings)
 
 
 def project_capture_root(project_name: str) -> Path:

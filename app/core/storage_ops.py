@@ -675,6 +675,8 @@ def renumber_collection_images(
     image in the collection owns, a new name's stem is shared by such a file
     with another suffix, or a RAW master's new sidecar name already holds a
     `_preview.jpg` that no image in the collection owns.
+    Raises StorageUnavailableError, before anything is renamed, if a source
+    lies under a storage override root that cannot take writes.
     Raises OSError if a filesystem rename fails after the plan validated. The
     exception carries `not_restored`, the original paths the unwind could not
     put back (empty when every file went back).
@@ -712,6 +714,11 @@ def renumber_collection_images(
         seq_str = str(idx).zfill(width)
         final_path = src.parent / f"{prefix}_{seq_str}{src.suffix}"
         plan.append((img, src, final_path))
+
+    # The renames happen in place, beside each source; refuse before any of
+    # them when a source is under an override root that cannot take writes.
+    from app.core.storage_override import refuse_writes_under_unusable_root
+    refuse_writes_under_unusable_root([src for _, src, _ in plan])
 
     # Every file to rename, (current path, final path): each master, then
     # each RAW master's sidecar under the name its final master derives. A
