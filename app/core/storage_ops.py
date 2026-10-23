@@ -15,6 +15,7 @@ import uuid
 from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
+from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.models.collection import Collection
@@ -149,7 +150,12 @@ def _name_taken(dst: Path, src: Path, sibling_masters: set) -> bool:
     return False
 
 
-def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[str]] = None) -> bool:
+def relocate_image(
+    img: RecordImage,
+    target_dir: Path,
+    not_moved: Optional[List[str]] = None,
+    moved: Optional[List[Tuple[Path, Path]]] = None,
+) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
     A RAW master's `_preview.jpg` sidecar moves with it and is named from the
@@ -168,6 +174,11 @@ def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[
 
     The thumbnail is dropped (set to None) so it is regenerated on demand from
     the new location. Returns True if a file was physically moved.
+
+    When the caller passes `moved`, each file moved is appended to it as an
+    (original path, new path) pair as soon as it has moved: the master, then
+    its sidecar if that followed. `undo_relocations` takes the list to put the
+    files back when the caller's later work or its commit fails.
     """
     src = resolve_within_storage(img.file_path)
     if src is None or not src.exists():
@@ -190,6 +201,8 @@ def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[
         dst = target_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
 
     shutil.move(str(src), str(dst))
+    if moved is not None:
+        moved.append((src, dst))
     img.file_path = str(dst)
     if img.filename == src.name:
         img.filename = dst.name
@@ -198,6 +211,8 @@ def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[
         sidecar_dst = preview_sidecar_of(dst)
         try:
             shutil.move(str(sidecar), str(sidecar_dst))
+            if moved is not None:
+                moved.append((sidecar, sidecar_dst))
         except OSError as e:
             logger.warning(f"Moved {src} to {dst} but its preview sidecar could not follow, left at {sidecar}: {e}")
             if not_moved is not None:
@@ -212,6 +227,98 @@ def relocate_image(img: RecordImage, target_dir: Path, not_moved: Optional[List[
             pass
 
     return True
+
+
+def undo_relocations(moved: List[Tuple[Path, Path]]) -> List[Path]:
+    """Move relocated files back to where they were; return the original paths not restored.
+
+    `moved` holds the (original path, new path) pairs `relocate_image` appended,
+    and they are undone in reverse order, so a sidecar goes back before its
+    master. A file is never moved onto an existing file. A move back that fails
+    is logged at ERROR with both paths, the file is left at its new path, and
+    the next pair is tried; nothing is raised, so the caller still reports the
+    error that started the undo.
+    """
+    not_restored: List[Path] = []
+    for orig, current in reversed(moved):
+        if orig.exists():
+            logger.error(f"Move rollback could not put {current} back at {orig}: the name is taken; left at {current}")
+            not_restored.append(orig)
+            continue
+        try:
+            shutil.move(str(current), str(orig))
+        except Exception as e:
+            logger.error(f"Move rollback could not put {current} back at {orig}; left at {current}: {e}")
+            not_restored.append(orig)
+    return not_restored
+
+
+def relocate_images_and_commit(
+    db: Session,
+    moves: Iterable[Tuple[RecordImage, Path]],
+    not_moved: List[str],
+    operation: str,
+) -> None:
+    """Relocate each (image, target directory) pair with `relocate_image`, then commit.
+
+    The rows' new paths and the files' new places cannot share one
+    transaction. If a move raises, or the commit does, the session is rolled
+    back, so every row keeps its old path, and `undo_relocations` moves every
+    file already moved back to that path. The error becomes a 500 whose detail
+    says whether every file went back; a file that could not be put back is
+    logged at ERROR by `undo_relocations`. A commit that fails when no file
+    moved is rolled back and its error re-raised unchanged. `operation` names
+    the request in the log.
+
+    Sidecars that could not follow their master are appended to `not_moved`,
+    as `relocate_image` does. The old thumbnails `relocate_image` deletes are
+    not restored on failure: the rolled-back row names the deleted file, and
+    the thumbnail endpoint regenerates a missing one on demand.
+    """
+    moved: List[Tuple[Path, Path]] = []
+    try:
+        for img, target_dir in moves:
+            relocate_image(img, target_dir, not_moved, moved)
+    except Exception as e:
+        db.rollback()
+        # The rows still name the old paths, so the moves are reversed to match them.
+        not_restored = undo_relocations(moved)
+        if not_restored:
+            logger.exception(
+                f"{operation} failed on disk; {len(not_restored)} file(s) could not be put back: "
+                f"{[str(p) for p in not_restored]}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail=f"Failed to move image files on disk: {e}. Some files could not be put back where they were",
+            ) from e
+        logger.exception(f"{operation} failed on disk; the files moved so far are back where they were")
+        raise HTTPException(
+            status_code=500,
+            detail=f"Failed to move image files on disk: {e}. The files are back where they were",
+        ) from e
+
+    try:
+        db.commit()
+    except Exception as e:
+        db.rollback()
+        if not moved:
+            raise  # no file moved (a metadata-only update, say), so nothing to put back
+        not_restored = undo_relocations(moved)
+        if not_restored:
+            logger.exception(
+                f"{operation} DB commit failed; {len(not_restored)} file(s) could not be put back: "
+                f"{[str(p) for p in not_restored]}"
+            )
+            raise HTTPException(
+                status_code=500,
+                detail="Files were moved on disk but the database update failed, and some files could not be put back where they were",
+            ) from e
+        logger.exception(f"{operation} DB commit failed; the files are back where they were")
+        raise HTTPException(
+            status_code=500,
+            detail="The database update failed; the files are back where they were. Please retry",
+        ) from e
 
 
 def remove_tree(directory: Path) -> None:
