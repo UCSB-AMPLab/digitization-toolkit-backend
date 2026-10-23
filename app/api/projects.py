@@ -10,7 +10,7 @@ from app.core.storage_ops import (
     collection_and_descendants,
     move_project_tree,
     rebase_stored_path,
-    relocate_image,
+    relocate_images_and_commit,
     remove_tree,
     surviving_images_under,
 )
@@ -270,6 +270,7 @@ def move_collections(
 
     # Relocate the image files so they physically live under the target project
     not_moved: list[str] = []
+    moves: list = []
     if moved_collection_ids:
         names = {
             c.id: c.name
@@ -278,10 +279,13 @@ def move_collections(
         records = db.query(Record).filter(Record.collection_id.in_(moved_collection_ids)).all()
         for r in records:
             target_dir = image_output_dir(target.name, names.get(r.collection_id))
-            for img in r.images:
-                relocate_image(img, target_dir, not_moved)
+            moves.extend((img, target_dir) for img in r.images)
 
-    db.commit()
+    # A failed move or commit puts every file already moved back.
+    relocate_images_and_commit(
+        db, moves, not_moved,
+        f"Move of collections from project {project_id} to {payload.target_project_id}",
+    )
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
               subject=f"{source.name} -> {target.name} ({moved} collections)")

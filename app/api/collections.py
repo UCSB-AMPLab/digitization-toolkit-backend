@@ -26,7 +26,7 @@ from app.core.export_jobs import export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
-    relocate_image,
+    relocate_images_and_commit,
     remove_tree,
     renumber_collection_images,
     restore_original_names,
@@ -259,6 +259,7 @@ def update_collection(
         or ("parent_collection_id" in update_data and update_data["parent_collection_id"] != old_parent)
     )
     not_moved: List[str] = []
+    moves: List = []
     if layout_changed:
         from capture.project_manager import image_output_dir
 
@@ -272,10 +273,10 @@ def update_collection(
             records = db.query(Record).filter(Record.collection_id.in_(subtree_ids)).all()
             for r in records:
                 target_dir = image_output_dir(project_name, names.get(r.collection_id))
-                for img in r.images:
-                    relocate_image(img, target_dir, not_moved)
+                moves.extend((img, target_dir) for img in r.images)
 
-    db.commit()
+    # A failed move or commit puts every file already moved back.
+    relocate_images_and_commit(db, moves, not_moved, f"Update of collection {collection_id}")
     db.refresh(collection)
     if not_moved:
         # Preview sidecars that stayed in the old directory (see relocate_image).
@@ -340,11 +341,15 @@ def move_collection_records(
         )
 
     not_moved: List[str] = []
+    moves: List = []
     for r in records:
         r.collection_id = target_collection_id
-        for img in r.images:
-            relocate_image(img, target_dir, not_moved)
-    db.commit()
+        moves.extend((img, target_dir) for img in r.images)
+    # A failed move or commit puts every file already moved back.
+    relocate_images_and_commit(
+        db, moves, not_moved,
+        f"Move of records from collection {collection_id} to {target_collection_id}",
+    )
 
     logger.info(f"Moved {len(records)} records from collection {collection_id} to {target_collection_id}")
     body = {"moved": len(records), "target_collection_id": target_collection_id}
