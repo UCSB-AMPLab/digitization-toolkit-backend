@@ -149,13 +149,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     # Either is reported as an ExportError naming the record, with the path in
     # the log only; see _source_error.
     try:
-        # Fixity gate: refuse to bag bytes that no longer match their capture-time sha256.
-        mismatches = verify_images_against_manifest([img for _, _, img in to_copy])
-        if mismatches:
-            raise ExportError(
-                f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
-                detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
-            )
+        _fixity_gate([img for _, _, img in to_copy])
 
         # Refuse to start if the exports filesystem can't hold the archive.
         total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
@@ -233,6 +227,35 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     job.zip_filename = zip_path.name
     _prune_exports(exports_dir, collection_id)
     logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
+
+
+def _fixity_gate(images) -> None:
+    """Refuse to bag bytes that no longer match their capture-time sha256, or that cannot be checked.
+
+    Raises ExportError with reason "checksum_mismatch" when a file's bytes
+    differ from its capture record's, and otherwise with reason
+    "checksum_unresolved" when a captured image (its capture id has a
+    capture record in some manifest) has no checksum that can be resolved,
+    naming each such image's id, capture id and stored path. Images with no
+    capture record (uploads) pass unchecked, as they always have.
+    """
+    found = verify_images_against_manifest(images)
+    mismatches = [m for m in found if m["reason"] == "mismatch"]
+    unresolved = [m for m in found if m["reason"] == "unresolved"]
+    if mismatches:
+        raise ExportError(
+            f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
+            detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
+        )
+    if unresolved:
+        ids = [m["record_image_id"] for m in unresolved]
+        raise ExportError(
+            f"{len(unresolved)} captured file(s) have no capture-time checksum that can be found, "
+            f"so their fixity cannot be checked: image(s) {', '.join(str(i) for i in ids)}.",
+            detail={"reason": "checksum_unresolved", "unresolved_image_ids": ids,
+                    "unresolved": [{"record_image_id": m["record_image_id"], "capture_id": m["capture_id"],
+                                    "file_path": m["file_path"]} for m in unresolved]},
+        )
 
 
 def _source_error(collection_id: int, to_copy, source: Path, error: OSError) -> ExportError:

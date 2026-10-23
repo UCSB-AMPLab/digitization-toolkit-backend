@@ -203,10 +203,15 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
 def verify_images_against_manifest(images) -> List[dict]:
     """Re-hash each image and compare it to its capture-time manifest sha256.
 
-    Returns the list of mismatches: files whose bytes on disk differ from what was
-    recorded when they were captured. Images with no capture_id, no manifest entry,
-    or a missing file are skipped, as there is no capture-time fixity to check, and a
-    missing file is a separate failure the caller handles. Read-only.
+    Returns the images that fail: each entry has "reason" "mismatch" (the
+    bytes on disk differ from what was recorded at capture, with both
+    sha256s) or "unresolved" (the image's capture id has a capture record in
+    some manifest, but no checksum can be resolved for this image: a master
+    renamed whose relocation record was not written, say). An image with no
+    capture id, or whose capture id has no capture record in any manifest
+    (an upload, which carries a capture id only if the client sent one), is
+    skipped, as there is no capture-time fixity to check. A missing file is
+    skipped too; it is a separate failure the caller handles. Read-only.
     """
     index = build_fixity_index(config.settings.projects_dir.resolve())
     mismatches: List[dict] = []
@@ -218,6 +223,14 @@ def verify_images_against_manifest(images) -> List[dict]:
             continue
         expected = index.expected(img.capture_id, img.id, resolved)
         if expected is None:
+            if img.capture_id in index.captured:
+                mismatches.append({
+                    "reason": "unresolved",
+                    "record_image_id": img.id,
+                    "record_id": img.record_id,
+                    "capture_id": img.capture_id,
+                    "file_path": img.file_path,
+                })
             continue
         try:
             actual = _sha256(resolved)
@@ -225,6 +238,7 @@ def verify_images_against_manifest(images) -> List[dict]:
             continue
         if actual != expected:
             mismatches.append({
+                "reason": "mismatch",
                 "record_image_id": img.id,
                 "record_id": img.record_id,
                 "file_path": img.file_path,

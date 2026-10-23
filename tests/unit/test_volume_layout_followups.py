@@ -786,3 +786,89 @@ def renamed_capture_i2(db_session, legacy):
     target.mkdir(parents=True)
     (target / "IMG_0002.jpg").write_bytes(b"unrelated")
     return hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest()
+
+
+# ---------------------------------------------------------------------------
+# The export fixity gate refuses a captured master it cannot check
+# ---------------------------------------------------------------------------
+
+def _renumber_with_failed_record(db, legacy, monkeypatch):
+    """A renumber renames captured IMG_0002, its relocation record cannot be written, and the file rots."""
+    import capture.manifestHandler as mh
+    from app.core.storage_ops import renumber_collection_images
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import RecordImage
+
+    migrate_volume_layout(db)
+    img = db.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "cap-0002"
+    db.commit()
+    proj = legacy["root"] / "proj"
+    (proj / "metadata" / "manifest.jsonl").write_text("")
+    _manifest(proj, "cap-0002", os.path.relpath(Path(img.file_path), proj.resolve()), Path(img.file_path).read_bytes())
+
+    def boom(*a, **k):
+        raise OSError(28, "No space left on device")
+
+    monkeypatch.setattr(mh, "append_relocation_record", boom)
+    renumber_collection_images(db, legacy["a2"])
+    db.commit()
+    db.expire_all()
+    img = db.get(RecordImage, legacy["i2"].id)
+    Path(img.file_path).write_bytes(b"bit rot")
+    return img
+
+
+@pytest.mark.unit
+def test_the_export_fixity_gate_does_not_pass_a_renamed_master_whose_record_was_not_written(db_session, legacy, monkeypatch):
+    from app.core.integrity import verify_images_against_manifest
+
+    img = _renumber_with_failed_record(db_session, legacy, monkeypatch)
+
+    found = verify_images_against_manifest([img])
+    assert [(m["record_image_id"], m["reason"]) for m in found] == [(img.id, "unresolved")]
+    assert found[0]["file_path"] == img.file_path
+
+
+@pytest.mark.unit
+def test_the_export_refuses_a_captured_master_with_no_resolvable_checksum_naming_it(db_session, legacy, monkeypatch):
+    from app.core.export_jobs import ExportError
+    from app.core.export_service import _fixity_gate
+
+    img = _renumber_with_failed_record(db_session, legacy, monkeypatch)
+
+    with pytest.raises(ExportError) as err:
+        _fixity_gate([img])
+    assert err.value.detail["reason"] == "checksum_unresolved"
+    assert err.value.detail["unresolved_image_ids"] == [img.id]
+    assert err.value.detail["unresolved"] == [{"record_image_id": img.id, "capture_id": "cap-0002",
+                                               "file_path": img.file_path}]
+    assert str(img.id) in str(err.value)
+
+
+@pytest.mark.unit
+def test_the_integrity_scan_reports_a_renamed_master_whose_record_was_not_written(db_session, legacy, monkeypatch):
+    from app.core.integrity import run_integrity_check
+
+    img = _renumber_with_failed_record(db_session, legacy, monkeypatch)
+    result = run_integrity_check(db_session, verify_hashes=True)
+    assert img.id in [m["record_image_id"] for m in result["manifest_missing_entry"]]
+
+
+@pytest.mark.unit
+def test_images_with_no_capture_record_still_pass_the_gate_unchecked(db_session, capture_settings, data_dir,
+                                                                    override_projects_root):
+    """An upload has no capture id unless the client sent one; one naming a capture no manifest holds is not checked either."""
+    from app.core import config
+    from app.core.export_service import _fixity_gate
+    from app.core.integrity import verify_images_against_manifest
+
+    root = override_projects_root
+    _p, c = _project_and_collection(db_session)
+    uploads = config.settings.data_dir / "uploads"
+    plain = _image(db_session, c.id, uploads / "upload_1.jpg", b"uploaded")
+    claimed = _image(db_session, c.id, uploads / "upload_2.jpg", b"uploaded", capture_id="cap-nowhere")
+    _manifest(root / "proj", "cap-other", "x/a.jpg", b"page")
+
+    assert verify_images_against_manifest([plain, claimed]) == []
+    _fixity_gate([plain, claimed])
