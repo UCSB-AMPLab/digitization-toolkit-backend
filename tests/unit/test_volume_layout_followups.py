@@ -872,3 +872,77 @@ def test_images_with_no_capture_record_still_pass_the_gate_unchecked(db_session,
 
     assert verify_images_against_manifest([plain, claimed]) == []
     _fixity_gate([plain, claimed])
+
+
+# ---------------------------------------------------------------------------
+# A commit whose outcome is unknown still records the renames
+# ---------------------------------------------------------------------------
+
+class _Interrupt(BaseException):
+    pass
+
+
+def _unknown_outcome_move(db_session, root, monkeypatch, lands: bool, interrupt: bool = False):
+    """Move a captured master onto a clashing name, with a commit whose outcome cannot be determined."""
+    import app.core.storage_ops as so
+
+    img, src, target = _clash_setup(db_session, root)
+    real_commit = db_session.commit
+
+    def commit():
+        if lands:
+            real_commit()
+        raise (_Interrupt() if interrupt else RuntimeError("connection lost"))
+
+    monkeypatch.setattr(db_session, "commit", commit)
+    monkeypatch.setattr(so, "_relocation_landed", lambda db, new_paths: None)
+    with pytest.raises(_Interrupt if interrupt else so.HTTPException):
+        so.relocate_images_and_commit(db_session, [(img, target)], [], "test move")
+    monkeypatch.setattr(db_session, "commit", real_commit)
+    records = _relocations(root / "proj")
+    return img, src, records
+
+
+def _scan_resolves(db_session, img_id) -> None:
+    from app.core.integrity import run_integrity_check
+    from app.models.record import RecordImage
+
+    db_session.expire_all()
+    img = db_session.get(RecordImage, img_id)
+    result = run_integrity_check(db_session, verify_hashes=True)
+    assert img_id not in [m["record_image_id"] for m in result["manifest_missing_entry"]]
+    assert result["manifest_mismatches"] == []
+    Path(img.file_path).write_bytes(b"bit rot")
+    result = run_integrity_check(db_session, verify_hashes=True)
+    assert [m["record_image_id"] for m in result["manifest_mismatches"]] == [img_id]
+
+
+@pytest.mark.unit
+def test_an_unknown_outcome_commit_that_landed_writes_the_record_and_the_scan_resolves_the_file(
+        db_session, capture_settings, data_dir, override_projects_root, monkeypatch):
+    img, src, records = _unknown_outcome_move(db_session, override_projects_root, monkeypatch, lands=True)
+
+    assert [(r["image_id"], r["capture_id"]) for r in records] == [(img.id, "cap-1")]
+    _scan_resolves(db_session, img.id)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("interrupt", [False, True])
+def test_an_unknown_outcome_commit_that_did_not_land_writes_the_record_and_the_file_resolves_once_the_row_is_fixed(
+        db_session, capture_settings, data_dir, override_projects_root, monkeypatch, interrupt):
+    """The row still names the old path; recovery by hand points it at the logged new path."""
+    from app.models.record import RecordImage
+
+    img, src, records = _unknown_outcome_move(db_session, override_projects_root, monkeypatch, lands=False,
+                                              interrupt=interrupt)
+    assert [(r["image_id"], r["capture_id"]) for r in records] == [(img.id, "cap-1")]
+    db_session.rollback()
+    db_session.expire_all()
+    row = db_session.get(RecordImage, img.id)
+    assert Path(row.file_path) == src and not src.exists()
+    new = (override_projects_root / "proj").resolve() / records[0]["to"]
+    assert new.is_file()
+
+    row.file_path = str(new)  # the recovery by hand the ERROR log asks for
+    db_session.commit()
+    _scan_resolves(db_session, img.id)

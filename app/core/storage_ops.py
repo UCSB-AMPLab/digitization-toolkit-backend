@@ -503,8 +503,10 @@ def relocate_images_and_commit(
     only once the commit is known to have landed; until then the files stay,
     so a rolled-back row's thumbnail_path still names an existing file. The
     relocation records of masters renamed on a clash are written to the
-    capture manifest at the same point, and never when the moves are undone
-    or the outcome is unknown.
+    capture manifest at the same point, and never when the moves are undone.
+    When the outcome is unknown they are written after the (original, new)
+    pairs are logged: a record names its image and its capture checksum, so
+    it holds whichever way the commit went.
     """
     moved: List[Tuple[Path, Path]] = []
     old_thumbnails: List[Path] = []
@@ -541,6 +543,11 @@ def relocate_images_and_commit(
     def log_unknown_outcome() -> None:
         for orig, current in moved:
             logger.error(f"{operation}: commit outcome unknown; file left at {current}, originally at {orig}")
+        # A record names its image and carries its capture checksum, so it is
+        # true whether or not the rows landed: once a row names the file's new
+        # path (the commit landed, or the row is fixed by hand from the lines
+        # above), the integrity check resolves the file through it.
+        write_relocation_records(relocations)
 
     try:
         db.commit()
