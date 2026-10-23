@@ -339,19 +339,16 @@ def _owners(db: Session) -> Dict[Path, int]:
     return owners
 
 
-def _capture_checksum(index: Tuple[dict, dict], capture_id: Optional[str], src: Path) -> Optional[str]:
-    """The capture-time sha256 the manifest holds for the file a row stored at `src`, or None.
+def _capture_checksum(index, capture_id: Optional[str], image_id: int, src: Path) -> Optional[str]:
+    """The capture-time sha256 the manifest holds for the image a row stored at `src`, or None.
 
     The capture manifest is the only checksum the system holds for an image
     (the image row has no checksum column), so a row with no capture id, or
-    whose capture record does not list the file, has none. The lookup is the
-    one app.core.integrity makes: by resolved path, then by file name, after
-    the relocation records have been followed.
+    whose capture record does not list the file, has none. The lookup is
+    app.core.integrity.FixityIndex.expected: a relocation record naming the
+    image first, then the resolved path, then the file name.
     """
-    if not capture_id:
-        return None
-    by_path, by_name = index
-    return by_path.get(capture_id, {}).get(str(src)) or by_name.get(capture_id, {}).get(src.name)
+    return index.expected(capture_id, image_id, src)
 
 
 def _adoptable(target: Path, src: Path, image_id: int, owners: Dict[Path, int],
@@ -399,7 +396,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     from app.core.storage_ops import resolve_project
 
     owners = _owners(db)
-    manifest_index: List[Tuple[dict, dict]] = []  # built on the first row whose file is missing
+    manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
     refused: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
     dirs: Dict[Path, _Dir] = {}
@@ -455,9 +452,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
 
         if not src.is_file():
             if not manifest_index:
-                from app.core.integrity import _build_manifest_index
-                manifest_index.append(_build_manifest_index(root))
-            checksum = _capture_checksum(manifest_index[0], img.capture_id, src)
+                from app.core.integrity import build_fixity_index
+                manifest_index.append(build_fixity_index(root))
+            checksum = _capture_checksum(manifest_index[0], img.capture_id, iid, src)
             found, not_taken = _adoptable(target, src, iid, owners, checksum)
             refused.update(p.resolve() for p in not_taken)
             if found is None:
@@ -604,14 +601,27 @@ def _free_name(e: dict, src: Path, dst: Path) -> Path:
 
 
 def _record_relocation(root: Path, e: dict, src: Path, dst: Path) -> None:
-    """Append a relocation record for a renamed master with a capture id to its project's manifest."""
+    """Append a relocation record for a renamed master with a capture id to its project's manifest.
+
+    The record carries the image id and the capture-time sha256 the
+    manifests hold for the image now, before the move. With no such
+    checksum there is nothing to carry: no record is written and a WARNING
+    says so; the export fixity gate then refuses the image by name.
+    """
     if not e.get("capture_id") or src.name == dst.name:
         return
+    from app.core.integrity import build_fixity_index
     from capture.manifestHandler import append_relocation_record
 
+    sha = build_fixity_index(root).expected(e["capture_id"], e["image_id"], src)
+    if sha is None:
+        logger.warning(f"Volume layout: no capture checksum is held for image {e['image_id']} at {src}; "
+                       f"no relocation record is written for its move to {dst}")
+        return
     project_root = root / dst.relative_to(root).parts[0]
     append_relocation_record(project_root, e["capture_id"],
-                             os.path.relpath(src, project_root), os.path.relpath(dst, project_root))
+                             os.path.relpath(src, project_root), os.path.relpath(dst, project_root),
+                             image_id=e["image_id"], sha256=sha)
 
 
 def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecars: List[dict]) -> Tuple[List[Path], Set[Path]]:

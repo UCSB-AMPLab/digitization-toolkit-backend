@@ -13,9 +13,9 @@ import hashlib
 import json
 import logging
 import random
-from datetime import datetime, timezone
+from dataclasses import dataclass, field
 from pathlib import Path
-from typing import Dict, List, Optional, Tuple
+from typing import Dict, List, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -65,56 +65,75 @@ def _iter_image_files(root: Path):
             yield p
 
 
-def _relocation_order(relocated_at, manifest_key: str, line_no: int) -> tuple:
-    """Sort key for a relocation record: untimestamped first, then by UTC time, manifest path, line number."""
-    when = None
-    if isinstance(relocated_at, str):
-        try:
-            when = datetime.fromisoformat(relocated_at)
-        except ValueError:
-            when = None
-    if when is None:
-        return (0, 0.0, manifest_key, line_no)
-    if when.tzinfo is None:
-        when = when.replace(tzinfo=timezone.utc)
-    return (1, when.timestamp(), manifest_key, line_no)
+@dataclass
+class FixityIndex:
+    """The capture-time checksums the manifests hold, and how to find an image's.
+
+    by_path and by_name: capture_id -> {absolute path or file name: sha256},
+    from the capture records and from relocation records with no image id.
+    by_image: (capture_id, image id) -> sha256, from relocation records that
+    name their image; None when two such records disagree. captured: the
+    capture ids that have a capture record in some manifest.
+    """
+    by_path: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    by_name: Dict[str, Dict[str, str]] = field(default_factory=dict)
+    by_image: Dict[Tuple[str, int], Optional[str]] = field(default_factory=dict)
+    captured: Set[str] = field(default_factory=set)
+
+    def expected(self, capture_id: Optional[str], image_id: Optional[int], resolved: Path) -> Optional[str]:
+        """The sha256 an image's file should have, or None if none can be resolved.
+
+        A relocation record naming the image decides first: it needs no chain
+        and no order, and a name reused by a later renumber cannot mislead it.
+        Two such records that disagree resolve to None. Otherwise the file's
+        resolved path, then its name, under its capture id.
+        """
+        if not capture_id:
+            return None
+        key = (capture_id, image_id)
+        if image_id is not None and key in self.by_image:
+            return self.by_image[key]
+        paths = self.by_path.get(capture_id)
+        expected = paths.get(str(resolved)) if paths else None
+        if expected is None:
+            names = self.by_name.get(capture_id)
+            expected = names.get(resolved.name) if names else None
+        return expected
 
 
-def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
-    """Index every project's metadata/manifest.jsonl by capture_id.
+def build_fixity_index(projects_dir: Path) -> FixityIndex:
+    """Index every project's metadata/manifest.jsonl under `projects_dir`.
 
-    Returns (by_path, by_name): capture_id -> {absolute_path: sha256} and
-    capture_id -> {filename: sha256}. The name map is a fallback for when a stored
-    absolute path differs from the manifest's (e.g. after an SD re-clone remounts
-    the tree at a different location).
+    Capture records give each file's sha256 by resolved path and by name (the
+    name map is a fallback for when a stored absolute path differs from the
+    manifest's, e.g. after an SD re-clone remounts the tree elsewhere).
 
     A relocation record (capture.manifestHandler.append_relocation_record)
-    says a captured file was moved to another name: once every capture record
-    is indexed, each relocation gives its `to` path (and name) the sha256 its
-    `from` path (or name) has, so a file renamed after capture is still
-    checked against its capture-time hash. A file renamed more than once can
-    have its relocation records in different projects' manifests (a move
-    into another project writes to the destination's), so the relocations of
-    all manifests are applied in the order they happened, by their
-    `relocated_at` UTC timestamp, ties broken by manifest path and then line
-    number. A record without a timestamp that parses (one written by hand)
-    is applied before every timestamped one, in manifest path and line order.
+    says a captured file was renamed. One that carries `image_id` and
+    `sha256` (every record the appliance writes) gives that image its
+    checksum directly; no order between records matters. One without
+    `image_id` (written by hand, or in an older format) is followed as a
+    chain: its `to` path and name get the sha256 its `from` path or name has.
+    Those are applied in line order within each manifest; a chain whose
+    links sit in different manifests is completed by sweeping the manifests
+    again, up to once per manifest, until a sweep changes nothing.
+    `relocated_at` is information only and is never used for ordering,
+    because a unit without a real-time clock can stamp a later rename with
+    an earlier time.
     """
-    by_path: Dict[str, Dict[str, str]] = {}
-    by_name: Dict[str, Dict[str, str]] = {}
-    # (sort key, capture_id, from abs, to abs); see _relocation_order
-    relocations: List[Tuple[tuple, str, str, str]] = []
+    index = FixityIndex()
     if not projects_dir.exists():
-        return by_path, by_name
+        return index
+    chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
 
     for manifest in projects_dir.glob("**/metadata/manifest.jsonl"):
-        manifest_key = str(manifest)
         project_root = manifest.parent.parent
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        for line_no, line in enumerate(lines):
+        chain: List[Tuple[str, str, str]] = []
+        for line in lines:
             line = line.strip()
             if not line:
                 continue
@@ -122,18 +141,29 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
                 rec = json.loads(line)
             except json.JSONDecodeError:
                 continue
+            if not isinstance(rec, dict):
+                continue
             cid = rec.get("capture_id")
             if not cid:
                 continue
             if rec.get("record_type") == "relocation":
+                image_id, sha = rec.get("image_id"), rec.get("sha256")
+                if isinstance(image_id, int) and sha:
+                    key = (cid, image_id)
+                    if key in index.by_image and index.by_image[key] != sha:
+                        logger.warning(f"Relocation records of image {image_id} (capture {cid}) disagree on its sha256")
+                        index.by_image[key] = None
+                    elif key not in index.by_image:
+                        index.by_image[key] = sha
+                    continue
                 frm, to = rec.get("from"), rec.get("to")
                 if frm and to:
                     try:
-                        relocations.append((_relocation_order(rec.get("relocated_at"), manifest_key, line_no), cid,
-                                            str((project_root / frm).resolve()), str((project_root / to).resolve())))
+                        chain.append((cid, str((project_root / frm).resolve()), str((project_root / to).resolve())))
                     except OSError:
                         pass
                 continue
+            index.captured.add(cid)
             for f in rec.get("files", []):
                 sha = f.get("sha256")
                 rel = f.get("relative_path")
@@ -143,15 +173,31 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
                     abs_path = str((project_root / rel).resolve())
                 except OSError:
                     continue
-                by_path.setdefault(cid, {})[abs_path] = sha
-                by_name.setdefault(cid, {})[Path(rel).name] = sha
-    relocations.sort(key=lambda r: r[0])
-    for _, cid, frm, to in relocations:
-        sha = by_path.get(cid, {}).get(frm) or by_name.get(cid, {}).get(Path(frm).name)
-        if sha:
-            by_path.setdefault(cid, {})[to] = sha
-            by_name.setdefault(cid, {})[Path(to).name] = sha
-    return by_path, by_name
+                index.by_path.setdefault(cid, {})[abs_path] = sha
+                index.by_name.setdefault(cid, {})[Path(rel).name] = sha
+        if chain:
+            chains.append(chain)
+
+    for _ in range(len(chains)):
+        changed = False
+        for chain in chains:
+            for cid, frm, to in chain:
+                sha = index.by_path.get(cid, {}).get(frm) or index.by_name.get(cid, {}).get(Path(frm).name)
+                if not sha:
+                    continue
+                if index.by_path.get(cid, {}).get(to) != sha or index.by_name.get(cid, {}).get(Path(to).name) != sha:
+                    index.by_path.setdefault(cid, {})[to] = sha
+                    index.by_name.setdefault(cid, {})[Path(to).name] = sha
+                    changed = True
+        if not changed:
+            break
+    return index
+
+
+def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
+    """(by_path, by_name) of build_fixity_index: capture_id -> {absolute path: sha256}, {file name: sha256}."""
+    index = build_fixity_index(projects_dir)
+    return index.by_path, index.by_name
 
 
 def verify_images_against_manifest(images) -> List[dict]:
@@ -162,7 +208,7 @@ def verify_images_against_manifest(images) -> List[dict]:
     or a missing file are skipped, as there is no capture-time fixity to check, and a
     missing file is a separate failure the caller handles. Read-only.
     """
-    by_path, by_name = _build_manifest_index(config.settings.projects_dir.resolve())
+    index = build_fixity_index(config.settings.projects_dir.resolve())
     mismatches: List[dict] = []
     for img in images:
         if not img.capture_id:
@@ -170,11 +216,7 @@ def verify_images_against_manifest(images) -> List[dict]:
         resolved = resolve_within_storage(img.file_path)
         if resolved is None or not resolved.exists():
             continue
-        paths = by_path.get(img.capture_id)
-        names = by_name.get(img.capture_id)
-        expected = paths.get(str(resolved)) if paths else None
-        if expected is None and names:
-            expected = names.get(resolved.name)
+        expected = index.expected(img.capture_id, img.id, resolved)
         if expected is None:
             continue
         try:
@@ -229,9 +271,9 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     # Manifest index is cheap (no hashing) and is needed both to spot-check hashes
     # and to recognize legitimate captured sidecars (e.g. raw files) that have no
     # dedicated row, so it is always built.
-    by_path, by_name = _build_manifest_index(config.settings.projects_dir.resolve())
+    index = build_fixity_index(config.settings.projects_dir.resolve())
     manifest_paths: set = set()
-    for paths in by_path.values():
+    for paths in index.by_path.values():
         manifest_paths.update(paths.keys())
     known = referenced | manifest_paths
     # A RAW master's `_preview.jpg` sidecar has no row and no manifest entry of
@@ -274,11 +316,7 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
             resolved = resolve_within_storage(img.file_path)
             if resolved is None or not resolved.exists():
                 continue  # already reported under missing_files
-            paths = by_path.get(img.capture_id)
-            names = by_name.get(img.capture_id)
-            expected = paths.get(str(resolved)) if paths else None
-            if expected is None and names:
-                expected = names.get(resolved.name)
+            expected = index.expected(img.capture_id, img.id, resolved)
             if expected is None:
                 manifest_missing_entry.append({
                     "record_image_id": img.id,

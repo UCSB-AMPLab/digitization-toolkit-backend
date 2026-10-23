@@ -623,19 +623,166 @@ def test_a_relocation_chain_split_across_project_manifests_resolves_to_the_curre
     assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
 
 
-@pytest.mark.unit
-def test_relocations_without_a_timestamp_are_applied_before_the_timestamped_ones(override_projects_root):
-    """A record with no relocated_at (written by hand) goes first, in manifest path order, then line order."""
+# ---------------------------------------------------------------------------
+# Relocation records that name their image; chains only for records that do not
+# ---------------------------------------------------------------------------
+
+def _chain_setup(legacy):
+    """A captured file at C, its third name; its capture record names A. Returns (A, B, C) relative to proj, and C."""
+    import hashlib
+
+    root = legacy["root"]
+    a = "fondo_a/images/main/CHAIN.jpg"
+    b = "collection-9/images/main/CHAIN_img9.jpg"
+    c = "collection-9/images/main/fondo_a_0001.jpg"
+    f = root / "proj" / c
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"captured bytes")
+    sha = hashlib.sha256(b"captured bytes").hexdigest()
+    with open(root / "proj" / "metadata" / "manifest.jsonl", "a") as m:
+        m.write(json.dumps({"capture_id": "cap-chain", "files": [{"relative_path": a, "sha256": sha}]}) + "\n")
+    f.write_bytes(b"bit rot")
+    return a, b, c, f, sha
+
+
+def _chain_checked(f: Path) -> bool:
+    from app.core import config
     from app.core.integrity import _build_manifest_index
 
+    by_path, _ = _build_manifest_index(config.settings.projects_dir.resolve())
+    return str(f.resolve()) in by_path.get("cap-chain", {})
+
+
+def _reloc(frm, to, **extra) -> str:
+    return json.dumps({"record_type": "relocation", "capture_id": "cap-chain", "from": frm, "to": to, **extra}) + "\n"
+
+
+@pytest.mark.unit
+def test_a_chain_survives_the_clock_going_back_between_its_two_renames(db_session, legacy):
+    """A unit with no real-time clock stamps the second rename earlier than the first; line order decides."""
+    a, b, c, f, _ = _chain_setup(legacy)
+    with open(legacy["root"] / "proj" / "metadata" / "manifest.jsonl", "a") as m:
+        m.write(_reloc(a, b, relocated_at="2026-10-20T10:00:00+00:00"))
+        m.write(_reloc(b, c, relocated_at="2026-01-01T00:00:05+00:00"))
+    assert _chain_checked(f)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reverse", [False, True])
+def test_a_chain_across_two_manifests_with_equal_timestamps(db_session, legacy, monkeypatch, reverse):
+    """The second rename is recorded in another manifest; whichever manifest is read first, the chain completes."""
+    root = legacy["root"]
+    a, b, c, f, _ = _chain_setup(legacy)
+    ts = "2026-10-20T10:00:00+00:00"
+    with open(root / "proj" / "metadata" / "manifest.jsonl", "a") as m:
+        m.write(_reloc(a, b, relocated_at=ts))
+    other = root / "aaa" / "metadata" / "manifest.jsonl"
+    other.parent.mkdir(parents=True)
+    other.write_text(_reloc("../proj/" + b, "../proj/" + c, relocated_at=ts))
+    _glob_in_order(monkeypatch, reverse)
+    assert _chain_checked(f)
+
+
+@pytest.mark.unit
+def test_a_hand_written_record_for_the_later_rename_completes_the_chain(db_session, legacy):
+    """A record written by hand (no timestamp) that names the image and its checksum resolves it on its own."""
+    from app.core.integrity import verify_images_against_manifest
+    from app.models.record import Record, RecordImage
+
+    a, b, c, f, sha = _chain_setup(legacy)
+    rec = Record(title="r", collection_id=legacy["a2"].id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    img = RecordImage(record_id=rec.id, filename=f.name, file_path=str(f), format="jpg", role="single",
+                      capture_id="cap-chain")
+    db_session.add(img)
+    db_session.commit()
+    with open(legacy["root"] / "proj" / "metadata" / "manifest.jsonl", "a") as m:
+        m.write(_reloc(a, b, relocated_at="2026-10-20T10:00:00+00:00"))
+        m.write(_reloc(b, c, image_id=img.id, sha256=sha))
+
+    assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
+    f.write_bytes(b"captured bytes")
+    assert verify_images_against_manifest([img]) == []
+
+
+@pytest.mark.unit
+def test_two_renumbers_that_reuse_names_still_resolve_each_image(
+        db_session, capture_settings, data_dir, override_projects_root):
+    """Two files of one capture (a dual pair); the second renumber swaps their names.
+
+    A chain by path cannot express a swap: whichever record is applied first,
+    the second reads the checksum the first just wrote.
+    """
+    from app.core.integrity import run_integrity_check, verify_images_against_manifest
+    from app.core.storage_ops import renumber_collection_images
+    from app.models.collection import Collection
+    from app.models.record import Record, RecordImage
+
     root = override_projects_root
-    _manifest(root / "p", "cap-1", "x/a.jpg", b"page")
-    with open(root / "p" / "metadata" / "manifest.jsonl", "a") as f:
-        # Written later in the file, but timestamped: applied after the hand-written one below.
-        f.write(json.dumps({"record_type": "relocation", "capture_id": "cap-1", "from": "x/b.jpg", "to": "x/c.jpg",
-                            "relocated_at": "2026-10-01T00:00:00+00:00"}) + "\n")
-        f.write(json.dumps({"record_type": "relocation", "capture_id": "cap-1", "from": "x/a.jpg", "to": "x/b.jpg"}) + "\n")
+    _p, c = _project_and_collection(db_session, cname="Tomo")
+    d = root / "proj" / f"collection-{c.id}" / "images" / "main"
+    left = _image(db_session, c.id, d / "L.jpg", b"left page", capture_id="cap-pair")
+    right = _image(db_session, c.id, d / "R.jpg", b"right page", capture_id="cap-pair")
+    for f, data in (("L.jpg", b"left page"), ("R.jpg", b"right page")):
+        _manifest(root / "proj", "cap-pair", f"collection-{c.id}/images/main/{f}", data)
+    rl, rr = db_session.get(Record, left.record_id), db_session.get(Record, right.record_id)
+    rl.sequence, rr.sequence = 1, 2
+    db_session.commit()
 
-    by_path, _ = _build_manifest_index(root)
+    renumber_collection_images(db_session, db_session.get(Collection, c.id))
+    db_session.commit()
+    first = {i.id: Path(db_session.get(RecordImage, i.id).file_path).name for i in (left, right)}
+    rl, rr = db_session.get(Record, left.record_id), db_session.get(Record, right.record_id)
+    rl.sequence, rr.sequence = 2, 1
+    db_session.commit()
+    renumber_collection_images(db_session, db_session.get(Collection, c.id))
+    db_session.commit()
+    db_session.expire_all()
+    imgs = [db_session.get(RecordImage, i.id) for i in (left, right)]
+    second = {i.id: Path(i.file_path).name for i in imgs}
+    assert second == {left.id: first[right.id], right.id: first[left.id]}  # the names were swapped
 
-    assert str((root / "p" / "x" / "c.jpg").resolve()) in by_path["cap-1"]
+    assert verify_images_against_manifest(imgs) == []
+    result = run_integrity_check(db_session, verify_hashes=True)
+    assert result["manifest_mismatches"] == []
+    assert not {i.id for i in imgs} & {m["record_image_id"] for m in result["manifest_missing_entry"]}
+    for img in imgs:
+        Path(img.file_path).write_bytes(b"bit rot " + str(img.id).encode())
+    assert sorted(m["record_image_id"] for m in verify_images_against_manifest(imgs)) == sorted(i.id for i in imgs)
+
+
+@pytest.mark.unit
+def test_every_written_relocation_record_names_its_image_and_checksum(db_session, legacy, renamed_capture_i2):
+    """The migration's clash rename and a later renumber both write image_id and the capture sha256."""
+    import hashlib
+    from app.core.storage_ops import renumber_collection_images
+    from app.core.volume_layout import migrate_volume_layout
+
+    sha = renamed_capture_i2
+    migrate_volume_layout(db_session)
+    renumber_collection_images(db_session, legacy["a2"])
+    db_session.commit()
+
+    records = [r for r in _relocations(legacy["root"] / "proj") if r["capture_id"] == "cap-0002"]
+    assert len(records) == 2
+    assert all(r["image_id"] == legacy["i2"].id and r["sha256"] == sha for r in records)
+    assert hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest() == sha
+
+
+@pytest.fixture
+def renamed_capture_i2(db_session, legacy):
+    """IMG_0002 with a capture record, and its name taken in its target so the migration renames it."""
+    import hashlib
+    from app.models.record import RecordImage
+
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "cap-0002"
+    db_session.commit()
+    proj = legacy["root"] / "proj"
+    (proj / "metadata" / "manifest.jsonl").write_text("")
+    _manifest(proj, "cap-0002", "fondo_a/images/main/IMG_0002.jpg", b"bytes of IMG_0002.jpg")
+    target = proj / f"collection-{legacy['a2'].id}" / "images" / "main"
+    target.mkdir(parents=True)
+    (target / "IMG_0002.jpg").write_bytes(b"unrelated")
+    return hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest()

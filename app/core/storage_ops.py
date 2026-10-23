@@ -32,51 +32,75 @@ logger = logging.getLogger(__name__)
 # Relocation records for masters renamed after capture
 # ---------------------------------------------------------------------------
 
-# (project directory, capture id, from, to), the paths relative to the project
-# directory, as capture.manifestHandler.append_relocation_record takes them.
-Relocation = Tuple[Path, str, str, str]
+# (project directory, capture id, image id, sha256, from, to), the paths
+# relative to the project directory, as
+# capture.manifestHandler.append_relocation_record takes them.
+Relocation = Tuple[Path, str, int, str, str, str]
 
 _QUEUED_RELOCATIONS = "storage_ops.queued_relocations"
 _RELOCATION_LISTENERS = "storage_ops.relocation_listeners"
 _SPENT_RELOCATION_LISTENERS = "storage_ops.spent_relocation_listeners"
 
 
-def relocation_of(capture_id: Optional[str], src: Path, dst: Path) -> Optional[Relocation]:
+class FixityIndexOnce:
+    """The capture manifests' FixityIndex under the active projects root, built on first use and kept."""
+
+    def __init__(self) -> None:
+        self._index = None
+
+    def __call__(self):
+        if self._index is None:
+            from app.core.integrity import build_fixity_index
+
+            self._index = build_fixity_index(config.settings.projects_dir.resolve())
+        return self._index
+
+
+def relocation_of(img: RecordImage, src: Path, dst: Path, fixity_index: FixityIndexOnce) -> Optional[Relocation]:
     """The relocation record a master moved from `src` to `dst` needs, or None.
 
     Only a renamed master with a capture id needs one, as in
     app.core.volume_layout: a move that keeps the name is found by the
-    integrity check's fallback by file name. The record goes in the manifest
-    of the project `dst` is in, under the active projects root, the root
-    app.core.integrity indexes; a `dst` outside it gets none.
+    integrity check's fallback by file name, scoped to the capture id. The
+    record carries the image id and the sha256 the manifests hold for the
+    image at `src`, looked up before the record is written. With no such
+    checksum there is nothing to carry: no record, and a WARNING; the export
+    fixity gate then refuses the image by name. The record goes in the
+    manifest of the project `dst` is in, under the active projects root, the
+    root app.core.integrity indexes; a `dst` outside it gets none.
     """
-    if not capture_id or src.name == dst.name:
+    if not img.capture_id or src.name == dst.name:
         return None
     root = config.settings.projects_dir.resolve()
     src, dst = src.resolve(), dst.resolve()
     if not dst.is_relative_to(root) or len(dst.relative_to(root).parts) < 2:
         return None
+    sha = fixity_index().expected(img.capture_id, img.id, src)
+    if sha is None:
+        logger.warning(f"No capture checksum is held for image {img.id} at {src}; "
+                       f"no relocation record is written for its rename to {dst}")
+        return None
     project_root = root / dst.relative_to(root).parts[0]
-    return (project_root, capture_id, os.path.relpath(src, project_root), os.path.relpath(dst, project_root))
+    return (project_root, img.capture_id, img.id, sha,
+            os.path.relpath(src, project_root), os.path.relpath(dst, project_root))
 
 
 def write_relocation_records(records: Iterable[Relocation]) -> None:
     """Append each relocation record to its project's capture manifest.
 
-    Called once the renames are committed. A record that cannot be written
-    is logged at ERROR with its paths and not raised: the rows and files
-    already agree, and until the record is written by hand the integrity
-    check skips that master's capture-time fixity.
+    A record that cannot be written is logged at ERROR with everything it
+    holds and not raised: the rows and files already agree. Until the record
+    is written by hand, the export fixity gate refuses the image.
     """
     from capture.manifestHandler import append_relocation_record
 
-    for project_root, capture_id, frm, to in records:
+    for project_root, capture_id, image_id, sha, frm, to in records:
         try:
-            append_relocation_record(project_root, capture_id, frm, to)
+            append_relocation_record(project_root, capture_id, frm, to, image_id=image_id, sha256=sha)
         except OSError as e:
             logger.error(
-                f"Could not append the relocation record of capture {capture_id} ({frm} -> {to}) "
-                f"to {project_root / 'metadata' / 'manifest.jsonl'}; its fixity is not checked until it is: {e}"
+                f"Could not append the relocation record of image {image_id}, capture {capture_id} "
+                f"({frm} -> {to}, sha256 {sha}) to {project_root / 'metadata' / 'manifest.jsonl'}: {e}"
             )
 
 
@@ -274,6 +298,7 @@ def relocate_image(
     moved: Optional[List[Tuple[Path, Path]]] = None,
     old_thumbnails: Optional[List[Path]] = None,
     relocations: Optional[List[Relocation]] = None,
+    fixity_index: Optional[FixityIndexOnce] = None,
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
@@ -330,7 +355,7 @@ def relocate_image(
     if moved is not None:
         moved.append((src, dst))
     if relocations is not None:
-        record = relocation_of(img.capture_id, src, dst)
+        record = relocation_of(img, src, dst, fixity_index or FixityIndexOnce())
         if record is not None:
             relocations.append(record)
     img.file_path = str(dst)
@@ -484,10 +509,11 @@ def relocate_images_and_commit(
     moved: List[Tuple[Path, Path]] = []
     old_thumbnails: List[Path] = []
     relocations: List[Relocation] = []
+    fixity_index = FixityIndexOnce()
     new_paths: dict = {}
     try:
         for img, target_dir in moves:
-            if relocate_image(img, target_dir, not_moved, moved, old_thumbnails, relocations):
+            if relocate_image(img, target_dir, not_moved, moved, old_thumbnails, relocations, fixity_index):
                 new_paths[img.id] = img.file_path
     except Exception as e:
         _rollback_logged(db, operation)
@@ -941,8 +967,9 @@ def renumber_collection_images(
         applied.extend((orig, final) for (orig, _), (_, final) in zip(to_temp, file_moves))
 
     relocations: List[Relocation] = []
+    fixity_index = FixityIndexOnce()
     for idx, (img, src, final_path) in enumerate(plan, start=1):
-        record = relocation_of(img.capture_id, src, final_path)
+        record = relocation_of(img, src, final_path, fixity_index)
         if record is not None:
             relocations.append(record)
         old_thumb = resolve_within_storage(img.thumbnail_path)

@@ -296,16 +296,21 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
 RELOCATION_RECORD_TYPE = "relocation"
 
 
-def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str) -> None:
+def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str, *,
+                             image_id: int, sha256: str) -> None:
     """Append to the project's capture manifest that a captured file now lives under another name.
 
     The manifest is append-only, so a file that is moved and renamed after
     capture keeps its capture-time sha256 through this record rather than by
     rewriting its capture record: `{"record_type": "relocation", "capture_id",
-    "from", "to", "relocated_at"}`, both paths relative to `project_root` as
-    the capture record's `relative_path` is. app.core.integrity follows these
-    records, in file order, when it indexes the manifest. The line is written
-    with one O_APPEND write and fsynced, as append_manifest_record writes.
+    "image_id", "sha256", "from", "to", "relocated_at"}`, both paths relative
+    to `project_root` as the capture record's `relative_path` is. `image_id`
+    is the RecordImage id and `sha256` the capture-time checksum the system
+    held for that image when it was renamed, so app.core.integrity resolves
+    the image's checksum from this one record, in any order and whatever
+    names later renames reuse. `relocated_at` is information only. The line
+    is written with one O_APPEND write and fsynced, as append_manifest_record
+    writes.
     """
     metadata_dir = project_root / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
@@ -313,6 +318,8 @@ def append_relocation_record(project_root: Path, capture_id: str, from_rel: str,
     payload = {
         "record_type": RELOCATION_RECORD_TYPE,
         "capture_id": capture_id,
+        "image_id": image_id,
+        "sha256": sha256,
         "from": from_rel,
         "to": to_rel,
         "relocated_at": datetime.now(timezone.utc).isoformat(),
