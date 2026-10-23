@@ -378,3 +378,68 @@ def test_an_interrupt_mid_loop_puts_the_files_back_and_propagates(db_session, la
     with pytest.raises(KeyboardInterrupt):
         relocate_images_and_commit(db_session, moves, [], "test move")
     assert _files(override_projects_root) == files_before
+
+
+def _assert_left_at_new_paths_and_logged(layout, new_dir, caplog):
+    """Every file sits at its new path and every (original, new) pair is logged at ERROR."""
+    names = ["IMG_0001.CR2", "IMG_0001_preview.jpg", "IMG_0002.CR2", "IMG_0002_preview.jpg", "IMG_0003.jpg"]
+    assert sorted(p.name for p in new_dir.iterdir()) == names
+    errors = [r.getMessage() for r in caplog.records if r.levelno >= logging.ERROR]
+    src = layout["src_dir"].resolve()
+    for name in names:
+        assert any(str(src / name) in m and str(new_dir.resolve() / name) in m for m in errors), name
+    assert len(list(layout["thumb_dir"].iterdir())) == 3
+
+
+@pytest.mark.unit
+def test_a_failed_commit_whose_rollback_also_fails_is_an_unknown_outcome(client, db_session, layout,
+                                                                         monkeypatch, caplog):
+    """The rows the session flushed are still visible to it, so a re-read cannot tell what landed."""
+    from sqlalchemy.exc import OperationalError
+    from capture.project_manager import image_output_dir
+
+    real_rollback = db_session.rollback
+
+    def commit():
+        db_session.flush()
+        raise OperationalError("COMMIT", {}, Exception("disk I/O error"))
+
+    def rollback():
+        raise OperationalError("ROLLBACK", {}, Exception("connection gone"))
+
+    monkeypatch.setattr(db_session, "commit", commit)
+    monkeypatch.setattr(db_session, "rollback", rollback)
+    with caplog.at_level(logging.ERROR, logger="app.core.storage_ops"):
+        resp = ROUTES["move_records"][0](_as_operator(client), layout)
+    monkeypatch.setattr(db_session, "rollback", real_rollback)
+    real_rollback()
+
+    assert resp.status_code == 500, resp.text
+    assert "could not be determined" in resp.json()["detail"]
+    _assert_left_at_new_paths_and_logged(layout, image_output_dir("proj", "B"), caplog)
+
+
+@pytest.mark.unit
+def test_an_interrupt_during_the_commit_moves_nothing_and_propagates(db_session, layout, monkeypatch, caplog):
+    from capture.project_manager import image_output_dir
+    from app.core.storage_ops import relocate_images_and_commit
+    from app.models.record import RecordImage
+
+    def commit():
+        raise KeyboardInterrupt()
+
+    target = image_output_dir("proj", "B")
+    moves = [(i, target) for i in db_session.query(RecordImage).order_by(RecordImage.id).all()]
+    monkeypatch.setattr(db_session, "commit", commit)
+    with caplog.at_level(logging.ERROR, logger="app.core.storage_ops"):
+        with pytest.raises(KeyboardInterrupt):
+            relocate_images_and_commit(db_session, moves, [], "test move")
+
+    _assert_left_at_new_paths_and_logged(layout, target, caplog)
+
+
+@pytest.mark.unit
+def test_no_moved_image_never_reads_as_landed(db_session):
+    from app.core.storage_ops import _relocation_landed
+
+    assert _relocation_landed(db_session, {}) is None

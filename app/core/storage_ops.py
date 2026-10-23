@@ -255,16 +255,21 @@ def undo_relocations(moved: List[Tuple[Path, Path]]) -> List[Path]:
     return not_restored
 
 
-def _rollback_logged(db: Session, operation: str) -> None:
-    """Roll the session back; a rollback that fails is logged at ERROR and not raised.
+def _rollback_logged(db: Session, operation: str) -> bool:
+    """Roll the session back; return whether the rollback succeeded.
 
-    The callers roll back on their way to putting files back, and a failed
-    rollback must neither stop that nor replace the error being reported.
+    A rollback that fails is logged at ERROR and not raised: the callers roll
+    back on their way to putting files back, and a failed rollback must
+    neither stop that nor replace the error being reported. After a failed
+    commit the result matters too, because a session that could not roll back
+    may still see its own uncommitted rows.
     """
     try:
         db.rollback()
+        return True
     except Exception:
         logger.exception(f"{operation}: rollback failed")
+        return False
 
 
 def _relocation_landed(db: Session, new_paths: dict) -> Optional[bool]:
@@ -274,9 +279,11 @@ def _relocation_landed(db: Session, new_paths: dict) -> Optional[bool]:
     moved image is checked, in one query: a transaction lands whole or not at
     all, so all rows agreeing is expected, and a mix is treated as unknown
     rather than guessed from one row. Returns True when every row holds its
-    new path, False when none does, and None when they disagree or the query
-    fails.
+    new path, False when none does, and None when they disagree, the query
+    fails, or `new_paths` is empty (no row to tell by).
     """
+    if not new_paths:
+        return None
     try:
         rows = dict(
             db.query(RecordImage.id, RecordImage.file_path)
@@ -326,6 +333,13 @@ def relocate_images_and_commit(
       back and a 500 is raised. If the check cannot tell, no file is moved,
       every (original, new) pair is logged at ERROR for recovery by hand, and
       a 500 says the outcome could not be determined.
+      The outcome is also unknown, and handled the same way, when the
+      rollback after the failed commit itself fails: the session may still
+      see its own uncommitted rows, so a re-read cannot be trusted.
+    - The commit raises a BaseException that is not an Exception (an
+      interrupt, SystemExit): the outcome is unknown, so the rollback is
+      tried (and logged if it fails), no file is moved, every (original, new)
+      pair is logged at ERROR, and the original is re-raised unchanged.
     - A commit that fails when no file moved is rolled back and its error
       re-raised unchanged.
 
@@ -369,13 +383,17 @@ def relocate_images_and_commit(
         undo_relocations(moved)
         raise
 
+    def log_unknown_outcome() -> None:
+        for orig, current in moved:
+            logger.error(f"{operation}: commit outcome unknown; file left at {current}, originally at {orig}")
+
     try:
         db.commit()
     except Exception as e:
-        _rollback_logged(db, operation)
+        rolled_back = _rollback_logged(db, operation)
         if not moved:
             raise  # no file moved (a metadata-only update, say), so nothing to put back
-        landed = _relocation_landed(db, new_paths)
+        landed = _relocation_landed(db, new_paths) if rolled_back else None
         if landed:
             logger.warning(
                 f"{operation}: the commit raised but its rows hold the new paths, so it landed; "
@@ -384,8 +402,7 @@ def relocate_images_and_commit(
             _unlink_old_thumbnails(old_thumbnails)
             return
         if landed is None:
-            for orig, current in moved:
-                logger.error(f"{operation}: commit outcome unknown; file left at {current}, originally at {orig}")
+            log_unknown_outcome()
             logger.exception(f"{operation} DB commit failed and its outcome could not be determined; no file was moved back")
             raise HTTPException(
                 status_code=500,
@@ -406,6 +423,10 @@ def relocate_images_and_commit(
             status_code=500,
             detail="The database update failed; the files are back where they were. Please retry",
         ) from e
+    except BaseException:
+        _rollback_logged(db, operation)
+        log_unknown_outcome()
+        raise
 
     _unlink_old_thumbnails(old_thumbnails)
 
