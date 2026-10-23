@@ -16,14 +16,94 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException
+from sqlalchemy import event
 from sqlalchemy.orm import Session
 
+from app.core import config
 from app.models.collection import Collection
 from app.models.project import Project
 from app.models.record import Record, RecordImage
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 
 logger = logging.getLogger(__name__)
+
+
+# ---------------------------------------------------------------------------
+# Relocation records for masters renamed after capture
+# ---------------------------------------------------------------------------
+
+# (project directory, capture id, from, to), the paths relative to the project
+# directory, as capture.manifestHandler.append_relocation_record takes them.
+Relocation = Tuple[Path, str, str, str]
+
+_QUEUED_RELOCATIONS = "storage_ops.queued_relocations"
+
+
+def relocation_of(capture_id: Optional[str], src: Path, dst: Path) -> Optional[Relocation]:
+    """The relocation record a master moved from `src` to `dst` needs, or None.
+
+    Only a renamed master with a capture id needs one, as in
+    app.core.volume_layout: a move that keeps the name is found by the
+    integrity check's fallback by file name. The record goes in the manifest
+    of the project `dst` is in, under the active projects root, the root
+    app.core.integrity indexes; a `dst` outside it gets none.
+    """
+    if not capture_id or src.name == dst.name:
+        return None
+    root = config.settings.projects_dir.resolve()
+    src, dst = src.resolve(), dst.resolve()
+    if not dst.is_relative_to(root) or len(dst.relative_to(root).parts) < 2:
+        return None
+    project_root = root / dst.relative_to(root).parts[0]
+    return (project_root, capture_id, os.path.relpath(src, project_root), os.path.relpath(dst, project_root))
+
+
+def write_relocation_records(records: Iterable[Relocation]) -> None:
+    """Append each relocation record to its project's capture manifest.
+
+    Called once the renames are committed. A record that cannot be written
+    is logged at ERROR with its paths and not raised: the rows and files
+    already agree, and until the record is written by hand the integrity
+    check skips that master's capture-time fixity.
+    """
+    from capture.manifestHandler import append_relocation_record
+
+    for project_root, capture_id, frm, to in records:
+        try:
+            append_relocation_record(project_root, capture_id, frm, to)
+        except OSError as e:
+            logger.error(
+                f"Could not append the relocation record of capture {capture_id} ({frm} -> {to}) "
+                f"to {project_root / 'metadata' / 'manifest.jsonl'}; its fixity is not checked until it is: {e}"
+            )
+
+
+def queue_relocation_records(db: Session, records: Iterable[Relocation]) -> None:
+    """Write `records` when `db` next commits; drop them if it rolls back first.
+
+    For renames whose caller commits the rows itself (renumber_collection_images).
+    """
+    records = list(records)
+    if records:
+        db.info.setdefault(_QUEUED_RELOCATIONS, []).extend(records)
+
+
+@event.listens_for(Session, "after_commit")
+def _write_queued_relocations(session: Session) -> None:
+    records = session.info.pop(_QUEUED_RELOCATIONS, None)
+    if not records:
+        return
+    try:
+        write_relocation_records(records)
+    except Exception:
+        logger.exception(f"Could not write {len(records)} relocation record(s) after a commit: {records}")
+
+
+@event.listens_for(Session, "after_soft_rollback")
+def _drop_queued_relocations(session: Session, previous_transaction) -> None:
+    # The renames whose rows were rolled back are put back by the caller, or
+    # stay unrecorded in the rows; either way no record describes them.
+    session.info.pop(_QUEUED_RELOCATIONS, None)
 
 
 def _is_within(path: Path, directory: Path) -> bool:
@@ -161,6 +241,7 @@ def relocate_image(
     not_moved: Optional[List[str]] = None,
     moved: Optional[List[Tuple[Path, Path]]] = None,
     old_thumbnails: Optional[List[Path]] = None,
+    relocations: Optional[List[Relocation]] = None,
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
@@ -176,7 +257,10 @@ def relocate_image(
     When the master's name clashes in the target (see `_name_taken`), it is
     moved as `{stem}_{uuid8}{suffix}` instead; `img.filename` follows when it
     held the stored file's name, and is left alone when it holds an upload's
-    original name.
+    original name. A renamed master with a capture id needs a relocation
+    record in its project's capture manifest (relocation_of); it is appended
+    to `relocations` when the caller passes a list, for the caller to write
+    once the commit has landed, never on a move that is undone.
 
     The row's thumbnail is dropped (set to None) so it is regenerated on demand
     from the new location. The old thumbnail file is not deleted here: its
@@ -213,6 +297,10 @@ def relocate_image(
     shutil.move(str(src), str(dst))
     if moved is not None:
         moved.append((src, dst))
+    if relocations is not None:
+        record = relocation_of(img.capture_id, src, dst)
+        if record is not None:
+            relocations.append(record)
     img.file_path = str(dst)
     if img.filename == src.name:
         img.filename = dst.name
@@ -356,14 +444,18 @@ def relocate_images_and_commit(
     Sidecars that could not follow their master are appended to `not_moved`,
     as `relocate_image` does. The moved images' old thumbnails are unlinked
     only once the commit is known to have landed; until then the files stay,
-    so a rolled-back row's thumbnail_path still names an existing file.
+    so a rolled-back row's thumbnail_path still names an existing file. The
+    relocation records of masters renamed on a clash are written to the
+    capture manifest at the same point, and never when the moves are undone
+    or the outcome is unknown.
     """
     moved: List[Tuple[Path, Path]] = []
     old_thumbnails: List[Path] = []
+    relocations: List[Relocation] = []
     new_paths: dict = {}
     try:
         for img, target_dir in moves:
-            if relocate_image(img, target_dir, not_moved, moved, old_thumbnails):
+            if relocate_image(img, target_dir, not_moved, moved, old_thumbnails, relocations):
                 new_paths[img.id] = img.file_path
     except Exception as e:
         _rollback_logged(db, operation)
@@ -404,6 +496,7 @@ def relocate_images_and_commit(
                 f"{operation}: the commit raised but its rows hold the new paths, so it landed; "
                 f"the files stay where they were moved: {e}"
             )
+            write_relocation_records(relocations)
             _unlink_old_thumbnails(old_thumbnails)
             return
         if landed is None:
@@ -433,6 +526,7 @@ def relocate_images_and_commit(
         log_unknown_outcome()
         raise
 
+    write_relocation_records(relocations)
     _unlink_old_thumbnails(old_thumbnails)
 
 
@@ -694,6 +788,12 @@ def renumber_collection_images(
     path) pair of every file renamed, so that a caller whose commit fails can
     hand them to `restore_original_names`.
 
+    Each renamed master with a capture id gets a relocation record in its
+    project's capture manifest, so the integrity check follows it to its new
+    name. The records are queued on the session (queue_relocation_records)
+    and written when the caller's commit lands; a rollback drops them, and a
+    renumber unwound on disk queues none.
+
     Raises ValueError, before anything is renamed, if an image's file is
     missing on disk, the computed plan would produce duplicate filenames
     (defensive; should not happen), a new name is already held by a file no
@@ -808,7 +908,11 @@ def renumber_collection_images(
     if applied is not None:
         applied.extend((orig, final) for (orig, _), (_, final) in zip(to_temp, file_moves))
 
-    for idx, (img, _, final_path) in enumerate(plan, start=1):
+    relocations: List[Relocation] = []
+    for idx, (img, src, final_path) in enumerate(plan, start=1):
+        record = relocation_of(img.capture_id, src, final_path)
+        if record is not None:
+            relocations.append(record)
         old_thumb = resolve_within_storage(img.thumbnail_path)
         img.filename = final_path.name
         img.file_path = str(final_path)
@@ -819,5 +923,6 @@ def renumber_collection_images(
                 old_thumb.unlink()
             except OSError:
                 pass
+    queue_relocation_records(db, relocations)
 
     return {"renumbered": len(plan), "prefix": prefix, "width": width}

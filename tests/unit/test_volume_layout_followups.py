@@ -272,3 +272,194 @@ def test_a_renamed_master_is_adopted_by_the_checksum_its_relocation_record_carri
     assert Path(db_session.get(RecordImage, img.id).file_path) == renamed
     assert [a["image_id"] for a in report["adopted"]] == [img.id]
     assert (target / "fondo_0001.jpg").read_bytes() == b"unrelated"
+
+
+# ---------------------------------------------------------------------------
+# Fixity after a rename made after the migration
+# ---------------------------------------------------------------------------
+
+def _manifest_lines(project_dir: Path) -> list:
+    return [json.loads(l) for l in (project_dir / "metadata" / "manifest.jsonl").read_text().splitlines() if l.strip()]
+
+
+def _relocations(project_dir: Path) -> list:
+    return [l for l in _manifest_lines(project_dir) if l.get("record_type") == "relocation"]
+
+
+def _captured_i2(db_session, legacy):
+    """IMG_0002 with a capture record in the project manifest, then migrated into its id-based directory."""
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import RecordImage
+
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "cap-0002"
+    db_session.commit()
+    _manifest_dir = legacy["root"] / "proj"
+    (_manifest_dir / "metadata" / "manifest.jsonl").write_text("")
+    _manifest(_manifest_dir, "cap-0002", "fondo_a/images/main/IMG_0002.jpg", Path(img.file_path).read_bytes())
+    migrate_volume_layout(db_session)
+    db_session.expire_all()
+
+
+@pytest.mark.unit
+def test_fixity_follows_a_master_renamed_by_a_renumber_after_the_migration(db_session, legacy):
+    from app.core.integrity import verify_images_against_manifest
+    from app.core.storage_ops import renumber_collection_images
+    from app.models.record import RecordImage
+
+    _captured_i2(db_session, legacy)
+    old = Path(db_session.get(RecordImage, legacy["i2"].id).file_path)
+    renumber_collection_images(db_session, legacy["a2"])
+    db_session.commit()
+    db_session.expire_all()
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    new = Path(img.file_path)
+    assert new.name != "IMG_0002.jpg"
+
+    proj = legacy["root"] / "proj"
+    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(proj)] == [
+        ("cap-0002", os.path.relpath(old, proj.resolve()), os.path.relpath(new, proj.resolve()))]
+    assert verify_images_against_manifest([img]) == []
+    new.write_bytes(b"bit rot")
+    assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
+
+
+@pytest.mark.unit
+def test_a_renumber_whose_commit_is_rolled_back_writes_no_relocation_record(db_session, legacy):
+    from app.core.storage_ops import renumber_collection_images, restore_original_names
+
+    _captured_i2(db_session, legacy)
+    applied: list = []
+    renumber_collection_images(db_session, legacy["a2"], applied)
+    db_session.rollback()
+    assert restore_original_names(applied) == []
+    db_session.commit()  # a later commit on the same session carries nothing from the rolled-back renumber
+
+    assert _relocations(legacy["root"] / "proj") == []
+
+
+@pytest.mark.unit
+def test_a_renumber_unwound_on_disk_writes_no_relocation_record(db_session, legacy, monkeypatch):
+    import app.core.storage_ops as so
+
+    _captured_i2(db_session, legacy)
+    real = os.replace
+    calls = {"n": 0}
+
+    def fail_in_phase_two(src, dst):
+        if not Path(dst).name.startswith(".renumber_"):
+            calls["n"] += 1
+            if calls["n"] == 2:
+                raise OSError(5, "Input/output error")
+        return real(src, dst)
+
+    monkeypatch.setattr(so.os, "replace", fail_in_phase_two)
+    with pytest.raises(OSError):
+        so.renumber_collection_images(db_session, legacy["a2"])
+    monkeypatch.setattr(so.os, "replace", real)
+    db_session.commit()
+
+    assert _relocations(legacy["root"] / "proj") == []
+
+
+def _clash_setup(db_session, capture_settings_root):
+    """An image with a capture record in collection A, to be moved into collection B, where its name is taken."""
+    root = capture_settings_root
+    _p, a = _project_and_collection(db_session, cname="A")
+    from app.models.collection import Collection
+
+    b = Collection(name="B", project_id=_p.id)
+    db_session.add(b)
+    db_session.commit()
+    src = root / "proj" / f"collection-{a.id}" / "images" / "main" / "folio_0001.jpg"
+    img = _image(db_session, a.id, src, b"the captured page", capture_id="cap-1")
+    _manifest(root / "proj", "cap-1", f"collection-{a.id}/images/main/folio_0001.jpg", b"the captured page")
+    target = root / "proj" / f"collection-{b.id}" / "images" / "main"
+    target.mkdir(parents=True)
+    (target / "folio_0001.jpg").write_bytes(b"another page")
+    return img, src, target
+
+
+@pytest.mark.unit
+def test_fixity_follows_a_master_renamed_on_a_clash_when_it_is_moved(
+        db_session, capture_settings, data_dir, override_projects_root):
+    from app.core.integrity import verify_images_against_manifest
+    from app.core.storage_ops import relocate_images_and_commit
+    from app.models.record import RecordImage
+
+    img, src, target = _clash_setup(db_session, override_projects_root)
+
+    relocate_images_and_commit(db_session, [(img, target)], [], "test move")
+
+    db_session.expire_all()
+    img = db_session.get(RecordImage, img.id)
+    new = Path(img.file_path)
+    assert new.parent == target and new.name != "folio_0001.jpg"
+    assert (target / "folio_0001.jpg").read_bytes() == b"another page"
+    proj = (override_projects_root / "proj").resolve()
+    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(proj)] == [
+        ("cap-1", os.path.relpath(src.resolve(), proj), os.path.relpath(new.resolve(), proj))]
+    assert verify_images_against_manifest([img]) == []
+    new.write_bytes(b"bit rot")
+    assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
+
+
+@pytest.mark.unit
+def test_a_clash_rename_whose_commit_fails_and_is_unwound_writes_no_relocation_record(
+        db_session, capture_settings, data_dir, override_projects_root, monkeypatch):
+    from fastapi import HTTPException
+    from app.core.storage_ops import relocate_images_and_commit
+
+    img, src, target = _clash_setup(db_session, override_projects_root)
+
+    def failing_commit():
+        raise RuntimeError("database is locked")
+
+    monkeypatch.setattr(db_session, "commit", failing_commit)
+    with pytest.raises(HTTPException):
+        relocate_images_and_commit(db_session, [(img, target)], [], "test move")
+    monkeypatch.undo()
+
+    assert src.read_bytes() == b"the captured page"
+    assert _relocations(override_projects_root / "proj") == []
+
+
+@pytest.mark.unit
+def test_a_clash_rename_whose_commit_raised_but_landed_writes_its_relocation_record(
+        db_session, capture_settings, data_dir, override_projects_root, monkeypatch):
+    from app.core.storage_ops import relocate_images_and_commit
+
+    img, src, target = _clash_setup(db_session, override_projects_root)
+    real_commit = db_session.commit
+
+    def commit_then_raise():
+        real_commit()
+        raise RuntimeError("connection lost after COMMIT")
+
+    monkeypatch.setattr(db_session, "commit", commit_then_raise)
+    relocate_images_and_commit(db_session, [(img, target)], [], "test move")
+    monkeypatch.undo()
+
+    assert not src.exists()
+    assert [r["capture_id"] for r in _relocations(override_projects_root / "proj")] == ["cap-1"]
+
+
+@pytest.mark.unit
+def test_relocation_records_of_later_renames_stay_out_of_the_bag_manifest(db_session, legacy):
+    from app.core.export_service import _filtered_manifest_blob
+    from app.core.storage_ops import renumber_collection_images
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    _captured_i2(db_session, legacy)
+    renumber_collection_images(db_session, legacy["a2"])
+    db_session.commit()
+    assert _relocations(legacy["root"] / "proj")
+
+    collection = db_session.get(Collection, legacy["a2"].id)
+    records = db_session.query(Record).filter(Record.collection_id == collection.id).all()
+    blob = _filtered_manifest_blob(db_session, collection, records)
+
+    kept = [json.loads(l) for l in blob.decode().splitlines() if l.strip()]
+    assert [k.get("capture_id") for k in kept] == ["cap-0002"]
+    assert all(k.get("record_type") != "relocation" for k in kept)
