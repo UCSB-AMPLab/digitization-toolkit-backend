@@ -543,7 +543,8 @@ def test_migration_leaves_files_outside_the_active_root_where_they_are(db_sessio
     assert upload.exists()
     db_session.expire_all()
     assert db_session.get(RecordImage, legacy["i2"].id).file_path == str(upload)
-    assert {"image_id": legacy["i2"].id, "path": str(upload.resolve()), "reason": "outside_projects_root"} in report["skipped"]
+    assert legacy["i2"].id not in [m["image_id"] for m in report["moved"]]
+    assert legacy["i2"].id not in [s["image_id"] for s in report["skipped"]]
 
 
 @pytest.mark.unit
@@ -679,3 +680,276 @@ def test_deleting_an_empty_collection_removes_its_id_directory(client, db_sessio
     assert resp.status_code == 204, resp.text
     assert not collection_capture_root("P", a.id).exists()
     assert collection_capture_root("P", b.id).exists()
+
+
+# ---------------------------------------------------------------------------
+# Rows decide; restores, retries, clashes, durability, fixity
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_database_restored_from_before_the_migration_is_pointed_at_the_moved_files(db_session, legacy):
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    before = {i.id: (i.file_path, i.filename, i.thumbnail_path) for i in db_session.query(RecordImage).all()}
+    vl.migrate_volume_layout_at_startup(db_session)
+    files = _files(legacy["root"])
+    for img in db_session.query(RecordImage).all():
+        img.file_path, img.filename, img.thumbnail_path = before[img.id]
+    db_session.commit()
+
+    report = vl.migrate_volume_layout(db_session)
+
+    assert _files(legacy["root"]) == files  # no file moved
+    assert sorted(a["image_id"] for a in report["adopted"]) == sorted(
+        legacy[k].id for k in ("i1", "i2", "i3a", "i3b", "i4"))
+    _assert_migrated(db_session, legacy)
+
+
+@pytest.mark.unit
+def test_an_old_layout_row_found_after_a_migrated_startup_is_migrated(db_session, legacy, override_projects_root):
+    import app.core.volume_layout as vl
+    from app.models.collection import Collection
+    from app.models.record import Record, RecordImage
+    from capture.project_manager import image_output_dir
+
+    vl.migrate_volume_layout_at_startup(db_session)
+    c = Collection(name="Restored", project_id=legacy["proj"].id)
+    db_session.add(c)
+    db_session.commit()
+    old = override_projects_root / "proj" / "restored" / "images" / "main"
+    old.mkdir(parents=True)
+    f = old / "R_0001.jpg"
+    f.write_bytes(b"restored")
+    rec = Record(title="r", collection_id=c.id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    img = RecordImage(record_id=rec.id, filename=f.name, file_path=str(f), format="jpg", role="single")
+    db_session.add(img)
+    db_session.commit()
+
+    vl.migrate_volume_layout_at_startup(db_session)
+
+    db_session.expire_all()
+    assert Path(db_session.get(RecordImage, img.id).file_path) == image_output_dir("Proj", c.id).resolve() / "R_0001.jpg"
+
+
+@pytest.mark.unit
+def test_a_startup_on_a_migrated_unit_touches_no_file_per_row(db_session, legacy, monkeypatch):
+    import app.core.volume_layout as vl
+
+    vl.migrate_volume_layout_at_startup(db_session)
+
+    def no_disk(*a, **kw):
+        raise AssertionError("the startup check looked at the disk")
+
+    monkeypatch.setattr(vl, "resolve_within_storage", no_disk)
+    monkeypatch.setattr(vl, "_plan", no_disk)
+    report = vl.migrate_volume_layout(db_session)
+    assert report["out_of_place"] == 0 and report["moved"] == []
+
+
+@pytest.mark.unit
+def test_a_sidecar_that_could_not_follow_is_reported_and_moved_by_a_later_run(db_session, legacy, monkeypatch):
+    import app.core.volume_layout as vl
+
+    real_move = vl._move
+
+    def failing_sidecar(src, dst):
+        if Path(dst).name.endswith("_preview.jpg"):
+            raise OSError(5, "Input/output error")
+        real_move(src, dst)
+
+    monkeypatch.setattr(vl, "_move", failing_sidecar)
+    first = vl.migrate_volume_layout(db_session)
+    assert len(first["sidecars_not_moved"]) == 2
+    second = vl.migrate_volume_layout(db_session)
+    assert len(second["sidecars_pending"]) == 2  # still failing, still reported
+
+    monkeypatch.setattr(vl, "_move", real_move)
+    third = vl.migrate_volume_layout(db_session)
+
+    assert len(third["sidecars_moved"]) == 2
+    _assert_migrated(db_session, legacy)
+    assert vl.migrate_volume_layout(db_session)["sidecars_pending"] == []
+
+
+@pytest.mark.unit
+def test_a_name_differing_only_in_case_is_taken_and_the_master_gets_its_image_suffix(db_session, legacy):
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import RecordImage
+
+    target = legacy["root"] / "proj" / f"collection-{legacy['a2'].id}" / "images" / "main"
+    target.mkdir(parents=True)
+    (target / "img_0002.JPG").write_bytes(b"unrelated")
+
+    dry = migrate_volume_layout(db_session, dry_run=True)
+    migrate_volume_layout(db_session)
+
+    db_session.expire_all()
+    moved = Path(db_session.get(RecordImage, legacy["i2"].id).file_path)
+    assert moved.name == f"IMG_0002_img{legacy['i2'].id}.jpg"
+    assert moved.read_bytes() == b"bytes of IMG_0002.jpg"
+    assert (target / "img_0002.JPG").read_bytes() == b"unrelated"
+    assert str(moved) in [m["to"] for m in dry["moved"]]
+
+
+@pytest.mark.unit
+def test_an_unreadable_journal_refuses_to_serve(db_session, legacy, data_dir):
+    import app.core.volume_layout as vl
+
+    (data_dir / vl.JOURNAL_NAME).write_text('{"version": 2, "root": ', encoding="utf-8")
+
+    with pytest.raises(vl.VolumeLayoutError):
+        vl.migrate_volume_layout_at_startup(db_session)
+    assert (data_dir / vl.JOURNAL_NAME).exists()
+
+
+@pytest.mark.unit
+def test_source_and_target_directories_are_fsynced_before_the_rows_are_committed(db_session, legacy, monkeypatch):
+    import app.core.volume_layout as vl
+
+    synced = []
+    monkeypatch.setattr(vl, "_fsync_dir", lambda d: synced.append(Path(d)))
+    at_commit = []
+    real_commit = db_session.commit
+
+    def commit():
+        at_commit.append(list(synced))
+        return real_commit()
+
+    monkeypatch.setattr(db_session, "commit", commit)
+    vl.migrate_volume_layout(db_session)
+
+    a1 = (legacy["root"] / "proj" / f"collection-{legacy['a1'].id}" / "images").resolve()
+    assert a1 / "main" in at_commit[0]
+    assert a1 / "thumbnails" in at_commit[0]
+    assert legacy["shared"].resolve() in at_commit[0]
+
+
+@pytest.mark.unit
+def test_a_move_across_filesystems_is_copied_flushed_and_only_then_unlinked(tmp_path, monkeypatch):
+    import errno
+    import os
+    import app.core.volume_layout as vl
+
+    src, dst = tmp_path / "a.jpg", tmp_path / "d" / "a.jpg"
+    dst.parent.mkdir()
+    src.write_bytes(b"bytes")
+    events = []
+
+    def exdev(*a):
+        raise OSError(errno.EXDEV, "cross-device link")
+
+    real_unlink = os.unlink
+    monkeypatch.setattr(vl.os, "rename", exdev)
+    monkeypatch.setattr("capture.utils._fsync_file", lambda p: events.append(("fsync_file", Path(p).name)))
+    monkeypatch.setattr(vl, "_fsync_dir", lambda d: events.append(("fsync_dir", Path(d))))
+    monkeypatch.setattr(vl.os, "unlink", lambda p: (events.append(("unlink", Path(p))), real_unlink(p)))
+
+    vl._move(src, dst)
+
+    assert dst.read_bytes() == b"bytes" and not src.exists()
+    assert [e[0] for e in events] == ["fsync_file", "fsync_dir", "unlink"]
+
+
+@pytest.mark.unit
+def test_a_thumbnail_left_behind_with_its_row_cleared_is_reported_as_unreferenced(db_session, legacy):
+    from app.core.volume_layout import migrate_volume_layout
+
+    thumbs = legacy["root"] / "proj" / f"collection-{legacy['a2'].id}" / "images" / "thumbnails"
+    thumbs.mkdir(parents=True)
+    (thumbs / "IMG_0002_thumb.jpg").write_bytes(b"another thumbnail")
+    old_thumb = legacy["root"] / "proj" / "fondo_a" / "images" / "thumbnails" / "IMG_0002_thumb.jpg"
+
+    report = migrate_volume_layout(db_session)
+
+    assert str(old_thumb.resolve()) in report["left_unreferenced"]
+
+
+@pytest.mark.unit
+def test_deleting_an_empty_collection_keeps_a_file_no_row_references(client, db_session, capture_settings, caplog):
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from capture.project_manager import collection_capture_root
+
+    p = Project(name="P")
+    db_session.add(p)
+    db_session.commit()
+    c = Collection(name="C", project_id=p.id)
+    db_session.add(c)
+    db_session.commit()
+    main = collection_capture_root("P", c.id) / "images" / "main"
+    main.mkdir(parents=True)
+    (collection_capture_root("P", c.id) / "images" / "thumbnails").mkdir()
+    stray = main / "stray.jpg"
+    stray.write_bytes(b"no row")
+
+    resp = _as_operator(client).delete(f"/collections/{c.id}")
+
+    assert resp.status_code == 204, resp.text
+    assert stray.read_bytes() == b"no row"
+    assert not (collection_capture_root("P", c.id) / "images" / "thumbnails").exists()
+    assert "stray.jpg" in caplog.text
+
+
+@pytest.fixture
+def renamed_capture(db_session, legacy):
+    """IMG_0002 with a capture record in the project manifest, and its name taken in the target."""
+    import json
+    from app.models.record import RecordImage
+
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "cap-0002"
+    db_session.commit()
+    sha = hashlib.sha256(Path(img.file_path).read_bytes()).hexdigest()
+    (legacy["root"] / "proj" / "metadata" / "manifest.jsonl").write_text(json.dumps(
+        {"capture_id": "cap-0002", "files": [{"relative_path": "fondo_a/images/main/IMG_0002.jpg", "sha256": sha}]}
+    ) + "\n")
+    target = legacy["root"] / "proj" / f"collection-{legacy['a2'].id}" / "images" / "main"
+    target.mkdir(parents=True)
+    (target / "IMG_0002.jpg").write_bytes(b"unrelated")
+    return img
+
+
+@pytest.mark.unit
+def test_a_renamed_master_keeps_its_capture_time_fixity(db_session, legacy, renamed_capture):
+    import json
+    from app.core.integrity import verify_images_against_manifest
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import RecordImage
+
+    migrate_volume_layout(db_session)
+    db_session.expire_all()
+    img = db_session.get(RecordImage, renamed_capture.id)
+    assert Path(img.file_path).name == f"IMG_0002_img{img.id}.jpg"
+    lines = [json.loads(l) for l in (legacy["root"] / "proj" / "metadata" / "manifest.jsonl").read_text().splitlines()]
+    assert lines[-1]["record_type"] == "relocation"
+    assert lines[-1]["from"] == "fondo_a/images/main/IMG_0002.jpg"
+    assert lines[-1]["to"] == f"collection-{legacy['a2'].id}/images/main/IMG_0002_img{img.id}.jpg"
+
+    assert verify_images_against_manifest([img]) == []
+    Path(img.file_path).write_bytes(b"bit rot")
+    assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
+
+
+@pytest.mark.unit
+def test_relocation_records_stay_out_of_the_bag_manifest(db_session, legacy, renamed_capture):
+    import json
+    from app.core.export_service import _filtered_manifest_blob
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    migrate_volume_layout(db_session)
+    db_session.expire_all()
+    collection = db_session.get(Collection, legacy["a2"].id)
+    records = db_session.query(Record).filter(Record.collection_id == collection.id).all()
+    for r in records:
+        for i in r.images:
+            i.is_current = True
+
+    blob = _filtered_manifest_blob(db_session, collection, records)
+
+    lines = [json.loads(l) for l in blob.decode().splitlines()]
+    assert [l.get("record_type") for l in lines] == [None]
