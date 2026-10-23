@@ -16,6 +16,7 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
+from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
 from app.core.record_status import change_record_status
@@ -829,13 +830,13 @@ def trigger_capture(
 			db.flush()  # Get the ID
 		
 		# Generate thumbnail alongside the captured images
-		# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
+		# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
 		thumbnail_path = None
 		try:
 			thumbnails_dir = file_path.parent.parent / "thumbnails"
 			thumb_source = file_path
-			if file_path.suffix.lower() == ".cr2":
-				preview = file_path.with_name(file_path.stem + "_preview.jpg")
+			if is_raw_suffix(file_path):
+				preview = preview_sidecar_of(file_path)
 				if preview.exists():
 					thumb_source = preview
 			thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
@@ -1043,13 +1044,13 @@ def trigger_dual_capture(
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
 			# Generate thumbnail alongside the captured images
-			# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
+			# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
 			thumbnail_path = None
 			try:
 				thumbnails_dir = file_path.parent.parent / "thumbnails"
 				thumb_source = file_path
-				if file_path.suffix.lower() == ".cr2":
-					preview = file_path.with_name(file_path.stem + "_preview.jpg")
+				if is_raw_suffix(file_path):
+					preview = preview_sidecar_of(file_path)
 					if preview.exists():
 						thumb_source = preview
 				thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)

@@ -19,13 +19,14 @@ from typing import Dict, List, Optional, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import resolve_within_storage
+from app.core.paths import RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
 
 # Original capture/upload formats. Thumbnails are derived artifacts and are excluded from the orphan scan by path (see _iter_image_files)
-IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp", ".cr2", ".dng", ".raw"}
+# RAW members come from RAW_SUFFIXES, the set the preview endpoint and the sidecar rule use.
+IMAGE_EXTS = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"} | RAW_SUFFIXES
 _SHA_CHUNK = 1024 * 1024
 
 
@@ -187,6 +188,17 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     for paths in by_path.values():
         manifest_paths.update(paths.keys())
     known = referenced | manifest_paths
+    # A RAW master's `_preview.jpg` sidecar has no row and no manifest entry of
+    # its own, so it counts as known when its master is known and still on
+    # disk. The manifest is append-only and keeps the lines of deleted
+    # captures, so a known path alone does not mean the master exists; a
+    # sidecar whose master is gone is the orphan a delete that ignored
+    # sidecars leaves (NEH-257), and it is reported.
+    known |= {
+        str(preview_sidecar_of(Path(k)))
+        for k in known
+        if is_raw_suffix(Path(k)) and Path(k).is_file()
+    }
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []

@@ -43,6 +43,7 @@ from .backends import (
 from .project_manager import project_capture_root, image_output_dir
 
 from app.core.config import settings
+from app.core.paths import is_raw_suffix, preview_sidecar_of
 
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -358,10 +359,10 @@ def capture_image(
     rotate_deg = getattr(camera_config, "rotate_deg", 0)
     if rotate_deg:
         _apply_rotation(Path(str(actual_path)), rotate_deg)
-        # Also rotate the _preview.jpg extracted from CR2 if present
-        preview = Path(str(actual_path)).with_suffix("")
-        preview = preview.parent / (preview.name + "_preview.jpg")
-        if preview.exists():
+        # Also rotate the _preview.jpg extracted from a RAW master, if present
+        master = Path(str(actual_path))
+        preview = preview_sidecar_of(master)
+        if is_raw_suffix(master) and preview.exists():
             _apply_rotation(preview, rotate_deg)
 
     return actual_path, metadata
@@ -428,7 +429,7 @@ def _unlink_capture_output(path) -> None:
     parts = path if isinstance(path, (tuple, list)) else (path,)
     for p in parts:
         fp = Path(str(p))
-        for target in (fp, fp.with_name(fp.stem + "_preview.jpg")):
+        for target in (fp, preview_sidecar_of(fp)):
             try:
                 target.unlink(missing_ok=True)
             except OSError:
@@ -505,8 +506,8 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
         if rotate_deg:
             for p in paths:
                 _apply_rotation(p, rotate_deg)
-                preview = p.parent / (p.stem + "_preview.jpg")
-                if preview.exists():
+                preview = preview_sidecar_of(p)
+                if is_raw_suffix(p) and preview.exists():
                     _apply_rotation(preview, rotate_deg)
 
         # Pick the bytes to return.
@@ -515,8 +516,8 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
             image_bytes = paths[0].read_bytes()
         else:
             single_path = paths[0]
-            if single_path.suffix.lower() in (".cr2", ".raw"):
-                sidecar = single_path.with_name(single_path.stem + "_preview.jpg")
+            if is_raw_suffix(single_path):
+                sidecar = preview_sidecar_of(single_path)
                 if not sidecar.exists():
                     raise RuntimeError(
                         f"No JPEG preview available for RAW capture {single_path.name}"

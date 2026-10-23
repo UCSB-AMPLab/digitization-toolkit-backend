@@ -5,8 +5,10 @@ the thumbnail before `db.commit()`. A commit that failed then left rows
 pointing at masters that were already gone from the card, which nothing can
 repair. The handlers now collect the paths under the record's row lock, commit,
 and unlink afterwards. A file that cannot be unlinked after a successful commit
-is logged at WARNING and left on disk: the row is gone, so what remains is an
-extra file, which can be found and removed later.
+is logged at WARNING, left on disk and named in the response's `not_removed`
+list (NEH-263): the row is gone, so what remains is an extra file, which can be
+found and removed later. A response with nothing left behind has no
+`not_removed` key, which the exact-body assertions below check.
 
 The files are real, under the per-test projects root from the
 `override_projects_root` fixture, as in test_record_delete_sidecar.py. The
@@ -232,7 +234,7 @@ def test_record_delete_logs_and_succeeds_when_an_unlink_fails_after_commit(clien
         resp = _client_as("op", "operator").delete(f"/records/{rec_id}")
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"detail": f"Record {rec_id} and 1 images deleted"}
+    assert resp.json() == {"detail": f"Record {rec_id} and 1 images deleted", "not_removed": [master.name]}
     assert db_session.query(Record).filter(Record.id == rec_id).count() == 0
     assert db_session.query(RecordImage).filter(RecordImage.record_id == rec_id).count() == 0
     assert master.exists(), "the master the patched unlink refused is gone"
@@ -337,7 +339,7 @@ def test_image_delete_logs_and_succeeds_when_an_unlink_fails_after_commit(client
         resp = _client_as("op", "operator").delete(f"/records/images/{img_id}")
 
     assert resp.status_code == 200, resp.text
-    assert resp.json() == {"detail": "Image deleted"}
+    assert resp.json() == {"detail": "Image deleted", "not_removed": [master.name]}
     assert db_session.query(RecordImage).filter(RecordImage.id == img_id).count() == 0
     assert master.exists(), "the master the patched unlink refused is gone"
     assert not preview.exists(), "one failed unlink stopped the sidecar's"
