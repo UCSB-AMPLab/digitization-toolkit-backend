@@ -114,21 +114,49 @@ def test_a_pending_sidecar_whose_new_name_is_taken_is_kept_and_logged_with_both_
 
 
 @pytest.mark.unit
-def test_a_pending_sidecar_whose_master_row_is_gone_is_kept_and_logged(db_session, legacy, monkeypatch, caplog):
+def test_a_pending_sidecar_whose_master_row_is_gone_is_reported_once_as_unreferenced_and_dropped(
+        db_session, legacy, monkeypatch, caplog, override_projects_root):
+    """The entry is dropped and the file left where it is, reported in that run as a file no row references.
+
+    A row found out of place in the same run (a restored old-layout row) makes the
+    run plan moves too, and the sidecar must still be in that run's report.
+    """
     import app.core.volume_layout as vl
-    from app.models.record import RecordImage
+    from app.models.collection import Collection
+    from app.models.record import Record, RecordImage
 
     _fail_sidecars_once(vl, monkeypatch, db_session)
     db_session.delete(db_session.get(RecordImage, legacy["i1"].id))
+    db_session.commit()
+    c = Collection(name="Restored", project_id=legacy["proj"].id)
+    db_session.add(c)
+    db_session.commit()
+    f = override_projects_root / "proj" / "restored" / "images" / "main" / "R_0001.jpg"
+    f.parent.mkdir(parents=True)
+    f.write_bytes(b"restored")
+    rec = Record(title="r", collection_id=c.id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=rec.id, filename=f.name, file_path=str(f), format="jpg", role="single"))
     db_session.commit()
     old = (legacy["shared"] / "IMG_0001_preview.jpg").resolve()
 
     with caplog.at_level("WARNING"):
         report = vl.migrate_volume_layout(db_session)
 
+    assert report["moved"]  # the restored row was planned and moved in the same run
     assert old.read_bytes() == b"preview of IMG_0001"
-    assert [s["from"] for s in report["sidecars_pending"] if s["image_id"] == legacy["i1"].id] == [str(old)]
-    assert str(old) in caplog.text
+    assert str(old) in report["left_unreferenced"]
+    assert all(s["image_id"] != legacy["i1"].id for s in report["sidecars_pending"])
+    assert all(s["image_id"] != legacy["i1"].id for s in vl._read_pending_sidecars())
+    assert sum(str(old) in r.getMessage() and "row is gone" in r.getMessage() for r in caplog.records) == 1
+
+    caplog.clear()
+    with caplog.at_level("WARNING"):
+        again = vl.migrate_volume_layout(db_session)
+    assert "row is gone" not in caplog.text
+    assert old.read_bytes() == b"preview of IMG_0001"
+    assert all(s["image_id"] != legacy["i1"].id for s in again["sidecars_pending"])
 
 
 # ---------------------------------------------------------------------------

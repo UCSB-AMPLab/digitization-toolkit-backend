@@ -776,9 +776,10 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
     waited), the sidecar goes beside that file, under the name its stem
     derives (preview_sidecar_of), as a renumber would have named it, and the
     entry is updated to match. An entry is dropped when the sidecar is at its
-    destination and gone from its old path, or when it is gone from both
-    (logged). An entry whose master row is gone, whose master file is
-    missing or is not RAW, whose destination is taken or outside the root, or
+    destination and gone from its old path, when it is gone from both
+    (logged), or when its image's row is gone: that is logged once, the file
+    is left where it is and reported under "left_unreferenced" in that run.
+    An entry whose master file is missing or is not RAW, whose destination is taken or outside the root, or
     whose move fails is kept, logged with both paths, and reported under
     "sidecars_pending"; nothing is dropped without a log line.
     """
@@ -798,7 +799,12 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
         frm = Path(s["from"])
         img = db.get(RecordImage, s["image_id"])
         if img is None:
-            pending(s, "the image's row is gone")
+            # No row will name the sidecar again, so there is nothing to move
+            # it beside. The file stays; the entry goes.
+            logger.warning(f"Volume layout: pending sidecar {frm} of image {s['image_id']}: the image's row is gone; "
+                           "the file is left where it is and no longer retried")
+            if frm.exists():
+                report["left_unreferenced"].append(str(frm.resolve()))
             continue
         master = resolve_within_storage(img.file_path)
         if master is None or not master.is_file():
@@ -908,7 +914,7 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
 
     batches, skipped, left = _plan(db, root, out_of_place)
     report["skipped"].extend(skipped)
-    report["left_unreferenced"] = left
+    report["left_unreferenced"] += [p for p in left if p not in report["left_unreferenced"]]
     if dry_run:
         for b in batches:
             for e in b["entries"]:
