@@ -37,6 +37,8 @@ logger = logging.getLogger(__name__)
 Relocation = Tuple[Path, str, str, str]
 
 _QUEUED_RELOCATIONS = "storage_ops.queued_relocations"
+_RELOCATION_LISTENERS = "storage_ops.relocation_listeners"
+_SPENT_RELOCATION_LISTENERS = "storage_ops.spent_relocation_listeners"
 
 
 def relocation_of(capture_id: Optional[str], src: Path, dst: Path) -> Optional[Relocation]:
@@ -82,28 +84,58 @@ def queue_relocation_records(db: Session, records: Iterable[Relocation]) -> None
     """Write `records` when `db` next commits; drop them if it rolls back first.
 
     For renames whose caller commits the rows itself (renumber_collection_images).
+    The queue lives in `db.info`. The after_commit and after_soft_rollback
+    listeners that write or drop it are registered on this session instance
+    only, the first time something is queued; no other session sees them.
+
+    When one of the two fires, it removes the other at once. SQLAlchemy
+    refuses the removal of a listener while its own event is being
+    dispatched ("deque mutated during iteration"), so the one that fired
+    stays registered, does nothing more, and is removed at the next call
+    here for this session, or goes with the session when it is closed and
+    released.
     """
     records = list(records)
-    if records:
-        db.info.setdefault(_QUEUED_RELOCATIONS, []).extend(records)
-
-
-@event.listens_for(Session, "after_commit")
-def _write_queued_relocations(session: Session) -> None:
-    records = session.info.pop(_QUEUED_RELOCATIONS, None)
     if not records:
         return
-    try:
-        write_relocation_records(records)
-    except Exception:
-        logger.exception(f"Could not write {len(records)} relocation record(s) after a commit: {records}")
+    for name, fn in db.info.pop(_SPENT_RELOCATION_LISTENERS, []):
+        if event.contains(db, name, fn):
+            event.remove(db, name, fn)
+    db.info.setdefault(_QUEUED_RELOCATIONS, []).extend(records)
+    if _RELOCATION_LISTENERS in db.info:
+        return
 
+    def done(fired: str) -> list:
+        queued = db.info.pop(_QUEUED_RELOCATIONS, None) or []
+        for name, fn in db.info.pop(_RELOCATION_LISTENERS, ()):
+            if name == fired:
+                db.info.setdefault(_SPENT_RELOCATION_LISTENERS, []).append((name, fn))
+            elif event.contains(db, name, fn):
+                event.remove(db, name, fn)
+        return queued
 
-@event.listens_for(Session, "after_soft_rollback")
-def _drop_queued_relocations(session: Session, previous_transaction) -> None:
-    # The renames whose rows were rolled back are put back by the caller, or
-    # stay unrecorded in the rows; either way no record describes them.
-    session.info.pop(_QUEUED_RELOCATIONS, None)
+    def on_commit(session: Session) -> None:
+        if (_RELOCATION_LISTENERS not in session.info
+                or ("after_commit", on_commit) not in session.info[_RELOCATION_LISTENERS]):
+            return  # spent: this pair has written or dropped its records
+        queued = done("after_commit")
+        try:
+            write_relocation_records(queued)
+        except Exception:
+            logger.exception(f"Could not write {len(queued)} relocation record(s) after a commit: {queued}")
+
+    def on_rollback(session: Session, previous_transaction) -> None:
+        if (_RELOCATION_LISTENERS not in session.info
+                or ("after_soft_rollback", on_rollback) not in session.info[_RELOCATION_LISTENERS]):
+            return
+        # The renames whose rows were rolled back are put back by the caller,
+        # or stay unrecorded in the rows; either way no record describes them.
+        done("after_soft_rollback")
+
+    listeners = (("after_commit", on_commit), ("after_soft_rollback", on_rollback))
+    db.info[_RELOCATION_LISTENERS] = listeners
+    for name, fn in listeners:
+        event.listen(db, name, fn)
 
 
 def _is_within(path: Path, directory: Path) -> bool:

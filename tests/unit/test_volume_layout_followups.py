@@ -491,3 +491,67 @@ def test_relocation_records_of_later_renames_stay_out_of_the_bag_manifest(db_ses
     kept = [json.loads(l) for l in blob.decode().splitlines() if l.strip()]
     assert [k.get("capture_id") for k in kept] == ["cap-0002"]
     assert all(k.get("record_type") != "relocation" for k in kept)
+
+
+def _storage_ops_listeners(target) -> list:
+    """The after_commit and after_soft_rollback listeners from app.core.storage_ops on `target`."""
+    out = []
+    for name in ("after_commit", "after_soft_rollback"):
+        for fn in getattr(target.dispatch, name):
+            if getattr(fn, "__module__", "") == "app.core.storage_ops":
+                out.append((name, fn))
+    return out
+
+
+@pytest.mark.unit
+def test_queued_relocations_are_scoped_to_the_renumbering_session(db_session, legacy):
+    """Another session committing writes none of them; the listeners leave the session once they have fired."""
+    from app.core.db import SessionLocal
+    from app.core.storage_ops import renumber_collection_images
+
+    _captured_i2(db_session, legacy)
+    assert _storage_ops_listeners(db_session) == []
+
+    renumber_collection_images(db_session, legacy["a2"])
+    assert _storage_ops_listeners(db_session)
+    other = SessionLocal()
+    try:
+        assert _storage_ops_listeners(other) == []  # nothing registered on the Session class
+        other.commit()
+    finally:
+        other.close()
+    assert _relocations(legacy["root"] / "proj") == []
+
+    db_session.commit()
+    assert [r["capture_id"] for r in _relocations(legacy["root"] / "proj")] == ["cap-0002"]
+    # The rollback listener is gone; the commit listener that fired cannot remove
+    # itself during its own dispatch, and stays, spent, until the next queue.
+    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
+    db_session.commit()
+    assert len(_relocations(legacy["root"] / "proj")) == 1
+
+    from app.models.collection import Collection
+
+    db_session.get(Collection, legacy["a2"].id).name = "Otro"
+    db_session.commit()
+    renumber_collection_images(db_session, legacy["a2"])  # renames to otro_NNNN; the spent listener is removed
+    assert sorted(n for n, _ in _storage_ops_listeners(db_session)) == ["after_commit", "after_soft_rollback"]
+    db_session.commit()
+    assert len(_relocations(legacy["root"] / "proj")) == 2
+    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
+
+
+@pytest.mark.unit
+def test_the_listeners_leave_the_session_when_its_queued_relocations_are_dropped(db_session, legacy):
+    from app.core.storage_ops import renumber_collection_images, restore_original_names
+
+    _captured_i2(db_session, legacy)
+    applied: list = []
+    renumber_collection_images(db_session, legacy["a2"], applied)
+    assert _storage_ops_listeners(db_session)
+    db_session.rollback()
+    restore_original_names(applied)
+
+    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_soft_rollback"]
+    db_session.commit()
+    assert _relocations(legacy["root"] / "proj") == []
