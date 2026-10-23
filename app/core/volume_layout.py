@@ -590,7 +590,9 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "row_changed"})
             continue
 
-        if e["adopt"]:
+        # A version-1 journal (written before adoption existed) has no "adopt"
+        # and no "capture_id": its entries are all moves.
+        if e.get("adopt", False):
             if not dst.is_file():
                 report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "missing"})
                 continue
