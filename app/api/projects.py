@@ -298,13 +298,9 @@ def move_collections(
         not_moved: list[str] = []
         moves: list = []
         if moved_collection_ids:
-            names = {
-                c.id: c.name
-                for c in db.query(Collection).filter(Collection.id.in_(moved_collection_ids)).all()
-            }
             records = db.query(Record).filter(Record.collection_id.in_(moved_collection_ids)).all()
             for r in records:
-                target_dir = image_output_dir(target.name, names.get(r.collection_id))
+                target_dir = image_output_dir(target.name, r.collection_id)
                 moves.extend((img, target_dir) for img in r.images)
 
         # A failed move or commit puts every file already moved back.

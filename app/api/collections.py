@@ -32,6 +32,7 @@ from app.core.storage_ops import (
     remove_tree,
     renumber_collection_images,
     restore_original_names,
+    resolve_project,
     resolve_project_name,
     surviving_images_under,
 )
@@ -251,9 +252,12 @@ def update_collection(
     
     Can update name, description, type, metadata, or move to different parent collection.
 
-    A rename or re-parent moves the files of every record in the collection and
-    its sub-collections, so it is refused with 409 while an export of any of
-    them is queued or running. Other edits are not refused.
+    A collection's directory is named by its id and sits directly under its
+    project's (image_output_dir), so a rename or a re-parent inside the
+    project moves no file. A re-parent under a collection of another project
+    moves the files of every record in the collection and its sub-collections
+    into that project's directory, so it is refused with 409 while an export
+    of any of them is queued or running. Other edits are not refused.
     """
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
@@ -281,21 +285,24 @@ def update_collection(
             if not current:
                 break
     
-    # A rename or cross-project re-parent changes the on-disk dir; relocate files
-    old_name = collection.name
-    old_parent = collection.parent_collection_id
+    # Only a change of project changes where the files live: the project's
+    # directory is named after it, the collection's after its id.
     update_data = payload.model_dump(exclude_unset=True)
-    layout_changed = (
-        ("name" in update_data and update_data["name"] != old_name)
-        or ("parent_collection_id" in update_data and update_data["parent_collection_id"] != old_parent)
-    )
+    old_project = resolve_project(db, collection)
+    new_project = old_project
+    if "parent_collection_id" in update_data and update_data["parent_collection_id"] != collection.parent_collection_id:
+        new_parent_id = update_data["parent_collection_id"]
+        # A null parent leaves the collection with no project (project_id is
+        # not set here), so no directory to move the files to.
+        new_project = resolve_project(db, db.get(Collection, new_parent_id)) if new_parent_id is not None else None
+    files_move = new_project is not None and (old_project is None or new_project.id != old_project.id)
     not_moved: List[str] = []
     moves: List = []
-    # A layout change relocates the files of every record in the subtree, and
-    # an export of any collection in it reads those files by path, so the
-    # whole subtree is held against exports, before anything is changed, until
-    # the files have moved and the commit is done.
-    held_ids = collection_and_descendants(db, collection.id) if layout_changed else []
+    # Moving files to another project relocates the files of every record in
+    # the subtree, and an export of any collection in it reads those files by
+    # path, so the whole subtree is held against exports, before anything is
+    # changed, until the files have moved and the commit is done.
+    held_ids = collection_and_descendants(db, collection.id) if files_move else []
     with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_SUBTREE_MESSAGE):
         # Update fields. A change to external_id or filename_stem that the
         # model refuses (written once; fixed by the first image) is a 409.
@@ -310,19 +317,13 @@ def update_collection(
         if collection.parent_collection_id is not None:
             collection.project_id = None
 
-        if layout_changed:
+        if files_move:
             from capture.project_manager import image_output_dir
 
-            project_name = resolve_project_name(db, collection)
-            if project_name:
-                names = {
-                    c.id: c.name
-                    for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all()
-                }
-                records = db.query(Record).filter(Record.collection_id.in_(held_ids)).all()
-                for r in records:
-                    target_dir = image_output_dir(project_name, names.get(r.collection_id))
-                    moves.extend((img, target_dir) for img in r.images)
+            records = db.query(Record).filter(Record.collection_id.in_(held_ids)).all()
+            for r in records:
+                target_dir = image_output_dir(new_project.name, r.collection_id)
+                moves.extend((img, target_dir) for img in r.images)
 
         # Flushed before any file is moved, so that a duplicate stem or
         # external_id, or an end date before the stored start, is refused
@@ -369,7 +370,7 @@ def move_collection_records(
     target_project_name = resolve_project_name(db, target)
     if not target_project_name:
         raise HTTPException(status_code=422, detail="Target collection is not attached to a project")
-    target_dir = image_output_dir(target_project_name, target.name)
+    target_dir = image_output_dir(target_project_name, target.id)
 
     # Locked, because the refusal below reads each record's status and the
     # relocation that follows is a filesystem move no transaction takes back.
@@ -447,8 +448,6 @@ def delete_collection(
     if collection.reserves_its_stem():
         raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
 
-    collection_name = collection.name
-
     # Refuse to delete a non-empty collection; report the blocking counts
     child_count = db.query(func.count(Collection.id)).filter(Collection.parent_collection_id == collection_id).scalar()
     record_count = db.query(func.count(Record.id)).filter(Record.collection_id == collection_id).scalar()
@@ -459,7 +458,7 @@ def delete_collection(
         )
 
     project_name = resolve_project_name(db, collection)
-    col_dir = collection_capture_root(project_name, collection_name) if project_name else None
+    col_dir = collection_capture_root(project_name, collection.id) if project_name else None
 
     if col_dir is not None:
         # Hard guard: never remove a directory that still holds a surviving record's files

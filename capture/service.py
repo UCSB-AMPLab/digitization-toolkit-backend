@@ -303,7 +303,7 @@ def capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         capture_output: bool = False,
-        collection_name: Optional[str] = None) -> str:
+        collection_id: Optional[int] = None) -> str:
     """
     Capture an image using the rpicam-still command.
     
@@ -321,7 +321,7 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = image_output_dir(project_name, collection_name)
+    project_path = image_output_dir(project_name, collection_id)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -373,7 +373,7 @@ def single_capture_image(
         camera_config: CameraConfig,
         check_camera: bool = True,
         include_resolution: bool = False,
-        collection_name: Optional[str] = None) -> tuple:
+        collection_id: Optional[int] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -396,7 +396,7 @@ def single_capture_image(
         camera_config=camera_config,
         check_camera=False,  # Already checked
         include_resolution=include_resolution,
-        collection_name=collection_name
+        collection_id=collection_id
     )
     
     elapsed_time = time.time() - start_time
@@ -538,7 +538,7 @@ def dual_capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         stagger_ms: int = 20,
-        collection_name: Optional[str] = None) -> tuple:
+        collection_id: Optional[int] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -592,7 +592,7 @@ def dual_capture_image(
             check_camera=False,  # Already checked
             include_resolution=include_resolution,
             capture_output=False,  # Max performance
-            collection_name=collection_name
+            collection_id=collection_id
         )
         elapsed = time.time() - start
         return path, elapsed, metadata

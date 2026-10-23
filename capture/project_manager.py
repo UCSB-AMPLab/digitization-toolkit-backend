@@ -57,15 +57,41 @@ def project_capture_root(project_name: str) -> Path:
     return Path(_projects_root(), secure_project_filename(project_name))
 
 
-def collection_capture_root(project_name: str, collection_name: str) -> Path:
-    """On-disk root of a collection (sibling directory under the project root)."""
-    return project_capture_root(project_name) / secure_project_filename(collection_name)
+COLLECTION_DIR_PREFIX = "collection-"
 
 
-def image_output_dir(project_name: str, collection_name: Optional[str] = None) -> Path:
-    """Directory where captured images are written for a project/collection."""
-    if collection_name:
-        root = collection_capture_root(project_name, collection_name)
+def collection_dir_name(collection_id: int) -> str:
+    """Name of a collection's directory under its project: `collection-<id>`.
+
+    The name comes from the id, never from the collection's name, so two
+    collections of one name never share a directory and a rename moves no
+    file. It is the same string the BagIt export writes as the bag's
+    External-Identifier. A str (a collection name passed by a caller written
+    for the old name-based layout), a bool or a float raises TypeError.
+    """
+    if isinstance(collection_id, bool) or not isinstance(collection_id, int):
+        raise TypeError(f"collection_id must be an int, not {type(collection_id).__name__}")
+    return f"{COLLECTION_DIR_PREFIX}{collection_id}"
+
+
+def collection_capture_root(project_name: str, collection_id: int) -> Path:
+    """On-disk root of a collection: `<project dir>/collection-<id>`.
+
+    Every collection's directory sits directly under its project's, whatever
+    its depth in the collection tree, so a re-parent inside one project moves
+    no file. The tree lives in the database and in the export's metadata.
+    """
+    return project_capture_root(project_name) / collection_dir_name(collection_id)
+
+
+def image_output_dir(project_name: str, collection_id: Optional[int] = None) -> Path:
+    """Directory where captured images are written for a project or one of its collections.
+
+    `<project dir>/collection-<id>/images/main` for a collection,
+    `<project dir>/images/main` for a project-level capture (collection_id None).
+    """
+    if collection_id is not None:
+        root = collection_capture_root(project_name, collection_id)
     else:
         root = project_capture_root(project_name)
     return root / "images" / "main"

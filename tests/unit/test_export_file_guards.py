@@ -11,9 +11,11 @@ of any of them is queued or running, and `export_jobs.start` refuses an export
 of a held collection.
 
 An export covers the records whose collection_id is the exported collection,
-not its sub-collections. A rename or re-parent moves the files of every record
-in the subtree, so it is refused when any collection of the subtree is being
-exported.
+not its sub-collections. A collection's directory is named by its id, so a
+rename or a re-parent inside the project moves no file and is not refused. A
+re-parent under a collection of another project moves the files of every
+record in the subtree, so it is refused when any collection of the subtree is
+being exported.
 
 The export used here is a registry job whose work waits on an event, so it
 stays running for as long as the test needs.
@@ -94,7 +96,7 @@ def tree(db_session, capture_settings):
 
     out = {"project": proj, "parent": parent, "child": child, "other": other}
     for key, col, status in (("parent_rec", parent, "approved"), ("child_rec", child, "approved")):
-        d = image_output_dir("P", col.name)
+        d = image_output_dir("P", col.id)
         d.mkdir(parents=True, exist_ok=True)
         f = d / f"{key}.jpg"
         f.write_bytes(b"bytes of " + key.encode())
@@ -122,29 +124,51 @@ def _assert_export_refusal(resp):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_rename_of_an_exporting_collection_is_refused(as_admin, tree, running_export, db_session):
+def test_rename_of_an_exporting_collection_is_allowed_and_moves_no_file(as_admin, tree, running_export, db_session):
     running_export(tree["parent"].id)
     resp = as_admin.patch(f"/collections/{tree['parent'].id}", json={"name": "Renamed"})
-    _assert_export_refusal(resp)
+    assert resp.status_code == 200, resp.text
     db_session.expire_all()
-    assert db_session.get(type(tree["parent"]), tree["parent"].id).name == "Parent"
+    assert db_session.get(type(tree["parent"]), tree["parent"].id).name == "Renamed"
     assert tree["parent_rec_file"].exists()
+    assert db_session.get(type(tree["parent_rec_img"]), tree["parent_rec_img"].id).file_path == str(tree["parent_rec_file"])
 
 
 @pytest.mark.unit
-def test_rename_of_an_ancestor_of_an_exporting_collection_is_refused(as_admin, tree, running_export):
+def test_rename_of_an_ancestor_of_an_exporting_collection_is_allowed(as_admin, tree, running_export):
     running_export(tree["child"].id)
     resp = as_admin.patch(f"/collections/{tree['parent'].id}", json={"name": "Renamed"})
-    _assert_export_refusal(resp)
+    assert resp.status_code == 200, resp.text
     assert tree["child_rec_file"].exists()
 
 
 @pytest.mark.unit
-def test_reparent_of_an_exporting_collection_is_refused(as_admin, tree, running_export):
+def test_reparent_within_the_project_of_an_exporting_collection_is_allowed(as_admin, tree, running_export):
     running_export(tree["child"].id)
     resp = as_admin.patch(f"/collections/{tree['child'].id}",
                           json={"parent_collection_id": tree["other"].id})
+    assert resp.status_code == 200, resp.text
+    assert tree["child_rec_file"].exists()
+
+
+@pytest.mark.unit
+def test_reparent_into_another_project_of_an_ancestor_of_an_exporting_collection_is_refused(
+        as_admin, tree, running_export, db_session):
+    from app.models.collection import Collection
+    from app.models.project import Project
+    elsewhere = Project(name="Elsewhere")
+    db_session.add(elsewhere)
+    db_session.commit()
+    host = Collection(name="Host", project_id=elsewhere.id)
+    db_session.add(host)
+    db_session.commit()
+    running_export(tree["child"].id)
+    resp = as_admin.patch(f"/collections/{tree['parent'].id}",
+                          json={"parent_collection_id": host.id})
     _assert_export_refusal(resp)
+    assert tree["child_rec_file"].exists()
+    db_session.expire_all()
+    assert db_session.get(Collection, tree["parent"].id).parent_collection_id is None
 
 
 @pytest.mark.unit

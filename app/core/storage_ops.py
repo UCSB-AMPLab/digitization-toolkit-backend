@@ -59,19 +59,24 @@ def collection_ids_under_project(db: Session, project_id: int) -> List[int]:
     return ids
 
 
-def resolve_project_name(db: Session, collection: Collection) -> Optional[str]:
-    """Walk up parent collections to find the name of the owning project."""
+def resolve_project(db: Session, collection: Collection) -> Optional[Project]:
+    """Walk up parent collections to find the owning project, or None if there is none."""
     seen: set[int] = set()
     current: Optional[Collection] = collection
     while current is not None and current.id not in seen:
         seen.add(current.id)
         if current.project_id:
-            project = db.query(Project).filter(Project.id == current.project_id).first()
-            return project.name if project else None
+            return db.query(Project).filter(Project.id == current.project_id).first()
         if not current.parent_collection_id:
             return None
         current = db.query(Collection).filter(Collection.id == current.parent_collection_id).first()
     return None
+
+
+def resolve_project_name(db: Session, collection: Collection) -> Optional[str]:
+    """Walk up parent collections to find the name of the owning project."""
+    project = resolve_project(db, collection)
+    return project.name if project else None
 
 
 def surviving_images_under(
@@ -734,11 +739,13 @@ def renumber_collection_images(
             sidecar_moves.append((sidecar, preview_sidecar_of(final)))
     sources = {src for src, _ in file_moves} | carried
     # Every image of every record in the collection is a source, so a file
-    # that is not one belongs elsewhere: two collections of the same name share
-    # one directory (collection_capture_root uses only the name) and derive the
-    # same `<prefix>_NNNN` names, and os.replace would overwrite the other
-    # collection's master without a trace. A same-stem file with another suffix
-    # names the same sidecar, the clash relocate_image refuses as well.
+    # that is not one belongs elsewhere, and os.replace would overwrite it
+    # without a trace. A collection's directory is named by its id, but files
+    # not yet moved out of the name-based layout (app.core.volume_layout) can
+    # put two same-named collections in one directory, deriving the same
+    # `<prefix>_NNNN` names, and a file can be put there by hand. A same-stem
+    # file with another suffix names the same sidecar, the clash
+    # relocate_image refuses as well.
     for _, _, final in plan:
         if final.exists() and final.resolve() not in sources:
             raise ValueError(f"Renumbering would overwrite {final.name}, which no image in this collection owns")
