@@ -555,3 +555,87 @@ def test_the_listeners_leave_the_session_when_its_queued_relocations_are_dropped
     assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_soft_rollback"]
     db_session.commit()
     assert _relocations(legacy["root"] / "proj") == []
+
+
+# ---------------------------------------------------------------------------
+# Relocations applied in the order they happened, across project manifests
+# ---------------------------------------------------------------------------
+
+def _glob_in_order(monkeypatch, reverse: bool):
+    """Make the manifest glob return the manifests sorted by path, forwards or backwards."""
+    import pathlib
+
+    real = pathlib.Path.glob
+
+    def ordered(self, pattern, *a, **kw):
+        found = list(real(self, pattern, *a, **kw))
+        return iter(sorted(found, reverse=reverse)) if pattern.endswith("manifest.jsonl") else iter(found)
+
+    monkeypatch.setattr(pathlib.Path, "glob", ordered)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reverse", [False, True])
+def test_a_relocation_chain_split_across_project_manifests_resolves_to_the_current_path(
+        db_session, capture_settings, data_dir, override_projects_root, monkeypatch, reverse):
+    """Captured in project A, moved into project B and renumbered there, then moved back to A on a name clash."""
+    from app.core.integrity import verify_images_against_manifest
+    from app.core.storage_ops import relocate_images_and_commit, renumber_collection_images
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+
+    root = override_projects_root
+    pa, a = _project_and_collection(db_session, name="PA", cname="A")
+    pb = Project(name="PB")
+    db_session.add(pb)
+    db_session.commit()
+    b = Collection(name="B", project_id=pb.id)
+    c = Collection(name="C", project_id=pa.id)
+    db_session.add_all([b, c])
+    db_session.commit()
+    src = root / "pa" / f"collection-{a.id}" / "images" / "main" / "folio_0001.jpg"
+    img = _image(db_session, a.id, src, b"the captured page", capture_id="cap-1")
+    _manifest(root / "pa", "cap-1", f"collection-{a.id}/images/main/folio_0001.jpg", b"the captured page")
+
+    rec = db_session.get(Record, img.record_id)
+    rec.collection_id = b.id
+    relocate_images_and_commit(db_session, [(img, root / "pb" / f"collection-{b.id}" / "images" / "main")], [], "move")
+    renumber_collection_images(db_session, db_session.get(Collection, b.id))
+    db_session.commit()
+    c_dir = root / "pa" / f"collection-{c.id}" / "images" / "main"
+    c_dir.mkdir(parents=True)
+    (c_dir / "b_0001.jpg").write_bytes(b"another page")
+    db_session.expire_all()
+    img = db_session.get(RecordImage, img.id)
+    db_session.get(Record, img.record_id).collection_id = c.id
+    relocate_images_and_commit(db_session, [(img, c_dir)], [], "move back")
+    db_session.expire_all()
+    img = db_session.get(RecordImage, img.id)
+    current = Path(img.file_path)
+    assert current.parent == c_dir.resolve() or current.parent == c_dir
+    assert current.name.startswith("b_0001_")
+    assert len(_relocations(root / "pa")) == 1 and len(_relocations(root / "pb")) == 1
+
+    _glob_in_order(monkeypatch, reverse)
+    assert verify_images_against_manifest([img]) == []
+    current.write_bytes(b"bit rot")
+    assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
+
+
+@pytest.mark.unit
+def test_relocations_without_a_timestamp_are_applied_before_the_timestamped_ones(override_projects_root):
+    """A record with no relocated_at (written by hand) goes first, in manifest path order, then line order."""
+    from app.core.integrity import _build_manifest_index
+
+    root = override_projects_root
+    _manifest(root / "p", "cap-1", "x/a.jpg", b"page")
+    with open(root / "p" / "metadata" / "manifest.jsonl", "a") as f:
+        # Written later in the file, but timestamped: applied after the hand-written one below.
+        f.write(json.dumps({"record_type": "relocation", "capture_id": "cap-1", "from": "x/b.jpg", "to": "x/c.jpg",
+                            "relocated_at": "2026-10-01T00:00:00+00:00"}) + "\n")
+        f.write(json.dumps({"record_type": "relocation", "capture_id": "cap-1", "from": "x/a.jpg", "to": "x/b.jpg"}) + "\n")
+
+    by_path, _ = _build_manifest_index(root)
+
+    assert str((root / "p" / "x" / "c.jpg").resolve()) in by_path["cap-1"]

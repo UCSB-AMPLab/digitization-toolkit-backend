@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import random
+from datetime import datetime, timezone
 from pathlib import Path
 from typing import Dict, List, Optional, Tuple
 
@@ -64,6 +65,21 @@ def _iter_image_files(root: Path):
             yield p
 
 
+def _relocation_order(relocated_at, manifest_key: str, line_no: int) -> tuple:
+    """Sort key for a relocation record: untimestamped first, then by UTC time, manifest path, line number."""
+    when = None
+    if isinstance(relocated_at, str):
+        try:
+            when = datetime.fromisoformat(relocated_at)
+        except ValueError:
+            when = None
+    if when is None:
+        return (0, 0.0, manifest_key, line_no)
+    if when.tzinfo is None:
+        when = when.replace(tzinfo=timezone.utc)
+    return (1, when.timestamp(), manifest_key, line_no)
+
+
 def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
     """Index every project's metadata/manifest.jsonl by capture_id.
 
@@ -74,23 +90,31 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
 
     A relocation record (capture.manifestHandler.append_relocation_record)
     says a captured file was moved to another name: once every capture record
-    is indexed, each relocation, in file order, gives its `to` path (and name)
-    the sha256 its `from` path (or name) has, so a file renamed after capture
-    is still checked against its capture-time hash.
+    is indexed, each relocation gives its `to` path (and name) the sha256 its
+    `from` path (or name) has, so a file renamed after capture is still
+    checked against its capture-time hash. A file renamed more than once can
+    have its relocation records in different projects' manifests (a move
+    into another project writes to the destination's), so the relocations of
+    all manifests are applied in the order they happened, by their
+    `relocated_at` UTC timestamp, ties broken by manifest path and then line
+    number. A record without a timestamp that parses (one written by hand)
+    is applied before every timestamped one, in manifest path and line order.
     """
     by_path: Dict[str, Dict[str, str]] = {}
     by_name: Dict[str, Dict[str, str]] = {}
-    relocations: List[Tuple[str, str, str]] = []  # (capture_id, from abs, to abs)
+    # (sort key, capture_id, from abs, to abs); see _relocation_order
+    relocations: List[Tuple[tuple, str, str, str]] = []
     if not projects_dir.exists():
         return by_path, by_name
 
     for manifest in projects_dir.glob("**/metadata/manifest.jsonl"):
+        manifest_key = str(manifest)
         project_root = manifest.parent.parent
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except OSError:
             continue
-        for line in lines:
+        for line_no, line in enumerate(lines):
             line = line.strip()
             if not line:
                 continue
@@ -105,7 +129,8 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
                 frm, to = rec.get("from"), rec.get("to")
                 if frm and to:
                     try:
-                        relocations.append((cid, str((project_root / frm).resolve()), str((project_root / to).resolve())))
+                        relocations.append((_relocation_order(rec.get("relocated_at"), manifest_key, line_no), cid,
+                                            str((project_root / frm).resolve()), str((project_root / to).resolve())))
                     except OSError:
                         pass
                 continue
@@ -120,7 +145,8 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
                     continue
                 by_path.setdefault(cid, {})[abs_path] = sha
                 by_name.setdefault(cid, {})[Path(rel).name] = sha
-    for cid, frm, to in relocations:
+    relocations.sort(key=lambda r: r[0])
+    for _, cid, frm, to in relocations:
         sha = by_path.get(cid, {}).get(frm) or by_name.get(cid, {}).get(Path(frm).name)
         if sha:
             by_path.setdefault(cid, {})[to] = sha
