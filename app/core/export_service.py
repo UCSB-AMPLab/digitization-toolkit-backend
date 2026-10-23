@@ -317,7 +317,10 @@ def _filtered_manifest_blob(db, collection, records):
             entry = json.loads(stripped)
         except json.JSONDecodeError:
             continue
-        if entry.get("capture_id") in capture_ids:
+        # Relocation records are the appliance's own bookkeeping of files
+        # renamed after capture; the bag names its files itself, so only the
+        # capture records go into it.
+        if entry.get("capture_id") in capture_ids and entry.get("record_type") != "relocation":
             kept.append(stripped)
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 

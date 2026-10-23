@@ -292,3 +292,38 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     else:
         subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
         
+
+RELOCATION_RECORD_TYPE = "relocation"
+
+
+def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str) -> None:
+    """Append to the project's capture manifest that a captured file now lives under another name.
+
+    The manifest is append-only, so a file that is moved and renamed after
+    capture keeps its capture-time sha256 through this record rather than by
+    rewriting its capture record: `{"record_type": "relocation", "capture_id",
+    "from", "to", "relocated_at"}`, both paths relative to `project_root` as
+    the capture record's `relative_path` is. app.core.integrity follows these
+    records, in file order, when it indexes the manifest. The line is written
+    with one O_APPEND write and fsynced, as append_manifest_record writes.
+    """
+    metadata_dir = project_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = metadata_dir / "manifest.jsonl"
+    payload = {
+        "record_type": RELOCATION_RECORD_TYPE,
+        "capture_id": capture_id,
+        "from": from_rel,
+        "to": to_rel,
+        "relocated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            mv = memoryview(line)
+            while mv:
+                mv = mv[os.write(fd, mv):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)

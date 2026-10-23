@@ -71,9 +71,16 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
     capture_id -> {filename: sha256}. The name map is a fallback for when a stored
     absolute path differs from the manifest's (e.g. after an SD re-clone remounts
     the tree at a different location).
+
+    A relocation record (capture.manifestHandler.append_relocation_record)
+    says a captured file was moved to another name: once every capture record
+    is indexed, each relocation, in file order, gives its `to` path (and name)
+    the sha256 its `from` path (or name) has, so a file renamed after capture
+    is still checked against its capture-time hash.
     """
     by_path: Dict[str, Dict[str, str]] = {}
     by_name: Dict[str, Dict[str, str]] = {}
+    relocations: List[Tuple[str, str, str]] = []  # (capture_id, from abs, to abs)
     if not projects_dir.exists():
         return by_path, by_name
 
@@ -94,6 +101,14 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
             cid = rec.get("capture_id")
             if not cid:
                 continue
+            if rec.get("record_type") == "relocation":
+                frm, to = rec.get("from"), rec.get("to")
+                if frm and to:
+                    try:
+                        relocations.append((cid, str((project_root / frm).resolve()), str((project_root / to).resolve())))
+                    except OSError:
+                        pass
+                continue
             for f in rec.get("files", []):
                 sha = f.get("sha256")
                 rel = f.get("relative_path")
@@ -105,6 +120,11 @@ def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]]
                     continue
                 by_path.setdefault(cid, {})[abs_path] = sha
                 by_name.setdefault(cid, {})[Path(rel).name] = sha
+    for cid, frm, to in relocations:
+        sha = by_path.get(cid, {}).get(frm) or by_name.get(cid, {}).get(Path(frm).name)
+        if sha:
+            by_path.setdefault(cid, {})[to] = sha
+            by_name.setdefault(cid, {})[Path(to).name] = sha
     return by_path, by_name
 
 
