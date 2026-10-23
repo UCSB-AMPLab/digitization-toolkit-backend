@@ -28,6 +28,7 @@ from app.core.record_status import change_record_status
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
+from app.core.storage_override import refuse_writes_under_unusable_root
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -365,7 +366,8 @@ def delete_record(
 	for img in rec.images:
 		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
 
-	# An export of the record's collection reads these files; refused while one runs.
+	# An export of the record's collection reads these files; refused while one
+	# runs. No check of the storage root here: a delete creates nothing.
 	with export_jobs.hold_for_file_changes(_collection_of(rec)):
 		db.delete(rec)
 		db.commit()
@@ -606,9 +608,11 @@ def delete_image(
 	]
 	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
 
-	# An export of the record's collection reads this file; refused while one
-	# runs, and held from before the delete until the file is unlinked.
-	with export_jobs.hold_for_file_changes(_collection_of(rec)):
+	# An export of the record's collection reads this file if it is current;
+	# refused while one runs, and held from before the delete until the file
+	# is unlinked. A superseded image is not read by an export, so it is not
+	# held. No check of the storage root here: a delete creates nothing.
+	with export_jobs.hold_for_file_changes(_collection_of(rec) if img.is_current else []):
 		record_id = img.record_id
 		db.delete(img)
 
@@ -778,6 +782,10 @@ def get_image_thumbnail(
 		if source_path is None or not source_path.exists():
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
 		thumb_source = _raw_preview_sidecar(source_path) or source_path
+		# The thumbnail is written beside the source. A source under an
+		# override root that cannot take writes is refused (503) before the
+		# thumbnail's mkdir, rather than writing onto the SD card.
+		refuse_writes_under_unusable_root([source_path])
 		try:
 			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
 			thumbnails_dir = source_path.parent.parent / "thumbnails"

@@ -351,3 +351,111 @@ def test_source_file_removed_during_the_write_fails_as_collection_changed(
     assert "No such file" not in st["error"]
     assert st["detail"]["blocking_record_ids"] == [tree["parent_rec"].id]
     assert list(exports.iterdir()) == []
+
+
+@pytest.fixture
+def exports(monkeypatch, tmp_path):
+    from app.core import config
+    d = tmp_path / "exp"
+    d.mkdir()
+    monkeypatch.setattr(config.settings, "EXPORTS_ROOT", str(d))
+    return d
+
+
+def _export_with_hook_after_fixity(as_admin, tree, monkeypatch, hook):
+    """Run an export of Parent, calling hook() once the fixity pass has run.
+
+    The fixity pass is the longest phase between planning and the write; the
+    size sum and the status re-check follow it."""
+    import app.core.export_service as es
+    real = es.verify_images_against_manifest
+
+    def verify_then(images):
+        out = real(images)
+        hook()
+        return out
+
+    monkeypatch.setattr(es, "verify_images_against_manifest", verify_then)
+    cid = tree["parent"].id
+    resp = as_admin.post(f"/collections/{cid}/export")
+    assert resp.status_code == 202, resp.text
+    return _wait(as_admin, cid, resp.json()["job_id"])
+
+
+@pytest.mark.unit
+def test_source_lost_after_the_fixity_pass_fails_as_collection_changed(as_admin, tree, exports, monkeypatch):
+    st = _export_with_hook_after_fixity(as_admin, tree, monkeypatch, tree["parent_rec_file"].unlink)
+    assert st["state"] == "failed"
+    assert "changed while the archive was being assembled" in st["error"]
+    assert str(tree["parent_rec_file"]) not in st["error"]
+    assert st["detail"]["blocking_record_ids"] == [tree["parent_rec"].id]
+    assert list(exports.iterdir()) == []
+
+
+@pytest.mark.unit
+def test_source_that_cannot_be_opened_fails_as_a_read_error(as_admin, tree, exports, monkeypatch):
+    f = tree["parent_rec_file"]
+
+    def replace_with_a_directory():
+        f.unlink()
+        f.mkdir()
+
+    st = _export_with_hook_after_fixity(as_admin, tree, monkeypatch, replace_with_a_directory)
+    assert st["state"] == "failed"
+    assert "could not be read" in st["error"]
+    assert "storage drive" in st["error"]
+    assert str(f) not in st["error"]
+    assert st["detail"]["reason"] == "read_error"
+    assert st["detail"]["blocking_record_ids"] == [tree["parent_rec"].id]
+    assert list(exports.iterdir()) == []
+
+
+@pytest.mark.unit
+def test_source_read_failing_with_eio_fails_as_a_read_error(as_admin, tree, exports, monkeypatch):
+    import builtins
+    import errno
+    import app.core.bag_export as bag_export
+
+    target = str(tree["parent_rec_file"])
+
+    class _Failing:
+        def __enter__(self):
+            return self
+
+        def __exit__(self, *exc):
+            return False
+
+        def read(self, n=-1):
+            raise OSError(errno.EIO, "Input/output error")
+
+    def fake_open(path, *a, **k):
+        if str(path) == target:
+            return _Failing()
+        return builtins.open(path, *a, **k)
+
+    monkeypatch.setattr(bag_export, "open", fake_open, raising=False)
+    cid = tree["parent"].id
+    resp = as_admin.post(f"/collections/{cid}/export")
+    assert resp.status_code == 202, resp.text
+    st = _wait(as_admin, cid, resp.json()["job_id"])
+    assert st["state"] == "failed"
+    assert "could not be read" in st["error"]
+    assert "Input/output" not in st["error"]
+    assert st["detail"]["blocking_record_ids"] == [tree["parent_rec"].id]
+    assert list(exports.iterdir()) == []
+
+
+@pytest.mark.unit
+def test_delete_of_a_superseded_image_in_an_exporting_collection_is_allowed(
+        as_admin, tree, running_export, db_session):
+    # The export reads only current images.
+    from app.models.record import RecordImage
+    old = tree["parent_rec_file"].parent / "superseded.jpg"
+    old.write_bytes(b"old")
+    img = RecordImage(record_id=tree["parent_rec"].id, filename=old.name, file_path=str(old),
+                      format="jpg", role="single", is_current=False)
+    db_session.add(img)
+    db_session.commit()
+    running_export(tree["parent"].id)
+    resp = as_admin.delete(f"/records/images/{img.id}")
+    assert resp.status_code == 200, resp.text

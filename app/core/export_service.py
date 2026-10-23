@@ -9,7 +9,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 
 from app.core import config
-from app.core.bag_export import write_bag_zip
+from app.core.bag_export import SourceReadError, write_bag_zip
 from app.core.export_jobs import ExportError, ExportJob
 from app.core.integrity import verify_images_against_manifest
 from app.core.paths import resolve_within_storage
@@ -142,102 +142,120 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             detail={"reason": "missing_files", "missing_image_ids": [m["record_image_id"] for m in missing], "missing": missing},
         )
 
-    # Fixity gate: refuse to bag bytes that no longer match their capture-time sha256.
-    mismatches = verify_images_against_manifest([img for _, _, img in to_copy])
-    if mismatches:
-        raise ExportError(
-            f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
-            detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
-        )
-
-    # Refuse to start if the exports filesystem can't hold the archive.
-    total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
-    free = shutil.disk_usage(exports_dir).free
-    if free < total_src + FREE_SPACE_MARGIN:
-        raise ExportError(
-            "Not enough free space on the exports filesystem to build this archive.",
-            detail={"reason": "low_disk", "needed_bytes": total_src + FREE_SPACE_MARGIN, "free_bytes": free},
-        )
-
-    # The payload is planned; nothing has been written yet. Check that the state
-    # the gate passed on is still the state, because the bag is a statement about
-    # it. A reviewer undoing an approval, or an operator retaking a record, in the
-    # time it took to resolve the files leaves a bag that claims a review that no
-    # longer stands. populate_existing() because a plain re-query returns the
-    # instances already in the identity map without refreshing their columns,
-    # which would compare the snapshot against itself.
-    rechecked = (
-        db.query(Record)
-        .options(joinedload(Record.images))
-        .filter(Record.collection_id == collection_id)
-        .populate_existing()
-        .all()
-    )
-    now_state = {rec.id: (rec.status,
-                          tuple(sorted(i.id for i in rec.images if i.is_current)))
-                 for rec in rechecked}
-    if now_state != gated_state:
-        moved = sorted(
-            set(gated_state) ^ set(now_state)
-            | {rid for rid in set(gated_state) & set(now_state)
-               if gated_state[rid] != now_state[rid]}
-        )
-        raise ExportError(
-            "Cannot export: the collection changed while the archive was being "
-            f"assembled ({len(moved)} record(s) affected). Try again.",
-            detail={"blocking_record_ids": moved},
-        )
-
-    metadata_payload = _metadata_payload(collection, project, records, timestamp)
-    blobs = [(json.dumps(metadata_payload, indent=2, ensure_ascii=False).encode("utf-8"), "metadata.json")]
-    manifest_blob = _filtered_manifest_blob(db, collection, records)
-    if manifest_blob:
-        blobs.append((manifest_blob, "metadata/manifest.jsonl"))
-
-    payload_files = [(resolved, rel) for rel, resolved, _ in to_copy]
-    bag_info = {
-        "Source-Organization": project.name if project else "Digitization Toolkit",
-        "External-Description": collection.description or collection.name,
-        "Bagging-Date": timestamp[:8],
-        "External-Identifier": f"collection-{collection_id}",
-        "Bag-Count": "1 of 1",
-        "Record-Count": str(len(records)),
-    }
-
-    # Write the zip straight into the exports dir, atomically via a .part file so a
-    # crash mid-write never leaves a truncated zip that download would serve.
-    job.set_progress(0, len(payload_files) + len(blobs))
-    zip_path = exports_dir / f"{bag_name}.zip"
-    part_path = exports_dir / f"{bag_name}.zip.part"
+    # From here to the end of the write, a planned source can be moved,
+    # renamed or deleted (the routes that do it hold the collection against
+    # exports, but a file can still go by other means: a drive pulled, a file
+    # removed by hand), or fail to read (EIO from a drive that is going).
+    # Either is reported as an ExportError naming the record, with the path in
+    # the log only; see _source_error.
     try:
-        write_bag_zip(part_path, bag_name, bag_info, payload_files, blobs,
-                      progress_cb=job.set_progress)
-        part_path.replace(zip_path)
-    except FileNotFoundError as e:
-        part_path.unlink(missing_ok=True)
-        # A planned source that is gone by the time it is read was moved,
-        # renamed or deleted after the re-check above: the routes that move a
-        # collection's files hold it against exports, but a file can still go
-        # by other means (a drive unmounted, a file removed by hand). It is
-        # reported the way the re-check reports a changed collection; the
-        # path goes to the log, not to the job's error.
-        lost = next((img for _, resolved, img in to_copy
-                     if e.filename is not None and str(resolved) == str(e.filename)), None)
-        if lost is None:
+        # Fixity gate: refuse to bag bytes that no longer match their capture-time sha256.
+        mismatches = verify_images_against_manifest([img for _, _, img in to_copy])
+        if mismatches:
+            raise ExportError(
+                f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
+                detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
+            )
+
+        # Refuse to start if the exports filesystem can't hold the archive.
+        total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
+        free = shutil.disk_usage(exports_dir).free
+        if free < total_src + FREE_SPACE_MARGIN:
+            raise ExportError(
+                "Not enough free space on the exports filesystem to build this archive.",
+                detail={"reason": "low_disk", "needed_bytes": total_src + FREE_SPACE_MARGIN, "free_bytes": free},
+            )
+
+        # The payload is planned; nothing has been written yet. Check that the state
+        # the gate passed on is still the state, because the bag is a statement about
+        # it. A reviewer undoing an approval, or an operator retaking a record, in the
+        # time it took to resolve the files leaves a bag that claims a review that no
+        # longer stands. populate_existing() because a plain re-query returns the
+        # instances already in the identity map without refreshing their columns,
+        # which would compare the snapshot against itself.
+        rechecked = (
+            db.query(Record)
+            .options(joinedload(Record.images))
+            .filter(Record.collection_id == collection_id)
+            .populate_existing()
+            .all()
+        )
+        now_state = {rec.id: (rec.status,
+                              tuple(sorted(i.id for i in rec.images if i.is_current)))
+                     for rec in rechecked}
+        if now_state != gated_state:
+            moved = sorted(
+                set(gated_state) ^ set(now_state)
+                | {rid for rid in set(gated_state) & set(now_state)
+                   if gated_state[rid] != now_state[rid]}
+            )
+            raise ExportError(
+                "Cannot export: the collection changed while the archive was being "
+                f"assembled ({len(moved)} record(s) affected). Try again.",
+                detail={"blocking_record_ids": moved},
+            )
+
+        metadata_payload = _metadata_payload(collection, project, records, timestamp)
+        blobs = [(json.dumps(metadata_payload, indent=2, ensure_ascii=False).encode("utf-8"), "metadata.json")]
+        manifest_blob = _filtered_manifest_blob(db, collection, records)
+        if manifest_blob:
+            blobs.append((manifest_blob, "metadata/manifest.jsonl"))
+
+        payload_files = [(resolved, rel) for rel, resolved, _ in to_copy]
+        bag_info = {
+            "Source-Organization": project.name if project else "Digitization Toolkit",
+            "External-Description": collection.description or collection.name,
+            "Bagging-Date": timestamp[:8],
+            "External-Identifier": f"collection-{collection_id}",
+            "Bag-Count": "1 of 1",
+            "Record-Count": str(len(records)),
+        }
+
+        # Write the zip straight into the exports dir, atomically via a .part file so a
+        # crash mid-write never leaves a truncated zip that download would serve.
+        job.set_progress(0, len(payload_files) + len(blobs))
+        zip_path = exports_dir / f"{bag_name}.zip"
+        part_path = exports_dir / f"{bag_name}.zip.part"
+        try:
+            write_bag_zip(part_path, bag_name, bag_info, payload_files, blobs,
+                          progress_cb=job.set_progress)
+            part_path.replace(zip_path)
+        except Exception:
+            part_path.unlink(missing_ok=True)
             raise
-        logger.warning(f"Export of collection {collection_id}: source file gone during the write: {e.filename}")
-        raise ExportError(
-            "Cannot export: the collection changed while the archive was being "
-            "assembled (1 record(s) affected). Try again.",
-            detail={"blocking_record_ids": [lost.record_id]},
-        ) from e
-    except Exception:
-        part_path.unlink(missing_ok=True)
-        raise
+    except SourceReadError as e:
+        raise _source_error(collection_id, to_copy, e.source_path, e.error) from e
+    except OSError as e:
+        if e.filename is None or not any(str(r) == str(e.filename) for _, r, _ in to_copy):
+            raise
+        raise _source_error(collection_id, to_copy, Path(e.filename), e) from e
 
     job.zip_filename = zip_path.name
     _prune_exports(exports_dir, collection_id)
     logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
+
+
+def _source_error(collection_id: int, to_copy, source: Path, error: OSError) -> ExportError:
+    """The ExportError for a planned source that is gone or could not be read.
+
+    A missing file is the collection changing under the export, reported as
+    the status re-check reports it. Any other error reading it is reported as
+    unreadable files, which on this appliance most often means the storage
+    drive. The path and the OS error go to the log.
+    """
+    record_ids = sorted({img.record_id for _, resolved, img in to_copy if str(resolved) == str(source)})
+    if isinstance(error, FileNotFoundError):
+        logger.warning(f"Export of collection {collection_id}: source file gone before it was read: {source}")
+        return ExportError(
+            "Cannot export: the collection changed while the archive was being "
+            f"assembled ({len(record_ids)} record(s) affected). Try again.",
+            detail={"blocking_record_ids": record_ids},
+        )
+    logger.error(f"Export of collection {collection_id}: source file could not be read: {source}: {error}")
+    return ExportError(
+        "Cannot export: some image files could not be read. Check the storage drive, then try again.",
+        detail={"reason": "read_error", "blocking_record_ids": record_ids},
+    )
 
 
 def _metadata_payload(collection, project, records, timestamp) -> dict:
