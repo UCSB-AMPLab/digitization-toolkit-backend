@@ -213,6 +213,24 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         write_bag_zip(part_path, bag_name, bag_info, payload_files, blobs,
                       progress_cb=job.set_progress)
         part_path.replace(zip_path)
+    except FileNotFoundError as e:
+        part_path.unlink(missing_ok=True)
+        # A planned source that is gone by the time it is read was moved,
+        # renamed or deleted after the re-check above: the routes that move a
+        # collection's files hold it against exports, but a file can still go
+        # by other means (a drive unmounted, a file removed by hand). It is
+        # reported the way the re-check reports a changed collection; the
+        # path goes to the log, not to the job's error.
+        lost = next((img for _, resolved, img in to_copy
+                     if e.filename is not None and str(resolved) == str(e.filename)), None)
+        if lost is None:
+            raise
+        logger.warning(f"Export of collection {collection_id}: source file gone during the write: {e.filename}")
+        raise ExportError(
+            "Cannot export: the collection changed while the archive was being "
+            "assembled (1 record(s) affected). Try again.",
+            detail={"blocking_record_ids": [lost.record_id]},
+        ) from e
     except Exception:
         part_path.unlink(missing_ok=True)
         raise
