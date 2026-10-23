@@ -102,7 +102,11 @@ def override_root_problem(root: Path) -> Optional[str]:
     never a mount point and its parent need not be one either. A directory with
     the root filesystem's device number is on the SD card, whatever its path,
     which is the case of a mount point with no drive mounted on it.
+
+    The root is resolved first, so a root reached through a symlink is judged
+    by the directory it leads to.
     """
+    root = Path(root).resolve()
     try:
         st = os.stat(root)
     except OSError:
@@ -132,15 +136,17 @@ def refuse_writes_under_unusable_root(paths) -> None:
     For writers that work beside an existing file (a thumbnail next to its
     source, a renumber renaming in place) rather than building a path through
     writable_projects_dir. A path outside the override root, such as an upload
-    under the data directory, is not affected. Containment is by absolute path,
-    without resolving symlinks, because the root may not exist.
+    under the data directory, is not affected. Containment is judged on
+    resolved paths, the root's and each path's, so a symlink on either side
+    cannot place a file outside the root that is inside it on disk (callers
+    often pass a path already resolved by resolve_within_storage).
     """
     override, _corrupt = get_storage_override_or_fallback()
     if not override:
         return
-    root = Path(os.path.abspath(override))
+    root = Path(override).resolve()
     for p in paths:
-        if Path(os.path.abspath(p)).is_relative_to(root):
+        if Path(p).resolve().is_relative_to(root):
             problem = override_root_problem(root)
             if problem:
                 logger.error("Storage override root %s refused for writing beside %s: %s", root, p, problem)

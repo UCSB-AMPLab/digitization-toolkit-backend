@@ -374,3 +374,89 @@ def test_activate_accepts_a_target_on_another_filesystem(client, db_session, on_
     resp = _admin_client(client).post("/system/storage/activate", json={"path": str(target)})
     assert resp.status_code == 200, resp.text
     assert stored == [str(target / "dtk-projects")]
+
+
+@pytest.fixture
+def linked_card_root(override, on_the_card, tmp_path):
+    """The override names a path through a symlink to a directory on the root filesystem."""
+    real = tmp_path / "real-mount" / "dtk-projects"
+    real.mkdir(parents=True)
+    (tmp_path / "media-usb").symlink_to(tmp_path / "real-mount")
+    root = tmp_path / "media-usb" / "dtk-projects"
+    override(root)
+    return root, real
+
+
+@pytest.mark.unit
+def test_thumbnail_is_refused_under_a_symlinked_refused_root(client, db_session, pm, linked_card_root):
+    root, real = linked_card_root
+    c, img = _record_under(db_session, root)
+    before = _entries(real)
+    resp = _admin_client(client).get(f"/records/images/{img.id}/thumbnail")
+    assert resp.status_code == 503, resp.text
+    assert _entries(real) == before
+
+
+@pytest.mark.unit
+def test_renumber_is_refused_under_a_symlinked_refused_root(client, db_session, pm, linked_card_root):
+    root, real = linked_card_root
+    c, img = _record_under(db_session, root)
+    before = _entries(real)
+    resp = _admin_client(client).post(f"/collections/{c.id}/images/renumber")
+    assert resp.status_code == 503, resp.text
+    assert _entries(real) == before
+
+
+def _bare_gphoto2_backend():
+    import logging
+    import threading
+    from capture.backends.gphoto2_backend import GPhoto2Backend
+    b = object.__new__(GPhoto2Backend)
+    b._pins = {}
+    b._seeded_serials = set()
+    b.logger = logging.getLogger("test-gphoto2")
+    b._save_lock = threading.Lock()
+    b._map_lock = threading.Lock()
+    return b
+
+
+@pytest.mark.unit
+def test_bindings_saved_after_the_drive_returns_keep_the_pins_on_disk(
+        override, on_the_card, tmp_path, monkeypatch):
+    """A backend built while the root was refused never read the bindings
+    file. Its first save once the drive is back merges: its own pins win, and
+    the pins on disk for other indices and other bodies stay."""
+    import json
+    root = tmp_path / "dtk-projects"
+    root.mkdir()
+    f = root / "camera-bindings.json"
+    f.write_text(json.dumps({"version": 1, "pins": {"0": "SERIAL-L", "1": "SERIAL-R", "2": "SERIAL-X"}}))
+    override(root)
+    b = _bare_gphoto2_backend()
+    b._load_pins()
+    assert b._pins == {}
+
+    monkeypatch.setattr("app.core.storage_override._internal_device", lambda: -1)  # drive back
+    # Index 0 is now a new body; index 3 holds a body that was at index 2.
+    b._pins = {0: "SERIAL-NEW", 3: "SERIAL-X"}
+    b._save_pins()
+    assert json.loads(f.read_text())["pins"] == {"0": "SERIAL-NEW", "1": "SERIAL-R", "3": "SERIAL-X"}
+    assert b._pins == {0: "SERIAL-NEW", 3: "SERIAL-X"}
+
+
+@pytest.mark.unit
+def test_bindings_saved_by_a_backend_that_read_the_file_are_not_merged(override, on_a_drive, tmp_path):
+    """Behaviour is unchanged for a backend that seeded from the file: its pins
+    are written as they stand, so a pin it dropped stays dropped."""
+    import json
+    root = tmp_path / "dtk-projects"
+    root.mkdir()
+    f = root / "camera-bindings.json"
+    f.write_text(json.dumps({"version": 1, "pins": {"0": "SERIAL-L", "1": "SERIAL-R"}}))
+    override(root)
+    b = _bare_gphoto2_backend()
+    b._load_pins()
+    assert b._pins == {0: "SERIAL-L", 1: "SERIAL-R"}
+    b._pins = {0: "SERIAL-L"}
+    b._save_pins()
+    assert json.loads(f.read_text())["pins"] == {"0": "SERIAL-L"}
