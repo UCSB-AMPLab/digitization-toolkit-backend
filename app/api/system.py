@@ -402,6 +402,13 @@ def activate_storage(
         raise HTTPException(status_code=400, detail="The path does not exist.")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="The path is not a directory.")
+    # The same test every writer applies to the stored root (see
+    # storage_override.override_root_problem), applied to the target before
+    # anything is created in it: a directory on the root filesystem is on the
+    # SD card, as an empty mount point with no drive mounted is.
+    from app.core.storage_override import override_root_problem
+    if override_root_problem(target):
+        raise HTTPException(status_code=400, detail="The path is not on a mounted drive.")
 
     # Use a clearly-labelled subdirectory so files aren't dumped into the root.
     projects_path = target / "dtk-projects"

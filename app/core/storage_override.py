@@ -114,6 +114,40 @@ def override_root_problem(root: Path) -> Optional[str]:
     return None
 
 
+def projects_root_refusal(settings=None) -> Optional[str]:
+    """Why the active projects root cannot take writes, or None if it can.
+
+    None with no override (or an unreadable one); otherwise
+    override_root_problem of the override's root."""
+    override, _corrupt = get_storage_override_or_fallback()
+    if not override:
+        return None
+    return override_root_problem(Path(override))
+
+
+def refuse_writes_under_unusable_root(paths) -> None:
+    """Raise StorageUnavailableError if any of `paths` lies under an override
+    root that cannot take writes.
+
+    For writers that work beside an existing file (a thumbnail next to its
+    source, a renumber renaming in place) rather than building a path through
+    writable_projects_dir. A path outside the override root, such as an upload
+    under the data directory, is not affected. Containment is by absolute path,
+    without resolving symlinks, because the root may not exist.
+    """
+    override, _corrupt = get_storage_override_or_fallback()
+    if not override:
+        return
+    root = Path(os.path.abspath(override))
+    for p in paths:
+        if Path(os.path.abspath(p)).is_relative_to(root):
+            problem = override_root_problem(root)
+            if problem:
+                logger.error("Storage override root %s refused for writing beside %s: %s", root, p, problem)
+                raise StorageUnavailableError(problem)
+            return
+
+
 def writable_projects_dir(settings=None) -> Path:
     """The projects root to write into; raises StorageUnavailableError if it is not usable.
 

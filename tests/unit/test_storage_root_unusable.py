@@ -8,10 +8,17 @@ ordinary directory on the SD card, and `mkdir(parents=True)` under it would put
 the project on the card while the operator believes it is on the drive (bench
 D3, section 5c).
 
-`writable_projects_dir()` is the check. Every path into the projects tree is
-built through `capture.project_manager._projects_root()`, which calls it, so
-captures, project initialisation, relocations, renames and deletes all refuse
-with `StorageUnavailableError`, which the app answers with 503.
+`writable_projects_dir()` is the check for writers that build a path into the
+tree; they all do it through `capture.project_manager._projects_root()`:
+captures, project initialisation, relocations (collection rename or re-parent,
+move-records, move-collections), project rename, and the path computation of
+collection and project deletes. Writers that work beside an existing file use
+`refuse_writes_under_unusable_root()`: thumbnail regeneration and renumbering.
+Both raise `StorageUnavailableError`, which the app answers with 503.
+POST /system/storage/activate refuses a target the same test would refuse.
+Record and image deletes are not checked: they create nothing. Reading the
+camera registry is never refused; under such a root it reads as no file, and
+only its writes refuse.
 
 The root filesystem's device number comes from `_internal_device()`, patched
 here because a test's tmp_path may or may not share a device with `/`.
@@ -144,12 +151,45 @@ def test_capture_refuses_before_writing(pm, override, tmp_path, mock_camera_conf
 
 
 @pytest.mark.unit
-def test_camera_registry_refuses_and_creates_nothing(override, tmp_path):
+def test_camera_registry_reads_a_missing_root_as_no_file_and_creates_nothing(override, tmp_path):
+    from capture.camera_registry import CameraRegistry
+    override(tmp_path / "mounts" / "usb" / "dtk-projects")
+    reg = CameraRegistry()
+    assert reg.cameras["cameras"] == {}
+    assert not (tmp_path / "mounts").exists()
+
+
+@pytest.mark.unit
+def test_camera_registry_ignores_a_file_under_a_root_on_the_card_and_refuses_writes(
+        override, on_the_card, tmp_path):
+    import json
     from capture.camera_registry import CameraRegistry
     from app.core.storage_override import StorageUnavailableError
-    override(tmp_path / "mounts" / "usb" / "dtk-projects")
+    root = tmp_path / "mounts" / "usb" / "dtk-projects"
+    root.mkdir(parents=True)
+    (root / "cameras.json").write_text(json.dumps(
+        {"version": "1.0", "cameras": {"hw1": {"current_index": 0}}}))
+    override(root)
+    reg = CameraRegistry()
+    assert reg.cameras["cameras"] == {}
     with pytest.raises(StorageUnavailableError):
-        CameraRegistry()
+        reg.update_orientation("hw1", 90)
+    assert json.loads((root / "cameras.json").read_text())["cameras"] == {"hw1": {"current_index": 0}}
+
+
+@pytest.mark.unit
+def test_test_capture_is_not_blocked_by_reading_the_registry(override, tmp_path, monkeypatch):
+    import capture.service as svc
+    override(tmp_path / "mounts" / "usb" / "dtk-projects")
+    monkeypatch.setattr(svc, "is_camera_connected", lambda i: True)
+
+    class FakeBackend:
+        def capture_image(self, *a, **k):
+            raise RuntimeError("reached the backend")
+
+    monkeypatch.setattr(svc, "get_backend", lambda: FakeBackend())
+    with pytest.raises(RuntimeError, match="reached the backend"):
+        svc.test_capture_bytes(0)
     assert not (tmp_path / "mounts").exists()
 
 
@@ -237,3 +277,100 @@ def test_storage_info_for_a_usable_override_is_available(client, db_session, ove
     body = _admin_client(client).get("/system/storage").json()
     assert body["available"] is True
     assert body["unavailable_reason"] is None
+
+
+def _jpeg(path):
+    from PIL import Image
+    path.parent.mkdir(parents=True, exist_ok=True)
+    Image.new("RGB", (40, 30), (200, 10, 10)).save(path, "JPEG")
+
+
+@pytest.fixture
+def card_root(override, on_the_card, tmp_path):
+    """An override root that exists but is on the root filesystem, holding a file
+    from before (an empty mount point that something earlier wrote under)."""
+    root = tmp_path / "mounts" / "usb" / "dtk-projects"
+    root.mkdir(parents=True)
+    override(root)
+    return root
+
+
+def _record_under(db_session, root):
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+    p = Project(name="P")
+    db_session.add(p)
+    db_session.commit()
+    c = Collection(name="C", project_id=p.id)
+    db_session.add(c)
+    db_session.commit()
+    f = root / "p" / "c" / "images" / "main" / "a.jpg"
+    _jpeg(f)
+    r = Record(title="r", collection_id=c.id, status="captured", capture_mode="single")
+    db_session.add(r)
+    db_session.commit()
+    img = RecordImage(record_id=r.id, filename=f.name, file_path=str(f),
+                      format="jpg", role="single", is_current=True)
+    db_session.add(img)
+    db_session.commit()
+    return c, img
+
+
+def _entries(root):
+    return sorted(str(p.relative_to(root)) for p in root.rglob("*"))
+
+
+@pytest.mark.unit
+def test_thumbnail_is_not_generated_under_a_refused_root(client, db_session, pm, card_root):
+    c, img = _record_under(db_session, card_root)
+    before = _entries(card_root)
+    resp = _admin_client(client).get(f"/records/images/{img.id}/thumbnail")
+    assert resp.status_code == 503, resp.text
+    assert _entries(card_root) == before
+
+
+@pytest.mark.unit
+def test_thumbnail_of_a_file_outside_the_override_root_is_still_generated(
+        client, db_session, pm, override, tmp_path, monkeypatch):
+    from app.core import config
+    c, img = _record_under(db_session, tmp_path / "elsewhere")
+    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "elsewhere"))
+    override(tmp_path / "mounts" / "usb" / "dtk-projects")
+    resp = _admin_client(client).get(f"/records/images/{img.id}/thumbnail")
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.unit
+def test_renumber_is_refused_under_a_refused_root_before_any_rename(client, db_session, pm, card_root):
+    c, img = _record_under(db_session, card_root)
+    before = _entries(card_root)
+    resp = _admin_client(client).post(f"/collections/{c.id}/images/renumber")
+    assert resp.status_code == 503, resp.text
+    assert _entries(card_root) == before
+
+
+@pytest.mark.unit
+def test_activate_refuses_a_target_on_the_root_filesystem(client, db_session, on_the_card, tmp_path, monkeypatch):
+    import app.core.storage_override as so
+    stored = []
+    monkeypatch.setattr(so, "set_storage_override", stored.append)
+    target = tmp_path / "mounts" / "empty-mountpoint"
+    target.mkdir(parents=True)
+    resp = _admin_client(client).post("/system/storage/activate", json={"path": str(target)})
+    assert resp.status_code == 400, resp.text
+    assert "not on a mounted drive" in resp.json()["detail"]
+    assert not (target / "dtk-projects").exists()
+    assert stored == []
+
+
+@pytest.mark.unit
+def test_activate_accepts_a_target_on_another_filesystem(client, db_session, on_a_drive, tmp_path, monkeypatch):
+    import app.core.storage_override as so
+    stored = []
+    monkeypatch.setattr(so, "set_storage_override", stored.append)
+    target = tmp_path / "drive"
+    target.mkdir()
+    resp = _admin_client(client).post("/system/storage/activate", json={"path": str(target)})
+    assert resp.status_code == 200, resp.text
+    assert stored == [str(target / "dtk-projects")]

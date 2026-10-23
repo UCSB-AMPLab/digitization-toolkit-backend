@@ -47,20 +47,27 @@ class CameraRegistry:
         Args:
             registry_path: Path to cameras.json. Defaults to PROJECTS_ROOT/cameras.json
         """
+        # Why the registry cannot be written, or None. Set when the default
+        # path is under a storage override root that cannot take writes
+        # (storage_override.projects_root_refusal): reading then returns an
+        # empty registry, as for a missing file, so captures and test captures
+        # are not refused for reading it, and every write raises
+        # StorageUnavailableError. Nothing is created under such a root.
+        self._write_refusal: Optional[str] = None
         if registry_path is None:
-            # Raises StorageUnavailableError, before the mkdir below, when the
-            # storage override names a root that cannot take writes.
             from app.core.config import settings
-            from app.core.storage_override import writable_projects_dir
-            registry_path = writable_projects_dir(settings) / "cameras.json"
-        
+            from app.core.storage_override import projects_root_refusal
+            self._write_refusal = projects_root_refusal(settings)
+            registry_path = Path(settings.projects_dir) / "cameras.json"
+
         self.registry_path = Path(registry_path)
-        self.registry_path.parent.mkdir(parents=True, exist_ok=True)
+        if self._write_refusal is None:
+            self.registry_path.parent.mkdir(parents=True, exist_ok=True)
         self.cameras = self._load_registry()
     
     def _load_registry(self) -> Dict:
         """Load the camera registry, self-healing from a corrupt/truncated file."""
-        if not self.registry_path.exists():
+        if self._write_refusal is not None or not self.registry_path.exists():
             return {"cameras": {}, "version": "1.0"}
         try:
             with open(self.registry_path, 'r') as f:
@@ -75,8 +82,14 @@ class CameraRegistry:
                 pass
             return {"cameras": {}, "version": "1.0"}
 
+    def _refuse_write(self) -> None:
+        if self._write_refusal is not None:
+            from app.core.storage_override import StorageUnavailableError
+            raise StorageUnavailableError(self._write_refusal)
+
     def _save_registry(self):
         """Save the camera registry atomically (temp + fsync + replace)."""
+        self._refuse_write()
         atomic_write(self.registry_path, lambda tmp: Path(tmp).write_text(json.dumps(self.cameras, indent=2)))
 
     def _mutate(self, change: Callable[[Dict], None]) -> None:
@@ -91,6 +104,7 @@ class CameraRegistry:
         copy, and writes the whole file back before releasing the lock, so
         no instance ever saves over a write it did not see.
         """
+        self._refuse_write()
         with _REGISTRY_WRITE_LOCK:
             self.cameras = self._load_registry()
             change(self.cameras)
