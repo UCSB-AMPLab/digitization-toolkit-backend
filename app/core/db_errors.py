@@ -19,6 +19,7 @@ _CONSTRAINT_MESSAGES = {
 	"check_collection_date_range": "The end date cannot be before the start date.",
 	"check_collection_filename_stem_pattern": "A file name stem is lowercase letters and digits, separated by single hyphens.",
 	"check_collection_filename_stem_length": "The file name stem is too long.",
+	"check_collection_external_id_trimmed": "The external identifier cannot be blank or begin or end with whitespace.",
 }
 
 # SQLite names unnamed constraints differently from Postgres; map the substrings
@@ -31,6 +32,7 @@ _SQLITE_ALIASES = {
 	"check_collection_date_range": "check_collection_date_range",
 	"check_collection_filename_stem_pattern": "check_collection_filename_stem_pattern",
 	"check_collection_filename_stem_length": "check_collection_filename_stem_length",
+	"check_collection_external_id_trimmed": "check_collection_external_id_trimmed",
 }
 
 _DEFAULT_MESSAGE = "The request conflicts with a database constraint."

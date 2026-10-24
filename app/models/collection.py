@@ -29,6 +29,24 @@ _FILENAME_STEM_GLOB = (
 )
 
 
+# An external_id is never empty and never starts or ends with whitespace: a
+# reference code that differs from another only by padding would pass the
+# unique index, and an empty one would take the write-once slot. The request
+# schemas strip it; these refuse it from any other writer. On SQLite
+# "whitespace" is the six characters passed to trim(): space, tab, newline,
+# vertical tab, form feed, carriage return. On Postgres it is [[:space:]],
+# which covers those six and, depending on the database's locale, may also
+# match other Unicode spaces.
+_EXTERNAL_ID_TRIMMED_POSTGRES = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id !~ '^[[:space:]]' AND external_id !~ '[[:space:]]$')"
+)
+_EXTERNAL_ID_TRIMMED_SQLITE = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id = trim(external_id, char(32, 9, 10, 11, 12, 13)))"
+)
+
+
 class Collection(Base):
     __tablename__ = "collections"
 
@@ -242,6 +260,14 @@ class Collection(Base):
             'capture_counter >= 0',
             name='check_collection_capture_counter'
         ),
+        CheckConstraint(
+            _EXTERNAL_ID_TRIMMED_POSTGRES,
+            name='check_collection_external_id_trimmed'
+        ).ddl_if(dialect='postgresql'),
+        CheckConstraint(
+            _EXTERNAL_ID_TRIMMED_SQLITE,
+            name='check_collection_external_id_trimmed'
+        ).ddl_if(dialect='sqlite'),
         UniqueConstraint('filename_stem', name='collections_filename_stem_key'),
         # length() counts characters on both Postgres and SQLite.
         CheckConstraint(

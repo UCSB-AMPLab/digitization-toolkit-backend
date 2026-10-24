@@ -724,7 +724,8 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, sqlite_en
     assert {"check_collection_parent", "check_collection_date_range",
             "check_collection_filename_stem_pattern",
             "check_collection_filename_stem_length",
-            "check_collection_capture_counter"} <= checks, checks
+            "check_collection_capture_counter",
+            "check_collection_external_id_trimmed"} <= checks, checks
     assert "collections_filename_stem_key" in {u["name"] for u in insp.get_unique_constraints("collections")}
     ix = {i["name"]: i for i in insp.get_indexes("collections")}
     assert ix["ix_collections_external_id"]["unique"] in (1, True)
@@ -762,6 +763,11 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, sqlite_en
         conn.execute(sa.text(
             "INSERT INTO collections (name, project_id, date_start, date_end, created_at) "
             "VALUES ('bad', 9, '1750-02-01', '1750-01-31', CURRENT_TIMESTAMP)"))
+
+    with pytest.raises(IntegrityError), sqlite_engine.begin() as conn:
+        conn.execute(sa.text(
+            "INSERT INTO collections (name, project_id, external_id, created_at) "
+            "VALUES ('bad', 9, ' padded', CURRENT_TIMESTAMP)"))
 
     _run(sqlite_engine, mod.downgrade)
 
@@ -1097,3 +1103,67 @@ def test_a_pending_image_in_another_volume_does_not_fix_this_stem(db_session):
     _pending_image(db_session, other)
 
     v.filename_stem = "co-b-004"
+
+
+# ---------------------------------------------------------------------------
+# external_id is stripped, and never blank or padded in the database
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", "   ", "\t\n"])
+def test_a_blank_external_id_is_a_422(client, db_session, value):
+    p = _project(db_session)
+    api = _client_as(client)
+
+    resp = api.post("/collections/", json={"name": "A", "project_id": p.id, "external_id": value})
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.unit
+def test_the_schemas_strip_external_id():
+    from app.schemas.collection import CollectionCreate, CollectionUpdate
+
+    assert CollectionCreate(name="v", project_id=1, external_id="  co-ahr-1 ").external_id == "co-ahr-1"
+    assert CollectionUpdate(external_id="co-ahr-1\n").external_id == "co-ahr-1"
+
+
+@pytest.mark.unit
+def test_a_padded_duplicate_external_id_is_a_409(client, db_session):
+    p = _project(db_session)
+    api = _client_as(client)
+
+    first = api.post("/collections/", json={"name": "A", "project_id": p.id, "external_id": "co-ahr-1"})
+    padded = api.post("/collections/", json={"name": "B", "project_id": p.id, "external_id": "co-ahr-1 "})
+
+    assert first.status_code == 201, first.text
+    assert padded.status_code == 409, padded.text
+    assert padded.json()["detail"]["constraint"] == "ix_collections_external_id"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", " co-ahr-2", "co-ahr-2 ", "\tco-ahr-2", "co-ahr-2\n"])
+def test_the_database_refuses_a_blank_or_padded_external_id(db_session, value):
+    """An ORM writer cannot store '' and so lock the real code out for good."""
+    from app.models.collection import Collection
+
+    p = _project(db_session)
+    db_session.add(Collection(name="v", project_id=p.id, external_id=value))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
+
+
+@pytest.mark.unit
+def test_a_blank_external_id_on_the_orm_is_a_named_409_through_the_handler(db_session):
+    from app.core.db_errors import integrity_conflict
+    from app.models.collection import Collection
+
+    p = _project(db_session)
+    db_session.add(Collection(name="v", project_id=p.id, external_id=""))
+    with pytest.raises(IntegrityError) as caught:
+        db_session.commit()
+    db_session.rollback()
+    exc = integrity_conflict(caught.value)
+    assert exc.status_code == 409
+    assert exc.detail["constraint"] == "check_collection_external_id_trimmed", exc.detail

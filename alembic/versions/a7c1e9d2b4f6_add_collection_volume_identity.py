@@ -26,7 +26,11 @@ no layout change, no import and no export.
 - `external_id`: Fisqua's `referenceCode`. Nullable, unique and indexed by
   one unique index, `ix_collections_external_id`, as `records.external_id` is.
   Written once; that rule is on the model, since no CHECK can compare a new
-  value with the stored one.
+  value with the stored one. `check_collection_external_id_trimmed` refuses
+  an empty value and one that begins or ends with whitespace: `[[:space:]]`
+  regexes on Postgres (space, tab, newline, vertical tab, form feed, carriage
+  return, and depending on the locale other Unicode spaces), `trim()` with
+  those six characters on SQLite, and nothing on any other engine.
 - `date`, `date_start`, `date_end`: the display date and its queryable range,
   the same columns `records` has, with `check_collection_date_range` refusing
   an end before its start in the form `check_record_date_range` uses.
@@ -112,6 +116,25 @@ UPDATE collections SET capture_counter = COALESCE((
 """
 
 
+EXTERNAL_ID_TRIMMED_POSTGRES = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id !~ '^[[:space:]]' AND external_id !~ '[[:space:]]$')"
+)
+EXTERNAL_ID_TRIMMED_SQLITE = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id = trim(external_id, char(32, 9, 10, 11, 12, 13)))"
+)
+
+
+def _external_id_trimmed_check():
+    dialect = op.get_bind().dialect.name
+    if dialect == 'postgresql':
+        return EXTERNAL_ID_TRIMMED_POSTGRES
+    if dialect == 'sqlite':
+        return EXTERNAL_ID_TRIMMED_SQLITE
+    return None
+
+
 def _stem_pattern_check():
     dialect = op.get_bind().dialect.name
     if dialect == 'postgresql':
@@ -123,6 +146,7 @@ def _stem_pattern_check():
 
 def upgrade() -> None:
     pattern = _stem_pattern_check()
+    trimmed = _external_id_trimmed_check()
     with op.batch_alter_table('collections') as batch:
         batch.add_column(sa.Column('filename_stem', sa.String(length=255), nullable=True))
         batch.add_column(sa.Column('external_id', sa.String(length=255), nullable=True))
@@ -146,13 +170,18 @@ def upgrade() -> None:
         )
         if pattern is not None:
             batch.create_check_constraint('check_collection_filename_stem_pattern', pattern)
+        if trimmed is not None:
+            batch.create_check_constraint('check_collection_external_id_trimmed', trimmed)
 
     op.execute(BACKFILL_CAPTURE_COUNTER)
 
 
 def downgrade() -> None:
     pattern = _stem_pattern_check()
+    trimmed = _external_id_trimmed_check()
     with op.batch_alter_table('collections') as batch:
+        if trimmed is not None:
+            batch.drop_constraint('check_collection_external_id_trimmed', type_='check')
         if pattern is not None:
             batch.drop_constraint('check_collection_filename_stem_pattern', type_='check')
         batch.drop_constraint('check_collection_filename_stem_length', type_='check')

@@ -1,5 +1,5 @@
 from typing import Optional, Dict, Any, List
-from pydantic import BaseModel, Field, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 # Aliased: `date` is a field name on these schemas (the free-text display
 # date), so the type is imported under another name, as in schemas/record.py.
@@ -28,6 +28,19 @@ class VolumeIdentityFields(BaseModel):
     date_end: Optional[dt_date] = None
     sequence: Optional[int] = None
     custom_attributes: Optional[str] = Field(None, description="JSON string for custom fields")
+
+    @field_validator("external_id", mode="before")
+    @classmethod
+    def _strip_external_id(cls, value):
+        # A reference code padded with whitespace would be a second code to
+        # the unique index, and a blank one is no code; strip, then refuse
+        # blank. None passes through (on update it is a request to clear,
+        # which the model refuses once a code is stored).
+        if isinstance(value, str):
+            value = value.strip()
+            if not value:
+                raise ValueError("external_id cannot be blank")
+        return value
 
     @model_validator(mode="after")
     def _end_not_before_start(self):
