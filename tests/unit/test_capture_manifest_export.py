@@ -697,16 +697,35 @@ def test_refused_with_a_malformed_recorded_sha256(client, vol):
 
 
 @pytest.mark.unit
-def test_today_raw_previews_have_no_recorded_digest(client, vol):
-    """Captua's capture record lists the RAW (and a JPEG), never the `_preview.jpg`
-    the RAW backend extracts, so nothing on the unit holds a preview's sha256 and
-    every volume with previews is refused. The other tests list the preview in
-    the capture record to exercise the export past this point; that entry is a
-    stand-in for whatever source is ruled, not a format capture writes today."""
+def test_refused_with_a_preview_that_has_no_recorded_digest(client, vol):
+    """A preview captured before capture recorded its sha256 has none until it is backfilled.
+
+    The capture record lists a RAW's preview as `<role>_preview` beside its
+    master (branch backend/preview-digests, capture.manifestHandler); that is
+    the entry `preview_digest_recorded` writes in these tests."""
     rec = vol.record(layout=("left", "right"), ext="cr2", preview_digest_recorded=False)
     problems = _refusal(_export(client, vol.col))
     assert problems["preview_sha256_missing"]["record_ids"] == [rec.id]
-    assert "preview" in problems["preview_sha256_missing"]["message"]
+    assert f"backfill-preview-digests {STEM} --apply" in problems["preview_sha256_missing"]["message"]
+
+
+@pytest.mark.unit
+def test_a_backfilled_preview_digest_is_read(client, vol):
+    """The backfill's `preview_digest` record (app.core.preview_digests) is the other source."""
+    rec = vol.record(layout=("single",), ext="cr2", preview_digest_recorded=False)
+    [img] = rec.images
+    name = f"{Path(img.filename).stem}_preview.jpg"
+    digest = _sha256((vol.root / "previews" / name).read_bytes())
+    vol.manifest_line({"record_type": "preview_digest", "capture_id": img.capture_id, "image_id": img.id,
+                       "files": [{"role": "single_preview", "relative_path": f"previews/{name}",
+                                  "bytes": 1, "mimetype": "image/jpeg", "sha256": digest}],
+                       "computed_at": "2026-10-24T00:00:00+00:00", "backfilled": True})
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    [out] = _images(resp.json())
+    assert out["previewSha256"] == digest
+    # The master's digest still comes from its capture record.
+    assert out["sha256"] == _sha256(Path(img.file_path).read_bytes())
 
 
 @pytest.mark.unit

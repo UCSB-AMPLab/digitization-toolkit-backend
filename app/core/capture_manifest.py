@@ -15,7 +15,8 @@ whose files are still on disk.
 * `sha256` is the capture-time digest the capture manifests hold for the
   image (a relocation record naming the image, then its path, then its name,
   then the name in its key). `previewSha256` is looked up the same way for
-  the preview's file. Neither is ever computed here: a missing digest refuses
+  the preview's file, which the manifests give either in its capture record
+  (a `<role>_preview` entry) or in a backfilled `preview_digest` record. Neither is ever computed here: a missing digest refuses
   the export.
 * A current RAW image must have a preview: Fisqua's runner reads pages with
   Pillow and cannot decode a RAW, so one without a preview row or file
@@ -444,10 +445,11 @@ def _problems(found: _Collector, tenant: Optional[str], stem: Optional[str]) -> 
             f"(records {_ids(r)}). The manifest is never built from recomputed digests; run the integrity "
             "check on the volume and resolve what it reports."),
         "preview_sha256_missing": lambda r, n: (
-            f"No capture-time sha256 is recorded for the previews of "
+            f"No sha256 is recorded for the previews of "
             f"{len(found.images['preview_sha256_missing'])} RAW image(s) (records {_ids(r)}), and Fisqua's "
-            "pipeline reads the preview. This unit does not record a preview's sha256 at capture, so a "
-            "volume with RAW previews cannot be exported yet."),
+            "pipeline reads the preview. They were captured before capture recorded it. Run "
+            f"`python -m app.core.image_upload backfill-preview-digests {stem} --apply` on the unit, "
+            "resolve anything it reports, then export again."),
     }
     out = []
     for rule in RULES:
