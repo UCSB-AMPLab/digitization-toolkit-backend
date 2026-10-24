@@ -513,19 +513,24 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
     for position, item in enumerate(items, start=1):
         code = _reference_code(item) if isinstance(item, dict) else None
         reason, values = _check_item(position, item, first_code, first_stem)
-        if reason is None:
-            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
-                reason = "reference_code_on_unit"
-            elif db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
-                reason = "filename_stem_on_unit"
         if reason is not None:
             rejects.append(_reject(position, code, reason))
             continue
 
-        volume = Collection(project_id=project_id, created_by=actor, **values)
-        db.add(volume)
+        # The lookups, the insert and the read of the new id are one step
+        # for the rollback-and-reject handling: a database failure at any
+        # of them costs this item only.
         try:
+            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
+                rejects.append(_reject(position, code, "reference_code_on_unit"))
+                continue
+            if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
+                rejects.append(_reject(position, code, "filename_stem_on_unit"))
+                continue
+            volume = Collection(project_id=project_id, created_by=actor, **values)
+            db.add(volume)
             db.commit()
+            volume_id = volume.id
         except IntegrityError as exc:
             db.rollback()
             reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
@@ -550,7 +555,7 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             "position": position,
             "referenceCode": values["external_id"],
             "filenameStem": values["filename_stem"],
-            "captuaCollectionId": volume.id,
+            "captuaCollectionId": volume_id,
         })
 
     return {
