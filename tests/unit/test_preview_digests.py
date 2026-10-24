@@ -395,3 +395,162 @@ def test_the_startup_repair_does_not_take_a_preview_digest_for_a_capture_record(
 
 
 from tests.unit.test_volume_layout_by_stem import capture_settings, data_dir, legacy  # noqa: E402,F401
+
+
+# ---------------------------------------------------------------------------
+# A preview renamed with its master keeps its digest
+#
+# storage_ops.relocate_image and the layout migration rename a RAW master on
+# a name clash and move its preview to the name preview_sidecar_of derives
+# from the new name; only the master gets a relocation record. The index
+# follows that record to the preview: the preview of `from` is the preview of
+# `to`.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_index_follows_a_masters_relocation_record_to_its_preview(override_projects_root):
+    from app.core.integrity import build_fixity_index
+
+    vol = _volume_dir(override_projects_root)
+    raw = _write(vol / "captures" / "a_x1.cr2", b"raw")
+    prev = _write(vol / "previews" / "a_x1_preview.jpg", b"prev")
+    _append(vol, {"capture_id": "c1", "files": [
+        {"role": "single", "relative_path": "captures/a.cr2", "sha256": _sha256(raw)},
+        {"role": "single_preview", "relative_path": "previews/a_preview.jpg", "sha256": _sha256(prev)}]})
+    _append(vol, {"record_type": "relocation", "capture_id": "c1", "image_id": 7, "sha256": _sha256(raw),
+                  "from": "captures/a.cr2", "to": "captures/a_x1.cr2", "relocated_at": "x"})
+    index = build_fixity_index(override_projects_root.resolve())
+    path = (vol / "previews" / "a_x1_preview.jpg").resolve()
+    assert index.expected("c1", None, path) == _sha256(prev)
+    assert str(path) in index.previews
+
+
+@pytest.mark.unit
+def test_the_index_follows_a_chain_of_relocations_to_the_preview(override_projects_root):
+    from app.core.integrity import build_fixity_index
+
+    vol = _volume_dir(override_projects_root)
+    _append(vol, {"capture_id": "c1", "files": [
+        {"role": "single_preview", "relative_path": "previews/a_preview.jpg", "sha256": "5" * 64}]})
+    # Out of order on purpose: the second rename's record comes first.
+    _append(vol, {"record_type": "relocation", "capture_id": "c1", "image_id": 7, "sha256": "4" * 64,
+                  "from": "captures/a_x1.cr2", "to": "captures/a_x2.cr2"})
+    _append(vol, {"record_type": "relocation", "capture_id": "c1", "image_id": 7, "sha256": "4" * 64,
+                  "from": "captures/a.cr2", "to": "captures/a_x1.cr2"})
+    index = build_fixity_index(override_projects_root.resolve())
+    assert index.expected("c1", None, (vol / "previews" / "a_x2_preview.jpg").resolve()) == "5" * 64
+
+
+@pytest.mark.unit
+def test_a_jpeg_masters_relocation_gives_no_preview(override_projects_root):
+    from app.core.integrity import build_fixity_index
+
+    vol = _volume_dir(override_projects_root)
+    _append(vol, {"capture_id": "c1", "files": [
+        {"role": "single_preview", "relative_path": "previews/a_preview.jpg", "sha256": "5" * 64}]})
+    _append(vol, {"record_type": "relocation", "capture_id": "c1", "image_id": 7, "sha256": "4" * 64,
+                  "from": "captures/a.jpg", "to": "captures/a_x1.jpg"})
+    index = build_fixity_index(override_projects_root.resolve())
+    assert index.expected("c1", None, (vol / "previews" / "a_x1_preview.jpg").resolve()) is None
+
+
+def _stemmed_raw(db, root, stem, name="IMG_0001.cr2", capture_id="cap-r1"):
+    """A volume with one RAW image whose capture record lists its preview, as capture now writes it."""
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+
+    vol = root / stem
+    for sub in ("captures", "previews", "metadata"):
+        (vol / sub).mkdir(parents=True, exist_ok=True)
+    p = db.query(Project).filter(Project.name == "P").one_or_none()
+    if p is None:
+        p = Project(name="P")
+        db.add(p)
+        db.commit()
+    col = Collection(name=stem, project_id=p.id, filename_stem=stem)
+    db.add(col)
+    db.commit()
+    if name is None:
+        return col, None, None
+    raw = _write(vol / "captures" / name, b"raw " + name.encode())
+    prev = _write(vol / "previews" / f"{Path(name).stem}_preview.jpg", b"preview " + name.encode())
+    rec = Record(title="r", collection_id=col.id, status="approved", sequence=1, capture_mode="single")
+    db.add(rec)
+    db.commit()
+    img = RecordImage(record_id=rec.id, capture_id=capture_id, role="single", filename=name,
+                      file_path=str(vol / "captures" / name), format="cr2")
+    db.add(img)
+    db.commit()
+    _append(vol, {"capture_id": capture_id, "files": [
+        {"role": "single", "relative_path": f"captures/{name}", "sha256": _sha256(raw)},
+        {"role": "single_preview", "relative_path": f"previews/{Path(name).stem}_preview.jpg",
+         "sha256": _sha256(prev)}]})
+    return col, img, prev
+
+
+@pytest.mark.unit
+def test_a_preview_renamed_by_relocate_image_keeps_its_digest(db_session, override_projects_root):
+    from app.core.integrity import build_fixity_index
+    from app.core.paths import preview_sidecar_of
+    from app.core.preview_digests import backfill_preview_digests
+    from app.core.storage_ops import relocate_image, write_relocation_records
+
+    src_col, img, prev = _stemmed_raw(db_session, override_projects_root, "co-test-src")
+    dst_col, _, _ = _stemmed_raw(db_session, override_projects_root, "co-test-dst", name=None)
+    target = override_projects_root / "co-test-dst" / "captures"
+    _write(target / "IMG_0001.cr2", b"another master of the same name")  # forces the rename
+
+    relocations = []
+    assert relocate_image(img, target, relocations=relocations)
+    img.record.collection_id = dst_col.id
+    db_session.commit()
+    write_relocation_records(relocations)
+
+    master = Path(img.file_path)
+    assert master.name != "IMG_0001.cr2"
+    moved_preview = preview_sidecar_of(master)
+    assert moved_preview.read_bytes() == prev
+    index = build_fixity_index(override_projects_root.resolve())
+    assert index.expected(img.capture_id, None, moved_preview.resolve()) == _sha256(prev)
+
+    report = backfill_preview_digests(db_session, "co-test-dst", apply=True)
+    assert report["already_recorded"] == 1 and report["backfilled"] == []
+
+
+@pytest.mark.unit
+def test_a_preview_renamed_by_the_layout_migration_keeps_its_digest(db_session, legacy):
+    from tests.unit.test_volume_layout_by_stem import STEMS, _capture_records
+    import app.core.volume_layout as vl
+    from app.core.integrity import build_fixity_index
+    from app.core.paths import preview_sidecar_of
+    from app.core.preview_digests import backfill_preview_digests
+    from app.models.record import RecordImage
+
+    _capture_records(db_session, legacy)
+    # The RAW capture's record lists its preview, as capture now writes it.
+    manifest = legacy["root"] / "proj" / "metadata" / "manifest.jsonl"
+    preview = legacy["root"] / "proj" / "fondo_a" / "images" / "main" / "IMG_0001_preview.jpg"
+    records = _lines(manifest)
+    for r in records:
+        if r["capture_id"] == "cap-i1":
+            r["files"].append({"role": "single_preview", "relative_path": "fondo_a/images/main/IMG_0001_preview.jpg",
+                               "sha256": _sha256(preview.read_bytes())})
+    manifest.write_text("".join(json.dumps(r) + "\n" for r in records))
+    digest = _sha256(preview.read_bytes())
+    occupant = legacy["root"] / STEMS["a1"] / "captures" / "IMG_0001.CR2"
+    occupant.parent.mkdir(parents=True)
+    occupant.write_bytes(b"another master of the same name")  # forces the rename
+
+    vl.migrate_volume_layout(db_session)
+
+    img = db_session.get(RecordImage, legacy["i1"].id)
+    master = Path(img.file_path)
+    assert master.parent == legacy["root"] / STEMS["a1"] / "captures" and master.name != "IMG_0001.CR2"
+    moved_preview = preview_sidecar_of(master)
+    assert moved_preview.is_file()
+    index = build_fixity_index(legacy["root"].resolve())
+    assert index.expected("cap-i1", None, moved_preview.resolve()) == digest
+
+    report = backfill_preview_digests(db_session, STEMS["a1"], apply=True)
+    assert report["already_recorded"] == 1 and report["backfilled"] == []

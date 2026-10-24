@@ -161,12 +161,23 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     `preview_digest` record is not a capture record: its capture id is not
     added to `captured`, and it never enters by_image, which holds masters.
     Each preview's path goes into `previews`.
+
+    A preview renamed with its master has no relocation record of its own:
+    app.core.storage_ops.relocate_image and the layout migration move a RAW
+    master's preview to the name preview_sidecar_of derives from the
+    master's new path, and write a record for the master only. So every
+    relocation record of a RAW master, with or without an image id, is also
+    read as one for its preview: the preview of `from` has moved to the
+    preview of `to`, and keeps its digest. Those are applied after the
+    masters' chains, swept the same way, so a preview renamed twice, by
+    records in any order or in different manifests, resolves.
     """
     from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
     if not projects_dir.exists():
         return index
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
+    preview_moves: List[Tuple[str, str, str]] = []  # (capture_id, preview of from, preview of to), absolute
 
     for manifest in _manifests(projects_dir):
         project_root = manifest_base(manifest, projects_dir)
@@ -191,6 +202,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
             if not cid:
                 continue
             if rec.get("record_type") == "relocation":
+                _note_preview_move(preview_moves, cid, project_root, rec.get("from"), rec.get("to"))
                 image_id, sha = rec.get("image_id"), rec.get("sha256")
                 if isinstance(image_id, int) and sha:
                     key = (cid, image_id)
@@ -244,7 +256,37 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                     changed = True
         if not changed:
             break
+
+    for _ in range(len(preview_moves) + 1):
+        changed = False
+        for cid, frm, to in preview_moves:
+            # By path, then by name under the capture id, as a master is
+            # found: the record's paths may predate an SD re-clone.
+            sha = index.by_path.get(cid, {}).get(frm) or index.by_name.get(cid, {}).get(Path(frm).name)
+            if not sha:
+                continue
+            if index.by_path.get(cid, {}).get(to) != sha or to not in index.previews:
+                index.by_path.setdefault(cid, {})[to] = sha
+                index.by_name.setdefault(cid, {})[Path(to).name] = sha
+                index.previews.add(to)
+                changed = True
+        if not changed:
+            break
     return index
+
+
+def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
+    """Record that a RAW master's relocation from `frm` to `to` moved its preview too (build_fixity_index)."""
+    if not (isinstance(frm, str) and isinstance(to, str) and frm and to):
+        return
+    if not (is_raw_suffix(Path(frm)) or is_raw_suffix(Path(to))):
+        return
+    try:
+        src = (project_root / frm).resolve()
+        dst = (project_root / to).resolve()
+    except OSError:
+        return
+    moves.append((cid, str(preview_sidecar_of(src)), str(preview_sidecar_of(dst))))
 
 
 RETIRED_MANIFESTS_DIR = ".retired-manifests"
