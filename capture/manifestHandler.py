@@ -343,6 +343,46 @@ def append_relocation_record(project_root: Path, capture_id: str, from_rel: str,
         _append_line(manifest_path, line)
 
 
+UPLOAD_RECORD_TYPE = "upload"
+
+
+def append_upload_record(volume_root: Path, *, capture_id: Optional[str], relative_path: str,
+                         size: int, mimetype: str, sha256: str) -> None:
+    """Append to a volume's capture manifest that an image was uploaded into it.
+
+    POST /records/{id}/images names the file `<stem>-img_<nnnn>_c0.<ext>`
+    with a number from the volume's counter, and this record is what keeps
+    that number from being given again once the image is deleted
+    (app.core.capture_naming.manifest_capture_numbers reads it). It has the
+    shape of a capture record, so every reader of the manifest treats it as
+    one: `{"record_type": "upload", "capture_id", "timestamp_utc", "files":
+    [{"role": "single", "relative_path", "bytes", "mimetype", "sha256"}]}`,
+    the path relative to `volume_root` as a capture record's is.
+    `capture_id` is the one the client sent with the upload, or null; the
+    readers that key on it (the fixity index, the export bag, the startup
+    repair of a volume's manifest) skip a record without one. The line is
+    written with one O_APPEND write and fsynced, a newline first if the last
+    line is torn, as append_manifest_record writes.
+    """
+    metadata_dir = volume_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "record_type": UPLOAD_RECORD_TYPE,
+        "capture_id": capture_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "files": [{
+            "role": "single",
+            "relative_path": relative_path,
+            "bytes": size,
+            "mimetype": mimetype,
+            "sha256": sha256,
+        }],
+    }
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(metadata_dir / "manifest.jsonl", line)
+
+
 # Written whole and renamed over the manifest by an earlier version of
 # append_manifest_lines; a leftover is removed at startup (app.core.volume_layout).
 MANIFEST_PART_NAME = "manifest.jsonl.part"

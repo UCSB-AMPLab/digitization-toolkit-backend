@@ -108,6 +108,10 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     A capture record's paths are relative to the directory that holds its
     `metadata/`: the project's directory, or the volume's `<stem>/`.
 
+    An upload record (capture.manifestHandler.append_upload_record) has the
+    shape of a capture record and is read as one when it carries a capture
+    id; one without (the client sent none) is skipped, as before.
+
     Capture records give each file's sha256 by resolved path and by name (the
     name map is a fallback for when a stored absolute path differs from the
     manifest's, e.g. after an SD re-clone remounts the tree elsewhere).
@@ -246,7 +250,8 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
     read. The startup migration copies a volume's records into its own
     manifest, marked `copied_from`; where the capture-time record is still
     there, it is the one returned, and a copy only for a capture whose
-    original no manifest holds. Relocation records are left out: they are the
+    original no manifest holds. An upload record with one of the capture ids
+    is returned as a capture record is. Relocation records are left out: they are the
     appliance's own bookkeeping of files renamed after capture. Manifests are
     read in path order and each in line order. Unreadable manifests and
     lines that are not JSON objects are skipped.
@@ -300,7 +305,8 @@ def verify_images_against_manifest(images) -> List[dict]:
     renamed whose relocation record was not written, say). An image with no
     capture id, or whose capture id has no capture record in any manifest
     (an upload, which carries a capture id only if the client sent one), is
-    skipped, as there is no capture-time fixity to check. A missing file is
+    skipped, as there is no capture-time fixity to check. An upload sent
+    with a capture id is checked against its upload record. A missing file is
     skipped too; it is a separate failure the caller handles. Read-only.
     """
     index = build_fixity_index(config.settings.projects_dir.resolve())
