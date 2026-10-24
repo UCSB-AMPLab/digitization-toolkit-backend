@@ -10,6 +10,8 @@ from app.core.export_jobs import export_jobs
 from app.core.storage_ops import (
     collection_and_descendants,
     collection_ids_under_project,
+    collections_in_old_layout,
+    image_in_old_layout,
     move_project_tree,
     rebase_stored_path,
     relocate_images_and_commit,
@@ -162,14 +164,6 @@ def _refuse_a_name_that_is_a_stem(db: Session, name: str) -> None:
         raise HTTPException(status_code=409, detail=message)
 
 
-def _without_stem(db: Session, collection_ids: List[int]) -> List[int]:
-    """The ids among `collection_ids` of volumes without a file name stem (the name-based layout)."""
-    if not collection_ids:
-        return []
-    return [cid for (cid,) in db.query(Collection.id)
-            .filter(Collection.id.in_(collection_ids), Collection.filename_stem.is_(None)).all()]
-
-
 @router.put("/{project_id}", response_model=ProjectRead)
 def update_project(
     project_id: int,
@@ -179,9 +173,11 @@ def update_project(
 ):
     """Update a project's details, moving its on-disk tree if the name changes.
 
-    A rename is refused with 409 while an export of any volume without a stem
-    in the project is queued or running. Volumes with a stem keep their files
-    in `<stem>/`, outside the project's tree, and a rename touches none of them.
+    A rename is refused with 409 while an export of any volume with files in
+    the project's tree is queued or running (collections_in_old_layout).
+    Migrated volumes keep their files in `<stem>/`, outside the tree, and a
+    rename touches none of them. Files of a volume given a stem since the last
+    startup are still in the tree: they move with it and their rows follow.
     """
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
@@ -197,10 +193,12 @@ def update_project(
         # Before the tree moves: its new directory may not be a volume's stem.
         _refuse_a_name_that_is_a_stem(db, payload.name)
 
-    # A rename moves the project's whole tree, so every volume whose files are
-    # in it is held against exports from before the change until the commit.
-    # A volume with a stem has its files in `<stem>/`, outside the tree.
-    held_ids = _without_stem(db, collection_ids_under_project(db, p.id)) if name_changed else []
+    # A rename moves the project's whole tree, so every volume with files in
+    # it is held against exports from before the change until the commit: a
+    # volume without a stem, and one whose stem was set since the last
+    # startup, which still has files there (collections_in_old_layout). A
+    # migrated volume has its files in `<stem>/`, outside the tree.
+    held_ids = collections_in_old_layout(db, collection_ids_under_project(db, p.id)) if name_changed else []
     with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_PROJECT_MESSAGE):
         return _update_project_held(db, p, payload, old_name, name_changed)
 
@@ -210,11 +208,12 @@ def _update_project_held(db: Session, p: Project, payload: ProjectUpdate, old_na
     for field, value in payload.model_dump(exclude_unset=True).items():
         setattr(p, field, value)
 
-    # The whole on-disk tree (images, manifest, packages, the directories of
-    # volumes without a stem) is keyed by name, so a rename moves the entire
-    # directory as a unit and rewrites the stored paths under it. A volume with
-    # a stem has its files in `<stem>/` under the projects root, outside the
-    # tree: no row of it is under old_root, so none is rewritten. This keeps
+    # The whole on-disk tree (images, manifest, packages, the name-based
+    # directories of volumes) is keyed by name, so a rename moves the entire
+    # directory as a unit and rewrites every stored path under it, those of a
+    # volume given a stem since the last startup included. A migrated volume
+    # has its files in `<stem>/` under the projects root, outside the tree: no
+    # row of it is under old_root, so none is rewritten. This keeps
     # every capture and its manifest together and leaves no stranded old-name
     # directory for delete_project to miss later.
     moved = False
@@ -289,9 +288,10 @@ def move_collections(
     Move all top-level collections from this project to another project.
     Sub-collections follow automatically through their parent FK.
 
-    The files of each moved volume without a stem move to its name-based
-    directory under the target project; a volume with a stem keeps its files
-    in `<stem>/` and none of them moves. Refused with 409 while an export of
+    The files of each moved volume that are in the name-based layout (every
+    file of a volume without a stem, and those of a volume given a stem since
+    the last startup) move to its name-based directory under the target
+    project, and the rows follow; files in `<stem>/` stay where they are. Refused with 409 while an export of
     any of the moved collections is queued or running.
     """
     from capture.project_manager import image_output_dir
@@ -310,10 +310,11 @@ def move_collections(
     for c in db.query(Collection).filter(Collection.project_id == project_id).all():
         moved_collection_ids.extend(collection_and_descendants(db, c.id))
 
-    # The moved volumes' files leave the paths an export of any of them reads,
-    # so they are held against exports until the move is committed. Volumes
-    # with a stem move no file and are not held.
-    with export_jobs.hold_for_file_changes(_without_stem(db, moved_collection_ids), EXPORT_IN_PROJECT_MESSAGE):
+    # The moved volumes' files in the old layout leave the paths an export of
+    # any of them reads, so those volumes are held against exports until the
+    # move is committed. A migrated volume moves no file and is not held.
+    old_layout = collections_in_old_layout(db, moved_collection_ids)
+    with export_jobs.hold_for_file_changes(old_layout, EXPORT_IN_PROJECT_MESSAGE):
         # Re-parent the top-level collections; descendants follow via parent FK
         moved = (
             db.query(Collection)
@@ -324,18 +325,17 @@ def move_collections(
         # Relocate the image files so they physically live under the target project
         not_moved: list[str] = []
         moves: list = []
-        # Only volumes without a stem have their files under the project's
-        # directory; a volume with a stem keeps its `<stem>/` and moves no file.
-        names = {
-            c.id: c.name
-            for c in db.query(Collection).filter(Collection.id.in_(moved_collection_ids)).all()
-            if not c.filename_stem
-        } if moved_collection_ids else {}
-        if names:
-            records = db.query(Record).filter(Record.collection_id.in_(list(names))).all()
+        # Only files in the name-based layout are under the project's
+        # directory; they move to the volume's name-based directory under the
+        # target. Files in `<stem>/` stay where they are.
+        cols = {c.id: c for c in db.query(Collection).filter(Collection.id.in_(old_layout)).all()} \
+            if old_layout else {}
+        if cols:
+            records = db.query(Record).filter(Record.collection_id.in_(list(cols))).all()
             for r in records:
-                target_dir = image_output_dir(target.name, names[r.collection_id])
-                moves.extend((img, target_dir) for img in r.images)
+                c = cols[r.collection_id]
+                target_dir = image_output_dir(target.name, c.name)
+                moves.extend((img, target_dir) for img in r.images if image_in_old_layout(c, img.file_path))
 
         # A failed move or commit puts every file already moved back.
         relocate_images_and_commit(

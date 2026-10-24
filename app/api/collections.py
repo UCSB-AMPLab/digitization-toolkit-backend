@@ -30,6 +30,9 @@ from app.core.storage_ops import (
     collection_and_descendants,
     collection_image_dir,
     collection_root_dir,
+    collections_in_old_layout,
+    image_in_old_layout,
+    legacy_image_dir,
     relocate_images_and_commit,
     remove_empty_dirs,
     renumber_collection_images,
@@ -260,9 +263,10 @@ def update_collection(
 
     A volume with a file name stem keeps its files in `<stem>/` under the
     projects root, outside any project, so a rename or a re-parent moves none
-    of them. A volume without a stem keeps the name-based layout,
-    `<project>/<name>/images/main/`, so a rename or a re-parent moves the
-    files of each such volume in the subtree whose directory changes. That
+    of them. Files in the name-based layout, `<project>/<name>/images/main/`
+    (every file of a volume without a stem, and those of a volume given a
+    stem that the startup migration has not moved yet), are moved for each
+    volume in the subtree whose directory changes, and the rows follow. That
     is refused with 409 while an export of any of those volumes is queued or
     running. Other edits are not refused.
     """
@@ -299,9 +303,11 @@ def update_collection(
         if message:
             raise HTTPException(status_code=409, detail={"message": message})
 
-    # Only volumes without a stem have a directory named after the volume
-    # and its project, so only they can have their files moved by a rename or
-    # a re-parent; a volume with a stem keeps its files where they are.
+    # Only files in the name-based layout sit in a directory named after the
+    # volume and its project, so only volumes with such files have them moved
+    # by a rename or a re-parent: a volume without a stem, or one given a stem
+    # whose files the startup migration has not moved yet
+    # (collections_in_old_layout). Files in `<stem>/` stay where they are.
     update_data = payload.model_dump(exclude_unset=True)
     layout_changed = (
         ("name" in update_data and update_data["name"] != collection.name)
@@ -313,9 +319,9 @@ def update_collection(
     held_ids: List[int] = []
     old_dirs: dict = {}
     if layout_changed:
-        subtree = db.query(Collection).filter(
-            Collection.id.in_(collection_and_descendants(db, collection.id))).all()
-        old_dirs = {c.id: collection_image_dir(db, c) for c in subtree if not c.filename_stem}
+        old_layout = collections_in_old_layout(db, collection_and_descendants(db, collection.id))
+        subtree = db.query(Collection).filter(Collection.id.in_(old_layout)).all() if old_layout else []
+        old_dirs = {c.id: legacy_image_dir(db, c) for c in subtree}
         # Their files are read by path by an export of any of them, so they
         # are held against exports, before anything is changed, until the
         # files have moved and the commit is done.
@@ -334,21 +340,22 @@ def update_collection(
         if collection.parent_collection_id is not None:
             collection.project_id = None
 
-        # Each volume without a stem whose directory the change moved has
-        # its records' files moved to the new directory. One given a stem in
-        # this same request is left to the startup migration.
+        # Each such volume whose name-based directory the change moved has the
+        # files it still has in the old layout moved to the new one, and the
+        # rows follow. A stem set in this same request changes nothing here:
+        # the files are still in the old layout until the startup migration.
         if held_ids:
             targets = {}
-            for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all():
-                if c.filename_stem:
-                    continue
-                new_dir = collection_image_dir(db, c)
+            cols = {c.id: c for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all()}
+            for c in cols.values():
+                new_dir = legacy_image_dir(db, c)
                 if new_dir is not None and new_dir != old_dirs.get(c.id):
                     targets[c.id] = new_dir
             if targets:
                 records = db.query(Record).filter(Record.collection_id.in_(list(targets))).all()
                 for r in records:
-                    moves.extend((img, targets[r.collection_id]) for img in r.images)
+                    moves.extend((img, targets[r.collection_id]) for img in r.images
+                                 if image_in_old_layout(cols[r.collection_id], img.file_path))
 
         # Flushed before any file is moved, so that a duplicate stem or
         # external_id, or an end date before the stored start, is refused

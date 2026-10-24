@@ -216,6 +216,64 @@ def resolve_project_name(db: Session, collection: Collection) -> Optional[str]:
     return project.name if project else None
 
 
+def _projects_root_resolved() -> Path:
+    return config.settings.projects_dir.resolve()
+
+
+def image_in_old_layout(collection: Collection, file_path: Optional[str]) -> bool:
+    """Whether an image of `collection` is still in the name-based layout, so a move of the volume moves it.
+
+    Every image of a volume without a stem is, as before stems. For a volume
+    with a stem, an image under the projects root but outside `<stem>/`: one
+    the startup migration has not moved yet. Its files in `<stem>/`, and
+    files outside the projects root (uploads in the data directory), are not.
+    """
+    if not collection.filename_stem:
+        return True
+    resolved = resolve_within_storage(file_path)
+    if resolved is None:
+        return False
+    root = _projects_root_resolved()
+    return resolved.is_relative_to(root) and not resolved.is_relative_to(root / collection.filename_stem)
+
+
+def collections_in_old_layout(db: Session, collection_ids: Iterable[int]) -> List[int]:
+    """The ids among `collection_ids` of volumes whose files are, wholly or partly, in the name-based layout.
+
+    A volume without a stem, or a volume with a stem that still has an image
+    under the projects root outside `<stem>/` (image_in_old_layout): a stem
+    set while the backend runs moves nothing until the next startup. These
+    are the volumes a project rename, a move to another project, a re-parent
+    or a rename moves files of, and so holds against their exports. Two
+    queries and a path check per image of the stemmed volumes among them.
+    """
+    ids = list(collection_ids)
+    if not ids:
+        return []
+    cols = {c.id: c for c in db.query(Collection).filter(Collection.id.in_(ids)).all()}
+    out = {cid for cid, c in cols.items() if not c.filename_stem}
+    stemmed = [cid for cid, c in cols.items() if c.filename_stem]
+    if stemmed:
+        rows = (db.query(Record.collection_id, RecordImage.file_path)
+                .join(RecordImage, RecordImage.record_id == Record.id)
+                .filter(Record.collection_id.in_(stemmed)).all())
+        for cid, fp in rows:
+            if cid not in out and image_in_old_layout(cols[cid], fp):
+                out.add(cid)
+    return sorted(out)
+
+
+def legacy_image_dir(db: Session, collection: Collection) -> Optional[Path]:
+    """The name-based `<project>/<name>/images/main` of a volume, stem or not, or None with no project.
+
+    Where a move puts the files of a volume still in the old layout.
+    """
+    from capture.project_manager import image_output_dir
+
+    project_name = resolve_project_name(db, collection)
+    return image_output_dir(project_name, collection.name) if project_name else None
+
+
 def collection_root_dir(db: Session, collection: Collection) -> Optional[Path]:
     """A volume's own directory on disk, in the layout its stem decides, or None.
 
