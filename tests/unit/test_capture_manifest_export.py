@@ -701,8 +701,8 @@ def test_refused_with_a_preview_that_has_no_recorded_digest(client, vol):
     """A preview captured before capture recorded its sha256 has none until it is backfilled.
 
     The capture record lists a RAW's preview as `<role>_preview` beside its
-    master (branch backend/preview-digests, capture.manifestHandler); that is
-    the entry `preview_digest_recorded` writes in these tests."""
+    master (capture.manifestHandler._preview_file); that is the entry
+    `preview_digest_recorded` writes in these tests."""
     rec = vol.record(layout=("left", "right"), ext="cr2", preview_digest_recorded=False)
     problems = _refusal(_export(client, vol.col))
     assert problems["preview_sha256_missing"]["record_ids"] == [rec.id]
