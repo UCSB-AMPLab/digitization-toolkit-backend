@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import logging
+import uuid
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
@@ -452,7 +453,7 @@ async def add_image_to_record(
 	# An upload is one capture event for the record's volume: it takes the
 	# next number, in the transaction that writes its image, and is named
 	# as a single capture is, `<stem>-img_<nnnn>_c0.<ext>` (contract 1.1,
-	# section 3), with the same refusals. The name the client sent is not kept.
+	# section 3), with the same refusals. The name the client sent is logged, not kept.
 	try:
 		filename_index = take_filename_index(db, rec.collection_id, stem, uploads_dir)
 	except CaptureNameRefused as refused:
@@ -460,6 +461,13 @@ async def add_image_to_record(
 		raise HTTPException(status_code=409, detail=refused.detail)
 	stored_filename = f"{filename_index}_c0{_upload_suffix(file)}"
 	file_path = uploads_dir / stored_filename
+	logger.info(f"Upload into record {rec_id}: the client's file {file.filename!r} is stored as {stored_filename}")
+	# Every image needs a sha256 the fixity index can find (the capture
+	# manifest export and Fisqua refuse an image without one), and the index
+	# keys the upload record by capture id, so an upload the client sent
+	# without one is given its own.
+	if not capture_id:
+		capture_id = str(uuid.uuid4())
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
@@ -510,10 +518,24 @@ async def add_image_to_record(
 	
 	db.add(img)
 	try:
+		# The volume's manifest names the file before the row is committed,
+		# so its number is reserved even if the commit fails or the image is
+		# deleted later (append_upload_record).
+		from capture.manifestHandler import append_upload_record
+		from capture.utils import compute_sha256
+		append_upload_record(
+			volume,
+			capture_id=capture_id,
+			relative_path=f"{CAPTURES_DIR}/{stored_filename}",
+			size=file_size,
+			mimetype=file.content_type,
+			sha256=compute_sha256(str(file_path)),
+		)
 		db.commit()
 	except Exception as e:
 		db.rollback()
 		# The DB row never persisted, so unlink the saved file and thumbnail to avoid orphaned files no record will reference.
+		# A manifest line already written stays: the manifest is append-only, and it keeps the number reserved.
 		# A file that cannot be unlinked is logged at WARNING with its path and left on disk; the response is the 500 below either way.
 		try:
 			file_path.unlink(missing_ok=True)
