@@ -108,7 +108,9 @@ class Collection(Base):
     # contract 1.1, section 3): the source of `<nnnn>` in its file names, so a
     # number is never reused. It never decreases — see
     # _capture_counter_never_decreases — and a CHECK refuses a negative value.
-    # Nothing raises it yet; the capture path will.
+    # next_capture_number (app/core/capture_counter.py) raises it, once per
+    # capture event: each single or dual capture, each retake, and each upload
+    # through POST /records/{id}/images.
     capture_counter = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     created_by = Column(String(255), nullable=True)
@@ -125,8 +127,7 @@ class Collection(Base):
     def _external_id_is_write_once(self, key, value, is_remove):
         """Refuse any assignment or removal that would change a stored external_id.
 
-        The same rule, and the same reasons, as Record._external_id_is_write_once:
-        a reference code that can be reassigned makes every trace drawn through
+        A reference code that can be reassigned makes every trace drawn through
         it unverifiable. Assigning the identical value is allowed; clearing to
         NULL or removing the attribute is a change and is refused. With nothing
         stored, a removal takes nothing away and is allowed.
@@ -194,8 +195,9 @@ class Collection(Base):
         """Whether the volume has ever captured: capture_counter above zero, or any image.
 
         The counter keeps the answer after the volume's records are deleted or
-        moved out; the image check covers images the counter does not yet
-        count, since nothing raises it until the capture path does.
+        moved out. next_capture_number raises it for each capture and upload
+        into the volume; the image check covers images that reach the volume
+        without one, such as those on a record moved in from another volume.
         """
         return (self.capture_counter or 0) > 0 or self.has_images()
 

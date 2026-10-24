@@ -20,7 +20,7 @@ from app.models.project import Project
 
 
 @pytest.mark.integration
-def test_single_capture_creates_database_record(authed_client, db_session, test_project, skip_if_no_camera):
+def test_single_capture_creates_database_record(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     """
     Test that /cameras/capture creates a RecordImage record in database.
     """
@@ -32,6 +32,7 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "medium",
             "include_resolution_in_filename": False
@@ -53,10 +54,10 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
     assert doc.format == "jpg"
     assert doc.resolution_width is not None
     assert doc.resolution_height is not None
-    # Check that the record is linked to the project
+    # Check that the record is linked to the volume
     record = db_session.query(Record).filter(Record.id == doc.record_id).first()
     assert record is not None
-    assert record.project_id == test_project.id
+    assert record.collection_id == capture_volume.id
     assert record.status == "captured"
     assert record.capture_mode == "single"
 
@@ -69,7 +70,7 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
 
 
 @pytest.mark.integration
-def test_dual_capture_creates_two_database_records(authed_client, db_session, test_project, skip_if_no_camera):
+def test_dual_capture_creates_two_database_records(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     """
     Test that /cameras/capture/dual creates two RecordImage records.
     """
@@ -80,6 +81,7 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
         "/cameras/capture/dual",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "resolution": "medium",
             "include_resolution_in_filename": False,
             "stagger_ms": 20
@@ -93,10 +95,10 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
     assert len(data["file_paths"]) == 2
 
     # Verify both database records were created
-    # RecordImage has no project_id — images belong to a Record, which
-    # belongs to the project.
+    # RecordImage has no collection_id — images belong to a Record, which
+    # belongs to the volume.
     docs = db_session.query(RecordImage).join(Record).filter(
-        Record.project_id == test_project.id
+        Record.collection_id == capture_volume.id
     ).all()
 
     assert len(docs) >= 2
@@ -114,7 +116,7 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
 
 
 @pytest.mark.integration
-def test_captured_images_stored_locally(authed_client, test_project, tmp_path, skip_if_no_camera):
+def test_captured_images_stored_locally(authed_client, test_project, capture_volume, tmp_path, skip_if_no_camera):
     """
     Test that captured images are actually stored on the filesystem (microSD).
     """
@@ -125,6 +127,7 @@ def test_captured_images_stored_locally(authed_client, test_project, tmp_path, s
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "medium"
         },
@@ -140,7 +143,7 @@ def test_captured_images_stored_locally(authed_client, test_project, tmp_path, s
 
 
 @pytest.mark.integration
-def test_exif_data_extracted_and_saved(authed_client, db_session, test_project, skip_if_no_camera):
+def test_exif_data_extracted_and_saved(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     """
     Test that EXIF data from captured image is extracted and saved to database.
     """
@@ -150,6 +153,7 @@ def test_exif_data_extracted_and_saved(authed_client, db_session, test_project, 
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "high"
         },

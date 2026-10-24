@@ -17,6 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -43,6 +44,33 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 		query = query.filter(Record.project_id == project_id)
 	current_max = query.scalar()
 	return (current_max + 1) if current_max is not None else 0
+
+
+def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
+	"""409 when the capture would go into no volume, into one without a filename_stem,
+	or, for a request with a record_id, into a volume other than the record's;
+	404 when the volume named does not exist.
+
+	Every capture is named after its volume's stem (contract 1.1 §3), so the
+	request must name a volume: 0 counts as none, as it does for the capture
+	path. A request with a record_id must name the record's own volume: the
+	file is written under the volume the request names, while the record and
+	the counter raised are its own volume's. Called in each capture endpoint
+	before any camera is touched.
+	"""
+	if not collection_id:
+		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	# Locked, so a PATCH of the stem waits until this capture commits.
+	volume = locked_volume_query(db, collection_id).first()
+	if volume is None:
+		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+	if retake_record is not None:
+		if retake_record.collection_id is None:
+			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+		if retake_record.collection_id != collection_id:
+			raise HTTPException(status_code=409, detail=RETAKE_VOLUME_DETAIL)
+	if volume.filename_stem is None:
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
 
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str]]:
@@ -701,6 +729,28 @@ def trigger_capture(
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
 	"""
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "single"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
@@ -781,15 +831,9 @@ def trigger_capture(
 		# its collection (NEH-260); without this flag every retake would promote
 		# the record it was meant to leave with her.
 		recapture_promotes = False
-		if request.record_id:
-			# Link to existing record. Locked, as every path that moves a
-			# record's status or changes which of its images are current is:
-			# the status read here is what the retake writes over and what its
-			# history row names as the old status.
-			from app.api.records import _locked_record
-			record = _locked_record(db, request.record_id)
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
 			if record.status in ("captured", "rejected"):
 				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
 				# can redo a frame she can see is bad instead of waiting for a
@@ -800,18 +844,15 @@ def trigger_capture(
 				#
 				# Either way the record can only be redone in the capture mode it was
 				# originally taken with — a single capture can't turn a dual-mode
-				# record's pair back into one image.
+				# record's pair back into one image. That is checked at the top,
+				# before the camera is touched.
 				#
 				# record_id is the only signal this endpoint has, and it now means
 				# "retake" in the two states an operator can act in and "add an
 				# image to this record" in the two she cannot. No client uses the
 				# second: the frontend passes record_id only from its retake handler,
 				# and every folio is captured as its own record.
-				if record.capture_mode != "single":
-					raise HTTPException(
-						status_code=422,
-						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
-					)
+				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
 				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
@@ -923,6 +964,28 @@ def trigger_dual_capture(
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
 	"""
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "dual"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig
@@ -986,25 +1049,15 @@ def trigger_dual_capture(
 		# its collection (NEH-260); without this flag every retake would promote
 		# the record it was meant to leave with her.
 		recapture_promotes = False
-		if request.record_id:
-			# Link to existing record. Locked, as every path that moves a
-			# record's status or changes which of its images are current is:
-			# the status read here is what the retake writes over and what its
-			# history row names as the old status.
-			from app.api.records import _locked_record
-			record = _locked_record(db, request.record_id)
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
 			if record.status in ("captured", "rejected"):
 				# Retake, on the same terms as the single-capture endpoint above
 				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
 				# be redone as a pair, and can't turn a single-mode record into two
 				# images.
-				if record.capture_mode != "dual":
-					raise HTTPException(
-						status_code=422,
-						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the single-capture endpoint to recapture it."
-					)
+				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
 				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images

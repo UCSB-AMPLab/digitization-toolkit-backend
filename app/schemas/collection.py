@@ -62,10 +62,14 @@ class CollectionBase(BaseModel):
 
 class CollectionCreate(VolumeIdentityFields, CollectionBase):
     """Create a collection. Must specify either project_id OR parent_collection_id."""
-    # filename_stem is optional here for now, although contract 1.1 §3 says a
-    # volume created on the device must be given one. It becomes required
-    # once the stem screen (step 2) and the list import (step 8) give an
-    # operator a source for it.
+    # Required: contract 1.1 §3 says a volume created on the device must be
+    # given a stem, and Captua never makes one up. The column stays nullable
+    # for volumes created before stems existed, which get theirs through an
+    # update.
+    filename_stem: str = Field(
+        ..., max_length=FILENAME_STEM_MAX_LENGTH, pattern=FILENAME_STEM_PATTERN,
+        description="Lowercase slug the volume's image file names are built from, e.g. co-ahrb-aht-003",
+    )
     project_id: Optional[int] = Field(None, description="Parent project (for top-level collections)")
     parent_collection_id: Optional[int] = Field(None, description="Parent collection (for nested subcollections)")
     created_by: Optional[str] = None
@@ -77,6 +81,7 @@ class CollectionCreate(VolumeIdentityFields, CollectionBase):
                 "description": "Contains correspondence from 1920-1925",
                 "collection_type": "box",
                 "project_id": 1,
+                "filename_stem": "co-ahrb-aht-003",
                 "archival_metadata": {"box_number": "42", "shelf_location": "A-3-2"}
             }
         }

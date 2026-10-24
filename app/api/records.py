@@ -26,6 +26,7 @@ from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
 from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
@@ -395,11 +396,21 @@ async def add_image_to_record(
 	Upload and attach an image to an existing record.
 	This is used when adding captures to a multi-page document.
 	"""
-	# Verify record exists
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	# Lock order, the same on every path that takes both: the record's row,
+	# then its volume's. The record is locked here, and the stem check below
+	# locks the volume. Read unlocked, the record was still locked later, by
+	# the image insert's foreign-key check (FOR KEY SHARE), after the volume:
+	# the opposite order to a retake, and the two deadlocked on PostgreSQL.
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+	# An upload is a capture event for the record's volume, refused on the
+	# same terms as a capture, before anything is written.
+	if rec.collection_id is None:
+		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	if volume_lacks_stem(db, rec.collection_id):
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
