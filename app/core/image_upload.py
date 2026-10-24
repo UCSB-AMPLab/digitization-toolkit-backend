@@ -261,21 +261,28 @@ def _stage(path: Path) -> Staged:
         return Staged(path, False)
 
 
-def stable_sha1(path: Path) -> Optional[str]:
-    """The file's SHA1, or None when its size or modification time changed while it was read."""
+def stable_digests(path: Path) -> Optional[tuple]:
+    """(sha1, sha256) of the file, or None when its size or modification time changed while it was read."""
     try:
         before = path.stat()
-        digest = hashlib.sha1()
+        sha1, sha256 = hashlib.sha1(), hashlib.sha256()
         with path.open("rb") as fh:
             for chunk in iter(lambda: fh.read(_SHA_CHUNK), b""):
-                digest.update(chunk)
+                sha1.update(chunk)
+                sha256.update(chunk)
         after = path.stat()
     except OSError as exc:
         logger.warning("Could not read %s for upload: %s", path, exc)
         return None
     if (before.st_size, before.st_mtime_ns) != (after.st_size, after.st_mtime_ns):
         return None
-    return digest.hexdigest()
+    return sha1.hexdigest(), sha256.hexdigest()
+
+
+def stable_sha1(path: Path) -> Optional[str]:
+    """The file's SHA1, or None when its size or modification time changed while it was read."""
+    digests = stable_digests(path)
+    return digests[0] if digests else None
 
 
 def upload_file(local: Path, key: str) -> None:
@@ -433,6 +440,7 @@ class RunResult:
     skipped: list = field(default_factory=list)
     error: Optional[str] = None
     finished_at: Optional[datetime] = None
+    fixity: object = None      # the run's FixityIndex, built on first use
 
     def as_dict(self) -> dict:
         return {
@@ -448,41 +456,137 @@ class RunResult:
         }
 
 
+def _image_state(db: Session, image_id: int) -> Optional[tuple]:
+    """(file_path, capture_id, collection_id) of an image as committed now, or None if it is gone.
+
+    A column query, so it reads the database rather than the session's
+    identity map.
+    """
+    from app.models.record import Record, RecordImage
+
+    return (db.query(RecordImage.file_path, RecordImage.capture_id, Record.collection_id)
+            .join(Record, RecordImage.record_id == Record.id)
+            .filter(RecordImage.id == image_id)
+            .one_or_none())
+
+
+@dataclass
+class _Read:
+    staged: Staged
+    path: Path
+    capture_id: Optional[str]
+    digests: Optional[tuple]  # (sha1, sha256), or None when the file changed while read
+
+
+def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
+    """Pin the bytes of the file the image's row names, or None (reported) when that cannot be done.
+
+    Under export_jobs.hold_for_reading, which a renumber, a record move, a
+    rename or a delete cannot overlap (they take hold_for_file_changes): the
+    row is re-read, the file is staged as a hard link, and the row is read a
+    third time and must name the same file. From then on the link holds this
+    image's bytes whatever happens to the name. Where no hard link can be
+    made, the file is hashed inside the hold instead, so the digest at least
+    is this image's; the listing after the copy then decides.
+    """
+    from app.core.export_jobs import FilesChanging, export_jobs
+
+    first = _image_state(db, item.image_id)
+    db.commit()  # no transaction stays open from here to the copy
+    if first is None:
+        return None
+    try:
+        with export_jobs.hold_for_reading([first.collection_id] if first.collection_id else []):
+            if _image_state(db, item.image_id) != first:
+                db.commit()
+                result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                                       "reason": "image changed while it was read"})
+                return None
+            path = local_file(item.kind, first.file_path)
+            if path is None or not path.is_file():
+                db.commit()
+                if item.kind == "capture":
+                    result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                                           "reason": "file not found", "path": first.file_path})
+                return None  # a RAW master without a preview has no preview to upload
+            staged = _stage(path)
+            digests = None if staged.linked else stable_digests(staged.path)
+            same = _image_state(db, item.image_id) == first
+            db.commit()
+            if not same:
+                staged.release()
+                result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                                       "reason": "image changed while it was read"})
+                return None
+    except FilesChanging:
+        db.commit()
+        result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                               "reason": "files of the volume being changed"})
+        return None
+    if staged.linked:
+        digests = stable_digests(staged.path)
+    return _Read(staged, path, first.capture_id, digests)
+
+
+def _fixity_index(result: RunResult):
+    """The capture-time sha256 index, built once per run and only when a run reaches a capture."""
+    if result.fixity is None:
+        from app.core.integrity import build_fixity_index
+
+        result.fixity = build_fixity_index(config.settings.projects_dir.resolve())
+    return result.fixity
+
+
+def _refuse(db: Session, row, item: Work, key: str, result: RunResult, *, reason: str,
+            local_sha1: str, remote_sha1: Optional[str] = None, detail: dict) -> None:
+    _save(db, row, item.image_id, item.kind, key, local_sha1=local_sha1,
+          remote_sha1=remote_sha1, refused_at=_now(), refusal=reason)
+    refusal = {"image_id": item.image_id, "kind": item.kind, "reason": reason, **detail}
+    result.refused.append(refusal)
+    text = "; ".join(f"{k} {v}" for k, v in detail.items())
+    logger.error("Refused %s (%s): %s", key, reason, text)
+    _log(db, action=REFUSED_ACTION, level="ERR", subject=key, detail=f"{reason}: {text}")
+
+
 def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
     """Upload, record or refuse one object. Raises VerificationUnavailable and UploadFailed."""
     row = _row_for(db, item.image_id, item.kind)
     if not _pending(row):
         return  # recorded since the work list was built (an adoption, say)
 
-    path = local_file(item.kind, item.master_path)
-    if path is None or not path.is_file():
-        if item.kind == "capture":
-            result.skipped.append({"image_id": item.image_id, "kind": item.kind,
-                                   "reason": "file not found", "path": item.master_path})
-        return  # a RAW master without a preview has no preview to upload
-
-    if row is not None:
-        key = row.object_key
-    elif item.kind == "capture":
-        key = capture_key(tenant, item.stem, path.name)
-    else:
-        key = preview_key(tenant, item.stem, path.name)
-
-    holder = _key_holder(db, key)
-    if holder is not None and (row is None or holder.id != row.id):
-        result.conflicts.append({"image_id": item.image_id, "kind": item.kind, "key": key,
-                                 "held_by_image_id": holder.record_image_id})
-        logger.error("Image %s (%s): key %s is already recorded for image %s; not uploaded",
-                     item.image_id, item.kind, key, holder.record_image_id)
+    read = _read_object(db, item, result)
+    if read is None:
         return
-
-    staged = _stage(path)
+    staged, path = read.staged, read.path
     try:
-        sha1 = stable_sha1(staged.path)
-        if sha1 is None:
+        if read.digests is None:
             result.skipped.append({"image_id": item.image_id, "kind": item.kind,
                                    "reason": "file changed while it was read", "path": str(path)})
             return
+        sha1, sha256 = read.digests
+
+        if row is not None:
+            key = row.object_key
+        elif item.kind == "capture":
+            key = capture_key(tenant, item.stem, path.name)
+        else:
+            key = preview_key(tenant, item.stem, path.name)
+
+        holder = _key_holder(db, key)
+        if holder is not None and (row is None or holder.id != row.id):
+            result.conflicts.append({"image_id": item.image_id, "kind": item.kind, "key": key,
+                                     "held_by_image_id": holder.record_image_id})
+            logger.error("Image %s (%s): key %s is already recorded for image %s; not uploaded",
+                         item.image_id, item.kind, key, holder.record_image_id)
+            return
+
+        if item.kind == "capture":
+            expected = _fixity_index(result).expected(read.capture_id, item.image_id, path)
+            if expected is not None and expected != sha256:
+                _refuse(db, row, item, key, result, reason="fixity", local_sha1=sha1,
+                        detail={"local_path": str(path), "local_sha256": sha256,
+                                "capture_sha256": expected, "key": key})
+                return
 
         before = listed_object(key)
         if before.present:
@@ -495,16 +599,10 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
                 _save(db, row, item.image_id, item.kind, key, local_sha1=sha1, verified_at=_now())
                 result.already_present += 1
                 return
-            _save(db, row, item.image_id, item.kind, key,
-                  local_sha1=sha1, remote_sha1=before.sha1, refused_at=_now())
-            refusal = {"image_id": item.image_id, "kind": item.kind,
-                       "local_path": str(path), "local_sha1": sha1,
-                       "key": key, "remote_sha1": before.sha1}
-            result.refused.append(refusal)
-            logger.error("Refused to upload over %s: local %s sha1 %s, remote sha1 %s",
-                         key, path, sha1, before.sha1)
-            _log(db, action=REFUSED_ACTION, level="ERR", subject=key,
-                 detail=f"local {path} sha1 {sha1}; remote {key} sha1 {before.sha1}")
+            _refuse(db, row, item, key, result, reason="remote_differs", local_sha1=sha1,
+                    remote_sha1=before.sha1,
+                    detail={"local_path": str(path), "local_sha1": sha1,
+                            "key": key, "remote_sha1": before.sha1})
             return
 
         upload_file(staged.path, key)
@@ -633,11 +731,22 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
     for item in pending_work(db):
         if _row_for(db, item.image_id, item.kind) is not None:
             continue  # has a key already: an upload in progress, or refused
-        path = local_file(item.kind, item.master_path)
+        # This command runs in a process of its own, outside the backend's
+        # read hold, so the file is identified by its inode on both sides of
+        # the hash and the row must still name it afterwards: a renumber or a
+        # move in between makes the digest someone else's.
+        state = _image_state(db, item.image_id)
+        path = local_file(item.kind, state.file_path) if state else None
         if path is None or not path.is_file():
             continue
-        sha1 = stable_sha1(path)
-        if sha1 is None:
+        try:
+            before = path.stat()
+            sha1 = stable_sha1(path)
+            after = path.stat()
+        except OSError:
+            sha1 = None
+        if (sha1 is None or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                or _image_state(db, item.image_id) != state):
             report["unreadable"].append(str(path))
             continue
         matches = by_sha1.get(sha1, [])
@@ -737,7 +846,8 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
                     state["last_verified_at"] = row.verified_at
             elif row.refused_at is not None:
                 state["refused"] += 1
-                state["refusals"].append({"image_id": image_id, "kind": kind, "key": row.object_key,
+                state["refusals"].append({"image_id": image_id, "kind": kind, "reason": row.refusal,
+                                          "key": row.object_key,
                                           "local_sha1": row.local_sha1, "remote_sha1": row.remote_sha1,
                                           "refused_at": row.refused_at})
     for state in out.values():

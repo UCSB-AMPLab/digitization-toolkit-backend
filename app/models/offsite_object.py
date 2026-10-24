@@ -13,9 +13,11 @@ States, all derived from the columns:
 
 - verified: `verified_at` is set. A listing taken after the upload, or the
   adoption listing, showed `object_key` with `local_sha1`.
-- refused: `refused_at` is set. Before the upload, the listing showed an
-  object at `object_key` with another SHA1 (`remote_sha1`). Nothing is
-  uploaded over it, and the uploader does not retry it.
+- refused: `refused_at` is set, and `refusal` says why. `remote_differs`:
+  before the upload, the listing showed an object at `object_key` with
+  another SHA1 (`remote_sha1`). `fixity`: the file's sha256 is not the one
+  its capture record holds. Nothing is uploaded, and the uploader does not
+  retry it.
 - pending: neither. `uploaded_at` set means the copy command succeeded and
   no listing has yet confirmed it.
 
@@ -35,6 +37,7 @@ from app.core.db import Base
 from app.models.record import ImmutableFieldError
 
 OBJECT_KINDS = ("capture", "preview")
+REFUSALS = ("remote_differs", "fixity")
 
 
 class OffsiteObject(Base):
@@ -49,6 +52,7 @@ class OffsiteObject(Base):
     uploaded_at = Column(DateTime, nullable=True)
     verified_at = Column(DateTime, nullable=True)
     refused_at = Column(DateTime, nullable=True)
+    refusal = Column(String(20), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
     image = relationship("RecordImage")
@@ -58,6 +62,10 @@ class OffsiteObject(Base):
         UniqueConstraint("record_image_id", "kind", name="offsite_objects_image_kind_key"),
         CheckConstraint("kind IN ('capture', 'preview')", name="check_offsite_object_kind"),
         CheckConstraint("verified_at IS NULL OR refused_at IS NULL", name="check_offsite_object_state"),
+        CheckConstraint(
+            "(refused_at IS NULL AND refusal IS NULL) OR "
+            "(refused_at IS NOT NULL AND refusal IS NOT NULL AND refusal IN ('remote_differs', 'fixity'))",
+            name="check_offsite_object_refusal"),
     )
 
 

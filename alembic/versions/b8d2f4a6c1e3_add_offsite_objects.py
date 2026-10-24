@@ -7,7 +7,7 @@ Create Date: 2026-10-23 20:00:00.000000
 One row per object the unit uploads to, or adopts from, the offsite bucket:
 the image it belongs to, which file (`capture` or `preview`), the object key
 frozen at first upload, the local SHA1, and when it was uploaded, verified or
-refused. See app/models/offsite_object.py for why this is a table and not
+refused, and why. See app/models/offsite_object.py for why this is a table and not
 columns on record_images.
 
 No backfill. The objects the Rionegro unit's interim script pushed are
@@ -42,6 +42,7 @@ def upgrade() -> None:
         sa.Column('uploaded_at', sa.DateTime(), nullable=True),
         sa.Column('verified_at', sa.DateTime(), nullable=True),
         sa.Column('refused_at', sa.DateTime(), nullable=True),
+        sa.Column('refusal', sa.String(length=20), nullable=True),
         sa.Column('created_at', sa.DateTime(), nullable=False),
         sa.ForeignKeyConstraint(['record_image_id'], ['record_images.id'], ondelete='SET NULL'),
         sa.PrimaryKeyConstraint('id'),
@@ -49,6 +50,10 @@ def upgrade() -> None:
         sa.UniqueConstraint('record_image_id', 'kind', name='offsite_objects_image_kind_key'),
         sa.CheckConstraint("kind IN ('capture', 'preview')", name='check_offsite_object_kind'),
         sa.CheckConstraint('verified_at IS NULL OR refused_at IS NULL', name='check_offsite_object_state'),
+        sa.CheckConstraint(
+            "(refused_at IS NULL AND refusal IS NULL) OR "
+            "(refused_at IS NOT NULL AND refusal IS NOT NULL AND refusal IN ('remote_differs', 'fixity'))",
+            name='check_offsite_object_refusal'),
     )
     op.create_index('ix_offsite_objects_id', 'offsite_objects', ['id'], unique=False)
     op.create_index('ix_offsite_objects_record_image_id', 'offsite_objects', ['record_image_id'], unique=False)

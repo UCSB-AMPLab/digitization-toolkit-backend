@@ -17,7 +17,7 @@ from sqlalchemy.exc import IntegrityError
 
 MIGRATION_FILE = "b8d2f4a6c1e3_add_offsite_objects.py"
 COLUMNS = {"id", "record_image_id", "kind", "object_key", "local_sha1", "remote_sha1",
-           "uploaded_at", "verified_at", "refused_at", "created_at"}
+           "uploaded_at", "verified_at", "refused_at", "refusal", "created_at"}
 
 
 def _load(backend_root):
@@ -55,21 +55,28 @@ def _exercise(engine, mod):
     uniques = {u["name"] for u in insp.get_unique_constraints("offsite_objects")}
     assert {"offsite_objects_object_key_key", "offsite_objects_image_kind_key"} <= uniques
     checks = {c["name"] for c in insp.get_check_constraints("offsite_objects")}
-    assert {"check_offsite_object_kind", "check_offsite_object_state"} <= checks
+    assert {"check_offsite_object_kind", "check_offsite_object_state", "check_offsite_object_refusal"} <= checks
     assert {"ix_offsite_objects_id", "ix_offsite_objects_record_image_id"} <= {
         i["name"] for i in insp.get_indexes("offsite_objects")}
 
     insert = sa.text(
-        "INSERT INTO offsite_objects (record_image_id, kind, object_key, local_sha1, verified_at, refused_at, created_at) "
-        "VALUES (:i, :k, :key, :s, :v, :r, CURRENT_TIMESTAMP)")
+        "INSERT INTO offsite_objects (record_image_id, kind, object_key, local_sha1, verified_at, refused_at, refusal, created_at) "
+        "VALUES (:i, :k, :key, :s, :v, :r, :why, CURRENT_TIMESTAMP)")
     with engine.begin() as conn:
-        conn.execute(insert, dict(i=1, k="capture", key="t/s/captures/a", s="0" * 40, v=None, r=None))
+        conn.execute(insert, dict(i=1, k="capture", key="t/s/captures/a", s="0" * 40, v=None, r=None, why=None))
+        conn.execute(insert, dict(i=2, k="preview", key="t/s/previews/a", s="0" * 40, v=None,
+                                  r="2026-10-23 00:00:00", why="fixity"))
     for bad in (
-        dict(i=2, k="thumbnail", key="t/s/thumbnails/a", s="0" * 40, v=None, r=None),  # kind
-        dict(i=2, k="capture", key="t/s/captures/a", s="0" * 40, v=None, r=None),      # key taken
-        dict(i=1, k="capture", key="t/s/captures/b", s="0" * 40, v=None, r=None),      # image+kind taken
+        dict(i=2, k="thumbnail", key="t/s/thumbnails/a", s="0" * 40, v=None, r=None, why=None),  # kind
+        dict(i=2, k="capture", key="t/s/captures/a", s="0" * 40, v=None, r=None, why=None),      # key taken
+        dict(i=1, k="capture", key="t/s/captures/b", s="0" * 40, v=None, r=None, why=None),      # image+kind taken
         dict(i=2, k="capture", key="t/s/captures/c", s="0" * 40,
-             v="2026-10-23 00:00:00", r="2026-10-23 00:00:00"),                          # both states
+             v="2026-10-23 00:00:00", r="2026-10-23 00:00:00", why="fixity"),                  # both states
+        dict(i=2, k="capture", key="t/s/captures/d", s="0" * 40,
+             v=None, r="2026-10-23 00:00:00", why=None),                                       # refused, no reason
+        dict(i=2, k="capture", key="t/s/captures/e", s="0" * 40,
+             v=None, r="2026-10-23 00:00:00", why="other"),                                    # unknown reason
+        dict(i=2, k="capture", key="t/s/captures/f", s="0" * 40, v=None, r=None, why="fixity"),  # reason, not refused
     ):
         with pytest.raises(IntegrityError), engine.begin() as conn:
             conn.execute(insert, bad)

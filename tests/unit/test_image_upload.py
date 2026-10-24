@@ -360,7 +360,7 @@ def test_a_different_sha1_at_the_key_stops_that_object_and_reports_both_files(
 
     assert result["status"] == "done"
     assert result["refused"] == [{
-        "image_id": img.id, "kind": "capture",
+        "image_id": img.id, "kind": "capture", "reason": "remote_differs",
         "local_path": str(Path(img.file_path).resolve()), "local_sha1": _sha1(b"local bytes"),
         "key": key, "remote_sha1": _sha1(b"someone else's bytes"),
     }]
@@ -780,3 +780,115 @@ def test_an_adopted_key_may_name_the_file_otherwise_than_the_disk(remote, db_ses
     assert rows[(img.id, "capture")].object_key == cap_key
     assert Path(db_session.get(RecordImage, img.id).file_path).name == "IMG_0001.CR2"
     assert volume_upload_state(db_session, vol)["received"] is True
+
+
+# ---------------------------------------------------------------------------
+# A renumber or a move between the work list and the copy
+# ---------------------------------------------------------------------------
+
+def _swap_names(db, a, b):
+    """What a renumber that swaps two images' numbers leaves: files swapped on disk, rows committed."""
+    from app.models.record import RecordImage
+
+    pa, pb = Path(a.file_path), Path(b.file_path)
+    tmp = pa.with_name("swap.tmp")
+    pa.rename(tmp)
+    pb.rename(pa)
+    tmp.rename(pb)
+    db.query(RecordImage).filter(RecordImage.id == a.id).update({"file_path": str(pb), "filename": pb.name})
+    db.query(RecordImage).filter(RecordImage.id == b.id).update({"file_path": str(pa), "filename": pa.name})
+    db.commit()
+
+
+@pytest.mark.unit
+def test_a_renumber_after_the_work_list_is_built_uploads_each_image_its_own_bytes(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+
+    vol = _volume(db_session)
+    a = _image(db_session, vol, override_projects_root, f"{STEM}-img_0001_c1.jpg", b"AAAA", thumbnail=False)
+    b = _image(db_session, vol, override_projects_root, f"{STEM}-img_0002_c1.jpg", b"BBBB", thumbnail=False)
+    real = iu.pending_work
+
+    def then_renumber(db):
+        work = real(db)
+        _swap_names(db, a, b)
+        return work
+
+    monkeypatch.setattr(iu, "pending_work", then_renumber)
+    _run(db_session)
+    rows = _rows(db_session)
+    bucket = remote.files()
+    for image, data in ((a, b"AAAA"), (b, b"BBBB")):
+        row = rows[(image.id, "capture")]
+        assert row.local_sha1 == _sha1(data)
+        assert bucket[row.object_key] == data
+
+
+@pytest.mark.unit
+def test_the_read_hold_and_the_file_change_hold_exclude_each_other():
+    from fastapi import HTTPException
+
+    from app.core.export_jobs import ExportJobRegistry, FilesChanging
+
+    jobs = ExportJobRegistry()
+    with jobs.hold_for_reading([1]):
+        with pytest.raises(HTTPException) as refused:
+            with jobs.hold_for_file_changes([1]):
+                pass
+        assert refused.value.status_code == 409
+        with jobs.hold_for_file_changes([2]):
+            pass  # another volume is not held
+    with jobs.hold_for_file_changes([1]):
+        with pytest.raises(FilesChanging):
+            with jobs.hold_for_reading([1]):
+                pass
+    with jobs.hold_for_file_changes([1]):
+        pass  # both released
+
+
+@pytest.mark.unit
+def test_an_image_whose_volume_is_held_for_file_changes_is_skipped_for_the_run(
+        remote, db_session, override_projects_root):
+    from app.core.export_jobs import export_jobs
+
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    with export_jobs.hold_for_file_changes([vol.id]):
+        result = _run(db_session)
+    assert result["skipped"] == [{"image_id": img.id, "kind": "capture",
+                                  "reason": "files of the volume being changed"}]
+    assert remote.calls("copyto") == [] and _rows(db_session) == {}
+    assert _run(db_session)["uploaded"] == 1
+
+
+def _manifest(root, stem, cid, rel, data):
+    m = root / stem / "metadata" / "manifest.jsonl"
+    m.parent.mkdir(parents=True, exist_ok=True)
+    with m.open("a") as fh:
+        fh.write(json.dumps({"capture_id": cid, "files": [
+            {"relative_path": rel, "sha256": hashlib.sha256(data).hexdigest()}]}) + "\n")
+
+
+@pytest.mark.unit
+def test_a_capture_whose_bytes_are_not_its_capture_records_is_refused(remote, db_session, override_projects_root):
+    from app.models.record import RecordImage
+
+    vol = _volume(db_session)
+    good = _image(db_session, vol, override_projects_root, "f1.jpg", b"as captured", thumbnail=False)
+    bad = _image(db_session, vol, override_projects_root, "f2.jpg", b"changed since", thumbnail=False)
+    for img, cid, data in ((good, "c-1", b"as captured"), (bad, "c-2", b"as captured too")):
+        db_session.query(RecordImage).filter(RecordImage.id == img.id).update({"capture_id": cid})
+        _manifest(override_projects_root, STEM, cid, f"captures/{Path(img.file_path).name}", data)
+    db_session.commit()
+
+    result = _run(db_session)
+
+    assert result["uploaded"] == 1
+    [refusal] = result["refused"]
+    assert refusal["reason"] == "fixity" and refusal["image_id"] == bad.id
+    assert refusal["capture_sha256"] == hashlib.sha256(b"as captured too").hexdigest()
+    assert refusal["local_sha256"] == hashlib.sha256(b"changed since").hexdigest()
+    assert f"{TENANT}/{STEM}/captures/f2.jpg" not in remote.files()
+    row = _rows(db_session)[(bad.id, "capture")]
+    assert row.refusal == "fixity" and row.refused_at is not None
