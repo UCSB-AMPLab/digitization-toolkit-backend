@@ -569,7 +569,8 @@ def dual_capture_image(
         collection_name: Optional[str] = None,
         stem: Optional[str] = None,
         filename_index: Optional[str] = None,
-        root: Optional[Path] = None) -> tuple:
+        root: Optional[Path] = None,
+        roles: Optional[list] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -584,6 +585,8 @@ def dual_capture_image(
             Required. Both images carry it, `_c0` and `_c1` telling them apart,
             and it is the pair id.
         root (Path): The projects root, read once by the caller; read here when not given.
+        roles (list): The manifest roles of cam1's and cam2's images, in that order,
+            as the caller records them in the database. ["left", "right"] when not given.
     Returns:
         tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
         
@@ -694,6 +697,7 @@ def dual_capture_image(
         project_name=project_name,
         pair_id=filename_index,
         img_paths=[img1_path, img2_path],
+        roles=roles,
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
         stagger=stagger_ms,

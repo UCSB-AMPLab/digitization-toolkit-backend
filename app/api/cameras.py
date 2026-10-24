@@ -1069,6 +1069,11 @@ def trigger_dual_capture(
 		# and which is their pair id.
 		filename_index = _take_filename_index(db, request.collection_id, stem, root)
 
+		# left_camera_index says which physical camera takes the left page;
+		# the manifest and the rows record the same roles.
+		role0 = "left" if request.left_camera_index == 0 else "right"
+		role1 = "right" if request.left_camera_index == 0 else "left"
+
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=project_name,
 			cam1_config=cam0_config,
@@ -1079,7 +1084,8 @@ def trigger_dual_capture(
 			collection_name=collection_name,
 			stem=stem,
 			filename_index=filename_index,
-			root=root
+			root=root,
+			roles=[role0, role1]
 		)
 
 		# Reuse the resolved project name so the DB record matches the on-disk tree
@@ -1200,10 +1206,7 @@ def trigger_dual_capture(
 			
 			return img
 		
-		# Create RecordImages for both captures with appropriate roles
-		# left_camera_index controls which physical camera maps to the "left" page
-		role0 = "left" if request.left_camera_index == 0 else "right"
-		role1 = "right" if request.left_camera_index == 0 else "left"
+		# Create RecordImages for both captures with the roles computed above
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
 

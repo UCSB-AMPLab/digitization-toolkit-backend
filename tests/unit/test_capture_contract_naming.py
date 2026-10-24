@@ -749,3 +749,23 @@ def test_a_failed_dual_capture_leaves_a_file_it_did_not_write(tmp_path, monkeypa
 
     assert sorted(p.name for p in captures.iterdir()) == [other.name]
     assert other.read_bytes() == b"not this capture's"
+
+
+# ---------------------------------------------------------------------------
+# Dual roles: the manifest and the rows agree
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("left,expected", [
+    (0, {"_c0": "left", "_c1": "right"}),
+    (1, {"_c0": "right", "_c1": "left"}),
+])
+def test_the_manifest_records_the_same_left_and_right_as_the_rows(
+        client, db_session, test_project, volume, backend, override_projects_root, left, expected):
+    body = _dual(_client_as(client), test_project, volume, left_camera_index=left)
+
+    rows = {Path(i.filename).stem[-3:]: i.role for i in _images(db_session, body["record_id"])}
+    line = json.loads((override_projects_root / STEM / "metadata" / "manifest.jsonl").read_text().splitlines()[-1])
+    in_manifest = {Path(f["relative_path"]).stem[-3:]: f["role"] for f in line["files"]}
+    assert rows == expected
+    assert in_manifest == expected

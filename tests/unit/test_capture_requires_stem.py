@@ -56,7 +56,7 @@ def camera_calls(monkeypatch, tmp_path):
         return str(tmp_path / "cap.jpg"), "cap-1", None
 
     def fake_dual(project_name, cam1_config, cam2_config, check_camera=False,
-                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None, filename_index=None, root=None):
+                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None, filename_index=None, root=None, roles=None):
         calls.append(("dual",))
         return (str(tmp_path / "cap_c0.jpg"), str(tmp_path / "cap_c1.jpg"),
                 "cap-2", "pair-1")
