@@ -976,3 +976,79 @@ def test_a_counted_volume_with_no_stem_still_takes_its_first(db_session):
     db_session.commit()
     with pytest.raises(ImmutableFieldError):
         v.filename_stem = "co-x-046"
+
+
+# ---------------------------------------------------------------------------
+# Concurrent first writes: the PATCH takes the row lock
+# ---------------------------------------------------------------------------
+#
+# Two PATCHes that both read a NULL stem or external_id would each pass the
+# write-once guard, and the later commit would overwrite the earlier. The
+# PATCH loads the volume under SELECT ... FOR UPDATE, so on Postgres the
+# second waits for the first to commit and its guard then compares against
+# the committed value. SQLite emits no FOR UPDATE, so, as in
+# test_workflow_row_locking.py, what this suite can check is the SQL that
+# would reach Postgres, and that the PATCH uses the locked loader.
+
+@pytest.mark.unit
+def test_the_patch_loader_locks_the_collection_row(db_session):
+    from sqlalchemy.dialects import postgresql
+    from app.api.collections import _locked_collection_query
+
+    sql = str(_locked_collection_query(db_session, 1).statement.compile(
+        dialect=postgresql.dialect())).upper()
+    assert "FOR UPDATE" in sql, sql
+
+
+@pytest.mark.unit
+def test_update_collection_loads_through_the_locked_loader():
+    import inspect
+    from app.api import collections as collections_api
+
+    src = inspect.getsource(collections_api.update_collection)
+    assert "db.query(Collection).filter(Collection.id == collection_id).first()" not in src
+    assert "_locked_collection_query(db, collection_id)" in src
+
+
+def _two_sessions_race(db_session, field, first, second):
+    """Two sessions both load the row, both write a first value, both commit."""
+    from sqlalchemy.orm import Session
+    from app.models.collection import Collection
+
+    p = _project(db_session)
+    v = _volume(db_session, p)
+    _image_in(db_session, v)
+    vid = v.id
+    engine = db_session.get_bind()
+    s1, s2 = Session(bind=engine), Session(bind=engine)
+    try:
+        a, b = s1.get(Collection, vid), s2.get(Collection, vid)
+        setattr(a, field, first)
+        s1.commit()
+        setattr(b, field, second)
+        s2.commit()
+    finally:
+        s1.close()
+        s2.close()
+    db_session.expire_all()
+    return getattr(db_session.get(Collection, vid), field)
+
+
+_SQLITE_CANNOT_LOCK = (
+    "The verifier's two-session race, at the ORM level. Both sessions load "
+    "the row before either commits, which the PATCH's FOR UPDATE prevents on "
+    "Postgres; SQLite emits no lock, and a writer that does not go through "
+    "the PATCH's locked loader is not covered by it."
+)
+
+
+@pytest.mark.unit
+@pytest.mark.xfail(strict=True, reason=_SQLITE_CANNOT_LOCK)
+def test_two_concurrent_first_stems_do_not_overwrite(db_session):
+    assert _two_sessions_race(db_session, "filename_stem", "co-e-001", "co-e-002") == "co-e-001"
+
+
+@pytest.mark.unit
+@pytest.mark.xfail(strict=True, reason=_SQLITE_CANNOT_LOCK)
+def test_two_concurrent_first_external_ids_do_not_overwrite(db_session):
+    assert _two_sessions_race(db_session, "external_id", "co-ref-a", "co-ref-b") == "co-ref-a"

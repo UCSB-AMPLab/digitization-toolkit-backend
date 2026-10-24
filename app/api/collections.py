@@ -48,6 +48,11 @@ EXPORT_IN_SUBTREE_MESSAGE = (
 )
 
 
+def _locked_collection_query(db: Session, collection_id: int):
+    """The collection row under SELECT ... FOR UPDATE (no lock clause on SQLite)."""
+    return db.query(Collection).filter(Collection.id == collection_id).with_for_update()
+
+
 def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
@@ -250,7 +255,10 @@ def update_collection(
     its sub-collections, so it is refused with 409 while an export of any of
     them is queued or running. Other edits are not refused.
     """
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    # Under the row lock, so that a concurrent PATCH setting a first stem or
+    # external_id commits before this one reads the row, and the model's
+    # write-once guards compare against the committed value.
+    collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     
