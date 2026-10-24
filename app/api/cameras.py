@@ -17,6 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -43,6 +44,20 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 		query = query.filter(Record.project_id == project_id)
 	current_max = query.scalar()
 	return (current_max + 1) if current_max is not None else 0
+
+
+def _refuse_capture_without_stem(db: Session, collection_id: Optional[int], record_id: Optional[int]) -> None:
+	"""409 when the capture would go into a volume that has no filename_stem.
+
+	Checks the requested volume and, for a retake, the volume the record is
+	in, since a retake request need not name one. Called first in each
+	capture endpoint, before any camera is touched.
+	"""
+	volume_ids = [collection_id]
+	if record_id is not None:
+		volume_ids.append(db.query(Record.collection_id).filter(Record.id == record_id).scalar())
+	if any(volume_lacks_stem(db, vid) for vid in volume_ids):
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
 
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str]]:
@@ -701,6 +716,7 @@ def trigger_capture(
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
 	"""
+	_refuse_capture_without_stem(db, request.collection_id, request.record_id)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
@@ -923,6 +939,7 @@ def trigger_dual_capture(
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
 	"""
+	_refuse_capture_without_stem(db, request.collection_id, request.record_id)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig

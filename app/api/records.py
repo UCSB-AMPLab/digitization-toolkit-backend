@@ -26,6 +26,7 @@ from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
 from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
@@ -399,7 +400,11 @@ async def add_image_to_record(
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+	# An upload is a capture event for the record's volume, refused on the
+	# same terms as a capture, before anything is written.
+	if volume_lacks_stem(db, rec.collection_id):
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:

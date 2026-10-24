@@ -59,6 +59,8 @@ def _install_capture_fakes(monkeypatch, tmp_path):
 
 def _volume(db_session, project, name="V", **kw):
     from app.models.collection import Collection
+    # A volume needs a stem to capture; one per name keeps them unique.
+    kw.setdefault("filename_stem", f"co-test-{name.lower()}")
     v = Collection(name=name, project_id=project.id, **kw)
     db_session.add(v)
     db_session.commit()
