@@ -534,9 +534,10 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
 
     Under export_jobs.hold_for_reading, which these cannot overlap, since
     each takes hold_for_file_changes on the volume: a move of its records
-    (move-records), a rename of its project or of the volume while its files
-    are in the name-based layout, a record delete, the delete of a current
-    image, and freeing.
+    (move-records); a rename of its project, a move of it to another project
+    (move-collections), or a rename, re-parent or un-nesting of it or of a
+    volume above it, while its files are in the name-based layout; a record
+    delete; the delete of a current image; and a free or a restore.
 
     Some changes are not excluded by the hold:
 
@@ -551,10 +552,16 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
       PATCH still has its files in that project's name-based tree: that
       rename holds that project's volumes, not this one.
 
-    Each of these is caught by the re-reads below and by _claim, which locks
-    the record and compares the image's row, path, volume and stem included,
-    with what was read here before it writes a first offsite row: a row that
-    is gone or differs writes nothing. Under the hold the row is re-read, the
+    When the image has no offsite row yet, each of these is caught by the
+    re-reads below and by _claim, which locks the record and compares the
+    image's row, path, volume and stem included, with what was read here
+    before it writes a first offsite row: a row that is gone or differs
+    writes nothing. When a row exists (a pending row left by a failed copy),
+    _claim updates it without comparing. An image deleted after the third
+    read then has its upload completed and recorded on a row whose
+    record_image_id is NULL (the foreign key is ON DELETE SET NULL).
+
+    Under the hold the row is re-read, the
     file is staged as a hard link, and the row is read a third time and must
     name the same file. Where no hard link can be made, the file is copied
     into the staging directory instead, still under the hold. From then on
@@ -969,9 +976,11 @@ def offsite_keys_under_volume(db: Session, record_id: int, stem: Optional[str]) 
     with files offsite: its keys then name that volume again. The way back
     leads wherever the keys are: keys all under another volume's stem lead
     into that volume, not the one the record last left, and keys split
-    across two or more stems lead into no volume. False when the volume has
-    no stem, the tenant is unset or not a tenant prefix, or the record has no
-    offsite row at all (it needs no way back).
+    across two or more stems lead into no volume. Keys lead into a volume
+    only under the configured tenant; keys under any other prefix (adopted
+    keys, or keys under an earlier tenant) lead into no volume. False when
+    the volume has no stem, the tenant is unset or not a tenant prefix, or
+    the record has no offsite row at all (it needs no way back).
     """
     tenant = configured_tenant_or_none()
     if not stem or tenant is None:

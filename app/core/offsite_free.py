@@ -22,20 +22,24 @@ The rules:
   reported. A listing that does not answer (VerificationUnavailable) frees
   nothing.
 * **Only a volume wholly in `<stem>/`.** A volume with any image still in
-  the name-based layout is refused: a project or volume rename moves such
-  files under a hold that does not exclude this one, while nothing running
+  the name-based layout is refused: a project rename, a move to another
+  project, or a volume rename or re-parent moves such files under a hold
+  that does not exclude this one, while nothing running
   moves a file in `<stem>/` (see _require_own_folder). A record outside
   every volume can still come back into this one after that check (PATCH
   /records/{id}, when its keys are under this stem) with its files in a
   project's tree, so each object whose image is in the name-based layout is
   refused again when the work list is read, as `outside_own_folder`.
 * **Under hold_for_file_changes**, so no export or offsite read of the
-  volume runs meanwhile. The hold does not exclude another holder. No record
-  being freed can leave the volume, since each freed image has a verified
-  offsite row and such a record stays in its volume (records_stored_offsite);
-  one that comes in is covered by the rule above, and a renumber changes
-  sequence only. No database transaction stays open across a listing, a
-  hash or a copy.
+  volume runs meanwhile. The hold does not exclude another holder. A record
+  with a verified offsite row cannot be moved out of the volume
+  (records_stored_offsite). A record or image delete can run during the
+  free; such an object is reported as `changed` (_set_freed, and the unlink
+  check after it). A record that comes in after _require_own_folder either
+  has no verified row, and so is not in the work list, or comes back from
+  outside every volume, and is refused if its image is in the name-based
+  layout. A renumber changes sequence only. No database transaction stays
+  open across a listing, a hash or a copy.
 * **The row first, then the file.** A file's freed state is committed under
   its record's row lock, conditional on the row still naming that path, and
   the file is unlinked only after that commit. A failed unlink clears the
