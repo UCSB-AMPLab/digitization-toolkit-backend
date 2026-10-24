@@ -45,10 +45,16 @@ def _projects_root() -> Path:
     from writable_projects_dir: an override naming a missing directory, or one
     that is not on a mounted drive, raises StorageUnavailableError instead of
     letting a later mkdir(parents=True) build the tree on the SD card.
+
+    The settings are read from the app.core.config module at each call, as
+    app.core.paths reads them, not from the object bound at this module's
+    import: a test fixture that reloads the config replaces that object, and
+    every writer then builds paths under the root the test configured.
     """
+    from app.core import config
     from app.core.storage_override import writable_projects_dir
 
-    return writable_projects_dir(settings)
+    return writable_projects_dir(config.settings)
 
 
 def project_capture_root(project_name: str) -> Path:

@@ -93,3 +93,32 @@ def test_an_upload_into_a_project_level_record_is_refused_and_writes_nothing(cli
     assert db_session.query(RecordImage).count() == 0
     assert not _uploads_dir().exists() or list(_uploads_dir().iterdir()) == []
     assert [p for p in override_projects_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.unit
+def test_the_projects_root_is_read_from_the_live_settings(client, db_session, override_projects_root):
+    """Without patching capture.project_manager, a write lands under the root the test configured.
+
+    The projects root is read from app.core.config.settings at each call, not
+    from the object bound when capture.project_manager was imported, which a
+    test that reloads the config leaves behind.
+    """
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import RecordImage
+
+    p = Project(name="P")
+    db_session.add(p)
+    db_session.commit()
+    vol = Collection(name="Tomo", project_id=p.id, filename_stem="xx-test-live")
+    db_session.add(vol)
+    db_session.commit()
+    rec = _record(db_session, collection_id=vol.id)
+
+    resp = _as_admin(client).post(f"/records/{rec.id}/images",
+                                  files={"file": ("page.jpg", _jpeg(), "image/jpeg")})
+
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    stored = Path(db_session.query(RecordImage).one().file_path)
+    assert stored.parent == override_projects_root / "xx-test-live" / "captures"
