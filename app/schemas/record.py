@@ -220,14 +220,9 @@ class RecordUpdate(BaseModel):
 
 class RecordRead(RecordBase):
 	id: int
-	# The catalogue entry's own identifier (Fisqua's `reference_code`). Read
-	# only: it is deliberately absent from RecordCreate and RecordUpdate, so a
-	# client cannot set or change it, and Record enforces that it is written
-	# once on the model as well.
-	external_id: Optional[str] = None
 	# The queryable form of `date`: the span the record's date covers, with
-	# day resolution. Read only for the same reason external_id is — no writer
-	# exists yet, and who may set a range, and in what form, is not settled.
+	# day resolution. Read only: no writer exists yet, and who may set a
+	# range, and in what form, is not settled.
 	# Either end may be absent ("after 1750", "before 1800"); an end before
 	# its start is refused by the database.
 	date_start: Optional[dt_date] = None

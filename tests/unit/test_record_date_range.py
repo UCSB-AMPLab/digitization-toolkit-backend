@@ -21,8 +21,8 @@ known. What is refused is an end before its start, and it is refused by the
 database, because a CHECK can compare two columns of one row.
 
 Nothing writes these columns yet. They are absent from every request schema
-and exposed read-only on the response, like `external_id`; the importer that
-will fill them is blocked on the exchange contract.
+and exposed read-only on the response; the importer that will fill them is
+blocked on the exchange contract.
 """
 
 from datetime import date
@@ -334,14 +334,12 @@ def test_an_end_before_its_start_is_refused_on_update(db_session):
 def test_the_range_check_also_catches_a_bulk_update(db_session):
     """The reason the check is in the database and not on the model.
 
-    `external_id`'s immutability had to be an ORM guard, because immutability
-    compares a new value against the stored one and no CHECK can see the old
-    row. An ordering rule is different: it compares two columns of the same
-    row, which is exactly what a CHECK does — so it holds against
-    `query().update()` and raw SQL as well, which is the path
-    `test_a_bulk_update_is_not_covered_by_the_guard` records as open for
-    `external_id`. The importer that will fill these columns is the writer
-    most likely to use it.
+    An immutability rule has to be an ORM guard, because it compares a new
+    value against the stored one and no CHECK can see the old row. An
+    ordering rule is different: it compares two columns of the same row,
+    which is exactly what a CHECK does — so it holds against
+    `query().update()` and raw SQL as well. The importer that will fill
+    these columns is the writer most likely to use it.
     """
     from app.models.record import Record
 

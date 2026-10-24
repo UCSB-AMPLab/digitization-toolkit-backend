@@ -14,6 +14,12 @@ from sqlalchemy.exc import IntegrityError
 _CONSTRAINT_MESSAGES = {
 	"check_record_single_parent": "A record belongs to either a project or a collection, not both.",
 	"camera_settings_record_image_id_key": "Camera settings already exist for this record.",
+	"collections_filename_stem_key": "Another volume already uses this file name stem.",
+	"ix_collections_external_id": "Another volume already has this external identifier.",
+	"check_collection_date_range": "The end date cannot be before the start date.",
+	"check_collection_filename_stem_pattern": "A file name stem is lowercase letters and digits, separated by single hyphens.",
+	"check_collection_filename_stem_length": "The file name stem is too long.",
+	"check_collection_external_id_trimmed": "The external identifier cannot be blank or begin or end with whitespace.",
 }
 
 # SQLite names unnamed constraints differently from Postgres; map the substrings
@@ -21,6 +27,12 @@ _CONSTRAINT_MESSAGES = {
 _SQLITE_ALIASES = {
 	"check_record_single_parent": "check_record_single_parent",
 	"camera_settings.record_image_id": "camera_settings_record_image_id_key",
+	"collections.filename_stem": "collections_filename_stem_key",
+	"collections.external_id": "ix_collections_external_id",
+	"check_collection_date_range": "check_collection_date_range",
+	"check_collection_filename_stem_pattern": "check_collection_filename_stem_pattern",
+	"check_collection_filename_stem_length": "check_collection_filename_stem_length",
+	"check_collection_external_id_trimmed": "check_collection_external_id_trimmed",
 }
 
 _DEFAULT_MESSAGE = "The request conflicts with a database constraint."

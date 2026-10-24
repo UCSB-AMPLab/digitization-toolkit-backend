@@ -16,6 +16,7 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
+from app.core.capture_counter import next_capture_number
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -886,6 +887,9 @@ def trigger_capture(
 		if is_recapture and recapture_promotes:
 			change_record_status(db, record, "in_review", current_user.username)
 
+		# One capture event, counted in the transaction that writes its image.
+		next_capture_number(db, record.collection_id)
+
 		db.commit()
 		db.refresh(record)
 		db.refresh(img)
@@ -1110,6 +1114,10 @@ def trigger_dual_capture(
 
 		if is_recapture and recapture_promotes:
 			change_record_status(db, record, "in_review", current_user.username)
+
+		# One capture event for the pair, counted in the transaction that
+		# writes both images.
+		next_capture_number(db, record.collection_id)
 
 		db.commit()
 		db.refresh(record)
