@@ -723,35 +723,69 @@ def store_report(report: dict) -> Path:
 
     One file per run, numbered from 1, so a re-import's report does not
     replace the first one's, and the order does not depend on the clock.
+    No run is ever overwritten: a taken number moves the write on to the
+    next one. `reportStored` is not written. Raises OSError if the report
+    cannot be written.
+
     The report is written to a temporary file and hard-linked to the run's
-    name, which fails if that name exists, so two runs never take the same
-    number and a reader never sees half a report; on a taken number the
-    next one is tried. `reportStored` is not written. Raises OSError if the
-    report cannot be written.
+    name, which fails if that name exists, so a reader never sees half a
+    report. On a filesystem without hard links (FAT or exFAT, which an
+    external drive may use) the run's name is created with O_CREAT|O_EXCL
+    and written in place instead; a failed write removes it.
     """
     list_id = str(uuid.UUID(report["listId"]))  # never a path component from the file unchecked
     directory = reports_dir() / list_id
     directory.mkdir(parents=True, exist_ok=True)
     body = {k: v for k, v in report.items() if k != "reportStored"}
+    data = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
-        with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(body, handle, ensure_ascii=False, indent=2)
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
         number = _next_run_number(directory, list_id)
         while True:
-            target = directory / f"import-report_{list_id}_run{number:04d}.json"
+            target = _run_path(directory, list_id, number)
             try:
                 os.link(tmp, target)
-                break
+                return target
             except FileExistsError:
                 number += 1
+            except OSError:
+                break  # no hard links on this filesystem
     finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
+    return _create_run_exclusively(directory, list_id, number, data)
+
+
+def _run_path(directory: Path, list_id: str, number: int) -> Path:
+    return directory / f"import-report_{list_id}_run{number:04d}.json"
+
+
+def _create_run_exclusively(directory: Path, list_id: str, number: int, data: bytes) -> Path:
+    """Create the first free run name from `number` with O_EXCL, and write the report into it."""
+    while True:
+        target = _run_path(directory, list_id, number)
+        try:
+            fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+            break
+        except FileExistsError:
+            number += 1
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(target)
+        except OSError:
+            pass
+        raise
     return target
 
 

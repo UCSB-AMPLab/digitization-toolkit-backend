@@ -1130,3 +1130,50 @@ def test_taking_the_lock_removes_temporary_files_older_than_an_hour(reports_root
     assert not old.exists()
     assert fresh.exists() and run.exists()
     assert other_old.exists()  # only the locked list's directory
+
+
+# ---------------------------------------------------------------------------
+# Filesystems without hard links
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("errno_value", [1, 45, 18])  # EPERM, EOPNOTSUPP (macOS), EXDEV
+def test_runs_are_stored_without_hard_links(reports_root, monkeypatch, errno_value):
+    import app.core.list_import as li
+
+    def nolink(src, dst):
+        raise OSError(errno_value, "no hard links here")
+
+    monkeypatch.setattr(li.os, "link", nolink)
+    first = li.store_report({"listId": VALID_ID, "importedAt": "t", "created": 1})
+    second = li.store_report({"listId": VALID_ID, "importedAt": "t", "created": 2})
+    assert first.name.endswith("_run0001.json") and second.name.endswith("_run0002.json")
+    assert json.loads(first.read_text())["created"] == 1
+    assert json.loads(second.read_text())["created"] == 2
+    assert not list((reports_root / VALID_ID).glob(".tmp-*"))
+
+
+@pytest.mark.unit
+def test_without_hard_links_a_taken_run_number_is_never_overwritten(reports_root, monkeypatch):
+    import app.core.list_import as li
+
+    def nolink(src, dst):
+        raise OSError(1, "no hard links here")
+
+    monkeypatch.setattr(li.os, "link", nolink)
+    monkeypatch.setattr(li, "_next_run_number", lambda directory, list_id: 1)
+    first = li.store_report({"listId": VALID_ID, "importedAt": "t", "created": 1})
+    second = li.store_report({"listId": VALID_ID, "importedAt": "t", "created": 2})
+    assert second.name.endswith("_run0002.json")
+    assert json.loads(first.read_text())["created"] == 1
+
+
+@pytest.mark.unit
+def test_a_whole_import_without_hard_links(db_session, reports_root, monkeypatch):
+    import app.core.list_import as li
+
+    monkeypatch.setattr(li.os, "link", lambda src, dst: (_ for _ in ()).throw(OSError(1, "no")))
+    r1 = li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    assert r1["reportStored"] is True
+    with pytest.raises(li.ListIdReused):
+        _second_import(db_session)
