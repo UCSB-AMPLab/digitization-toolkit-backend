@@ -25,9 +25,10 @@ subprocess_logger = setup_rotating_logger(
 )
 
 def secure_project_filename(project_name):
-    project_name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
-    project_name = re.sub(r'[^a-zA-Z0-9._-]', '_', project_name)
-    return project_name.lstrip('.').lower()
+    """A project's directory name (app.core.paths.project_dir_name)."""
+    from app.core.paths import project_dir_name
+
+    return project_dir_name(project_name)
 
 
 def _projects_root() -> Path:
@@ -44,31 +45,108 @@ def _projects_root() -> Path:
     from writable_projects_dir: an override naming a missing directory, or one
     that is not on a mounted drive, raises StorageUnavailableError instead of
     letting a later mkdir(parents=True) build the tree on the SD card.
+
+    The settings are read from the app.core.config module at each call, as
+    app.core.paths reads them, not from the object bound at this module's
+    import: a test fixture that reloads the config replaces that object, and
+    every writer then builds paths under the root the test configured.
     """
+    from app.core import config
     from app.core.storage_override import writable_projects_dir
 
-    return writable_projects_dir(settings)
+    return writable_projects_dir(config.settings)
 
 
-def project_capture_root(project_name: str) -> Path:
+def projects_root() -> Path:
+    """The active projects root, refusing one that cannot take writes (_projects_root).
+
+    A writer that builds several paths for one operation (a capture's image
+    and its manifest record) reads it once and passes it to each helper as
+    `root`, so a storage switch in between cannot put them on two drives.
+    """
+    return _projects_root()
+
+
+def project_capture_root(project_name: str, root: Optional[Path] = None) -> Path:
     """Project-level directory holding the manifest and all image subdirs.
     Args:
         project_name: Name of the project"""
-    return Path(_projects_root(), secure_project_filename(project_name))
+    return Path(root if root is not None else _projects_root(), secure_project_filename(project_name))
 
 
-def collection_capture_root(project_name: str, collection_name: str) -> Path:
-    """On-disk root of a collection (sibling directory under the project root)."""
-    return project_capture_root(project_name) / secure_project_filename(collection_name)
+def volume_root(stem: str, root: Optional[Path] = None) -> Path:
+    """On-disk root of a volume that has a file name stem: `<projects root>/<stem>`.
+
+    The volume's directory sits directly under the projects root, with no
+    project level, so renaming a project, moving the volume to another
+    project or re-parenting it moves no file. It holds the four directories
+    of app.core.paths.VOLUME_SUBDIRS: `captures/`, `previews/`,
+    `thumbnails/` and `metadata/` (the volume's own manifest.jsonl).
+
+    Raises ValueError for a stem that is not a lowercase slug within the
+    model's length cap (app.models.collection), so a stored value can never
+    name a path outside the root.
+    """
+    import re
+
+    from app.models.collection import FILENAME_STEM_MAX_LENGTH, FILENAME_STEM_PATTERN
+
+    if (not isinstance(stem, str) or len(stem) > FILENAME_STEM_MAX_LENGTH
+            or not re.fullmatch(FILENAME_STEM_PATTERN, stem)):
+        raise ValueError(f"Not a volume file name stem: {stem!r}")
+    return Path(root if root is not None else _projects_root(), stem)
 
 
-def image_output_dir(project_name: str, collection_name: Optional[str] = None) -> Path:
-    """Directory where captured images are written for a project/collection."""
+def ensure_volume_dirs(stem: str, root: Optional[Path] = None) -> Path:
+    """Create the volume's four directories if they are missing; return its root."""
+    from app.core.paths import VOLUME_SUBDIRS
+
+    volume = volume_root(stem, root)
+    for name in VOLUME_SUBDIRS:
+        (volume / name).mkdir(parents=True, exist_ok=True)
+    return volume
+
+
+def collection_capture_root(project_name: str, collection_name: str, root: Optional[Path] = None) -> Path:
+    """On-disk root of a volume without a stem: `<project dir>/<secure collection name>`.
+
+    The name-based layout every volume had before stems. Two volumes of one
+    name share the directory, and a nested volume's directory sits beside its
+    parent's. A volume keeps it until it is given a stem and the startup
+    migration (app.core.volume_layout) moves its files.
+    """
+    return project_capture_root(project_name, root) / secure_project_filename(collection_name)
+
+
+def image_output_dir(project_name: str, collection_name: Optional[str] = None,
+                     stem: Optional[str] = None, root: Optional[Path] = None) -> Path:
+    """Directory where captured images are written.
+
+    `<projects root>/<stem>/captures` for a volume with a stem,
+    `<project dir>/<collection name>/images/main` for a volume without one,
+    and `<project dir>/images/main` for a project-level capture (neither).
+    """
+    from app.core.paths import CAPTURES_DIR
+
+    if stem:
+        return volume_root(stem, root) / CAPTURES_DIR
     if collection_name:
-        root = collection_capture_root(project_name, collection_name)
+        base = collection_capture_root(project_name, collection_name, root)
     else:
-        root = project_capture_root(project_name)
-    return root / "images" / "main"
+        base = project_capture_root(project_name, root)
+    return base / "images" / "main"
+
+
+def capture_manifest_root(project_name: str, stem: Optional[str] = None, root: Optional[Path] = None) -> Path:
+    """The directory whose `metadata/manifest.jsonl` takes a capture's record.
+
+    The volume's root for a volume with a stem, so each such volume has its
+    own manifest; the project's directory otherwise, as before stems. The
+    capture record's paths are relative to it.
+    """
+    if stem:
+        return volume_root(stem, root)
+    return project_capture_root(project_name, root)
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """

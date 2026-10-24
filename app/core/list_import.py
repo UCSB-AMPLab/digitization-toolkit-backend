@@ -67,6 +67,9 @@ from app.models.collection import (
     FILENAME_STEM_MAX_LENGTH,
     FILENAME_STEM_PATTERN,
     Collection,
+    StemDirectoryCollisionError,
+    StemDirectoryOccupiedError,
+    StemIsProjectDirectoryError,
 )
 from app.models.project import Project
 
@@ -118,6 +121,17 @@ REASONS = {
     "reference_code_on_unit": "A volume on this unit already has this referenceCode.",
     "filename_stem_on_unit": "A volume on this unit already has this filenameStem.",
     "refused_by_database": "The database refused the volume.",
+    "filename_stem_is_project_directory": "The filenameStem is the directory name of a project on this unit.",
+    "filename_stem_directory_occupied": (
+        "A directory named as the filenameStem already holds files on this unit, and no volume's files "
+        "are ever merged into it."
+    ),
+}
+
+# A refusal by app.models.collection's stem directory check, mapped to its reason.
+_STEM_DIRECTORY_REASONS = {
+    StemIsProjectDirectoryError: "filename_stem_is_project_directory",
+    StemDirectoryOccupiedError: "filename_stem_directory_occupied",
 }
 
 # A constraint named in an IntegrityError at commit, mapped to its reason.
@@ -444,6 +458,11 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     db.add(project)
     try:
         db.commit()
+    except StemDirectoryCollisionError as exc:
+        # The project's directory would be a volume's stem: no volume of the
+        # list can be placed in it, so the list is refused with nothing written.
+        db.rollback()
+        raise ListRefused(str(exc)) from exc
     except IntegrityError:
         # Created by a concurrent request since the query above.
         db.rollback()
@@ -510,6 +529,13 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
         except IntegrityError as exc:
             db.rollback()
             reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+            rejects.append(_reject(position, code, reason))
+            continue
+        except StemDirectoryCollisionError as exc:
+            # The model's flush listener refused the stem's directory; this
+            # item only is rolled back and reported.
+            db.rollback()
+            reason = _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
             rejects.append(_reject(position, code, reason))
             continue
         except SQLAlchemyError:

@@ -180,7 +180,7 @@ def _install_capture_fakes(monkeypatch, recorded, fake_config_dict):
         return dict(fake_config_dict), "hw"
 
     def fake_single_capture_image(project_name, camera_config, check_camera=False,
-                                   include_resolution=False, collection_name=None):
+                                   include_resolution=False, collection_name=None, stem=None):
         recorded["camera_config"] = camera_config
         return "/tmp/nonexistent-capture-for-test.jpg", "cap-1", None
 

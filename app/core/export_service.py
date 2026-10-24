@@ -11,9 +11,8 @@ from pathlib import Path
 from app.core import config
 from app.core.bag_export import SourceReadError, write_bag_zip
 from app.core.export_jobs import ExportError, ExportJob
-from app.core.integrity import verify_images_against_manifest
+from app.core.integrity import capture_record_lines, verify_images_against_manifest
 from app.core.paths import resolve_within_storage
-from app.core.storage_ops import resolve_project_name
 from app.models.collection import Collection
 from app.models.project import Project
 from sqlalchemy.orm import joinedload
@@ -149,13 +148,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     # Either is reported as an ExportError naming the record, with the path in
     # the log only; see _source_error.
     try:
-        # Fixity gate: refuse to bag bytes that no longer match their capture-time sha256.
-        mismatches = verify_images_against_manifest([img for _, _, img in to_copy])
-        if mismatches:
-            raise ExportError(
-                f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
-                detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
-            )
+        _fixity_gate([img for _, _, img in to_copy])
 
         # Refuse to start if the exports filesystem can't hold the archive.
         total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
@@ -235,6 +228,35 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
 
 
+def _fixity_gate(images) -> None:
+    """Refuse to bag bytes that no longer match their capture-time sha256, or that cannot be checked.
+
+    Raises ExportError with reason "checksum_mismatch" when a file's bytes
+    differ from its capture record's, and otherwise with reason
+    "checksum_unresolved" when a captured image (its capture id has a
+    capture record in some manifest) has no checksum that can be resolved,
+    naming each such image's id, capture id and stored path. Images with no
+    capture record (uploads) pass unchecked, as they always have.
+    """
+    found = verify_images_against_manifest(images)
+    mismatches = [m for m in found if m["reason"] == "mismatch"]
+    unresolved = [m for m in found if m["reason"] == "unresolved"]
+    if mismatches:
+        raise ExportError(
+            f"{len(mismatches)} file(s) fail their capture-time checksum (possible corruption).",
+            detail={"reason": "checksum_mismatch", "mismatched_image_ids": [m["record_image_id"] for m in mismatches], "mismatches": mismatches},
+        )
+    if unresolved:
+        ids = [m["record_image_id"] for m in unresolved]
+        raise ExportError(
+            f"{len(unresolved)} captured file(s) have no capture-time checksum that can be found, "
+            f"so their fixity cannot be checked: image(s) {', '.join(str(i) for i in ids)}.",
+            detail={"reason": "checksum_unresolved", "unresolved_image_ids": ids,
+                    "unresolved": [{"record_image_id": m["record_image_id"], "capture_id": m["capture_id"],
+                                    "file_path": m["file_path"]} for m in unresolved]},
+        )
+
+
 def _source_error(collection_id: int, to_copy, source: Path, error: OSError) -> ExportError:
     """The ExportError for a planned source that is gone or could not be read.
 
@@ -297,28 +319,21 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
 
 
 def _filtered_manifest_blob(db, collection, records):
-    """The project's capture manifest, filtered to this collection's captures."""
-    from capture.project_manager import secure_project_filename
+    """The capture records of this collection's current images, from every capture manifest.
+
+    The records are found the way the fixity gate finds checksums
+    (app.core.integrity): in any manifest under the active projects root,
+    the project's or the volume's own, so a volume migrated into its stem
+    layout, whose earlier captures are recorded in its project's manifest
+    and later ones in `<stem>/metadata/manifest.jsonl`, has all of them in
+    its bag. Relocation records are the appliance's own bookkeeping of files
+    renamed after capture; the bag names its files itself, so only the
+    capture records go into it.
+    """
     capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
     if not capture_ids:
         return None
-    proj_name = resolve_project_name(db, collection)
-    if not proj_name:
-        return None
-    manifest_src = config.settings.projects_dir / secure_project_filename(proj_name) / "metadata" / "manifest.jsonl"
-    if not manifest_src.exists():
-        return None
-    kept = []
-    for line in manifest_src.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        if entry.get("capture_id") in capture_ids:
-            kept.append(stripped)
+    kept = capture_record_lines(config.settings.projects_dir.resolve(), capture_ids)
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 
 

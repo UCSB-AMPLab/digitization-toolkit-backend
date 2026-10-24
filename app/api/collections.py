@@ -10,7 +10,7 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.collection import STEM_RESERVED_MESSAGE, Collection
+from app.models.collection import STEM_RESERVED_MESSAGE, Collection, stem_directory_collision
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
@@ -28,11 +28,15 @@ from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
+    collection_image_dir,
+    collection_root_dir,
+    collections_in_old_layout,
+    image_in_old_layout,
+    legacy_image_dir,
     relocate_images_and_commit,
-    remove_tree,
+    remove_empty_dirs,
     renumber_collection_images,
     restore_original_names,
-    resolve_project_name,
     surviving_images_under,
 )
 
@@ -107,6 +111,12 @@ def create_collection(
         created_by=payload.created_by or current_user.username
     )
     
+    # A stem may not name a project's directory (app.models.collection).
+    if payload.filename_stem is not None:
+        message = stem_directory_collision(db, stem=payload.filename_stem)
+        if message:
+            raise HTTPException(status_code=409, detail={"message": message})
+
     try:
         db.add(collection)
         db.commit()
@@ -251,9 +261,14 @@ def update_collection(
     
     Can update name, description, type, metadata, or move to different parent collection.
 
-    A rename or re-parent moves the files of every record in the collection and
-    its sub-collections, so it is refused with 409 while an export of any of
-    them is queued or running. Other edits are not refused.
+    A volume with a file name stem keeps its files in `<stem>/` under the
+    projects root, outside any project, so a rename or a re-parent moves none
+    of them. Files in the name-based layout, `<project>/<name>/images/main/`
+    (every file of a volume without a stem, and those of a volume given a
+    stem that the startup migration has not moved yet), are moved for each
+    volume in the subtree whose directory changes, and the rows follow. That
+    is refused with 409 while an export of any of those volumes is queued or
+    running. Other edits are not refused.
     """
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
@@ -281,21 +296,36 @@ def update_collection(
             if not current:
                 break
     
-    # A rename or cross-project re-parent changes the on-disk dir; relocate files
-    old_name = collection.name
-    old_parent = collection.parent_collection_id
+    # A stem may not name a project's directory (app.models.collection).
+    new_stem = payload.model_dump(exclude_unset=True).get("filename_stem")
+    if new_stem is not None and new_stem != collection.filename_stem:
+        message = stem_directory_collision(db, stem=new_stem, collection=collection)
+        if message:
+            raise HTTPException(status_code=409, detail={"message": message})
+
+    # Only files in the name-based layout sit in a directory named after the
+    # volume and its project, so only volumes with such files have them moved
+    # by a rename or a re-parent: a volume without a stem, or one given a stem
+    # whose files the startup migration has not moved yet
+    # (collections_in_old_layout). Files in `<stem>/` stay where they are.
     update_data = payload.model_dump(exclude_unset=True)
     layout_changed = (
-        ("name" in update_data and update_data["name"] != old_name)
-        or ("parent_collection_id" in update_data and update_data["parent_collection_id"] != old_parent)
+        ("name" in update_data and update_data["name"] != collection.name)
+        or ("parent_collection_id" in update_data
+            and update_data["parent_collection_id"] != collection.parent_collection_id)
     )
     not_moved: List[str] = []
     moves: List = []
-    # A layout change relocates the files of every record in the subtree, and
-    # an export of any collection in it reads those files by path, so the
-    # whole subtree is held against exports, before anything is changed, until
-    # the files have moved and the commit is done.
-    held_ids = collection_and_descendants(db, collection.id) if layout_changed else []
+    held_ids: List[int] = []
+    old_dirs: dict = {}
+    if layout_changed:
+        old_layout = collections_in_old_layout(db, collection_and_descendants(db, collection.id))
+        subtree = db.query(Collection).filter(Collection.id.in_(old_layout)).all() if old_layout else []
+        old_dirs = {c.id: legacy_image_dir(db, c) for c in subtree}
+        # Their files are read by path by an export of any of them, so they
+        # are held against exports, before anything is changed, until the
+        # files have moved and the commit is done.
+        held_ids = sorted(old_dirs)
     with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_SUBTREE_MESSAGE):
         # Update fields. A change to external_id or filename_stem that the
         # model refuses (written once; fixed by the first image) is a 409.
@@ -310,19 +340,22 @@ def update_collection(
         if collection.parent_collection_id is not None:
             collection.project_id = None
 
-        if layout_changed:
-            from capture.project_manager import image_output_dir
-
-            project_name = resolve_project_name(db, collection)
-            if project_name:
-                names = {
-                    c.id: c.name
-                    for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all()
-                }
-                records = db.query(Record).filter(Record.collection_id.in_(held_ids)).all()
+        # Each such volume whose name-based directory the change moved has the
+        # files it still has in the old layout moved to the new one, and the
+        # rows follow. A stem set in this same request changes nothing here:
+        # the files are still in the old layout until the startup migration.
+        if held_ids:
+            targets = {}
+            cols = {c.id: c for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all()}
+            for c in cols.values():
+                new_dir = legacy_image_dir(db, c)
+                if new_dir is not None and new_dir != old_dirs.get(c.id):
+                    targets[c.id] = new_dir
+            if targets:
+                records = db.query(Record).filter(Record.collection_id.in_(list(targets))).all()
                 for r in records:
-                    target_dir = image_output_dir(project_name, names.get(r.collection_id))
-                    moves.extend((img, target_dir) for img in r.images)
+                    moves.extend((img, targets[r.collection_id]) for img in r.images
+                                 if image_in_old_layout(cols[r.collection_id], img.file_path))
 
         # Flushed before any file is moved, so that a duplicate stem or
         # external_id, or an end date before the stored start, is refused
@@ -356,8 +389,6 @@ def move_collection_records(
     Move all records from one collection to another, relocating their image
     files on disk so the moved records keep pointing at existing files.
     """
-    from capture.project_manager import image_output_dir
-
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
@@ -366,10 +397,10 @@ def move_collection_records(
     if not target:
         raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
 
-    target_project_name = resolve_project_name(db, target)
-    if not target_project_name:
+    # `<stem>/captures` for a target with a stem, its name-based directory otherwise
+    target_dir = collection_image_dir(db, target)
+    if target_dir is None:
         raise HTTPException(status_code=422, detail="Target collection is not attached to a project")
-    target_dir = image_output_dir(target_project_name, target.name)
 
     # Locked, because the refusal below reads each record's status and the
     # relocation that follows is a filesystem move no transaction takes back.
@@ -428,16 +459,18 @@ def delete_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Delete an empty collection and its (now unused) directory.
+    Delete an empty collection and the empty directories of its own.
 
     Refuses (409) if the volume has a file name stem and has captured, even
     once emptied: its row keeps the stem so the names issued under it are
     never issued again. Also refuses (409) if the collection still has
     sub-collections or records (those must be moved or deleted first) or if
-    its directory still holds files that a surviving record points at.
+    its directory still holds files that a surviving record points at. An
+    empty collection has no files of its own, so no file is removed: a file
+    found in its directory (one no row references, such as a file the volume
+    layout migration left there) stays, with the directories above it, and is
+    logged at WARNING.
     """
-    from capture.project_manager import collection_capture_root
-
     # Under the row lock, so that a PATCH setting a first stem cannot land
     # between this check and the delete.
     collection = _locked_collection_query(db, collection_id).first()
@@ -446,8 +479,6 @@ def delete_collection(
 
     if collection.reserves_its_stem():
         raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
-
-    collection_name = collection.name
 
     # Refuse to delete a non-empty collection; report the blocking counts
     child_count = db.query(func.count(Collection.id)).filter(Collection.parent_collection_id == collection_id).scalar()
@@ -458,8 +489,8 @@ def delete_collection(
             detail=f"Cannot delete a non-empty collection: {child_count} sub-collection(s) and {record_count} record(s) remain. Move or delete them first.",
         )
 
-    project_name = resolve_project_name(db, collection)
-    col_dir = collection_capture_root(project_name, collection_name) if project_name else None
+    # `<stem>/` for a volume with a stem, its name-based directory otherwise
+    col_dir = collection_root_dir(db, collection)
 
     if col_dir is not None:
         # Hard guard: never remove a directory that still holds a surviving record's files
@@ -468,12 +499,17 @@ def delete_collection(
                 status_code=409,
                 detail="Collection directory still holds files referenced by other records. Move those records first.",
             )
-        # Remove files first so a filesystem failure aborts before touching the DB
+        # Remove the directories first so a filesystem failure aborts before touching the DB
         try:
-            remove_tree(col_dir)
+            left = remove_empty_dirs(col_dir)
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
             raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
+        if left:
+            logger.warning(
+                f"Deleting collection {collection_id}: {len(left)} file(s) no record references were left in "
+                f"{col_dir}: {[str(p) for p in left]}"
+            )
 
     db.delete(collection)
     db.commit()

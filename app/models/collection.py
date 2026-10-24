@@ -53,6 +53,102 @@ class StemReservedError(ImmutableFieldError):
     """A delete would free a stem whose file names have been issued."""
 
 
+class StemDirectoryCollisionError(ValueError):
+    """A stem and a project's directory name would name the same directory under the projects root.
+
+    A volume with a stem keeps its files in `<projects root>/<stem>/`, and a
+    project its tree in `<projects root>/<project directory>/`. Raised by the
+    before_flush listener _refuse_a_stem_that_is_a_project_directory, so
+    every writer meets it; the API answers 409 (app.main).
+    """
+
+
+class StemIsProjectDirectoryError(StemDirectoryCollisionError):
+    """The stem is the directory name of a project."""
+
+
+class StemDirectoryOccupiedError(StemDirectoryCollisionError):
+    """`<projects root>/<stem>/` already holds files that are not the volume's."""
+
+
+class ProjectNameIsStemError(StemDirectoryCollisionError):
+    """A project's directory name would be a volume's stem."""
+
+
+def _stem_directory_is_someone_elses(session, stem, collection) -> bool:
+    """Whether `<projects root>/<stem>/` exists with a file in it and `collection` has no image there.
+
+    A directory holding only empty directories is free. Reads the disk under
+    the projects root as configured, without the storage-override write
+    check, so it never raises for an unusable drive.
+    """
+    from pathlib import Path
+
+    from app.core import config
+
+    root = config.settings.projects_dir
+    directory = root / stem
+    try:
+        if not directory.is_dir() or not any(p.is_file() for p in directory.rglob("*")):
+            return False
+    except OSError:
+        return True
+    if collection is not None and collection.id is not None:
+        prefix = (root.resolve() / stem)
+        rows = session.execute(
+            select(RecordImage.file_path).where(RecordImage.record_id == Record.id,
+                                                Record.collection_id == collection.id)
+        ).scalars().all()
+        for fp in rows:
+            try:
+                if fp and Path(fp).resolve().is_relative_to(prefix):
+                    return False
+            except (OSError, ValueError):
+                continue
+    return True
+
+
+def stem_directory_conflict(session, stem=None, project_name=None, collection=None):
+    """The StemDirectoryCollisionError refusing `stem`, or a project named `project_name`, or None.
+
+    A stem collides with a project whose directory name (project_dir_name)
+    equals it (StemIsProjectDirectoryError), and with a
+    `<projects root>/<stem>/` that already exists on disk with a file in it
+    when `collection` (the volume taking the stem, or None for one not yet
+    created) has no image there (StemDirectoryOccupiedError). A project name
+    collides with a volume whose stem equals its directory name
+    (ProjectNameIsStemError). Reads with autoflush off, so it can run inside
+    a flush. The error is returned, not raised.
+    """
+    from app.core.paths import project_dir_name
+    from app.models.project import Project
+
+    with session.no_autoflush:
+        if stem is not None:
+            for (name,) in session.query(Project.name).all():
+                if project_dir_name(name) == stem:
+                    return StemIsProjectDirectoryError(
+                        f"The file name stem {stem} is the directory of project {name!r}; "
+                        "a volume's files and a project's tree cannot share it.")
+            if _stem_directory_is_someone_elses(session, stem, collection):
+                return StemDirectoryOccupiedError(
+                    f"The directory {stem} already exists in the projects root and holds files that are "
+                    "not this volume's; a volume's files are never merged into it.")
+        if project_name is not None:
+            directory = project_dir_name(project_name)
+            if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
+                return ProjectNameIsStemError(
+                    f"The project name {project_name!r} would use the directory {directory}, "
+                    "which is a volume's file name stem.")
+    return None
+
+
+def stem_directory_collision(session, stem=None, project_name=None, collection=None):
+    """The message of stem_directory_conflict, or None when there is no collision."""
+    error = stem_directory_conflict(session, stem=stem, project_name=project_name, collection=collection)
+    return str(error) if error is not None else None
+
+
 STEM_RESERVED_MESSAGE = (
     "This volume has a file name stem and has captured images, so it cannot be "
     "deleted; it keeps its stem so the name is never issued again."
@@ -372,3 +468,41 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
             )
+
+
+@event.listens_for(Session, "before_flush")
+def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances):
+    """Refuse a flush that gives a volume a stem equal to a project's directory, or the reverse.
+
+    Covers every writer: the collection and project routes, and the list
+    import, which creates volumes through the model. Only a new volume, a
+    changed stem, a new project or a renamed project is checked. Because of
+    the stem pattern, only a project name that folds to a lowercase
+    hyphenated slug can collide. Two writes in one flush that collide with
+    each other (a new project and a new volume) are compared too.
+    """
+    from app.core.paths import project_dir_name
+    from app.models.project import Project
+
+    pending = list(session.new) + list(session.dirty)
+    new_stems = {}
+    new_dirs = {}
+    for obj in pending:
+        if isinstance(obj, Collection) and obj.filename_stem is not None:
+            if obj in session.new or sa_inspect(obj).attrs.filename_stem.history.has_changes():
+                new_stems[obj.filename_stem] = obj
+        elif isinstance(obj, Project) and obj.name:
+            if obj in session.new or sa_inspect(obj).attrs.name.history.has_changes():
+                new_dirs[project_dir_name(obj.name)] = obj
+    for stem, volume in new_stems.items():
+        error = stem_directory_conflict(session, stem=stem, collection=volume)
+        if error is None and stem in new_dirs:
+            error = StemIsProjectDirectoryError(
+                f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
+                "a volume's files and a project's tree cannot share it.")
+        if error is not None:
+            raise error
+    for directory, project in new_dirs.items():
+        error = stem_directory_conflict(session, project_name=project.name)
+        if error is not None:
+            raise error
