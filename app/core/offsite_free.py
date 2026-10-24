@@ -585,6 +585,15 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
     return None
 
 
+def _fsync_file(path: Path) -> None:
+    """fsync a file's contents; raises OSError, which refuses the restore of that file."""
+    fd = os.open(path, os.O_RDONLY)
+    try:
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def _fsync_dir(directory: Path) -> None:
     try:
         fd = os.open(directory, os.O_RDONLY)
@@ -625,6 +634,12 @@ def _restore_one(db: Session, obj: _Object) -> tuple:
         if copied != obj.sha1:
             return None, obj.entry(reason="sha1_differs", copied_sha1=copied, expected_sha1=obj.sha1)
         size = staging.stat().st_size
+        # On disk before it can take the final name and the state is cleared,
+        # as capture.utils.atomic_write does: otherwise a power cut could
+        # leave a cleared state over a truncated file, which a later restore
+        # would find in place and skip. Done before _place, so the record's
+        # lock is not held across it.
+        _fsync_file(staging)
         placed = _place(db, obj, staging, target)
     except OSError as exc:
         db.rollback()

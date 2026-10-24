@@ -608,3 +608,69 @@ def test_a_delete_during_freeing_leaves_a_consistent_state(
     assert {(f["image_id"], f["kind"]) for f in result["files"]} == {(raw_id, "capture"), (raw_id, "preview")}
     row = _image_row(db_session, raw_id)
     assert row.master_freed_at is not None and row.preview_freed_at is not None
+
+
+def _fd_path(fd):
+    """The path an open descriptor names (Linux /proc, macOS F_GETPATH)."""
+    import os
+    import sys
+
+    if sys.platform == "darwin":
+        import fcntl
+        return fcntl.fcntl(fd, fcntl.F_GETPATH, bytes(1024)).rstrip(b"\0").decode()
+    return os.readlink(f"/proc/self/fd/{fd}")
+
+
+@pytest.mark.unit
+def test_restore_fsyncs_the_staging_file_before_the_replace_and_the_directory_after(
+        read_remote, db_session, override_projects_root, monkeypatch):
+    import os
+
+    vol, _, jpg = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    target = _paths(override_projects_root, "f2.jpg")[0].resolve()
+    events = []
+    real_fsync, real_replace = os.fsync, os.replace
+
+    def fsync(fd):
+        events.append(("fsync", os.path.realpath(_fd_path(fd))))
+        return real_fsync(fd)
+
+    def replace(src, dst):
+        events.append(("replace", os.path.realpath(src), os.path.realpath(dst)))
+        return real_replace(src, dst)
+
+    monkeypatch.setattr(os, "fsync", fsync)
+    monkeypatch.setattr(os, "replace", replace)
+
+    _restore(db_session, vol)
+
+    placed = [i for i, e in enumerate(events) if e[0] == "replace" and e[2] == str(target)]
+    assert len(placed) == 1, events
+    staging = events[placed[0]][1]
+    assert Path(staging).parent == target.parent and staging.endswith(".part")
+    assert ("fsync", staging) in events[:placed[0]], "the staging file was not fsynced before the replace"
+    assert ("fsync", str(target.parent)) in events[placed[0]:], "the directory was not fsynced after the replace"
+
+
+@pytest.mark.unit
+def test_a_missing_thumbnail_of_a_local_raw_whose_preview_is_freed_answers_410_with_the_preview_key(
+        remote, client, db_session, override_projects_root):
+    from app.models.record import RecordImage
+
+    _as("reviewer")
+    vol, raw, _ = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    master, preview, thumb = _paths(override_projects_root, "f1.CR2")
+    # A partial restore: the master is back, the preview still freed.
+    master.write_bytes(b"raw one")
+    row = db_session.get(RecordImage, raw.id)
+    row.master_freed_at, row.master_freed_bytes = None, None
+    db_session.commit()
+    thumb.unlink()
+
+    r = client.get(f"/records/images/{raw.id}/thumbnail")
+
+    assert r.status_code == 410, r.text
+    detail = r.json()["detail"]
+    assert detail["kind"] == "preview" and detail["key"] == f"{TENANT}/{STEM}/previews/f1_preview.jpg"
