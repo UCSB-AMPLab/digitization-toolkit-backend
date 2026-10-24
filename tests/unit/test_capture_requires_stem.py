@@ -266,6 +266,21 @@ def test_a_retake_in_the_wrong_capture_mode_is_a_422_before_any_camera(
     assert _state(db_session, v.id) == before
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["single", "dual"])
+def test_a_capture_into_an_unknown_volume_is_a_404_before_any_camera(client, db_session, test_project,
+                                                                     camera_calls, mode):
+    api = _client_as(client)
+    before = _counts(db_session)
+
+    resp = _capture(mode)(api, test_project, 999)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Collection 999 not found"
+    assert camera_calls == [], "a capture into an unknown volume touches no camera"
+    assert _counts(db_session) == before
+
+
 # ---------------------------------------------------------------------------
 # No capture outside a volume
 # ---------------------------------------------------------------------------

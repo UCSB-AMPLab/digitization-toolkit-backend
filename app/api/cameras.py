@@ -17,7 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_counter import next_capture_number
-from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -48,7 +48,8 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 
 def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
 	"""409 when the capture would go into no volume, into one without a filename_stem,
-	or, for a request with a record_id, into a volume other than the record's.
+	or, for a request with a record_id, into a volume other than the record's;
+	404 when the volume named does not exist.
 
 	Every capture is named after its volume's stem (contract 1.1 §3), so the
 	request must name a volume: 0 counts as none, as it does for the capture
@@ -59,12 +60,15 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	volume = db.query(Collection).filter(Collection.id == collection_id).first()
+	if volume is None:
+		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 	if retake_record is not None:
 		if retake_record.collection_id is None:
 			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
 		if retake_record.collection_id != collection_id:
 			raise HTTPException(status_code=409, detail=RETAKE_VOLUME_DETAIL)
-	if volume_lacks_stem(db, collection_id):
+	if volume.filename_stem is None:
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
 
