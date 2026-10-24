@@ -334,6 +334,30 @@ class _Dir:
         return bool(self.stems.get(stem.casefold(), set()) - {record_id})
 
 
+def _clashing_files(target: Path, previews_dir: Optional[Path], stems: List[str],
+                    owners: Dict[Path, int]) -> List[Path]:
+    """The files on disk, no row's, that took the names a master was denied in `target` (resolved).
+
+    `stems` are the stems passed over: the master's own, then each suffixed
+    one (_suffixed_stems) that was taken, up to the one it is given. In
+    `target`, a file whose stem casefolds to one of them (the name, or the
+    same stem with another suffix, which would name the same sidecar); in
+    `previews_dir` (for a RAW master), the `_preview.jpg` each derives.
+    Files of other rows, whether on disk or planned, are not listed.
+    """
+    out: List[Path] = []
+    folded = {s.casefold() for s in stems}
+    for p in _listdir(target):
+        if p.is_file() and Path(p.name).stem.casefold() in folded and p.resolve() not in owners:
+            out.append(p.resolve())
+    if previews_dir is not None:
+        names = {f"{s}{PREVIEW_SIDECAR_SUFFIX}".casefold() for s in stems}
+        for p in _listdir(previews_dir):
+            if p.is_file() and p.name.casefold() in names and p.resolve() not in owners:
+                out.append(p.resolve())
+    return out
+
+
 def _suffixed_stems(stem: str, image_id: int) -> Iterable[str]:
     """`<stem>_img<id>`, then `<stem>_img<id>_2`, `_3`, ...: the names a clashing master is given, in order."""
     base = f"{stem}_img{image_id}"
@@ -581,6 +605,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     orphan_thumbnails: List[str] = []
     manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
     refused: Set[Path] = set()
+    clashing: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
     dirs: Dict[Path, _Dir] = {}
     stem_for: Dict[Tuple[Path, int, str], str] = {}
@@ -685,8 +710,18 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         else:
             stem = src.stem
             if state.master_taken(stem, src.suffix, img.record_id, previews):
-                stem = next(s for s in _suffixed_stems(src.stem, iid)
-                            if not state.master_taken(s, src.suffix, img.record_id, previews))
+                passed_over = [src.stem]
+                for candidate in _suffixed_stems(src.stem, iid):
+                    if not state.master_taken(candidate, src.suffix, img.record_id, previews):
+                        stem = candidate
+                        break
+                    passed_over.append(candidate)
+                for f in _clashing_files(target, previews_dir if raw else None, passed_over, owners):
+                    if f not in clashing:
+                        clashing.add(f)
+                        logger.warning(f"Volume layout: {f} is no row's and takes the name of image {iid}'s master "
+                                       f"{src.name}, which is moved as {stem}{src.suffix}; the file is left where "
+                                       "it is, and the volume will be skipped as stem_dir_occupied until it is removed")
             stem_for[key] = stem
         dst = target / f"{stem}{src.suffix}"
         state.add(dst.name, img.record_id)
@@ -721,6 +756,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     # A refused candidate sits in a volume's `captures/`, which the scan above
     # does not walk, so it is added here unless a row has since claimed it.
     left += [str(p) for p in sorted(refused) if p not in owners and str(p) not in left]
+    # So is a file that forced a rename on a clash: no row's, in a volume's
+    # `captures/` or `previews/`, and foreign to the next run.
+    left += [str(p) for p in sorted(clashing) if p not in owners and str(p) not in left]
     return ([{"collection_id": cid, "entries": e} for cid, e in batches.items()], skipped, left, temps,
             orphan_thumbnails)
 
@@ -877,6 +915,11 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
         if src.exists() and dst.exists():
             new_dst = _free_name(e, src, dst)
             logger.warning(f"Volume layout: {dst} was taken after planning; moving {src} to {new_dst}")
+            if dst.resolve() not in {Path(m["to"]).resolve() for m in report["moved"]} \
+                    and str(dst.resolve()) not in report["left_unreferenced"]:
+                logger.warning(f"Volume layout: {dst} took the name of image {e['image_id']}'s master after "
+                               "planning and is left where it is")
+                report["left_unreferenced"].append(str(dst.resolve()))
             e["to"] = str(new_dst)
             if e["sidecar_from"]:
                 e["sidecar_to"] = str(preview_sidecar_of(new_dst))
