@@ -55,3 +55,40 @@ def test_a_failed_duplicate_lookup_rejects_that_item_and_the_rest_are_created(
     assert report["created"] == 1 and report["reportStored"] is True
     monkeypatch.setattr(db_session, "query", real_query)
     assert set(_volumes(db_session)) == {"xx-test-950"}
+
+
+@pytest.mark.unit
+def test_a_failed_read_after_the_commit_does_not_report_a_committed_volume_as_refused(
+        client, db_session, reports_root):
+    """The new volume's id is taken at the flush, before the commit; nothing is read back after it."""
+    from sqlalchemy import event
+    from app.models.project import Project
+
+    db_session.add(Project(name="Prueba válida"))
+    db_session.commit()
+    state = {"committed": False}
+
+    def after_commit(session):
+        state["committed"] = True
+
+    def fail_the_next_collections_read(conn, cursor, statement, params, context, executemany):
+        if state["committed"] and statement.lstrip().upper().startswith("SELECT") and "collections" in statement:
+            state["committed"] = False
+            raise OperationalError(statement, params, Exception("connection lost after COMMIT"))
+
+    engine = db_session.get_bind()
+    event.listen(db_session, "after_commit", after_commit)
+    event.listen(engine, "before_cursor_execute", fail_the_next_collections_read)
+    try:
+        _as("adm", "admin")
+        resp = _post(client, _list_with([_item()]))
+    finally:
+        event.remove(engine, "before_cursor_execute", fail_the_next_collections_read)
+        event.remove(db_session, "after_commit", after_commit)
+
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert report["rejects"] == []
+    assert report["created"] == 1
+    assert set(_volumes(db_session)) == {"xx-test-901"}
+    assert report["volumes"][0]["captuaCollectionId"] == _volumes(db_session)["xx-test-901"].id

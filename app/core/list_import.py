@@ -614,9 +614,12 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             rejects.append(_reject(position, code, reason))
             continue
 
-        # The lookups, the insert and the read of the new id are one step
-        # for the rollback-and-reject handling: a database failure at any
-        # of them costs this item only.
+        # The lookups and the insert are one step for the rollback-and-reject
+        # handling: a database failure at any of them costs this item only.
+        # The new id is taken at the flush, before the commit, so nothing is
+        # read back after it: with the session expiring on commit, reading
+        # the id afterwards is a query that can fail for a volume already
+        # committed, which a rollback could no longer remove.
         try:
             if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
                 rejects.append(_reject(position, code, "reference_code_on_unit"))
@@ -626,8 +629,9 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
                 continue
             volume = Collection(project_id=project_id, created_by=actor, **values)
             db.add(volume)
-            db.commit()
+            db.flush()
             volume_id = volume.id
+            db.commit()
         except IntegrityError as exc:
             db.rollback()
             reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
