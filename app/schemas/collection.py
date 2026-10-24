@@ -39,6 +39,8 @@ class VolumeIdentityFields(BaseModel):
 
 
 class CollectionBase(BaseModel):
+    # Exchange contract 1.1 §3 maps an item's `title` onto the volume's
+    # `title`; a collection has no such column, and `name` is that field.
     name: str = Field(..., min_length=1, max_length=255)
     description: Optional[str] = None
     collection_type: Optional[str] = Field(None, max_length=50, description="Type: fonds, series, box, folder, volume, etc.")
