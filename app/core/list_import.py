@@ -170,9 +170,31 @@ def _refuse_duplicate_keys(pairs):
     for key, value in pairs:
         if key in obj:
             shown = key if len(key) <= 120 else key[:120] + "..."
-            raise _DuplicateKey(shown)
+            # Echoed in the 400: a lone surrogate in it is escaped, so the
+            # response can be encoded.
+            raise _DuplicateKey(shown.encode("utf-8", "backslashreplace").decode("utf-8"))
         obj[key] = value
     return obj
+
+
+def _holds_lone_surrogate(document: Any) -> bool:
+    """Whether any key or string in the parsed document holds a code point from U+D800 to U+DFFF.
+
+    json.loads joins an escaped surrogate pair into one character, so only
+    a lone surrogate is left in a string. Walked without recursion.
+    """
+    stack = [document]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            if any("\ud800" <= ch <= "\udfff" for ch in value):
+                return True
+        elif isinstance(value, dict):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return False
 
 
 def parse_list_file(raw: bytes) -> Any:
@@ -181,15 +203,18 @@ def parse_list_file(raw: bytes) -> Any:
     A UTF-8 byte order mark is accepted. Refused: bytes that are not UTF-8;
     text that is not JSON, including a number beyond Python's digit limit
     and nesting deep enough to exhaust the recursion limit; NaN, Infinity
-    and -Infinity; and a key repeated within one object, at any depth.
+    and -Infinity; a key repeated within one object, at any depth; and a key
+    or string holding a lone surrogate, which json accepts as an escape
+    (`\\ud800`) but no UTF-8 encoder writes. Nothing is written before
+    this returns.
     """
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise ListUnreadable("The file is not UTF-8 text.")
     try:
-        return json.loads(text, parse_constant=_refuse_constant,
-                          object_pairs_hook=_refuse_duplicate_keys)
+        document = json.loads(text, parse_constant=_refuse_constant,
+                              object_pairs_hook=_refuse_duplicate_keys)
     except _DuplicateKey as exc:
         raise ListUnreadable(f"The file is not valid for import: the key {str(exc)!r} appears twice in one object.")
     except RecursionError:
@@ -200,6 +225,54 @@ def parse_list_file(raw: bytes) -> Any:
         # The integer-conversion digit limit (sys.set_int_max_str_digits),
         # whose own text names interpreter settings an operator cannot use.
         raise ListUnreadable("The file contains a number too large to read.")
+    if _holds_lone_surrogate(document):
+        raise ListUnreadable(
+            "The file is not valid for import: a string in it holds an escaped lone surrogate "
+            "(such as \\ud800), which is not a character and cannot be stored."
+        )
+    return document
+
+
+class ProjectLockUnavailable(Exception):
+    """The list would create a project and the project lock could not be taken; nothing has been written."""
+
+
+PROJECT_LOCK_UNAVAILABLE_MESSAGE = (
+    "Captua could not take the lock that keeps two imports from creating the same project, "
+    "so it did not import the list. Try again."
+)
+
+PROJECT_LOCK_NAME = ".project-create.lock"
+
+
+def _take_project_lock() -> Optional[int]:
+    """An exclusive flock on `<imports>/.project-create.lock`, as a file descriptor; None, logged, if it cannot be taken.
+
+    A file lock rather than a database advisory lock: the import already
+    serialises its runs with flocks under the imports directory, the unit's
+    one backend host shares that directory, and SQLite (the test database)
+    has no advisory locks. It blocks until the import holding it has
+    committed its project.
+    """
+    path = reports_dir() / PROJECT_LOCK_NAME
+    fd = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError:
+        logger.exception("Could not lock %s; a list that would create a project is not imported", path)
+        if fd is not None:
+            os.close(fd)
+        return None
+
+
+def _release_project_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
 
 
 class ProjectNeedsAdmin(Exception):
@@ -448,12 +521,36 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     the first import made. Creating one needs `may_create_project`, as
     POST /projects needs an admin; without it, ProjectNeedsAdmin is raised
     before anything is written.
+
+    The project is looked for again and created under an exclusive flock on
+    `<imports>/.project-create.lock`, shared by every import, since the
+    list lock serialises only imports of one list id. When that lock cannot
+    be taken, ProjectLockUnavailable is raised before the project is
+    created: going on unlocked could create a second project of the same
+    normalised name. An existing project is still found without the lock.
     """
     project = _find_project(db, name)
     if project is not None:
         return project, False
     if not may_create_project:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
+    # Looking for the project by its normalised name and creating it are
+    # one step across all imports, whatever their list ids: two lists named
+    # "Basket" and "basket" would otherwise both find none and create two.
+    fd = _take_project_lock()
+    if fd is None:
+        raise ProjectLockUnavailable(PROJECT_LOCK_UNAVAILABLE_MESSAGE)
+    try:
+        return _create_project_locked(db, name, actor, notes)
+    finally:
+        _release_project_lock(fd)
+
+
+def _create_project_locked(db: Session, name: str, actor: Optional[str], notes: Any) -> tuple[Project, bool]:
+    """The body of _project_for that runs under the project lock: look again, then create."""
+    project = _find_project(db, name)
+    if project is not None:
+        return project, False
     description = notes if notes_skip_reason(notes) is None else None
     project = Project(name=_project_name(name), description=description, created_by=actor)
     db.add(project)
@@ -513,18 +610,27 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
     for position, item in enumerate(items, start=1):
         code = _reference_code(item) if isinstance(item, dict) else None
         reason, values = _check_item(position, item, first_code, first_stem)
-        if reason is None:
-            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
-                reason = "reference_code_on_unit"
-            elif db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
-                reason = "filename_stem_on_unit"
         if reason is not None:
             rejects.append(_reject(position, code, reason))
             continue
 
-        volume = Collection(project_id=project_id, created_by=actor, **values)
-        db.add(volume)
+        # The lookups and the insert are one step for the rollback-and-reject
+        # handling: a database failure at any of them costs this item only.
+        # The new id is taken at the flush, before the commit, so nothing is
+        # read back after it: with the session expiring on commit, reading
+        # the id afterwards is a query that can fail for a volume already
+        # committed, which a rollback could no longer remove.
         try:
+            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
+                rejects.append(_reject(position, code, "reference_code_on_unit"))
+                continue
+            if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
+                rejects.append(_reject(position, code, "filename_stem_on_unit"))
+                continue
+            volume = Collection(project_id=project_id, created_by=actor, **values)
+            db.add(volume)
+            db.flush()
+            volume_id = volume.id
             db.commit()
         except IntegrityError as exc:
             db.rollback()
@@ -550,7 +656,7 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             "position": position,
             "referenceCode": values["external_id"],
             "filenameStem": values["filename_stem"],
-            "captuaCollectionId": volume.id,
+            "captuaCollectionId": volume_id,
         })
 
     return {
@@ -907,7 +1013,13 @@ def store_report(report: dict) -> Path:
     directory = reports_dir() / list_id
     directory.mkdir(parents=True, exist_ok=True)
     body = {k: v for k, v in report.items() if k != "reportStored"}
-    data = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
+    try:
+        data = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
+    except UnicodeEncodeError:
+        # A string UTF-8 cannot hold (a lone surrogate, which the parser
+        # refuses before an import starts): written with \\u escapes
+        # instead, so the report is still stored.
+        data = json.dumps(body, ensure_ascii=True, indent=2).encode("ascii")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "wb") as handle:

@@ -63,6 +63,9 @@ What is moved, and how:
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
   reported.
+- A volume whose `<stem>/`, or one of its four directories, resolves
+  outside the projects root (a symbolic link) is not moved, and each of its
+  images is reported as skipped with reason "stem_dir_outside_projects_root".
 - A volume whose `<stem>/` is a live project tree (a project of that
   directory name, or a directory holding `images/`, `packages/` or
   `metadata/project_manifest.jsonl`) is not moved, and each of its images is
@@ -107,6 +110,7 @@ be done and writes nothing.
 
 import argparse
 import errno
+import itertools
 import json
 import logging
 import os
@@ -435,6 +439,28 @@ PROJECT_TREE = object()
 # The target given to a volume whose `<stem>/` holds what is not its own: nothing is moved.
 OCCUPIED = object()
 
+# The target given to a volume whose `<stem>/`, or one of its four
+# directories, resolves outside the projects root (a symbolic link): nothing is moved.
+OUTSIDE_ROOT = object()
+
+
+def _volume_dirs_inside(root: Path, stem: str) -> bool:
+    """Whether `<root>/<stem>/` and each of its four directories resolve inside `root` (resolved).
+
+    A symbolic link at any of them pointing elsewhere would take the
+    masters off the storage, where every reader refuses them.
+    """
+    from app.core.paths import VOLUME_SUBDIRS
+
+    volume = root / stem
+    for p in [volume] + [volume / d for d in VOLUME_SUBDIRS]:
+        try:
+            if not p.resolve().is_relative_to(root):
+                return False
+        except (OSError, RuntimeError):  # unreadable, or a symlink loop
+            return False
+    return True
+
 # app.core.thumbnail.generate_thumbnail: `<uuid4().hex>_thumb.jpg`, in thumbnails/ only.
 _GENERATED_THUMBNAIL = re.compile(r"^[0-9a-f]{32}_thumb\.jpg$")
 
@@ -636,7 +662,11 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 targets[cid] = image_output_dir("", stem=stem).resolve() if stem else None
             except ValueError:
                 targets[cid] = None  # a stem the model's pattern would refuse
-            if targets[cid] is not None and _is_project_tree(targets[cid].parent, project_dirs):
+            if targets[cid] is not None and not _volume_dirs_inside(root, stem):
+                logger.warning(f"Volume layout: {root / stem} or one of its directories resolves outside the "
+                               f"projects root {root}; volume {cid}'s files are not moved there")
+                targets[cid] = OUTSIDE_ROOT
+            if isinstance(targets[cid], Path) and _is_project_tree(targets[cid].parent, project_dirs):
                 targets[cid] = PROJECT_TREE
             if isinstance(targets[cid], Path):
                 foreign = _foreign_entries(db, targets[cid].parent, cid, temps, orphan_thumbnails)
@@ -652,6 +682,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         if target is OCCUPIED:
             skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_occupied",
                             "foreign": occupied[cid]})
+            continue
+        if target is OUTSIDE_ROOT:
+            skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_outside_projects_root"})
             continue
         if target is PROJECT_TREE:
             skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_is_project_tree"})
@@ -833,18 +866,44 @@ def _settle(src: Path, dst: Path) -> Optional[Path]:
     return None
 
 
-def _free_name(e: dict, src: Path, dst: Path) -> Path:
-    """A name in dst's directory for a master whose planned name was taken after planning.
+def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
+    """A name in dst's directory for a master whose planned name was taken after planning, and what took the others.
 
-    For a RAW master the name its sidecar would take in `previews/` must be free too.
+    For a RAW master the name its sidecar would take in `previews/` must be
+    free too. A name is taken by any entry, a directory included. Returns
+    (the name, the files found at every name passed over,
+    `dst` included: masters, and previews for a RAW master), the files
+    resolved and listed by their names on disk, which may differ in case.
     """
-    for stem in _suffixed_stems(src.stem, e["image_id"]):
+    taken: List[Path] = []
+    raw = is_raw_suffix(src)
+    for stem in [dst.stem] + list(itertools.islice(_suffixed_stems(src.stem, e["image_id"]), 10000)):
         cand = dst.with_name(f"{stem}{src.suffix}")
         sidecar = preview_sidecar_of(cand)
-        if not _taken_in(cand.parent, cand.name) and not (
-                is_raw_suffix(src) and _taken_in(sidecar.parent, sidecar.name)):
-            return cand
+        # Any entry takes a name, a directory included; only files are
+        # listed for the report, which names files no row references.
+        if not _taken_in(cand.parent, cand.name) and not (raw and _taken_in(sidecar.parent, sidecar.name)):
+            return cand, taken
+        taken.extend(_entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else []))
     raise AssertionError("unreachable")
+
+
+def _placed_this_run(report: dict) -> Set[Path]:
+    """Every file this run has moved or pointed a row at so far, resolved: masters, sidecars, thumbnails."""
+    out: Set[Path] = set()
+    for key in ("moved", "adopted", "sidecars_moved", "thumbnails_moved"):
+        for item in report[key]:
+            try:
+                out.add(Path(item["to"]).resolve())
+            except (KeyError, OSError, TypeError):
+                continue
+    return out
+
+
+def _entries_named(directory: Path, name: str) -> List[Path]:
+    """The files in `directory` whose names casefold to `name`'s, resolved."""
+    folded = name.casefold()
+    return [p.resolve() for p in _listdir(directory) if p.name.casefold() == folded and p.is_file()]
 
 
 def _record_relocation(root: Path, e: dict, src: Path, dst: Path) -> None:
@@ -914,13 +973,20 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             continue
 
         if src.exists() and dst.exists():
-            new_dst = _free_name(e, src, dst)
+            new_dst, taken = _free_name(e, src, dst)
             logger.warning(f"Volume layout: {dst} was taken after planning; moving {src} to {new_dst}")
-            if dst.resolve() not in {Path(m["to"]).resolve() for m in report["moved"]} \
-                    and str(dst.resolve()) not in report["left_unreferenced"]:
-                logger.warning(f"Volume layout: {dst} took the name of image {e['image_id']}'s master after "
-                               "planning and is left where it is")
-                report["left_unreferenced"].append(str(dst.resolve()))
+            # Only files no row references are strays: one a row names (a
+            # master written since the plan, or a pending journal's) is that
+            # row's, and so is every file this run has already put in place.
+            # Those rows are not in the database yet: the batch commits at
+            # its end and the session does not autoflush.
+            owned = (set(_owners(db)) | _placed_this_run(report)) if taken else set()
+            for f in taken:
+                if f in owned or str(f) in report["left_unreferenced"]:
+                    continue
+                logger.warning(f"Volume layout: {f} took a name image {e['image_id']}'s master was planned to "
+                               "take, after planning, and is left where it is")
+                report["left_unreferenced"].append(str(f))
             e["to"] = str(new_dst)
             if e["sidecar_from"]:
                 e["sidecar_to"] = str(preview_sidecar_of(new_dst))
@@ -1050,13 +1116,13 @@ def _records_to_copy(root: Path, wanted: Dict[int, Tuple[Path, Set[str]]]) -> Di
     the source. A line the volume's manifest already holds is not copied
     again, so a replayed batch adds nothing.
     """
-    from app.core.integrity import _manifests, manifest_base
+    from app.core.integrity import _manifests, manifest_base, read_manifest_lines
 
     own = {cid: vol / "metadata" / "manifest.jsonl" for cid, (vol, _) in wanted.items()}
     present: Dict[int, Set[str]] = {}
     for cid, path in own.items():
         try:
-            present[cid] = set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+            present[cid] = set(read_manifest_lines(path)[0]) if path.exists() else set()
         except OSError as e:
             raise VolumeLayoutError(f"The manifest {path} is unreadable: {e}") from e
     by_capture: Dict[str, List[int]] = {}
@@ -1070,7 +1136,7 @@ def _records_to_copy(root: Path, wanted: Dict[int, Tuple[Path, Set[str]]]) -> Di
         resolved = manifest.resolve()
         base = manifest_base(manifest, root)
         try:
-            lines = manifest.read_text(encoding="utf-8").splitlines()
+            lines, _ = read_manifest_lines(manifest)
         except OSError as e:
             logger.warning(f"Volume layout: could not read {manifest} to copy volumes' records: {e}")
             continue
@@ -1380,6 +1446,7 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
     skips the pass (a walk of the tree for the manifests' paths and a stat
     of each remain) and still reports them.
     """
+    from app.core.integrity import read_manifest_lines
     from capture.manifestHandler import append_manifest_lines
 
     rows = (db.query(Collection.id, Collection.filename_stem, RecordImage.capture_id, RecordImage.file_path)
@@ -1405,7 +1472,7 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
         own = vol / "metadata" / "manifest.jsonl"
         have: Set[str] = set()
         try:
-            lines = own.read_text(encoding="utf-8").splitlines() if own.exists() else []
+            lines = read_manifest_lines(own)[0] if own.exists() else []
         except OSError as e:
             logger.error(f"Volume layout: could not read {own} to check volume {cid}'s records: {e}")
             continue

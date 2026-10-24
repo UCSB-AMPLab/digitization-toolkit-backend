@@ -153,3 +153,145 @@ def test_a_preview_at_a_passed_over_name_is_reported(db_session, legacy):
 
     assert str(first.resolve()) in report["left_unreferenced"]
     assert str(second.resolve()) in report["left_unreferenced"]
+
+
+# ---------------------------------------------------------------------------
+# Names taken after planning
+# ---------------------------------------------------------------------------
+
+def _plant_after_planning(vl, monkeypatch, image_id, plant):
+    """Wrap _plan so that, once it has planned `image_id`'s move, `plant(planned destination)` runs."""
+    real_plan = vl._plan
+
+    def plan_then_plant(*a, **k):
+        out = real_plan(*a, **k)
+        for b in out[0]:
+            for e in b["entries"]:
+                if e["image_id"] == image_id:
+                    plant(vl.Path(e["to"]))
+        return out
+
+    monkeypatch.setattr(vl, "_plan", plan_then_plant)
+
+
+@pytest.mark.unit
+def test_a_late_occupant_that_a_row_references_is_not_reported_as_unreferenced(db_session, legacy, monkeypatch):
+    import app.core.volume_layout as vl
+    from app.models.record import Record, RecordImage
+
+    planted = []
+
+    def plant(dst):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"another row's master")
+        rec = Record(title="r", collection_id=legacy["a2"].id, status="captured", capture_mode="single")
+        db_session.add(rec)
+        db_session.flush()
+        db_session.add(RecordImage(record_id=rec.id, filename=dst.name, file_path=str(dst), format="jpg"))
+        db_session.flush()
+        planted.append(dst.resolve())
+
+    _plant_after_planning(vl, monkeypatch, legacy["i2"].id, plant)
+
+    report = vl.migrate_volume_layout(db_session)
+
+    assert planted
+    assert str(planted[0]) not in report["left_unreferenced"]
+    moved = {m["image_id"]: m["to"] for m in report["moved"]}
+    assert moved[legacy["i2"].id].endswith(f"IMG_0002_img{legacy['i2'].id}.jpg")
+
+
+@pytest.mark.unit
+def test_every_name_taken_after_planning_is_reported_previews_included(db_session, legacy, monkeypatch):
+    """IMG_0001.CR2 and IMG_0001_img<id>.CR2 in captures/, and the preview of _img<id>_2, appear after planning."""
+    import app.core.volume_layout as vl
+
+    iid = legacy["i1"].id
+    planted = []
+
+    def plant(dst):
+        captures = dst.parent
+        previews = captures.parent / "previews"
+        captures.mkdir(parents=True, exist_ok=True)
+        previews.mkdir(parents=True, exist_ok=True)
+        for f in (dst, captures / f"IMG_0001_img{iid}.CR2", previews / f"IMG_0001_img{iid}_2_preview.jpg"):
+            f.write_bytes(b"arrived after planning")
+            planted.append(f.resolve())
+
+    _plant_after_planning(vl, monkeypatch, iid, plant)
+
+    report = vl.migrate_volume_layout(db_session)
+
+    moved = {m["image_id"]: m["to"] for m in report["moved"]}
+    assert moved[iid].endswith(f"IMG_0001_img{iid}_3.CR2")
+    for f in planted:
+        assert str(f) in report["left_unreferenced"], f
+        assert f.read_bytes() == b"arrived after planning"
+
+
+@pytest.mark.unit
+def test_a_directory_at_the_planned_name_after_planning_counts_as_taken(db_session, legacy, monkeypatch):
+    """A directory, not only a file, takes the name: the master moves to the next free one, not reported missing."""
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    iid = legacy["i1"].id
+    planted = []
+
+    def plant(dst):
+        dst.mkdir(parents=True)
+        planted.append(dst)
+
+    _plant_after_planning(vl, monkeypatch, iid, plant)
+
+    report = vl.migrate_volume_layout(db_session)
+
+    moved = {m["image_id"]: m["to"] for m in report["moved"]}
+    assert moved[iid].endswith(f"IMG_0001_img{iid}.CR2")
+    assert not [s for s in report["skipped"] if s["image_id"] == iid]
+    db_session.expire_all()
+    master = vl.Path(db_session.get(RecordImage, iid).file_path)
+    assert master.name == f"IMG_0001_img{iid}.CR2" and master.read_bytes() == b"bytes of IMG_0001.CR2"
+    assert planted[0].is_dir()
+    # left_unreferenced lists files; the directory is not one.
+    assert str(planted[0].resolve()) not in report["left_unreferenced"]
+
+
+@pytest.mark.unit
+def test_a_master_moved_earlier_in_the_batch_is_never_reported_as_unreferenced(db_session, legacy, monkeypatch):
+    """IMG_0002 is pushed by a late file into IMG_0002_img<id>.jpg, the name another row of the batch was planned to take.
+
+    Production sessions do not autoflush and the batch commits at its end, so
+    the earlier move is not yet in the database when the later entry meets it.
+    """
+    from sqlalchemy.orm import sessionmaker
+    import app.core.volume_layout as vl
+    from app.models.record import Record, RecordImage
+
+    i2 = legacy["i2"].id
+    other = legacy["root"] / "proj" / "tomo_1" / "images" / "main" / f"IMG_0002_img{i2}.jpg"
+    other.write_bytes(b"a page whose name is a clash name")
+    rec = Record(title="r", collection_id=legacy["a2"].id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    row = RecordImage(record_id=rec.id, filename=other.name, file_path=str(other), format="jpg", role="single")
+    db_session.add(row)
+    db_session.commit()
+
+    def plant(dst):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"arrived after planning")
+
+    _plant_after_planning(vl, monkeypatch, i2, plant)
+    session = sessionmaker(bind=db_session.get_bind(), autoflush=False)()
+    try:
+        report = vl.migrate_volume_layout(session)
+    finally:
+        session.close()
+
+    moved = {m["image_id"]: vl.Path(m["to"]).resolve() for m in report["moved"]}
+    assert moved[i2].name == f"IMG_0002_img{i2}.jpg"
+    assert str(moved[i2]) not in report["left_unreferenced"]
+    assert str(moved[row.id]) not in report["left_unreferenced"]
+    late = (legacy["root"] / STEMS["a2"] / "captures" / "IMG_0002.jpg").resolve()
+    assert str(late) in report["left_unreferenced"]
