@@ -328,12 +328,14 @@ def verify_images_against_manifest(images) -> List[dict]:
     is skipped, as there is no capture-time fixity to check: an upload made
     before uploads were written to the manifest is one. A later upload is
     checked against its upload record. A missing file is skipped too; it is
-    a separate failure the caller handles. Read-only.
+    a separate failure the caller handles. So is a master freed from the
+    card (app.core.offsite_free): its bytes are in the bucket, verified by
+    SHA1 when it was freed. Read-only.
     """
     index = build_fixity_index(config.settings.projects_dir.resolve())
     mismatches: List[dict] = []
     for img in images:
-        if not img.capture_id:
+        if not img.capture_id or getattr(img, "master_freed_at", None) is not None:
             continue
         resolved = resolve_within_storage(img.file_path)
         if resolved is None or not resolved.exists():
@@ -377,11 +379,27 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
 
     referenced: set = set()
     missing_files: List[dict] = []
+    freed_files: List[dict] = []
     missing_thumbnails: List[dict] = []
+    # A RAW preview kept on the card after its master was freed (a hand
+    # clearance of the masters only) has its master's name to go by.
+    kept_previews: set = set()
 
     for img in images:
         resolved = resolve_within_storage(img.file_path)
-        if resolved is None or not resolved.exists():
+        if img.master_freed_at is not None:
+            # Stored offsite and freed from the card on purpose: not missing (NEH-248).
+            freed_files.append({
+                "record_image_id": img.id,
+                "record_id": img.record_id,
+                "file_path": img.file_path,
+                "freed_at": img.master_freed_at.isoformat(),
+            })
+            if resolved is not None and is_raw_suffix(resolved) and img.preview_freed_at is None:
+                kept_previews.add(str(preview_sidecar_of(resolved)))
+            if resolved is not None and resolved.exists():
+                referenced.add(str(resolved))  # still on the card: its row's, not an orphan
+        elif resolved is None or not resolved.exists():
             missing_files.append({
                 "record_image_id": img.id,
                 "record_id": img.record_id,
@@ -418,6 +436,7 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         for k in known
         if is_raw_suffix(Path(k)) and Path(k).is_file()
     }
+    known |= kept_previews
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []
@@ -442,7 +461,7 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         # files rather than the first N - a bounded but representative sweep.
         eligible: List[Tuple] = []
         for img in images:
-            if not img.capture_id:
+            if not img.capture_id or img.master_freed_at is not None:
                 continue
             resolved = resolve_within_storage(img.file_path)
             if resolved is None or not resolved.exists():
@@ -486,6 +505,7 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     summary = {
         "db_images": len(images),
         "missing_files": len(missing_files),
+        "freed_files": len(freed_files),
         "missing_thumbnails": len(missing_thumbnails),
         "orphan_files": len(orphan_files),
         "hashes_checked": hashes_checked,
@@ -507,6 +527,7 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     return {
         "summary": summary,
         "missing_files": missing_files,
+        "freed_files": freed_files,
         "missing_thumbnails": missing_thumbnails,
         "orphan_files": orphan_files,
         "manifest_mismatches": manifest_mismatches,

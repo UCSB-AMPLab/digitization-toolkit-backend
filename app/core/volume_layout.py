@@ -59,6 +59,9 @@ What is moved, and how:
   check follows it to its new name. A move that keeps the name needs no
   record: the integrity check finds the file by name under its capture id,
   and the old per-project manifests stay where they are and are still read.
+- A row whose master was freed from the card (app.core.offsite_free) and
+  whose file is absent is skipped with reason "freed", never "missing": the
+  file is stored offsite, and a restore puts it back at its stored path.
 - Only files under the active projects root move, and they stay on it. Files
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
@@ -527,12 +530,14 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
       restored row's moved file can still be adopted;
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
-    - in `metadata/`, `manifest.jsonl`, always (see owned()), and the
-      `manifest.jsonl.part` an earlier version's crashed copy left.
+    - in `metadata/`, `manifest.jsonl`, always (see owned()), the
+      `manifest.jsonl.part` an earlier version's crashed copy left, and the
+      `offsite-freed-*.jsonl` / `offsite-restored-*.jsonl` run manifests.
     Anything else is foreign: another entry at the top, a directory inside
     one of the four, or any other file. A directory is listed, not walked.
     Nothing when `<stem>/` does not exist.
     """
+    from app.core.offsite_free import RUN_MANIFEST_PATTERN
     from app.core.paths import CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
     from capture.manifestHandler import MANIFEST_PART_NAME
 
@@ -565,6 +570,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
             return name in thumbs or (name.endswith("_thumb.jpg") and stem_owned(f.name[: -len("_thumb.jpg")]))
         if sub == METADATA_DIR and f.name == MANIFEST_PART_NAME:
             return True  # left by an earlier version's copy; removed at the start of a run
+        if sub == METADATA_DIR and RUN_MANIFEST_PATTERN.match(f.name):
+            return True  # a free's or a restore's record (app.core.offsite_free)
         if sub == METADATA_DIR and f.name == "manifest.jsonl":
             # Never foreign: append-only, it keeps records of deleted captures,
             # of records moved out and of copies naming other volumes'
@@ -691,6 +698,12 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             continue
         if src.parent == target:
             continue  # stored through another spelling of the same directory
+        if img.master_freed_at is not None and not src.is_file():
+            # Stored offsite and freed from the card: nothing here to move,
+            # and not missing (NEH-248). A restore puts it back at its
+            # stored path, and the next run moves it then.
+            skipped.append({"image_id": iid, "path": str(src), "reason": "freed"})
+            continue
 
         entry = {
             "image_id": iid,
@@ -1580,8 +1593,13 @@ def _log_report(report: dict) -> None:
         )
     for f in report["failed"]:
         logger.error(f"Volume layout: image {f['image_id']} not moved, left at {f['path']}: {f['error']}")
+    freed = [s for s in report["skipped"] if s["reason"] == "freed"]
+    if freed:
+        logger.info(f"Volume layout: {len(freed)} image(s) out of place are freed from the card "
+                    "(stored offsite); they are moved after a restore")
     for s in report["skipped"]:
-        logger.warning(f"Volume layout: image {s['image_id']} not moved ({s['reason']}): {s['path']}")
+        if s["reason"] != "freed":
+            logger.warning(f"Volume layout: image {s['image_id']} not moved ({s['reason']}): {s['path']}")
     for s in report["sidecars_pending"] + report["sidecars_not_moved"]:
         logger.warning(f"Volume layout: sidecar not yet beside its master, still at {s.get('from') or s.get('path')}")
     for p in report["left_unreferenced"]:

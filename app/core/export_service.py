@@ -118,6 +118,14 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     to_copy = []   # (rel_under_data, resolved_src, img)
     missing = []
     used_names: dict = {}
+    # Re-checked in the worker, as the workflow gate is: a free can follow
+    # the request. A freed master is stored offsite, not missing.
+    freed = [i.id for rec in records for i in rec.images if i.is_current and i.master_freed_at is not None]
+    if freed:
+        from app.core.offsite_free import FREED_EXPORT_MESSAGE
+        raise ExportError(FREED_EXPORT_MESSAGE.format(n=len(freed)),
+                          detail={"reason": "freed_files", "freed_image_ids": freed})
+
     for idx, rec in enumerate(records):
         seq_label = f"{idx + 1:04d}"
         safe_title = "".join(c if c.isalnum() or c in "-_ " else "_" for c in (rec.title or "record"))[:60]
