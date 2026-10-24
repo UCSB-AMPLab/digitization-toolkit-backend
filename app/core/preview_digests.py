@@ -31,15 +31,18 @@ give a digest for (`already_recorded`), one with no capture id
 (`no_capture_id`), one whose file has been freed (`freed`, from
 record_images.preview_freed_at where the column exists) or is otherwise not
 on disk (`missing`), one outside the volume's directory (`outside_volume`),
-one whose file changed while it was read or whose row changed meanwhile
-(`unreadable`), and one whose SHA1 differs from its offsite row
+one whose file changed while it was read (`unreadable`), one whose row is
+gone, has left the volume or names another file by the time it is read
+(`changed`), and one whose SHA1 differs from its offsite row
 (`sha1_differs`).
 
 Run as `python -m app.core.image_upload backfill-preview-digests <stem>`,
 a dry run unless `--apply`. It runs in a process of its own, outside the
-backend's read hold, so each file is identified by its inode on both sides
-of the hash and the image's row must still name it afterwards, as adoption
-does (app.core.image_upload.adopt_objects).
+backend's read hold. As adoption does (app.core.image_upload.adopt_objects),
+the image's row is read again before the hash, and the path and capture id
+come from that read, not from the listing query; the file is identified by
+its inode on both sides of the hash, and the row must read the same
+afterwards.
 """
 
 import json
@@ -74,7 +77,7 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
     from app.core import audit
     from app.core.image_upload import _image_state, stable_digests
     from app.core.integrity import build_fixity_index
-    from app.core.paths import is_raw_suffix, preview_sidecar_of
+    from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
@@ -99,21 +102,32 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
 
     report = {"stem": stem, "applied": apply, "backfilled": [], "already_recorded": 0,
               "no_capture_id": [], "freed": [], "missing": [], "outside_volume": [],
-              "unreadable": [], "sha1_differs": []}
+              "unreadable": [], "changed": [], "sha1_differs": []}
     lines = []
     for img in images:
         if not img.file_path or not is_raw_suffix(Path(img.file_path)):
             continue
         entry = {"image_id": img.id, "record_id": img.record_id, "current": bool(img.is_current)}
-        if not img.capture_id:
+        # The query above is a snapshot. The row is read again, and only
+        # that read is used: it must still exist and still be in this
+        # volume, and its path and capture id are the ones that count.
+        state = _image_state(db, img.id)
+        if state is None or state.collection_id != collection.id:
+            report["changed"].append(entry)
+            continue
+        if not state.file_path or not is_raw_suffix(Path(state.file_path)):
+            report["changed"].append(entry)
+            continue
+        if not state.capture_id:
             report["no_capture_id"].append(entry)
             continue
-        try:
-            preview = preview_sidecar_of(Path(img.file_path).resolve())
-        except OSError:
-            preview = preview_sidecar_of(Path(img.file_path))
+        master = resolve_within_storage(state.file_path)
+        preview = resolve_within_storage(str(preview_sidecar_of(master))) if master is not None else None
+        if preview is None:
+            report["outside_volume"].append(entry)
+            continue
         entry["path"] = str(preview)
-        if index.expected(img.capture_id, None, preview) is not None:
+        if index.expected(state.capture_id, None, preview) is not None:
             report["already_recorded"] += 1
             continue
         if _preview_freed(img):
@@ -126,16 +140,17 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
             report["outside_volume"].append(entry)
             continue
 
-        state = _image_state(db, img.id)
         try:
             before = preview.stat()
             digests = stable_digests(preview)
             after = preview.stat()
         except OSError:
             digests = None
-        if (digests is None or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
-                or _image_state(db, img.id) != state):
+        if digests is None or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino):
             report["unreadable"].append(entry)
+            continue
+        if _image_state(db, img.id) != state:
+            report["changed"].append(entry)
             continue
         sha1, sha256 = digests
 
@@ -149,7 +164,7 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
         relative = str(preview.relative_to(volume_dir))
         lines.append(json.dumps({
             "record_type": PREVIEW_DIGEST_RECORD_TYPE,
-            "capture_id": img.capture_id,
+            "capture_id": state.capture_id,
             "image_id": img.id,
             "files": [{"role": f"{img.role or 'single'}_preview", "relative_path": relative,
                        "bytes": after.st_size, "mimetype": "image/jpeg", "sha256": sha256}],
@@ -166,5 +181,6 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
                         detail=(f"backfilled={len(report['backfilled'])} "
                                 f"already_recorded={report['already_recorded']} "
                                 f"sha1_differs={len(report['sha1_differs'])} freed={len(report['freed'])} "
-                                f"missing={len(report['missing'])} unreadable={len(report['unreadable'])}"))
+                                f"missing={len(report['missing'])} unreadable={len(report['unreadable'])} "
+                                f"changed={len(report['changed'])}"))
     return report

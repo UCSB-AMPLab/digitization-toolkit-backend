@@ -248,3 +248,91 @@ def test_the_command_line(vol, db_session, capsys):
     assert main(["backfill-preview-digests", STEM, "--apply"]) == 0
     assert len(_lines(vol.manifest)) == 2
     assert main(["backfill-preview-digests", "no-such-stem"]) == 2
+
+
+# ---------------------------------------------------------------------------
+# The row is read again before and after the hash, and only that read counts
+# ---------------------------------------------------------------------------
+
+def _change_before_the_state_read(monkeypatch, db, image_id, sql):
+    """Run `sql` on the image's row just before the backfill first reads its state."""
+    from sqlalchemy import text
+    import app.core.image_upload as iu
+
+    real = iu._image_state
+    done = []
+
+    def change_then_read(session, iid):
+        if iid == image_id and not done:
+            done.append(iid)
+            db.execute(text(sql), {"id": image_id})
+            db.commit()
+        return real(session, iid)
+
+    monkeypatch.setattr(iu, "_image_state", change_then_read)
+
+
+@pytest.mark.unit
+def test_an_image_deleted_before_its_state_is_read_is_reported(vol, db_session, monkeypatch):
+    img, _ = vol.image()
+    image_id = img.id
+    before = vol.manifest.read_bytes()
+    _change_before_the_state_read(monkeypatch, db_session, image_id, "DELETE FROM record_images WHERE id = :id")
+    report = _backfill(db_session, apply=True)
+    assert report["backfilled"] == []
+    assert [e["image_id"] for e in report["changed"]] == [image_id]
+    assert vol.manifest.read_bytes() == before
+
+
+@pytest.mark.unit
+def test_an_image_moved_out_before_its_state_is_read_is_reported(vol, db_session, monkeypatch, override_projects_root):
+    other = Vol(db_session, override_projects_root, stem="co-test-other")
+    img, _ = vol.image()
+    before = vol.manifest.read_bytes()
+    _change_before_the_state_read(
+        monkeypatch, db_session, img.id,
+        f"UPDATE records SET collection_id = {other.col.id} "
+        "WHERE id = (SELECT record_id FROM record_images WHERE id = :id)")
+    report = _backfill(db_session, apply=True)
+    assert report["backfilled"] == []
+    assert [e["image_id"] for e in report["changed"]] == [img.id]
+    assert vol.manifest.read_bytes() == before
+
+
+@pytest.mark.unit
+def test_the_path_and_capture_id_come_from_the_fresh_row(vol, db_session, monkeypatch):
+    """A row renamed before its state is read is backfilled at its new name, under its current capture id."""
+    img, data = vol.image()
+    new_master = vol.dir / "captures" / f"{STEM}-img_0099_c0.cr2"
+    vol.preview_path(img).rename(vol.dir / "previews" / f"{STEM}-img_0099_c0_preview.jpg")
+    _change_before_the_state_read(
+        monkeypatch, db_session, img.id,
+        f"UPDATE record_images SET file_path = '{new_master}', capture_id = 'cap-fresh' WHERE id = :id")
+    report = _backfill(db_session, apply=True)
+    [entry] = report["backfilled"]
+    assert entry["relative_path"] == f"previews/{STEM}-img_0099_c0_preview.jpg"
+    rec = _lines(vol.manifest)[-1]
+    assert rec["capture_id"] == "cap-fresh"
+    assert rec["files"][0]["relative_path"] == f"previews/{STEM}-img_0099_c0_preview.jpg"
+    assert rec["files"][0]["sha256"] == _sha256(data)
+
+
+@pytest.mark.unit
+def test_an_image_changed_while_its_preview_is_hashed_is_reported(vol, db_session, monkeypatch):
+    from sqlalchemy import text
+    import app.core.image_upload as iu
+
+    img, _ = vol.image()
+    real = iu.stable_digests
+
+    def hash_then_move(path):
+        out = real(path)
+        db_session.execute(text("UPDATE record_images SET file_path = 'elsewhere.cr2' WHERE id = :id"),
+                           {"id": img.id})
+        db_session.commit()
+        return out
+
+    monkeypatch.setattr(iu, "stable_digests", hash_then_move)
+    report = _backfill(db_session, apply=True)
+    assert report["backfilled"] == []
+    assert [e["image_id"] for e in report["changed"]] == [img.id]
