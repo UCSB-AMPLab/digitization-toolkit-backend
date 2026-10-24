@@ -33,6 +33,11 @@ class Settings(BaseSettings):
     # is write + list only, which is why the upload skips the destination check.
     OFFSITE_REMOTE: str = Field(default="", validation_alias="DTK_OFFSITE_REMOTE")
     OFFSITE_DB_PREFIX: str = Field(default="db-backups", validation_alias="DTK_OFFSITE_DB_PREFIX")
+    # The tenant prefix image objects are keyed under, relative to
+    # OFFSITE_REMOTE: `<tenant>/<stem>/captures/<file>` (contract 1.1 §4).
+    # Empty disables image upload, as an empty OFFSITE_REMOTE does
+    # (app.core.image_upload). Read from offsite.env like the keys above.
+    OFFSITE_TENANT: str = Field(default="", validation_alias="DTK_OFFSITE_TENANT")
     # The interim push on the Rionegro unit has run at 750 KB/s since 2026-08-20
     # over a ~12 Mbps link without starving the UI; its settings are the defaults.
     OFFSITE_BWLIMIT: str = Field(default="750k", validation_alias="DTK_OFFSITE_BWLIMIT")

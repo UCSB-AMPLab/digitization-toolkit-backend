@@ -230,6 +230,28 @@ def get_collection(
     return CollectionRead.model_validate(collection)
 
 
+@router.get("/{collection_id}/offsite")
+def get_collection_offsite_state(
+    collection_id: int,
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency)
+):
+    """The volume's received indicator (NEH-227), derived from its objects' rows.
+
+    `received` is true when the volume has objects to upload and every one is
+    verified. `refusals` lists each object refused because the bucket already
+    held another file at its key, with both SHA1s. A route of its own rather
+    than fields on CollectionRead, so listing volumes does not derive this
+    for each of them.
+    """
+    from app.core.image_upload import volume_upload_state
+
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return volume_upload_state(db, collection)
+
+
 @router.get("/{collection_id}/hierarchy", response_model=CollectionWithChildren)
 def get_collection_hierarchy(
     collection_id: int,

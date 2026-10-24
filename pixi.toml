@@ -63,6 +63,11 @@ db-history = "alembic history"
 # once dropped by an unreviewed autogenerate.
 db-check-drift = { cmd = "alembic check", depends-on = ["db-upgrade"] }
 
+# Offsite image upload (NEH-227): record objects an earlier script put in the
+# bucket as the keys of matching local images. Reports only, unless --apply.
+#   pixi run offsite-adopt <prefix> [--apply]
+offsite-adopt = "python -m app.core.image_upload adopt"
+
 # Testing
 test-cameras = "python test/test_cameras.py"
 

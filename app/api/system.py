@@ -118,7 +118,8 @@ def get_catalogue_backup_state(
     current_user: User = Depends(allow_read_only),
     db: Session      = Depends(get_db_dependency),
 ):
-    """Report when the catalogue was last verified offsite (NEH-249).
+    """Report when the catalogue was last verified offsite (NEH-249), and the
+    image upload's unit-level summary (NEH-227) under `images`.
 
     Read-only, and deliberately visible to every role that can see the rest of
     the system panel: a backup whose state nobody can see is a backup nobody
@@ -129,6 +130,7 @@ def get_catalogue_backup_state(
     """
     from app.core.catalogue_backup import last_verified_backup
     from app.core.config import settings
+    from app.core.image_upload import unit_upload_summary
 
     state = last_verified_backup(db)
     return {
@@ -136,6 +138,8 @@ def get_catalogue_backup_state(
         "last_verified_at": state["verified_at"] if state else None,
         "object":           state["object"] if state else None,
         "detail":           state["detail"] if state else None,
+        # Per-volume counts are on GET /collections/{id}/offsite.
+        "images":           unit_upload_summary(db),
     }
 
 
