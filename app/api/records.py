@@ -409,8 +409,20 @@ async def add_image_to_record(
 			detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
 		)
 	
-	# Create upload directory
-	uploads_dir = settings.data_dir / "uploads"
+	# A record of a volume with a stem keeps its upload in `<stem>/captures/`
+	# and the thumbnail in `<stem>/thumbnails/`, as a capture does; any other
+	# upload goes to the data directory's uploads/. The name is a uuid either way.
+	stem = rec.collection.filename_stem if rec.collection is not None else None
+	if stem:
+		from capture.project_manager import ensure_volume_dirs
+		from app.core.paths import CAPTURES_DIR, THUMBNAILS_DIR
+
+		volume = ensure_volume_dirs(stem)
+		uploads_dir = volume / CAPTURES_DIR
+		thumbnails_dir = volume / THUMBNAILS_DIR
+	else:
+		uploads_dir = settings.data_dir / "uploads"
+		thumbnails_dir = settings.data_dir / "thumbnails"
 	uploads_dir.mkdir(parents=True, exist_ok=True)
 	
 	# Generate unique filename
@@ -450,7 +462,6 @@ async def add_image_to_record(
 	# Generate thumbnail
 	thumbnail_path = None
 	try:
-		thumbnails_dir = settings.data_dir / "thumbnails"
 		thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
 	except Exception as e:
 		logger.warning(f"Failed to generate thumbnail for {file.filename}: {e}")
