@@ -231,6 +231,9 @@ def check_envelope(document: Any) -> tuple[str, str, list]:
     name = meta.get("name") if isinstance(meta, dict) else None
     if not isinstance(name, str) or not name.strip():
         raise ListRefused("The file has no list name, which the project is named after.")
+    if "\x00" in name:
+        # Postgres text cannot hold NUL; psycopg refuses it at the insert.
+        raise ListRefused("The list name contains a NUL character.")
     if len(_project_name(name)) > _PROJECT_NAME_MAX_LENGTH:
         raise ListRefused(f"The list name is longer than {_PROJECT_NAME_MAX_LENGTH} characters.")
     items = document.get("items")
@@ -290,7 +293,9 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     code = _reference_code(item)
     if code is None:
         return "missing_reference_code", {}
-    if not isinstance(code, str) or len(code) > _EXTERNAL_ID_MAX_LENGTH:
+    # NUL anywhere in a text column is refused by Postgres (psycopg raises
+    # DataError at the insert), so it is a reject here, before the database.
+    if not isinstance(code, str) or len(code) > _EXTERNAL_ID_MAX_LENGTH or "\x00" in code:
         return "invalid_reference_code", {}
     if code != code.strip():
         return "reference_code_padded", {}
@@ -318,7 +323,7 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     title = item.get("title")
     if title is None or (isinstance(title, str) and not title.strip()):
         return "missing_title", {}
-    if not isinstance(title, str) or len(title) > _NAME_MAX_LENGTH:
+    if not isinstance(title, str) or len(title) > _NAME_MAX_LENGTH or "\x00" in title:
         return "invalid_title", {}
 
     dates = item.get("dates")
@@ -327,7 +332,9 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     if not isinstance(dates, dict):
         return "invalid_dates", {}
     display = dates.get("display")
-    if display is not None and (not isinstance(display, str) or len(display) > _DATE_MAX_LENGTH):
+    if display is not None and (
+        not isinstance(display, str) or len(display) > _DATE_MAX_LENGTH or "\x00" in display
+    ):
         return "invalid_dates", {}
     ok_start, start = _parse_date(dates.get("start"))
     ok_end, end = _parse_date(dates.get("end"))
@@ -374,6 +381,28 @@ def _name_key(name: str) -> str:
     return _project_name(name).casefold()
 
 
+# The longest list.notes stored as a project's description.
+NOTES_MAX_LENGTH = 10_000
+
+
+def notes_skip_reason(notes: Any) -> Optional[str]:
+    """Why list.notes cannot be a project's description, or None if it can.
+
+    None or a missing field counts as blank: there are no notes to store.
+    """
+    if notes is None:
+        return "blank"
+    if not isinstance(notes, str):
+        return "not_a_string"
+    if not notes.strip():
+        return "blank"
+    if len(notes) > NOTES_MAX_LENGTH:
+        return "too_long"
+    if "\x00" in notes:
+        return "contains_nul"
+    return None
+
+
 def _find_project(db: Session, name: str) -> Optional[Project]:
     """The project whose name matches the list's name by _name_key, or None.
 
@@ -393,8 +422,9 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     """The project named `name`, created if there is none. Returns (project, created).
 
     A project created here takes the list's `notes` (the contract's
-    "optional operator instructions") as its description, when they are a
-    non-blank string. An existing project's description is never touched.
+    "optional operator instructions") as its description, when
+    notes_skip_reason finds nothing against them. An existing project's
+    description is never touched.
 
     An existing project of that name is reused: a project is a grouping in
     the catalogue only, and re-importing a list has to land in the project
@@ -407,7 +437,7 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
         return project, False
     if not may_create_project:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
-    description = notes if isinstance(notes, str) and notes.strip() else None
+    description = notes if notes_skip_reason(notes) is None else None
     project = Project(name=_project_name(name), description=description, created_by=actor)
     db.add(project)
     try:
@@ -450,6 +480,9 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
     project_name = project.name
     # Stored only when this import created the project with a description.
     notes_stored = project_created and project.description is not None
+    notes_skipped = None if notes_stored else (
+        notes_skip_reason(notes) if project_created else "project_exists"
+    )
 
     first_code = _first_positions(items, _reference_code)
     first_stem = _first_positions(items, lambda item: item.get("filenameStem"))
@@ -499,6 +532,7 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
         "projectName": project_name,
         "projectCreated": project_created,
         "projectNotesStored": notes_stored,
+        "projectNotesSkipped": notes_skipped,
         "importedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "importedBy": actor,
         "created": len(created),

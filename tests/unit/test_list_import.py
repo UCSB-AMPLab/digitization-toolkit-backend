@@ -924,8 +924,12 @@ def test_a_new_project_takes_the_lists_notes_as_its_description(client, db_sessi
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("notes", [None, "", "   ", 5])
-def test_no_notes_leave_a_new_projects_description_empty(client, db_session, reports_root, notes):
+@pytest.mark.parametrize("notes, reason", [
+    (None, "blank"), ("", "blank"), ("   ", "blank"),
+    (5, "not_a_string"), ({"a": 1}, "not_a_string"), (["x"], "not_a_string"), (True, "not_a_string"),
+    ("n" * 10_001, "too_long"), ("con\u0000nul", "contains_nul"),
+], ids=["none", "empty", "spaces", "int", "object", "array", "bool", "too_long", "nul"])
+def test_unusable_notes_leave_a_new_projects_description_empty(client, db_session, reports_root, notes, reason):
     from app.models.project import Project
 
     doc = _load(VALID)
@@ -934,6 +938,29 @@ def test_no_notes_leave_a_new_projects_description_empty(client, db_session, rep
     report = _post(client, doc).json()
     assert db_session.query(Project).one().description is None
     assert report["projectNotesStored"] is False
+    assert report["projectNotesSkipped"] == reason
+
+
+@pytest.mark.unit
+def test_notes_of_exactly_10000_characters_are_stored(client, db_session, reports_root):
+    from app.models.project import Project
+
+    doc = _load(VALID)
+    doc["list"]["notes"] = "n" * 10_000
+    _as("op", "admin")
+    report = _post(client, doc).json()
+    assert db_session.query(Project).one().description == "n" * 10_000
+    assert report["projectNotesStored"] is True
+    assert report["projectNotesSkipped"] is None
+
+
+@pytest.mark.unit
+def test_a_missing_notes_field_is_blank(client, db_session, reports_root):
+    doc = _load(VALID)
+    del doc["list"]["notes"]
+    _as("op", "admin")
+    report = _post(client, doc).json()
+    assert report["projectNotesStored"] is False and report["projectNotesSkipped"] == "blank"
 
 
 @pytest.mark.unit
@@ -949,6 +976,7 @@ def test_an_existing_projects_description_is_never_overwritten(client, db_sessio
     db_session.expire_all()
     assert db_session.query(Project).one().description == existing
     assert report["projectNotesStored"] is False
+    assert report["projectNotesSkipped"] == "project_exists"
 
 
 # ---------------------------------------------------------------------------
@@ -1177,3 +1205,45 @@ def test_a_whole_import_without_hard_links(db_session, reports_root, monkeypatch
     assert r1["reportStored"] is True
     with pytest.raises(li.ListIdReused):
         _second_import(db_session)
+
+
+# ---------------------------------------------------------------------------
+# NUL characters, which Postgres text cannot hold
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_list_name_with_nul_is_refused_at_the_envelope(client, db_session, reports_root):
+    from app.models.project import Project
+
+    doc = _load(VALID)
+    doc["list"]["name"] = "Prueba\u0000válida"
+    _as("op", "admin")
+    resp = _post(client, doc)
+    assert resp.status_code == 422
+    assert "NUL" in resp.json()["detail"]
+    assert db_session.query(Project).count() == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("field, reason", [
+    ({"title": "T\u0000"}, "invalid_title"),
+    ({"dates": {"display": "1790\u0000", "start": None, "end": None}}, "invalid_dates"),
+    ({"code": "xx-test-9\u000001"}, "invalid_reference_code"),
+])
+def test_an_item_text_field_with_nul_is_rejected(client, db_session, reports_root, field, reason):
+    _as("op", "admin")
+    kw = dict(field)
+    code = kw.pop("code", "xx-test-901")
+    report = _post(client, _list_with([_item(code=code, stem="xx-test-901", **kw),
+                                       _item(code="xx-test-902", stem="xx-test-902")])).json()
+    assert [(r["position"], r["reason"]) for r in report["rejects"]] == [(1, reason)]
+    assert set(_volumes(db_session)) == {"xx-test-902"}
+
+
+@pytest.mark.unit
+def test_nul_in_an_unmapped_field_is_escaped_in_the_stored_json(client, db_session, reports_root):
+    _as("op", "admin")
+    _post(client, _list_with([_item(notes="a\u0000b")]))
+    raw = _volumes(db_session)["xx-test-901"].custom_attributes
+    assert "\x00" not in raw and "\\u0000" in raw
+    assert json.loads(raw)["fisqua"]["notes"] == "a\u0000b"
