@@ -346,6 +346,19 @@ def update_collection(
     # whose files the startup migration has not moved yet
     # (collections_in_old_layout). Files in `<stem>/` stay where they are.
     update_data = payload.model_dump(exclude_unset=True)
+    # An explicit null parent un-nests the volume. A volume has a project or a
+    # parent, never neither (check_collection_parent), so it becomes a
+    # top-level volume of the project its root ancestor belongs to. The chain
+    # is read under the volume's row lock, before anything is changed.
+    if "parent_collection_id" in update_data and update_data["parent_collection_id"] is None:
+        if collection.parent_collection_id is None:
+            del update_data["parent_collection_id"]
+        else:
+            root, seen = collection, {collection.id}
+            while root.parent_collection_id is not None and root.parent_collection_id not in seen:
+                root = db.query(Collection).filter(Collection.id == root.parent_collection_id).first()
+                seen.add(root.id)
+            update_data["project_id"] = root.project_id
     before = (collection.name, collection.filename_stem,
               collection.project_id, collection.parent_collection_id)
     layout_changed = (

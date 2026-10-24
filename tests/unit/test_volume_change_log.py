@@ -141,6 +141,37 @@ def test_patch_rename_and_move_log_both(operator, db_session):
     assert len(_events(db_session, "collection_moved")) == 1
 
 
+def test_patch_null_parent_makes_a_top_level_volume_of_the_root_project(operator, db_session):
+    p, q = _project(db_session, "P"), _project(db_session, "Q")
+    root = _volume(db_session, "Root", p)
+    mid = _volume(db_session, "Mid", parent=root)
+    v = _volume(db_session, "V", parent=mid)
+    vid = v.id
+
+    r = operator.patch(f"/collections/{vid}", json={"parent_collection_id": None})
+
+    assert r.status_code == 200
+    body = r.json()
+    assert (body["project_id"], body["parent_collection_id"]) == (p.id, None)
+    listed = operator.get(f"/collections/?project_id={p.id}").json()
+    assert vid in [c["id"] for c in listed]
+    (e,) = _events(db_session, "collection_moved")
+    assert f"project None -> {p.id}" in e.detail
+    assert f"parent {mid.id} -> None" in e.detail
+    assert not _events(db_session, "collection_renamed")
+
+
+def test_patch_null_parent_on_a_top_level_volume_changes_nothing(operator, db_session):
+    p = _project(db_session, "P")
+    v = _volume(db_session, "V", p)
+
+    r = operator.patch(f"/collections/{v.id}", json={"parent_collection_id": None})
+
+    assert r.status_code == 200
+    assert r.json()["project_id"] == p.id
+    assert not _events(db_session, "collection_moved")
+
+
 def test_refused_move_logs_nothing(operator, db_session):
     p = _project(db_session, "P")
     v = _volume(db_session, "V", p)
