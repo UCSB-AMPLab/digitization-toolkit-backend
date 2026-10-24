@@ -7,7 +7,11 @@ superseded alike, at
     <tenant>/<stem>/previews/<stem>_preview.jpg      a RAW master's preview
 
 relative to OFFSITE_REMOTE. Thumbnails are never uploaded. The file name is
-the image's name on disk when the object is first uploaded. Each object's key
+the image's name on disk when this unit first uploads the object. An adopted
+object keeps the key it was found at, whose last segment may differ from the
+name on disk (a contract name given in the bucket to an image captured before
+contract naming), so nothing here takes the key's name from the disk once a
+row exists, or the disk name from the key. Each object's key
 is stored in offsite_objects when it is first uploaded or adopted and never
 changes, so a later move on disk, a renumber or a project rename leaves the
 bucket as it is.

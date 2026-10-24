@@ -748,3 +748,30 @@ def test_a_file_that_changes_while_it_is_hashed_is_skipped(tmp_path, monkeypatch
 
     monkeypatch.setattr(Path, "stat", stat_then_grow)
     assert iu.stable_sha1(f) is None
+
+
+@pytest.mark.unit
+def test_an_adopted_key_may_name_the_file_otherwise_than_the_disk(remote, db_session, override_projects_root):
+    """Contract names written in the bucket for images that keep older names on the card."""
+    from app.core.image_upload import adopt_objects, volume_upload_state
+    from app.models.record import RecordImage
+
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "IMG_0001.CR2", b"raw", preview=b"prev")
+    cap_key = f"{TENANT}/{STEM}/captures/{STEM}-img_0001_c1.CR2"
+    prev_key = f"{TENANT}/{STEM}/previews/{STEM}-img_0001_c1_preview.jpg"
+    remote.put(cap_key, b"raw")
+    remote.put(prev_key, b"prev")
+
+    report = adopt_objects(db_session, f"{TENANT}/{STEM}", apply=True)
+    assert {e["key"] for e in report["adopted"]} == {cap_key, prev_key}
+
+    # The disk name stays what it was; nothing is uploaded under it.
+    calls = len(remote.calls())
+    result = _run(db_session)
+    assert result["uploaded"] == 0 and remote.calls()[calls:] == []
+    assert sorted(remote.files()) == sorted([cap_key, prev_key])
+    rows = _rows(db_session)
+    assert rows[(img.id, "capture")].object_key == cap_key
+    assert Path(db_session.get(RecordImage, img.id).file_path).name == "IMG_0001.CR2"
+    assert volume_upload_state(db_session, vol)["received"] is True
