@@ -17,7 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_counter import next_capture_number
-from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -47,22 +47,24 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 
 
 def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
-	"""409 when the capture would go into no volume, or into one without a filename_stem.
+	"""409 when the capture would go into no volume, into one without a filename_stem,
+	or, for a request with a record_id, into a volume other than the record's.
 
 	Every capture is named after its volume's stem (contract 1.1 §3), so the
 	request must name a volume: 0 counts as none, as it does for the capture
-	path. A retake is also checked against the volume its record is in, since
-	the request's volume need not be that one. Called in each capture
-	endpoint before any camera is touched.
+	path. A request with a record_id must name the record's own volume: the
+	file is written under the volume the request names, while the record and
+	the counter raised are its own volume's. Called in each capture endpoint
+	before any camera is touched.
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
-	volume_ids = [collection_id]
 	if retake_record is not None:
 		if retake_record.collection_id is None:
 			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
-		volume_ids.append(retake_record.collection_id)
-	if any(volume_lacks_stem(db, vid) for vid in volume_ids):
+		if retake_record.collection_id != collection_id:
+			raise HTTPException(status_code=409, detail=RETAKE_VOLUME_DETAIL)
+	if volume_lacks_stem(db, collection_id):
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
 

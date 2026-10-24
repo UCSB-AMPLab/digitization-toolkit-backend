@@ -21,7 +21,7 @@ import pytest
 import capture.service as capture_service
 import capture.project_manager as project_manager_module
 
-from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL
 
 
 def _user(username, role):
@@ -193,17 +193,25 @@ def test_a_retake_in_a_volume_without_a_stem_is_refused(client, db_session, test
 
 @pytest.mark.unit
 @pytest.mark.parametrize("mode", ["single", "dual"])
-def test_a_retake_naming_a_stemmed_volume_for_a_record_in_a_stemless_one_is_refused(
-        client, db_session, test_project, camera_calls, mode):
+@pytest.mark.parametrize("record_stem", ["co-test-a", None], ids=["stemmed", "stemless"])
+@pytest.mark.parametrize("status", ["captured", "rejected", "approved"])
+def test_a_retake_into_another_volume_is_refused(client, db_session, test_project,
+                                                 camera_calls, mode, record_stem, status):
+    """The file would land in the named volume while the record and its counter are another's."""
     api = _client_as(client)
-    stemless = _volume(db_session, test_project, "A", None)
-    stemmed = _volume(db_session, test_project, "B", "co-test-b")
-    rec = _record(db_session, stemless, mode)
+    own = _volume(db_session, test_project, "A", record_stem)
+    other = _volume(db_session, test_project, "B", "co-test-b")
+    rec = _record(db_session, own, mode)
+    rec.status = status
+    db_session.commit()
+    before_own, before_other = _state(db_session, own.id), _state(db_session, other.id)
 
-    resp = _capture(mode)(api, test_project, stemmed.id, record_id=rec.id)
+    resp = _capture(mode)(api, test_project, other.id, record_id=rec.id)
 
-    _assert_refused(resp)
-    assert camera_calls == []
+    _assert_refused(resp, RETAKE_VOLUME_DETAIL)
+    assert camera_calls == [], "a retake into another volume touches no camera"
+    assert _state(db_session, own.id) == before_own
+    assert _state(db_session, other.id) == before_other
 
 
 @pytest.mark.unit
