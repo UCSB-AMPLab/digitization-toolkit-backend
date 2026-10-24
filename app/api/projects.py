@@ -314,6 +314,8 @@ def move_collections(
     # any of them reads, so those volumes are held against exports until the
     # move is committed. A migrated volume moves no file and is not held.
     old_layout = collections_in_old_layout(db, moved_collection_ids)
+    top_level = [(c.id, c.name) for c in
+                 db.query(Collection).filter(Collection.project_id == project_id).order_by(Collection.id).all()]
     with export_jobs.hold_for_file_changes(old_layout, EXPORT_IN_PROJECT_MESSAGE):
         # Re-parent the top-level collections; descendants follow via parent FK
         moved = (
@@ -343,6 +345,11 @@ def move_collections(
             f"Move of collections from project {project_id} to {payload.target_project_id}",
         )
 
+    for volume_id, volume_name in top_level:
+        log_event(db, level="INFO", category="activity", action="collection_moved",
+                  actor=current_user.username, subject=volume_name,
+                  detail=(f"id={volume_id}; project {project_id!r} -> {payload.target_project_id!r}; "
+                          f"parent None -> None"))
     log_event(db, level="INFO", category="activity", action="collections_moved",
               actor=current_user.username,
               subject=f"{source.name} -> {target.name} ({moved} collections)")
