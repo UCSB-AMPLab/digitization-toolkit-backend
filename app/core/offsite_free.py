@@ -235,6 +235,10 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
             .filter(Record.collection_id == collection_id, OffsiteObject.verified_at.isnot(None))
             .order_by(RecordImage.id, OffsiteObject.kind)
             .all())
+    # Before the commit, which expires `collection`: read after it, the row
+    # would be loaded again in a transaction left open through the hashing,
+    # the listing and the copies that follow.
+    old_layout = {fp: collection is None or image_in_old_layout(collection, fp) for (_, _, fp, *_) in rows}
     db.commit()
     out = []
     for (image_id, record_id, file_path, m_at, m_bytes, p_at, p_bytes, kind, key, sha1, capture_id) in rows:
@@ -243,7 +247,7 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
             continue
         out.append(_Object(image_id, record_id, kind, file_path, local_file(kind, file_path), key, sha1, size,
                            capture_id,
-                           old_layout=collection is None or image_in_old_layout(collection, file_path)))
+                           old_layout=old_layout[file_path]))
     return out
 
 

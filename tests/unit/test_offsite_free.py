@@ -941,3 +941,16 @@ def test_a_record_let_back_into_the_volume_mid_free_with_files_in_the_old_layout
     assert result["freed"]["files"] == 3
     assert stray_path.read_bytes() == b"jpeg nine"
     assert _image_row(db_session, stray.id).master_freed_at is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("freed", [False, True])
+def test_reading_the_objects_leaves_no_transaction_open(remote, db_session, override_projects_root, freed):
+    """The work list is read and committed; no transaction stays open across the hashing and listing that follow."""
+    from app.core.offsite_free import _objects
+
+    vol, _, _ = _received(db_session, override_projects_root)
+    db_session.commit()
+    objects = _objects(db_session, vol.id, freed=freed)
+    assert not db_session.in_transaction()
+    assert all(o.old_layout is False for o in objects)
