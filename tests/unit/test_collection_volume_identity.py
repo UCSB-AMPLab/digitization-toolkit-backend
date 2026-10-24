@@ -628,7 +628,8 @@ def _load_migration(backend_root):
 def _pre_migration_schema(engine):
     """`collections` as it stands at f5a6b7c8d9e0, and enough of its neighbours.
 
-    `records` and `record_images` carry only the columns the backfill reads.
+    `records` and `record_images` carry only the columns the backfill reads,
+    and `records.external_id` with its index, which the revision drops.
     """
     md = sa.MetaData()
     sa.Table("projects", md,
@@ -653,7 +654,9 @@ def _pre_migration_schema(engine):
     sa.Table("records", md,
              sa.Column("id", sa.Integer, primary_key=True),
              sa.Column("collection_id", sa.Integer,
-                       sa.ForeignKey("collections.id", ondelete="SET NULL")))
+                       sa.ForeignKey("collections.id", ondelete="SET NULL")),
+             sa.Column("external_id", sa.String(255)),
+             sa.Index("ix_records_external_id", "external_id", unique=True))
     sa.Table("record_images", md,
              sa.Column("id", sa.Integer, primary_key=True),
              sa.Column("record_id", sa.Integer,

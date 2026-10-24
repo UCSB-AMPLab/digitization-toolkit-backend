@@ -57,6 +57,13 @@ The backfill can only count images that still exist. A capture whose record
 was deleted before this revision left no row, so it is not counted, and a
 volume whose records were moved out counts what it holds now.
 
+It also drops `records.external_id` and its unique index,
+`ix_records_external_id`, which `c2d3e4f5a6b7` added. Under contract 1.1 the
+reference code belongs to the volume, so a record carries none; the column
+had no writer, and the frontend never read it. The downgrade adds it back,
+nullable, with the same unique index, and empty: any value it held before the
+upgrade is lost.
+
 Every column applies to every row the same way, nested volumes
 (`parent_collection_id`) included.
 
@@ -175,8 +182,16 @@ def upgrade() -> None:
 
     op.execute(BACKFILL_CAPTURE_COUNTER)
 
+    with op.batch_alter_table('records') as batch:
+        batch.drop_index('ix_records_external_id')
+        batch.drop_column('external_id')
+
 
 def downgrade() -> None:
+    with op.batch_alter_table('records') as batch:
+        batch.add_column(sa.Column('external_id', sa.String(length=255), nullable=True))
+        batch.create_index('ix_records_external_id', ['external_id'], unique=True)
+
     pattern = _stem_pattern_check()
     trimmed = _external_id_trimmed_check()
     with op.batch_alter_table('collections') as batch:
