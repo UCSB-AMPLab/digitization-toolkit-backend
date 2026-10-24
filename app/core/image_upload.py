@@ -957,6 +957,331 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Adoption from a rename map (contract 1.1, kind "rename-map")
+# ---------------------------------------------------------------------------
+
+RENAME_MAP_CONTRACT = "fisqua-captua-exchange"
+RENAME_MAP_VERSION = "1.1"
+RENAME_MAP_KIND = "rename-map"
+_SHA1_PATTERN = re.compile(r"^[0-9a-fA-F]{40}$")
+_LAYOUT_DIR = {"capture": CAPTURES_DIR, "preview": PREVIEWS_DIR}
+
+
+def _remote_bucket() -> str:
+    """The bucket DTK_OFFSITE_REMOTE addresses, which must be the whole of its path.
+
+    A remote of the form `<name>:<bucket>`: keys recorded relative to it are
+    then the bucket's own keys, which is what a rename map gives. A remote
+    with no bucket after the colon (an alias, say) or a path inside the
+    bucket makes the keys mean something else, so it is refused rather than
+    guessed at.
+    """
+    remote = config.settings.OFFSITE_REMOTE.strip()
+    if not remote:
+        raise ValueError("DTK_OFFSITE_REMOTE is not configured")
+    name, colon, path = remote.rpartition(":")
+    bucket = path.strip("/")
+    if not colon or not name or not bucket or "/" in bucket:
+        raise ValueError(
+            f"DTK_OFFSITE_REMOTE={remote!r} does not name a bucket as <remote>:<bucket>, "
+            "so the map's bucket keys cannot be checked against it"
+        )
+    return bucket
+
+
+def _map_key(root: str, destination_key) -> Optional[str]:
+    """`<root><destinationKey>`, or None when the destination key is not a plain relative path."""
+    if not isinstance(destination_key, str) or not destination_key or destination_key.startswith("/"):
+        return None
+    if "\\" in destination_key or any(seg in ("", ".", "..") for seg in destination_key.split("/")):
+        return None
+    return f"{root}{destination_key}"
+
+
+def _map_entry_fields(entry) -> Optional[dict]:
+    """The fields of a rename-map entry adoption reads, or None when one is missing or of the wrong type."""
+    if not isinstance(entry, dict):
+        return None
+    image_id, record_id = entry.get("imageId"), entry.get("recordId")
+    kind, name, sha1 = entry.get("kind"), entry.get("originalFilename"), entry.get("sha1")
+    size, capture_id = entry.get("bytes"), entry.get("captureId")
+    if (not isinstance(image_id, int) or isinstance(image_id, bool)
+            or not isinstance(record_id, int) or isinstance(record_id, bool)
+            or not isinstance(kind, str) or kind not in _LAYOUT_DIR
+            or not isinstance(name, str) or not name
+            or not isinstance(sha1, str) or not _SHA1_PATTERN.match(sha1)
+            or (size is not None and (not isinstance(size, int) or isinstance(size, bool)))
+            or (capture_id is not None and not isinstance(capture_id, str))):
+        return None
+    return {"image_id": image_id, "record_id": record_id, "kind": kind, "name": name,
+            "sha1": sha1.lower(), "bytes": size, "capture_id": capture_id}
+
+
+def _read_rename_map_header(db: Session, rename_map) -> tuple:
+    """(collection, tenant, root, key prefix) for a rename map this unit may adopt from. Raises ValueError."""
+    from app.models.collection import Collection
+
+    if not isinstance(rename_map, dict):
+        raise ValueError("the rename map is not a JSON object")
+    for name, expected in (("contract", RENAME_MAP_CONTRACT), ("version", RENAME_MAP_VERSION),
+                           ("kind", RENAME_MAP_KIND)):
+        if rename_map.get(name) != expected:
+            raise ValueError(f"the map's {name} is {rename_map.get(name)!r}, not {expected!r}")
+    volume, destination = rename_map.get("volume"), rename_map.get("destination")
+    if not isinstance(volume, dict) or not isinstance(destination, dict):
+        raise ValueError("the map has no volume or no destination")
+    if not isinstance(rename_map.get("entries"), list):
+        raise ValueError("the map's entries are not a list")
+
+    stem, collection_id = volume.get("stem"), volume.get("captuaCollectionId")
+    collection = None
+    if isinstance(collection_id, int) and not isinstance(collection_id, bool):
+        collection = db.query(Collection).filter(Collection.id == collection_id).one_or_none()
+    if collection is None or not stem or collection.filename_stem != stem:
+        db.rollback()
+        raise ValueError(f"no volume on this unit has id {collection_id!r} and the file name stem {stem!r}")
+
+    bucket = _remote_bucket()
+    if destination.get("bucket") != bucket:
+        raise ValueError(
+            f"the map's destination bucket is {destination.get('bucket')!r}, but DTK_OFFSITE_REMOTE "
+            f"addresses the bucket {bucket!r}; nothing is listed or recorded"
+        )
+    raw_root = destination.get("root")
+    root = raw_root.strip().strip("/") if isinstance(raw_root, str) else ""
+    if not root or any(seg in ("", ".", "..") for seg in root.split("/")):
+        raise ValueError(f"the map's destination root {raw_root!r} is not a key prefix")
+    root += "/"
+    try:
+        tenant = configured_tenant()
+    except ImageUploadMisconfigured as exc:
+        raise ValueError(str(exc)) from exc
+    if tenant is None:
+        raise ValueError("DTK_OFFSITE_TENANT is not configured, so nothing can be listed")
+    map_tenant = root.split("/", 1)[0]
+    if map_tenant != tenant:
+        # The appliance key lists only under its tenant's prefix, and so do
+        # mark-freed and the received indicator.
+        raise ValueError(
+            f"the map's destination root {root!r} is under the tenant {map_tenant!r}, "
+            f"not this unit's tenant {tenant!r}"
+        )
+    return collection, tenant, root, f"{tenant}/{stem}/"
+
+
+def adopt_rename_map(db: Session, rename_map: dict, *, apply: bool = False) -> dict:
+    """Record the objects a rename map names as the frozen keys of its images, verified, with no upload.
+
+    A rename map (contract 1.1, kind "rename-map") lists, for one volume, the
+    key each capture and preview was copied to in the destination bucket. It
+    lets this unit record a row for an image whose file is absent from the
+    card, which adopt_objects cannot match: mark-freed then needs that row.
+
+    The map is refused whole (ValueError, nothing listed or written) when its
+    header is not contract 1.1's rename map, when its volume is not one on
+    this unit with that id and stem, when DTK_OFFSITE_REMOTE does not address
+    exactly the map's destination bucket, or when the destination root is
+    not under this unit's tenant.
+
+    Each entry is recorded at `<root><destinationKey>` only when all of
+    these hold, and is otherwise reported under `refused` with its reason:
+
+    * the key is `<tenant>/<stem>/captures/<name>` for a capture, or
+      `.../previews/<name>` for a preview (key_outside_volume);
+    * no other entry names the same image and kind, or the same key
+      (duplicate_entry);
+    * the image exists (image_not_found), belongs to the entry's record
+      (record_differs), whose volume is the map's (not_in_volume), has the
+      entry's capture id when the entry gives one (capture_differs), and its
+      file name is the entry's originalFilename: the master's name for a
+      capture, its preview's for a preview (filename_differs);
+    * the image has no row for that kind (already_recorded at the same key,
+      key_differs at another) and no other row holds the key
+      (key_already_held);
+    * a fresh listing shows the key with the entry's sha1 (not_in_bucket,
+      listed_without_sha1, bucket_sha1_differs) and, where the listing gives
+      a size and the entry bytes, that size (bucket_size_differs);
+    * the local file, when present, has the entry's sha1 (local_sha1_differs;
+      unreadable when it changed while it was read).
+
+    Each row is written through _claim, as adopt_objects writes its rows, so
+    an image that moved or whose row changed after it was checked is
+    reported under `changed`. Nothing is uploaded, deleted, or changed in
+    the bucket. Without `apply` nothing is written. Raises
+    VerificationUnavailable when a listing does not answer.
+    """
+    from app.core.offsite_free import _listings
+    from app.models.record import RecordImage
+
+    collection, tenant, root, prefix = _read_rename_map_header(db, rename_map)
+    stem, collection_id = collection.filename_stem, collection.id
+    db.commit()
+
+    report = {"map_id": rename_map.get("id"), "filename_stem": stem, "collection_id": collection_id,
+              "key_prefix": prefix, "entries": len(rename_map["entries"]), "applied": apply,
+              "adopted": [], "adopted_present": 0, "adopted_absent": 0,
+              "already_recorded": [], "refused": [], "refused_counts": {}}
+
+    def refuse(index, reason, fields=None, key=None, **extra):
+        report["refused"].append({"index": index,
+                                  "image_id": fields["image_id"] if fields else None,
+                                  "kind": fields["kind"] if fields else None,
+                                  "key": key, "reason": reason, **extra})
+
+    # Shape and keys first, so that duplicates are counted among entries that can be read.
+    readable = []
+    for index, entry in enumerate(rename_map["entries"]):
+        fields = _map_entry_fields(entry)
+        if fields is None:
+            given = entry if isinstance(entry, dict) else {}
+            # The entry's own values, as given, so the operator can find it.
+            refuse(index, "malformed_entry", {"image_id": given.get("imageId"), "kind": given.get("kind")},
+                   key=given.get("destinationKey"))
+            continue
+        key = _map_key(root, entry.get("destinationKey"))
+        parent, _, name = key.rpartition("/") if key else ("", "", "")
+        if key is None or parent != f"{prefix}{_LAYOUT_DIR[fields['kind']]}" or not name:
+            refuse(index, "key_outside_volume", fields, key=key or entry.get("destinationKey"))
+            continue
+        readable.append((index, fields, key))
+
+    seen_objects: dict = {}
+    seen_keys: dict = {}
+    for _, fields, key in readable:
+        obj = (fields["image_id"], fields["kind"])
+        seen_objects[obj] = seen_objects.get(obj, 0) + 1
+        seen_keys[key] = seen_keys.get(key, 0) + 1
+
+    checked = []  # (index, fields, key, state)
+    for index, fields, key in readable:
+        if seen_objects[(fields["image_id"], fields["kind"])] > 1 or seen_keys[key] > 1:
+            refuse(index, "duplicate_entry", fields, key=key)
+            continue
+        image_id, kind = fields["image_id"], fields["kind"]
+        state = _image_state(db, image_id)
+        record_id = db.query(RecordImage.record_id).filter(RecordImage.id == image_id).scalar()
+        if state is None:
+            refuse(index, "image_not_found", fields, key=key)
+            continue
+        if record_id != fields["record_id"]:
+            refuse(index, "record_differs", fields, key=key, record_id=record_id)
+            continue
+        if state.collection_id != collection_id or state.filename_stem != stem:
+            refuse(index, "not_in_volume", fields, key=key, collection_id=state.collection_id)
+            continue
+        if fields["capture_id"] is not None and fields["capture_id"] != state.capture_id:
+            refuse(index, "capture_differs", fields, key=key, capture_id=state.capture_id)
+            continue
+        master = Path(state.file_path)
+        if kind == "capture":
+            local_name = master.name
+        else:
+            local_name = preview_sidecar_of(master).name if is_raw_suffix(master) else None
+        if local_name != fields["name"]:
+            refuse(index, "filename_differs", fields, key=key, local_name=local_name)
+            continue
+        row = _row_for(db, image_id, kind)
+        if row is not None:
+            if row.object_key == key:
+                report["already_recorded"].append({"index": index, "image_id": image_id, "kind": kind,
+                                                   "key": key, "verified": row.verified_at is not None})
+            else:
+                refuse(index, "key_differs", fields, key=key, recorded_key=row.object_key)
+            continue
+        holder = _key_holder(db, key)
+        if holder is not None:
+            refuse(index, "key_already_held", fields, key=key, held_by_image_id=holder.record_image_id)
+            continue
+        checked.append((index, fields, key, state))
+    db.commit()  # no transaction stays open through the listing and the hashing
+
+    listed = _listings(key for _, _, key, _ in checked) if checked else {}
+
+    for index, fields, key, state in checked:
+        image_id, kind, sha1 = fields["image_id"], fields["kind"], fields["sha1"]
+        info = listed.get(key)
+        if info is None or not info.present:
+            refuse(index, "not_in_bucket", fields, key=key)
+            continue
+        if info.sha1 is None:
+            refuse(index, "listed_without_sha1", fields, key=key)
+            continue
+        if info.sha1 != sha1:
+            refuse(index, "bucket_sha1_differs", fields, key=key, listed_sha1=info.sha1, expected_sha1=sha1)
+            continue
+        if fields["bytes"] is not None and info.size is not None and info.size != fields["bytes"]:
+            refuse(index, "bucket_size_differs", fields, key=key, listed_bytes=info.size,
+                   expected_bytes=fields["bytes"])
+            continue
+
+        path = local_file(kind, state.file_path)
+        local = "absent"
+        if path is not None and path.is_file():
+            # As in adopt_objects: this runs outside the backend's read hold,
+            # so the file is identified by its inode on both sides of the hash
+            # and the row must still name it afterwards.
+            local = "present"
+            try:
+                before = path.stat()
+                local_sha1 = stable_sha1(path)
+                after = path.stat()
+            except OSError:
+                local_sha1 = None
+            if (local_sha1 is None or (before.st_dev, before.st_ino) != (after.st_dev, after.st_ino)
+                    or _image_state(db, image_id) != state):
+                db.commit()
+                refuse(index, "unreadable", fields, key=key, local_path=str(path))
+                continue
+            db.commit()
+            if local_sha1 != sha1:
+                refuse(index, "local_sha1_differs", fields, key=key, local_path=str(path),
+                       local_sha1=local_sha1, expected_sha1=sha1)
+                continue
+
+        adopted = {"index": index, "image_id": image_id, "kind": kind, "key": key, "sha1": sha1,
+                   "bytes": info.size if info.size is not None else fields["bytes"], "local": local,
+                   "local_path": str(path) if path is not None else state.file_path}
+        if apply:
+            try:
+                _claim(db, None, Work(image_id, kind, stem, state.file_path), key, state,
+                       local_sha1=sha1, verified_at=_now())
+            except _ImageMoved:
+                refuse(index, "changed", fields, key=key)
+                continue
+            except IntegrityError as exc:
+                db.rollback()
+                refuse(index, "recorded_meanwhile", fields, key=key, error=str(exc.orig)[:200])
+                continue
+        report["adopted"].append(adopted)
+        report[f"adopted_{local}"] += 1
+
+    report["refused"].sort(key=lambda r: r["index"])
+    for refusal in report["refused"]:
+        counts = report["refused_counts"]
+        counts[refusal["reason"]] = counts.get(refusal["reason"], 0) + 1
+
+    if apply:
+        reasons = " ".join(f"{k}={v}" for k, v in sorted(report["refused_counts"].items()))
+        _log(db, action=ADOPT_ACTION, level="WARN" if report["refused"] else "INFO", subject=stem,
+             detail=(f"rename-map {report['map_id']}: adopted={len(report['adopted'])} "
+                     f"absent={report['adopted_absent']} present={report['adopted_present']} "
+                     f"already_recorded={len(report['already_recorded'])} "
+                     f"refused={len(report['refused'])}" + (f" ({reasons})" if reasons else "")))
+    return report
+
+
+def load_rename_map(path: str) -> dict:
+    """The JSON object in the file at `path`. Raises ValueError when it cannot be read or parsed."""
+    try:
+        with open(path, encoding="utf-8") as fh:
+            return json.load(fh)
+    except OSError as exc:
+        raise ValueError(f"cannot read {path}: {exc.strerror or exc}") from exc
+    except (json.JSONDecodeError, UnicodeDecodeError) as exc:
+        raise ValueError(f"{path} is not JSON: {exc}") from exc
+
+
+# ---------------------------------------------------------------------------
 # Records whose files are stored offsite
 # ---------------------------------------------------------------------------
 
@@ -1254,6 +1579,14 @@ def main(argv: Optional[list] = None) -> int:
     adopt.add_argument("prefix", help="remote prefix, relative to DTK_OFFSITE_REMOTE")
     adopt.add_argument("--apply", action="store_true",
                        help="write the rows; without it, only report what would be recorded")
+    adopt_map = sub.add_parser(
+        "adopt-map",
+        help="record the objects a rename map (contract 1.1) names as the keys of its volume's images, "
+             "present on the card or not (uploads and deletes nothing)",
+    )
+    adopt_map.add_argument("map", help="path to the rename-map JSON file")
+    adopt_map.add_argument("--apply", action="store_true",
+                           help="write the rows; without it, only report what would be recorded")
     mark = sub.add_parser(
         "mark-freed",
         help="mark as freed a volume's files already removed from the card whose verified objects "
@@ -1296,6 +1629,8 @@ def main(argv: Optional[list] = None) -> int:
             from app.core.capture_counter import raise_capture_counter
 
             report = raise_capture_counter(db, args.stem, args.n, apply=args.apply)
+        elif args.command == "adopt-map":
+            report = adopt_rename_map(db, load_rename_map(args.map), apply=args.apply)
         else:
             report = adopt_objects(db, args.prefix, apply=args.apply)
     except (ValueError, VerificationUnavailable) as exc:
