@@ -334,23 +334,26 @@ class _Dir:
         return bool(self.stems.get(stem.casefold(), set()) - {record_id})
 
 
-def _clashing_files(target: Path, previews_dir: Optional[Path], src: Path, owners: Dict[Path, int]) -> List[Path]:
-    """The files on disk, no row's, that take the name `src` would have had in `target` (resolved).
+def _clashing_files(target: Path, previews_dir: Optional[Path], stems: List[str],
+                    owners: Dict[Path, int]) -> List[Path]:
+    """The files on disk, no row's, that took the names a master was denied in `target` (resolved).
 
-    In `target`, a file whose name casefolds to `src.name`, or one with the
-    same stem and another suffix (it would name the same sidecar); in
-    `previews_dir` (for a RAW master), the `_preview.jpg` its name derives.
+    `stems` are the stems passed over: the master's own, then each suffixed
+    one (_suffixed_stems) that was taken, up to the one it is given. In
+    `target`, a file whose stem casefolds to one of them (the name, or the
+    same stem with another suffix, which would name the same sidecar); in
+    `previews_dir` (for a RAW master), the `_preview.jpg` each derives.
     Files of other rows, whether on disk or planned, are not listed.
     """
     out: List[Path] = []
-    stem = src.stem.casefold()
+    folded = {s.casefold() for s in stems}
     for p in _listdir(target):
-        if p.is_file() and Path(p.name).stem.casefold() == stem and p.resolve() not in owners:
+        if p.is_file() and Path(p.name).stem.casefold() in folded and p.resolve() not in owners:
             out.append(p.resolve())
     if previews_dir is not None:
-        name = f"{src.stem}{PREVIEW_SIDECAR_SUFFIX}".casefold()
+        names = {f"{s}{PREVIEW_SIDECAR_SUFFIX}".casefold() for s in stems}
         for p in _listdir(previews_dir):
-            if p.is_file() and p.name.casefold() == name and p.resolve() not in owners:
+            if p.is_file() and p.name.casefold() in names and p.resolve() not in owners:
                 out.append(p.resolve())
     return out
 
@@ -707,9 +710,13 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         else:
             stem = src.stem
             if state.master_taken(stem, src.suffix, img.record_id, previews):
-                stem = next(s for s in _suffixed_stems(src.stem, iid)
-                            if not state.master_taken(s, src.suffix, img.record_id, previews))
-                for f in _clashing_files(target, previews_dir if raw else None, src, owners):
+                passed_over = [src.stem]
+                for candidate in _suffixed_stems(src.stem, iid):
+                    if not state.master_taken(candidate, src.suffix, img.record_id, previews):
+                        stem = candidate
+                        break
+                    passed_over.append(candidate)
+                for f in _clashing_files(target, previews_dir if raw else None, passed_over, owners):
                     if f not in clashing:
                         clashing.add(f)
                         logger.warning(f"Volume layout: {f} is no row's and takes the name of image {iid}'s master "
