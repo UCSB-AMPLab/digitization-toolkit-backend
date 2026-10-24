@@ -903,9 +903,14 @@ def get_image_thumbnail(
 		if not img.file_path:
 			raise HTTPException(status_code=404, detail="Image has no source file for thumbnail generation")
 		source_path = resolve_within_storage(img.file_path)
+		# A RAW master's thumbnail is made from its preview, never from the
+		# RAW (which Pillow cannot read), so a freed preview is a 410 whether
+		# or not the master is on the card (a partial free or restore).
+		if source_path is not None and is_raw_suffix(source_path) and img.preview_freed_at is not None:
+			raise _freed(db, img, "preview")
 		sidecar = _raw_preview_sidecar(source_path) if source_path is not None else None
 		if source_path is not None and img.master_freed_at is not None and sidecar is None:
-			raise _freed(db, img, "preview" if img.preview_freed_at is not None else "capture")
+			raise _freed(db, img, "capture")
 		if source_path is None or not (source_path.exists() or sidecar is not None):
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
 		thumb_source = sidecar or source_path
