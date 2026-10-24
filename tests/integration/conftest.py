@@ -31,3 +31,16 @@ def authed_client(client, db_session):
 
     app.dependency_overrides[get_current_user] = lambda: user
     yield client
+
+
+@pytest.fixture
+def capture_volume(db_session, test_project):
+    """The volume these captures go into: every capture needs one, with a stem."""
+    from app.models.collection import Collection
+
+    volume = Collection(name="Capture volume", project_id=test_project.id,
+                        filename_stem="co-test-capture")
+    db_session.add(volume)
+    db_session.commit()
+    db_session.refresh(volume)
+    return volume

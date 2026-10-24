@@ -1,14 +1,13 @@
-"""No capture into a volume that has no filename_stem.
+"""No capture outside a volume, and none into a volume without a filename_stem.
 
 Exchange contract 1.1 §3 names every captured image
-`<filename_stem>-img_<nnnn>_c<n>`, and Captua never makes a stem up, so a
-volume without one cannot take a capture. The capture endpoints and the
-image upload refuse it with a 409 carrying STEM_REQUIRED_DETAIL, before any
-camera is triggered or any file is written. The interface matches the 409 on
-this exact text, so it does not change.
-
-A capture into no volume (a record attached to a project directly) is not
-refused here.
+`<filename_stem>-img_<nnnn>_c<n>`, withdraws the timestamp names used when
+there was no stem, and Captua never makes a stem up. So the capture
+endpoints and the image upload refuse, with a 409, a capture into no volume
+(a record attached straight to a project), carrying VOLUME_REQUIRED_DETAIL,
+and a capture into a volume without a stem, carrying STEM_REQUIRED_DETAIL.
+They refuse before any camera is triggered or any file is written. The
+interface matches each 409 on its exact text, so the texts do not change.
 """
 from typing import Optional
 
@@ -18,6 +17,7 @@ from app.models.collection import Collection
 
 
 STEM_REQUIRED_DETAIL = "This volume has no file name stem. Give it one before capturing into it."
+VOLUME_REQUIRED_DETAIL = "Captures must go into a volume."
 
 
 def volume_lacks_stem(db: Session, collection_id: Optional[int]) -> bool:

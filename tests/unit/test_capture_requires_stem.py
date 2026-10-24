@@ -1,10 +1,12 @@
-"""No capture into a volume without a filename_stem.
+"""No capture outside a volume, and none into a volume without a filename_stem.
 
 Exchange contract 1.1 §3 names every captured image after its volume's stem,
-and Captua never makes a stem up. So the single capture, the dual capture, a
-retake through either, and an upload through POST /records/{id}/images are
-refused with a 409 when the volume has no stem, before any camera is touched
-and before any file is written. With a stem, each goes through.
+withdraws the timestamp names used when there was none, and Captua never
+makes a stem up. So the single capture, the dual capture, a retake through
+either, and an upload through POST /records/{id}/images are refused with a
+409 when they would go into no volume (a record attached straight to a
+project) or into a volume that has no stem, before any camera is touched and
+before any file is written. In a volume with a stem, each goes through.
 
 The camera test (POST /cameras/test-capture/{i}) takes no volume and stores
 nothing (NEH-166), so it is not refused.
@@ -19,7 +21,7 @@ import pytest
 import capture.service as capture_service
 import capture.project_manager as project_manager_module
 
-from app.core.volume_stem import STEM_REQUIRED_DETAIL
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL
 
 
 def _user(username, role):
@@ -83,9 +85,12 @@ def _volume(db_session, project, name, stem):
     return v
 
 
-def _record(db_session, volume, mode):
+def _record(db_session, volume, mode, project=None):
+    """A captured record in volume, or attached straight to project when volume is None."""
     from app.models.record import Record
-    rec = Record(title="r", status="captured", capture_mode=mode, collection_id=volume.id)
+    rec = Record(title="r", status="captured", capture_mode=mode,
+                 collection_id=volume.id if volume is not None else None,
+                 project_id=project.id if volume is None else None)
     db_session.add(rec)
     db_session.commit()
     return rec
@@ -121,9 +126,15 @@ def _state(db_session, volume_id):
             db_session.get(Collection, volume_id).capture_counter)
 
 
-def _assert_refused(resp):
+def _assert_refused(resp, detail=STEM_REQUIRED_DETAIL):
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"] == STEM_REQUIRED_DETAIL
+    assert resp.json()["detail"] == detail
+
+
+def _counts(db_session):
+    from app.models.record import Record, RecordImage
+    db_session.expire_all()
+    return db_session.query(Record).count(), db_session.query(RecordImage).count()
 
 
 # ---------------------------------------------------------------------------
@@ -166,16 +177,14 @@ def test_a_capture_into_a_volume_with_a_stem_goes_through(client, db_session, te
 
 @pytest.mark.unit
 @pytest.mark.parametrize("mode", ["single", "dual"])
-@pytest.mark.parametrize("names_volume", [True, False])
 def test_a_retake_in_a_volume_without_a_stem_is_refused(client, db_session, test_project,
-                                                        camera_calls, mode, names_volume):
-    """Refused whether or not the request names the volume; the record's volume decides."""
+                                                        camera_calls, mode):
     api = _client_as(client)
     v = _volume(db_session, test_project, "V", None)
     rec = _record(db_session, v, mode)
     before = _state(db_session, v.id)
 
-    resp = _capture(mode)(api, test_project, v.id if names_volume else None, record_id=rec.id)
+    resp = _capture(mode)(api, test_project, v.id, record_id=rec.id)
 
     _assert_refused(resp)
     assert camera_calls == []
@@ -214,6 +223,59 @@ def test_a_retake_in_a_volume_with_a_stem_goes_through(client, db_session, test_
 
 
 # ---------------------------------------------------------------------------
+# No capture outside a volume
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["single", "dual"])
+@pytest.mark.parametrize("volume_id", [None, 0], ids=["omitted", "zero"])
+def test_a_capture_into_no_volume_is_refused(client, db_session, test_project,
+                                             camera_calls, mode, volume_id):
+    """0 counts as none: the capture screen sends it when its URL names no volume."""
+    api = _client_as(client)
+    before = _counts(db_session)
+
+    resp = _capture(mode)(api, test_project, volume_id)
+
+    _assert_refused(resp, VOLUME_REQUIRED_DETAIL)
+    assert camera_calls == [], "a refused capture touches no camera"
+    assert _counts(db_session) == before
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["single", "dual"])
+def test_a_retake_that_names_no_volume_is_refused(client, db_session, test_project,
+                                                  camera_calls, mode):
+    """The request's volume decides where the file is written, so it must name one."""
+    api = _client_as(client)
+    v = _volume(db_session, test_project, "V", "co-test-v")
+    rec = _record(db_session, v, mode)
+    before = _state(db_session, v.id)
+
+    resp = _capture(mode)(api, test_project, None, record_id=rec.id)
+
+    _assert_refused(resp, VOLUME_REQUIRED_DETAIL)
+    assert camera_calls == []
+    assert _state(db_session, v.id) == before
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["single", "dual"])
+def test_a_retake_of_a_record_in_no_volume_is_refused(client, db_session, test_project,
+                                                      camera_calls, mode):
+    api = _client_as(client)
+    v = _volume(db_session, test_project, "V", "co-test-v")
+    rec = _record(db_session, None, mode, project=test_project)
+    before = _counts(db_session)
+
+    resp = _capture(mode)(api, test_project, v.id, record_id=rec.id)
+
+    _assert_refused(resp, VOLUME_REQUIRED_DETAIL)
+    assert camera_calls == []
+    assert _counts(db_session) == before
+
+
+# ---------------------------------------------------------------------------
 # An upload
 # ---------------------------------------------------------------------------
 
@@ -234,6 +296,20 @@ def test_an_upload_into_a_volume_without_a_stem_is_refused(client, db_session, t
 
     _assert_refused(resp)
     assert _state(db_session, v.id) == before
+    uploads = upload_dir / "uploads"
+    assert not uploads.exists() or not any(uploads.iterdir()), "a refused upload writes no file"
+
+
+@pytest.mark.unit
+def test_an_upload_into_no_volume_is_refused(client, db_session, test_project, upload_dir):
+    api = _client_as(client)
+    rec = _record(db_session, None, "single", project=test_project)
+    before = _counts(db_session)
+
+    resp = _upload(api, rec.id)
+
+    _assert_refused(resp, VOLUME_REQUIRED_DETAIL)
+    assert _counts(db_session) == before
     uploads = upload_dir / "uploads"
     assert not uploads.exists() or not any(uploads.iterdir()), "a refused upload writes no file"
 

@@ -212,15 +212,15 @@ def test_an_upload_raises_it_by_one(client, db_session, test_project, upload_dir
 
 
 @pytest.mark.unit
-def test_a_capture_outside_any_volume_raises_nothing(client, db_session, test_project,
-                                                     monkeypatch, tmp_path):
+def test_a_capture_outside_any_volume_is_refused_and_raises_nothing(client, db_session, test_project,
+                                                                    monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
     api = _client_as(client)
     v = _volume(db_session, test_project)
 
     resp = api.post("/cameras/capture", json={"project_name": test_project.name, "camera_index": 0})
 
-    assert resp.json()["success"], resp.text
+    assert resp.status_code == 409, resp.text
     assert _counter(db_session, v.id) == 0
 
 

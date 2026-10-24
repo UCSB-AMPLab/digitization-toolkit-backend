@@ -25,13 +25,14 @@ from app.models.record import Record, RecordImage
 
 
 @pytest.mark.integration
-def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client, db_session, test_project, skip_if_no_camera):
+def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     project_name = test_project.name
 
     response = authed_client.post(
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "medium",
             "include_resolution_in_filename": False
@@ -49,6 +50,7 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "medium",
             "include_resolution_in_filename": False,
@@ -69,13 +71,14 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client
 
 
 @pytest.mark.integration
-def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session, test_project, skip_if_no_camera):
+def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     project_name = test_project.name
 
     response = authed_client.post(
         "/cameras/capture/dual",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "resolution": "medium",
             "include_resolution_in_filename": False,
             "stagger_ms": 20
@@ -96,6 +99,7 @@ def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session,
         "/cameras/capture/dual",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "resolution": "medium",
             "include_resolution_in_filename": False,
             "stagger_ms": 20,
@@ -118,11 +122,11 @@ def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session,
 
 
 @pytest.mark.integration
-def test_single_capture_recapture_rejects_mode_mismatch(authed_client, db_session, test_project, skip_if_no_camera):
+def test_single_capture_recapture_rejects_mode_mismatch(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     """A dual-mode record can't be recaptured through the single-camera endpoint."""
     project_name = test_project.name
 
-    rec = Record(title="dual doc", status="rejected", capture_mode="dual", project_id=test_project.id)
+    rec = Record(title="dual doc", status="rejected", capture_mode="dual", collection_id=capture_volume.id)
     db_session.add(rec)
     db_session.commit()
 
@@ -130,6 +134,7 @@ def test_single_capture_recapture_rejects_mode_mismatch(authed_client, db_sessio
         "/cameras/capture",
         json={
             "project_name": project_name,
+            "collection_id": capture_volume.id,
             "camera_index": 0,
             "resolution": "medium",
             "record_id": rec.id,
