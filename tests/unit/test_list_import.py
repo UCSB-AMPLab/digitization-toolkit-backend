@@ -1097,3 +1097,36 @@ def test_a_hash_file_that_cannot_be_written_refuses_the_import(client, db_sessio
     assert resp.status_code == 503
     assert db_session.query(Project).count() == 0
     assert _volumes(db_session) == {}
+
+
+# ---------------------------------------------------------------------------
+# Stale temporary files
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_taking_the_lock_removes_temporary_files_older_than_an_hour(reports_root):
+    import os
+    import time
+    import app.core.list_import as li
+
+    d = reports_root / VALID_ID
+    d.mkdir(parents=True)
+    old = d / ".tmp-old.json"
+    fresh = d / ".tmp-fresh.json"
+    run = d / f"import-report_{VALID_ID}_run0001.json"
+    for p in (old, fresh, run):
+        p.write_text("{}")
+    two_hours_ago = time.time() - 7200
+    os.utime(old, (two_hours_ago, two_hours_ago))
+    os.utime(run, (two_hours_ago, two_hours_ago))
+    other = reports_root / REJECTS_ID
+    other.mkdir()
+    other_old = other / ".tmp-old.json"
+    other_old.write_text("{}")
+    os.utime(other_old, (two_hours_ago, two_hours_ago))
+
+    with li._list_lock(VALID_ID):
+        pass
+    assert not old.exists()
+    assert fresh.exists() and run.exists()
+    assert other_old.exists()  # only the locked list's directory

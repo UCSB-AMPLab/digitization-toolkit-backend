@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import tempfile
+import time
 import unicodedata
 import uuid
 from datetime import date, datetime, timezone
@@ -579,8 +580,28 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     return {**report, "reportStored": stored}
 
 
+# A temporary file older than this was left by a run that crashed between
+# writing it and renaming or linking it; no run holds the lock that long.
+STALE_TEMP_SECONDS = 3600
+
+
+def _remove_stale_temporaries(directory: Path) -> None:
+    """Remove `.tmp-*` files in one list's directory last modified over an hour ago."""
+    cutoff = time.time() - STALE_TEMP_SECONDS
+    for path in directory.glob(".tmp-*"):
+        try:
+            if path.stat().st_mtime < cutoff:
+                path.unlink()
+        except OSError:
+            logger.warning("Could not remove the stale temporary file %s", path)
+
+
 class _list_lock:
-    """An exclusive flock on `<reports_dir>/<list-id>/.lock`, or nothing if it cannot be made."""
+    """An exclusive flock on `<reports_dir>/<list-id>/.lock`, or nothing if it cannot be made.
+
+    On entry, after the lock is taken (or found unavailable), stale
+    temporary files in the list's directory are removed.
+    """
 
     def __init__(self, list_id: str):
         self.path = reports_dir() / list_id / ".lock"
@@ -596,6 +617,7 @@ class _list_lock:
             if self.fd is not None:
                 os.close(self.fd)
                 self.fd = None
+        _remove_stale_temporaries(self.path.parent)
         return self
 
     def __exit__(self, *exc):
