@@ -10,7 +10,7 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.collection import Collection
+from app.models.collection import STEM_RESERVED_MESSAGE, Collection
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
@@ -430,15 +430,22 @@ def delete_collection(
     """
     Delete an empty collection and its (now unused) directory.
 
-    Refuses (409) if the collection still has sub-collections or records (those
-    must be moved or deleted first) or if its directory still holds files that a
-    surviving record points at.
+    Refuses (409) if the volume has a file name stem and has captured, even
+    once emptied: its row keeps the stem so the names issued under it are
+    never issued again. Also refuses (409) if the collection still has
+    sub-collections or records (those must be moved or deleted first) or if
+    its directory still holds files that a surviving record points at.
     """
     from capture.project_manager import collection_capture_root
 
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    # Under the row lock, so that a PATCH setting a first stem cannot land
+    # between this check and the delete.
+    collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    if collection.reserves_its_stem():
+        raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
 
     collection_name = collection.name
 

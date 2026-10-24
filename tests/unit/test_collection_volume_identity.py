@@ -1187,3 +1187,161 @@ def test_a_volume_can_be_created_without_a_stem_for_now(client, db_session):
 
     assert resp.status_code == 201, resp.text
     assert resp.json()["filename_stem"] is None
+
+
+# ---------------------------------------------------------------------------
+# A volume that has issued names under its stem cannot be deleted
+# ---------------------------------------------------------------------------
+#
+# Deleting it would free the stem, and a new volume could then be given the
+# same stem and issue the same file names again. So a volume with a stem
+# that has captured keeps its row, and with it the stem, even once empty.
+
+STEM_DELETE_MESSAGE = (
+    "This volume has a file name stem and has captured images, so it cannot be "
+    "deleted; it keeps its stem so the name is never issued again."
+)
+
+
+def _admin_client(client):
+    from app.main import app
+    import app.api.collections as collections
+    import app.api.projects as projects
+
+    user = _user("adm", "admin")
+    for dep in (collections.allow_contributor, collections.allow_read_only, projects.allow_admin):
+        app.dependency_overrides[dep] = lambda u=user: u
+    return client
+
+
+@pytest.mark.unit
+def test_an_emptied_volume_with_a_stem_and_captures_cannot_be_deleted(client, db_session):
+    """The verifier's case: records moved out, delete, then reissue the stem."""
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    api = _admin_client(client)
+    p = _project(db_session)
+    a = _volume(db_session, p, "A", filename_stem="co-f-001", capture_counter=1)
+    b = _volume(db_session, p, "B")
+    _image_in(db_session, a)
+    for rec in db_session.query(Record).filter(Record.collection_id == a.id).all():
+        rec.collection_id = b.id
+    db_session.commit()
+
+    resp = api.delete(f"/collections/{a.id}")
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == {"message": STEM_DELETE_MESSAGE}
+    assert "co-f-001" not in resp.text
+    assert db_session.get(Collection, a.id) is not None
+
+    reissue = api.post("/collections/", json={"name": "C", "project_id": p.id,
+                                              "filename_stem": "co-f-001"})
+    assert reissue.status_code == 409, reissue.text
+
+
+@pytest.mark.unit
+def test_a_volume_with_a_stem_and_images_gets_the_stem_refusal(client, db_session):
+    api = _admin_client(client)
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-f-002")
+    _image_in(db_session, v)
+
+    resp = api.delete(f"/collections/{v.id}")
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == {"message": STEM_DELETE_MESSAGE}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("counter", [0, 5])
+def test_a_volume_without_a_stem_is_deleted_whatever_its_counter(client, db_session, counter):
+    from app.models.collection import Collection
+
+    api = _admin_client(client)
+    p = _project(db_session)
+    v = _volume(db_session, p, capture_counter=counter)
+    vid = v.id
+
+    resp = api.delete(f"/collections/{vid}")
+
+    assert resp.status_code == 204, resp.text
+    db_session.expire_all()
+    assert db_session.get(Collection, vid) is None
+
+
+@pytest.mark.unit
+def test_a_volume_with_a_stem_and_no_captures_is_deleted(client, db_session):
+    from app.models.collection import Collection
+
+    api = _admin_client(client)
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-f-003")
+    vid = v.id
+
+    resp = api.delete(f"/collections/{vid}")
+
+    assert resp.status_code == 204, resp.text
+    db_session.expire_all()
+    assert db_session.get(Collection, vid) is None
+    reuse = api.post("/collections/", json={"name": "D", "project_id": p.id,
+                                            "filename_stem": "co-f-003"})
+    assert reuse.status_code == 201, reuse.text
+
+
+@pytest.mark.unit
+def test_a_project_holding_such_a_volume_is_refused_by_the_api(client, db_session):
+    """DELETE /projects/{id} refuses any project that still has a collection."""
+    from app.models.project import Project
+
+    api = _admin_client(client)
+    p = _project(db_session)
+    _volume(db_session, p, filename_stem="co-f-004", capture_counter=1)
+
+    resp = api.delete(f"/projects/{p.id}")
+
+    assert resp.status_code == 409, resp.text
+    assert db_session.get(Project, p.id) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("nested", [False, True], ids=["top-level", "nested"])
+def test_an_orm_cascade_cannot_delete_such_a_volume(db_session, nested):
+    """Project.collections and child_collections cascade deletes in the ORM."""
+    from app.models.collection import Collection, StemReservedError
+
+    p = _project(db_session)
+    top = _volume(db_session, p, "top")
+    if nested:
+        target = Collection(name="child", parent_collection_id=top.id,
+                            filename_stem="co-f-005", capture_counter=1)
+        db_session.add(target)
+        db_session.commit()
+    else:
+        target = _volume(db_session, p, "v", filename_stem="co-f-005", capture_counter=1)
+    tid = target.id
+
+    db_session.delete(p)
+    with pytest.raises(StemReservedError):
+        db_session.flush()
+    db_session.rollback()
+    assert db_session.get(Collection, tid) is not None
+
+
+@pytest.mark.unit
+def test_an_orm_cascade_still_deletes_volumes_without_the_reservation(db_session):
+    from app.models.collection import Collection
+    from app.models.project import Project
+
+    p = _project(db_session)
+    a = _volume(db_session, p, "a", capture_counter=3)
+    b = _volume(db_session, p, "b", filename_stem="co-f-006")
+    ids = (p.id, a.id, b.id)
+
+    db_session.delete(p)
+    db_session.commit()
+
+    assert db_session.get(Project, ids[0]) is None
+    assert db_session.get(Collection, ids[1]) is None
+    assert db_session.get(Collection, ids[2]) is None

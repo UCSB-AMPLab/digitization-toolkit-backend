@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
+from sqlalchemy import event, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
 from sqlalchemy.orm import relationship, validates, object_session
 
 from app.core.db import Base
@@ -46,6 +46,16 @@ _EXTERNAL_ID_TRIMMED_POSTGRES = (
 _EXTERNAL_ID_TRIMMED_SQLITE = (
     "external_id IS NULL OR (external_id <> '' "
     "AND external_id = trim(external_id, char(32, 9, 10, 11, 12, 13)))"
+)
+
+
+class StemReservedError(ImmutableFieldError):
+    """A delete would free a stem whose file names have been issued."""
+
+
+STEM_RESERVED_MESSAGE = (
+    "This volume has a file name stem and has captured images, so it cannot be "
+    "deleted; it keeps its stem so the name is never issued again."
 )
 
 
@@ -189,6 +199,16 @@ class Collection(Base):
         """
         return (self.capture_counter or 0) > 0 or self.has_images()
 
+    def reserves_its_stem(self) -> bool:
+        """Whether the volume has a stem and has captured, so its row must be kept.
+
+        Deleting such a volume would free the stem under the unique
+        constraint, and a later volume could take it and issue the same file
+        names again. A volume without a stem, or with one it has not yet
+        captured under, reserves nothing.
+        """
+        return self.filename_stem is not None and self.has_captured()
+
     @validates("capture_counter", include_removes=True)
     def _capture_counter_never_decreases(self, key, value, is_remove):
         """Refuse any write that would lower or clear a stored capture_counter.
@@ -288,3 +308,28 @@ class Collection(Base):
             name='check_collection_filename_stem_pattern'
         ).ddl_if(dialect='sqlite'),
     )
+
+
+@event.listens_for(Collection, "before_delete")
+def _refuse_to_delete_a_reserved_stem(mapper, connection, target):
+    """Refuse an ORM delete of a volume that reserves its stem.
+
+    DELETE /collections/{id} refuses this itself with a 409. This covers the
+    ORM cascades the API does not use: Project.collections and
+    Collection.child_collections both cascade deletes. It reads images on the
+    flush's own connection rather than through the session, which is
+    mid-flush. A database-level ON DELETE CASCADE or raw SQL goes around it.
+    """
+    if target.filename_stem is None:
+        return
+    captured = (target.capture_counter or 0) > 0 or connection.execute(
+        select(exists().where(
+            RecordImage.record_id == Record.id,
+            Record.collection_id == target.id,
+        ))
+    ).scalar()
+    if captured:
+        raise StemReservedError(
+            f"collections.filename_stem is reserved: volume {target.id} has captured "
+            f"under it and cannot be deleted"
+        )
