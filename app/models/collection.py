@@ -12,8 +12,8 @@ from app.models.record import ImmutableFieldError, Record, RecordImage
 # is left of that column once `-img_<nnnn>` is appended: 36 - 9 = 27.
 PAIR_ID_MAX_LENGTH = RecordImage.__table__.columns["pair_id"].type.length
 FILENAME_INDEX_SUFFIX = "-img_0000"
-# Static: it assumes four digits. The capture path must check
-# len(stem) + len("-img_") + digits <= 36 itself, since <nnnn> outgrows four.
+# Static: it assumes four digits, which capture_naming.MAX_CAPTURE_NUMBER
+# (9999) guarantees, so every filename index fits in a pair id.
 FILENAME_STEM_MAX_LENGTH = PAIR_ID_MAX_LENGTH - len(FILENAME_INDEX_SUFFIX)
 
 # A lowercase slug: runs of [a-z0-9] joined by single hyphens.

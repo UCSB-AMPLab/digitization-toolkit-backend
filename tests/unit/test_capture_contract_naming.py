@@ -401,7 +401,7 @@ def test_capture_image_refuses_a_name_taken_after_the_check(tmp_path, monkeypatc
 
 
 # ---------------------------------------------------------------------------
-# A name longer than a pair id holds
+# A volume holds at most 9999 captures
 # ---------------------------------------------------------------------------
 
 STEM_27 = "co-ahr-con-caj001-car001-xy"
@@ -426,16 +426,16 @@ def _post(api, project, volume, dual=False, **extra):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("dual", [False, True])
-def test_a_name_longer_than_a_pair_id_is_refused_before_the_shutter_fires(
+def test_the_10000th_capture_is_refused_before_the_shutter_fires(
         client, db_session, test_project, backend, override_projects_root, dual):
-    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+    from app.core.capture_naming import CAPTURE_LIMIT_DETAIL
 
     v = _volume_at(db_session, test_project, STEM_27, 9999)
 
     resp = _post(_client_as(client), test_project, v, dual=dual)
 
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert resp.json()["detail"] == CAPTURE_LIMIT_DETAIL
     assert backend.requested == [], "no camera fired"
     assert _counter(db_session, v) == 9999, "the refused capture consumed no number"
     assert not (override_projects_root / STEM_27 / "captures").exists() or not any(
@@ -444,9 +444,9 @@ def test_a_name_longer_than_a_pair_id_is_refused_before_the_shutter_fires(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("dual", [False, True])
-def test_a_retake_whose_name_is_too_long_is_refused_and_the_record_is_left_as_it_was(
+def test_a_retake_past_the_limit_is_refused_and_the_record_is_left_as_it_was(
         client, db_session, test_project, backend, override_projects_root, dual):
-    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+    from app.core.capture_naming import CAPTURE_LIMIT_DETAIL
     from app.models.record import Record, RecordImage
 
     v = _volume_at(db_session, test_project, STEM_27, 9999)
@@ -460,7 +460,7 @@ def test_a_retake_whose_name_is_too_long_is_refused_and_the_record_is_left_as_it
     resp = _post(_client_as(client), test_project, v, dual=dual, record_id=rec.id)
 
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert resp.json()["detail"] == CAPTURE_LIMIT_DETAIL
     assert backend.requested == []
     db_session.expire_all()
     assert db_session.get(Record, rec.id).status == "rejected"
@@ -481,16 +481,52 @@ def test_a_27_character_stem_still_captures_number_9999(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("dual", [False, True])
-def test_a_shorter_stem_is_not_refused_for_a_five_digit_number(
+def test_a_shorter_stem_is_refused_at_the_same_limit(
         client, db_session, test_project, backend, override_projects_root, dual):
-    """Whether five digits are acceptable is not settled; only the 36-character limit is enforced."""
+    """The limit is 9999 whatever the stem's length."""
+    from app.core.capture_naming import CAPTURE_LIMIT_DETAIL
+
     v = _volume_at(db_session, test_project, STEM_26, 9999)
 
-    body = (_dual if dual else _single)(_client_as(client), test_project, v)
+    resp = _post(_client_as(client), test_project, v, dual=dual)
 
-    names = [Path(p).name for p in body["file_paths"]] if dual else [Path(body["file_path"]).name]
-    assert all(n.startswith(f"{STEM_26}-img_10000_c") for n in names)
-    assert _counter(db_session, v) == 10000
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == CAPTURE_LIMIT_DETAIL
+    assert backend.requested == []
+    assert _counter(db_session, v) == 9999
+
+
+@pytest.mark.unit
+def test_a_short_stem_still_captures_number_9999(
+        client, db_session, test_project, backend, override_projects_root):
+    v = _volume_at(db_session, test_project, STEM_26, 9998)
+
+    body = _single(_client_as(client), test_project, v)
+
+    assert Path(body["file_path"]).name == f"{STEM_26}-img_9999_c0.jpg"
+
+
+@pytest.mark.unit
+def test_passing_over_taken_numbers_stops_at_the_limit(
+        client, db_session, test_project, backend, override_projects_root):
+    """9999 is on disk, so the next number would be 10000: refused, not skipped to."""
+    from app.core.capture_naming import CAPTURE_LIMIT_DETAIL
+
+    v = _volume_at(db_session, test_project, STEM, 9998)
+    _occupy(override_projects_root, [9999])
+
+    resp = _post(_client_as(client), test_project, v)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == CAPTURE_LIMIT_DETAIL
+    assert backend.requested == []
+    assert _counter(db_session, v) == 9998
+
+
+@pytest.mark.unit
+def test_the_limit_is_9999():
+    from app.core.capture_naming import MAX_CAPTURE_NUMBER
+    assert MAX_CAPTURE_NUMBER == 9999
 
 
 # ---------------------------------------------------------------------------
@@ -629,9 +665,9 @@ def test_an_upload_passes_over_a_number_on_disk(
 
 
 @pytest.mark.unit
-def test_an_upload_whose_name_is_too_long_is_refused_and_writes_nothing(
+def test_an_upload_past_the_limit_is_refused_and_writes_nothing(
         client, db_session, test_project, upload_data, override_projects_root):
-    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+    from app.core.capture_naming import CAPTURE_LIMIT_DETAIL
 
     v = _volume_at(db_session, test_project, STEM_27, 9999)
     rec = _record_in(db_session, v)
@@ -639,7 +675,7 @@ def test_an_upload_whose_name_is_too_long_is_refused_and_writes_nothing(
     resp = _upload(_client_as(client), rec.id)
 
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert resp.json()["detail"] == CAPTURE_LIMIT_DETAIL
     assert _counter(db_session, v) == 9999
     assert _images(db_session, rec.id) == []
     assert not any((override_projects_root / STEM_27 / "captures").iterdir())
