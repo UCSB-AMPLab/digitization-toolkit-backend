@@ -16,8 +16,10 @@ number.
 """
 import logging
 import os
+import re
+import threading
 from pathlib import Path
-from typing import Optional
+from typing import Dict, Optional, Set, Tuple
 
 from sqlalchemy.orm import Session
 
@@ -100,6 +102,46 @@ def capture_name_taken(output_dir: Path, name_stem: str) -> bool:
     return False
 
 
+# Per manifest path and stem: (device, inode, bytes read, the numbers found so far).
+# A manifest is append-only, so each call reads only what was appended since
+# the last; a file replaced, or shorter than what was read, is read again.
+_manifest_numbers_cache: Dict[Tuple[str, str], Tuple[int, int, int, Set[int]]] = {}
+_manifest_numbers_lock = threading.Lock()
+
+
+def manifest_capture_numbers(manifest: Path, stem: str) -> Set[int]:
+    """The capture numbers a volume's manifest names, from any `<stem>-img_<nnnn>_c<n>` in it.
+
+    A number named there was given to a capture once, even if its file has
+    since been deleted from the card and its row from the catalogue, so it
+    must not be given again (a catalogue restored from a backup holds an
+    older counter). The text is searched for the name, not parsed as JSON,
+    and only the bytes up to the last newline count, so a line still being
+    appended is read on the next call. A manifest that does not exist names
+    nothing.
+    """
+    pattern = re.compile(re.escape(stem.encode()) + rb"-img_(\d+)_c", re.IGNORECASE)
+    key = (str(manifest), stem)
+    with _manifest_numbers_lock:
+        try:
+            st = os.stat(manifest)
+        except FileNotFoundError:
+            _manifest_numbers_cache.pop(key, None)
+            return set()
+        dev, ino, offset, numbers = _manifest_numbers_cache.get(key, (st.st_dev, st.st_ino, 0, set()))
+        if (dev, ino) != (st.st_dev, st.st_ino) or st.st_size < offset:
+            offset, numbers = 0, set()
+        if st.st_size > offset:
+            with open(manifest, "rb") as f:
+                f.seek(offset)
+                chunk = f.read(st.st_size - offset)
+            end = chunk.rfind(b"\n") + 1
+            numbers = numbers | {int(m.group(1)) for m in pattern.finditer(chunk, 0, end)}
+            offset += end
+        _manifest_numbers_cache[key] = (st.st_dev, st.st_ino, offset, numbers)
+        return set(numbers)
+
+
 def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: Path) -> str:
     """Raise the volume's capture counter and return the event's `<stem>-img_<nnnn>`.
 
@@ -109,19 +151,23 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
     where it was. The caller holds the volume's row lock.
 
     A number that a file in `output_dir` (the volume's `captures/`) or its
-    `previews/` already carries (capture_name_taken) is passed over and the
-    counter raised again, so no file is ever overwritten and no name is
-    given twice. That happens only when the counter is behind the disk: an
+    `previews/` already carries (capture_name_taken), or that the volume's
+    `metadata/manifest.jsonl` names (manifest_capture_numbers), is passed
+    over and the counter raised again, so no file is ever overwritten and no
+    name is given twice. That happens only when the counter is behind: an
     event whose files were written but whose commit failed, or a catalogue
-    restored from before captures still on the card. The contract allows
+    restored from a backup older than captures made since, including ones
+    whose files have been deleted. The manifest is read once per call. The contract allows
     gaps in <nnnn> and forbids reuse.
 
     Raises CaptureNameRefused, leaving the rollback to the caller, when the
     index would be longer than PAIR_ID_MAX_LENGTH, or when more than
     MAX_NUMBERS_PASSED_OVER numbers in a row are already on disk.
     """
+    from app.core.paths import METADATA_DIR
     from app.models.collection import PAIR_ID_MAX_LENGTH
 
+    in_manifest = manifest_capture_numbers(output_dir.parent / METADATA_DIR / "manifest.jsonl", stem)
     for _ in range(MAX_NUMBERS_PASSED_OVER + 1):
         number: Optional[int] = next_capture_number(db, collection_id)
         if number is None:
@@ -132,7 +178,7 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
             logger.warning(f"Capture number {number} of collection {collection_id} makes {index}, "
                            f"longer than {PAIR_ID_MAX_LENGTH} characters; capture refused")
             raise CaptureNameRefused(CAPTURE_NAME_TOO_LONG_DETAIL)
-        if not capture_name_taken(output_dir, index):
+        if number not in in_manifest and not capture_name_taken(output_dir, index):
             return index
-        logger.warning(f"Capture number {number} of collection {collection_id} is already on disk ({index}); taking the next")
+        logger.warning(f"Capture number {number} of collection {collection_id} is already on disk or in the manifest ({index}); taking the next")
     raise CaptureNameRefused(CAPTURE_NUMBERS_TAKEN_DETAIL)

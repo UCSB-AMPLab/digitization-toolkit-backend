@@ -640,3 +640,61 @@ def test_an_upload_whose_name_is_too_long_is_refused_and_writes_nothing(
     assert _counter(db_session, v) == 9999
     assert _images(db_session, rec.id) == []
     assert not any((override_projects_root / STEM_27 / "captures").iterdir())
+
+
+# ---------------------------------------------------------------------------
+# Numbers the manifest names
+# ---------------------------------------------------------------------------
+
+def _manifest_names(root):
+    m = root / STEM / "metadata" / "manifest.jsonl"
+    if not m.exists():
+        return []
+    names = []
+    for line in m.read_text().splitlines():
+        if line.strip():
+            names += [Path(f["relative_path"]).name for f in json.loads(line)["files"]]
+    return names
+
+
+@pytest.mark.unit
+def test_a_restored_catalogue_does_not_reuse_a_number_whose_file_was_deleted(
+        client, db_session, test_project, volume, backend, override_projects_root):
+    """The counter goes back to a backup's value; image 2 was deleted from the card; 3 is still there."""
+    from sqlalchemy import text
+    from app.models.record import RecordImage
+
+    api = _client_as(client, role="admin")
+    for _ in range(3):
+        _single(api, test_project, volume)
+    img2 = db_session.query(RecordImage).filter(RecordImage.filename == f"{STEM}-img_0002_c0.jpg").one()
+    assert api.delete(f"/records/images/{img2.id}").status_code == 200
+    assert f"{STEM}-img_0002_c0.jpg" not in _captures(override_projects_root)
+    db_session.execute(text("UPDATE collections SET capture_counter = 1 WHERE id = :i"), {"i": volume.id})
+    db_session.commit()
+
+    body = _single(api, test_project, volume)
+
+    assert Path(body["file_path"]).name == f"{STEM}-img_0004_c0.jpg"
+    names = _manifest_names(override_projects_root)
+    assert len(names) == len(set(names)), "no name is given twice"
+
+
+@pytest.mark.unit
+def test_the_manifest_is_read_incrementally_and_a_torn_last_line_waits(tmp_path):
+    from app.core.capture_naming import manifest_capture_numbers
+
+    m = tmp_path / "manifest.jsonl"
+    assert manifest_capture_numbers(m, STEM) == set()
+    m.write_text(f'{{"files": [{{"relative_path": "captures/{STEM}-img_0001_c0.cr2"}}]}}\n')
+    assert manifest_capture_numbers(m, STEM) == {1}
+    with open(m, "a") as f:
+        f.write(f'{{"files": [{{"relative_path": "captures/{STEM.upper()}-IMG_0007_C1.jpg"}}]}}\n'
+                f'{{"files": [{{"relative_path": "captures/{STEM}-img_0009_c0')
+    assert manifest_capture_numbers(m, STEM) == {1, 7}, "the unfinished line is not read yet"
+    with open(m, "a") as f:
+        f.write('.jpg"}]}\n')
+    assert manifest_capture_numbers(m, STEM) == {1, 7, 9}
+    assert manifest_capture_numbers(m, "co-other") == set()
+    m.write_text("")
+    assert manifest_capture_numbers(m, STEM) == set(), "a replaced, shorter file is read again"
