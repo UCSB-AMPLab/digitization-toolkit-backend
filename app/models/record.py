@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
+from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
 from sqlalchemy.orm import relationship
 
 from app.core.db import Base
@@ -157,6 +157,30 @@ class RecordImage(Base):
 	is_current = Column(Boolean, nullable=False, default=True)
 	superseded_at = Column(DateTime, nullable=True)
 	rejection_id = Column(Integer, ForeignKey("record_rejections.id", ondelete="SET NULL"), nullable=True, index=True)
+
+	# Freed from the card (app.core.offsite_free): the file was removed with
+	# its verified object still in the offsite bucket, so it is stored
+	# offsite, not missing. The master and a RAW master's preview are each
+	# freed on their own; the size is kept because a freed file cannot be
+	# measured on the card. Each pair is set or unset together
+	# (check_record_image_*_freed). Cleared by a restore.
+	master_freed_at = Column(DateTime, nullable=True)
+	master_freed_bytes = Column(BigInteger, nullable=True)
+	preview_freed_at = Column(DateTime, nullable=True)
+	preview_freed_bytes = Column(BigInteger, nullable=True)
+
+	__table_args__ = (
+		CheckConstraint(
+			"(master_freed_at IS NULL AND master_freed_bytes IS NULL) OR "
+			"(master_freed_at IS NOT NULL AND master_freed_bytes IS NOT NULL AND master_freed_bytes >= 0)",
+			name="check_record_image_master_freed",
+		),
+		CheckConstraint(
+			"(preview_freed_at IS NULL AND preview_freed_bytes IS NULL) OR "
+			"(preview_freed_at IS NOT NULL AND preview_freed_bytes IS NOT NULL AND preview_freed_bytes >= 0)",
+			name="check_record_image_preview_freed",
+		),
+	)
 
 	# Relationships
 	record = relationship("Record", back_populates="images")
