@@ -7,7 +7,9 @@ copy, drop the checksums from a listing, or refuse listings once a copy has
 succeeded. No bucket and no key is used; rclone is given an empty config file
 so that it reads no configuration of this machine's.
 
-Skipped when no rclone binary is found (DTK_TEST_RCLONE, else PATH).
+Skipped when no rclone binary is found (DTK_TEST_RCLONE, else PATH), except
+under CI (the CI environment variable set), where a missing rclone fails the
+test: .github/workflows/ci.yml installs a pinned one for these tests.
 
     python -m pytest tests/unit/test_image_upload.py
 """
@@ -94,8 +96,11 @@ class Remote:
 @pytest.fixture
 def remote(db_session, tmp_path, monkeypatch):
     """A local directory remote behind the wrapper, with OFFSITE_* pointing at it."""
-    if not REAL_RCLONE:
-        pytest.skip("no rclone binary (set DTK_TEST_RCLONE or put rclone on PATH)")
+    if not REAL_RCLONE or not os.access(REAL_RCLONE, os.X_OK):
+        message = "no rclone binary (set DTK_TEST_RCLONE or put rclone on PATH)"
+        if os.environ.get("CI"):
+            pytest.fail(message)
+        pytest.skip(message)
     from app.core import config
 
     root = tmp_path / "bucket"
