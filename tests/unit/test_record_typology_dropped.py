@@ -107,11 +107,11 @@ def _install_capture_fakes(monkeypatch, tmp_path):
         return {"camera_index": camera_index, "rotate_deg": 0}, "hw"
 
     def fake_single(project_name, camera_config, check_camera=False,
-                    include_resolution=False, collection_name=None, stem=None):
+                    include_resolution=False, collection_name=None, stem=None, filename_index=None, root=None):
         return str(tmp_path / "cap.jpg"), "cap-1", None
 
     def fake_dual(project_name, cam1_config, cam2_config, check_camera=False,
-                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None):
+                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None, filename_index=None, root=None):
         return (str(tmp_path / "cap_c0.jpg"), str(tmp_path / "cap_c1.jpg"),
                 "cap-2", "pair-1")
 

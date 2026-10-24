@@ -1087,7 +1087,9 @@ def update_record_status(
 	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
 	A retake only happens via the capture endpoints in app/api/cameras.py: it
 	supersedes the current images, leaves a captured record captured, and
-	moves a rejected one to in_review. The undo transitions above are plain
+	returns a rejected one to captured, writing the same rejected > captured
+	history row as the prepare-for-retake transition. The record reaches
+	review again only when an operator promotes its volume. The undo transitions above are plain
 	status resets with no new image, no reason and no rejection record; the
 	change itself is dated in record_status_changes, like every other.
 	"""

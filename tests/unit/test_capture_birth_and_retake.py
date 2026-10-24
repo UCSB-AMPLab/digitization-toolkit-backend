@@ -2,10 +2,10 @@
 """NEH-260: what state a capture is born in, and what a retake does to it.
 
 A record is born `captured` — it is the operator's until she promotes the
-collection. A retake supersedes the current images either way, but only a
-rejected record is moved into the review queue by it: a captured record stays
-where it is, or every retake would promote the record it was meant to leave in
-her hands.
+volume. A retake supersedes the current images either way and leaves the
+record `captured`: a captured record stays where it is, and a rejected one
+returns to `captured` (decision 8, ruled 2026-10-24). It reaches review again
+only when the operator promotes the volume, as a new capture does.
 
 An approved record is deliberately not retakeable. Approved is the only state
 that means something may already have left the appliance, and the supersede
@@ -40,11 +40,11 @@ def _install_capture_fakes(monkeypatch, tmp_path):
         return {"camera_index": camera_index, "rotate_deg": 0}, "hw"
 
     def fake_single(project_name, camera_config, check_camera=False,
-                    include_resolution=False, collection_name=None, stem=None):
+                    include_resolution=False, collection_name=None, stem=None, filename_index=None, root=None):
         return str(tmp_path / "cap.jpg"), "cap-1", None
 
     def fake_dual(project_name, cam1_config, cam2_config, check_camera=False,
-                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None):
+                  include_resolution=False, stagger_ms=0, collection_name=None, stem=None, filename_index=None, root=None):
         return (str(tmp_path / "cap_c0.jpg"), str(tmp_path / "cap_c1.jpg"),
                 "cap-2", "pair-1")
 
@@ -147,7 +147,7 @@ def test_retaking_a_captured_record_supersedes_but_does_not_promote(
 
 
 @pytest.mark.unit
-def test_retaking_a_rejected_record_supersedes_and_promotes(
+def test_retaking_a_rejected_record_supersedes_and_returns_it_to_captured(
         client, db_session, test_project, volume, monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
     rec, old = _record_with_image(db_session, volume, "rejected")
@@ -158,7 +158,23 @@ def test_retaking_a_rejected_record_supersedes_and_promotes(
 
     db_session.refresh(rec)
     db_session.refresh(old)
-    assert rec.status == "in_review"
+    assert rec.status == "captured", "only a promotion of the volume sends it to review"
+    assert old.is_current is False
+
+
+@pytest.mark.unit
+def test_retaking_a_rejected_dual_record_returns_it_to_captured(
+        client, db_session, test_project, volume, monkeypatch, tmp_path):
+    _install_capture_fakes(monkeypatch, tmp_path)
+    rec, old = _record_with_image(db_session, volume, "rejected", capture_mode="dual")
+    api = _client_as(client, "op", "operator")
+
+    resp = _capture_dual(api, test_project.name, collection_id=volume.id, record_id=rec.id)
+    assert resp.status_code == 200, resp.text
+
+    db_session.refresh(rec)
+    db_session.refresh(old)
+    assert rec.status == "captured"
     assert old.is_current is False
 
 

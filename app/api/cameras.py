@@ -95,6 +95,36 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 	return project.name, None, None
 
 
+def _take_filename_index(db: Session, collection_id: int, stem: str, root) -> str:
+	"""Raise the volume's capture counter and return the event's `<stem>-img_<nnnn>`.
+
+	Called once per capture event, after the refusals and before the
+	camera is touched, in the transaction that writes the event's images, so
+	a capture that fails before its commit leaves the counter where it was
+	(app.core.capture_counter). The volume's row is already locked by
+	_refuse_capture_without_volume_or_stem, so the raise takes no new lock.
+
+	A number that a file in the volume's `captures/` or `previews/` already
+	carries (capture.service.capture_name_taken) is passed over and the
+	counter raised again, so no file is ever overwritten and no name is
+	given twice. That happens only when the counter is behind the disk: a
+	capture whose files and manifest record were written but whose commit
+	failed, or a catalogue restored from before captures still on the card.
+	"""
+	from capture.project_manager import image_output_dir
+	from capture.service import capture_filename_index, capture_name_taken
+
+	output_dir = image_output_dir("", None, stem, root)
+	while True:
+		number = next_capture_number(db, collection_id)
+		if number is None:
+			raise RuntimeError(f"Collection {collection_id} has no capture counter")
+		index = capture_filename_index(stem, number)
+		if not capture_name_taken(output_dir, index):
+			return index
+		logger.warning(f"Capture number {number} of collection {collection_id} is already on disk ({index}); taking the next")
+
+
 class DeviceInfo(BaseModel):
 	"""Information about a detected camera device."""
 	hardware_id: str
@@ -759,6 +789,7 @@ def trigger_capture(
 		)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
+		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, IMG_SIZES
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
@@ -791,13 +822,21 @@ def trigger_capture(
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
+		# Read once: the number is checked against, and the image written
+		# under, the same root.
+		root = projects_root()
+		# One capture event: its number, in the transaction that writes its image.
+		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
 			collection_name=collection_name,
-			stem=stem
+			stem=stem,
+			filename_index=filename_index,
+			root=root
 		)
 		
 		# Extract image dimensions and EXIF data
@@ -833,11 +872,6 @@ def trigger_capture(
 
 		# Get or create Record
 		is_recapture = False
-		# A retake promotes only a rejected record, moving it into the review
-		# queue. A captured one stays in the operator's hands until she promotes
-		# its collection (NEH-260); without this flag every retake would promote
-		# the record it was meant to leave with her.
-		recapture_promotes = False
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
@@ -861,7 +895,6 @@ def trigger_capture(
 				# and every folio is captured as its own record.
 				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
-				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
 				_supersede_current_images(record)
 		else:
@@ -932,11 +965,11 @@ def trigger_capture(
 			)
 			db.add(ex)
 
-		if is_recapture and recapture_promotes:
-			change_record_status(db, record, "in_review", current_user.username)
-
-		# One capture event, counted in the transaction that writes its image.
-		next_capture_number(db, record.collection_id)
+		if is_recapture:
+			# A rejected record returns to captured, as through the
+			# prepare-for-retake transition, and reaches review again only
+			# when an operator promotes its volume; a captured one stays.
+			change_record_status(db, record, "captured", current_user.username)
 
 		db.commit()
 		db.refresh(record)
@@ -995,6 +1028,7 @@ def trigger_dual_capture(
 		)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
+		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
@@ -1031,6 +1065,12 @@ def trigger_dual_capture(
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
+		# Read once (see trigger_capture).
+		root = projects_root()
+		# One capture event for the pair: one number, which both images carry
+		# and which is their pair id.
+		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=project_name,
 			cam1_config=cam0_config,
@@ -1039,7 +1079,9 @@ def trigger_dual_capture(
 			include_resolution=request.include_resolution_in_filename,
 			stagger_ms=request.stagger_ms,
 			collection_name=collection_name,
-			stem=stem
+			stem=stem,
+			filename_index=filename_index,
+			root=root
 		)
 
 		# Reuse the resolved project name so the DB record matches the on-disk tree
@@ -1052,11 +1094,6 @@ def trigger_dual_capture(
 		
 		# Get or create Record
 		is_recapture = False
-		# A retake promotes only a rejected record, moving it into the review
-		# queue. A captured one stays in the operator's hands until she promotes
-		# its collection (NEH-260); without this flag every retake would promote
-		# the record it was meant to leave with her.
-		recapture_promotes = False
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
@@ -1067,7 +1104,6 @@ def trigger_dual_capture(
 				# images.
 				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
-				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
 				_supersede_current_images(record)
 		else:
@@ -1173,12 +1209,9 @@ def trigger_dual_capture(
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
 
-		if is_recapture and recapture_promotes:
-			change_record_status(db, record, "in_review", current_user.username)
-
-		# One capture event for the pair, counted in the transaction that
-		# writes both images.
-		next_capture_number(db, record.collection_id)
+		if is_recapture:
+			# As in trigger_capture: a rejected record returns to captured.
+			change_record_status(db, record, "captured", current_user.username)
 
 		db.commit()
 		db.refresh(record)

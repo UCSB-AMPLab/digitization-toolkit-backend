@@ -149,7 +149,7 @@ def test_retaking_a_rejected_record_is_dated(client, db_session, test_project, v
     resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
-    assert _changes(db_session, rec) == [("rejected", "in_review", "op")]
+    assert _changes(db_session, rec) == [("rejected", "captured", "op")]
 
 
 @pytest.mark.unit
@@ -164,7 +164,7 @@ def test_retaking_a_rejected_dual_record_is_dated(client, db_session, test_proje
     resp = _capture_dual(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
-    assert _changes(db_session, rec) == [("rejected", "in_review", "op")]
+    assert _changes(db_session, rec) == [("rejected", "captured", "op")]
 
 
 @pytest.mark.unit

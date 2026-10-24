@@ -25,7 +25,7 @@ from app.models.record import Record, RecordImage
 
 
 @pytest.mark.integration
-def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
+def test_single_capture_recapture_returns_rejected_to_captured(authed_client, db_session, test_project, capture_volume, skip_if_no_camera):
     project_name = test_project.name
 
     response = authed_client.post(
@@ -60,7 +60,7 @@ def test_single_capture_recapture_flips_rejected_back_to_in_review(authed_client
     assert response.status_code == 200, response.text
 
     db_session.refresh(record)
-    assert record.status == "in_review"
+    assert record.status == "captured"
 
     # The original file is preserved on disk — a rejected capture is never deleted.
     assert first_image_path.exists()
@@ -109,7 +109,7 @@ def test_dual_capture_recapture_supersedes_both_sides(authed_client, db_session,
     assert response.status_code == 200, response.text
 
     db_session.refresh(record)
-    assert record.status == "in_review"
+    assert record.status == "captured"
 
     for img in old_images:
         db_session.refresh(img)

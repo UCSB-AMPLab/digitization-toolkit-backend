@@ -47,7 +47,7 @@ RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 #   paths, so one record cannot be withdrawn from a reviewer on its own.
 # - A retake, which supersedes the current images and is driven entirely by
 #   app/api/cameras.py rather than by a client-chosen status value. It leaves a
-#   captured record captured, and moves a rejected one to in_review.
+#   captured record captured, and returns a rejected one to captured.
 #
 # approved -> in_review and rejected -> in_review ARE here: these are the
 # "undo my mistake" resets a reviewer can trigger directly from the record

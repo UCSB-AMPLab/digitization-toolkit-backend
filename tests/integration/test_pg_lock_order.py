@@ -122,7 +122,7 @@ def _install_app(monkeypatch, tmp_path, Session):
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "single_capture_image",
                         lambda project_name, camera_config, check_camera=False,
-                        include_resolution=False, collection_name=None, stem=None:
+                        include_resolution=False, collection_name=None, **_kw:
                         (str(tmp_path / "cap.jpg"), "cap-1", None))
     monkeypatch.setattr(project_manager_module, "default_camera_config_from_registry",
                         lambda camera_index, resolution="high", registry=None:

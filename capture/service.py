@@ -1,10 +1,10 @@
+import os
 import sys
 from pathlib import Path
 import time
 import threading
 import tempfile
 import shutil
-from datetime import datetime, timezone
 import concurrent.futures
 from typing import Optional
 
@@ -43,7 +43,7 @@ from .backends import (
 from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir, projects_root
 
 from app.core.config import settings
-from app.core.paths import is_raw_suffix, preview_sidecar_of
+from app.core.paths import PREVIEW_SIDECAR_SUFFIX, is_raw_suffix, preview_sidecar_of
 
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -261,40 +261,94 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
         subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
 
 
+# The file name of a capture is `<filename index>_c<camera index>.<ext>`, and
+# the filename index is `<filename_stem>-img_<nnnn>` (exchange contract 1.1,
+# section 3). <nnnn> is the volume's capture number (app.core.capture_counter),
+# zero-padded to four digits; str.format pads and never truncates, so 10000
+# and above are written with five or more digits.
+CAPTURE_NUMBER_DIGITS = 4
+
+
+def capture_filename_index(stem: str, number: int) -> str:
+    """`<stem>-img_<nnnn>`: the shared part of a capture event's file names, and a dual capture's pair id."""
+    if not stem:
+        raise ValueError("A capture's file name needs its volume's file name stem")
+    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
+        raise ValueError(f"Not a capture number: {number!r}")
+    return f"{stem}-img_{number:0{CAPTURE_NUMBER_DIGITS}d}"
+
+
+def capture_name_taken(output_dir: Path, name_stem: str) -> bool:
+    """True if a file in `output_dir`, or in its sidecar directory, already carries `name_stem`.
+
+    `name_stem` is a file name without its suffix (`<index>_c0`), or the
+    filename index alone (`<index>`), which covers every camera of the event.
+    A file carries it when its name, casefolded, is `name_stem` followed by
+    a suffix, by `_c<n>` for an index, or by `_preview.jpg`. The suffix is
+    not known before the shot (the gphoto2 backend writes `.cr2` for a
+    request for `.jpg`), so every suffix counts. Names are casefolded
+    because exFAT, vfat and APFS by default treat names differing only in
+    case as one. The sidecar directory is where preview_sidecar_of puts a
+    RAW master's `_preview.jpg`: `previews/` beside a `captures/` directory,
+    the directory itself otherwise. A directory that does not exist holds
+    nothing.
+    """
+    target = name_stem.casefold()
+
+    def carries(name: str) -> bool:
+        name = name.casefold()
+        if not name.startswith(target):
+            return False
+        rest = name[len(target):]
+        return rest.startswith(".") or rest.startswith("_c") or rest.startswith(PREVIEW_SIDECAR_SUFFIX)
+
+    dirs = [output_dir]
+    sidecar_dir = preview_sidecar_of(output_dir / "x.jpg").parent
+    if sidecar_dir != output_dir:
+        dirs.append(sidecar_dir)
+    for d in dirs:
+        try:
+            with os.scandir(d) as entries:
+                if any(carries(e.name) for e in entries):
+                    return True
+        except FileNotFoundError:
+            continue
+    return False
+
+
 def image_filename(
-    camera_index: int, 
-    index: str = None,
+    camera_index: int,
+    index: str,
     img_size: tuple = None,
     image_encoding: str = "jpg") -> str:
     """
-    Generate a compact image filename with timestamp and camera index.
-    
+    The file name of one camera's image of a capture event.
+
     Examples:
-        - 20260104_035632_123_c1.jpg  (with milliseconds for uniqueness)
-        - 20260104_035632_123_c1_4624x3472.jpg  (with resolution)
-        - 0001_c1.jpg  (with custom index like "0001")
-    
+        - co-ahr-con-t055-img_0001_c1.jpg  (index "co-ahr-con-t055-img_0001")
+        - co-ahr-con-t055-img_0001_c1_4624x3472.jpg  (with resolution)
+
     Args:
-        camera_index (int): The camera index.
-        index (str): Custom index/counter. If None, uses UTC timestamp with ms.
-        include_resolution (bool): Whether to include resolution in filename.
-        img_size (tuple): The image size as (width, height), required if include_resolution=True.
+        camera_index (int): The camera index, appended as `_c<n>` on every capture.
+        index (str): The event's filename index (capture_filename_index). Required:
+            there is no timestamp fallback (exchange contract 1.1, section 3).
+        img_size (tuple): The image size as (width, height), appended when given.
+        image_encoding (str): The file suffix requested from the backend.
     Returns:
         str: The generated image filename.
     """
     if not index:
-        now = datetime.now(timezone.utc)
-        index = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
-    
+        raise ValueError("A capture's file name needs a filename index")
+
     filename = f"{index}_c{camera_index}"
-    
+
     if img_size:
         width, height = img_size
         filename += f"_{width}x{height}"
-    
+
     filename += image_encoding if image_encoding.startswith('.') else f".{image_encoding}"
     return filename
-    
+
 
 def capture_image(
         project_name: str,
@@ -312,9 +366,9 @@ def capture_image(
     Args:
         project_name (str): The name of the project to save the image in.
         camera_config (CameraConfig): Camera configuration object with all capture settings.
-        output_filename (str): The name of the output image file (optional, auto-generated if None).
+        output_filename (str): The name of the output image file (image_filename). Required.
         check_camera (bool): Whether to check camera availability before capture (default is True).
-        include_resolution (bool): Include resolution in auto-generated filename (default is False).
+        include_resolution (bool): Unused; the caller puts any resolution in output_filename.
         capture_output (bool): Capture stderr/stdout for debugging (default is False for performance).
         collection_name (str): The volume's name, for a volume without a stem (name-based layout).
         stem (str): The volume's file name stem; the image goes to `<stem>/captures/`.
@@ -336,21 +390,16 @@ def capture_image(
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
-        output_filename = image_filename(
-            camera_index=camera_config.camera_index,
-            img_size=camera_config.img_size if include_resolution else None,
-            image_encoding=camera_config.encoding
-        )
-    
+        raise ValueError("capture_image needs output_filename; there is no timestamp fallback")
+
     output_path = Path(project_path, output_filename)
 
-    # Never overwrite an existing master if a repeated timestamp collides
-    if output_path.exists():
-        stem, suffix = output_path.stem, output_path.suffix
-        counter = 1
-        while output_path.exists():
-            output_path = project_path / f"{stem}_{counter}{suffix}"
-            counter += 1
+    # Never overwrite a master or its sidecar. The caller takes a capture
+    # number no file carries (capture_name_taken), so this refuses only a
+    # name that was taken after that check, under any suffix, since the
+    # backend may change the suffix (gphoto2 writes `.cr2`).
+    if capture_name_taken(project_path, output_path.stem):
+        raise FileExistsError(f"A file named {output_path.stem} already exists in {project_path}")
 
     # Use backend for actual capture
     backend = get_backend()
@@ -385,7 +434,9 @@ def single_capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         collection_name: Optional[str] = None,
-        stem: Optional[str] = None) -> tuple:
+        stem: Optional[str] = None,
+        filename_index: Optional[str] = None,
+        root: Optional[Path] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -393,11 +444,17 @@ def single_capture_image(
         project_name (str): The name of the project to save the image in.
         camera_config (CameraConfig): Configuration for the camera.
         check_camera (bool): Whether to check camera availability before capture.
-        include_resolution (bool): Include resolution in auto-generated filename.
+        include_resolution (bool): Append the resolution to the file name.
+        filename_index (str): The event's `<stem>-img_<nnnn>` (capture_filename_index).
+            Required; the image is named `<filename_index>_c<camera index>.<ext>`.
+        root (Path): The projects root, read once by the caller; read here when not given.
     Returns:
         tuple: (output_path, capture_id, pair_id) - path to image and manifest IDs.
+            pair_id is None: a single capture has no pair.
     """
-    
+    if not filename_index:
+        raise ValueError("single_capture_image needs a filename_index; there is no timestamp fallback")
+
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
@@ -405,11 +462,18 @@ def single_capture_image(
 
     # Read once: the image and its manifest record go under the same root
     # even if an admin activates another drive while the shutter is open.
-    root = projects_root()
+    if root is None:
+        root = projects_root()
 
     output_path, metadata = capture_image(
         project_name=project_name,
         camera_config=camera_config,
+        output_filename=image_filename(
+            camera_index=camera_config.camera_index,
+            index=filename_index,
+            img_size=camera_config.img_size if include_resolution else None,
+            image_encoding=camera_config.encoding,
+        ),
         check_camera=False,  # Already checked
         include_resolution=include_resolution,
         collection_name=collection_name,
@@ -558,7 +622,9 @@ def dual_capture_image(
         include_resolution: bool = False,
         stagger_ms: int = 20,
         collection_name: Optional[str] = None,
-        stem: Optional[str] = None) -> tuple:
+        stem: Optional[str] = None,
+        filename_index: Optional[str] = None,
+        root: Optional[Path] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -567,43 +633,49 @@ def dual_capture_image(
         cam1_config (CameraConfig): Configuration for camera 1.
         cam2_config (CameraConfig): Configuration for camera 2.
         check_camera (bool): Whether to check camera availability before capture.
-        include_resolution (bool): Include resolution in auto-generated filenames.
+        include_resolution (bool): Append each camera's resolution to its file name.
         stagger_ms (int): Delay in ms between starting cameras (default is 20ms).
+        filename_index (str): The event's `<stem>-img_<nnnn>` (capture_filename_index).
+            Required. Both images carry it, `_c0` and `_c1` telling them apart,
+            and it is the pair id.
+        root (Path): The projects root, read once by the caller; read here when not given.
     Returns:
         tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
         
     Example:
         cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
         cam2 = CameraConfig(camera_index=1, hflip=True, awb="indoor")
-        path1, path2, capture_id, pair_id = dual_capture_image("myproject", cam1, cam2)
+        path1, path2, capture_id, pair_id = dual_capture_image(
+            "myproject", cam1, cam2, stem="co-ahr-con-t055",
+            filename_index="co-ahr-con-t055-img_0001")
     """
-    
+    if not filename_index:
+        raise ValueError("dual_capture_image needs a filename_index; there is no timestamp fallback")
+
     if check_camera:
         if not is_camera_connected(cam1_config.camera_index):
             raise RuntimeError(f"Camera {cam1_config.camera_index} is not connected.")
         if not is_camera_connected(cam2_config.camera_index):
             raise RuntimeError(f"Camera {cam2_config.camera_index} is not connected.")
         
-    # Pre-generate filenames with same timestamp index for pairing
-    now = datetime.now(timezone.utc)
-    timestamp_index = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
-    
+    # One filename index for the pair; `_c<n>` tells the two images apart.
     filename1 = image_filename(
         camera_index=cam1_config.camera_index,
-        index=timestamp_index,
+        index=filename_index,
         img_size=cam1_config.img_size if include_resolution else None,
         image_encoding=cam1_config.encoding
     )
     filename2 = image_filename(
         camera_index=cam2_config.camera_index,
-        index=timestamp_index,
+        index=filename_index,
         img_size=cam2_config.img_size if include_resolution else None,
         image_encoding=cam2_config.encoding
     )
     
     timing = {}
     # Read once for both cameras and the manifest record (see single_capture_image).
-    root = projects_root()
+    if root is None:
+        root = projects_root()
 
     def capture_with_timing(config, fname):
         start = time.time()
@@ -660,7 +732,7 @@ def dual_capture_image(
 
     record = generate_manifest_record(
         project_name=project_name,
-        pair_id=timestamp_index,
+        pair_id=filename_index,
         img_paths=[img1_path, img2_path],
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
