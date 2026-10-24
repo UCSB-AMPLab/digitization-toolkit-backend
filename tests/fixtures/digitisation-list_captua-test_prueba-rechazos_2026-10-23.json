@@ -1,0 +1,179 @@
+{
+  "contract": "fisqua-captua-exchange",
+  "version": "1.1",
+  "kind": "digitisation-list",
+  "id": "00000000-0000-4000-8000-000000000002",
+  "generatedAt": "2026-10-23T18:05:00Z",
+  "generatedBy": {
+    "system": "fisqua",
+    "instance": "captua-test",
+    "systemVersion": "0.0.0-test"
+  },
+  "inReplyTo": null,
+  "list": {
+    "name": "Prueba de rechazos",
+    "tenant": "captua-test",
+    "repositoryCode": "XX-TEST",
+    "notes": "Lista sintética. Todos los ítems, salvo el primero, deben quedar en el informe de rechazos; los dos últimos, solo si antes se importó la lista válida."
+  },
+  "items": [
+    {
+      "referenceCode": "xx-test-101",
+      "sequence": 1,
+      "title": "Aceptado",
+      "dates": {
+        "display": "1820",
+        "start": "1820-01-01",
+        "end": "1820-12-31"
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-101",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-101",
+      "sequence": 2,
+      "title": "Rechazo: referenceCode repetido en esta lista",
+      "dates": {
+        "display": "1821",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-102",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "sequence": 3,
+      "title": "Rechazo: falta referenceCode",
+      "dates": {
+        "display": "1822",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-103",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-104",
+      "sequence": 4,
+      "title": "Rechazo: falta filenameStem",
+      "dates": {
+        "display": "1823",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-105",
+      "sequence": 5,
+      "title": "Rechazo: la raíz con -img_0000 pasa de 36 caracteres",
+      "dates": {
+        "display": "1824",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-largo-00000000000105",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-106",
+      "sequence": 6,
+      "title": "Rechazo: la raíz no es un slug (tiene mayúsculas y espacios)",
+      "dates": {
+        "display": "1825",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "XX Test 106",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-107",
+      "sequence": 7,
+      "title": "Rechazo: la raíz coincide con la de otro ítem de esta lista",
+      "dates": {
+        "display": "1826",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-101",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-108",
+      "sequence": 8,
+      "title": "Rechazo: fecha final anterior a la inicial",
+      "dates": {
+        "display": "1830–1827",
+        "start": "1830-01-01",
+        "end": "1827-12-31"
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-108",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-001",
+      "sequence": 9,
+      "title": "Rechazo si antes se importó la lista válida: el referenceCode ya existe en la unidad",
+      "dates": {
+        "display": "1831",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-109",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-110",
+      "sequence": 10,
+      "title": "Rechazo si antes se importó la lista válida: la raíz ya está en uso en la unidad",
+      "dates": {
+        "display": "1832",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-002",
+      "expectedImages": null,
+      "notes": null
+    }
+  ]
+}

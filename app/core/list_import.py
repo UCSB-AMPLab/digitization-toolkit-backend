@@ -1,0 +1,406 @@
+"""Import a Fisqua digitisation list (exchange contract 1.1, artefact 1).
+
+The list becomes a Project named after the basket (`list.name`), and each
+item becomes a volume (a row of `collections`):
+
+    referenceCode  -> external_id
+    filenameStem   -> filename_stem
+    title          -> name
+    dates.display  -> date
+    dates.start    -> date_start
+    dates.end      -> date_end
+    sequence       -> sequence
+
+Every other item field, `containerPath` and fields the contract does not
+name included, goes into `custom_attributes` as JSON under a `fisqua` key.
+No records are created.
+
+The envelope is checked before anything is written: a file whose `contract`,
+`kind` or major version is not this one is refused whole (ListRefused), as is
+one without the `id`, `list.name` or `items` the import needs. Unknown fields
+anywhere are ignored by the checks.
+
+Items are skip-and-report. Each one is checked, then created and committed on
+its own, so one bad item never rolls back another, and a crash partway leaves
+only whole volumes. An item that cannot be created goes into `rejects` with
+its position, its referenceCode (None when it has none) and a reason. Nothing
+is made up for a missing field. Re-importing a list rejects every item that
+is already on the unit, by its reference code or its stem, so nothing is
+created twice.
+
+Volumes are created through the Collection model, so its guards and the
+table's constraints apply; an IntegrityError at commit (a duplicate written
+by a concurrent request between the check and the insert, or a CHECK) is
+reported as a reject, not raised.
+
+The report is returned and also written under
+`<DTK_DATA_DIR>/imports/<list-id>/`, one file per run, so an operator can
+fetch it again (latest_report_path).
+"""
+
+from __future__ import annotations
+
+import json
+import logging
+import os
+import re
+import tempfile
+import uuid
+from datetime import date, datetime, timezone
+from pathlib import Path
+from typing import Any, Optional
+
+from sqlalchemy.exc import IntegrityError
+from sqlalchemy.orm import Session
+
+# The module, not the settings object, so that a reloaded config is seen.
+from app.core import config
+from app.core.db_errors import constraint_name
+from app.models.collection import (
+    FILENAME_STEM_MAX_LENGTH,
+    FILENAME_STEM_PATTERN,
+    Collection,
+)
+from app.models.project import Project
+
+logger = logging.getLogger(__name__)
+
+CONTRACT_NAME = "fisqua-captua-exchange"
+LIST_KIND = "digitisation-list"
+SUPPORTED_MAJOR_VERSION = "1"
+
+# The item fields that have a column; everything else goes under `fisqua`.
+MAPPED_ITEM_FIELDS = frozenset({"referenceCode", "filenameStem", "title", "dates", "sequence"})
+
+# Column widths the values must fit (app/models/collection.py, project.py).
+_NAME_MAX_LENGTH = Collection.__table__.columns["name"].type.length
+_EXTERNAL_ID_MAX_LENGTH = Collection.__table__.columns["external_id"].type.length
+_DATE_MAX_LENGTH = Collection.__table__.columns["date"].type.length
+_PROJECT_NAME_MAX_LENGTH = Project.__table__.columns["name"].type.length
+
+_STEM_RE = re.compile(FILENAME_STEM_PATTERN)
+# date.fromisoformat also takes forms such as 17900101; the contract's dates
+# are ISO calendar dates written out in full.
+_ISO_DATE_RE = re.compile(r"^\d{4}-\d{2}-\d{2}$")
+
+# Reason codes in a reject, with the message that goes beside each.
+REASONS = {
+    "item_not_an_object": "The item is not a JSON object.",
+    "missing_reference_code": "The item has no referenceCode.",
+    "invalid_reference_code": f"The referenceCode is not a string of at most {_EXTERNAL_ID_MAX_LENGTH} characters.",
+    "reference_code_duplicated_in_list": "An earlier item in this list has the same referenceCode.",
+    "missing_filename_stem": "The item has no filenameStem.",
+    "filename_stem_not_a_slug": "The filenameStem is not lowercase letters and digits separated by single hyphens.",
+    "filename_stem_too_long": f"The filenameStem is longer than {FILENAME_STEM_MAX_LENGTH} characters.",
+    "filename_stem_duplicated_in_list": "An earlier item in this list has the same filenameStem.",
+    "missing_title": "The item has no title.",
+    "invalid_title": f"The title is not a string of at most {_NAME_MAX_LENGTH} characters.",
+    "invalid_dates": (
+        f"The dates are not an object whose display is a string of at most {_DATE_MAX_LENGTH} "
+        "characters and whose start and end are ISO dates (YYYY-MM-DD) or null."
+    ),
+    "end_date_before_start": "The end date is before the start date.",
+    "invalid_sequence": "The sequence is not an integer.",
+    "reference_code_on_unit": "A volume on this unit already has this referenceCode.",
+    "filename_stem_on_unit": "A volume on this unit already has this filenameStem.",
+    "refused_by_database": "The database refused the volume.",
+}
+
+# A constraint named in an IntegrityError at commit, mapped to its reason.
+_CONSTRAINT_REASONS = {
+    "ix_collections_external_id": "reference_code_on_unit",
+    "collections_filename_stem_key": "filename_stem_on_unit",
+    "check_collection_date_range": "end_date_before_start",
+    "check_collection_filename_stem_pattern": "filename_stem_not_a_slug",
+    "check_collection_filename_stem_length": "filename_stem_too_long",
+    "check_collection_external_id_trimmed": "invalid_reference_code",
+}
+
+
+class ListRefused(Exception):
+    """The file as a whole cannot be imported; nothing has been written."""
+
+
+def _major_version(version: Any) -> Optional[str]:
+    if not isinstance(version, str):
+        return None
+    major = version.split(".", 1)[0]
+    return major if major.isdigit() else None
+
+
+def check_envelope(document: Any) -> tuple[str, str, list]:
+    """Refuse a file that is not a digitisation list this importer reads.
+
+    Returns the list id (canonical UUID form), the list name and the items.
+    Unknown envelope fields are ignored. The id is required because the
+    report is named by it; the name, because the project is.
+    """
+    if not isinstance(document, dict):
+        raise ListRefused("The file is not a JSON object.")
+    if document.get("contract") != CONTRACT_NAME:
+        raise ListRefused(f"The file's contract is not {CONTRACT_NAME}.")
+    if document.get("kind") != LIST_KIND:
+        raise ListRefused(f"The file's kind is not {LIST_KIND}.")
+    if _major_version(document.get("version")) != SUPPORTED_MAJOR_VERSION:
+        raise ListRefused(
+            f"The file's contract version is not {SUPPORTED_MAJOR_VERSION}.x; "
+            "this unit reads major version 1 only."
+        )
+    raw_id = document.get("id")
+    try:
+        list_id = str(uuid.UUID(raw_id)) if isinstance(raw_id, str) else None
+    except ValueError:
+        list_id = None
+    if list_id is None:
+        raise ListRefused("The file's id is not a UUID.")
+    meta = document.get("list")
+    name = meta.get("name") if isinstance(meta, dict) else None
+    if not isinstance(name, str) or not name.strip():
+        raise ListRefused("The file has no list name, which the project is named after.")
+    if len(name) > _PROJECT_NAME_MAX_LENGTH:
+        raise ListRefused(f"The list name is longer than {_PROJECT_NAME_MAX_LENGTH} characters.")
+    items = document.get("items")
+    if not isinstance(items, list):
+        raise ListRefused("The file's items are not a list.")
+    return list_id, name, items
+
+
+def _reference_code(item: dict) -> Any:
+    """The item's referenceCode, stripped as the volume API strips it; '' counts as missing."""
+    code = item.get("referenceCode")
+    if isinstance(code, str):
+        code = code.strip()
+        return code or None
+    return code
+
+
+def _parse_date(value: Any) -> tuple[bool, Optional[date]]:
+    if value is None:
+        return True, None
+    if not isinstance(value, str) or not _ISO_DATE_RE.match(value):
+        return False, None
+    try:
+        return True, date.fromisoformat(value)
+    except ValueError:
+        return False, None
+
+
+def _first_positions(items: list, key) -> dict:
+    """value -> 1-based position of its first item, for string values of `key(item)`."""
+    first: dict = {}
+    for position, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        value = key(item)
+        if isinstance(value, str) and value not in first:
+            first[value] = position
+    return first
+
+
+def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) -> tuple[Optional[str], dict]:
+    """The reject reason for an item, or None and the volume's column values.
+
+    Checks run in a fixed order and the first failure is the reason given.
+    The checks against volumes already on the unit come after this, in
+    import_list, since they read the database.
+    """
+    if not isinstance(item, dict):
+        return "item_not_an_object", {}
+    code = _reference_code(item)
+    if code is None:
+        return "missing_reference_code", {}
+    if not isinstance(code, str) or len(code) > _EXTERNAL_ID_MAX_LENGTH:
+        return "invalid_reference_code", {}
+    if first_code.get(code) != position:
+        return "reference_code_duplicated_in_list", {}
+
+    stem = item.get("filenameStem")
+    if stem is None or stem == "":
+        return "missing_filename_stem", {}
+    if not isinstance(stem, str) or not _STEM_RE.match(stem):
+        return "filename_stem_not_a_slug", {}
+    if len(stem) > FILENAME_STEM_MAX_LENGTH:
+        return "filename_stem_too_long", {}
+    if first_stem.get(stem) != position:
+        return "filename_stem_duplicated_in_list", {}
+
+    title = item.get("title")
+    if title is None or (isinstance(title, str) and not title.strip()):
+        return "missing_title", {}
+    if not isinstance(title, str) or len(title) > _NAME_MAX_LENGTH:
+        return "invalid_title", {}
+
+    dates = item.get("dates")
+    if dates is None:
+        dates = {}
+    if not isinstance(dates, dict):
+        return "invalid_dates", {}
+    display = dates.get("display")
+    if display is not None and (not isinstance(display, str) or len(display) > _DATE_MAX_LENGTH):
+        return "invalid_dates", {}
+    ok_start, start = _parse_date(dates.get("start"))
+    ok_end, end = _parse_date(dates.get("end"))
+    if not (ok_start and ok_end):
+        return "invalid_dates", {}
+    if start is not None and end is not None and end < start:
+        return "end_date_before_start", {}
+
+    sequence = item.get("sequence")
+    # bool is an int subclass; true is not a sequence number.
+    if sequence is not None and (isinstance(sequence, bool) or not isinstance(sequence, int)):
+        return "invalid_sequence", {}
+
+    fisqua = {k: v for k, v in item.items() if k not in MAPPED_ITEM_FIELDS}
+    return None, {
+        "external_id": code,
+        "filename_stem": stem,
+        "name": title,
+        "date": display,
+        "date_start": start,
+        "date_end": end,
+        "sequence": sequence,
+        "custom_attributes": json.dumps({"fisqua": fisqua}, ensure_ascii=False),
+    }
+
+
+def _project_for(db: Session, name: str, actor: Optional[str]) -> tuple[Project, bool]:
+    """The project named `name`, created if there is none. Returns (project, created).
+
+    An existing project of that name is reused: a project is a grouping in
+    the catalogue only, and re-importing a list has to land in the project
+    the first import made.
+    """
+    project = db.query(Project).filter(Project.name == name).first()
+    if project is not None:
+        return project, False
+    project = Project(name=name, created_by=actor)
+    db.add(project)
+    try:
+        db.commit()
+    except IntegrityError:
+        # Created by a concurrent request since the query above.
+        db.rollback()
+        project = db.query(Project).filter(Project.name == name).first()
+        if project is None:
+            raise
+        return project, False
+    db.refresh(project)
+    return project, True
+
+
+def _reject(position: int, code: Any, reason: str) -> dict:
+    return {
+        "position": position,
+        "referenceCode": code if isinstance(code, str) else None,
+        "reason": reason,
+        "message": REASONS[reason],
+    }
+
+
+def import_list(db: Session, document: Any, actor: Optional[str]) -> dict:
+    """Import a digitisation list and return its report.
+
+    Raises ListRefused, before writing anything, when the envelope is not
+    one this importer reads. Otherwise commits the project (if new) and then
+    each volume on its own, and returns the report; it does not store it
+    (store_report does).
+    """
+    list_id, list_name, items = check_envelope(document)
+    project, project_created = _project_for(db, list_name, actor)
+    project_id = project.id
+
+    first_code = _first_positions(items, _reference_code)
+    first_stem = _first_positions(items, lambda item: item.get("filenameStem"))
+
+    created: list[dict] = []
+    rejects: list[dict] = []
+    for position, item in enumerate(items, start=1):
+        code = _reference_code(item) if isinstance(item, dict) else None
+        reason, values = _check_item(position, item, first_code, first_stem)
+        if reason is None:
+            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
+                reason = "reference_code_on_unit"
+            elif db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
+                reason = "filename_stem_on_unit"
+        if reason is not None:
+            rejects.append(_reject(position, code, reason))
+            continue
+
+        volume = Collection(project_id=project_id, created_by=actor, **values)
+        db.add(volume)
+        try:
+            db.commit()
+        except IntegrityError as exc:
+            db.rollback()
+            reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+            rejects.append(_reject(position, code, reason))
+            continue
+        created.append({
+            "position": position,
+            "referenceCode": values["external_id"],
+            "filenameStem": values["filename_stem"],
+            "captuaCollectionId": volume.id,
+        })
+
+    return {
+        "listId": list_id,
+        "listName": list_name,
+        "projectId": project_id,
+        "projectName": list_name,
+        "projectCreated": project_created,
+        "importedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+        "importedBy": actor,
+        "created": len(created),
+        "skipped": len(rejects),
+        "volumes": created,
+        "rejects": rejects,
+    }
+
+
+def reports_dir() -> Path:
+    """Where import reports are kept: `<DTK_DATA_DIR>/imports`."""
+    return config.settings.data_dir / "imports"
+
+
+def report_filename(list_id: str) -> str:
+    """The contract's name for the report, `import-report_<list-id>.json`."""
+    return f"import-report_{list_id}.json"
+
+
+def store_report(report: dict) -> Path:
+    """Write the report as `<reports_dir>/<list-id>/import-report_<list-id>_<time>.json`.
+
+    One file per run, so a re-import's report does not replace the first
+    one's. The time is the report's importedAt without punctuation, so the
+    names sort in run order. Written to a temporary file and renamed, so a
+    reader never sees half a report. Raises OSError if it cannot be written.
+    """
+    list_id = str(uuid.UUID(report["listId"]))  # never a path component from the file unchecked
+    stamp = re.sub(r"[^0-9TZ]", "", report["importedAt"])
+    directory = reports_dir() / list_id
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / f"import-report_{list_id}_{stamp}.json"
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "w", encoding="utf-8") as handle:
+            json.dump(report, handle, ensure_ascii=False, indent=2)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def latest_report_path(list_id: str) -> Optional[Path]:
+    """The most recent stored report for a list, or None. `list_id` must be a UUID."""
+    list_id = str(uuid.UUID(list_id))
+    directory = reports_dir() / list_id
+    if not directory.is_dir():
+        return None
+    runs = sorted(directory.glob(f"import-report_{list_id}_*.json"))
+    return runs[-1] if runs else None

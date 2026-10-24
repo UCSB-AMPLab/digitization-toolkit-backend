@@ -1,0 +1,103 @@
+{
+  "contract": "fisqua-captua-exchange",
+  "version": "1.1",
+  "kind": "digitisation-list",
+  "id": "00000000-0000-4000-8000-000000000001",
+  "generatedAt": "2026-10-23T18:00:00Z",
+  "generatedBy": {
+    "system": "fisqua",
+    "instance": "captua-test",
+    "systemVersion": "0.0.0-test"
+  },
+  "inReplyTo": null,
+  "list": {
+    "name": "Prueba válida",
+    "tenant": "captua-test",
+    "repositoryCode": "XX-TEST",
+    "notes": "Lista sintética para pruebas. No describe ningún fondo real."
+  },
+  "items": [
+    {
+      "referenceCode": "xx-test-001",
+      "sequence": 1,
+      "title": "Volumen de prueba uno",
+      "dates": {
+        "display": "1790–1795",
+        "start": "1790-01-01",
+        "end": "1795-12-31"
+      },
+      "typology": "Libro de prueba",
+      "extent": "120 folios",
+      "containerPath": [
+        {
+          "level": "fonds",
+          "title": "Fondo de prueba",
+          "referenceCode": "xx-test"
+        },
+        {
+          "level": "volume",
+          "title": "Volumen de prueba uno",
+          "referenceCode": "xx-test-001"
+        }
+      ],
+      "filenameStem": "xx-test-001",
+      "expectedImages": 240,
+      "notes": "Volumen con fechas completas."
+    },
+    {
+      "referenceCode": "xx-test-002",
+      "sequence": 2,
+      "title": "Volumen de prueba dos, con tildes y eñe (á, é, í, ó, ú, ü, ñ)",
+      "dates": {
+        "display": "ca. 1801",
+        "start": "1801-01-01",
+        "end": null
+      },
+      "typology": "Expediente de prueba",
+      "extent": null,
+      "containerPath": [
+        {
+          "level": "fonds",
+          "title": "Fondo de prueba",
+          "referenceCode": "xx-test"
+        }
+      ],
+      "filenameStem": "xx-test-002",
+      "expectedImages": null,
+      "notes": null
+    },
+    {
+      "referenceCode": "xx-test-003",
+      "sequence": 3,
+      "title": "Volumen de prueba tres, sin fechas",
+      "dates": {
+        "display": "s. f.",
+        "start": null,
+        "end": null
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-003",
+      "expectedImages": null,
+      "notes": null,
+      "fieldNotInContract": "Campo que no está en el contrato: el importador no lo interpreta, pero lo conserva en custom_attributes.fisqua."
+    },
+    {
+      "referenceCode": "xx-test-004",
+      "sequence": 4,
+      "title": "Volumen de prueba cuatro, raíz de 27 caracteres",
+      "dates": {
+        "display": "1810",
+        "start": "1810-01-01",
+        "end": "1810-12-31"
+      },
+      "typology": "Libro de prueba",
+      "extent": null,
+      "containerPath": [],
+      "filenameStem": "xx-test-largo-0000000000004",
+      "expectedImages": null,
+      "notes": "La raíz tiene 27 caracteres; con -img_0000 llega a 36, que es justo el límite, así que se acepta."
+    }
+  ]
+}
