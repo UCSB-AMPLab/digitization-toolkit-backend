@@ -256,7 +256,10 @@ def test_a_duplicate_on_post_is_a_sanitised_409(client, db_session, field, value
     _volume(db_session, p, "a", **{field: value})
     api = _client_as(client)
 
-    resp = api.post("/collections/", json={"name": "b", "project_id": p.id, field: value})
+    # Both cases carry a stem, which create requires; the duplicate field
+    # comes last so that it overrides the stem in the stem case.
+    resp = api.post("/collections/", json={"name": "b", "project_id": p.id,
+                                           "filename_stem": "co-x-009", field: value})
 
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
@@ -553,7 +556,8 @@ def test_the_schemas_refuse_an_end_before_its_start():
     from app.schemas.collection import CollectionCreate, CollectionUpdate
 
     with pytest.raises(ValidationError):
-        CollectionCreate(name="v", project_id=1, date_start="1750-02-01", date_end="1750-01-31")
+        CollectionCreate(name="v", project_id=1, filename_stem="co-x-001",
+                         date_start="1750-02-01", date_end="1750-01-31")
     with pytest.raises(ValidationError):
         CollectionUpdate(date_start="1750-02-01", date_end="1750-01-31")
 
@@ -1118,7 +1122,8 @@ def test_a_blank_external_id_is_a_422(client, db_session, value):
     p = _project(db_session)
     api = _client_as(client)
 
-    resp = api.post("/collections/", json={"name": "A", "project_id": p.id, "external_id": value})
+    resp = api.post("/collections/", json={"name": "A", "project_id": p.id,
+                                           "filename_stem": "co-ahr-a", "external_id": value})
 
     assert resp.status_code == 422, resp.text
 
@@ -1127,7 +1132,8 @@ def test_a_blank_external_id_is_a_422(client, db_session, value):
 def test_the_schemas_strip_external_id():
     from app.schemas.collection import CollectionCreate, CollectionUpdate
 
-    assert CollectionCreate(name="v", project_id=1, external_id="  co-ahr-1 ").external_id == "co-ahr-1"
+    assert CollectionCreate(name="v", project_id=1, filename_stem="co-ahr-1",
+                            external_id="  co-ahr-1 ").external_id == "co-ahr-1"
     assert CollectionUpdate(external_id="co-ahr-1\n").external_id == "co-ahr-1"
 
 
@@ -1136,8 +1142,10 @@ def test_a_padded_duplicate_external_id_is_a_409(client, db_session):
     p = _project(db_session)
     api = _client_as(client)
 
-    first = api.post("/collections/", json={"name": "A", "project_id": p.id, "external_id": "co-ahr-1"})
-    padded = api.post("/collections/", json={"name": "B", "project_id": p.id, "external_id": "co-ahr-1 "})
+    first = api.post("/collections/", json={"name": "A", "project_id": p.id,
+                                            "filename_stem": "co-ahr-a", "external_id": "co-ahr-1"})
+    padded = api.post("/collections/", json={"name": "B", "project_id": p.id,
+                                             "filename_stem": "co-ahr-b", "external_id": "co-ahr-1 "})
 
     assert first.status_code == 201, first.text
     assert padded.status_code == 409, padded.text
@@ -1177,19 +1185,27 @@ def test_a_blank_external_id_on_the_orm_is_a_named_409_through_the_handler(db_se
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_a_volume_can_be_created_without_a_stem_for_now(client, db_session):
-    """Contract 1.1 requires one; it becomes required with its sources.
+@pytest.mark.parametrize("extra", [{}, {"filename_stem": None}])
+def test_a_volume_cannot_be_created_without_a_stem(client, db_session, extra):
+    """Contract 1.1 §3: a volume created on the device must be given a stem."""
+    from app.models.collection import Collection
 
-    Those are the stem screen and the list import. Until they exist an
-    operator has no way to supply one, so create accepts its absence.
-    """
     p = _project(db_session)
     api = _client_as(client)
 
-    resp = api.post("/collections/", json={"name": "no stem", "project_id": p.id})
+    resp = api.post("/collections/", json={"name": "no stem", "project_id": p.id, **extra})
 
-    assert resp.status_code == 201, resp.text
-    assert resp.json()["filename_stem"] is None
+    assert resp.status_code == 422, resp.text
+    assert db_session.query(Collection).filter(Collection.name == "no stem").count() == 0
+
+
+@pytest.mark.unit
+def test_the_create_schema_requires_a_stem():
+    from pydantic import ValidationError
+    from app.schemas.collection import CollectionCreate
+
+    with pytest.raises(ValidationError):
+        CollectionCreate(name="v", project_id=1)
 
 
 # ---------------------------------------------------------------------------

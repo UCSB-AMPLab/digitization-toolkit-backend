@@ -26,6 +26,7 @@ from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
 from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
@@ -396,11 +397,21 @@ async def add_image_to_record(
 	Upload and attach an image to an existing record.
 	This is used when adding captures to a multi-page document.
 	"""
-	# Verify record exists
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	# Lock order, the same on every path that takes both: the record's row,
+	# then its volume's. The record is locked here, and the stem check below
+	# locks the volume. Read unlocked, the record was still locked later, by
+	# the image insert's foreign-key check (FOR KEY SHARE), after the volume:
+	# the opposite order to a retake, and the two deadlocked on PostgreSQL.
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+	# An upload is a capture event for the record's volume, refused on the
+	# same terms as a capture, before anything is written.
+	if rec.collection_id is None:
+		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	if volume_lacks_stem(db, rec.collection_id):
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
@@ -409,21 +420,15 @@ async def add_image_to_record(
 			detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
 		)
 	
-	# A record of a volume with a stem keeps its upload in `<stem>/captures/`
-	# and the thumbnail in `<stem>/thumbnails/`, as a capture does; any other
-	# upload goes to the data directory's uploads/. The name is a uuid either way.
-	stem = rec.collection.filename_stem if rec.collection is not None else None
-	if stem:
-		from capture.project_manager import ensure_volume_dirs
-		from app.core.paths import CAPTURES_DIR, THUMBNAILS_DIR
+	# The record's volume has a stem (refused above otherwise), so the upload
+	# goes to `<stem>/captures/` and its thumbnail to `<stem>/thumbnails/`, as
+	# a capture does, under a uuid name.
+	from capture.project_manager import ensure_volume_dirs
+	from app.core.paths import CAPTURES_DIR, THUMBNAILS_DIR
 
-		volume = ensure_volume_dirs(stem)
-		uploads_dir = volume / CAPTURES_DIR
-		thumbnails_dir = volume / THUMBNAILS_DIR
-	else:
-		uploads_dir = settings.data_dir / "uploads"
-		thumbnails_dir = settings.data_dir / "thumbnails"
-	uploads_dir.mkdir(parents=True, exist_ok=True)
+	volume = ensure_volume_dirs(rec.collection.filename_stem)
+	uploads_dir = volume / CAPTURES_DIR
+	thumbnails_dir = volume / THUMBNAILS_DIR
 	
 	# Generate unique filename
 	ext = Path(file.filename).suffix if file.filename else ".jpg"

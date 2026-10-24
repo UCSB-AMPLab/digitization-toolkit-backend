@@ -12,7 +12,7 @@ Run with: python -m pytest tests/unit/test_record_status_history.py
 import pytest
 
 from tests.unit.test_capture_birth_and_retake import (
-    _capture, _capture_dual, _install_capture_fakes,
+    _capture, _capture_dual, _install_capture_fakes, volume,  # noqa: F401
 )
 
 
@@ -140,28 +140,28 @@ def test_rejection_is_dated(client, db_session):
 
 
 @pytest.mark.unit
-def test_retaking_a_rejected_record_is_dated(client, db_session, test_project,
+def test_retaking_a_rejected_record_is_dated(client, db_session, test_project, volume,
                                               monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, _ = _record(db_session, status="rejected")
+    rec, _ = _record(db_session, status="rejected", col=volume)
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, record_id=rec.id)
+    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     assert _changes(db_session, rec) == [("rejected", "in_review", "op")]
 
 
 @pytest.mark.unit
-def test_retaking_a_rejected_dual_record_is_dated(client, db_session, test_project,
+def test_retaking_a_rejected_dual_record_is_dated(client, db_session, test_project, volume,
                                                    monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, _ = _record(db_session, status="rejected")
+    rec, _ = _record(db_session, status="rejected", col=volume)
     rec.capture_mode = "dual"
     db_session.commit()
     api = _client_as(client, "op", "operator")
 
-    resp = _capture_dual(api, test_project.name, record_id=rec.id)
+    resp = _capture_dual(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     assert _changes(db_session, rec) == [("rejected", "in_review", "op")]

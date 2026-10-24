@@ -55,9 +55,20 @@ def _install_capture_fakes(monkeypatch, tmp_path):
                         "default_camera_config_from_registry", fake_config)
 
 
-def _record_with_image(db_session, status, capture_mode="single"):
+@pytest.fixture
+def volume(db_session, test_project):
+    """The volume every capture here goes into; a capture needs one, with a stem."""
+    from app.models.collection import Collection
+    v = Collection(name="V", project_id=test_project.id, filename_stem="co-test-v")
+    db_session.add(v)
+    db_session.commit()
+    return v
+
+
+def _record_with_image(db_session, volume, status, capture_mode="single"):
     from app.models.record import Record, RecordImage
-    rec = Record(title="folio", status=status, capture_mode=capture_mode)
+    rec = Record(title="folio", status=status, capture_mode=capture_mode,
+                 collection_id=volume.id)
     db_session.add(rec)
     db_session.commit()
     db_session.refresh(rec)
@@ -87,12 +98,12 @@ def _capture_dual(api, project_name, **extra):
 
 @pytest.mark.unit
 def test_a_fresh_single_capture_is_born_captured(client, db_session, test_project,
-                                                 monkeypatch, tmp_path):
+                                                 volume, monkeypatch, tmp_path):
     from app.models.record import Record
     _install_capture_fakes(monkeypatch, tmp_path)
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name)
+    resp = _capture(api, test_project.name, collection_id=volume.id)
     assert resp.status_code == 200, resp.text
 
     rec = db_session.query(Record).order_by(Record.id.desc()).first()
@@ -101,12 +112,12 @@ def test_a_fresh_single_capture_is_born_captured(client, db_session, test_projec
 
 @pytest.mark.unit
 def test_a_fresh_dual_capture_is_born_captured(client, db_session, test_project,
-                                               monkeypatch, tmp_path):
+                                               volume, monkeypatch, tmp_path):
     from app.models.record import Record
     _install_capture_fakes(monkeypatch, tmp_path)
     api = _client_as(client, "op", "operator")
 
-    resp = _capture_dual(api, test_project.name)
+    resp = _capture_dual(api, test_project.name, collection_id=volume.id)
     assert resp.status_code == 200, resp.text
 
     rec = db_session.query(Record).order_by(Record.id.desc()).first()
@@ -119,12 +130,12 @@ def test_a_fresh_dual_capture_is_born_captured(client, db_session, test_project,
 
 @pytest.mark.unit
 def test_retaking_a_captured_record_supersedes_but_does_not_promote(
-        client, db_session, test_project, monkeypatch, tmp_path):
+        client, db_session, test_project, volume, monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, old = _record_with_image(db_session, "captured")
+    rec, old = _record_with_image(db_session, volume, "captured")
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, record_id=rec.id)
+    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     db_session.refresh(rec)
@@ -137,12 +148,12 @@ def test_retaking_a_captured_record_supersedes_but_does_not_promote(
 
 @pytest.mark.unit
 def test_retaking_a_rejected_record_supersedes_and_promotes(
-        client, db_session, test_project, monkeypatch, tmp_path):
+        client, db_session, test_project, volume, monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, old = _record_with_image(db_session, "rejected")
+    rec, old = _record_with_image(db_session, volume, "rejected")
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, record_id=rec.id)
+    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     db_session.refresh(rec)
@@ -153,12 +164,12 @@ def test_retaking_a_rejected_record_supersedes_and_promotes(
 
 @pytest.mark.unit
 def test_retaking_a_captured_dual_record_supersedes_but_does_not_promote(
-        client, db_session, test_project, monkeypatch, tmp_path):
+        client, db_session, test_project, volume, monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, old = _record_with_image(db_session, "captured", capture_mode="dual")
+    rec, old = _record_with_image(db_session, volume, "captured", capture_mode="dual")
     api = _client_as(client, "op", "operator")
 
-    resp = _capture_dual(api, test_project.name, record_id=rec.id)
+    resp = _capture_dual(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     db_session.refresh(rec)
@@ -169,24 +180,24 @@ def test_retaking_a_captured_dual_record_supersedes_but_does_not_promote(
 
 @pytest.mark.unit
 def test_a_captured_record_can_only_be_retaken_in_its_own_capture_mode(
-        client, db_session, test_project, monkeypatch, tmp_path):
+        client, db_session, test_project, volume, monkeypatch, tmp_path):
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, _ = _record_with_image(db_session, "captured", capture_mode="dual")
+    rec, _ = _record_with_image(db_session, volume, "captured", capture_mode="dual")
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, record_id=rec.id)
+    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 422, resp.text
 
 
 @pytest.mark.unit
 def test_an_approved_record_is_not_retaken(client, db_session, test_project,
-                                           monkeypatch, tmp_path):
+                                           volume, monkeypatch, tmp_path):
     """The supersede branch must not fire: approved work may already have left."""
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, old = _record_with_image(db_session, "approved")
+    rec, old = _record_with_image(db_session, volume, "approved")
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, record_id=rec.id)
+    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
     assert resp.status_code == 200, resp.text
 
     db_session.refresh(rec)

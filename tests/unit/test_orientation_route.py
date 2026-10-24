@@ -193,15 +193,25 @@ def _install_capture_fakes(monkeypatch, recorded, fake_config_dict):
     )
 
 
+def _volume(db_session, project):
+    """A capture needs a volume with a stem."""
+    from app.models.collection import Collection
+    v = Collection(name="V", project_id=project.id, filename_stem="co-test-v")
+    db_session.add(v)
+    db_session.commit()
+    return v
+
+
 @pytest.mark.unit
-def test_capture_with_no_rotate_deg_keeps_the_registrys_saved_orientation(client, monkeypatch, test_project):
+def test_capture_with_no_rotate_deg_keeps_the_registrys_saved_orientation(client, db_session, monkeypatch, test_project):
     recorded = {}
     _install_capture_fakes(monkeypatch, recorded, {"camera_index": 0, "rotate_deg": 270})
     api = _client_as(client, "op", "operator")
 
     resp = api.post(
         "/cameras/capture",
-        json={"project_name": test_project.name, "camera_index": 0},
+        json={"project_name": test_project.name, "camera_index": 0,
+              "collection_id": _volume(db_session, test_project).id},
     )
 
     assert resp.status_code == 200, resp.text
@@ -210,14 +220,15 @@ def test_capture_with_no_rotate_deg_keeps_the_registrys_saved_orientation(client
 
 
 @pytest.mark.unit
-def test_capture_with_explicit_zero_overrides_the_saved_orientation(client, monkeypatch, test_project):
+def test_capture_with_explicit_zero_overrides_the_saved_orientation(client, db_session, monkeypatch, test_project):
     recorded = {}
     _install_capture_fakes(monkeypatch, recorded, {"camera_index": 0, "rotate_deg": 270})
     api = _client_as(client, "op", "operator")
 
     resp = api.post(
         "/cameras/capture",
-        json={"project_name": test_project.name, "camera_index": 0, "rotate_deg": 0},
+        json={"project_name": test_project.name, "camera_index": 0, "rotate_deg": 0,
+              "collection_id": _volume(db_session, test_project).id},
     )
 
     assert resp.status_code == 200, resp.text

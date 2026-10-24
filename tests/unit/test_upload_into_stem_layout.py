@@ -1,7 +1,7 @@
 """An upload into a volume with a stem is stored in `<stem>/captures/`, its thumbnail in `<stem>/thumbnails/`.
 
 The file keeps the uuid name uploads have always had (naming is step 3).
-Other uploads still go to the data directory's `uploads/`.
+Any other upload is refused before anything is written (step 2).
 """
 
 import io
@@ -75,7 +75,9 @@ def test_an_upload_into_a_stemmed_volume_goes_into_its_captures(client, db_sessi
 
 
 @pytest.mark.unit
-def test_an_upload_into_a_project_level_record_still_goes_to_uploads(client, db_session, capture_settings, data_dir):
+def test_an_upload_into_a_project_level_record_is_refused_and_writes_nothing(client, db_session, capture_settings,
+                                                                           data_dir, override_projects_root):
+    """Step 2 refuses an upload outside a stemmed volume before anything is written."""
     from app.models.project import Project
     from app.models.record import RecordImage
 
@@ -87,8 +89,7 @@ def test_an_upload_into_a_project_level_record_still_goes_to_uploads(client, db_
     resp = _as_admin(client).post(f"/records/{rec.id}/images",
                                   files={"file": ("page.jpg", _jpeg(), "image/jpeg")})
 
-    assert resp.status_code == 200, resp.text
-    db_session.expire_all()
-    img = db_session.query(RecordImage).one()
-    assert Path(img.file_path).parent == _uploads_dir()
-    assert Path(img.thumbnail_path).parent == _uploads_dir().parent / "thumbnails"
+    assert resp.status_code == 409, resp.text
+    assert db_session.query(RecordImage).count() == 0
+    assert not _uploads_dir().exists() or list(_uploads_dir().iterdir()) == []
+    assert [p for p in override_projects_root.rglob("*") if p.is_file()] == []

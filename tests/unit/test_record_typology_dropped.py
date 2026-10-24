@@ -122,6 +122,15 @@ def _install_capture_fakes(monkeypatch, tmp_path):
                         "default_camera_config_from_registry", fake_config)
 
 
+def _volume(db_session, project):
+    """A capture needs a volume with a stem."""
+    from app.models.collection import Collection
+    v = Collection(name="V", project_id=project.id, filename_stem="co-test-v")
+    db_session.add(v)
+    db_session.commit()
+    return v
+
+
 @pytest.mark.unit
 def test_single_capture_records_only_capture_mode(client, db_session, test_project,
                                                   monkeypatch, tmp_path):
@@ -130,7 +139,8 @@ def test_single_capture_records_only_capture_mode(client, db_session, test_proje
     api = _client_as(client, "op", "operator")
 
     resp = api.post("/cameras/capture",
-                    json={"project_name": test_project.name, "camera_index": 0})
+                    json={"project_name": test_project.name, "camera_index": 0,
+                          "collection_id": _volume(db_session, test_project).id})
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["success"] is True, resp.text
@@ -149,7 +159,8 @@ def test_dual_capture_records_only_capture_mode(client, db_session, test_project
     api = _client_as(client, "op", "operator")
 
     resp = api.post("/cameras/capture/dual",
-                    json={"project_name": test_project.name})
+                    json={"project_name": test_project.name,
+                          "collection_id": _volume(db_session, test_project).id})
 
     assert resp.status_code == 200, resp.text
     assert resp.json()["success"] is True, resp.text
