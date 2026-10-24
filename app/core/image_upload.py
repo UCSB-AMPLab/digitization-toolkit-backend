@@ -1269,6 +1269,15 @@ def main(argv: Optional[list] = None) -> int:
     backfill.add_argument("stem", help="the volume's file name stem")
     backfill.add_argument("--apply", action="store_true",
                           help="append the records; without it, only report what would be recorded")
+    raise_counter = sub.add_parser(
+        "raise-capture-counter",
+        help="raise a volume's capture counter to n, so the next capture takes n + 1 "
+             "(for numbers already given outside this unit; never lowers it)",
+    )
+    raise_counter.add_argument("stem", help="the volume's file name stem")
+    raise_counter.add_argument("n", type=int, help="the new counter: the highest capture number already given")
+    raise_counter.add_argument("--apply", action="store_true",
+                               help="write the counter; without it, only report what would be set")
     args = parser.parse_args(argv)
 
     from app.core.db import SessionLocal
@@ -1283,6 +1292,10 @@ def main(argv: Optional[list] = None) -> int:
             from app.core.preview_digests import backfill_preview_digests
 
             report = backfill_preview_digests(db, args.stem, apply=args.apply)
+        elif args.command == "raise-capture-counter":
+            from app.core.capture_counter import raise_capture_counter
+
+            report = raise_capture_counter(db, args.stem, args.n, apply=args.apply)
         else:
             report = adopt_objects(db, args.prefix, apply=args.apply)
     except (ValueError, VerificationUnavailable) as exc:
