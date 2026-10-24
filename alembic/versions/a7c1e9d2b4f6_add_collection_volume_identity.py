@@ -35,8 +35,8 @@ no layout change, no import and no export.
 Every column applies to every row the same way, nested volumes
 (`parent_collection_id`) included.
 
-The stem's rule that it is fixed once the volume has an image is on the
-model, for the same reason as external_id's.
+The stem's rule that it is fixed once it is set and the volume has an image
+is on the model, for the same reason as external_id's.
 
 Written with batch_alter_table so the revision also runs on SQLite, which
 cannot add a constraint to an existing table; on Postgres batch mode emits

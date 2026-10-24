@@ -55,8 +55,8 @@ class Collection(Base):
     # file names. Pattern and length are CHECKs (see __table_args__); the
     # column is wider than the cap so that an overlong stem is refused by the
     # named length CHECK on every engine, rather than by Postgres's varchar
-    # limit as a different kind of error. Fixed once the volume has an image —
-    # see _filename_stem_is_fixed_by_the_first_image.
+    # limit as a different kind of error. Fixed once it is set and the volume
+    # has an image — see _filename_stem_is_fixed_by_the_first_image.
     filename_stem = Column(String(255), nullable=True)
 
     # external_id: Fisqua's reference code for the item. Unique through one
@@ -139,15 +139,15 @@ class Collection(Base):
 
     @validates("filename_stem", include_removes=True)
     def _filename_stem_is_fixed_by_the_first_image(self, key, value, is_remove):
-        """Refuse a change to filename_stem once the volume holds an image.
+        """Refuse a change to a set filename_stem once the volume holds an image.
 
-        Until then the stem is free: set, changed or cleared. From the first
-        image on, files exist whose names were built from the stem in force
-        when they were written, so any other value — a different stem, NULL,
-        a removal, or a first stem on a volume that captured without one —
-        would leave those files named from something the volume no longer
-        says. Assigning the identical value is allowed, since it changes
-        nothing.
+        Before the first image the stem is free: set, changed or cleared.
+        A NULL stem may be set once whether or not the volume has images,
+        because that is how a volume captured before stems existed gets one
+        from an operator. Once a stem is set and the volume has an image,
+        files exist whose names were built from it, so any other value — a
+        different stem, NULL, or a removal — is refused. Assigning the
+        identical value is allowed, since it changes nothing.
 
         An ORM attribute guard, like the external_id one: `query().update()`
         and raw SQL go around it. "Has an image" is has_images().
@@ -160,7 +160,7 @@ class Collection(Base):
                     f"and cannot be removed (volume {self.id}: {current!r})"
                 )
             return value
-        if value != current and self.has_images():
+        if current is not None and value != current and self.has_images():
             raise ImmutableFieldError(
                 f"collections.filename_stem is fixed once the volume has an image "
                 f"(volume {self.id}: {current!r} -> {value!r})"

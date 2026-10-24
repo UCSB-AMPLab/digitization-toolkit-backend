@@ -9,7 +9,8 @@ rely on, and the rules that keep it stable:
 
 - `external_id` is written once and never changed or cleared;
 - `filename_stem` can be set and changed until the volume holds its first
-  image, superseded images included, and is fixed from then on;
+  image, superseded images included; a NULL stem may be set once even after
+  that, and a set stem on a volume with images is fixed;
 - both are unique, and a duplicate is a 409 through the sanitised
   constraint-violation handler;
 - a stem is a lowercase slug, short enough that `<stem>-img_<nnnn>` fits
@@ -438,15 +439,47 @@ def test_a_stem_is_fixed_after_its_only_image_is_superseded(db_session):
 
 
 @pytest.mark.unit
-def test_a_volume_with_images_and_no_stem_cannot_be_given_one(db_session):
-    """Its images were named without one; a stem now would not match them."""
+def test_an_existing_volume_with_images_accepts_its_first_stem_then_refuses_a_second(db_session):
+    """Existing volumes get their stems from an operator after capture.
+
+    A NULL stem may be set once whether or not the volume has images; from
+    then on the images fix it like any other set stem.
+    """
     from app.models.record import ImmutableFieldError
 
     p = _project(db_session)
     v = _volume(db_session, p)
     _image_in(db_session, v)
+
+    v.filename_stem = "co-x-028"
+    db_session.commit()
+    db_session.refresh(v)
+    assert v.filename_stem == "co-x-028"
+
     with pytest.raises(ImmutableFieldError):
-        v.filename_stem = "co-x-028"
+        v.filename_stem = "co-x-036"
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = None
+    db_session.rollback()
+    db_session.refresh(v)
+    assert v.filename_stem == "co-x-028"
+
+
+@pytest.mark.unit
+def test_patch_gives_a_volume_with_images_its_first_stem_and_refuses_a_second(client, db_session):
+    p = _project(db_session)
+    v = _volume(db_session, p)
+    _image_in(db_session, v)
+    api = _client_as(client)
+
+    first = api.patch(f"/collections/{v.id}", json={"filename_stem": "co-x-037"})
+    second = api.patch(f"/collections/{v.id}", json={"filename_stem": "co-x-038"})
+
+    assert first.status_code == 200, first.text
+    assert first.json()["filename_stem"] == "co-x-037"
+    assert second.status_code == 409, second.text
+    db_session.refresh(v)
+    assert v.filename_stem == "co-x-037"
 
 
 @pytest.mark.unit
