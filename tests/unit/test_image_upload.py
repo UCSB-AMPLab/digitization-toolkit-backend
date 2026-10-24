@@ -633,7 +633,9 @@ def test_adoption_records_unique_matches_and_reports_the_rest(remote, db_session
     rows = _rows(db_session)
     assert rows[(a.id, "capture")].object_key == "ahr/tomo-6/images/a.CR2"
     assert rows[(c.id, "capture")].object_key == f"{TENANT}/{STEM}/captures/c.jpg"
-    assert not [call for call in remote.calls("copyto") if "a.CR2" in call[1]]
+    # By destination: the source is a staging name, which says nothing of the image.
+    assert not [call for call in remote.calls("copyto")
+                if call[2].endswith(("/a.CR2", "/a_preview.jpg"))]
     assert result["status"] == "done"
 
 
