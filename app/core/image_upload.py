@@ -941,30 +941,54 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 # Records whose files are stored offsite
 # ---------------------------------------------------------------------------
 
+def _offsite_keys(db: Session, record_id: int) -> list:
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    return [k for (k,) in (db.query(OffsiteObject.object_key)
+                           .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+                           .filter(RecordImage.record_id == record_id).all())]
+
+
 def offsite_keys_under_volume(db: Session, record_id: int, stem: Optional[str]) -> bool:
     """Whether every offsite_objects key of the record's images lies under `<tenant>/<stem>/`.
 
     The way back into a volume for a record that is outside every volume
-    with files offsite: its keys then name that volume again. False when the
-    volume has no stem, the tenant is unset or not a tenant prefix, or the
-    record has no offsite row at all (it needs no way back).
+    with files offsite: its keys then name that volume again. The way back
+    leads wherever the keys are: keys all under another volume's stem lead
+    into that volume, not the one the record last left, and keys split
+    across two or more stems lead into no volume. False when the volume has
+    no stem, the tenant is unset or not a tenant prefix, or the record has no
+    offsite row at all (it needs no way back).
     """
-    from app.models.offsite_object import OffsiteObject
-    from app.models.record import RecordImage
-
-    if not stem:
+    tenant = configured_tenant_or_none()
+    if not stem or tenant is None:
         return False
-    try:
-        tenant = configured_tenant()
-    except ImageUploadMisconfigured:
-        return False
-    if tenant is None:
-        return False
-    keys = [k for (k,) in (db.query(OffsiteObject.object_key)
-                           .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
-                           .filter(RecordImage.record_id == record_id).all())]
+    keys = _offsite_keys(db, record_id)
     prefix = f"{tenant}/{stem}/"
     return bool(keys) and all(k.startswith(prefix) for k in keys)
+
+
+def stranded_offsite_message(db: Session, record_id: int) -> str:
+    """The 409 detail for a record outside every volume refused the way back, naming the stems its keys are under.
+
+    The stem is a key's second segment, `<tenant>/<stem>/...`.
+    """
+    stems = sorted({k.strip("/").split("/")[1] for k in _offsite_keys(db, record_id) if k.count("/") >= 2})
+    if len(stems) == 1:
+        return (f"This record's files are stored offsite under the volume stem {stems[0]}, "
+                "so it can be put only into the volume with that stem"
+                + ("" if configured_tenant_or_none() else ", once DTK_OFFSITE_TENANT is set") + ".")
+    return ("This record's files are stored offsite under more than one volume stem "
+            f"({', '.join(stems)}), so it can be put into no volume.")
+
+
+def configured_tenant_or_none() -> Optional[str]:
+    """configured_tenant, with None for a value that is not a tenant prefix."""
+    try:
+        return configured_tenant()
+    except ImageUploadMisconfigured:
+        return None
 
 
 STORED_OFFSITE_MESSAGE = (

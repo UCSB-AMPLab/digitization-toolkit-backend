@@ -128,7 +128,7 @@ def test_patch_refuses_to_put_a_record_stored_offsite_into_a_volume(admin, db_se
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": b.id})
     assert response.status_code == 409, response.text
-    assert "stored offsite under this volume" in response.json()["detail"]
+    assert "under the volume stem xx-test-001" in response.json()["detail"]
     db_session.expire_all()
     assert db_session.get(type(rec), rec.id).collection_id is None
 
@@ -170,12 +170,16 @@ def test_the_way_back_is_refused_when_one_key_lies_under_another_volume(admin, d
 
 
 @pytest.mark.unit
-def test_the_way_back_is_refused_without_a_configured_tenant(admin, db_session):
+def test_the_way_back_is_refused_without_a_configured_tenant(admin, db_session, monkeypatch):
     """The keys cannot be matched to `<tenant>/<stem>/` without the tenant, so the move is refused."""
+    from app.core import config
+
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", "")
     a, _, rec, _ = _setup(db_session)
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})
     assert response.status_code == 409, response.text
+    assert "once DTK_OFFSITE_TENANT is set" in response.json()["detail"]
 
 
 @pytest.mark.unit
@@ -193,3 +197,55 @@ def test_patch_puts_a_record_with_nothing_stored_offsite_into_a_volume(admin, db
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": b.id})
     assert response.status_code == 200, response.text
+
+
+@pytest.mark.unit
+def test_the_way_back_is_refused_into_a_volume_whose_stem_is_a_prefix_of_the_keys_stem(admin, db_session, tenant):
+    """Keys under `xx-test-001/` do not lie under `xx-test-00/`."""
+    from app.models.collection import Collection
+
+    a, _, rec, _ = _setup(db_session)
+    short = Collection(name="Tomo 0", project_id=a.project_id, filename_stem="xx-test-00")
+    db_session.add(short)
+    db_session.commit()
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    response = admin.patch(f"/records/{rec.id}", json={"collection_id": short.id})
+    assert response.status_code == 409, response.text
+    assert "xx-test-001" in response.json()["detail"]
+
+
+@pytest.mark.unit
+def test_a_stranded_record_refused_the_way_back_is_told_the_stem_its_keys_are_under(admin, db_session, tenant):
+    from app.core.image_upload import STORED_OFFSITE_MESSAGE
+
+    a, b, rec, _ = _setup(db_session)
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    detail = admin.patch(f"/records/{rec.id}", json={"collection_id": b.id}).json()["detail"]
+    assert detail != STORED_OFFSITE_MESSAGE
+    assert "xx-test-001" in detail and "only into" in detail
+
+
+@pytest.mark.unit
+def test_a_stranded_record_with_keys_under_two_stems_is_told_it_can_go_into_no_volume(admin, db_session, tenant):
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    a, _, rec, _ = _setup(db_session)
+    img = RecordImage(record_id=rec.id, filename="f9.jpg", file_path="/nonexistent/f9.jpg", format="JPG")
+    db_session.add(img)
+    db_session.commit()
+    db_session.add(OffsiteObject(record_image_id=img.id, kind="capture",
+                                 object_key="captua-test/xx-test-002/captures/f9.jpg", local_sha1="1" * 40))
+    db_session.commit()
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    detail = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id}).json()["detail"]
+    assert "xx-test-001" in detail and "xx-test-002" in detail and "no volume" in detail
+
+
+@pytest.mark.unit
+def test_a_record_leaving_its_volume_still_gets_the_original_message(admin, db_session):
+    from app.core.image_upload import STORED_OFFSITE_MESSAGE
+
+    a, b, rec, _ = _setup(db_session)
+    assert admin.patch(f"/records/{rec.id}", json={"collection_id": b.id}).json()["detail"] == STORED_OFFSITE_MESSAGE
+    assert admin.post(f"/projects/{a.project_id}/add_record/{rec.id}").json()["detail"] == STORED_OFFSITE_MESSAGE
