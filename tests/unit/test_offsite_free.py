@@ -39,10 +39,34 @@ def read_remote(remote, monkeypatch):
     return remote
 
 
-def _received(db, root):
-    """A volume with a RAW image (master, preview, thumbnail) and a JPEG image, every object verified."""
+def _capture_record(db, root, image, files: dict):
+    """Give `image` a capture id and write its capture record, with a sha256 for each of `files` (relative path -> bytes)."""
+    import uuid
+
+    image.capture_id = str(uuid.uuid4())
+    db.commit()
+    metadata = root / STEM / "metadata"
+    metadata.mkdir(parents=True, exist_ok=True)
+    line = {"capture_id": image.capture_id,
+            "files": [{"relative_path": rel, "sha256": hashlib.sha256(data).hexdigest()}
+                      for rel, data in files.items()]}
+    with open(metadata / "manifest.jsonl", "a") as fh:
+        fh.write(json.dumps(line) + "\n")
+
+
+def _received(db, root, *, preview_digest=True):
+    """A volume with a RAW image (master, preview, thumbnail) and a JPEG image, every object verified.
+
+    The RAW image's capture record carries its master's sha256 and, unless
+    `preview_digest` is false, its preview's: freeing leaves a preview
+    without one on the card.
+    """
     vol = _volume(db)
     raw = _image(db, vol, root, "f1.CR2", b"raw one", preview=b"preview one")
+    files = {"captures/f1.CR2": b"raw one"}
+    if preview_digest:
+        files["previews/f1_preview.jpg"] = b"preview one"
+    _capture_record(db, root, raw, files)
     jpg = _image(db, vol, root, "f2.jpg", b"jpeg two")
     result = _run(db)
     assert result["status"] == "done" and result["uploaded"] == 3, result
@@ -810,3 +834,45 @@ def test_a_job_whose_root_becomes_unusable_fails_with_the_storage_message_and_cl
         row = _image_row(db_session, image.id)
         assert row.master_freed_at is not None
     assert not _paths(override_projects_root, "f2.jpg")[0].exists()
+
+
+# ---------------------------------------------------------------------------
+# A preview without a recorded sha256
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_preview_whose_capture_record_has_no_sha256_stays_and_its_master_is_freed(
+        remote, db_session, override_projects_root):
+    from app.core.offsite_free import plan_free
+
+    vol, raw, jpg = _received(db_session, override_projects_root, preview_digest=False)
+    raw_master, raw_preview, _ = _paths(override_projects_root, "f1.CR2")
+
+    plan = plan_free(db_session, vol.id)
+    assert [(r["image_id"], r["kind"], r["reason"]) for r in plan["refused"]] == [(raw.id, "preview", "no_preview_digest")]
+
+    result = _free(db_session, vol)
+
+    assert [(r["image_id"], r["kind"], r["reason"]) for r in result["refused"]] == [(raw.id, "preview", "no_preview_digest")]
+    assert raw_preview.read_bytes() == b"preview one"
+    assert not raw_master.exists() and not _paths(override_projects_root, "f2.jpg")[0].exists()
+    row = _image_row(db_session, raw.id)
+    assert row.master_freed_at is not None and row.preview_freed_at is None
+    assert result["freed"]["files"] == 2
+
+
+@pytest.mark.unit
+def test_a_preview_digest_is_never_taken_from_the_masters_relocation_record(
+        remote, db_session, override_projects_root):
+    """A relocation record naming the image carries the master's sha256, which is not the preview's."""
+    from capture.manifestHandler import append_relocation_record
+
+    vol, raw, jpg = _received(db_session, override_projects_root, preview_digest=False)
+    append_relocation_record(override_projects_root / STEM, _image_row(db_session, raw.id).capture_id,
+                             "captures/old.CR2", "captures/f1.CR2", image_id=raw.id,
+                             sha256=hashlib.sha256(b"raw one").hexdigest())
+
+    result = _free(db_session, vol)
+
+    assert [(r["kind"], r["reason"]) for r in result["refused"]] == [("preview", "no_preview_digest")]
+    assert _paths(override_projects_root, "f1.CR2")[1].exists()

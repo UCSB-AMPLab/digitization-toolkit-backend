@@ -11,6 +11,9 @@ The rules:
 * **Only a received volume.** Every uploadable object of the volume must be
   verified (image_upload.volume_upload_state). Review state and Fisqua play
   no part.
+* **A RAW preview needs its sha256 first.** One whose capture records carry
+  no sha256 for it stays on the card, reported as `no_preview_digest`
+  (_digest_refusal); its master may still be freed.
 * **Checked at the moment of freeing, file by file.** The local file's SHA1
   is recomputed and must equal its offsite row's `local_sha1`; then the
   bucket is listed again, and the listing must show the row's key with that
@@ -186,6 +189,7 @@ class _Object:
     key: str
     sha1: str               # the offsite row's local_sha1
     freed_bytes: Optional[int] = None
+    capture_id: Optional[str] = None
 
     def entry(self, **extra) -> dict:
         return {"image_id": self.image_id, "kind": self.kind,
@@ -201,7 +205,8 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,
                      RecordImage.master_freed_at, RecordImage.master_freed_bytes,
                      RecordImage.preview_freed_at, RecordImage.preview_freed_bytes,
-                     OffsiteObject.kind, OffsiteObject.object_key, OffsiteObject.local_sha1)
+                     OffsiteObject.kind, OffsiteObject.object_key, OffsiteObject.local_sha1,
+                     RecordImage.capture_id)
             .join(Record, RecordImage.record_id == Record.id)
             .join(OffsiteObject, OffsiteObject.record_image_id == RecordImage.id)
             .filter(Record.collection_id == collection_id, OffsiteObject.verified_at.isnot(None))
@@ -209,11 +214,12 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
             .all())
     db.commit()
     out = []
-    for (image_id, record_id, file_path, m_at, m_bytes, p_at, p_bytes, kind, key, sha1) in rows:
+    for (image_id, record_id, file_path, m_at, m_bytes, p_at, p_bytes, kind, key, sha1, capture_id) in rows:
         at, size = (m_at, m_bytes) if kind == "capture" else (p_at, p_bytes)
         if (at is not None) != freed:
             continue
-        out.append(_Object(image_id, record_id, kind, file_path, local_file(kind, file_path), key, sha1, size))
+        out.append(_Object(image_id, record_id, kind, file_path, local_file(kind, file_path), key, sha1, size,
+                           capture_id))
     return out
 
 
@@ -247,6 +253,29 @@ def _listings(keys: Iterable[str]) -> dict:
             else:
                 out[key] = _Listed(True, row_sha1(row), row.get("Size"))
     return out
+
+
+def _fixity_index():
+    from app.core.integrity import build_fixity_index
+
+    return build_fixity_index(config.settings.projects_dir.resolve())
+
+
+def _digest_refusal(obj: _Object, index) -> Optional[dict]:
+    """A RAW preview whose capture records carry no sha256 for it stays on the card.
+
+    Fisqua needs a sha256 for every preview, computed on the unit from the
+    local file; once freed, a preview without one could never get one. The
+    lookup is the fixity index's (FixityIndex.expected) by the preview's
+    path, then its name, under the image's capture id, and never by image
+    id: a relocation record naming the image carries its master's sha256.
+    The master is checked on its own and may be freed.
+    """
+    if obj.kind != "preview" or obj.path is None:
+        return None
+    if index.expected(obj.capture_id, None, obj.path) is None:
+        return obj.entry(reason="no_preview_digest")
+    return None
 
 
 def _listing_refusal(obj: _Object, listed: Optional[_Listed]) -> Optional[dict]:
@@ -468,8 +497,9 @@ def plan_free(db: Session, collection_id: int) -> dict:
     finally:
         hold.release()
     files, refused = [], []
+    index = _fixity_index()
     for obj in objects:
-        refusal = _listing_refusal(obj, listed.get(obj.key))
+        refusal = _digest_refusal(obj, index) or _listing_refusal(obj, listed.get(obj.key))
         if refusal is None and (obj.path is None or not obj.path.is_file()):
             refusal = obj.entry(reason="local_file_missing")
         if refusal is not None:
@@ -511,7 +541,12 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
     _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     objects = _objects(db, collection_id, freed=False)
     refused, hashed = [], []
+    index = _fixity_index()
     for obj in objects:
+        refusal = _digest_refusal(obj, index)
+        if refusal is not None:
+            refused.append(refusal)
+            continue
         if obj.path is None or not obj.path.is_file():
             refused.append(obj.entry(reason="local_file_missing"))
             continue
