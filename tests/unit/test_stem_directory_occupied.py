@@ -7,15 +7,15 @@ a manifest of its own captures), reporting it as `stem_dir_occupied` with the
 foreign entries. Setting a stem is refused with 409 when `<stem>/` exists on
 disk with a file in it and the volume has no image there.
 
-The volume's own manifest is append-only, so it keeps the records of
-captures deleted since and of records moved out to other volumes. It is
-foreign only when a record's capture id is held by no image row of this
-volume and its paths, resolved from `<stem>/`, point into another volume's
-`<stem>/`; a record with no path that resolves, and a line that does not
-parse, are not evidence.
+`metadata/manifest.jsonl` is never foreign. It is append-only, so it keeps
+the records of captures deleted since, of records moved out, and of copies
+naming other volumes' directories; and a stray one merged into does no harm,
+because the index, the fixity gate and the bag select records by the capture
+ids of the volume's rows.
 
 The first test is the verifier's (round 4); the deleted-capture and
-moved-out tests are the verifier's (round 5).
+moved-out tests are the verifier's (round 5); the two-hop and merged-manifest
+tests are the verifier's (round 6).
 """
 
 import hashlib
@@ -26,7 +26,7 @@ from pathlib import Path
 import pytest
 
 from tests.unit.test_volume_layout_by_stem import (  # noqa: F401
-    STEMS, _as_admin, _capture_records, capture_settings, data_dir, legacy,
+    STEMS, _approve, _as_admin, _capture_records, capture_settings, data_dir, legacy,
 )
 
 
@@ -245,7 +245,7 @@ def _a1_manifest(L, lines):
 
 
 @pytest.mark.unit
-def test_a_manifest_whose_records_point_into_another_volumes_directory_is_foreign(db_session, legacy):
+def test_a_manifest_whose_records_point_into_another_volumes_directory_is_not_foreign(db_session, legacy):
     from app.core.volume_layout import migrate_volume_layout
 
     _a1_manifest(legacy, [json.dumps({"capture_id": "cap-z", "files": [
@@ -253,13 +253,12 @@ def test_a_manifest_whose_records_point_into_another_volumes_directory_is_foreig
 
     report = migrate_volume_layout(db_session)
 
-    assert not [m for m in report["moved"] if m["collection_id"] == legacy["a1"].id]
-    skipped = [s for s in report["skipped"] if s["image_id"] == legacy["i1"].id]
-    assert [(s["reason"], s["foreign"]) for s in skipped] == [("stem_dir_occupied", ["metadata/manifest.jsonl"])]
+    assert [m for m in report["moved"] if m["collection_id"] == legacy["a1"].id]
+    assert not [s for s in report["skipped"] if s["image_id"] == legacy["i1"].id]
 
 
 @pytest.mark.unit
-def test_a_relocation_record_pointing_into_another_volumes_directory_is_foreign(db_session, legacy):
+def test_a_relocation_record_pointing_into_another_volumes_directory_is_not_foreign(db_session, legacy):
     from app.core.volume_layout import migrate_volume_layout
 
     _a1_manifest(legacy, [json.dumps({"record_type": "relocation", "capture_id": "cap-z", "image_id": 999,
@@ -268,7 +267,8 @@ def test_a_relocation_record_pointing_into_another_volumes_directory_is_foreign(
 
     report = migrate_volume_layout(db_session)
 
-    assert [s["reason"] for s in report["skipped"] if s["image_id"] == legacy["i1"].id] == ["stem_dir_occupied"]
+    assert [m for m in report["moved"] if m["collection_id"] == legacy["a1"].id]
+    assert not [s for s in report["skipped"] if s["image_id"] == legacy["i1"].id]
 
 
 @pytest.mark.unit
@@ -319,3 +319,104 @@ def test_a_manifest_whose_only_odd_records_are_unparsable_lines_is_not_foreign(d
 
     assert [m for m in report["moved"] if m["collection_id"] == legacy["a1"].id]
     assert not [s for s in report["skipped"] if s["reason"] == "stem_dir_occupied"]
+
+
+def _capture_into(db, root, collection_id, stem, name, cid):
+    from app.models.record import Record, RecordImage
+
+    vol = root / stem
+    for d in ("captures", "previews", "thumbnails", "metadata"):
+        (vol / d).mkdir(parents=True, exist_ok=True)
+    f = vol / "captures" / name
+    f.write_bytes(_jpeg())
+    with (vol / "metadata" / "manifest.jsonl").open("a") as m:
+        m.write(json.dumps({"capture_id": cid, "files": [{"relative_path": f"captures/{name}", "sha256": _sha(f)}]}) + "\n")
+    rec = Record(title="n", collection_id=collection_id, status="captured", capture_mode="single")
+    db.add(rec)
+    db.commit()
+    img = RecordImage(record_id=rec.id, filename=name, file_path=str(f), format="jpg", role="single", capture_id=cid)
+    db.add(img)
+    db.commit()
+    return img
+
+
+@pytest.mark.unit
+def test_a_record_that_passed_through_a_volume_twice_does_not_strand_it(client, db_session, legacy):
+    """A capture in a2; its record moved to a1 (a1's repair copies it, naming a2's <stem>/); then moved on to tomo;
+    then a record of u reassigned into a1; restart."""
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import RecordImage
+
+    _capture_records(db_session, legacy)
+    migrate_volume_layout(db_session)
+    _capture_into(db_session, legacy["root"], legacy["a2"].id, STEMS["a2"], "NEW_c0.jpg", "cap-new")
+    c = _as_admin(client)
+    assert c.post(f"/collections/{legacy['a2'].id}/move-records", params={"target_collection_id": legacy["a1"].id}).status_code == 200
+    r1 = migrate_volume_layout(db_session)  # a restart: a1's repair copies cap-new's record
+    a1_manifest = (legacy["root"] / STEMS["a1"] / "metadata" / "manifest.jsonl").read_text()
+    assert c.post(f"/collections/{legacy['a1'].id}/move-records", params={"target_collection_id": legacy["tomo"].id}).status_code == 200
+    rec9 = db_session.get(RecordImage, legacy["i9"].id).record_id
+    assert c.patch(f"/records/{rec9}", json={"collection_id": legacy["a1"].id}).status_code == 200
+
+    report = migrate_volume_layout(db_session)
+
+    skipped = [(s["reason"], s.get("foreign")) for s in report["skipped"] if s["image_id"] == legacy["i9"].id]
+    db_session.expire_all()
+    fp = db_session.get(RecordImage, legacy["i9"].id).file_path
+    assert skipped == []
+    assert Path(fp).parent == (legacy["root"] / STEMS["a1"] / "captures").resolve()
+
+
+@pytest.mark.unit
+def test_a_stray_manifest_merged_into_does_no_harm(client, db_session, legacy):
+    """<stem>/metadata/manifest.jsonl from elsewhere (another unit's drive, a restored copy): stem-relative paths,
+    capture ids no row holds. Not evidence, so the volume is moved in. Fixity, bag and integrity afterwards."""
+    from app.core.export_jobs import ExportJob
+    from app.core.export_service import _do_export
+    from app.core.integrity import run_integrity_check, verify_images_against_manifest
+    from app.core import config
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import Record, RecordImage
+    import zipfile
+
+    _capture_records(db_session, legacy)
+    meta = legacy["root"] / STEMS["a2"] / "metadata"
+    meta.mkdir(parents=True)
+    (meta / "manifest.jsonl").write_text("\n".join(json.dumps(
+        {"capture_id": f"other-unit-{n}", "files": [{"relative_path": f"captures/IMG_000{n}.jpg", "sha256": "f" * 64}]})
+        for n in (2, 3)) + "\n")
+
+    report = migrate_volume_layout(db_session)
+    moved = sorted(m["image_id"] for m in report["moved"] if m["collection_id"] == legacy["a2"].id)
+    db_session.expire_all()
+    imgs = db_session.query(RecordImage).join(Record).filter(Record.collection_id == legacy["a2"].id).all()
+    gate = verify_images_against_manifest(imgs)
+    result = run_integrity_check(db_session, verify_hashes=True)
+    _approve(db_session, legacy["a2"].id)
+    job = ExportJob(legacy["a2"].id)
+    _do_export(db_session, job, legacy["a2"].id)
+    with zipfile.ZipFile(config.settings.exports_dir / job.zip_filename) as z:
+        names = z.namelist()
+        bag = [json.loads(l)["capture_id"] for l in z.read(next(n for n in names if n.endswith("data/metadata/manifest.jsonl"))).decode().splitlines()]
+    assert moved == sorted(legacy[k].id for k in ("i2", "i3a", "i3b"))
+    assert gate == [] and result["manifest_mismatches"] == []
+    assert sorted(bag) == ["cap-i2", "cap-i3a", "cap-i3b"]
+
+
+@pytest.mark.unit
+def test_a_stray_tree_with_an_unowned_file_in_captures_still_skips(db_session, legacy):
+    """A stray manifest is not foreign, but the stray tree's capture beside it is."""
+    from app.core.volume_layout import migrate_volume_layout
+
+    vol = legacy["root"] / STEMS["a2"]
+    (vol / "metadata").mkdir(parents=True)
+    (vol / "metadata" / "manifest.jsonl").write_text(json.dumps(
+        {"capture_id": "other-unit-9", "files": [{"relative_path": "captures/OTHER_0009.jpg", "sha256": "f" * 64}]}) + "\n")
+    (vol / "captures").mkdir()
+    (vol / "captures" / "OTHER_0009.jpg").write_bytes(b"another unit's page")
+
+    report = migrate_volume_layout(db_session)
+
+    assert not [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
+    assert {tuple(s["foreign"]) for s in report["skipped"] if s["reason"] == "stem_dir_occupied"} == {
+        ("captures/OTHER_0009.jpg",)}
