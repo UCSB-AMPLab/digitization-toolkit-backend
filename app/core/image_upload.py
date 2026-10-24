@@ -156,6 +156,13 @@ def preview_key(tenant: str, stem: str, file_name: str) -> str:
     return f"{tenant}/{stem}/{PREVIEWS_DIR}/{file_name}"
 
 
+def disambiguated_key(key: str, image_id: int) -> str:
+    """`key` with `_img<image id>` before its suffix, in the same directory."""
+    parent, name = key.rsplit("/", 1)
+    p = Path(name)
+    return f"{parent}/{p.stem}_img{image_id}{p.suffix}"
+
+
 def remote_path(key: str) -> str:
     """`key` under OFFSITE_REMOTE, as rclone addresses it."""
     return f"{config.settings.OFFSITE_REMOTE.rstrip('/')}/{key.strip('/')}"
@@ -573,6 +580,16 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
             key = preview_key(tenant, item.stem, path.name)
 
         holder = _key_holder(db, key)
+        if holder is not None and row is None:
+            # Two images whose names on disk met (legacy names after record
+            # moves): the name is already another image's frozen key. This one
+            # goes beside it under a name that carries its own id; the listing
+            # check below still keeps it from overwriting anything there.
+            taken = key
+            key = disambiguated_key(key, item.image_id)
+            logger.warning("Image %s (%s): %s is image %s's key; using %s",
+                           item.image_id, item.kind, taken, holder.record_image_id, key)
+            holder = _key_holder(db, key)
         if holder is not None and (row is None or holder.id != row.id):
             result.conflicts.append({"image_id": item.image_id, "kind": item.kind, "key": key,
                                      "held_by_image_id": holder.record_image_id})

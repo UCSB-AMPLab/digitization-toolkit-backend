@@ -892,3 +892,40 @@ def test_a_capture_whose_bytes_are_not_its_capture_records_is_refused(remote, db
     assert f"{TENANT}/{STEM}/captures/f2.jpg" not in remote.files()
     row = _rows(db_session)[(bad.id, "capture")]
     assert row.refusal == "fixity" and row.refused_at is not None
+
+
+@pytest.mark.unit
+def test_a_disk_name_that_is_another_images_key_gets_a_key_of_its_own(remote, db_session, override_projects_root):
+    from app.core.image_upload import volume_upload_state
+
+    vol = _volume(db_session)
+    a = _image(db_session, vol, override_projects_root, f"{STEM}-img_0001_c1.jpg", b"AAAA", thumbnail=False)
+    _run(db_session)
+    b = _image(db_session, vol, override_projects_root, f"{STEM}-img_0002_c1.jpg", b"BBBB", thumbnail=False)
+    _swap_names(db_session, a, b)  # B's name on disk is now A's frozen key
+
+    result = _run(db_session)
+
+    assert result["uploaded"] == 1 and result["conflicts"] == []
+    key = f"{TENANT}/{STEM}/captures/{STEM}-img_0001_c1_img{b.id}.jpg"
+    assert _rows(db_session)[(b.id, "capture")].object_key == key
+    bucket = remote.files()
+    assert bucket[key] == b"BBBB"
+    assert bucket[f"{TENANT}/{STEM}/captures/{STEM}-img_0001_c1.jpg"] == b"AAAA", "A's object is untouched"
+    assert volume_upload_state(db_session, vol)["received"] is True
+
+
+@pytest.mark.unit
+def test_the_disambiguated_key_is_still_never_overwritten(remote, db_session, override_projects_root):
+    vol = _volume(db_session)
+    a = _image(db_session, vol, override_projects_root, f"{STEM}-img_0001_c1.jpg", b"AAAA", thumbnail=False)
+    _run(db_session)
+    b = _image(db_session, vol, override_projects_root, f"{STEM}-img_0002_c1.jpg", b"BBBB", thumbnail=False)
+    _swap_names(db_session, a, b)
+    key = f"{TENANT}/{STEM}/captures/{STEM}-img_0001_c1_img{b.id}.jpg"
+    remote.put(key, b"someone else")
+
+    result = _run(db_session)
+
+    assert [r["key"] for r in result["refused"]] == [key]
+    assert remote.files()[key] == b"someone else"
