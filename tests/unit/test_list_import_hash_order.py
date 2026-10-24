@@ -5,14 +5,22 @@ later files under that id are checked (ListIdReused). A refusal of the whole
 list (the project would take a volume's stem directory, an operator would
 have to create the project) is decided before the hash is written; if one
 still happens after this run wrote the first hash (a project deleted between
-the check and its use), the hash this run wrote is removed. A corrected file
-under the same id then imports. A hash recorded by an earlier import is never
-removed.
+the check and its use), the hash this run wrote is removed, but only while
+this run holds the list lock: without it, another run of the same file may
+already have passed the check against that hash, so the hash stays (and is
+logged), and a different file under the id is refused as before. A corrected
+file under the same id then imports. A hash recorded by an earlier import is
+never removed; one that cannot be removed is logged with its path.
+
+The lock-unavailable test is the verifier's.
 """
 
 import pytest
 
-from tests.unit.test_list_import import _as, _item, _list_with, _post, _volumes, reports_root  # noqa: F401
+import errno
+import threading
+
+from tests.unit.test_list_import import VALID_ID, _as, _item, _list_with, _post, _volumes, reports_root  # noqa: F401
 
 
 def _hash_file(reports_root, doc):
@@ -107,3 +115,78 @@ def test_a_refusal_never_removes_a_hash_an_earlier_import_recorded(client, db_se
     monkeypatch.setattr(li, "_project_for", refused)
     assert _post(client, doc).status_code == 403
     assert _hash_file(reports_root, doc).read_bytes() == recorded
+
+
+def _sessions(db_session, n):
+    from sqlalchemy.orm import sessionmaker
+    mk = sessionmaker(bind=db_session.get_bind())
+    return [mk() for _ in range(n)]
+
+
+def _project(db_session, name="Prueba válida"):
+    from app.models.project import Project
+    db_session.add(Project(name=name))
+    db_session.commit()
+
+
+def _try(li, *a, **k):
+    try:
+        r = li.import_list(*a, **k)
+        return f"created {r['created']}"
+    except (li.ListIdReused, li.ListUnverifiable, li.ProjectNeedsAdmin, li.ListRefused, li.ListHashNotRecorded) as exc:
+        return type(exc).__name__
+
+
+@pytest.mark.unit
+def test_without_the_lock_a_late_refusal_keeps_the_hash_another_run_is_importing_under(
+        db_session, reports_root, monkeypatch, caplog):
+    """A (H1) writes the first hash and is refused late; B (H1) passed the check on A's hash and is still
+    importing; with the hash gone and B's report not yet stored, C (H2) imports under the same id."""
+    import app.core.list_import as li
+
+    def nolock(fd, op):
+        raise OSError(errno.ENOLCK, "No locks available")
+
+    monkeypatch.setattr(li.fcntl, "flock", nolock)
+    _project(db_session)
+    real_pf = li._project_for
+    b_past_hash, a_done, c_done = threading.Event(), threading.Event(), threading.Event()
+
+    def pf(db, name, actor, may, notes=None):
+        t = threading.current_thread().name
+        if t == "A":
+            b_past_hash.wait(10)
+            raise li.ProjectNeedsAdmin("project deleted between the check and its use (simulated)")
+        if t == "B":
+            b_past_hash.set()
+            a_done.wait(10)
+            c_done.wait(10)
+        return real_pf(db, name, actor, may, notes)
+
+    monkeypatch.setattr(li, "_project_for", pf)
+    sa, sb, sc = _sessions(db_session, 3)
+    doc_h1 = _list_with([_item(code="xx-test-001", stem="xx-test-001")])
+    doc_h2 = _list_with([_item(code="xx-test-002", stem="xx-test-002")])
+    out = {}
+    caplog.set_level("WARNING", logger="app.core.list_import")
+    ta = threading.Thread(name="A", target=lambda: out.__setitem__("A", _try(li, sa, doc_h1, "op", False, file_sha256="1" * 64)))
+    tb = threading.Thread(name="B", target=lambda: out.__setitem__("B", _try(li, sb, doc_h1, "ad", True, file_sha256="1" * 64)))
+    ta.start()
+    tb.start()
+    ta.join(15)
+    a_done.set()
+    h = reports_root / VALID_ID / "sha256"
+    out["hash after A"] = h.read_text().strip()[:6] if h.exists() else None
+    out["C"] = _try(li, sc, doc_h2, "ad", True, file_sha256="2" * 64)
+    c_done.set()
+    tb.join(15)
+    out["hash at end"] = h.read_text().strip()[:6] if h.exists() else None
+    for s in (sa, sb, sc):
+        s.close()
+    vols = sorted(_volumes(db_session))
+    assert out["A"] == "ProjectNeedsAdmin"
+    assert out["hash after A"] == "111111"
+    assert out["C"] == "ListIdReused", "two different files were imported under one list id"
+    assert out["B"] == "created 1" and out["hash at end"] == "111111"
+    assert vols == ["xx-test-001"]
+    assert str(h) in caplog.text

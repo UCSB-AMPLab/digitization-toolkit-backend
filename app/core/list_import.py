@@ -634,7 +634,7 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     # _project_for checks again under the lock.
     if not may_create_project and _find_project(db, list_name) is None:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
-    with _list_lock(list_id):
+    with _list_lock(list_id) as lock:
         # Every refusal of the whole list is decided before the hash is
         # written, so a refused file leaves no hash for its corrected
         # version to be refused against (ListIdReused).
@@ -648,10 +648,20 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
         except BaseException:
             # A refusal the check above could not see (the project deleted
             # since, a concurrent create): no volume exists yet, so the
-            # first hash this run wrote goes with it. One an earlier import
-            # recorded stays.
+            # first hash this run wrote goes with it, but only under the
+            # lock. Without it another run of the same file may already have
+            # passed the check against this hash and be importing, and
+            # removing it would let a different file in under the same id.
+            # One an earlier import recorded stays.
             if wrote_hash:
-                _remove_hash_file(reports_dir() / list_id, list_id)
+                if lock.held:
+                    _remove_hash_file(reports_dir() / list_id, list_id)
+                else:
+                    logger.warning(
+                        "List %s was refused after recording its first hash, without the list lock, so "
+                        "the hash %s is kept: another import of the same file may be using it. A corrected "
+                        "file under this id is refused until it is removed.",
+                        list_id, reports_dir() / list_id / HASH_FILE_NAME)
             raise
         report = _import_items(db, list_id, list_name, project, project_created, items, actor, notes=notes)
         report["fileSha256"] = file_sha256
@@ -690,6 +700,11 @@ class _list_lock:
     def __init__(self, list_id: str):
         self.path = reports_dir() / list_id / ".lock"
         self.fd = None
+
+    @property
+    def held(self) -> bool:
+        """Whether this run holds the lock (False when it could not be made)."""
+        return self.fd is not None
 
     def __enter__(self):
         try:
