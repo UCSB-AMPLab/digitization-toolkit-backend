@@ -8,7 +8,10 @@ app.core.fisqua_contract. Here:
 
 * **Enqueue at handover** (enqueue_handover). A handover that promotes at
   least one record adds a `waiting_for_upload` row in the same transaction,
-  with a fresh manifest id, when Fisqua is configured. Any older row of the
+  with a fresh manifest id, when Fisqua is configured. A volume with no
+  Fisqua reference code (collections.external_id) is never sent: its row is
+  `refused` (`not_exportable`) at once, with the problem `no_reference_code`
+  saying how to add one; the manifest download is not affected. Any older row of the
   volume not yet sent (`waiting_for_upload`, `ready`, `failed`) becomes
   `superseded`, and a take-back makes those rows `withdrawn`
   (withdraw_unsent), whatever the configuration. A row being sent, or
@@ -64,7 +67,7 @@ import threading
 import uuid
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
-from typing import Any, Optional, Protocol
+from typing import Any, Callable, Optional, Protocol
 
 from sqlalchemy import update
 from sqlalchemy.orm import Session
@@ -75,6 +78,17 @@ from app.core import fisqua_contract as fc
 logger = logging.getLogger(__name__)
 
 UNSENT = ("waiting_for_upload", "ready", "failed")
+
+# The problem recorded for a handover of a volume with no Fisqua reference
+# code (collections.external_id), in the shape of capture_manifest's problems.
+NO_REFERENCE_CODE_PROBLEM = {
+    "rule": "no_reference_code",
+    "message": ("The volume has no Fisqua reference code, so it is not sent to Fisqua. Set the volume's "
+                "reference code (external_id) in its details, then take the handover back and hand the "
+                "volume over again."),
+    "record_ids": [],
+    "image_ids": [],
+}
 LAST_ERROR_LIMIT = 2000
 OUTBOX_LISTED = 20
 
@@ -301,6 +315,12 @@ def enqueue_handover(db: Session, collection):
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
+    if not (collection.external_id or "").strip():
+        # Ruled: a volume with no Fisqua reference code is not sent. A row
+        # refused here, rather than no row, so the volume page says why and
+        # how to fix it.
+        row.state, row.refusal, row.problems = "refused", "not_exportable", [NO_REFERENCE_CODE_PROBLEM]
+        row.last_error = NO_REFERENCE_CODE_PROBLEM["message"]
     db.add(row)
     return row
 
@@ -414,19 +434,25 @@ def _keep_status(db: Session, collection_id: int, manifest_id: Optional[str], st
     db.commit()
 
 
-def _send(db: Session, row, transport, now: datetime, result: _Run) -> bool:
-    """Send one row. False when Fisqua refused the token, and sending is to stop."""
+def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _Run) -> bool:
+    """Send one row. False when Fisqua refused the token, and sending is to stop.
+
+    Times are read from `clock` when each thing happens: the attempt when the
+    row is claimed, and every deadline from when the answer came, so a long
+    send or a long pass neither shortens the backoff nor breaks a Retry-After.
+    """
     from app.models.fisqua import FisquaOutbox
 
     attempts = row.attempts + 1
     if not _move(db, row.id, ("ready", "failed"), state="sending", attempts=attempts,
-                 last_attempt_at=now, next_attempt_at=None):
+                 last_attempt_at=clock(), next_attempt_at=None):
         return True
     manifest = db.query(FisquaOutbox.manifest).filter(FisquaOutbox.id == row.id).scalar()
     try:
         answer = transport.send_manifest(manifest)
     except Exception as exc:  # the transport is not trusted to classify every failure
         answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+    now = _naive(clock())
     answer = _redacted(answer)
 
     if answer.outcome == "delivered":
@@ -461,7 +487,8 @@ def _send(db: Session, row, transport, now: datetime, result: _Run) -> bool:
 
 
 def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = None,
-                      now: Optional[datetime] = None, stop: Optional[threading.Event] = None) -> dict:
+                      now: Optional[datetime] = None, stop: Optional[threading.Event] = None,
+                      clock: Optional[Callable[[], datetime]] = None) -> dict:
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
     Statuses: "disabled" (Fisqua not configured), "no_transport" (rows are
@@ -474,7 +501,10 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
     if not fisqua_configured():
         return {"status": "disabled"}
     transport = transport if transport is not None else get_transport()
-    now = _naive(now) or _now()
+    if clock is None:
+        fixed = _naive(now)
+        clock = (lambda: fixed) if fixed is not None else _now
+    now = _naive(clock())
     result = _Run()
 
     def stopping() -> bool:
@@ -513,7 +543,7 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             for row in due:
                 if stopping():
                     return result.as_dict()
-                if not _send(db, row, transport, now, result):
+                if not _send(db, row, transport, clock, result):
                     break
         except Exception:
             db.rollback()
@@ -539,32 +569,37 @@ def _parse_time(value: Any) -> Optional[datetime]:
 
 
 def volumes_to_poll(db: Session) -> dict:
-    """{reference code: (collection id, newest sent row)} for every volume whose latest manifest is not final.
+    """{reference code: (collection id, manifest id)} for every volume whose newest sent manifest is not final.
 
     A row counts as sent once it is delivered, or once an attempt failed:
     Fisqua may have it, and a poll by reference recovers a lost answer. A
-    volume with no reference code cannot be asked for.
+    volume with no reference code cannot be asked for. One query, selecting
+    only ids and names: the outbox keeps every manifest and answer a volume
+    ever had, and none of them is needed to choose what to ask for.
     """
+    from sqlalchemy import and_, func, not_, or_
+
     from app.models.collection import Collection
     from app.models.fisqua import FisquaOutbox, FisquaStatus
 
-    newest = {}
-    rows = (db.query(FisquaOutbox)
-            .filter(FisquaOutbox.state.in_(SENT), FisquaOutbox.attempts > 0)
-            .order_by(FisquaOutbox.id))
-    for row in rows:
-        newest[row.collection_id] = row
-    out = {}
-    for cid, row in newest.items():
-        collection = db.get(Collection, cid)
-        if collection is None or not collection.external_id:
-            continue
-        status = db.get(FisquaStatus, cid)
-        if (status is not None and status.status in fc.FINAL_STATES
-                and status.manifest_id == row.manifest_id):
-            continue
-        out[collection.external_id] = (cid, row)
-    return out
+    newest = (db.query(FisquaOutbox.collection_id.label("collection_id"),
+                       func.max(FisquaOutbox.id).label("row_id"))
+              .filter(FisquaOutbox.state.in_(SENT), FisquaOutbox.attempts > 0)
+              .group_by(FisquaOutbox.collection_id)
+              .subquery())
+    # COALESCE, so a status row with no state or no manifest id reads as not
+    # final rather than as NULL, which NOT would also drop.
+    final = and_(func.coalesce(FisquaStatus.status, "").in_(fc.FINAL_STATES),
+                 func.coalesce(FisquaStatus.manifest_id, "") == FisquaOutbox.manifest_id)
+    rows = (db.query(Collection.external_id, Collection.id, FisquaOutbox.manifest_id)
+            .select_from(newest)
+            .join(FisquaOutbox, FisquaOutbox.id == newest.c.row_id)
+            .join(Collection, Collection.id == newest.c.collection_id)
+            .outerjoin(FisquaStatus, FisquaStatus.collection_id == newest.c.collection_id)
+            .filter(Collection.external_id.isnot(None), Collection.external_id != "")
+            .filter(or_(FisquaStatus.collection_id.is_(None), not_(final)))
+            .all())
+    return {ref: (cid, manifest_id) for ref, cid, manifest_id in rows}
 
 
 def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = None,
@@ -607,7 +642,7 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                     ref = entry.get(fc.F_REF)
                     if ref not in wanted or ref not in chunk:
                         continue
-                    cid, _row = wanted[ref]
+                    cid, _manifest_id = wanted[ref]
                     manifest_id = entry.get(fc.F_MANIFEST_ID)
                     manifest_id = manifest_id if isinstance(manifest_id, str) else None
                     state = entry.get(fc.F_STATE)

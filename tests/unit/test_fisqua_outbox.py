@@ -168,6 +168,47 @@ def test_a_refused_handover_enqueues_nothing(client, db_session, vol, fisqua):
 
 
 @pytest.mark.unit
+def test_a_volume_with_no_reference_code_is_refused_at_handover_and_never_sent(
+        client, db_session, override_projects_root, fisqua):
+    v = Volume(db_session, override_projects_root, external_id=None)
+    v.record(status="captured")
+    assert _handover(client, v.col)["promoted"] == 1
+
+    [row] = _rows(db_session, v.col)
+    assert row.state == "refused" and row.refusal == "not_exportable"
+    [problem] = row.problems
+    assert problem["rule"] == "no_reference_code"
+    assert "reference code" in problem["message"] and "external_id" in problem["message"]
+    assert row.manifest is None
+
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    _poll(db_session, transport)
+    assert transport.sent == [] and transport.polled == []
+    assert _rows(db_session, v.col)[0].state == "refused"
+
+    body = _as(client, "reviewer").get(f"/collections/{v.col.id}/offsite").json()
+    assert body["fisqua"]["outbox"][0]["problems"][0]["rule"] == "no_reference_code"
+    # The manifest download is unaffected.
+    resp = _as(client, "operator").get(f"/collections/{v.col.id}/capture-manifest")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["volumes"][0]["externalId"] is None
+
+
+@pytest.mark.unit
+def test_once_the_reference_code_is_set_a_new_handover_queues_a_manifest(
+        client, db_session, override_projects_root, fisqua):
+    v = Volume(db_session, override_projects_root, external_id=None)
+    v.record(status="captured")
+    _handover(client, v.col)
+    resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-test-001"})
+    assert resp.status_code == 200, resp.text
+    _take_back(client, v.col)
+    _handover(client, v.col)
+    assert [r.state for r in _rows(db_session, v.col)] == ["refused", "waiting_for_upload"]
+
+
+@pytest.mark.unit
 def test_take_back_withdraws_the_unsent_row_and_a_new_handover_adds_another(client, db_session, vol, fisqua):
     vol.record(status="captured")
     _handover(client, vol.col)
@@ -302,7 +343,7 @@ def test_a_volume_without_a_stem_is_refused_rather_than_left_waiting(client, db_
     proj = Project(name="P")
     db_session.add(proj)
     db_session.commit()
-    col = Collection(name="Tomo", project_id=proj.id)
+    col = Collection(name="Tomo", project_id=proj.id, external_id="xx-nostem-001")
     db_session.add(col)
     db_session.commit()
     rec = Record(title="r", collection_id=col.id, status="captured", capture_mode="single", sequence=1)
@@ -438,6 +479,46 @@ def test_a_transport_error_fails_the_row_and_retries_after_a_backoff(client, db_
     row = _rows(db_session, vol.col)[0]
     assert row.state == "delivered" and row.attempts == 5
     assert row.next_attempt_at is None
+
+
+@pytest.mark.unit
+def test_the_backoff_runs_from_when_the_answer_came_not_from_the_start_of_the_pass(
+        client, db_session, vol, fisqua, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import TransportResult, run_fisqua_outbox
+    monkeypatch.setattr(config.settings, "FISQUA_RETRY_BASE_SECONDS", 60)
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    t0 = datetime(2026, 10, 24, 12, 0, 0)
+    clock = {"now": t0}
+
+    class Slow(FakeTransport):
+        def send_manifest(self, manifest):
+            clock["now"] += timedelta(minutes=10)  # a long send
+            return super().send_manifest(manifest)
+
+    transport = Slow(sends=[TransportResult(outcome="error", error="429", retry_after=900)])
+    run_fisqua_outbox(db_session, transport=transport, clock=lambda: clock["now"])
+    row = _rows(db_session, vol.col)[0]
+    assert row.last_attempt_at == t0
+    assert row.next_attempt_at == t0 + timedelta(minutes=10) + timedelta(seconds=900)
+
+
+@pytest.mark.unit
+def test_delivered_at_is_when_the_answer_came(client, db_session, vol, fisqua):
+    from app.core.fisqua_outbox import run_fisqua_outbox
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    t0 = datetime(2026, 10, 24, 12, 0, 0)
+    clock = {"now": t0}
+
+    class Slow(FakeTransport):
+        def send_manifest(self, manifest):
+            clock["now"] += timedelta(seconds=45)
+            return super().send_manifest(manifest)
+
+    run_fisqua_outbox(db_session, transport=Slow(sends=[_delivered()]), clock=lambda: clock["now"])
+    assert _rows(db_session, vol.col)[0].delivered_at == t0 + timedelta(seconds=45)
 
 
 @pytest.mark.unit
@@ -660,6 +741,58 @@ def test_the_poll_recovers_a_lost_answer_to_a_send(client, db_session, vol, fisq
     row = _rows(db_session, vol.col)[0]
     assert row.state == "delivered" and row.external_id == "fq-42"
     assert row.next_attempt_at is None
+
+
+@pytest.mark.unit
+def test_the_poll_candidates_are_found_in_one_query_without_loading_manifests(
+        client, db_session, override_projects_root, fisqua):
+    import sqlalchemy as sa
+
+    from app.core.fisqua_outbox import _now, volumes_to_poll
+    from app.models.fisqua import FisquaOutbox, FisquaStatus
+    vols = [Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}") for n in range(1, 6)]
+    big = {"volumes": [{"records": ["x" * 1000] * 50}]}
+    ids = {}
+    for v in vols:
+        for state in ("delivered", "failed", "delivered"):
+            row = FisquaOutbox(collection_id=v.col.id, manifest_id=str(uuid.uuid4()), stem=v.stem,
+                               state=state, attempts=1, manifest=big, response=big, created_at=_now(),
+                               delivered_at=_now() if state == "delivered" else None)
+            db_session.add(row)
+            db_session.flush()
+            ids[v.col.id] = row.manifest_id
+    # A newer unsent row is not a candidate; the newest sent one is.
+    db_session.add(FisquaOutbox(collection_id=vols[0].col.id, manifest_id=str(uuid.uuid4()), stem="s",
+                                state="ready", attempts=0, created_at=_now()))
+    # Volume 2's newest manifest is final: left out. Volume 3's final state is for an older one: kept.
+    # Volume 4 has a status with no state and no manifest id: kept.
+    db_session.add(FisquaStatus(collection_id=vols[3].col.id, manifest_id=None, status=None,
+                                status_checked_at=_now()))
+    db_session.add(FisquaStatus(collection_id=vols[1].col.id, manifest_id=ids[vols[1].col.id],
+                                status="published", status_checked_at=_now()))
+    db_session.add(FisquaStatus(collection_id=vols[2].col.id, manifest_id="older",
+                                status="published", status_checked_at=_now()))
+    db_session.commit()
+
+    statements = []
+    engine = db_session.get_bind()
+
+    def capture(conn, cursor, statement, params, context, executemany):
+        statements.append(statement)
+    sa.event.listen(engine, "before_cursor_execute", capture)
+    try:
+        wanted = volumes_to_poll(db_session)
+    finally:
+        sa.event.remove(engine, "before_cursor_execute", capture)
+
+    selects = [st for st in statements if st.lstrip().upper().startswith("SELECT")]
+    assert len(selects) == 1, selects
+    sql = selects[0]
+    for column in ("manifest,", "manifest ", "response", "problems", "last_error"):
+        assert f"fisqua_outbox.{column}" not in sql, sql
+    assert sorted(wanted) == sorted(v.col.external_id for v in vols if v is not vols[1])
+    assert wanted[vols[0].col.external_id] == (vols[0].col.id, ids[vols[0].col.id])
 
 
 @pytest.mark.unit
