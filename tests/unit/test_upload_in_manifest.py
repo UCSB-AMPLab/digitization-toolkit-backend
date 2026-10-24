@@ -8,11 +8,11 @@ record (`files` with `relative_path`, `bytes`, `mimetype`, `sha256`). After
 the upload's image is deleted and the catalogue restored from before it, the
 number is not given again.
 
-The consumers of the manifest read the record as they read a capture record
-when it carries the image's capture id, and skip it when it carries none:
-the fixity index (app.core.integrity), the export bag's capture records
-(capture_record_lines) and the startup repair of a volume's manifest
-(app.core.volume_layout).
+Every upload carries a capture id, the client's or a uuid4 of its own, on
+its row and in its record, so the consumers of the manifest read the record
+as they read a capture record: the fixity index (app.core.integrity), the
+export bag's capture records (capture_record_lines) and the startup repair
+of a volume's manifest (app.core.volume_layout).
 """
 
 import hashlib
@@ -112,7 +112,7 @@ def test_an_upload_appends_a_record_naming_its_file(client, db_session, capture_
     assert resp.status_code == 200, resp.text
     [rec] = _manifest(override_projects_root)
     assert rec["record_type"] == "upload"
-    assert rec["capture_id"] is None
+    assert rec["capture_id"] == resp.json()["capture_id"]
     assert rec["files"] == [{
         "role": "single",
         "relative_path": f"captures/{STEM}-img_0001_c0.jpg",
@@ -170,15 +170,30 @@ def test_an_upload_with_a_capture_id_is_verified_against_its_record(client, db_s
 
 
 @pytest.mark.unit
-def test_an_upload_without_a_capture_id_adds_nothing_to_the_fixity_index(client, db_session, capture_settings,
-                                                                         override_projects_root, volume):
-    from app.core.integrity import build_fixity_index
+def test_an_upload_sent_without_a_capture_id_gets_its_own_and_is_verified(
+        client, db_session, capture_settings, override_projects_root, volume):
+    """Step 7's capture manifest needs a sha256 for every image, so every upload is under the fixity index."""
+    import uuid
+    from app.core.integrity import build_fixity_index, verify_images_against_manifest
+    from app.models.record import RecordImage
 
-    assert _upload(_as_admin(client), _record(db_session, volume)).status_code == 200
+    api = _as_admin(client)
+    rec = _record(db_session, volume)
+    body = _jpeg()
+    first = _upload(api, rec, body=body).json()
+    second = _upload(api, rec).json()
 
+    assert uuid.UUID(first["capture_id"]).version == 4
+    assert first["capture_id"] != second["capture_id"]
+    assert [r["capture_id"] for r in _manifest(override_projects_root)] == [first["capture_id"], second["capture_id"]]
+    db_session.expire_all()
+    img = db_session.get(RecordImage, first["id"])
+    assert img.capture_id == first["capture_id"]
     index = build_fixity_index(override_projects_root.resolve())
-    assert index.captured == set()
-    assert index.by_path == {}
+    assert index.expected(img.capture_id, img.id, Path(img.file_path).resolve()) == hashlib.sha256(body).hexdigest()
+    assert verify_images_against_manifest([img]) == []
+    Path(img.file_path).write_bytes(_jpeg("black"))
+    assert [m["reason"] for m in verify_images_against_manifest([img])] == ["mismatch"]
 
 
 @pytest.mark.unit
@@ -189,12 +204,13 @@ def test_the_export_bag_carries_the_upload_record_of_its_capture_id(client, db_s
     api = _as_admin(client)
     rec = _record(db_session, volume)
     assert _upload(api, rec, capture_id="upl-1").status_code == 200
+    own = _upload(api, rec).json()["capture_id"]
     assert _upload(api, rec).status_code == 200
 
-    lines = capture_record_lines(override_projects_root.resolve(), {"upl-1", "other"})
+    lines = capture_record_lines(override_projects_root.resolve(), {"upl-1", own, "other"})
 
-    assert [json.loads(l)["capture_id"] for l in lines] == ["upl-1"]
-    assert json.loads(lines[0])["record_type"] == "upload"
+    assert [json.loads(l)["capture_id"] for l in lines] == ["upl-1", own]
+    assert {json.loads(l)["record_type"] for l in lines} == {"upload"}
 
 
 @pytest.mark.unit

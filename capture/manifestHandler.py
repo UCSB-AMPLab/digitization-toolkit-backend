@@ -358,9 +358,11 @@ def append_upload_record(volume_root: Path, *, capture_id: Optional[str], relati
     one: `{"record_type": "upload", "capture_id", "timestamp_utc", "files":
     [{"role": "single", "relative_path", "bytes", "mimetype", "sha256"}]}`,
     the path relative to `volume_root` as a capture record's is.
-    `capture_id` is the one the client sent with the upload, or null; the
-    readers that key on it (the fixity index, the export bag, the startup
-    repair of a volume's manifest) skip a record without one. The line is
+    `capture_id` is the one the client sent with the upload, or the uuid4
+    the upload endpoint gives an upload sent without one, and is the image
+    row's too; the readers that key on it (the fixity index, the export bag,
+    the startup repair of a volume's manifest) read the record as a capture
+    record. The line is
     written with one O_APPEND write and fsynced, a newline first if the last
     line is torn, as append_manifest_record writes.
     """

@@ -5,6 +5,7 @@ from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import logging
+import uuid
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
@@ -461,6 +462,12 @@ async def add_image_to_record(
 	stored_filename = f"{filename_index}_c0{_upload_suffix(file)}"
 	file_path = uploads_dir / stored_filename
 	logger.info(f"Upload into record {rec_id}: the client's file {file.filename!r} is stored as {stored_filename}")
+	# Every image needs a sha256 the fixity index can find (the capture
+	# manifest export and Fisqua refuse an image without one), and the index
+	# keys the upload record by capture id, so an upload the client sent
+	# without one is given its own.
+	if not capture_id:
+		capture_id = str(uuid.uuid4())
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
