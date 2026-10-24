@@ -80,7 +80,7 @@ time.sleep(20)
 # The one object the fake listing carries, and the checksum the module is
 # supposed to read out of it. A transport that drops matching objects'
 # checksums fails every test that reads one.
-_LISTED_NAME = "catalogue-20261016-000000-a1b2c3.sql.gz"
+_LISTED_NAME = "catalogue-20261016-000000-a1b2c3.sql.gz.age"
 _LISTED_SHA1 = "6f" * 20
 
 
@@ -162,6 +162,12 @@ def offsite(tmp_path, monkeypatch, db_session):
 
     monkeypatch.setattr(settings, "OFFSITE_REMOTE", "b2stub:bucket", raising=False)
     monkeypatch.setattr(settings, "OFFSITE_DB_PREFIX", "db-backups", raising=False)
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", "captua-test", raising=False)
+    # A throwaway keypair: the unit is given only the public half, and the
+    # tests decrypt with the private half to prove the round trip.
+    import pyrage
+    identity = pyrage.x25519.Identity.generate()
+    monkeypatch.setattr(settings, "OFFSITE_DUMP_RECIPIENT", str(identity.to_public()), raising=False)
     monkeypatch.setattr(settings, "OFFSITE_BWLIMIT", "750k", raising=False)
     monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(pg_dump), raising=False)
 
@@ -180,6 +186,7 @@ def offsite(tmp_path, monkeypatch, db_session):
     class Harness:
         module = cb
         dump_dir = dump_tmp
+        key = identity
         fail = staticmethod(bucket.fail)
         real_upload = staticmethod(real_upload_fn)
         real_listing_sha1 = staticmethod(real_listing_fn)
@@ -260,7 +267,10 @@ def test_a_failed_listing_aborts_before_the_dump_is_removed(offsite, db_session,
     cb.run_catalogue_backup(db_session)
 
     assert ("abort", "listing") in order, order
-    unlinks = [i for i, step in enumerate(order) if step[0] == "unlink"]
+    # The plaintext is removed as soon as the ciphertext exists, before the
+    # upload; the ciphertext is the dump whose removal must wait for the abort.
+    unlinks = [i for i, step in enumerate(order)
+               if step[0] == "unlink" and step[1].endswith(cb.AGE_SUFFIX)]
     assert unlinks, "the dump must not be left on the card"
     assert order.index(("abort", "listing")) < min(unlinks)
 
@@ -509,7 +519,7 @@ def test_an_explicit_dump_command_overrides_the_default(monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_the_uploaded_object_is_the_gzipped_dump(offsite, db_session):
+def test_the_uploaded_object_is_the_encrypted_gzipped_dump(offsite, db_session):
     """The bytes handed to upload() are the dump, and their digest is the one
     verification compares against the listing."""
     cb = offsite.module
@@ -518,8 +528,9 @@ def test_the_uploaded_object_is_the_gzipped_dump(offsite, db_session):
     assert result["status"] == "verified", result
     received = offsite.received()
     assert list(received) == [result["object"]]
-    assert result["object"].endswith(".sql.gz")
-    body = gzip.decompress(received[result["object"]]).decode()
+    assert result["object"].endswith(".sql.gz.age")
+    import pyrage
+    body = gzip.decompress(pyrage.decrypt(received[result["object"]], [offsite.key])).decode()
     assert "stub catalogue dump" in body
     assert hashlib.sha1(received[result["object"]]).hexdigest() == result["sha1"]
     assert offsite.objects()[result["object"]] == result["sha1"]
@@ -579,7 +590,7 @@ def test_last_verified_backup_reports_the_most_recent_verified_run(offsite, db_s
     assert state is not None
     assert state["object"] == result["object"]
     assert state["object"] != earlier.subject
-    assert state["object"].endswith(".sql.gz")
+    assert state["object"].endswith(".sql.gz.age")
     assert state["verified_at"] is not None
 
 
@@ -616,7 +627,7 @@ def test_the_status_endpoint_reports_the_last_verified_dump(offsite, reader_clie
 
     after = client.get("/system/catalogue-backup").json()
     assert after["last_verified_at"] is not None
-    assert after["object"].endswith(".sql.gz")
+    assert after["object"].endswith(".sql.gz.age")
 
 
 @pytest.mark.unit
@@ -649,8 +660,8 @@ def rclone(offsite, monkeypatch):
                 # the name rather than on being the only row.
                 {"Path": "older", "Name": "older", "IsDir": True, "Hashes": {}},
                 {
-                    "Path": "catalogue-19990101-000000-zzzzzz.sql.gz",
-                    "Name": "catalogue-19990101-000000-zzzzzz.sql.gz",
+                    "Path": "catalogue-19990101-000000-zzzzzz.sql.gz.age",
+                    "Name": "catalogue-19990101-000000-zzzzzz.sql.gz.age",
                     "IsDir": False, "Hashes": {"sha1": "00" * 20},
                 },
             ]
@@ -673,13 +684,136 @@ def rclone(offsite, monkeypatch):
 def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, rclone):
     """The scoped key is write + list: rclone's default destination HEAD 401s."""
     dump = offsite.dump_dir / _LISTED_NAME
-    dump.write_bytes(b"x")
+    dump.write_bytes(b"age-encryption.org/v1\n" + b"x")
 
     offsite.real_upload(dump)
 
     copy = next(c for c in rclone.calls if "copy" in c)
     assert "--no-check-dest" in copy
     assert copy[copy.index("--bwlimit") + 1] == "750k"
+
+
+@pytest.mark.unit
+def test_the_object_is_age_ciphertext_for_the_configured_recipient(offsite, db_session):
+    """Nothing in the bucket is the plaintext: only the recipient's private key opens it."""
+    import pyrage
+
+    cb = offsite.module
+    result = cb.run_catalogue_backup(db_session)
+    data = offsite.received()[result["object"]]
+
+    assert data.startswith(b"age-encryption.org/v1\n")
+    assert b"stub catalogue dump" not in data
+    with pytest.raises(pyrage.DecryptError):
+        pyrage.decrypt(data, [pyrage.x25519.Identity.generate()])
+    assert gzip.decompress(pyrage.decrypt(data, [offsite.key])).startswith(b"-- stub catalogue dump")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("recipient", [
+    "",
+    "age1notarecipient",
+    "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ",
+    "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
+])
+def test_no_dump_is_uploaded_without_a_valid_recipient(offsite, db_session, monkeypatch, caplog, recipient):
+    from app.core.config import settings
+    from app.models.system_log import SystemLog
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_DUMP_RECIPIENT", recipient, raising=False)
+
+    with caplog.at_level(logging.ERROR, logger="app.core.catalogue_backup"):
+        result = cb.run_catalogue_backup(db_session)
+
+    assert result["status"] == "misconfigured", result
+    assert "DTK_OFFSITE_DUMP_RECIPIENT" in result["error"]
+    assert offsite.upload_calls() == []
+    assert offsite.leftovers() == [], "no dump is written either"
+    assert "DTK_OFFSITE_DUMP_RECIPIENT" in caplog.text
+    logged = db_session.query(SystemLog).filter(SystemLog.action == cb.FAILED_ACTION).all()
+    assert logged and "DTK_OFFSITE_DUMP_RECIPIENT" in logged[-1].detail
+
+
+@pytest.mark.unit
+def test_the_transport_refuses_a_file_that_is_not_age_ciphertext(offsite, rclone):
+    cb = offsite.module
+    plain = offsite.dump_dir / "catalogue-20261016-000000-a1b2c3.sql.gz"
+    plain.write_bytes(gzip.compress(b"-- plaintext"))
+    with pytest.raises(cb.BackupError):
+        offsite.real_upload(plain)
+    assert not [c for c in rclone.calls if "copy" in c]
+
+    named = offsite.dump_dir / "catalogue-20261016-000000-a1b2c3.sql.gz.age"
+    named.write_bytes(gzip.compress(b"-- plaintext under the right name"))
+    with pytest.raises(cb.BackupError):
+        offsite.real_upload(named)
+    assert not [c for c in rclone.calls if "copy" in c]
+
+
+@pytest.mark.unit
+def test_both_temporary_files_are_removed_on_every_path(offsite, db_session):
+    from datetime import date
+
+    cb = offsite.module
+    cb.run_catalogue_backup(db_session)
+    assert offsite.leftovers() == []
+    offsite.fail("upload")
+    cb.run_catalogue_backup(db_session, today=date(2099, 1, 1))
+    assert offsite.leftovers() == []
+
+
+@pytest.mark.unit
+def test_the_sweep_removes_a_stale_encrypted_dump(offsite):
+    cb = offsite.module
+    for name in ("catalogue-19990101-000000-abc123.sql.gz", "catalogue-19990101-000000-abc123.sql.gz.age"):
+        (offsite.dump_dir / name).write_bytes(b"left by a killed run")
+    cb._sweep_stale_dumps()
+    assert offsite.leftovers() == []
+
+
+@pytest.mark.unit
+def test_the_dump_goes_under_the_tenant_prefix(offsite, rclone):
+    """The appliance key may write only under <tenant>/, so the dump does too."""
+    dump = offsite.dump_dir / _LISTED_NAME
+    dump.write_bytes(b"age-encryption.org/v1\n" + b"x")
+
+    offsite.real_upload(dump)
+    offsite.real_listing_sha1(_LISTED_NAME)
+
+    copy = next(c for c in rclone.calls if "copy" in c)
+    assert copy[copy.index(str(dump)) + 1] == "b2stub:bucket/captua-test/db-backups/"
+    ls = next(c for c in rclone.calls if "lsjson" in c)
+    assert "b2stub:bucket/captua-test/db-backups/" in ls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tenant", ["", "  ", "/"])
+def test_the_run_is_disabled_without_a_tenant(offsite, db_session, monkeypatch, tenant):
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", tenant, raising=False)
+
+    assert cb.run_catalogue_backup(db_session)["status"] == "disabled"
+    assert offsite.upload_calls() == []
+    scheduler = cb.CatalogueBackupScheduler()
+    try:
+        assert scheduler.start() is False
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.unit
+def test_a_tenant_that_is_not_a_prefix_stops_the_run(offsite, db_session, monkeypatch):
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", "../elsewhere", raising=False)
+
+    result = cb.run_catalogue_backup(db_session)
+    assert result["status"] == "misconfigured", result
+    assert offsite.upload_calls() == []
 
 
 @pytest.mark.unit
@@ -703,7 +837,7 @@ def test_neither_transport_call_asks_rclone_to_remove_anything(offsite, rclone):
     }
 
     dump = offsite.dump_dir / _LISTED_NAME
-    dump.write_bytes(b"x")
+    dump.write_bytes(b"age-encryption.org/v1\n" + b"x")
     offsite.real_upload(dump)
 
     assert offsite.real_listing_sha1(dump.name) == _LISTED_SHA1
@@ -1098,11 +1232,11 @@ def test_a_verified_run_names_the_configured_destination(
     assert result["status"] == "verified", result
 
     state = cb.last_verified_backup(db_session)
-    assert "/mnt/offsite-dump/db-backups" in state["detail"], state
+    assert "/mnt/offsite-dump/captua-test/db-backups" in state["detail"], state
     assert "bucket" not in state["detail"].lower(), state
 
     logged = " ".join(record.getMessage() for record in caplog.records)
-    assert "/mnt/offsite-dump/db-backups" in logged, logged
+    assert "/mnt/offsite-dump/captua-test/db-backups" in logged, logged
     assert "in the bucket" not in logged, logged
 
 
@@ -1115,7 +1249,7 @@ def test_a_timed_out_upload_is_a_plain_failure(offsite, rclone):
     cb = offsite.module
     rclone.raises = subprocess.TimeoutExpired(cmd=["rclone", "copy"], timeout=1)
     dump = offsite.dump_dir / _LISTED_NAME
-    dump.write_bytes(b"x")
+    dump.write_bytes(b"age-encryption.org/v1\n" + b"x")
 
     with pytest.raises(cb.BackupError) as excinfo:
         offsite.real_upload(dump)

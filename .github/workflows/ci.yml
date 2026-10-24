@@ -37,9 +37,26 @@ jobs:
           environments: dev
           cache: true
 
+      # tests/unit/test_image_upload.py runs a real rclone against a local
+      # directory remote. Pinned to the version the appliance carries, and
+      # checked against the SHA256 published in that release's SHA256SUMS.
+      - name: Install rclone v1.70.2
+        env:
+          RCLONE_ZIP: rclone-v1.70.2-linux-amd64.zip
+          RCLONE_SHA256: 7bfa813f426820d20436e48a4e0b9bf21977fcd513a48f2d28eede3136b4bacb
+        run: |
+          cd "$RUNNER_TEMP"
+          curl -fsSLO "https://downloads.rclone.org/v1.70.2/$RCLONE_ZIP"
+          echo "$RCLONE_SHA256  $RCLONE_ZIP" | sha256sum -c -
+          unzip -q "$RCLONE_ZIP"
+          mkdir -p rclone-bin
+          mv rclone-v1.70.2-linux-amd64/rclone rclone-bin/rclone
+          rclone-bin/rclone version | head -1
+
       - name: Unit and integration tests
         run: pixi run -e dev pytest tests/ -m "not camera" -q
         env:
+          DTK_TEST_RCLONE: ${{ runner.temp }}/rclone-bin/rclone
           DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
           DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
           APP_ENV: test

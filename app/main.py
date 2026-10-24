@@ -52,7 +52,13 @@ async def lifespan(app: FastAPI):
     from app.core.catalogue_backup import catalogue_backup_scheduler
 
     catalogue_backup_scheduler.start()
+    # Schedule the offsite image upload (NEH-227). A no-op on a unit with no
+    # offsite remote or no tenant prefix configured.
+    from app.core.image_upload import image_upload_scheduler
+
+    image_upload_scheduler.start()
     yield
+    image_upload_scheduler.stop()
     catalogue_backup_scheduler.stop()
     # The camera backends hold a PTP claim on each body for the life of the
     # process. Closing them here waits for whatever capture is still running

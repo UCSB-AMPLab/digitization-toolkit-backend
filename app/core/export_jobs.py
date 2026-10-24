@@ -49,6 +49,13 @@ EXPORT_RUNNING_MESSAGE = (
 FILES_CHANGING_MESSAGE = (
     "The files of this collection are being moved or renamed. Try the export again in a moment."
 )
+FILES_BEING_READ_MESSAGE = (
+    "Captua is preparing a file of this volume for the offsite copy. Try again in a moment."
+)
+
+
+class FilesChanging(Exception):
+    """A read of a collection's files was asked for while a request is changing them."""
 
 
 class ExportJobRegistry:
@@ -59,6 +66,9 @@ class ExportJobRegistry:
         # Collections whose files a request is moving, renaming or deleting,
         # with how many such requests hold each one.
         self._held: Counter = Counter()
+        # Collections whose files the offsite upload is reading by path
+        # (hold_for_reading), with how many such reads hold each one.
+        self._reading: Counter = Counter()
 
     @contextmanager
     def hold_for_file_changes(
@@ -81,6 +91,8 @@ class ExportJobRegistry:
                 job = self._jobs.get(jid) if jid else None
                 if job and job.state in ("queued", "running"):
                     raise HTTPException(status_code=409, detail=message)
+                if self._reading[cid] > 0:
+                    raise HTTPException(status_code=409, detail=FILES_BEING_READ_MESSAGE)
             self._held.update(ids)
         try:
             yield
@@ -88,6 +100,31 @@ class ExportJobRegistry:
             with self._lock:
                 self._held.subtract(ids)
                 self._held += Counter()  # drop the ids that reached zero
+
+    @contextmanager
+    def hold_for_reading(self, collection_ids: Iterable[int]) -> Iterator[None]:
+        """Hold collections while their files are read by the paths their rows name.
+
+        The other side of hold_for_file_changes, for the offsite upload
+        (app.core.image_upload): raises FilesChanging when a request holds any
+        of the collections for file changes; otherwise, until the block exits,
+        hold_for_file_changes refuses them with a 409. The check and the hold
+        are taken under the one lock, so a renumber, a move or a delete either
+        finished before the read began or starts after it ends. Meant for a
+        short span (the upload holds it to re-read a row and make a hard link),
+        since a request refused here is the operator's to retry.
+        """
+        ids = set(collection_ids)
+        with self._lock:
+            if any(self._held[cid] > 0 for cid in ids):
+                raise FilesChanging(FILES_CHANGING_MESSAGE)
+            self._reading.update(ids)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._reading.subtract(ids)
+                self._reading += Counter()
 
     def active_for(self, collection_id: int) -> Optional[ExportJob]:
         with self._lock:
