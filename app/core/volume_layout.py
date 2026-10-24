@@ -476,8 +476,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
       restored row's moved file can still be adopted;
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
-    - in `metadata/`, `manifest.jsonl` when every record in it that can be
-      read names a capture id of the volume's images, and the
+    - in `metadata/`, `manifest.jsonl` unless a record in it is positive
+      evidence it is another volume's (_record_of_another_volume), and the
       `manifest.jsonl.part` an earlier version's crashed copy left.
     Anything else is foreign: another entry at the top, a directory inside
     one of the four, or any other file. A directory is listed, not walked.
@@ -494,6 +494,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     stems: List[Tuple[str, str, str]] = []  # (exact stem, clash prefix, suffix), casefolded
     thumbs: Set[str] = set()
     capture_ids = {cid for _, _, _, cid in rows if cid}
+    other_stems = {stem for (stem,) in db.query(Collection.filename_stem)
+                   .filter(Collection.filename_stem.isnot(None), Collection.id != collection_id).all()}
     for iid, fp, tp, _ in rows:
         if fp:
             p = Path(fp)
@@ -521,14 +523,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
                 lines = f.read_text(encoding="utf-8").splitlines()
             except OSError:
                 return False
-            for line in lines:
-                try:
-                    rec = json.loads(line)
-                except ValueError:
-                    continue
-                if isinstance(rec, dict) and rec.get("capture_id") not in capture_ids:
-                    return False
-            return True
+            return not any(_record_of_another_volume(line, capture_ids, volume_dir, other_stems)
+                           for line in lines)
         return False
 
     foreign: List[str] = []
@@ -549,6 +545,44 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
             if f.is_dir() or not owned(entry.name, f):
                 foreign.append(f"{entry.name}/{f.name}")
     return foreign
+
+
+def _record_of_another_volume(line: str, capture_ids: Set[str], volume_dir: Path, other_stems: Set[str]) -> bool:
+    """Whether a line of `<stem>/metadata/manifest.jsonl` is positive evidence the manifest is another volume's.
+
+    True only when the record's capture id is held by no image row of this
+    volume and one of its paths (`files[].relative_path` of a capture
+    record, `from` or `to` of a relocation record), resolved from
+    `<stem>/`, lies in another volume's `<stem>/`. The manifest is
+    append-only, so it keeps records of captures deleted since and of
+    records moved out to other volumes; their ids are held by no row of this
+    volume, but their paths name this `<stem>/` or the project tree a copy
+    came from, which are not evidence. A line that does not parse, and a
+    record with no path that resolves, are not evidence either.
+    """
+    try:
+        rec = json.loads(line)
+    except ValueError:
+        return False
+    if not isinstance(rec, dict) or rec.get("capture_id") in capture_ids:
+        return False
+    if rec.get("record_type") == "relocation":
+        paths = [rec.get("from"), rec.get("to")]
+    else:
+        files = rec.get("files")
+        paths = [f.get("relative_path") for f in files if isinstance(f, dict)] if isinstance(files, list) else []
+    root = volume_dir.parent
+    for rel in paths:
+        if not isinstance(rel, str) or not rel:
+            continue
+        try:
+            resolved = Path(os.path.normpath(volume_dir / rel))
+            parts = resolved.relative_to(root).parts
+        except (ValueError, TypeError):
+            continue
+        if parts and parts[0] != volume_dir.name and parts[0] in other_stems:
+            return True
+    return False
 
 
 def _project_dir_names(db: Session) -> Set[str]:
