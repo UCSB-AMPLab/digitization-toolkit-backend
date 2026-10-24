@@ -126,6 +126,56 @@ class ListRefused(Exception):
     """The file as a whole cannot be imported; nothing has been written."""
 
 
+class ListUnreadable(Exception):
+    """The file cannot be read as one strict JSON document; nothing has been written."""
+
+
+class _DuplicateKey(ValueError):
+    pass
+
+
+def _refuse_constant(name: str):
+    # json accepts NaN, Infinity and -Infinity, which are not JSON (RFC 8259).
+    raise ListUnreadable(f"The file is not valid JSON: it contains {name}, which JSON does not allow.")
+
+
+def _refuse_duplicate_keys(pairs):
+    # A key given twice in one object is read by json as its last value,
+    # silently; a file whose first `version` was 2.0 would pass as 1.1.
+    obj = {}
+    for key, value in pairs:
+        if key in obj:
+            shown = key if len(key) <= 120 else key[:120] + "..."
+            raise _DuplicateKey(shown)
+        obj[key] = value
+    return obj
+
+
+def parse_list_file(raw: bytes) -> Any:
+    """Decode an uploaded list as strict UTF-8 JSON, or raise ListUnreadable.
+
+    A UTF-8 byte order mark is accepted. Refused: bytes that are not UTF-8;
+    text that is not JSON, including a number beyond Python's digit limit
+    and nesting deep enough to exhaust the recursion limit; NaN, Infinity
+    and -Infinity; and a key repeated within one object, at any depth.
+    """
+    try:
+        text = raw.decode("utf-8-sig")
+    except UnicodeDecodeError:
+        raise ListUnreadable("The file is not UTF-8 text.")
+    try:
+        return json.loads(text, parse_constant=_refuse_constant,
+                          object_pairs_hook=_refuse_duplicate_keys)
+    except _DuplicateKey as exc:
+        raise ListUnreadable(f"The file is not valid for import: the key {str(exc)!r} appears twice in one object.")
+    except RecursionError:
+        raise ListUnreadable("The file is not valid JSON that can be read: it is nested too deeply.")
+    except ValueError as exc:
+        # json.JSONDecodeError, and the ValueError for an integer over the
+        # interpreter's digit limit.
+        raise ListUnreadable(f"The file is not valid JSON: {exc}")
+
+
 class ProjectNeedsAdmin(Exception):
     """The list would create a project and the caller may not; nothing has been written."""
 

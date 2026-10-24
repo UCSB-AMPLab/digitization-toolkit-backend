@@ -660,3 +660,90 @@ def test_sequence_is_bounded_to_int4(client500, db_session, reports_root, sequen
     else:
         assert _reasons(resp.json()) == [(2, "xx-test-801", "invalid_sequence")]
         assert set(vols) == {"xx-test-800", "xx-test-802"}
+
+
+# ---------------------------------------------------------------------------
+# Malformed JSON is a 400, never a 500
+# ---------------------------------------------------------------------------
+
+def _single(code="xx-test-991"):
+    return json.dumps(_list_with([_item(code=code, stem=code)]))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("constant", ["NaN", "Infinity", "-Infinity"])
+def test_nan_and_infinity_are_refused(client500, db_session, reports_root, constant):
+    _as("op", "admin")
+    body = _single().replace('"sequence": 1', f'"sequence": 1, "expectedImages": {constant}')
+    resp = _post(client500, body.encode())
+    assert resp.status_code == 400, resp.text
+    assert constant in resp.json()["detail"]
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+def test_a_number_beyond_the_parsers_digit_limit_is_a_400(client500, db_session, reports_root):
+    _as("op", "admin")
+    body = _single().replace('"sequence": 1', '"sequence": 1, "extent": ' + "9" * 5000)
+    assert _post(client500, body.encode()).status_code == 400
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+def test_deep_nesting_is_a_400(client500, db_session, reports_root):
+    _as("op", "admin")
+    body = _single().replace('"sequence": 1', '"sequence": 1, "extent": ' + "[" * 100000 + "]" * 100000)
+    assert _post(client500, body.encode()).status_code == 400
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+def test_a_duplicate_envelope_key_is_refused_naming_the_key(client500, db_session, reports_root):
+    _as("op", "admin")
+    text = VALID.read_text(encoding="utf-8")
+    body = text.replace('"version": "1.1"', '"version": "2.0", "version": "1.1"', 1)
+    resp = _post(client500, body.encode())
+    assert resp.status_code == 400, resp.text
+    assert "'version'" in resp.json()["detail"]
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("item, key", [
+    ('{"referenceCode": "xx-test-bad", "referenceCode": "xx-test-990", '
+     '"filenameStem": "xx-test-990", "title": "T"}', "referenceCode"),
+    ('{"referenceCode": "xx-test-990", "filenameStem": "xx-test-990", "title": "T", '
+     '"dates": {"start": null, "start": "1800-01-01"}}', "start"),
+])
+def test_a_duplicate_key_inside_an_item_is_refused(client500, db_session, reports_root, item, key):
+    _as("op", "admin")
+    body = json.dumps(_list_with([])).replace('"items": []', '"items": [' + item + ']')
+    resp = _post(client500, body.encode())
+    assert resp.status_code == 400, resp.text
+    assert f"'{key}'" in resp.json()["detail"]
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+def test_a_utf8_byte_order_mark_is_accepted(client500, db_session, reports_root):
+    _as("op", "admin")
+    resp = _post(client500, b"\xef\xbb\xbf" + VALID.read_bytes())
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["created"] == 4
+
+
+@pytest.mark.unit
+def test_a_latin1_file_is_refused_as_not_utf8(client500, db_session, reports_root):
+    _as("op", "admin")
+    text = VALID.read_text(encoding="utf-8").replace("–", "-")
+    resp = _post(client500, text.encode("latin-1"))
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "The file is not UTF-8 text."
+
+
+@pytest.mark.unit
+def test_text_that_is_not_json_is_refused_as_not_json(client500, db_session, reports_root):
+    _as("op", "admin")
+    resp = _post(client500, b"{not json")
+    assert resp.status_code == 400
+    assert resp.json()["detail"].startswith("The file is not valid JSON")

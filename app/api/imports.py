@@ -7,7 +7,6 @@ GET /imports/digitisation-list/{list_id}/report returns the latest stored
 import report for a list. The import itself is app/core/list_import.py.
 """
 
-import json
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -19,8 +18,10 @@ from app.api.deps import get_db_dependency
 from app.core.audit import log_event
 from app.core.list_import import (
     ListRefused,
+    ListUnreadable,
     ProjectNeedsAdmin,
     import_list,
+    parse_list_file,
     latest_report_path,
     report_filename,
     store_report,
@@ -75,9 +76,9 @@ def import_digitisation_list(
     """
     raw = _read_capped(file)
     try:
-        document = json.loads(raw.decode("utf-8"))
-    except (UnicodeDecodeError, json.JSONDecodeError):
-        raise HTTPException(status_code=400, detail="The file is not UTF-8 JSON.")
+        document = parse_list_file(raw)
+    except ListUnreadable as exc:
+        raise HTTPException(status_code=400, detail=str(exc))
 
     try:
         report = import_list(db, document, current_user.username,
