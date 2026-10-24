@@ -123,6 +123,16 @@ class ListRefused(Exception):
     """The file as a whole cannot be imported; nothing has been written."""
 
 
+class ProjectNeedsAdmin(Exception):
+    """The list would create a project and the caller may not; nothing has been written."""
+
+
+PROJECT_NEEDS_ADMIN_MESSAGE = (
+    "No project of this list's name exists, and importing this list would create one. "
+    "An admin must import a list that creates a project."
+)
+
+
 def _major_version(version: Any) -> Optional[str]:
     if not isinstance(version, str):
         return None
@@ -282,16 +292,20 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     }
 
 
-def _project_for(db: Session, name: str, actor: Optional[str]) -> tuple[Project, bool]:
+def _project_for(db: Session, name: str, actor: Optional[str], may_create_project: bool) -> tuple[Project, bool]:
     """The project named `name`, created if there is none. Returns (project, created).
 
     An existing project of that name is reused: a project is a grouping in
     the catalogue only, and re-importing a list has to land in the project
-    the first import made.
+    the first import made. Creating one needs `may_create_project`, as
+    POST /projects needs an admin; without it, ProjectNeedsAdmin is raised
+    before anything is written.
     """
     project = db.query(Project).filter(Project.name == name).first()
     if project is not None:
         return project, False
+    if not may_create_project:
+        raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
     project = Project(name=name, created_by=actor)
     db.add(project)
     try:
@@ -316,16 +330,18 @@ def _reject(position: int, code: Any, reason: str) -> dict:
     }
 
 
-def import_list(db: Session, document: Any, actor: Optional[str]) -> dict:
+def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool) -> dict:
     """Import a digitisation list and return its report.
 
     Raises ListRefused, before writing anything, when the envelope is not
-    one this importer reads. Otherwise commits the project (if new) and then
+    one this importer reads, and then ProjectNeedsAdmin, also before writing
+    anything, when no project of the list's name exists and
+    `may_create_project` is false. Otherwise commits the project (if new) and then
     each volume on its own, and returns the report; it does not store it
     (store_report does).
     """
     list_id, list_name, items = check_envelope(document)
-    project, project_created = _project_for(db, list_name, actor)
+    project, project_created = _project_for(db, list_name, actor, may_create_project)
     project_id = project.id
 
     first_code = _first_positions(items, _reference_code)

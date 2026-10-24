@@ -19,6 +19,7 @@ from app.api.deps import get_db_dependency
 from app.core.audit import log_event
 from app.core.list_import import (
     ListRefused,
+    ProjectNeedsAdmin,
     import_list,
     latest_report_path,
     report_filename,
@@ -29,8 +30,10 @@ from app.models.user import User
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Creating volumes is admin or operator, as POST /collections; the import
-# also creates the list's project when none of that name exists.
+# Creating volumes is admin or operator, as POST /collections. Creating a
+# project is admin only, as POST /projects, so an operator can import only
+# into a project that already has the list's name (import_list refuses the
+# rest with ProjectNeedsAdmin).
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
@@ -63,7 +66,8 @@ def import_digitisation_list(
     """Create one volume per item of a digitisation list, and return the import report.
 
     A file whose envelope this unit does not read is refused with a 422 and
-    nothing is written. Otherwise the response is the report: counts
+    nothing is written. A list whose project does not exist yet needs an
+    admin: from an operator it is refused with a 403 and nothing is written. Otherwise the response is the report: counts
     `created` and `skipped`, the volumes created, and the `rejects`, each
     with the item's position, referenceCode and reason. `reportStored` says
     whether the report was also kept on the unit for
@@ -76,9 +80,12 @@ def import_digitisation_list(
         raise HTTPException(status_code=400, detail="The file is not UTF-8 JSON.")
 
     try:
-        report = import_list(db, document, current_user.username)
+        report = import_list(db, document, current_user.username,
+                             may_create_project=current_user.role == "admin")
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
+    except ProjectNeedsAdmin as exc:
+        raise HTTPException(status_code=403, detail=str(exc))
 
     try:
         store_report(report)
