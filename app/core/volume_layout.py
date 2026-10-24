@@ -63,6 +63,9 @@ What is moved, and how:
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
   reported.
+- A volume whose `<stem>/`, or one of its four directories, resolves
+  outside the projects root (a symbolic link) is not moved, and each of its
+  images is reported as skipped with reason "stem_dir_outside_projects_root".
 - A volume whose `<stem>/` is a live project tree (a project of that
   directory name, or a directory holding `images/`, `packages/` or
   `metadata/project_manifest.jsonl`) is not moved, and each of its images is
@@ -435,6 +438,28 @@ PROJECT_TREE = object()
 # The target given to a volume whose `<stem>/` holds what is not its own: nothing is moved.
 OCCUPIED = object()
 
+# The target given to a volume whose `<stem>/`, or one of its four
+# directories, resolves outside the projects root (a symbolic link): nothing is moved.
+OUTSIDE_ROOT = object()
+
+
+def _volume_dirs_inside(root: Path, stem: str) -> bool:
+    """Whether `<root>/<stem>/` and each of its four directories resolve inside `root` (resolved).
+
+    A symbolic link at any of them pointing elsewhere would take the
+    masters off the storage, where every reader refuses them.
+    """
+    from app.core.paths import VOLUME_SUBDIRS
+
+    volume = root / stem
+    for p in [volume] + [volume / d for d in VOLUME_SUBDIRS]:
+        try:
+            if not p.resolve().is_relative_to(root):
+                return False
+        except (OSError, RuntimeError):  # unreadable, or a symlink loop
+            return False
+    return True
+
 # app.core.thumbnail.generate_thumbnail: `<uuid4().hex>_thumb.jpg`, in thumbnails/ only.
 _GENERATED_THUMBNAIL = re.compile(r"^[0-9a-f]{32}_thumb\.jpg$")
 
@@ -636,7 +661,11 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 targets[cid] = image_output_dir("", stem=stem).resolve() if stem else None
             except ValueError:
                 targets[cid] = None  # a stem the model's pattern would refuse
-            if targets[cid] is not None and _is_project_tree(targets[cid].parent, project_dirs):
+            if targets[cid] is not None and not _volume_dirs_inside(root, stem):
+                logger.warning(f"Volume layout: {root / stem} or one of its directories resolves outside the "
+                               f"projects root {root}; volume {cid}'s files are not moved there")
+                targets[cid] = OUTSIDE_ROOT
+            if isinstance(targets[cid], Path) and _is_project_tree(targets[cid].parent, project_dirs):
                 targets[cid] = PROJECT_TREE
             if isinstance(targets[cid], Path):
                 foreign = _foreign_entries(db, targets[cid].parent, cid, temps, orphan_thumbnails)
@@ -652,6 +681,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         if target is OCCUPIED:
             skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_occupied",
                             "foreign": occupied[cid]})
+            continue
+        if target is OUTSIDE_ROOT:
+            skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_outside_projects_root"})
             continue
         if target is PROJECT_TREE:
             skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_is_project_tree"})
