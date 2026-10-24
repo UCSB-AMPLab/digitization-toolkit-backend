@@ -14,7 +14,7 @@
     "name": "Prueba de rechazos",
     "tenant": "captua-test",
     "repositoryCode": "XX-TEST",
-    "notes": "Lista sintética. Todos los ítems, salvo el primero, deben quedar en el informe de rechazos; los dos últimos, solo si antes se importó la lista válida."
+    "notes": "Lista sintética. Todos los ítems, salvo el primero, deben quedar en el informe de rechazos; el noveno, solo si antes se importó la lista válida."
   },
   "items": [
     {
@@ -45,7 +45,7 @@
       "typology": "Libro de prueba",
       "extent": null,
       "containerPath": [],
-      "filenameStem": "xx-test-102",
+      "filenameStem": "xx-test-101",
       "expectedImages": null,
       "notes": null
     },
@@ -80,7 +80,7 @@
       "notes": null
     },
     {
-      "referenceCode": "xx-test-105",
+      "referenceCode": "xx-test-largo-00000000000105",
       "sequence": 5,
       "title": "Rechazo: la raíz con -img_0000 pasa de 36 caracteres",
       "dates": {
@@ -114,7 +114,7 @@
     {
       "referenceCode": "xx-test-107",
       "sequence": 7,
-      "title": "Rechazo: la raíz coincide con la de otro ítem de esta lista",
+      "title": "Rechazo: la raíz no coincide con el referenceCode",
       "dates": {
         "display": "1826",
         "start": null,
@@ -123,7 +123,7 @@
       "typology": "Libro de prueba",
       "extent": null,
       "containerPath": [],
-      "filenameStem": "xx-test-101",
+      "filenameStem": "xx-test-107-b",
       "expectedImages": null,
       "notes": null
     },
@@ -155,14 +155,14 @@
       "typology": "Libro de prueba",
       "extent": null,
       "containerPath": [],
-      "filenameStem": "xx-test-109",
+      "filenameStem": "xx-test-001",
       "expectedImages": null,
       "notes": null
     },
     {
-      "referenceCode": "xx-test-110",
+      "referenceCode": " xx-test-110",
       "sequence": 10,
-      "title": "Rechazo si antes se importó la lista válida: la raíz ya está en uso en la unidad",
+      "title": "Rechazo: el referenceCode tiene un espacio al principio",
       "dates": {
         "display": "1832",
         "start": null,
@@ -171,7 +171,7 @@
       "typology": "Libro de prueba",
       "extent": null,
       "containerPath": [],
-      "filenameStem": "xx-test-002",
+      "filenameStem": "xx-test-110",
       "expectedImages": null,
       "notes": null
     }

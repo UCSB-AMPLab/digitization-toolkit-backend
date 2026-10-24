@@ -4,7 +4,7 @@ The list becomes a Project named after the basket (`list.name`), and each
 item becomes a volume (a row of `collections`):
 
     referenceCode  -> external_id
-    filenameStem   -> filename_stem
+    filenameStem   -> filename_stem (which must equal referenceCode)
     title          -> name
     dates.display  -> date
     dates.start    -> date_start
@@ -93,6 +93,7 @@ REASONS = {
     "missing_filename_stem": "The item has no filenameStem.",
     "filename_stem_not_a_slug": "The filenameStem is not lowercase letters and digits separated by single hyphens.",
     "filename_stem_too_long": f"The filenameStem is longer than {FILENAME_STEM_MAX_LENGTH} characters.",
+    "filename_stem_differs_from_reference_code": "The filenameStem is not the same as the referenceCode.",
     "filename_stem_duplicated_in_list": "An earlier item in this list has the same filenameStem.",
     "missing_title": "The item has no title.",
     "invalid_title": f"The title is not a string of at most {_NAME_MAX_LENGTH} characters.",
@@ -205,7 +206,10 @@ def _first_positions(items: list, key) -> dict:
 def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) -> tuple[Optional[str], dict]:
     """The reject reason for an item, or None and the volume's column values.
 
-    Checks run in a fixed order and the first failure is the reason given.
+    Checks run in a fixed order and the first failure is the reason given:
+    the reference code's checks, then the stem's format and length, then
+    that the stem equals the code, then the stem's duplicate in the list,
+    then the title, dates and sequence.
     The checks against volumes already on the unit come after this, in
     import_list, since they read the database.
     """
@@ -228,6 +232,14 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "filename_stem_not_a_slug", {}
     if len(stem) > FILENAME_STEM_MAX_LENGTH:
         return "filename_stem_too_long", {}
+    # The stem is the volume's reference code, unchanged (contract 1.1 §8,
+    # ruled 2026-10-23). Checked after the stem's own format, so a stem that
+    # is not a slug or is too long is reported as that.
+    if stem != code:
+        return "filename_stem_differs_from_reference_code", {}
+    # With the stem equal to the code, a stem repeated in the list has a
+    # repeated code too, which is reported above; this check, and the
+    # stem-on-unit check in import_list, stay for a stem held without that code.
     if first_stem.get(stem) != position:
         return "filename_stem_duplicated_in_list", {}
 

@@ -87,7 +87,7 @@ def test_valid_list_creates_four_volumes_in_a_project_named_after_the_basket(cli
     project = db_session.query(Project).filter(Project.name == "Prueba válida").one()
     assert report["projectId"] == project.id
     vols = _volumes(db_session)
-    assert set(vols) == {"xx-test-001", "xx-test-002", "xx-test-003", "xx-test-004"}
+    assert set(vols) == {"xx-test-001", "xx-test-002", "xx-test-003", "xx-test-largo-0000000000004"}
     assert all(v.project_id == project.id and v.parent_collection_id is None for v in vols.values())
     assert db_session.query(Record).count() == 0
     assert sorted(v["captuaCollectionId"] for v in report["volumes"]) == sorted(v.id for v in vols.values())
@@ -122,7 +122,7 @@ def test_valid_list_stores_the_mapped_fields(client, db_session, reports_root):
     assert v3.date == "s. f."
     assert v3.date_start is None and v3.date_end is None
 
-    v4 = vols["xx-test-004"]
+    v4 = vols["xx-test-largo-0000000000004"]
     assert v4.filename_stem == "xx-test-largo-0000000000004"
     assert len(v4.filename_stem) == 27
 
@@ -166,29 +166,30 @@ FRESH_REJECTS = [
     (2, "xx-test-101", "reference_code_duplicated_in_list"),
     (3, None, "missing_reference_code"),
     (4, "xx-test-104", "missing_filename_stem"),
-    (5, "xx-test-105", "filename_stem_too_long"),
+    (5, "xx-test-largo-00000000000105", "filename_stem_too_long"),
     (6, "xx-test-106", "filename_stem_not_a_slug"),
-    (7, "xx-test-107", "filename_stem_duplicated_in_list"),
+    (7, "xx-test-107", "filename_stem_differs_from_reference_code"),
     (8, "xx-test-108", "end_date_before_start"),
+    (10, " xx-test-110", "reference_code_padded"),
 ]
 
 
 @pytest.mark.unit
-def test_rejects_list_on_a_fresh_unit_creates_items_1_9_and_10(client, db_session, reports_root):
+def test_rejects_list_on_a_fresh_unit_creates_items_1_and_9(client, db_session, reports_root):
     _as("op", "operator")
     resp = _post_fixture(client, REJECTS)
     assert resp.status_code == 200, resp.text
     report = resp.json()
-    assert report["created"] == 3
-    assert report["skipped"] == 7
-    assert [v["position"] for v in report["volumes"]] == [1, 9, 10]
+    assert report["created"] == 2
+    assert report["skipped"] == 8
+    assert [v["position"] for v in report["volumes"]] == [1, 9]
     assert _reasons(report) == FRESH_REJECTS
     assert all(r["message"] for r in report["rejects"])
 
     vols = _volumes(db_session)
-    assert set(vols) == {"xx-test-101", "xx-test-001", "xx-test-110"}
-    assert vols["xx-test-001"].filename_stem == "xx-test-109"
-    assert vols["xx-test-110"].filename_stem == "xx-test-002"
+    assert set(vols) == {"xx-test-101", "xx-test-001"}
+    assert all(v.filename_stem == v.external_id for v in vols.values())
+    assert vols["xx-test-001"].name.startswith("Rechazo si antes")
 
 
 @pytest.mark.unit
@@ -199,15 +200,54 @@ def test_rejects_list_after_the_valid_list_creates_one(client, db_session, repor
     assert report["created"] == 1
     assert report["skipped"] == 9
     assert [v["referenceCode"] for v in report["volumes"]] == ["xx-test-101"]
-    assert _reasons(report) == FRESH_REJECTS + [
+    assert _reasons(report) == FRESH_REJECTS[:7] + [
         (9, "xx-test-001", "reference_code_on_unit"),
-        (10, "xx-test-110", "filename_stem_on_unit"),
-    ]
+    ] + FRESH_REJECTS[7:]
     vols = _volumes(db_session)
     assert len(vols) == 5
     # The valid list's xx-test-001 is untouched by item 9.
-    assert vols["xx-test-001"].filename_stem == "xx-test-001"
     assert vols["xx-test-001"].name == "Volumen de prueba uno"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code, stem", [
+    ("xx-test-980", "xx-test-981"),
+    ("xx-test-980", "xx-test-980-b"),
+    ("XX-TEST-980", "xx-test-980"),
+])
+def test_a_stem_that_differs_from_the_reference_code_is_rejected(client, db_session, reports_root, code, stem):
+    """The stem is the volume's reference code, unchanged (contract 1.1 §8)."""
+    _as("op", "operator")
+    report = _post(client, _list_with([_item(code=code, stem=stem)])).json()
+    assert report["created"] == 0
+    assert _reasons(report) == [(1, code, "filename_stem_differs_from_reference_code")]
+
+
+@pytest.mark.unit
+def test_a_bad_stem_format_is_reported_before_the_equality_check(client, db_session, reports_root):
+    _as("op", "operator")
+    report = _post(client, _list_with([
+        _item(code="xx-test-990", stem="XX Test 990"),
+        _item(code="xx-test-largo-00000000000991", stem="xx-test-largo-00000000000991"),
+    ])).json()
+    assert [r["reason"] for r in report["rejects"]] == ["filename_stem_not_a_slug", "filename_stem_too_long"]
+
+
+@pytest.mark.unit
+def test_a_stem_held_by_a_volume_without_a_reference_code_is_rejected(client, db_session, reports_root):
+    """A volume created on the device may carry the stem with no external_id."""
+    from app.models.collection import Collection
+    from app.models.project import Project
+
+    p = Project(name="Local")
+    db_session.add(p)
+    db_session.commit()
+    db_session.add(Collection(name="local", project_id=p.id, filename_stem="xx-test-901"))
+    db_session.commit()
+
+    _as("op", "operator")
+    report = _post(client, _list_with([_item()])).json()
+    assert _reasons(report) == [(1, "xx-test-901", "filename_stem_on_unit")]
 
 
 @pytest.mark.unit
@@ -223,7 +263,7 @@ def test_reimporting_the_valid_list_creates_nothing_twice(client, db_session, re
         (1, "xx-test-001", "reference_code_on_unit"),
         (2, "xx-test-002", "reference_code_on_unit"),
         (3, "xx-test-003", "reference_code_on_unit"),
-        (4, "xx-test-004", "reference_code_on_unit"),
+        (4, "xx-test-largo-0000000000004", "reference_code_on_unit"),
     ]
     # The existing project of that name is reused.
     assert second["projectCreated"] is False
@@ -499,4 +539,4 @@ def test_the_import_is_logged(client, db_session, reports_root):
     entry = db_session.query(SystemLog).filter(SystemLog.action == "digitisation_list_imported").one()
     assert entry.actor == "op"
     assert entry.subject == "Prueba de rechazos"
-    assert entry.detail == f"list {REJECTS_ID}: 3 created, 7 skipped"
+    assert entry.detail == f"list {REJECTS_ID}: 2 created, 8 skipped"

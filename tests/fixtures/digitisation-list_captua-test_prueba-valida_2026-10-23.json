@@ -84,7 +84,7 @@
       "fieldNotInContract": "Campo que no está en el contrato: el importador no lo interpreta, pero lo conserva en custom_attributes.fisqua."
     },
     {
-      "referenceCode": "xx-test-004",
+      "referenceCode": "xx-test-largo-0000000000004",
       "sequence": 4,
       "title": "Volumen de prueba cuatro, raíz de 27 caracteres",
       "dates": {
