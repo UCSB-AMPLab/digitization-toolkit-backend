@@ -34,6 +34,13 @@ from app.models import user, project, project_member, collection, record, camera
 engine = create_engine(f"sqlite:///{dbfile}")
 Base.metadata.create_all(engine)
 db = sessionmaker(bind=engine)()
+if mode == "import_noflock":
+    # Without flock an import may not create a project (the project lock
+    # cannot be taken, ProjectLockUnavailable), so the project exists
+    # already; this race is about the first hash file.
+    from app.models.project import Project
+    db.add(Project(name="Carrera"))
+    db.commit()
 doc = {"contract": "fisqua-captua-exchange", "version": "1.1", "kind": "digitisation-list",
        "id": LIST_ID, "list": {"name": "Carrera"},
        "items": [{"referenceCode": "xx-test-001", "filenameStem": "xx-test-001", "title": "T"}]}

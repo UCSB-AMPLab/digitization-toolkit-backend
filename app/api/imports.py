@@ -19,6 +19,7 @@ from app.api.deps import get_db_dependency
 from app.core.audit import log_event
 from app.core.list_import import (
     ListHashNotRecorded,
+    ProjectLockUnavailable,
     ListIdReused,
     ListUnverifiable,
     ListRefused,
@@ -98,7 +99,7 @@ def import_digitisation_list(
         raise HTTPException(status_code=403, detail=str(exc))
     except (ListIdReused, ListUnverifiable) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
-    except ListHashNotRecorded as exc:
+    except (ListHashNotRecorded, ProjectLockUnavailable) as exc:
         raise HTTPException(status_code=503, detail=str(exc))
 
     stored = report["reportStored"]

@@ -233,6 +233,48 @@ def parse_list_file(raw: bytes) -> Any:
     return document
 
 
+class ProjectLockUnavailable(Exception):
+    """The list would create a project and the project lock could not be taken; nothing has been written."""
+
+
+PROJECT_LOCK_UNAVAILABLE_MESSAGE = (
+    "Captua could not take the lock that keeps two imports from creating the same project, "
+    "so it did not import the list. Try again."
+)
+
+PROJECT_LOCK_NAME = ".project-create.lock"
+
+
+def _take_project_lock() -> Optional[int]:
+    """An exclusive flock on `<imports>/.project-create.lock`, as a file descriptor; None, logged, if it cannot be taken.
+
+    A file lock rather than a database advisory lock: the import already
+    serialises its runs with flocks under the imports directory, the unit's
+    one backend host shares that directory, and SQLite (the test database)
+    has no advisory locks. It blocks until the import holding it has
+    committed its project.
+    """
+    path = reports_dir() / PROJECT_LOCK_NAME
+    fd = None
+    try:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        fd = os.open(path, os.O_RDWR | os.O_CREAT, 0o644)
+        fcntl.flock(fd, fcntl.LOCK_EX)
+        return fd
+    except OSError:
+        logger.exception("Could not lock %s; a list that would create a project is not imported", path)
+        if fd is not None:
+            os.close(fd)
+        return None
+
+
+def _release_project_lock(fd: int) -> None:
+    try:
+        fcntl.flock(fd, fcntl.LOCK_UN)
+    finally:
+        os.close(fd)
+
+
 class ProjectNeedsAdmin(Exception):
     """The list would create a project and the caller may not; nothing has been written."""
 
@@ -479,12 +521,36 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     the first import made. Creating one needs `may_create_project`, as
     POST /projects needs an admin; without it, ProjectNeedsAdmin is raised
     before anything is written.
+
+    The project is looked for again and created under an exclusive flock on
+    `<imports>/.project-create.lock`, shared by every import, since the
+    list lock serialises only imports of one list id. When that lock cannot
+    be taken, ProjectLockUnavailable is raised before the project is
+    created: going on unlocked could create a second project of the same
+    normalised name. An existing project is still found without the lock.
     """
     project = _find_project(db, name)
     if project is not None:
         return project, False
     if not may_create_project:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
+    # Looking for the project by its normalised name and creating it are
+    # one step across all imports, whatever their list ids: two lists named
+    # "Basket" and "basket" would otherwise both find none and create two.
+    fd = _take_project_lock()
+    if fd is None:
+        raise ProjectLockUnavailable(PROJECT_LOCK_UNAVAILABLE_MESSAGE)
+    try:
+        return _create_project_locked(db, name, actor, notes)
+    finally:
+        _release_project_lock(fd)
+
+
+def _create_project_locked(db: Session, name: str, actor: Optional[str], notes: Any) -> tuple[Project, bool]:
+    """The body of _project_for that runs under the project lock: look again, then create."""
+    project = _find_project(db, name)
+    if project is not None:
+        return project, False
     description = notes if notes_skip_reason(notes) is None else None
     project = Project(name=_project_name(name), description=description, created_by=actor)
     db.add(project)
