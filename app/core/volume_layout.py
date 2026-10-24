@@ -911,66 +911,89 @@ def _volume_records_to_copy(db: Session, root: Path, collection_id: int) -> Tupl
     """The volume's `<stem>/` and the lines its manifest still lacks: its records from every other manifest.
 
     A volume's records are the capture records of the capture ids of its
-    images, and the relocation records of those captures. Each copy keeps
-    every field of the line it is taken from, adds `copied_from` (the source
-    manifest, relative to the root; a line that is itself a copy keeps the
-    original's), and has its paths (`files[].relative_path`, `from`, `to`)
-    rebased from the source manifest's directory onto `<stem>/`, so each
-    names the same absolute file and the fixity index gets from the copy the
-    checksum it gets from the source. A line the volume's manifest already
-    holds is not copied again, so a replayed batch adds nothing.
+    images, and the relocation records of those captures. See
+    _records_to_copy for how each copy is made.
     """
-    from app.core.integrity import _manifests, manifest_base
-
     collection = db.get(Collection, collection_id)
     if collection is None or not collection.filename_stem:
         return None, []
     vol = root / collection.filename_stem
-    own = vol / "metadata" / "manifest.jsonl"
     capture_ids = {cid for (cid,) in db.query(RecordImage.capture_id)
                    .join(Record, RecordImage.record_id == Record.id)
                    .filter(Record.collection_id == collection_id, RecordImage.capture_id.isnot(None)).all()}
     if not capture_ids:
         return vol, []
-    try:
-        present = set(own.read_text(encoding="utf-8").splitlines()) if own.exists() else set()
-    except OSError as e:
-        raise VolumeLayoutError(f"The manifest {own} is unreadable: {e}") from e
+    return vol, _records_to_copy(root, {collection_id: (vol, capture_ids)})[collection_id]
 
-    def rebase(rel: str, base: Path) -> str:
-        return os.path.relpath(os.path.normpath(base / rel), vol)
 
-    out: List[str] = []
+def _records_to_copy(root: Path, wanted: Dict[int, Tuple[Path, Set[str]]]) -> Dict[int, List[str]]:
+    """For each volume in `wanted` (id -> (`<stem>/`, capture ids)), the lines to add to its own manifest.
+
+    Every manifest is read once, whatever the number of volumes. For each
+    volume, the capture and relocation records of its capture ids found in
+    any manifest but its own are copied. Each copy keeps every field of the
+    line it is taken from, adds `copied_from` (the source manifest, relative
+    to the root; a line that is itself a copy keeps the original's), and has
+    its paths (`files[].relative_path`, `from`, `to`) rebased from the source
+    manifest's directory onto `<stem>/`, so each names the same absolute
+    file and the fixity index gets from the copy the checksum it gets from
+    the source. A line the volume's manifest already holds is not copied
+    again, so a replayed batch adds nothing.
+    """
+    from app.core.integrity import _manifests, manifest_base
+
+    own = {cid: vol / "metadata" / "manifest.jsonl" for cid, (vol, _) in wanted.items()}
+    present: Dict[int, Set[str]] = {}
+    for cid, path in own.items():
+        try:
+            present[cid] = set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+        except OSError as e:
+            raise VolumeLayoutError(f"The manifest {path} is unreadable: {e}") from e
+    by_capture: Dict[str, List[int]] = {}
+    for cid, (_, ids) in wanted.items():
+        for capture_id in ids:
+            by_capture.setdefault(capture_id, []).append(cid)
+    out: Dict[int, List[str]] = {cid: [] for cid in wanted}
+    if not by_capture:
+        return out
     for manifest in sorted(_manifests(root)):
-        if manifest.resolve() == own.resolve():
-            continue
+        resolved = manifest.resolve()
         base = manifest_base(manifest, root)
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except OSError as e:
-            logger.warning(f"Volume layout: could not read {manifest} to copy volume {collection_id}'s records: {e}")
+            logger.warning(f"Volume layout: could not read {manifest} to copy volumes' records: {e}")
             continue
         for line in lines:
             try:
-                entry = json.loads(line)
+                source = json.loads(line)
             except ValueError:
                 continue
-            if not isinstance(entry, dict) or entry.get("capture_id") not in capture_ids:
+            if not isinstance(source, dict) or source.get("capture_id") not in by_capture:
                 continue
-            if entry.get("record_type") == "relocation":
-                for key in ("from", "to"):
-                    if isinstance(entry.get(key), str):
-                        entry[key] = rebase(entry[key], base)
-            else:
-                for f in entry.get("files") or []:
-                    if isinstance(f, dict) and isinstance(f.get("relative_path"), str):
-                        f["relative_path"] = rebase(f["relative_path"], base)
-            entry.setdefault("copied_from", os.path.relpath(manifest, root))
-            copy = json.dumps(entry, ensure_ascii=False)
-            if copy not in present:
-                present.add(copy)
-                out.append(copy)
-    return vol, out
+            for cid in by_capture[source["capture_id"]]:
+                if resolved == own[cid].resolve():
+                    continue
+                vol = wanted[cid][0]
+                entry = json.loads(line)
+
+                def rebase(rel: str) -> str:
+                    return os.path.relpath(os.path.normpath(base / rel), vol)
+
+                if entry.get("record_type") == "relocation":
+                    for key in ("from", "to"):
+                        if isinstance(entry.get(key), str):
+                            entry[key] = rebase(entry[key])
+                else:
+                    for f in entry.get("files") or []:
+                        if isinstance(f, dict) and isinstance(f.get("relative_path"), str):
+                            f["relative_path"] = rebase(f["relative_path"])
+                entry.setdefault("copied_from", os.path.relpath(manifest, root))
+                copy = json.dumps(entry, ensure_ascii=False)
+                if copy not in present[cid]:
+                    present[cid].add(copy)
+                    out[cid].append(copy)
+    return out
 
 
 def _copy_volume_records(db: Session, root: Path, collection_id: int, report: dict) -> None:
@@ -1115,6 +1138,8 @@ def _new_report(root: Path, dry_run: bool) -> dict:
         "left_unreferenced": [],
         "manifest_records_copied": 0,
         "manifest_copy_failed": [],
+        "manifests_repaired": {},
+        "captures_without_record": {},
     }
 
 
@@ -1127,8 +1152,9 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
     """Move every stemmed volume's out-of-place files into its stem layout; return a report.
 
     In order: complete a pending journal, retry the sidecars that could not
-    follow their masters, find the out-of-place rows, and move their files a
-    volume at a time. With dry_run, nothing is moved, written or created:
+    follow their masters, find the out-of-place rows, move their files a
+    volume at a time, then check every migrated volume's own manifest and
+    copy in the capture records it lacks (_repair_volume_manifests). With dry_run, nothing is moved, written or created:
     the report lists the moves and row updates a run would make now, and a
     pending journal's entries are listed under "pending_journal_entries"
     without being replayed. Raises StorageUnavailableError when the active
@@ -1160,29 +1186,114 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
 
     out_of_place = _out_of_place(db, root_forms)
     report["out_of_place"] = len(out_of_place)
-    if not out_of_place:
-        return report
-
-    batches, skipped, left = _plan(db, root, out_of_place)
-    report["skipped"].extend(skipped)
-    report["left_unreferenced"] += [p for p in left if p not in report["left_unreferenced"]]
-    if dry_run:
+    if out_of_place:
+        batches, skipped, left = _plan(db, root, out_of_place)
+        report["skipped"].extend(skipped)
+        report["left_unreferenced"] += [p for p in left if p not in report["left_unreferenced"]]
+        if dry_run:
+            for b in batches:
+                report["manifest_records_copied"] += len(_volume_records_to_copy(db, root, b["collection_id"])[1])
+                for e in b["entries"]:
+                    (report["adopted"] if e["adopt"] else report["moved"]).append(
+                        {"image_id": e["image_id"], "from": e["from"], "to": e["to"]} if e["adopt"] else _summary(e))
+            return report
         for b in batches:
-            report["manifest_records_copied"] += len(_volume_records_to_copy(db, root, b["collection_id"])[1])
-            for e in b["entries"]:
-                (report["adopted"] if e["adopt"] else report["moved"]).append(
-                    {"image_id": e["image_id"], "from": e["from"], "to": e["to"]} if e["adopt"] else _summary(e))
-        return report
+            write_layout_journal({
+                "version": JOURNAL_VERSION,
+                "root": str(root),
+                "collection_id": b["collection_id"],
+                "entries": b["entries"],
+            })
+            _commit_batch(db, root, b, report)
 
-    for b in batches:
-        write_layout_journal({
-            "version": JOURNAL_VERSION,
-            "root": str(root),
-            "collection_id": b["collection_id"],
-            "entries": b["entries"],
-        })
-        _commit_batch(db, root, b, report)
+    _repair_volume_manifests(db, root, root_forms, report, dry_run)
     return report
+
+
+def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], report: dict, dry_run: bool) -> None:
+    """Copy into each migrated volume's own manifest the capture records it lacks.
+
+    A volume qualifies when it has a stem and every image of it under the
+    projects root is in its `<stem>/captures/`; a volume with images still
+    out of place is left to the migration, which copies when it moves them.
+    Its own `metadata/manifest.jsonl` must hold a capture record that parses
+    for each capture id of its images. The missing ones (a copy that failed
+    or was torn by a power cut) are copied from the other manifests, with
+    their relocation records, as the migration copies (_records_to_copy), so
+    the next start repairs them. A capture id no manifest holds (an upload
+    whose client sent one, a capture whose record was never written) is
+    logged and reported under "captures_without_record".
+
+    Cost on a migrated unit with nothing missing: one query over the images
+    of the stemmed volumes, a string comparison per row, and reading and
+    parsing each stemmed volume's own manifest once; no other manifest is
+    read. When something is missing, every manifest is read once more in
+    one pass, whatever the number of volumes concerned.
+    """
+    from capture.manifestHandler import append_manifest_lines
+
+    rows = (db.query(Collection.id, Collection.filename_stem, RecordImage.capture_id, RecordImage.file_path)
+            .join(Record, Record.collection_id == Collection.id)
+            .join(RecordImage, RecordImage.record_id == Record.id)
+            .filter(Collection.filename_stem.isnot(None)).all())
+    prefixes = tuple(r.rstrip(os.sep) + os.sep for r in root_forms)
+    capture_ids: Dict[int, Set[str]] = {}
+    stems: Dict[int, str] = {}
+    out_of_place: Set[int] = set()
+    for cid, stem, capture_id, fp in rows:
+        stems[cid] = stem
+        if fp and fp.startswith(prefixes) and os.path.dirname(fp) not in {
+                os.path.join(r, stem, CAPTURES_DIR) for r in root_forms}:
+            out_of_place.add(cid)
+        if capture_id:
+            capture_ids.setdefault(cid, set()).add(capture_id)
+    wanted: Dict[int, Tuple[Path, Set[str]]] = {}
+    for cid, ids in capture_ids.items():
+        if cid in out_of_place:
+            continue
+        vol = root / stems[cid]
+        own = vol / "metadata" / "manifest.jsonl"
+        have: Set[str] = set()
+        try:
+            lines = own.read_text(encoding="utf-8").splitlines() if own.exists() else []
+        except OSError as e:
+            logger.error(f"Volume layout: could not read {own} to check volume {cid}'s records: {e}")
+            continue
+        for line in lines:
+            try:
+                rec = json.loads(line)
+            except ValueError:
+                continue
+            if isinstance(rec, dict) and rec.get("record_type") != "relocation" and rec.get("capture_id"):
+                have.add(rec["capture_id"])
+        missing = ids - have
+        if missing:
+            wanted[cid] = (vol, missing)
+    if not wanted:
+        return
+    copies = _records_to_copy(root, wanted)
+    for cid, (vol, missing) in wanted.items():
+        found = set()
+        for line in copies[cid]:
+            rec = json.loads(line)
+            if rec.get("record_type") != "relocation":
+                found.add(rec.get("capture_id"))
+        nowhere = sorted(missing - found)
+        if nowhere:
+            logger.warning(f"Volume layout: no manifest holds a capture record for capture(s) {nowhere} "
+                           f"of volume {cid}")
+            report["captures_without_record"][cid] = nowhere
+        if not copies[cid]:
+            continue
+        if not dry_run:
+            try:
+                append_manifest_lines(vol, copies[cid])
+            except OSError as e:
+                logger.error(f"Volume layout: could not repair {vol / 'metadata' / 'manifest.jsonl'}: {e}")
+                report["manifest_copy_failed"].append({"collection_id": cid, "error": str(e)})
+                continue
+            logger.warning(f"Volume layout: copied {len(copies[cid])} missing record(s) into volume {cid}'s manifest")
+        report["manifests_repaired"][cid] = len(copies[cid])
 
 
 def _log_report(report: dict) -> None:
