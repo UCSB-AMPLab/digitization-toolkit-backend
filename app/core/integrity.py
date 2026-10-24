@@ -137,6 +137,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         except OSError:
             continue
         chain: List[Tuple[str, str, str]] = []
+        unparsed = 0
         for line in lines:
             line = line.strip()
             if not line:
@@ -144,6 +145,8 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
             try:
                 rec = json.loads(line)
             except json.JSONDecodeError:
+                # A line a power cut tore: the appends start a new line after it.
+                unparsed += 1
                 continue
             if not isinstance(rec, dict):
                 continue
@@ -179,6 +182,8 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                     continue
                 index.by_path.setdefault(cid, {})[abs_path] = sha
                 index.by_name.setdefault(cid, {})[Path(rel).name] = sha
+        if unparsed:
+            logger.warning(f"Capture manifest {manifest}: skipped {unparsed} line(s) that are not JSON (torn writes)")
         if chain:
             chains.append(chain)
 

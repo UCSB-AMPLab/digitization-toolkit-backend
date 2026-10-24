@@ -257,6 +257,27 @@ def generate_manifest_record(
     )
     
 
+def _append_line(manifest_path: Path, line: bytes) -> None:
+    """Append one encoded JSONL line to a manifest in one O_APPEND write, fsynced.
+
+    If the file does not end with a newline (a power cut tore its last
+    line), a newline is written first, in the same write, so the torn line
+    stays a line of its own, which the index skips and logs, and never
+    swallows this record. Called under _manifest_append_lock.
+    """
+    fd = os.open(manifest_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            line = b"\n" + line
+        mv = memoryview(line)
+        while mv:  # one O_APPEND write keeps the JSONL line atomic
+            mv = mv[os.write(fd, mv):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def append_manifest_record(project_root: Path, record: Union[CaptureRecord, ProjectInfo], record_type: str = "capture"):
     """
     Append a capture or project record to the manifest file in the project directory.
@@ -278,14 +299,7 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     
     line = (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
     with _manifest_append_lock:
-        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            mv = memoryview(line)
-            while mv:  # one O_APPEND write keeps the JSONL line atomic
-                mv = mv[os.write(fd, mv):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _append_line(manifest_path, line)
 
     if record_type == "project":
         subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
@@ -326,30 +340,37 @@ def append_relocation_record(project_root: Path, capture_id: str, from_rel: str,
     }
     line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
     with _manifest_append_lock:
-        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            mv = memoryview(line)
-            while mv:
-                mv = mv[os.write(fd, mv):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _append_line(manifest_path, line)
+
+
+MANIFEST_PART_NAME = "manifest.jsonl.part"
 
 
 def append_manifest_lines(root: Path, lines: list) -> None:
-    """Append already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, in one write, fsynced.
+    """Add already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, replacing the file atomically.
 
     For records copied from another manifest (app.core.volume_layout), which
-    are written as they are rather than built here. Each line is one JSON
-    object without its newline.
+    run at startup, when nothing else writes the manifest. The current
+    bytes, a newline if the last line was torn, and the new lines are
+    written to `manifest.jsonl.part` beside it, fsynced, and renamed over
+    it, and the directory is fsynced. A crash therefore leaves the manifest
+    as it was and at most a stale `.part`, which the next copy overwrites.
+    Each line is one JSON object without its newline.
     """
     if not lines:
         return
+    from .utils import _fsync_dir
+
     metadata_dir = root / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
-    data = "".join(line + "\n" for line in lines).encode("utf-8")
+    path = metadata_dir / "manifest.jsonl"
+    part = metadata_dir / MANIFEST_PART_NAME
     with _manifest_append_lock:
-        fd = os.open(metadata_dir / "manifest.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        current = path.read_bytes() if path.exists() else b""
+        if current and not current.endswith(b"\n"):
+            current += b"\n"
+        data = current + "".join(line + "\n" for line in lines).encode("utf-8")
+        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
         try:
             mv = memoryview(data)
             while mv:
@@ -357,3 +378,5 @@ def append_manifest_lines(root: Path, lines: list) -> None:
             os.fsync(fd)
         finally:
             os.close(fd)
+        os.replace(part, path)
+        _fsync_dir(metadata_dir)

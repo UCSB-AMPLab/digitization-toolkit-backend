@@ -414,12 +414,14 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int) -> List[
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
     - in `metadata/`, `manifest.jsonl` when every record in it that can be
-      read names a capture id of the volume's images.
+      read names a capture id of the volume's images, and the
+      `manifest.jsonl.part` a crashed copy leaves.
     Anything else is foreign: another entry at the top, a directory inside
     one of the four, or any other file. A directory is listed, not walked.
     Nothing when `<stem>/` does not exist.
     """
     from app.core.paths import CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+    from capture.manifestHandler import MANIFEST_PART_NAME
 
     if not volume_dir.is_dir():
         return []
@@ -449,6 +451,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int) -> List[
             return name.endswith(PREVIEW_SIDECAR_SUFFIX) and stem_owned(f.name[: -len(PREVIEW_SIDECAR_SUFFIX)])
         if sub == THUMBNAILS_DIR:
             return name in thumbs or (name.endswith("_thumb.jpg") and stem_owned(f.name[: -len("_thumb.jpg")]))
+        if sub == METADATA_DIR and f.name == MANIFEST_PART_NAME:
+            return True  # a crashed copy's; the next copy overwrites it (append_manifest_lines)
         if sub == METADATA_DIR and f.name == "manifest.jsonl":
             try:
                 lines = f.read_text(encoding="utf-8").splitlines()
@@ -970,7 +974,7 @@ def _volume_records_to_copy(db: Session, root: Path, collection_id: int) -> Tupl
 
 
 def _copy_volume_records(db: Session, root: Path, collection_id: int, report: dict) -> None:
-    """Append the volume's records still missing from `<stem>/metadata/manifest.jsonl` to it.
+    """Add the volume's records still missing from `<stem>/metadata/manifest.jsonl` to it (append_manifest_lines).
 
     Done before the batch's files move, so the volume carries its own
     fixity from the moment its files are in `<stem>/`. A copy that cannot
