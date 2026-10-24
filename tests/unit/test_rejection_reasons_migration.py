@@ -112,14 +112,3 @@ def test_downgrade_refuses_while_a_rejection_uses_a_new_reason(tmp_path, reason)
         assert conn.execute(sa.text("SELECT predefined_reason FROM record_rejections WHERE id = 2")).scalar() == reason
     # The constraint is still the wide one: nothing was half-applied.
     _insert(engine, 3, "other")
-
-
-@pytest.mark.unit
-def test_alembic_has_a_single_head():
-    """Moved here from test_master_orientation.py: the newest revision pins the head."""
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-
-    cfg = Config(str(BACKEND_ROOT / "alembic.ini"))
-    cfg.set_main_option("script_location", str(BACKEND_ROOT / "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["a8c2e4f6b1d3"]

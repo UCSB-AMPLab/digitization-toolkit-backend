@@ -24,6 +24,7 @@ import app.models.user  # noqa: F401
 import app.models.system_log  # noqa: F401
 import app.models.project_member  # noqa: F401
 import app.models.offsite_object  # noqa: F401
+import app.models.fisqua  # noqa: F401
 
 # this is the Alembic Config object, which provides
 # access to the values within the .ini file in use.
