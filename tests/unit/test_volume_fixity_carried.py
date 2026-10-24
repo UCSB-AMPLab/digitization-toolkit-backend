@@ -102,17 +102,16 @@ def test_a_migrated_volume_keeps_its_fixity_without_the_project_manifest(db_sess
 
 @pytest.mark.unit
 def test_a_relocation_record_of_an_earlier_rename_is_copied_too(db_session, legacy):
-    """A renumber before stems renamed the master; its relocation record names the image and its sha256."""
+    """A file-renaming renumber before stems renamed the master; its relocation record names the image and its sha256."""
     import os
     from app.core.integrity import verify_images_against_manifest
-    from app.core.storage_ops import renumber_collection_images
     from app.core.volume_layout import migrate_volume_layout
     from app.models.collection import Collection
     from app.models.record import RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     _capture_records(db_session, legacy)
-    renumber_collection_images(db_session, db_session.get(Collection, legacy["a2"].id))
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, db_session.get(Collection, legacy["a2"].id))
     migrate_volume_layout(db_session)
     (legacy["root"] / "proj" / "metadata" / "manifest.jsonl").unlink()
     db_session.expire_all()

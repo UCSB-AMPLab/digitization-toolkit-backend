@@ -190,10 +190,11 @@ def test_move_records_into_an_exporting_collection_is_allowed(as_admin, tree, ru
 
 
 @pytest.mark.unit
-def test_renumber_of_an_exporting_collection_is_refused(as_admin, tree, running_export):
+def test_renumber_of_an_exporting_collection_goes_ahead_since_it_moves_no_file(as_admin, tree, running_export):
+    """A renumber writes records' sequence only; the export read its records in one statement."""
     running_export(tree["parent"].id)
     resp = as_admin.post(f"/collections/{tree['parent'].id}/images/renumber")
-    _assert_export_refusal(resp)
+    assert resp.status_code == 200, resp.text
     assert tree["parent_rec_file"].exists()
 
 

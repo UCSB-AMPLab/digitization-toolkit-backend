@@ -26,6 +26,7 @@ from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
+from app.core.record_sequence import renumber_volume_records
 from app.core.storage_ops import (
     collection_and_descendants,
     collection_image_dir,
@@ -35,8 +36,6 @@ from app.core.storage_ops import (
     legacy_image_dir,
     relocate_images_and_commit,
     remove_empty_dirs,
-    renumber_collection_images,
-    restore_original_names,
     surviving_images_under,
 )
 
@@ -564,7 +563,7 @@ def reorder_collection_records(
 
 
 # ==============================================================================
-# Image renumbering
+# Renumbering (records' sequence only)
 # ==============================================================================
 
 @router.post("/{collection_id}/images/renumber", status_code=200)
@@ -574,76 +573,35 @@ def renumber_images(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Physically renumber every image file in a collection (documentary unit),
-    sequentially from 1, zero-padded to the total capture count. Never
-    renames anything else — only assigns fresh sequential filenames based on
-    current display order. If a file operation fails, or the commit after
-    the renames does, every renamed file is put back under its old name and
-    the database is left untouched; a file the unwind could not put back is
-    logged at ERROR and left under a temporary name, and the 500's detail
-    says that not every file went back.
+    Renumber a volume's records: set their `sequence` to 1..N in the order
+    they are listed in (`sequence`, NULLs last, then id), in one transaction.
 
-    Refused with 409 while an export of the collection is queued or running,
-    since the export reads the files by their current names.
+    No file is renamed, moved or written, and no manifest line is written
+    (contract 1.1 §3): a file's name carries its capture ordinal, and order
+    is the records' `sequence`. Records of other volumes are not touched.
+    The volume's row is locked for the transaction, as a capture's raise of
+    its counter locks it, so the rewrite and a capture's commit do not
+    interleave. If the commit fails, every sequence stays as it was.
     """
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    with export_jobs.hold_for_file_changes([collection_id]):
-        return _renumber_held(db, collection, collection_id, current_user)
-
-
-def _renumber_held(db: Session, collection: Collection, collection_id: int, current_user: User) -> dict:
-    """The body of renumber_images, run while the collection is held against exports."""
-    applied: List = []
-    try:
-        result = renumber_collection_images(db, collection, applied)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except OSError as e:
-        not_restored = getattr(e, "not_restored", [])
-        if not_restored:
-            logger.error(
-                f"Renumber of collection {collection_id} failed on disk; "
-                f"{len(not_restored)} file(s) could not be put back under their old names: "
-                f"{[p.name for p in not_restored]}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to renumber images on disk: {e}. Some files could not be put back under their old names",
-            )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to renumber images on disk: {e}. The files are back under their old names",
-        )
-
+    renumbered = renumber_volume_records(db, collection_id)
     try:
         db.commit()
     except Exception:
         db.rollback()
-        # The rows still name the old files, so the renames are reversed to match them.
-        not_restored = restore_original_names(applied)
-        if not_restored:
-            logger.exception(
-                f"Renumber DB commit failed for collection {collection_id}; "
-                f"{len(not_restored)} file(s) could not be put back under their old names: "
-                f"{[p.name for p in not_restored]}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Files were renumbered on disk but the database update failed, and some files could not be put back under their old names",
-            )
-        logger.exception(f"Renumber DB commit failed for collection {collection_id}; files put back under their old names")
+        logger.exception(f"Renumber DB commit failed for collection {collection_id}; no sequence was changed")
         raise HTTPException(
             status_code=500,
-            detail="The database update failed; the files are back under their old names. Please retry",
+            detail="The database update failed, so no record was renumbered. Please retry",
         )
 
     log_event(db, level="INFO", category="activity", action="images_renumbered",
               actor=current_user.username, subject=collection.name,
-              detail=f"Renumbered {result['renumbered']} images")
-    return result
+              detail=f"Renumbered {renumbered} records")
+    return {"renumbered": renumbered}
 
 
 # ==============================================================================

@@ -64,15 +64,14 @@ def _fail_sidecars_once(vl, monkeypatch, db):
 
 @pytest.mark.unit
 def test_a_pending_sidecar_whose_master_is_renumbered_meanwhile_is_not_silently_dropped(db_session, legacy, monkeypatch):
-    """The backend serves while a sidecar is pending, and a renumber renames its master."""
+    """The backend serves while a sidecar is pending, and a file-renaming renumber renamed its master."""
     import app.core.volume_layout as vl
     from app.core.paths import preview_sidecar_of
-    from app.core.storage_ops import renumber_collection_images
     from app.models.record import RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     _fail_sidecars_once(vl, monkeypatch, db_session)
-    renumber_collection_images(db_session, legacy["a1"])
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, legacy["a1"])
 
     report = vl.migrate_volume_layout(db_session)
 
@@ -91,12 +90,11 @@ def test_a_pending_sidecar_whose_new_name_is_taken_is_kept_and_logged_with_both_
         db_session, legacy, monkeypatch, caplog):
     import app.core.volume_layout as vl
     from app.core.paths import preview_sidecar_of
-    from app.core.storage_ops import renumber_collection_images
     from app.models.record import RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     _fail_sidecars_once(vl, monkeypatch, db_session)
-    renumber_collection_images(db_session, legacy["a1"])
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, legacy["a1"])
     db_session.expire_all()
     master = Path(db_session.get(RecordImage, legacy["i1"].id).file_path)
     taken = preview_sidecar_of(master)
@@ -340,15 +338,15 @@ def _captured_i2(db_session, legacy):
 
 
 @pytest.mark.unit
-def test_fixity_follows_a_master_renamed_by_a_renumber_after_the_migration(db_session, legacy):
+def test_fixity_follows_a_master_renamed_by_a_file_renaming_renumber_after_the_migration(db_session, legacy):
+    """The relocation record such a renumber wrote stays in the volume's manifest, and the index reads it."""
     from app.core.integrity import verify_images_against_manifest
-    from app.core.storage_ops import renumber_collection_images
     from app.models.record import RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     _captured_i2(db_session, legacy)
     old = Path(db_session.get(RecordImage, legacy["i2"].id).file_path)
-    renumber_collection_images(db_session, legacy["a2"])
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, legacy["a2"])
     db_session.expire_all()
     img = db_session.get(RecordImage, legacy["i2"].id)
     new = Path(img.file_path)
@@ -361,44 +359,6 @@ def test_fixity_follows_a_master_renamed_by_a_renumber_after_the_migration(db_se
     assert verify_images_against_manifest([img]) == []
     new.write_bytes(b"bit rot")
     assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
-
-
-@pytest.mark.unit
-def test_a_renumber_whose_commit_is_rolled_back_writes_no_relocation_record(db_session, legacy):
-    from app.core.storage_ops import renumber_collection_images, restore_original_names
-
-    _captured_i2(db_session, legacy)
-    applied: list = []
-    renumber_collection_images(db_session, legacy["a2"], applied)
-    db_session.rollback()
-    assert restore_original_names(applied) == []
-    db_session.commit()  # a later commit on the same session carries nothing from the rolled-back renumber
-
-    assert _relocations(_a2_volume(legacy)) == []
-
-
-@pytest.mark.unit
-def test_a_renumber_unwound_on_disk_writes_no_relocation_record(db_session, legacy, monkeypatch):
-    import app.core.storage_ops as so
-
-    _captured_i2(db_session, legacy)
-    real = os.replace
-    calls = {"n": 0}
-
-    def fail_in_phase_two(src, dst):
-        if not Path(dst).name.startswith(".renumber_"):
-            calls["n"] += 1
-            if calls["n"] == 2:
-                raise OSError(5, "Input/output error")
-        return real(src, dst)
-
-    monkeypatch.setattr(so.os, "replace", fail_in_phase_two)
-    with pytest.raises(OSError):
-        so.renumber_collection_images(db_session, legacy["a2"])
-    monkeypatch.setattr(so.os, "replace", real)
-    db_session.commit()
-
-    assert _relocations(_a2_volume(legacy)) == []
 
 
 def _clash_setup(db_session, capture_settings_root):
@@ -490,13 +450,12 @@ def test_a_clash_rename_whose_commit_raised_but_landed_writes_its_relocation_rec
 @pytest.mark.unit
 def test_relocation_records_of_later_renames_stay_out_of_the_bag_manifest(db_session, legacy):
     from app.core.export_service import _filtered_manifest_blob
-    from app.core.storage_ops import renumber_collection_images
     from app.models.collection import Collection
     from app.models.record import Record
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     _captured_i2(db_session, legacy)
-    renumber_collection_images(db_session, legacy["a2"])
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, legacy["a2"])
     assert _relocations(_a2_volume(legacy))
 
     collection = db_session.get(Collection, legacy["a2"].id)
@@ -506,70 +465,6 @@ def test_relocation_records_of_later_renames_stay_out_of_the_bag_manifest(db_ses
     kept = [json.loads(l) for l in blob.decode().splitlines() if l.strip()]
     assert [k.get("capture_id") for k in kept] == ["cap-0002"]
     assert all(k.get("record_type") != "relocation" for k in kept)
-
-
-def _storage_ops_listeners(target) -> list:
-    """The after_commit and after_soft_rollback listeners from app.core.storage_ops on `target`."""
-    out = []
-    for name in ("after_commit", "after_soft_rollback"):
-        for fn in getattr(target.dispatch, name):
-            if getattr(fn, "__module__", "") == "app.core.storage_ops":
-                out.append((name, fn))
-    return out
-
-
-@pytest.mark.unit
-def test_queued_relocations_are_scoped_to_the_renumbering_session(db_session, legacy):
-    """Another session committing writes none of them; the listeners leave the session once they have fired."""
-    from app.core.db import SessionLocal
-    from app.core.storage_ops import renumber_collection_images
-
-    _captured_i2(db_session, legacy)
-    assert _storage_ops_listeners(db_session) == []
-
-    renumber_collection_images(db_session, legacy["a2"])
-    assert _storage_ops_listeners(db_session)
-    other = SessionLocal()
-    try:
-        assert _storage_ops_listeners(other) == []  # nothing registered on the Session class
-        other.commit()
-    finally:
-        other.close()
-    assert _relocations(_a2_volume(legacy)) == []
-
-    db_session.commit()
-    assert [r["capture_id"] for r in _relocations(_a2_volume(legacy))] == ["cap-0002"]
-    # The rollback listener is gone; the commit listener that fired cannot remove
-    # itself during its own dispatch, and stays, spent, until the next queue.
-    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
-    db_session.commit()
-    assert len(_relocations(_a2_volume(legacy))) == 1
-
-    from app.models.collection import Collection
-
-    db_session.get(Collection, legacy["a2"].id).name = "Otro"
-    db_session.commit()
-    renumber_collection_images(db_session, legacy["a2"])  # renames to otro_NNNN; the spent listener is removed
-    assert sorted(n for n, _ in _storage_ops_listeners(db_session)) == ["after_commit", "after_soft_rollback"]
-    db_session.commit()
-    assert len(_relocations(_a2_volume(legacy))) == 2
-    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
-
-
-@pytest.mark.unit
-def test_the_listeners_leave_the_session_when_its_queued_relocations_are_dropped(db_session, legacy):
-    from app.core.storage_ops import renumber_collection_images, restore_original_names
-
-    _captured_i2(db_session, legacy)
-    applied: list = []
-    renumber_collection_images(db_session, legacy["a2"], applied)
-    assert _storage_ops_listeners(db_session)
-    db_session.rollback()
-    restore_original_names(applied)
-
-    assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_soft_rollback"]
-    db_session.commit()
-    assert _relocations(_a2_volume(legacy)) == []
 
 
 # ---------------------------------------------------------------------------
@@ -593,9 +488,10 @@ def _glob_in_order(monkeypatch, reverse: bool):
 @pytest.mark.parametrize("reverse", [False, True])
 def test_a_relocation_chain_split_across_volume_manifests_resolves_to_the_current_path(
         db_session, capture_settings, data_dir, override_projects_root, monkeypatch, reverse):
-    """Captured in volume A, moved into volume B (another project) and renumbered there, then moved to C on a clash."""
+    """Captured in volume A, moved into volume B (another project) and renamed there by a file-renaming renumber, then moved to C on a clash."""
     from app.core.integrity import verify_images_against_manifest
-    from app.core.storage_ops import relocate_images_and_commit, renumber_collection_images
+    from app.core.storage_ops import relocate_images_and_commit
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record, RecordImage
@@ -616,8 +512,7 @@ def test_a_relocation_chain_split_across_volume_manifests_resolves_to_the_curren
     rec = db_session.get(Record, img.record_id)
     rec.collection_id = b.id
     relocate_images_and_commit(db_session, [(img, root / "xx-test-pb-b" / "captures")], [], "move")
-    renumber_collection_images(db_session, db_session.get(Collection, b.id))
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, db_session.get(Collection, b.id))
     c_dir = root / "xx-test-pa-c" / "captures"
     c_dir.mkdir(parents=True)
     (c_dir / "b_0001.jpg").write_bytes(b"another page")
@@ -723,17 +618,17 @@ def test_a_hand_written_record_for_the_later_rename_completes_the_chain(db_sessi
 
 
 @pytest.mark.unit
-def test_two_renumbers_that_reuse_names_still_resolve_each_image(
+def test_two_file_renaming_renumbers_that_reuse_names_still_resolve_each_image(
         db_session, capture_settings, data_dir, override_projects_root):
-    """Two files of one capture (a dual pair); the second renumber swaps their names.
+    """Two files of one capture (a dual pair); the second renumber swapped their names.
 
     A chain by path cannot express a swap: whichever record is applied first,
     the second reads the checksum the first just wrote.
     """
     from app.core.integrity import run_integrity_check, verify_images_against_manifest
-    from app.core.storage_ops import renumber_collection_images
     from app.models.collection import Collection
     from app.models.record import Record, RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     root = override_projects_root
     _p, c = _project_and_collection(db_session, cname="Tomo", stem="xx-test-tomo")
@@ -746,14 +641,12 @@ def test_two_renumbers_that_reuse_names_still_resolve_each_image(
     rl.sequence, rr.sequence = 1, 2
     db_session.commit()
 
-    renumber_collection_images(db_session, db_session.get(Collection, c.id))
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, db_session.get(Collection, c.id))
     first = {i.id: Path(db_session.get(RecordImage, i.id).file_path).name for i in (left, right)}
     rl, rr = db_session.get(Record, left.record_id), db_session.get(Record, right.record_id)
     rl.sequence, rr.sequence = 2, 1
     db_session.commit()
-    renumber_collection_images(db_session, db_session.get(Collection, c.id))
-    db_session.commit()
+    rename_as_an_earlier_renumber(db_session, db_session.get(Collection, c.id))
     db_session.expire_all()
     imgs = [db_session.get(RecordImage, i.id) for i in (left, right)]
     second = {i.id: Path(i.file_path).name for i in imgs}
@@ -770,18 +663,15 @@ def test_two_renumbers_that_reuse_names_still_resolve_each_image(
 
 @pytest.mark.unit
 def test_every_written_relocation_record_names_its_image_and_checksum(db_session, legacy, renamed_capture_i2):
-    """The migration's clash rename and a later renumber both write image_id and the capture sha256."""
+    """The migration's clash rename writes image_id and the capture sha256."""
     import hashlib
-    from app.core.storage_ops import renumber_collection_images
     from app.core.volume_layout import migrate_volume_layout
 
     sha = renamed_capture_i2
     migrate_volume_layout(db_session)
-    renumber_collection_images(db_session, legacy["a2"])
-    db_session.commit()
 
     records = [r for r in _relocations(_a2_volume(legacy)) if r["capture_id"] == "cap-0002"]
-    assert len(records) == 2
+    assert len(records) == 1
     assert all(r["image_id"] == legacy["i2"].id and r["sha256"] == sha for r in records)
     assert hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest() == sha
 
@@ -809,11 +699,10 @@ def renamed_capture_i2(db_session, legacy):
 # ---------------------------------------------------------------------------
 
 def _renumber_with_failed_record(db, legacy, monkeypatch):
-    """A renumber renames captured IMG_0002, its relocation record cannot be written, and the file rots."""
-    import capture.manifestHandler as mh
-    from app.core.storage_ops import renumber_collection_images
+    """A file-renaming renumber renamed captured IMG_0002, its relocation record was not written, and the file rots."""
     from app.core.volume_layout import migrate_volume_layout
     from app.models.record import RecordImage
+    from tests.unit.earlier_renumber import rename_as_an_earlier_renumber
 
     migrate_volume_layout(db)
     img = db.get(RecordImage, legacy["i2"].id)
@@ -824,12 +713,7 @@ def _renumber_with_failed_record(db, legacy, monkeypatch):
     vol = _a2_volume(legacy)
     _manifest(vol, "cap-0002", os.path.relpath(Path(img.file_path), vol.resolve()), Path(img.file_path).read_bytes())
 
-    def boom(*a, **k):
-        raise OSError(28, "No space left on device")
-
-    monkeypatch.setattr(mh, "append_relocation_record", boom)
-    renumber_collection_images(db, legacy["a2"])
-    db.commit()
+    rename_as_an_earlier_renumber(db, legacy["a2"], write_records=False)
     db.expire_all()
     img = db.get(RecordImage, legacy["i2"].id)
     Path(img.file_path).write_bytes(b"bit rot")

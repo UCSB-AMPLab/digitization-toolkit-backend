@@ -438,7 +438,8 @@ OCCUPIED = object()
 # app.core.thumbnail.generate_thumbnail: `<uuid4().hex>_thumb.jpg`, in thumbnails/ only.
 _GENERATED_THUMBNAIL = re.compile(r"^[0-9a-f]{32}_thumb\.jpg$")
 
-# storage_ops.renumber_collection_images phase 1: `.renumber_<uuid4().hex><suffix>`.
+# `.renumber_<uuid4().hex><suffix>`: the first-phase temporary name of a renumber that renamed files.
+# Units in service may hold one left by such a renumber that was interrupted.
 _RENUMBER_TEMP = re.compile(r"^\.renumber_[0-9a-f]{32}(\.[^./]+)?$")
 
 
@@ -468,7 +469,7 @@ def _writer_temp(sub: str, name: str) -> bool:
     """Whether a file in `<stem>/<sub>/` is named exactly as a writer into that directory names its temporary file.
 
     captures/ and previews/: atomic_write (masters, the RAW preview, the EXIF
-    rewrite), a renumber's phase-1 name, and _move. thumbnails/: _move only
+    rewrite), a file-renaming renumber's phase-1 name, and _move. thumbnails/: _move only
     (thumbnails are written directly under a uuid name, never through a
     temporary file).
     """
@@ -1152,9 +1153,9 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
     because only then are both known: the capture manifest holds capture-time
     paths, which a later relocation makes stale, and a sidecar need not be in
     it. The entry is keyed by image id. When the master's row names another
-    file than the one recorded (a renumber renamed it while the sidecar
-    waited), the sidecar goes where that file names it, under the name its
-    stem derives (preview_sidecar_of), as a renumber would have named it, and the
+    file than the one recorded (the master was renamed or moved while the
+    sidecar waited), the sidecar goes where that file names it, under the name its
+    stem derives (preview_sidecar_of), as relocate_image would have named it, and the
     entry is updated to match. An entry is dropped when the sidecar is at its
     destination and gone from its old path, when it is gone from both
     (logged), or when its image's row is gone: that is logged once, the file
