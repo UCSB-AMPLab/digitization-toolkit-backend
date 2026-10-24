@@ -846,16 +846,40 @@ class OffsiteJob:
                 "state": self.state, "result": self.result, "error": self.error}
 
 
+# How long a finished job stays readable. The job id is known only to the
+# page that started the job, which polls it until it ends, so a result is
+# normally read within one poll of its end; a day also covers a tab left
+# asleep overnight. Bounded by time, not by a count per volume, because a
+# count would keep every volume's last results for as long as the backend
+# runs, which no reader needs. A job dropped here answers 404, which the
+# page reports as a lost job.
+FINISHED_JOB_TTL = 24 * 3600
+
+
 class OffsiteJobRegistry:
-    """One free or restore per volume at a time, in this process (the appliance runs one)."""
+    """One free or restore per volume at a time, in this process (the appliance runs one).
+
+    Finished jobs are dropped FINISHED_JOB_TTL after they end, when the next
+    job is reserved; a queued or running job is never dropped.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._jobs: dict = {}
         self._active: dict = {}
 
+    def _drop_expired(self) -> None:
+        """Drop the jobs that finished more than FINISHED_JOB_TTL ago. Called under the lock."""
+        cutoff = time.time() - FINISHED_JOB_TTL
+        for job_id in [j.id for j in self._jobs.values()
+                       if j.finished_at is not None and j.finished_at < cutoff]:
+            job = self._jobs.pop(job_id)
+            if self._active.get(job.collection_id) == job_id:
+                del self._active[job.collection_id]
+
     def reserve(self, collection_id: int, action: str) -> OffsiteJob:
         with self._lock:
+            self._drop_expired()
             active = self._jobs.get(self._active.get(collection_id))
             if active is not None and active.state in ("queued", "running"):
                 raise FreeRefused(JOB_RUNNING_MESSAGE, detail={"job_id": active.id})
