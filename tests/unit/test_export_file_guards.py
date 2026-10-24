@@ -460,3 +460,37 @@ def test_delete_of_a_superseded_image_in_an_exporting_collection_is_allowed(
     running_export(tree["parent"].id)
     resp = as_admin.delete(f"/records/images/{img.id}")
     assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.unit
+def test_reorder_committed_during_the_export_fails_as_collection_changed(
+        as_admin, tree, exports, monkeypatch, db_session):
+    """A reorder that lands between the gate's read and the re-check would leave
+    the record directories numbered in the old order and metadata.json carrying
+    the new sequences. It fails the export like any other change of state."""
+    from app.models.record import Record, RecordImage
+    from capture.project_manager import image_output_dir
+
+    first = tree["parent_rec"]
+    f = image_output_dir("P", "Parent") / "second.jpg"
+    f.write_bytes(b"bytes of second")
+    second = Record(title="second", collection_id=tree["parent"].id,
+                    status="approved", capture_mode="single")
+    db_session.add(second)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=second.id, filename=f.name, file_path=str(f),
+                               format="jpg", role="single", is_current=True))
+    first.sequence, second.sequence = 1, 2
+    db_session.commit()
+    first_id, second_id = first.id, second.id
+
+    def reorder():
+        db_session.query(Record).filter(Record.id == first_id).update({"sequence": 2})
+        db_session.query(Record).filter(Record.id == second_id).update({"sequence": 1})
+        db_session.commit()
+
+    st = _export_with_hook_after_fixity(as_admin, tree, monkeypatch, reorder)
+    assert st["state"] == "failed"
+    assert "changed while the archive was being assembled" in st["error"]
+    assert sorted(st["detail"]["blocking_record_ids"]) == sorted([first_id, second_id])
+    assert list(exports.iterdir()) == []

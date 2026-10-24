@@ -103,7 +103,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     # What the gate passed on, kept so it can be checked again once the payload
     # is planned: an export is a statement about a state, and if that state
     # moved while the bag was being assembled the bag is not about anything.
-    gated_state = {rec.id: (rec.status,
+    gated_state = {rec.id: (rec.status, rec.sequence,
                             tuple(sorted(i.id for i in rec.images if i.is_current)))
                    for rec in records}
 
@@ -163,7 +163,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         # the gate passed on is still the state, because the bag is a statement about
         # it. A reviewer undoing an approval, or an operator retaking a record, in the
         # time it took to resolve the files leaves a bag that claims a review that no
-        # longer stands. populate_existing() because a plain re-query returns the
+        # longer stands, and so does a reorder or renumber, which would leave the
+        # record directories numbered in the old order beside a metadata.json
+        # carrying the new sequences. populate_existing() because a plain re-query returns the
         # instances already in the identity map without refreshing their columns,
         # which would compare the snapshot against itself.
         rechecked = (
@@ -173,7 +175,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             .populate_existing()
             .all()
         )
-        now_state = {rec.id: (rec.status,
+        now_state = {rec.id: (rec.status, rec.sequence,
                               tuple(sorted(i.id for i in rec.images if i.is_current)))
                      for rec in rechecked}
         if now_state != gated_state:
