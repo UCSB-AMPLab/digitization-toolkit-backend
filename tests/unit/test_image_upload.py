@@ -941,3 +941,28 @@ def test_the_disambiguated_key_is_still_never_overwritten(remote, db_session, ov
 
     assert [r["key"] for r in result["refused"]] == [key]
     assert remote.files()[key] == b"someone else"
+
+
+@pytest.mark.unit
+def test_no_transaction_is_open_while_rclone_runs(remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+
+    vol = _volume(db_session)
+    _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    _image(db_session, vol, override_projects_root, "f2.jpg", b"two", thumbnail=False)
+    seen = []
+    real_upload, real_list = iu.upload_file, iu.listed_object
+
+    def upload(local, key):
+        seen.append(("copy", db_session.in_transaction()))
+        return real_upload(local, key)
+
+    def listed(key):
+        seen.append(("list", db_session.in_transaction()))
+        return real_list(key)
+
+    monkeypatch.setattr(iu, "upload_file", upload)
+    monkeypatch.setattr(iu, "listed_object", listed)
+    _run(db_session)
+    assert [kind for kind, _ in seen].count("copy") == 2
+    assert not [s for s in seen if s[1]], seen

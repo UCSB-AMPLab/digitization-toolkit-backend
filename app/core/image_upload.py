@@ -617,6 +617,9 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
                                 "capture_sha256": expected, "key": key})
                 return
 
+        # No transaction stays open on this session while rclone runs: the
+        # reads above began one, and a long copy must not hold it.
+        db.commit()
         before = listed_object(key)
         if before.present:
             if before.sha1 is None:
@@ -634,6 +637,7 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
                             "key": key, "remote_sha1": before.sha1})
             return
 
+        db.commit()
         upload_file(staged.path, key)
         row = _save(db, row, item.image_id, item.kind, key, local_sha1=sha1, uploaded_at=_now())
 
