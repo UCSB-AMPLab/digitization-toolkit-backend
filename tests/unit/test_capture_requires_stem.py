@@ -411,3 +411,53 @@ def test_the_camera_test_works_while_a_volume_has_no_stem(client, db_session, te
 
     assert resp.status_code == 200, resp.text
     assert resp.content == b"\xff\xd8fake"
+
+
+# ---------------------------------------------------------------------------
+# The stem check holds the volume row
+# ---------------------------------------------------------------------------
+#
+# A PATCH clearing a stem (app/api/collections.py) takes the volume row under
+# SELECT ... FOR UPDATE. The stem check takes the same row the same way, so a
+# PATCH cannot land between the check and the capture's commit. The suite
+# runs on SQLite, which emits no lock clause, so these tests read the SQL
+# that would reach PostgreSQL and the source of each path, as
+# test_workflow_row_locking.py does for the record row.
+
+def _postgres_sql(query) -> str:
+    from sqlalchemy.dialects import postgresql
+    return str(query.statement.compile(dialect=postgresql.dialect())).upper()
+
+
+@pytest.mark.unit
+def test_the_volume_loader_locks_the_volume_row(db_session):
+    from app.core.volume_stem import locked_volume_query
+
+    sql = _postgres_sql(locked_volume_query(db_session, 1))
+    assert "FROM COLLECTIONS" in sql, sql
+    assert sql.rstrip().endswith("FOR UPDATE"), sql
+
+
+@pytest.mark.unit
+def test_sqlite_emits_no_volume_lock(db_session):
+    """Stated as a test so the limitation is not rediscovered as a surprise."""
+    from sqlalchemy.dialects import sqlite
+    from app.core.volume_stem import locked_volume_query
+
+    sql = str(locked_volume_query(db_session, 1).statement.compile(dialect=sqlite.dialect())).upper()
+    assert "FOR UPDATE" not in sql, sql
+
+
+@pytest.mark.unit
+def test_every_stem_check_loads_the_volume_through_the_locked_loader():
+    from app.api import cameras as cameras_api
+    from app.core import volume_stem
+
+    for fn in (cameras_api._refuse_capture_without_volume_or_stem, volume_stem.volume_lacks_stem):
+        src = inspect.getsource(fn)
+        assert "locked_volume_query(db, " in src, f"{fn.__name__} does not lock the volume row"
+        assert "db.query(Collection" not in src, f"{fn.__name__} loads the volume without the lock"
+
+    from app.api import records as records_api
+    src = inspect.getsource(records_api.add_image_to_record)
+    assert "volume_lacks_stem(db, rec.collection_id)" in src, "the upload does not run the locked stem check"

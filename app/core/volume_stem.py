@@ -23,13 +23,25 @@ VOLUME_REQUIRED_DETAIL = "Captures must go into a volume."
 RETAKE_VOLUME_DETAIL = "A retake must go into the record's own volume."
 
 
+def locked_volume_query(db: Session, collection_id: int):
+    """The volume row under SELECT ... FOR UPDATE (no lock clause on SQLite).
+
+    The stem check reads the row this way so that the lock is held until the
+    capture's transaction ends. A PATCH clearing or setting the stem takes the
+    same row the same way (app/api/collections.py), so it cannot land between
+    the check and the commit. A capture holds the lock through the shot.
+    """
+    return db.query(Collection).filter(Collection.id == collection_id).with_for_update()
+
+
 def volume_lacks_stem(db: Session, collection_id: Optional[int]) -> bool:
     """True when collection_id names an existing volume whose filename_stem is NULL.
 
-    False for None and for an id that matches no volume: the caller's own
-    lookup answers a missing volume with its 404.
+    Locks the volume row (locked_volume_query) for the rest of the
+    transaction. False for None and for an id that matches no volume: the
+    caller's own lookup answers a missing volume with its 404.
     """
     if collection_id is None:
         return False
-    stem = db.query(Collection.filename_stem).filter(Collection.id == collection_id).first()
-    return stem is not None and stem[0] is None
+    volume = locked_volume_query(db, collection_id).first()
+    return volume is not None and volume.filename_stem is None

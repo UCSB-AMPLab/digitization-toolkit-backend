@@ -17,7 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_counter import next_capture_number
-from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -60,7 +60,8 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
-	volume = db.query(Collection).filter(Collection.id == collection_id).first()
+	# Locked, so a PATCH of the stem waits until this capture commits.
+	volume = locked_volume_query(db, collection_id).first()
 	if volume is None:
 		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 	if retake_record is not None:
