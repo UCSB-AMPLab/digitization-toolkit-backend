@@ -47,12 +47,11 @@ while it is hashed is skipped for this run.
 
 Each file is uploaded from a hard link made in a staging directory under the
 projects root, so a move of the volume's records, a rename or a delete that
-changes the file's name during the upload cannot change which bytes are
+removes or renames the file during the upload cannot change which bytes are
 sent: the read hold (_read_object) lasts only while the file is staged, not
 while it is uploaded. A renumber renames nothing. Where a hard link cannot
-be made (a file system
-without hard links), a copy is made there instead, and removed after the
-upload.
+be made (a file system without hard links), a copy is made there instead,
+and removed after the upload.
 """
 
 import argparse
@@ -533,21 +532,34 @@ class _Read:
 def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     """Pin the bytes of the file the image's row names, or None (reported) when that cannot be done.
 
-    Under export_jobs.hold_for_reading, which nothing that moves, renames or
-    deletes the volume's files can overlap: a move of its records
-    (move-records), a project or volume rename, a record or image delete and
-    freeing all take hold_for_file_changes. A single-record move (PATCH
-    /records/{id}) and a renumber take no hold and need none: the PATCH
-    rewrites the record's collection_id and sequence and a renumber its
-    sequence, and neither touches a file, so the path the row names still
-    holds the same bytes. A PATCH move that lands between this read and the
-    first offsite row is caught by _claim, which locks the record and reads
-    the image's row again, volume and stem included, before it writes. Under
-    the hold the row is re-read, the file is staged as a hard link, and the
-    row is read a third time and must name the same file. Where no hard link can be made,
-    the file is copied into the staging directory instead, still under the
-    hold. From then on the staged file holds this image's bytes whatever
-    happens to its name, and it is what is hashed and uploaded.
+    Under export_jobs.hold_for_reading, which these cannot overlap, since
+    each takes hold_for_file_changes on the volume: a move of its records
+    (move-records), a rename of its project or of the volume while its files
+    are in the name-based layout, a record delete, the delete of a current
+    image, and freeing.
+
+    Some changes are not excluded by the hold:
+
+    * A single-record move (PATCH /records/{id}), add_record_to_project and
+      a renumber take no hold. The PATCH and add_record rewrite the record's
+      parent (and the PATCH its sequence), a renumber rewrites sequences,
+      and none touches a file, so the path the row names still holds the
+      same bytes.
+    * The delete of a superseded image takes no hold (records.py, the image
+      delete route).
+    * A rename of another project, when a record moved into this volume by
+      PATCH still has its files in that project's name-based tree: that
+      rename holds that project's volumes, not this one.
+
+    Each of these is caught by the re-reads below and by _claim, which locks
+    the record and compares the image's row, path, volume and stem included,
+    with what was read here before it writes a first offsite row: a row that
+    is gone or differs writes nothing. Under the hold the row is re-read, the
+    file is staged as a hard link, and the row is read a third time and must
+    name the same file. Where no hard link can be made, the file is copied
+    into the staging directory instead, still under the hold. From then on
+    the staged file holds this image's bytes whatever happens to its name,
+    and it is what is hashed and uploaded.
     """
     from app.core.export_jobs import FilesChanging, export_jobs
 

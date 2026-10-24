@@ -110,10 +110,13 @@ class ExportJobRegistry:
         of the collections for file changes; otherwise, until the block exits,
         hold_for_file_changes refuses them with a 409. The check and the hold
         are taken under the one lock, so a move of the collection's records, a
-        rename or a delete either finished before the read began or starts
-        after it ends. A renumber and a single-record PATCH take no hold: they
-        rewrite rows and touch no file. Meant for a
-        short span (the upload holds it to re-read a row and make a hard link),
+        rename of its files, a record delete or a current image's delete
+        either finished before the read began or starts after it ends. A
+        renumber, a single-record PATCH and add_record_to_project take no
+        hold: they rewrite rows and touch no file. Neither does the delete of a
+        superseded image, nor a rename of another project whose tree still
+        holds files of a record moved into this collection; the upload's
+        re-reads and image_upload._claim catch both. Meant for a short span (the upload holds it to re-read a row and make a hard link),
         since a request refused here is the operator's to retry.
         """
         ids = set(collection_ids)
