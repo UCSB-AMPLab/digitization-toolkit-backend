@@ -354,6 +354,52 @@ def offsite_job_status(
     return job.to_dict()
 
 
+@router.get("/{collection_id}/capture-manifest")
+def export_capture_manifest(
+    collection_id: int,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """The volume's capture manifest for Fisqua (exchange contract 1.1, artefact 2), as a JSON download.
+
+    Built from the catalogue, the capture manifests and offsite_objects only
+    (app.core.capture_manifest), with a fresh id each time. Admins and
+    operators only, like promotion: the manifest is how a handed-over volume
+    reaches Fisqua, and handing over is the operator's act, not a
+    reviewer's. Answers 409 when Fisqua would refuse the file, with a
+    message naming the fix and, per problem, the records concerned. Each
+    export is written to the system log with its id and counts.
+    """
+    from datetime import timezone as _tz
+
+    from app.core.capture_manifest import (
+        EXPORT_ACTION, ManifestRefused, build_capture_manifest, download_name, manifest_counts,
+    )
+
+    collection = db.query(Collection).filter(Collection.id == collection_id).first()
+    if not collection:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    now = datetime.now(_tz.utc)
+    try:
+        doc = build_capture_manifest(db, collection, now=now)
+    except ManifestRefused as exc:
+        db.rollback()
+        raise HTTPException(
+            status_code=409,
+            detail={"message": exc.message, "problems": [p.as_dict() for p in exc.problems]},
+        )
+    db.commit()  # end the read transaction before the log's own commit
+
+    counts = manifest_counts(doc)
+    log_event(db, level="INFO", category="activity", action=EXPORT_ACTION,
+              actor=current_user.username, subject=collection.filename_stem,
+              detail=(f"volume {collection.id} id={doc['id']} records={counts['records']} "
+                      f"images={counts['images']} previews={counts['previews']}"))
+    name = download_name(doc["volumes"][0]["stem"], now)
+    return JSONResponse(content=doc, headers={"Content-Disposition": f'attachment; filename="{name}"'})
+
+
 @router.get("/{collection_id}/hierarchy", response_model=CollectionWithChildren)
 def get_collection_hierarchy(
     collection_id: int,
