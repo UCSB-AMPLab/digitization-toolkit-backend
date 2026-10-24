@@ -1158,6 +1158,13 @@ def main(argv: Optional[list] = None) -> int:
     mark.add_argument("stem", help="the volume's file name stem")
     mark.add_argument("--apply", action="store_true",
                       help="write the freed state; without it, only report what would be marked")
+    backfill = sub.add_parser(
+        "backfill-preview-digests",
+        help="record the sha256 of a volume's RAW previews that have none (app.core.preview_digests)",
+    )
+    backfill.add_argument("stem", help="the volume's file name stem")
+    backfill.add_argument("--apply", action="store_true",
+                          help="append the records; without it, only report what would be recorded")
     args = parser.parse_args(argv)
 
     from app.core.db import SessionLocal
@@ -1168,6 +1175,10 @@ def main(argv: Optional[list] = None) -> int:
             from app.core.offsite_free import mark_freed
 
             report = mark_freed(db, args.stem, apply=args.apply)
+        elif args.command == "backfill-preview-digests":
+            from app.core.preview_digests import backfill_preview_digests
+
+            report = backfill_preview_digests(db, args.stem, apply=args.apply)
         else:
             report = adopt_objects(db, args.prefix, apply=args.apply)
     except (ValueError, VerificationUnavailable) as exc:
