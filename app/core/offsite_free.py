@@ -653,9 +653,16 @@ def _fsync_dir(directory: Path) -> None:
 
 def _restore_one(db: Session, obj: _Object) -> tuple:
     """(entry, None) when restored, (None, refusal) otherwise."""
+    from app.core.storage_override import refuse_writes_under_unusable_root
+
     target = obj.path
     if target is None:
         return None, obj.entry(reason="outside_storage")
+    # Before anything is created: with the drive gone, its mount point is a
+    # directory on the card, and a file restored there would vanish under the
+    # drive when it returns, with its freed state already cleared. Raises
+    # StorageUnavailableError, which ends the job and clears nothing more.
+    refuse_writes_under_unusable_root([target])
     if target.exists():
         # Put back by other means. Never overwritten: kept as it is, and the
         # state cleared only when the bytes are the object's.
@@ -730,20 +737,28 @@ def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[st
     _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     manifest = _RunManifest(stem, "restored")
     restored, refused = [], []
-    for obj in _objects(db, collection_id, freed=True):
-        entry, refusal = _restore_one(db, obj)
-        if refusal is not None:
-            logger.warning("Restore of %s (%s) refused: %s", obj.key, obj.kind, refusal["reason"])
-            refused.append(refusal)
-            continue
-        entry["restored_at"] = _now().isoformat()
-        restored.append(entry)
-        manifest.write(entry)
-    total = sum(r["bytes"] for r in restored)
-    if restored or refused:
-        _log(db, action=RESTORED_ACTION, level="WARN" if refused else "INFO", actor=actor, stem=stem,
-             detail=f"files={len(restored)} bytes={total} refused={len(refused)}"
-                    + (f" manifest={manifest.path.name}" if manifest.path else ""))
+    stopped = None
+    try:
+        for obj in _objects(db, collection_id, freed=True):
+            entry, refusal = _restore_one(db, obj)
+            if refusal is not None:
+                logger.warning("Restore of %s (%s) refused: %s", obj.key, obj.kind, refusal["reason"])
+                refused.append(refusal)
+                continue
+            entry["restored_at"] = _now().isoformat()
+            restored.append(entry)
+            manifest.write(entry)
+    except Exception as exc:
+        stopped = exc
+        raise
+    finally:
+        total = sum(r["bytes"] for r in restored)
+        if restored or refused or stopped is not None:
+            _log(db, action=RESTORED_ACTION, level="WARN" if refused or stopped else "INFO", actor=actor,
+                 stem=stem,
+                 detail=f"files={len(restored)} bytes={total} refused={len(refused)}"
+                        + (f" manifest={manifest.path.name}" if manifest.path else "")
+                        + (f" stopped: {stopped}" if stopped is not None else ""))
     return {"collection_id": collection_id, "filename_stem": stem,
             "restored": {"files": len(restored), "bytes": total},
             "files": restored, "refused": refused,
@@ -751,9 +766,15 @@ def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[st
 
 
 def _prepare_restore(db: Session, collection_id: int):
+    from app.core.storage_override import refuse_writes_under_unusable_root
+    from capture.project_manager import volume_root
+
     collection = _stem_volume(db, collection_id)
     if not config.settings.OFFSITE_READ_REMOTE.strip():
         raise FreeRefused(NO_READ_REMOTE_MESSAGE)
+    # StorageUnavailableError, which the app answers with 503, as it does for
+    # every other writer; each file is checked again before it is written.
+    refuse_writes_under_unusable_root([volume_root(collection.filename_stem, config.settings.projects_dir)])
     return collection, _Hold(collection_id)
 
 

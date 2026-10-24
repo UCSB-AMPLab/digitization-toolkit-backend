@@ -744,3 +744,69 @@ def test_the_job_checks_the_layout_again(read_remote, db_session, override_proje
 
     assert refused.message == of.NOT_IN_OWN_FOLDER_MESSAGE
     assert _paths(override_projects_root, "f1.CR2")[1].exists() == (work == "free")
+
+
+# ---------------------------------------------------------------------------
+# An unusable storage root
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_restore_refuses_an_unusable_storage_root_and_writes_nothing(
+        read_remote, api, db_session, override_projects_root, monkeypatch):
+    import os
+
+    from app.core.storage_override import StorageUnavailableError
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    previews = override_projects_root / STEM / "previews"
+    captures = override_projects_root / STEM / "captures"
+    assert list(previews.iterdir()) == [] and list(captures.iterdir()) == []
+    previews.rmdir()
+    captures.rmdir()
+    # The projects root is the override's, and it sits on the card: a drive's
+    # mount point with no drive mounted.
+    monkeypatch.setattr("app.core.storage_override.get_storage_override", lambda: str(override_projects_root))
+    dev = os.stat(override_projects_root).st_dev
+    monkeypatch.setattr("app.core.storage_override._internal_device", lambda: dev)
+
+    with pytest.raises(StorageUnavailableError):
+        _restore(db_session, vol)
+    r = api.post(f"/collections/{vol.id}/offsite/restore")
+    assert r.status_code == 503, r.text
+
+    assert not previews.exists() and not captures.exists(), "a restore wrote under an unusable root"
+    for image in (raw, jpg):
+        assert _image_row(db_session, image.id).master_freed_at is not None
+    assert read_remote.calls("copyto")[3:] == []
+
+
+@pytest.mark.unit
+def test_a_job_whose_root_becomes_unusable_fails_with_the_storage_message_and_clears_no_state(
+        read_remote, db_session, override_projects_root, monkeypatch):
+    import os
+
+    import app.core.offsite_free as of
+    from app.core.storage_override import StorageUnavailableError
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    objects = of._objects(db_session, vol.id, freed=True)  # read while the root is still usable
+    previews = override_projects_root / STEM / "previews"
+    previews.rmdir()
+    # The drive goes during the job, after its checks at the start.
+    monkeypatch.setattr("app.core.storage_override.get_storage_override", lambda: str(override_projects_root))
+    dev = os.stat(override_projects_root).st_dev
+    monkeypatch.setattr("app.core.storage_override._internal_device", lambda: dev)
+
+    for obj in objects:
+        with pytest.raises(StorageUnavailableError) as exc:
+            of._restore_one(db_session, obj)
+        assert "not on a mounted drive" in str(exc.value)
+
+    assert not previews.exists(), "a restore created a directory under an unusable root"
+    assert read_remote.calls("copyto")[3:] == []
+    for image in (raw, jpg):
+        row = _image_row(db_session, image.id)
+        assert row.master_freed_at is not None
+    assert not _paths(override_projects_root, "f2.jpg")[0].exists()
