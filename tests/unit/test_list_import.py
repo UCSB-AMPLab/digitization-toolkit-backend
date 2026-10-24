@@ -1289,3 +1289,56 @@ def test_get_is_a_404_when_no_run_parses(client, db_session, reports_root):
     for run in (reports_root / VALID_ID).glob("*_run*.json"):
         run.write_text("{not json")
     assert client.get(f"/imports/digitisation-list/{VALID_ID}/report").status_code == 404
+
+
+# ---------------------------------------------------------------------------
+# The first hash is created exclusively
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("other, expect_reused", [("b" * 64, True), ("1" * 64, False)])
+@pytest.mark.parametrize("links", [True, False])
+def test_a_hash_file_written_meanwhile_is_compared_not_replaced(db_session, reports_root, monkeypatch,
+                                                                other, expect_reused, links):
+    """Another process writes sha256 after this import's check found none and before its write."""
+    import app.core.list_import as li
+
+    if not links:
+        monkeypatch.setattr(li.os, "link", lambda src, dst: (_ for _ in ()).throw(OSError(1, "no links")))
+    real_write = li._write_hash_file
+
+    def other_writes_first(directory, digest):
+        directory.mkdir(parents=True, exist_ok=True)
+        (directory / "sha256").write_text(other + "\n")
+        return real_write(directory, digest)
+
+    monkeypatch.setattr(li, "_write_hash_file", other_writes_first)
+    doc = _list_with([_item()])
+    if expect_reused:
+        with pytest.raises(li.ListIdReused):
+            li.import_list(db_session, doc, "a", True, file_sha256="1" * 64)
+        assert _volumes(db_session) == {}
+    else:
+        assert li.import_list(db_session, doc, "a", True, file_sha256="1" * 64)["created"] == 1
+    assert (reports_root / VALID_ID / "sha256").read_text().strip() == other
+    assert not list((reports_root / VALID_ID).glob(".tmp-*"))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["import", "import_noflock"])
+def test_two_processes_racing_the_first_hash_create_once(tmp_path, mode):
+    import os
+    import subprocess
+    import sys
+
+    worker = str(Path(__file__).resolve().parent / "list_import_race_worker.py")
+    env = {**os.environ, "DTK_DATA_DIR": str(tmp_path)}
+    procs = [subprocess.Popen([sys.executable, worker, mode, str(tmp_path / f"{t}.db"), t * 64],
+                              env=env, cwd=os.getcwd(), stdout=subprocess.PIPE,
+                              stderr=subprocess.STDOUT, text=True)
+             for t in ("a", "b")]
+    outs = [p.communicate(timeout=60)[0] for p in procs]
+    results = [line for out in outs for line in out.splitlines() if line.startswith("RESULT")]
+    assert len(results) == 2, outs
+    assert sum("created 1" in r for r in results) == 1, results
+    assert sum("ListIdReused" in r for r in results) == 1, results

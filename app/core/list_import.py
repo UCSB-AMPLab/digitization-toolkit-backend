@@ -691,19 +691,13 @@ def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
     - Without one: every stored run is read for its fileSha256 (runs
       stored before hash files existed). A run that cannot be read, or has
       no hash, is ListUnverifiable. A run with another hash is
-      ListIdReused. Otherwise the hash file is written now, and if that
-      fails, ListHashNotRecorded.
+      ListIdReused. Otherwise the hash file is created now, exclusively;
+      if another import created it meanwhile, it is compared as above, and
+      if it cannot be written, ListHashNotRecorded.
     """
     hash_file = directory / HASH_FILE_NAME
     if hash_file.exists():
-        try:
-            recorded = hash_file.read_text(encoding="ascii").strip()
-        except (OSError, UnicodeDecodeError):
-            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
-        if not _SHA256_RE.fullmatch(recorded):
-            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
-        if recorded != file_sha256:
-            raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+        _compare_with_hash_file(hash_file, file_sha256)
         return
     for _, path in _run_files(directory, list_id):
         try:
@@ -716,24 +710,68 @@ def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
             raise ListIdReused(LIST_ID_REUSED_MESSAGE)
     try:
         _write_hash_file(directory, file_sha256)
+    except FileExistsError:
+        # Another import of this list id (one that could not take the lock)
+        # wrote the hash since the check above: compare with it as if it
+        # had been there from the start.
+        _compare_with_hash_file(hash_file, file_sha256)
     except OSError:
         logger.exception("Could not record the hash of list %s", list_id)
         raise ListHashNotRecorded(LIST_HASH_NOT_RECORDED_MESSAGE)
 
 
+def _compare_with_hash_file(hash_file: Path, file_sha256: str) -> None:
+    """ListUnverifiable if the hash file cannot be read as a hash; ListIdReused if it differs."""
+    try:
+        recorded = hash_file.read_text(encoding="ascii").strip()
+    except (OSError, UnicodeDecodeError):
+        raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+    if not _SHA256_RE.fullmatch(recorded):
+        raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+    if recorded != file_sha256:
+        raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+
+
 def _write_hash_file(directory: Path, digest: str) -> None:
-    """Write `<directory>/sha256` through a temporary file and a rename."""
+    """Create `<directory>/sha256` holding `digest`, or raise FileExistsError if it exists.
+
+    Created exclusively, so that of two imports that both found no hash
+    file (possible when the list lock is unavailable) only one writes it:
+    the hash goes to a temporary file, which is hard-linked to the name
+    (failing if the name exists). Without hard links the name is created
+    with O_CREAT|O_EXCL and written in place, and removed if the write
+    fails.
+    """
     directory.mkdir(parents=True, exist_ok=True)
+    target = directory / HASH_FILE_NAME
+    data = (digest + "\n").encode("ascii")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".sha256")
     try:
-        with os.fdopen(fd, "w", encoding="ascii") as handle:
-            handle.write(digest + "\n")
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, directory / HASH_FILE_NAME)
-    except BaseException:
+        try:
+            os.link(tmp, target)
+            return
+        except FileExistsError:
+            raise
+        except OSError:
+            pass  # no hard links on this filesystem
+    finally:
         try:
             os.unlink(tmp)
+        except OSError:
+            pass
+    fd = os.open(target, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o644)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+    except BaseException:
+        try:
+            os.unlink(target)
         except OSError:
             pass
         raise
