@@ -442,13 +442,17 @@ def test_a_key_outside_the_tenant_prefix_is_not_listed(remote, db_session):
 @pytest.mark.unit
 def test_a_failed_copy_stops_the_run_and_marks_nothing(remote, db_session, override_projects_root):
     vol = _volume(db_session)
-    _image(db_session, vol, override_projects_root, "f1.jpg", b"one")
+    first = _image(db_session, vol, override_projects_root, "f1.jpg", b"one")
     _image(db_session, vol, override_projects_root, "f2.jpg", b"two")
     remote.set_modes("copy-fails")
     result = _run(db_session)
     assert result["status"] == "failed"
     assert len(remote.calls("copyto")) == 1
-    assert _rows(db_session) == {}
+    # Only the reservation made before the copy: nothing uploaded, verified or refused.
+    rows = _rows(db_session)
+    assert list(rows) == [(first.id, "capture")]
+    assert (rows[(first.id, "capture")].uploaded_at, rows[(first.id, "capture")].verified_at,
+            rows[(first.id, "capture")].refused_at) == (None, None, None)
 
 
 # ---------------------------------------------------------------------------
@@ -1122,3 +1126,177 @@ def test_the_key_takes_the_stem_of_the_volume_the_record_is_in_when_it_is_read(
     monkeypatch.setattr(iu, "pending_work", then_move)
     _run(db_session)
     assert _rows(db_session)[(img.id, "capture")].object_key == f"{TENANT}/xx-test-002/captures/f1.jpg"
+
+
+# ---------------------------------------------------------------------------
+# The key is reserved, as a pending row, before the transfer
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def api(db_session):
+    """A TestClient whose requests run on sessions of their own, as admin."""
+    from fastapi.testclient import TestClient
+    from sqlalchemy.orm import sessionmaker
+
+    from app.api.auth import get_current_user
+    from app.api.deps import get_db_dependency
+    from app.main import app
+    from app.models.user import User
+
+    Session = sessionmaker(bind=db_session.get_bind())
+
+    def own_session():
+        db = Session()
+        try:
+            yield db
+        finally:
+            db.close()
+
+    app.dependency_overrides[get_db_dependency] = own_session
+    app.dependency_overrides[get_current_user] = lambda: User(
+        username="adm", email="adm@example.com", hashed_password="x", role="admin", is_active=True)
+    yield TestClient(app)
+    app.dependency_overrides.clear()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["patch", "move-records"])
+def test_a_move_during_the_transfer_is_refused(remote, db_session, override_projects_root, monkeypatch, api, path):
+    import app.core.image_upload as iu
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    rec_id, vol_id, other_id = img.record_id, vol.id, other.id
+    real = iu.upload_file
+    answers = []
+
+    def move_during_copy(local, key):
+        if path == "patch":
+            r = api.patch(f"/records/{rec_id}", json={"collection_id": other_id})
+        else:
+            r = api.post(f"/collections/{vol_id}/move-records", params={"target_collection_id": other_id})
+        answers.append((r.status_code, r.text))
+        return real(local, key)
+
+    monkeypatch.setattr(iu, "upload_file", move_during_copy)
+    result = _run(db_session)
+
+    assert answers and answers[0][0] == 409, answers
+    assert "stored offsite under this volume" in answers[0][1]
+    assert result["uploaded"] == 1
+    db_session.expire_all()
+    assert db_session.get(Record, rec_id).collection_id == vol_id
+
+
+@pytest.mark.unit
+def test_the_key_is_reserved_before_the_transfer(remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+    from app.core.image_upload import records_stored_offsite
+    from app.models.offsite_object import OffsiteObject
+    from sqlalchemy.orm import sessionmaker
+
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    other = sessionmaker(bind=db_session.get_bind())()
+    seen = []
+    real = iu.upload_file
+
+    def look_then_copy(local, key):
+        row = other.query(OffsiteObject).filter(OffsiteObject.record_image_id == img.id).one_or_none()
+        seen.append((row.object_key if row else None, row.uploaded_at if row else "no row",
+                     records_stored_offsite(other, [img.record_id])))
+        other.rollback()
+        return real(local, key)
+
+    monkeypatch.setattr(iu, "upload_file", look_then_copy)
+    _run(db_session)
+    other.close()
+    assert seen == [(f"{TENANT}/{STEM}/captures/f1.jpg", None, [img.record_id])], \
+        "a committed pending row, counted as stored offsite, before the copy starts"
+
+
+@pytest.mark.unit
+def test_a_crash_after_the_remote_copy_keeps_the_reserved_key(remote, db_session, override_projects_root, monkeypatch, api):
+    import app.core.image_upload as iu
+    from app.models.record import RecordImage
+
+    vol = _volume(db_session)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    img_id, rec_id, other_id = img.id, img.record_id, other.id
+    key = f"{TENANT}/{STEM}/captures/f1.jpg"
+
+    class Crash(BaseException):
+        pass
+
+    real = iu.upload_file
+
+    def copy_then_die(local, k):
+        real(local, k)
+        raise Crash()
+
+    monkeypatch.setattr(iu, "upload_file", copy_then_die)
+    with pytest.raises(Crash):
+        _run(db_session)
+    db_session.rollback()
+
+    row = _rows(db_session)[(img_id, "capture")]
+    assert row.object_key == key and row.uploaded_at is None and row.verified_at is None
+    # Still blocks a move, and survives a rename on disk.
+    assert api.patch(f"/records/{rec_id}", json={"collection_id": other_id}).status_code == 409
+    old = Path(db_session.get(RecordImage, img_id).file_path)
+    new = old.with_name("renamed.jpg")
+    old.rename(new)
+    db_session.query(RecordImage).filter(RecordImage.id == img_id).update({"file_path": str(new)})
+    db_session.commit()
+
+    monkeypatch.setattr(iu, "upload_file", real)
+    copies = len(remote.calls("copyto"))
+    result = _run(db_session)
+    assert result["already_present"] == 1 and result["uploaded"] == 0
+    assert len(remote.calls("copyto")) == copies, "nothing is uploaded again"
+    assert sorted(remote.files()) == [key]
+    assert _rows(db_session)[(img_id, "capture")].verified_at is not None
+
+
+@pytest.mark.unit
+def test_a_failed_transfer_leaves_the_reservation_pending(remote, db_session, override_projects_root):
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    remote.set_modes("copy-fails")
+    assert _run(db_session)["status"] == "failed"
+    row = _rows(db_session)[(img.id, "capture")]
+    assert row.object_key == f"{TENANT}/{STEM}/captures/f1.jpg"
+    assert (row.uploaded_at, row.verified_at, row.refused_at) == (None, None, None)
+
+    remote.set_modes()
+    assert _run(db_session)["uploaded"] == 1
+    assert _rows(db_session)[(img.id, "capture")].object_key == f"{TENANT}/{STEM}/captures/f1.jpg"
+
+
+@pytest.mark.unit
+def test_no_key_is_reserved_for_a_record_that_moved_after_its_file_was_staged(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    real = iu.stable_digests
+    done = []
+
+    def digest_then_move(path):
+        out = real(path)
+        if not done:
+            done.append(1)
+            db_session.query(Record).filter(Record.id == img.record_id).update({"collection_id": other.id})
+            db_session.commit()
+        return out
+
+    monkeypatch.setattr(iu, "stable_digests", digest_then_move)
+    result = _run(db_session)
+    assert result["skipped"][0]["reason"] == "image changed while it was read"
+    assert _rows(db_session) == {} and remote.calls("copyto") == []

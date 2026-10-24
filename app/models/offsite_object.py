@@ -18,8 +18,12 @@ States, all derived from the columns:
   another SHA1 (`remote_sha1`). `fixity`: the file's sha256 is not the one
   its capture record holds. Nothing is uploaded, and the uploader does not
   retry it.
-- pending: neither. `uploaded_at` set means the copy command succeeded and
-  no listing has yet confirmed it.
+- pending: neither. With no `uploaded_at`, the key is reserved: the row is
+  committed before the copy starts (app.core.image_upload._claim), so the
+  key is frozen and the record kept in its volume whatever happens to the
+  copy. `uploaded_at` set means the copy command succeeded and no listing
+  has yet confirmed it. A pending row is never deleted; the next run lists
+  its key and verifies the object or copies it again to the same key.
 
 An adopted object (app.core.image_upload.adopt_objects) has `verified_at`
 and no `uploaded_at`: this unit's uploader never sent it.

@@ -524,6 +524,7 @@ class _Read:
     capture_id: Optional[str]
     stem: str                 # the volume's stem, as read under the hold
     digests: Optional[tuple]  # (sha1, sha256), or None when the file changed while read
+    state: tuple = ()         # _image_state as read under the hold
 
 
 def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
@@ -581,7 +582,38 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
         result.skipped.append({"image_id": item.image_id, "kind": item.kind,
                                "reason": "files of the volume being changed"})
         return None
-    return _Read(staged, path, first.capture_id, first.filename_stem, stable_digests(staged.path))
+    return _Read(staged, path, first.capture_id, first.filename_stem, stable_digests(staged.path), first)
+
+
+class _ImageMoved(Exception):
+    """The image's row no longer says what it said when its file was staged."""
+
+
+def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
+    """Write the object's row; a new row only while the record is where its file was staged.
+
+    A new row freezes `key` and, from its commit on, keeps the record in its
+    volume (records_stored_offsite). It is written under the record's row
+    lock, the lock both move paths take before their own check
+    (records.update_record, collections.move_collection_records), with the
+    image's row read again under it: either the move committed first, and
+    the row here differs from `state` and nothing is written, or this commit
+    comes first and the move then finds the row and answers 409. Only the
+    record's row is locked, so the order is record before volume, as on every
+    path that takes both. An existing row is updated without the lock: its
+    record is already held in place by it.
+    """
+    if row is not None:
+        return _save(db, row, item.image_id, item.kind, key, **fields)
+    from app.models.record import Record, RecordImage
+
+    record_id = db.query(RecordImage.record_id).filter(RecordImage.id == item.image_id).scalar()
+    if record_id is not None:
+        db.query(Record.id).filter(Record.id == record_id).with_for_update().one_or_none()
+    if record_id is None or _image_state(db, item.image_id) != state:
+        db.rollback()
+        raise _ImageMoved()
+    return _save(db, row, item.image_id, item.kind, key, **fields)
 
 
 def _fixity_index(result: RunResult, *, fresh: bool = False):
@@ -598,9 +630,10 @@ def _fixity_index(result: RunResult, *, fresh: bool = False):
 
 
 def _refuse(db: Session, row, item: Work, key: str, result: RunResult, *, reason: str,
-            local_sha1: str, remote_sha1: Optional[str] = None, detail: dict) -> None:
-    _save(db, row, item.image_id, item.kind, key, local_sha1=local_sha1,
-          remote_sha1=remote_sha1, refused_at=_now(), refusal=reason)
+            local_sha1: str, remote_sha1: Optional[str] = None, detail: dict,
+            state: tuple) -> None:
+    _claim(db, row, item, key, state, local_sha1=local_sha1,
+           remote_sha1=remote_sha1, refused_at=_now(), refusal=reason)
     refusal = {"image_id": item.image_id, "kind": item.kind, "reason": reason, **detail}
     result.refused.append(refusal)
     text = "; ".join(f"{k} {v}" for k, v in detail.items())
@@ -619,93 +652,106 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
         return
     staged, path = read.staged, read.path
     try:
-        if read.digests is None:
-            result.skipped.append({"image_id": item.image_id, "kind": item.kind,
-                                   "reason": "file changed while it was read", "path": str(path)})
-            return
-        sha1, sha256 = read.digests
-
-        if row is not None:
-            key = row.object_key
-        elif item.kind == "capture":
-            key = capture_key(tenant, read.stem, path.name)
-        else:
-            key = preview_key(tenant, read.stem, path.name)
-
-        holder = _key_holder(db, key)
-        if holder is not None and row is None:
-            # Two images whose names on disk met (legacy names after record
-            # moves): the name is already another image's frozen key. This one
-            # goes beside it under a name that carries its own id; the listing
-            # check below still keeps it from overwriting anything there.
-            taken = key
-            key = disambiguated_key(key, item.image_id)
-            logger.warning("Image %s (%s): %s is image %s's key; using %s",
-                           item.image_id, item.kind, taken, holder.record_image_id, key)
-            holder = _key_holder(db, key)
-        if holder is not None and (row is None or holder.id != row.id):
-            result.conflicts.append({"image_id": item.image_id, "kind": item.kind, "key": key,
-                                     "held_by_image_id": holder.record_image_id})
-            logger.error("Image %s (%s): key %s is already recorded for image %s; not uploaded",
-                         item.image_id, item.kind, key, holder.record_image_id)
-            return
-
-        if item.kind == "capture":
-            expected = _fixity_index(result).expected(read.capture_id, item.image_id, path)
-            if expected is not None and expected != sha256:
-                # Refused only on the manifests as they stand now, never on
-                # the copy read at the start of the run.
-                expected = _fixity_index(result, fresh=True).expected(read.capture_id, item.image_id, path)
-            if expected is not None and expected != sha256:
-                _refuse(db, row, item, key, result, reason="fixity", local_sha1=sha1,
-                        detail={"local_path": str(path), "local_sha256": sha256,
-                                "capture_sha256": expected, "key": key})
-                return
-
-        # No transaction stays open on this session while rclone runs: the
-        # reads above began one, and a long copy must not hold it.
-        db.commit()
-        before = listed_object(key)
-        if before.present:
-            if before.sha1 is None:
-                logger.warning("%s is in the listing with no SHA1; not uploaded, not verified", key)
-                result.skipped.append({"image_id": item.image_id, "kind": item.kind,
-                                       "reason": "listed with no SHA1", "key": key})
-                return
-            if before.sha1 == sha1:
-                _save(db, row, item.image_id, item.kind, key, local_sha1=sha1, verified_at=_now())
-                result.already_present += 1
-                return
-            _refuse(db, row, item, key, result, reason="remote_differs", local_sha1=sha1,
-                    remote_sha1=before.sha1,
-                    detail={"local_path": str(path), "local_sha1": sha1,
-                            "key": key, "remote_sha1": before.sha1})
-            return
-
-        db.commit()
-        upload_file(staged.path, key)
-        row = _save(db, row, item.image_id, item.kind, key, local_sha1=sha1, uploaded_at=_now())
-
-        after = listed_object(key)
-        if after.present and after.sha1 == sha1:
-            _save(db, row, item.image_id, item.kind, key, verified_at=_now())
-            result.uploaded += 1
-            return
-        result.unverified += 1
-        if after.present and after.sha1 is None:
-            # rclone's B2 backend uploads a file above --b2-upload-cutoff
-            # (200 MiB by default) in parts, and the listing's SHA1 for such a
-            # file comes from its large_file_sha1 metadata. rclone sets that
-            # from a local source, but a part-uploaded object without it lists
-            # no SHA1, and without a SHA1 nothing is verified.
-            logger.warning("Uploaded %s, but its listing carries no SHA1; not verified", key)
-        elif after.present:
-            logger.warning("Uploaded %s, but the listing shows sha1 %s, not %s; not verified",
-                           key, after.sha1, sha1)
-        else:
-            logger.warning("Uploaded %s, but it is not in the listing; not verified", key)
+        _process_read(db, tenant, item, result, row, read)
+    except _ImageMoved:
+        result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                               "reason": "image changed while it was read"})
     finally:
         staged.release()
+
+
+def _process_read(db: Session, tenant: str, item: Work, result: RunResult, row, read: _Read) -> None:
+    """_process from the pinned bytes on. Raises _ImageMoved when a new row cannot be written."""
+    staged, path = read.staged, read.path
+    if read.digests is None:
+        result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                               "reason": "file changed while it was read", "path": str(path)})
+        return
+    sha1, sha256 = read.digests
+
+    if row is not None:
+        key = row.object_key
+    elif item.kind == "capture":
+        key = capture_key(tenant, read.stem, path.name)
+    else:
+        key = preview_key(tenant, read.stem, path.name)
+
+    holder = _key_holder(db, key)
+    if holder is not None and row is None:
+        # Two images whose names on disk met (legacy names after record
+        # moves): the name is already another image's frozen key. This one
+        # goes beside it under a name that carries its own id; the listing
+        # check below still keeps it from overwriting anything there.
+        taken = key
+        key = disambiguated_key(key, item.image_id)
+        logger.warning("Image %s (%s): %s is image %s's key; using %s",
+                       item.image_id, item.kind, taken, holder.record_image_id, key)
+        holder = _key_holder(db, key)
+    if holder is not None and (row is None or holder.id != row.id):
+        result.conflicts.append({"image_id": item.image_id, "kind": item.kind, "key": key,
+                                 "held_by_image_id": holder.record_image_id})
+        logger.error("Image %s (%s): key %s is already recorded for image %s; not uploaded",
+                     item.image_id, item.kind, key, holder.record_image_id)
+        return
+
+    if item.kind == "capture":
+        expected = _fixity_index(result).expected(read.capture_id, item.image_id, path)
+        if expected is not None and expected != sha256:
+            # Refused only on the manifests as they stand now, never on
+            # the copy read at the start of the run.
+            expected = _fixity_index(result, fresh=True).expected(read.capture_id, item.image_id, path)
+        if expected is not None and expected != sha256:
+            _refuse(db, row, item, key, result, reason="fixity", local_sha1=sha1,
+                    detail={"local_path": str(path), "local_sha256": sha256,
+                            "capture_sha256": expected, "key": key}, state=read.state)
+            return
+
+    # No transaction stays open on this session while rclone runs: the
+    # reads above began one, and a long copy must not hold it.
+    db.commit()
+    before = listed_object(key)
+    if before.present:
+        if before.sha1 is None:
+            logger.warning("%s is in the listing with no SHA1; not uploaded, not verified", key)
+            result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                                   "reason": "listed with no SHA1", "key": key})
+            return
+        if before.sha1 == sha1:
+            _claim(db, row, item, key, read.state, local_sha1=sha1, verified_at=_now())
+            result.already_present += 1
+            return
+        _refuse(db, row, item, key, result, reason="remote_differs", local_sha1=sha1,
+                remote_sha1=before.sha1,
+                detail={"local_path": str(path), "local_sha1": sha1,
+                        "key": key, "remote_sha1": before.sha1}, state=read.state)
+        return
+
+    # The key is reserved, as a committed pending row, before the transfer
+    # starts: a move during the copy finds it and is refused, and a crash
+    # after the copy leaves the key frozen for the next run's listing to
+    # verify. A failed copy leaves the row pending; it is never deleted.
+    row = _claim(db, row, item, key, read.state, local_sha1=sha1)
+    upload_file(staged.path, key)
+    row = _save(db, row, item.image_id, item.kind, key, local_sha1=sha1, uploaded_at=_now())
+
+    after = listed_object(key)
+    if after.present and after.sha1 == sha1:
+        _save(db, row, item.image_id, item.kind, key, verified_at=_now())
+        result.uploaded += 1
+        return
+    result.unverified += 1
+    if after.present and after.sha1 is None:
+        # rclone's B2 backend uploads a file above --b2-upload-cutoff
+        # (200 MiB by default) in parts, and the listing's SHA1 for such a
+        # file comes from its large_file_sha1 metadata. rclone sets that
+        # from a local source, but a part-uploaded object without it lists
+        # no SHA1, and without a SHA1 nothing is verified.
+        logger.warning("Uploaded %s, but its listing carries no SHA1; not verified", key)
+    elif after.present:
+        logger.warning("Uploaded %s, but the listing shows sha1 %s, not %s; not verified",
+                       key, after.sha1, sha1)
+    else:
+        logger.warning("Uploaded %s, but it is not in the listing; not verified", key)
 
 
 def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dict:
