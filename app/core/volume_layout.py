@@ -1082,13 +1082,13 @@ def _records_to_copy(root: Path, wanted: Dict[int, Tuple[Path, Set[str]]]) -> Di
     the source. A line the volume's manifest already holds is not copied
     again, so a replayed batch adds nothing.
     """
-    from app.core.integrity import _manifests, manifest_base
+    from app.core.integrity import _manifests, manifest_base, read_manifest_lines
 
     own = {cid: vol / "metadata" / "manifest.jsonl" for cid, (vol, _) in wanted.items()}
     present: Dict[int, Set[str]] = {}
     for cid, path in own.items():
         try:
-            present[cid] = set(path.read_text(encoding="utf-8").splitlines()) if path.exists() else set()
+            present[cid] = set(read_manifest_lines(path)[0]) if path.exists() else set()
         except OSError as e:
             raise VolumeLayoutError(f"The manifest {path} is unreadable: {e}") from e
     by_capture: Dict[str, List[int]] = {}
@@ -1102,7 +1102,7 @@ def _records_to_copy(root: Path, wanted: Dict[int, Tuple[Path, Set[str]]]) -> Di
         resolved = manifest.resolve()
         base = manifest_base(manifest, root)
         try:
-            lines = manifest.read_text(encoding="utf-8").splitlines()
+            lines, _ = read_manifest_lines(manifest)
         except OSError as e:
             logger.warning(f"Volume layout: could not read {manifest} to copy volumes' records: {e}")
             continue
@@ -1412,6 +1412,7 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
     skips the pass (a walk of the tree for the manifests' paths and a stat
     of each remain) and still reports them.
     """
+    from app.core.integrity import read_manifest_lines
     from capture.manifestHandler import append_manifest_lines
 
     rows = (db.query(Collection.id, Collection.filename_stem, RecordImage.capture_id, RecordImage.file_path)
@@ -1437,7 +1438,7 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
         own = vol / "metadata" / "manifest.jsonl"
         have: Set[str] = set()
         try:
-            lines = own.read_text(encoding="utf-8").splitlines() if own.exists() else []
+            lines = read_manifest_lines(own)[0] if own.exists() else []
         except OSError as e:
             logger.error(f"Volume layout: could not read {own} to check volume {cid}'s records: {e}")
             continue

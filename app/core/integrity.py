@@ -102,6 +102,25 @@ class FixityIndex:
         return expected
 
 
+def read_manifest_lines(path: Path) -> Tuple[List[str], int]:
+    """A manifest's lines, decoded one by one, and how many could not be decoded.
+
+    The file is split on newline bytes and each line decoded as UTF-8 on
+    its own, so a line a power cut cut inside a multibyte character (copies
+    are written with ensure_ascii=False) is skipped, and counted, while the
+    lines around it are read. Lines are returned without their newline.
+    Raises OSError when the file cannot be read.
+    """
+    lines: List[str] = []
+    undecodable = 0
+    for raw in path.read_bytes().split(b"\n"):
+        try:
+            lines.append(raw.decode("utf-8"))
+        except UnicodeDecodeError:
+            undecodable += 1
+    return lines, undecodable
+
+
 def build_fixity_index(projects_dir: Path) -> FixityIndex:
     """Index every metadata/manifest.jsonl under `projects_dir`: each project's, and each stemmed volume's.
 
@@ -137,11 +156,10 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     for manifest in _manifests(projects_dir):
         project_root = manifest_base(manifest, projects_dir)
         try:
-            lines = manifest.read_text(encoding="utf-8").splitlines()
+            lines, unparsed = read_manifest_lines(manifest)
         except OSError:
             continue
         chain: List[Tuple[str, str, str]] = []
-        unparsed = 0
         for line in lines:
             line = line.strip()
             if not line:
@@ -187,7 +205,8 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                 index.by_path.setdefault(cid, {})[abs_path] = sha
                 index.by_name.setdefault(cid, {})[Path(rel).name] = sha
         if unparsed:
-            logger.warning(f"Capture manifest {manifest}: skipped {unparsed} line(s) that are not JSON (torn writes)")
+            logger.warning(f"Capture manifest {manifest}: skipped {unparsed} line(s) that are not JSON or not "
+                           "UTF-8 (torn writes)")
         if chain:
             chains.append(chain)
 
@@ -260,7 +279,7 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
     copies: List[Tuple[str, str]] = []
     for manifest in sorted(_manifests(projects_dir)):
         try:
-            lines = manifest.read_text(encoding="utf-8").splitlines()
+            lines, _ = read_manifest_lines(manifest)
         except OSError:
             continue
         for line in lines:
