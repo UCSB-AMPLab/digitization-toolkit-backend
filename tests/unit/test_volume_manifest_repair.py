@@ -176,3 +176,73 @@ def test_the_check_on_a_rionegro_sized_unit(db_session, capture_settings, data_d
     assert report["manifests_repaired"] == {}
     assert reads == []  # nothing missing, so no manifest but the volumes' own is read
     assert elapsed < 2
+
+
+# ---------------------------------------------------------------------------
+# A capture id no manifest holds: one full pass, then only while something changes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_capture_id_no_manifest_holds_does_not_rescan_every_manifest_at_every_start(db_session, legacy, monkeypatch):
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    vl.migrate_volume_layout(db_session)
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "client-sent-id"  # an upload whose client sent a capture id
+    db_session.commit()
+    calls = {"n": 0}
+    real = vl._records_to_copy
+
+    def counted(*a, **k):
+        calls["n"] += 1
+        return real(*a, **k)
+
+    monkeypatch.setattr(vl, "_records_to_copy", counted)
+    reports = [vl.migrate_volume_layout(db_session) for _ in range(3)]
+    assert calls["n"] <= 1
+    assert all(r["captures_without_record"] == {legacy["a2"].id: ["client-sent-id"]} for r in reports)
+
+
+@pytest.mark.unit
+def test_a_manifest_that_changes_brings_the_full_pass_back(db_session, legacy, monkeypatch):
+    """Once a record for the missing id is written somewhere, the next start finds and copies it."""
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    _capture_records(db_session, legacy)
+    vl.migrate_volume_layout(db_session)
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    img.capture_id = "cap-late"
+    db_session.commit()
+    assert vl.migrate_volume_layout(db_session)["captures_without_record"] == {legacy["a2"].id: ["cap-late"]}
+    with open(legacy["root"] / "proj" / "metadata" / "manifest.jsonl", "a") as m:
+        m.write(json.dumps({"capture_id": "cap-late", "files": [
+            {"relative_path": "fondo_a/images/main/IMG_0002.jpg", "sha256": "0" * 64}]}) + "\n")
+
+    report = vl.migrate_volume_layout(db_session)
+
+    assert report["captures_without_record"] == {}
+    assert "cap-late" in _ids(_own(legacy, "a2"))
+
+
+@pytest.mark.unit
+def test_the_memo_lives_in_the_data_directory_and_goes_when_nothing_is_missing(db_session, legacy, data_dir):
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    _capture_records(db_session, legacy)
+    vl.migrate_volume_layout(db_session)
+    img = db_session.get(RecordImage, legacy["i2"].id)
+    real = img.capture_id
+    img.capture_id = "cap-nowhere"
+    db_session.commit()
+    vl.migrate_volume_layout(db_session)
+    memo = data_dir / vl.MISSING_RECORDS_NAME
+    assert json.loads(memo.read_text())["missing"] == {str(legacy["a2"].id): ["cap-nowhere"]}
+    assert not any(legacy["root"].rglob(vl.MISSING_RECORDS_NAME))
+
+    img.capture_id = real
+    db_session.commit()
+    vl.migrate_volume_layout(db_session)
+    assert not memo.exists()

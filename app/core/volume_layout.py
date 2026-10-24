@@ -131,6 +131,7 @@ logger = logging.getLogger(__name__)
 
 JOURNAL_NAME = "volume-layout.journal"
 SIDECARS_NAME = "volume-layout.sidecars"
+MISSING_RECORDS_NAME = "volume-layout.missing-records"
 JOURNAL_VERSION = 2
 
 # A project directory's own subdirectories; never a volume's directory.
@@ -1337,7 +1338,12 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
     of the stemmed volumes, a string comparison per row, and reading and
     parsing each stemmed volume's own manifest once; no other manifest is
     read. When something is missing, every manifest is read once more in
-    one pass, whatever the number of volumes concerned.
+    one pass, whatever the number of volumes concerned. The capture ids that
+    pass finds in no manifest are kept, with each manifest's path, size and
+    modification time, in `volume-layout.missing-records` in the data
+    directory; a later start whose missing ids and manifests are the same
+    skips the pass (a walk of the tree for the manifests' paths and a stat
+    of each remain) and still reports them.
     """
     from capture.manifestHandler import append_manifest_lines
 
@@ -1379,6 +1385,21 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
         if missing:
             wanted[cid] = (vol, missing)
     if not wanted:
+        _write_missing_memo(None)
+        return
+    from app.core.integrity import _manifests
+
+    missing_now = {str(cid): sorted(ids) for cid, (_, ids) in wanted.items()}
+    memo = _read_missing_memo()
+    if memo is not None and memo.get("missing") == missing_now \
+            and memo.get("fingerprint") == _manifest_fingerprint(_manifests(root)):
+        # The same capture ids were found in no manifest by the last full
+        # pass, and no manifest has changed since, so a pass would find
+        # nothing either.
+        for cid, (_, ids) in wanted.items():
+            logger.warning(f"Volume layout: no manifest holds a capture record for capture(s) {sorted(ids)} "
+                           f"of volume {cid} (no manifest changed since the last full search)")
+            report["captures_without_record"][cid] = sorted(ids)
         return
     copies = _records_to_copy(root, wanted)
     for cid, (vol, missing) in wanted.items():
@@ -1403,6 +1424,50 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
                 continue
             logger.warning(f"Volume layout: copied {len(copies[cid])} missing record(s) into volume {cid}'s manifest")
         report["manifests_repaired"][cid] = len(copies[cid])
+    if not dry_run:
+        nowhere = report["captures_without_record"]
+        _write_missing_memo({
+            "version": 1,
+            "missing": {str(cid): ids for cid, ids in sorted(nowhere.items())},
+            # Taken after the copies above, so they do not count as a change.
+            "fingerprint": _manifest_fingerprint(_manifests(root)),
+        } if nowhere else None)
+
+
+def _missing_memo_file() -> Path:
+    return config.settings.data_dir / MISSING_RECORDS_NAME
+
+
+def _manifest_fingerprint(manifests) -> List[list]:
+    """Each manifest's path, size and modification time in nanoseconds, sorted by path."""
+    out = []
+    for m in sorted(manifests):
+        try:
+            st = m.stat()
+        except OSError:
+            continue
+        out.append([str(m), st.st_size, st.st_mtime_ns])
+    return out
+
+
+def _read_missing_memo() -> Optional[dict]:
+    """The last full search's capture ids found in no manifest, with the manifests' fingerprint; None if absent or unreadable."""
+    try:
+        return _read_json(_missing_memo_file(), "missing-records memo")
+    except VolumeLayoutError as e:
+        logger.warning(f"Volume layout: {e}; searching every manifest again")
+        return None
+
+
+def _write_missing_memo(payload: Optional[dict]) -> None:
+    """Store the memo in the data directory (beside the journal), or remove it when nothing is missing."""
+    try:
+        if payload is None:
+            _missing_memo_file().unlink(missing_ok=True)
+        else:
+            _write_json(_missing_memo_file(), payload)
+    except OSError as e:
+        logger.warning(f"Volume layout: could not store {_missing_memo_file()}: {e}")
 
 
 def _log_report(report: dict) -> None:
