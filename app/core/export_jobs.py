@@ -109,10 +109,18 @@ class ExportJobRegistry:
         (app.core.image_upload): raises FilesChanging when a request holds any
         of the collections for file changes; otherwise, until the block exits,
         hold_for_file_changes refuses them with a 409. The check and the hold
-        are taken under the one lock, so a renumber, a move or a delete either
-        finished before the read began or starts after it ends. Meant for a
-        short span (the upload holds it to re-read a row and make a hard link),
-        since a request refused here is the operator's to retry.
+        are taken under the one lock, so a move of the collection's records,
+        a rename of its files, a move of it to another project, a re-parent
+        of it, a record delete, a current image's delete, and a free or a
+        restore either finished before the read began or start after it ends.
+        A renumber, a single-record PATCH and add_record_to_project take no
+        hold: they rewrite rows and touch no file. Neither does the delete of
+        a superseded image, nor a rename of another project whose tree still
+        holds files of a record moved into this collection. The upload's
+        re-reads catch both, and image_upload._claim catches both before a
+        first offsite row is written. Meant for a short span (the upload
+        holds it to re-read a row and make a hard link), since a request
+        refused here is the operator's to retry.
         """
         ids = set(collection_ids)
         with self._lock:

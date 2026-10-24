@@ -46,10 +46,12 @@ has committed, and capture writes each file whole before that commit
 while it is hashed is skipped for this run.
 
 Each file is uploaded from a hard link made in a staging directory under the
-projects root, so a renumber that renames the file during the upload cannot
-change which bytes are sent. Where a hard link cannot be made (a file system
-without hard links), a copy is made there instead, and removed after the
-upload.
+projects root, so a move of the volume's records, a rename or a delete that
+removes or renames the file during the upload cannot change which bytes are
+sent: the read hold (_read_object) lasts only while the file is staged, not
+while it is uploaded. A renumber renames nothing. Where a hard link cannot
+be made (a file system without hard links), a copy is made there instead,
+and removed after the upload.
 """
 
 import argparse
@@ -530,13 +532,41 @@ class _Read:
 def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     """Pin the bytes of the file the image's row names, or None (reported) when that cannot be done.
 
-    Under export_jobs.hold_for_reading, which a renumber, a record move, a
-    rename or a delete cannot overlap (they take hold_for_file_changes): the
-    row is re-read, the file is staged as a hard link, and the row is read a
-    third time and must name the same file. Where no hard link can be made,
-    the file is copied into the staging directory instead, still under the
-    hold. From then on the staged file holds this image's bytes whatever
-    happens to its name, and it is what is hashed and uploaded.
+    Under export_jobs.hold_for_reading, which these cannot overlap, since
+    each takes hold_for_file_changes on the volume: a move of its records
+    (move-records); a rename of its project, a move of it to another project
+    (move-collections), or a rename, re-parent or un-nesting of it or of a
+    volume above it, while its files are in the name-based layout; a record
+    delete; the delete of a current image; and a free or a restore.
+
+    Some changes are not excluded by the hold:
+
+    * A single-record move (PATCH /records/{id}), add_record_to_project and
+      a renumber take no hold. The PATCH and add_record rewrite the record's
+      parent (and the PATCH its sequence), a renumber rewrites sequences,
+      and none touches a file, so the path the row names still holds the
+      same bytes.
+    * The delete of a superseded image takes no hold (records.py, the image
+      delete route).
+    * A rename of another project, when a record moved into this volume by
+      PATCH still has its files in that project's name-based tree: that
+      rename holds that project's volumes, not this one.
+
+    When the image has no offsite row yet, each of these is caught by the
+    re-reads below and by _claim, which locks the record and compares the
+    image's row, path, volume and stem included, with what was read here
+    before it writes a first offsite row: a row that is gone or differs
+    writes nothing. When a row exists (a pending row left by a failed copy),
+    _claim updates it without comparing. An image deleted after the third
+    read then has its upload completed and recorded on a row whose
+    record_image_id is NULL (the foreign key is ON DELETE SET NULL).
+
+    Under the hold the row is re-read, the
+    file is staged as a hard link, and the row is read a third time and must
+    name the same file. Where no hard link can be made, the file is copied
+    into the staging directory instead, still under the hold. From then on
+    the staged file holds this image's bytes whatever happens to its name,
+    and it is what is hashed and uploaded.
     """
     from app.core.export_jobs import FilesChanging, export_jobs
 
@@ -594,8 +624,9 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
 
     A new row freezes `key` and, from its commit on, keeps the record in its
     volume (records_stored_offsite). It is written under the record's row
-    lock, the lock both move paths take before their own check
-    (records.update_record, collections.move_collection_records), with the
+    lock, the lock every path that changes a record's volume takes before
+    its own check (records.update_record, collections.move_collection_records,
+    projects.add_record_to_project), with the
     image's row read again under it: either the move committed first, and
     the row here differs from `state` and nothing is written, or this commit
     comes first and the move then finds the row and answers 409. Only the
@@ -619,8 +650,7 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
 def _fixity_index(result: RunResult, *, fresh: bool = False):
     """The capture-time sha256 index, built once per run and only when a run reaches a capture.
 
-    `fresh` rebuilds it: a renumber or a move during the run appends
-    relocation records the run's copy does not have.
+    `fresh` rebuilds it: a move during the run appends relocation records the run's copy does not have.
     """
     if result.fixity is None or fresh:
         from app.core.integrity import build_fixity_index
@@ -860,8 +890,8 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
             continue  # has a key already: an upload in progress, or refused
         # This command runs in a process of its own, outside the backend's
         # read hold, so the file is identified by its inode on both sides of
-        # the hash and the row must still name it afterwards: a renumber or a
-        # move in between makes the digest someone else's.
+        # the hash and the row must still name it afterwards: a move, a rename
+        # or a delete in between makes the digest someone else's.
         state = _image_state(db, item.image_id)
         path = local_file(item.kind, state.file_path) if state else None
         if path is None or not path.is_file():
@@ -929,6 +959,80 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 # ---------------------------------------------------------------------------
 # Records whose files are stored offsite
 # ---------------------------------------------------------------------------
+
+def _offsite_keys(db: Session, record_id: int) -> list:
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    return [k for (k,) in (db.query(OffsiteObject.object_key)
+                           .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+                           .filter(RecordImage.record_id == record_id).all())]
+
+
+def offsite_keys_under_volume(db: Session, record_id: int, stem: Optional[str]) -> bool:
+    """Whether every offsite_objects key of the record's images lies under `<tenant>/<stem>/`.
+
+    The way back into a volume for a record that is outside every volume
+    with files offsite: its keys then name that volume again. The way back
+    leads wherever the keys are: keys all under another volume's stem lead
+    into that volume, not the one the record last left, and keys split
+    across two or more stems lead into no volume. Keys lead into a volume
+    only under the configured tenant; keys under any other prefix (adopted
+    keys, or keys under an earlier tenant) lead into no volume. False when
+    the volume has no stem, the tenant is unset or not a tenant prefix, or
+    the record has no offsite row at all (it needs no way back).
+    """
+    tenant = configured_tenant_or_none()
+    if not stem or tenant is None:
+        return False
+    keys = _offsite_keys(db, record_id)
+    return bool(keys) and all(_key_stem(k, tenant) == stem for k in keys)
+
+
+def _key_stem(key: str, tenant: str) -> Optional[str]:
+    """The stem of a key of the form `<tenant>/<stem>/<rest>`, or None for any other key."""
+    head = f"{tenant}/"
+    if not key.startswith(head):
+        return None
+    stem, sep, rest = key[len(head):].partition("/")
+    return stem if stem and sep and rest else None
+
+
+def stranded_offsite_message(db: Session, record_id: int) -> str:
+    """The 409 detail for a record outside every volume refused the way back.
+
+    Only a key under the configured tenant, `<tenant>/<stem>/...`, names a
+    volume of this unit. With every key under one stem, the detail names it;
+    under several, it names them all and says the record can be put into no
+    volume. A key under any other prefix (an adopted key, or one under an
+    earlier tenant) or without a stem segment names no volume, and nor can
+    any key be matched while no valid tenant is configured; the detail then
+    says so, in the second case naming DTK_OFFSITE_TENANT.
+    """
+    tenant = configured_tenant_or_none()
+    if tenant is None:
+        return ("This record's files are stored offsite, and no valid DTK_OFFSITE_TENANT is set, "
+                "so their keys cannot be matched to any volume of this unit. It can be put into a "
+                "volume only once DTK_OFFSITE_TENANT is set, and then only into the volume its keys are under.")
+    stems = [_key_stem(k, tenant) for k in _offsite_keys(db, record_id)]
+    if not stems or None in stems:
+        return ("This record's files are stored offsite under keys that name no volume of this unit, "
+                "so it can be put into no volume.")
+    names = sorted(set(stems))
+    if len(names) == 1:
+        return (f"This record's files are stored offsite under the volume stem {names[0]}, "
+                "so it can be put only into the volume with that stem.")
+    return ("This record's files are stored offsite under more than one volume stem "
+            f"({', '.join(names)}), so it can be put into no volume.")
+
+
+def configured_tenant_or_none() -> Optional[str]:
+    """configured_tenant, with None for a value that is not a tenant prefix."""
+    try:
+        return configured_tenant()
+    except ImageUploadMisconfigured:
+        return None
+
 
 STORED_OFFSITE_MESSAGE = (
     "This record's files are already stored offsite under this volume, "

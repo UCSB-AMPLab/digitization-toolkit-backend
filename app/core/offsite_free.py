@@ -22,11 +22,23 @@ The rules:
   reported. A listing that does not answer (VerificationUnavailable) frees
   nothing.
 * **Only a volume wholly in `<stem>/`.** A volume with any image still in
-  the name-based layout is refused: a project or volume rename moves such
-  files under a hold that does not exclude this one, while nothing running
-  moves a file in `<stem>/` (see _require_own_folder).
-* **Under hold_for_file_changes**, so no export, record move, renumber or
-  offsite read of the volume runs meanwhile. No database transaction stays
+  the name-based layout is refused: a project rename, a move to another
+  project, or a volume rename or re-parent moves such files under a hold
+  that does not exclude this one, while nothing running
+  moves a file in `<stem>/` (see _require_own_folder). A record outside
+  every volume can still come back into this one after that check (PATCH
+  /records/{id}, when its keys are under this stem) with its files in a
+  project's tree, so each object whose image is in the name-based layout is
+  refused again when the work list is read, as `outside_own_folder`.
+* **Under hold_for_file_changes**, so no export or offsite read of the
+  volume runs meanwhile. The hold does not exclude another holder. A record
+  with a verified offsite row cannot be moved out of the volume
+  (records_stored_offsite). A record or image delete can run during the
+  free; such an object is reported as `changed` (_set_freed, and the unlink
+  check after it). A record that comes in after _require_own_folder either
+  has no verified row, and so is not in the work list, or comes back from
+  outside every volume, and is refused if its image is in the name-based
+  layout. A renumber changes sequence only. No database transaction stays
   open across a listing, a hash or a copy.
 * **The row first, then the file.** A file's freed state is committed under
   its record's row lock, conditional on the row still naming that path, and
@@ -75,6 +87,7 @@ from sqlalchemy.orm import Session
 from app.core import config
 from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1, transfer_lock
 from app.core.paths import METADATA_DIR
+from app.core.storage_override import StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -191,6 +204,7 @@ class _Object:
     sha1: str               # the offsite row's local_sha1
     freed_bytes: Optional[int] = None
     capture_id: Optional[str] = None
+    old_layout: bool = False  # storage_ops.image_in_old_layout, as read with the row
 
     def entry(self, **extra) -> dict:
         return {"image_id": self.image_id, "kind": self.kind,
@@ -198,10 +212,22 @@ class _Object:
 
 
 def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
-    """The volume's objects with a verified offsite row, freed or not, in image then kind order."""
+    """The volume's objects with a verified offsite row, freed or not, in image then kind order.
+
+    Each is marked when its image is in the name-based layout. The volume was
+    checked wholly in `<stem>/` a moment before (_require_own_folder), but a
+    record outside every volume may come back into it in between (PATCH
+    /records/{id}, when its keys are under this stem) with its files still
+    in a project's tree, which a rename moves under no hold this one
+    excludes. Freeing refuses such an object (_layout_refusal).
+    """
     from app.core.image_upload import local_file
+    from app.core.storage_ops import image_in_old_layout
+    from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
+
+    collection = db.get(Collection, collection_id)
 
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,
                      RecordImage.master_freed_at, RecordImage.master_freed_bytes,
@@ -213,6 +239,10 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
             .filter(Record.collection_id == collection_id, OffsiteObject.verified_at.isnot(None))
             .order_by(RecordImage.id, OffsiteObject.kind)
             .all())
+    # Before the commit, which expires `collection`: read after it, the row
+    # would be loaded again in a transaction left open through the hashing,
+    # the listing and the copies that follow.
+    old_layout = {fp: collection is None or image_in_old_layout(collection, fp) for (_, _, fp, *_) in rows}
     db.commit()
     out = []
     for (image_id, record_id, file_path, m_at, m_bytes, p_at, p_bytes, kind, key, sha1, capture_id) in rows:
@@ -220,8 +250,16 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
         if (at is not None) != freed:
             continue
         out.append(_Object(image_id, record_id, kind, file_path, local_file(kind, file_path), key, sha1, size,
-                           capture_id))
+                           capture_id,
+                           old_layout=old_layout[file_path]))
     return out
+
+
+def _layout_refusal(obj: _Object) -> Optional[dict]:
+    """An object whose image is in the name-based layout stays on the card (see _objects)."""
+    if obj.old_layout:
+        return obj.entry(reason="outside_own_folder")
+    return None
 
 
 @dataclass
@@ -503,7 +541,8 @@ def plan_free(db: Session, collection_id: int) -> dict:
     files, refused = [], []
     index = _fixity_index()
     for obj in objects:
-        refusal = _digest_refusal(obj, index) or _listing_refusal(obj, listed.get(obj.key))
+        refusal = (_layout_refusal(obj) or _digest_refusal(obj, index)
+                   or _listing_refusal(obj, listed.get(obj.key)))
         if refusal is None and (obj.path is None or not obj.path.is_file()):
             refusal = obj.entry(reason="local_file_missing")
         if refusal is not None:
@@ -547,7 +586,7 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
     refused, hashed = [], []
     index = _fixity_index()
     for obj in objects:
-        refusal = _digest_refusal(obj, index)
+        refusal = _layout_refusal(obj) or _digest_refusal(obj, index)
         if refusal is not None:
             refused.append(refusal)
             continue
@@ -846,16 +885,40 @@ class OffsiteJob:
                 "state": self.state, "result": self.result, "error": self.error}
 
 
+# How long a finished job stays readable. The job id is known only to the
+# page that started the job, which polls it until it ends, so a result is
+# normally read within one poll of its end; a day also covers a tab left
+# asleep overnight. Bounded by time, not by a count per volume, because a
+# count would keep every volume's last results for as long as the backend
+# runs, which no reader needs. A job dropped here answers 404, which the
+# page reports as a lost job.
+FINISHED_JOB_TTL = 24 * 3600
+
+
 class OffsiteJobRegistry:
-    """One free or restore per volume at a time, in this process (the appliance runs one)."""
+    """One free or restore per volume at a time, in this process (the appliance runs one).
+
+    Finished jobs are dropped FINISHED_JOB_TTL after they end, when the next
+    job is reserved; a queued or running job is never dropped.
+    """
 
     def __init__(self):
         self._lock = threading.Lock()
         self._jobs: dict = {}
         self._active: dict = {}
 
+    def _drop_expired(self) -> None:
+        """Drop the jobs that finished more than FINISHED_JOB_TTL ago. Called under the lock."""
+        cutoff = time.time() - FINISHED_JOB_TTL
+        for job_id in [j.id for j in self._jobs.values()
+                       if j.finished_at is not None and j.finished_at < cutoff]:
+            job = self._jobs.pop(job_id)
+            if self._active.get(job.collection_id) == job_id:
+                del self._active[job.collection_id]
+
     def reserve(self, collection_id: int, action: str) -> OffsiteJob:
         with self._lock:
+            self._drop_expired()
             active = self._jobs.get(self._active.get(collection_id))
             if active is not None and active.state in ("queued", "running"):
                 raise FreeRefused(JOB_RUNNING_MESSAGE, detail={"job_id": active.id})
@@ -884,6 +947,12 @@ class OffsiteJobRegistry:
                 job.state, job.error = "failed", f"{LISTING_MESSAGE} ({exc})"
             except FreeRefused as exc:
                 job.state, job.error = "failed", exc.message
+            except StorageUnavailableError as exc:
+                # The drive the projects root is on is gone or not writable
+                # (restore checks before each file it writes). Its message is
+                # the operator's; a traceback says nothing more.
+                job.state, job.error = "failed", str(exc)
+                logger.warning("Offsite %s job for volume %s stopped: %s", job.action, job.collection_id, exc)
             except Exception as exc:
                 job.state, job.error = "failed", str(exc)[:500]
                 logger.exception("Offsite %s job for volume %s failed", job.action, job.collection_id)

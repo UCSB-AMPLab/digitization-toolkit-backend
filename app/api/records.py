@@ -27,7 +27,7 @@ from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_sto
 from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
 from app.core.capture_naming import CaptureNameRefused, take_filename_index
-from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
@@ -338,11 +338,23 @@ def update_record(
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
 			# A record whose images are in the bucket stays in its volume:
-			# their keys are under the volume's stem and never change.
-			if rec.collection_id is not None and new_parent[1] != rec.collection_id:
-				from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
+			# their keys are under the volume's stem and never change. A
+			# record with such images that is outside every volume (one taken
+			# out before add_record checked this) may go back only into the
+			# volume all its keys are under, `<tenant>/<stem>/`.
+			if new_parent[1] != rec.collection_id:
+				from app.core.image_upload import (
+					STORED_OFFSITE_MESSAGE, offsite_keys_under_volume, records_stored_offsite,
+					stranded_offsite_message)
 				if records_stored_offsite(db, [rec.id]):
-					raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
+					if rec.collection_id is not None or new_parent[1] is None:
+						raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
+					# The volume's row is locked after the record's, as on every
+					# path that takes both, so its stem cannot change before the
+					# commit; next_sequences below takes the same row again.
+					target = locked_volume_query(db, new_parent[1]).first()
+					if target is None or not offsite_keys_under_volume(db, rec.id, target.filename_stem):
+						raise HTTPException(status_code=409, detail=stranded_offsite_message(db, rec.id))
 
 	# A record moved into another volume takes the sequence after the
 	# highest there, so no two records of that volume share one. The volume's
