@@ -500,3 +500,33 @@ def test_a_retake_of_a_freed_record_works_as_usual(remote, client, db_session, o
     new = (db_session.query(RecordImage)
            .filter(RecordImage.record_id == jpg.record_id, RecordImage.is_current.is_(True)).one())
     assert new.master_freed_at is None and new.preview_freed_at is None
+
+
+@pytest.mark.unit
+def test_restore_shares_the_uploads_transfer_lock_and_bandwidth_cap(read_remote, db_session, override_projects_root,
+                                                                    monkeypatch):
+    from app.core import config
+    from app.core.catalogue_backup import transfer_lock
+    from app.core.offsite_free import restore_volume
+
+    vol, _, _ = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    monkeypatch.setattr(config.settings, "OFFSITE_BWLIMIT", "123k")
+    before = len(read_remote.calls("copyto"))
+    done = {}
+
+    with transfer_lock:
+        worker = threading.Thread(target=lambda: done.setdefault(
+            "result", restore_volume(db_session, vol.id, actor="adm")))
+        worker.start()
+        time.sleep(1.0)
+        # Held by another transfer: the restore waits and copies nothing.
+        assert len(read_remote.calls("copyto")) == before
+        assert worker.is_alive()
+    worker.join(30)
+
+    assert done["result"]["restored"]["files"] == 3
+    copies = read_remote.calls("copyto")[before:]
+    assert len(copies) == 3
+    for call in copies:
+        assert call[call.index("--bwlimit") + 1] == "123k"

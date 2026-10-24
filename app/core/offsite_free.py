@@ -26,7 +26,8 @@ The rules:
   state again and is reported.
 
 Restore reads through a second rclone remote, OFFSITE_READ_REMOTE, whose key
-may read the tenant's prefix (the upload key cannot). Each freed object is
+may read the tenant's prefix (the upload key cannot), one object at a time
+under the upload's transfer_lock and bandwidth cap. Each freed object is
 copied to a staging file beside its final name, its SHA1 checked against
 the offsite row, and moved into place with os.replace, under the same hold.
 A file already at the path is never overwritten.
@@ -64,7 +65,7 @@ from fastapi import HTTPException
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1
+from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1, transfer_lock
 from app.core.paths import METADATA_DIR
 
 logger = logging.getLogger(__name__)
@@ -529,12 +530,16 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
 
     --inplace, so rclone writes `dest` itself rather than a `.partial` file
     of its own beside it: the staging name is the only name a killed copy
-    can leave.
+    can leave. Under the upload's transfer_lock and OFFSITE_BWLIMIT, so one
+    rclone transfer runs at a time and the unit's link carries the same
+    load whichever way the bytes go.
     """
-    argv = _rclone_argv("copyto", read_remote_path(key), str(dest), "--inplace")
+    argv = _rclone_argv("copyto", read_remote_path(key), str(dest), "--inplace",
+                        "--bwlimit", config.settings.OFFSITE_BWLIMIT)
     try:
-        result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-                                timeout=_COPY_TIMEOUT_SECONDS)
+        with transfer_lock:
+            result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                                    timeout=_COPY_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
         return f"the copy of {key} did not finish within {_COPY_TIMEOUT_SECONDS}s"
     except OSError as exc:
