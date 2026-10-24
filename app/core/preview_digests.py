@@ -28,9 +28,9 @@ that were hashed (or report a different SHA1 at the key).
 Every image of the volume, current or superseded, with a RAW master is
 considered. Reported, and not backfilled: a preview the manifests already
 give a digest for (`already_recorded`), one with no capture id
-(`no_capture_id`), one whose file has been freed (`freed`, from
-record_images.preview_freed_at where the column exists) or is otherwise not
-on disk (`missing`), one outside the volume's directory (`outside_volume`),
+(`no_capture_id`), one whose file has been freed (`freed`:
+record_images.preview_freed_at, set by app.core.offsite_free) or is
+otherwise not on disk (`missing`), one outside the volume's directory (`outside_volume`),
 one whose file changed while it was read (`unreadable`), one whose row is
 gone, has left the volume or names another file by the time it is read
 (`changed`), and one whose SHA1 differs from its offsite row
@@ -55,11 +55,6 @@ from sqlalchemy.orm import Session
 from app.core import config
 
 ACTION = "preview_digests_backfilled"
-
-
-def _preview_freed(image) -> bool:
-    """Whether the image's preview file has been freed. False where the column does not exist yet."""
-    return getattr(image, "preview_freed_at", None) is not None
 
 
 def _now() -> datetime:
@@ -130,7 +125,10 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
         if index.expected(state.capture_id, None, preview) is not None:
             report["already_recorded"] += 1
             continue
-        if _preview_freed(img):
+        # Read now, as the state is: freeing may have run since the listing.
+        freed_at = (db.query(RecordImage.preview_freed_at)
+                    .filter(RecordImage.id == img.id).scalar())
+        if freed_at is not None:
             report["freed"].append(entry)
             continue
         if not preview.is_file():

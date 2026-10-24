@@ -12,7 +12,6 @@ never rewritten.
 import json
 from datetime import datetime, timezone
 from pathlib import Path
-from types import SimpleNamespace
 
 import pytest
 
@@ -176,23 +175,46 @@ def test_an_uploaded_preview_whose_file_has_changed_is_reported_not_backfilled(v
 
 
 @pytest.mark.unit
-def test_a_freed_preview_is_reported(vol, db_session, monkeypatch):
-    import app.core.preview_digests as pd
+def test_a_freed_preview_is_reported(vol, db_session):
+    """record_images.preview_freed_at, set by freeing (app.core.offsite_free), as the row reads now."""
+    from sqlalchemy import text
 
     img, _ = vol.image()
+    image_id = img.id
     vol.preview_path(img).unlink()
-    monkeypatch.setattr(pd, "_preview_freed", lambda image: image.id == img.id)
+    db_session.execute(text("UPDATE record_images SET preview_freed_at = :t, preview_freed_bytes = 10 "
+                            "WHERE id = :id"), {"t": datetime.now(timezone.utc), "id": image_id})
+    db_session.commit()
     report = _backfill(db_session, apply=True)
-    assert [e["image_id"] for e in report["freed"]] == [img.id]
+    assert [e["image_id"] for e in report["freed"]] == [image_id]
     assert report["backfilled"] == [] and report["missing"] == []
 
 
 @pytest.mark.unit
-def test_the_freed_guard_reads_the_column_only_where_it_exists():
-    from app.core.preview_digests import _preview_freed
-    assert _preview_freed(SimpleNamespace()) is False
-    assert _preview_freed(SimpleNamespace(preview_freed_at=None)) is False
-    assert _preview_freed(SimpleNamespace(preview_freed_at=datetime.now(timezone.utc))) is True
+def test_a_preview_freed_before_its_state_is_read_is_reported_freed(vol, db_session, monkeypatch):
+    img, _ = vol.image()
+    image_id = img.id
+    vol.preview_path(img).unlink()
+    _change_before_the_state_read(
+        monkeypatch, db_session, image_id,
+        "UPDATE record_images SET preview_freed_at = '2026-10-24 00:00:00', preview_freed_bytes = 10 "
+        "WHERE id = :id")
+    report = _backfill(db_session, apply=True)
+    assert [e["image_id"] for e in report["freed"]] == [image_id]
+    assert report["missing"] == []
+
+
+@pytest.mark.unit
+def test_a_freed_master_with_its_preview_on_the_card_is_backfilled(vol, db_session):
+    from sqlalchemy import text
+
+    img, data = vol.image()
+    Path(img.file_path).unlink()
+    db_session.execute(text("UPDATE record_images SET master_freed_at = :t, master_freed_bytes = 10 "
+                            "WHERE id = :id"), {"t": datetime.now(timezone.utc), "id": img.id})
+    db_session.commit()
+    report = _backfill(db_session, apply=True)
+    assert [e["sha256"] for e in report["backfilled"]] == [_sha256(data)]
 
 
 @pytest.mark.unit
@@ -255,7 +277,7 @@ def test_the_command_line(vol, db_session, capsys):
 # ---------------------------------------------------------------------------
 
 def _change_before_the_state_read(monkeypatch, db, image_id, sql):
-    """Run `sql` on the image's row just before the backfill first reads its state."""
+    """Run `sql` on the image's row, on another connection, just before the backfill first reads its state."""
     from sqlalchemy import text
     import app.core.image_upload as iu
 
@@ -265,8 +287,10 @@ def _change_before_the_state_read(monkeypatch, db, image_id, sql):
     def change_then_read(session, iid):
         if iid == image_id and not done:
             done.append(iid)
-            db.execute(text(sql), {"id": image_id})
-            db.commit()
+            # On a connection of its own, as another process's write: the
+            # backfill's session is not expired, so its objects stay stale.
+            with db.get_bind().begin() as conn:
+                conn.execute(text(sql), {"id": image_id})
         return real(session, iid)
 
     monkeypatch.setattr(iu, "_image_state", change_then_read)
