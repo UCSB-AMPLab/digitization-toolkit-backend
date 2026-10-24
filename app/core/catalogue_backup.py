@@ -90,6 +90,12 @@ _DUMP_TIMEOUT_SECONDS = 15 * 60
 _UPLOAD_TIMEOUT_SECONDS = 60 * 60
 _LISTING_TIMEOUT_SECONDS = 120
 
+# One transfer at a time across the offsite path. OFFSITE_BWLIMIT is a cap for
+# the unit's link, and rclone applies --bwlimit per process: the catalogue dump
+# and an image upload running together would use twice the cap. Both take this
+# lock around their rclone transfer (app.core.image_upload does the same).
+transfer_lock = threading.Lock()
+
 
 class BackupError(Exception):
     """A run that failed and must be retried on the next tick."""
@@ -396,10 +402,11 @@ def upload(local: Path) -> None:
         config.settings.OFFSITE_BWLIMIT,
     )
     try:
-        result = subprocess.run(
-            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=_UPLOAD_TIMEOUT_SECONDS,
-        )
+        with transfer_lock:
+            result = subprocess.run(
+                argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+                timeout=_UPLOAD_TIMEOUT_SECONDS,
+            )
     except subprocess.TimeoutExpired as exc:
         # An upload that ran out of time is a failed upload, and the caller
         # promises not to raise anything but BackupError.
@@ -409,6 +416,64 @@ def upload(local: Path) -> None:
     if result.returncode != 0:
         stderr = (result.stderr or result.stdout or "").strip()
         raise BackupError(f"the upload failed (rc={result.returncode}): {stderr[:300]}")
+
+
+# rclone's documented exit code for "Directory not found".
+RCLONE_EXIT_DIRECTORY_NOT_FOUND = 3
+
+
+def lsjson_rows(path: str, *, recursive: bool = False,
+                absent_ok: bool = False) -> Optional[list]:
+    """The rows `rclone lsjson --hash --hash-type sha1` reports for `path`.
+
+    Raises VerificationUnavailable when the listing did not answer: a refused
+    call, a timeout, or output that is not JSON. With `absent_ok`, rclone's
+    "directory not found" exit returns None instead of raising; the caller
+    decides what that is evidence of, because on its own it is not evidence
+    that nothing is there (app.core.image_upload confirms it against the
+    parent's listing). Every other non-zero exit raises.
+
+    This is the one listing parser for the offsite path: the catalogue backup
+    and the image uploader both read checksums through it.
+    """
+    args = ["lsjson", "--hash", "--hash-type", "sha1"]
+    if recursive:
+        args += ["-R", "--files-only"]
+    argv = _rclone_argv(*args, path)
+    try:
+        result = subprocess.run(
+            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
+            timeout=_LISTING_TIMEOUT_SECONDS,
+        )
+    except subprocess.TimeoutExpired as exc:
+        raise VerificationUnavailable(
+            f"could not list {path.rstrip('/')} within "
+            f"{_LISTING_TIMEOUT_SECONDS}s"
+        ) from exc
+    if absent_ok and result.returncode == RCLONE_EXIT_DIRECTORY_NOT_FOUND:
+        return None
+    if result.returncode != 0:
+        stderr = (result.stderr or result.stdout or "").strip()
+        raise VerificationUnavailable(
+            f"could not list {path.rstrip('/')} (rc={result.returncode}): {stderr[:300]}"
+        )
+    try:
+        rows = json.loads(result.stdout)
+    except json.JSONDecodeError as exc:
+        raise VerificationUnavailable(
+            f"unreadable listing for {path.rstrip('/')}: {exc}"
+        ) from exc
+    if not isinstance(rows, list):
+        raise VerificationUnavailable(
+            f"unreadable listing for {path.rstrip('/')}: not a list"
+        )
+    return rows
+
+
+def row_sha1(row: dict) -> Optional[str]:
+    """The lowercase SHA1 a listing row carries, or None when it carries none."""
+    sha1 = (row.get("Hashes") or {}).get("sha1")
+    return sha1.lower() if sha1 else None
 
 
 def listing_sha1(name: str) -> Optional[str]:
@@ -421,35 +486,12 @@ def listing_sha1(name: str) -> Optional[str]:
     carries no checksum. All of those are silence, and silence about an object
     is not a report that the object is missing.
     """
-    argv = _rclone_argv(
-        "lsjson", "--hash", "--hash-type", "sha1", remote_dir() + "/",
-    )
-    try:
-        result = subprocess.run(
-            argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
-            timeout=_LISTING_TIMEOUT_SECONDS,
-        )
-    except subprocess.TimeoutExpired as exc:
-        raise VerificationUnavailable(
-            f"could not list {remote_dir()} within "
-            f"{_LISTING_TIMEOUT_SECONDS}s"
-        ) from exc
-    if result.returncode != 0:
-        stderr = (result.stderr or result.stdout or "").strip()
-        raise VerificationUnavailable(
-            f"could not list {remote_dir()} (rc={result.returncode}): {stderr[:300]}"
-        )
-    try:
-        rows = json.loads(result.stdout)
-    except json.JSONDecodeError as exc:
-        raise VerificationUnavailable(
-            f"unreadable listing for {remote_dir()}: {exc}"
-        ) from exc
+    rows = lsjson_rows(remote_dir() + "/")
     for row in rows:
         if row.get("IsDir"):
             continue
         if row.get("Name") == name:
-            sha1 = (row.get("Hashes") or {}).get("sha1")
+            sha1 = row_sha1(row)
             if not sha1:
                 # The object is there; it is the checksum that is missing. The
                 # same return value for this and for an absent name would turn
