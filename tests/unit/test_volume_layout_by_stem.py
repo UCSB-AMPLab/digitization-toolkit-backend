@@ -171,7 +171,8 @@ def test_a_capture_into_a_stemmed_volume_writes_its_files_and_manifest_in_the_st
     monkeypatch.setattr(service, "get_backend", lambda: _FakeBackend(raw))
 
     path, capture_id, _ = service.single_capture_image(
-        "P", mock_camera_config, check_camera=False, collection_name="Tomo 1", stem="xx-test-001")
+        "P", mock_camera_config, check_camera=False, collection_name="Tomo 1", stem="xx-test-001",
+        filename_index="xx-test-001-img_0001")
 
     vol = override_projects_root / "xx-test-001"
     master = Path(str(path))
@@ -197,7 +198,8 @@ def test_a_capture_into_a_volume_without_a_stem_keeps_the_name_based_layout(
     monkeypatch.setattr(service, "get_backend", lambda: _FakeBackend(raw=True))
 
     path, capture_id, _ = service.single_capture_image(
-        "P", mock_camera_config, check_camera=False, collection_name="Tomo 1")
+        "P", mock_camera_config, check_camera=False, collection_name="Tomo 1",
+        filename_index="tomo-1-img_0001")
 
     master = Path(str(path))
     assert master.parent == override_projects_root / "p" / "tomo_1" / "images" / "main"
@@ -216,7 +218,8 @@ def test_a_dual_capture_into_a_stemmed_volume_writes_one_record_in_the_volume_ma
     cam1 = dataclasses.replace(mock_camera_config, camera_index=1)
 
     p0, p1, capture_id, _ = service.dual_capture_image(
-        "P", mock_camera_config, cam1, check_camera=False, stagger_ms=0, stem="xx-test-001")
+        "P", mock_camera_config, cam1, check_camera=False, stagger_ms=0, stem="xx-test-001",
+        filename_index="xx-test-001-img_0001")
 
     vol = override_projects_root / "xx-test-001"
     assert {Path(str(p0)).parent, Path(str(p1)).parent} == {vol / "captures"}
@@ -1442,7 +1445,8 @@ def test_an_export_bag_after_the_migration_holds_the_moved_files_and_both_manife
     # A capture after the migration, into the volume's own layout and manifest.
     monkeypatch.setattr(service, "get_backend", lambda: _FakeBackend(raw=False))
     path, capture_id, _ = service.single_capture_image(
-        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a2"])
+        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a2"],
+        filename_index=f"{STEMS['a2']}-img_0001")
     rec = Record(title="new", collection_id=legacy["a2"].id, status="approved", capture_mode="single")
     db_session.add(rec)
     db_session.commit()
@@ -1501,7 +1505,8 @@ def test_a_mixed_layout_unit_passes_the_integrity_check(db_session, legacy, monk
     migrate_volume_layout(db_session)
     monkeypatch.setattr(service, "get_backend", lambda: _FakeBackend(raw=True))
     path, capture_id, _ = service.single_capture_image(
-        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a1"])
+        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a1"],
+        filename_index=f"{STEMS['a1']}-img_0001")
     rec = Record(title="new", collection_id=legacy["a1"].id, status="captured", capture_mode="single")
     db_session.add(rec)
     db_session.commit()

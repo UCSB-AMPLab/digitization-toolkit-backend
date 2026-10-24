@@ -51,13 +51,14 @@ def test_full_single_mode_reject_recapture_approve_flow(client, db_session):
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "rejected"
 
-    # Recapture: supersede the old image, add the replacement, flip back to in_review
-    # (exactly what cameras.py's trigger_capture does on a rejected record).
+    # Recapture: supersede the old image, add the replacement, and return the
+    # record to captured (what cameras.py's trigger_capture does on a rejected
+    # record).
     db_session.refresh(rec)
     _supersede_current_images(rec)
     new_img = RecordImage(record_id=rec.id, filename="a2.jpg", file_path="/tmp/a2.jpg", format="jpg", role="single")
     db_session.add(new_img)
-    rec.status = "in_review"
+    rec.status = "captured"
     db_session.commit()
 
     # Only the new image is "current".
@@ -74,10 +75,15 @@ def test_full_single_mode_reject_recapture_approve_flow(client, db_session):
     assert [i["id"] for i in rejections[0]["images"]] == [old_img.id]
     assert rejections[0]["images"][0]["is_current"] is False
 
-    # Back in in_review, so it can now be approved.
+    # Back in the operator's hands until she promotes it.
     resp = api.get(f"/records/{rec.id}")
-    assert resp.json()["status"] == "in_review"
+    assert resp.json()["status"] == "captured"
 
+    op = _client_as(client, "o", "operator")
+    resp = op.patch(f"/records/{rec.id}/status", json={"status": "in_review"})
+    assert resp.status_code == 200, resp.text
+
+    api = _client_as(client, "u", "reviewer")
     resp = api.patch(f"/records/{rec.id}/status", json={"status": "approved"})
     assert resp.status_code == 200, resp.text
     assert resp.json()["status"] == "approved"
@@ -118,7 +124,7 @@ def test_full_dual_mode_reject_recapture_flow(client, db_session):
     new_right = RecordImage(record_id=rec.id, filename="r2.jpg", file_path="/tmp/r2.jpg", format="jpg",
                              role="right", pair_id="p2")
     db_session.add_all([new_left, new_right])
-    rec.status = "in_review"
+    rec.status = "captured"
     db_session.commit()
 
     resp = api.get(f"/records/{rec.id}/images")

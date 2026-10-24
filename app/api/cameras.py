@@ -16,8 +16,8 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
-from app.core.capture_counter import next_capture_number
-from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
+from app.core.capture_naming import RESOLUTION_IN_FILENAME_DETAIL, CaptureNameRefused, take_filename_index
+from app.core.volume_stem import RETAKE_STATUS_DETAIL, RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -73,6 +73,19 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
 
+def _refuse_retake_out_of_the_operators_hands(retake_record: Optional[Record]) -> None:
+	"""409 for a retake of a record that is neither captured nor rejected.
+
+	A record in review or approved is a reviewer's: a capture with its
+	record_id would add a current image beside the one being reviewed, with
+	no supersede and no status change. Approved is also the only state
+	meaning something may already have left the appliance. Called after the
+	volume refusals, before any number is taken or camera touched.
+	"""
+	if retake_record is not None and retake_record.status not in ("captured", "rejected"):
+		raise HTTPException(status_code=409, detail=RETAKE_STATUS_DETAIL)
+
+
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
 	"""Authoritative (project_name, collection_name, stem) for the on-disk capture path.
 
@@ -93,6 +106,32 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 	if not project:
 		raise HTTPException(status_code=422, detail="project_name does not match a known project")
 	return project.name, None, None
+
+
+def _take_filename_index(db: Session, collection_id: int, stem: str, root) -> str:
+	"""The event's `<stem>-img_<nnnn>` (app.core.capture_naming.take_filename_index), or a 409.
+
+	Called once per capture event, after the refusals and before the
+	camera is touched. The volume's row is already locked by
+	_refuse_capture_without_volume_or_stem, so the counter's raise takes no
+	new lock. A refused name (longer than a pair id holds, or too many
+	numbers already on disk) is rolled back before the 409, so it consumes
+	no number; the rollback also releases the record and volume locks,
+	which the refused capture no longer needs.
+	"""
+	from capture.project_manager import image_output_dir
+
+	try:
+		return take_filename_index(db, collection_id, stem, image_output_dir("", None, stem, root))
+	except CaptureNameRefused as refused:
+		db.rollback()
+		raise HTTPException(status_code=409, detail=refused.detail)
+
+
+def _refuse_resolution_in_filename(include_resolution_in_filename: bool) -> None:
+	"""422 for a capture asking for its resolution in the file name, which would break the contract name."""
+	if include_resolution_in_filename:
+		raise HTTPException(status_code=422, detail=RESOLUTION_IN_FILENAME_DETAIL)
 
 
 class DeviceInfo(BaseModel):
@@ -134,7 +173,7 @@ class CaptureRequest(BaseModel):
 	project_name: str
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
-	include_resolution_in_filename: bool = False
+	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
 	# None (the default) leaves the registry's saved orientation from
 	# default_camera_config_from_registry in place; an explicit value,
@@ -154,7 +193,7 @@ class DualCaptureRequest(BaseModel):
 	"""Request body for dual capture endpoint."""
 	project_name: str
 	resolution: str = "medium"
-	include_resolution_in_filename: bool = False
+	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	stagger_ms: int = 20
 	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
 	# registry's saved orientation in place; an explicit value, including 0,
@@ -743,6 +782,7 @@ def trigger_capture(
 	# history row names as the old status. Lock order, the same on every
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
+	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -750,15 +790,16 @@ def trigger_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	_refuse_retake_out_of_the_operators_hands(retake_record)
 	# A retake is redone only in the mode the record was captured in.
-	if (retake_record is not None and retake_record.status in ("captured", "rejected")
-			and retake_record.capture_mode != "single"):
+	if retake_record is not None and retake_record.capture_mode != "single":
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
 		)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
+		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, IMG_SIZES
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
@@ -791,13 +832,21 @@ def trigger_capture(
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
+		# Read once: the number is checked against, and the image written
+		# under, the same root.
+		root = projects_root()
+		# One capture event: its number, in the transaction that writes its image.
+		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
 			collection_name=collection_name,
-			stem=stem
+			stem=stem,
+			filename_index=filename_index,
+			root=root
 		)
 		
 		# Extract image dimensions and EXIF data
@@ -833,37 +882,20 @@ def trigger_capture(
 
 		# Get or create Record
 		is_recapture = False
-		# A retake promotes only a rejected record, moving it into the review
-		# queue. A captured one stays in the operator's hands until she promotes
-		# its collection (NEH-260); without this flag every retake would promote
-		# the record it was meant to leave with her.
-		recapture_promotes = False
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
-			if record.status in ("captured", "rejected"):
-				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
-				# can redo a frame she can see is bad instead of waiting for a
-				# reviewer to reject it and pick one of six image faults). An
-				# approved record is deliberately not retakeable: approved is the
-				# only state meaning something may already have left the appliance,
-				# so the path is reviewer undoes, reviewer rejects, operator retakes.
-				#
-				# Either way the record can only be redone in the capture mode it was
-				# originally taken with — a single capture can't turn a dual-mode
-				# record's pair back into one image. That is checked at the top,
-				# before the camera is touched.
-				#
-				# record_id is the only signal this endpoint has, and it now means
-				# "retake" in the two states an operator can act in and "add an
-				# image to this record" in the two she cannot. No client uses the
-				# second: the frontend passes record_id only from its retake handler,
-				# and every folio is captured as its own record.
-				# Its capture mode was checked before the camera was touched.
-				is_recapture = True
-				recapture_promotes = record.status == "rejected"
-				from app.api.records import _supersede_current_images
-				_supersede_current_images(record)
+			# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
+			# can redo a frame she can see is bad instead of waiting for a
+			# reviewer to reject it and pick one of six image faults). A record
+			# in review or approved was refused at the top: approved is the only
+			# state meaning something may already have left the appliance, so
+			# the path is reviewer undoes, reviewer rejects, operator retakes.
+			# The record can only be redone in the capture mode it was taken
+			# with, also checked at the top, before the camera was touched.
+			is_recapture = True
+			from app.api.records import _supersede_current_images
+			_supersede_current_images(record)
 		else:
 			# Create new record for this capture
 			record = Record(
@@ -932,11 +964,11 @@ def trigger_capture(
 			)
 			db.add(ex)
 
-		if is_recapture and recapture_promotes:
-			change_record_status(db, record, "in_review", current_user.username)
-
-		# One capture event, counted in the transaction that writes its image.
-		next_capture_number(db, record.collection_id)
+		if is_recapture:
+			# A rejected record returns to captured, as through the
+			# prepare-for-retake transition, and reaches review again only
+			# when an operator promotes its volume; a captured one stays.
+			change_record_status(db, record, "captured", current_user.username)
 
 		db.commit()
 		db.refresh(record)
@@ -979,6 +1011,7 @@ def trigger_dual_capture(
 	# history row names as the old status. Lock order, the same on every
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
+	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -986,15 +1019,16 @@ def trigger_dual_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	_refuse_retake_out_of_the_operators_hands(retake_record)
 	# A retake is redone only in the mode the record was captured in.
-	if (retake_record is not None and retake_record.status in ("captured", "rejected")
-			and retake_record.capture_mode != "dual"):
+	if retake_record is not None and retake_record.capture_mode != "dual":
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
 		)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
+		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
@@ -1031,6 +1065,17 @@ def trigger_dual_capture(
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
+		# Read once (see trigger_capture).
+		root = projects_root()
+		# One capture event for the pair: one number, which both images carry
+		# and which is their pair id.
+		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+
+		# left_camera_index says which physical camera takes the left page;
+		# the manifest and the rows record the same roles.
+		role0 = "left" if request.left_camera_index == 0 else "right"
+		role1 = "right" if request.left_camera_index == 0 else "left"
+
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=project_name,
 			cam1_config=cam0_config,
@@ -1039,7 +1084,10 @@ def trigger_dual_capture(
 			include_resolution=request.include_resolution_in_filename,
 			stagger_ms=request.stagger_ms,
 			collection_name=collection_name,
-			stem=stem
+			stem=stem,
+			filename_index=filename_index,
+			root=root,
+			roles=[role0, role1]
 		)
 
 		# Reuse the resolved project name so the DB record matches the on-disk tree
@@ -1052,24 +1100,16 @@ def trigger_dual_capture(
 		
 		# Get or create Record
 		is_recapture = False
-		# A retake promotes only a rejected record, moving it into the review
-		# queue. A captured one stays in the operator's hands until she promotes
-		# its collection (NEH-260); without this flag every retake would promote
-		# the record it was meant to leave with her.
-		recapture_promotes = False
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
-			if record.status in ("captured", "rejected"):
-				# Retake, on the same terms as the single-capture endpoint above
-				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
-				# be redone as a pair, and can't turn a single-mode record into two
-				# images.
-				# Its capture mode was checked before the camera was touched.
-				is_recapture = True
-				recapture_promotes = record.status == "rejected"
-				from app.api.records import _supersede_current_images
-				_supersede_current_images(record)
+			# Retake, on the same terms as the single-capture endpoint above
+			# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
+			# be redone as a pair, and can't turn a single-mode record into two
+			# images; status and mode were checked before the camera was touched.
+			is_recapture = True
+			from app.api.records import _supersede_current_images
+			_supersede_current_images(record)
 		else:
 			# Create new record for this dual capture
 			record = Record(
@@ -1166,19 +1206,13 @@ def trigger_dual_capture(
 			
 			return img
 		
-		# Create RecordImages for both captures with appropriate roles
-		# left_camera_index controls which physical camera maps to the "left" page
-		role0 = "left" if request.left_camera_index == 0 else "right"
-		role1 = "right" if request.left_camera_index == 0 else "left"
+		# Create RecordImages for both captures with the roles computed above
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
 
-		if is_recapture and recapture_promotes:
-			change_record_status(db, record, "in_review", current_user.username)
-
-		# One capture event for the pair, counted in the transaction that
-		# writes both images.
-		next_capture_number(db, record.collection_id)
+		if is_recapture:
+			# As in trigger_capture: a rejected record returns to captured.
+			change_record_status(db, record, "captured", current_user.username)
 
 		db.commit()
 		db.refresh(record)

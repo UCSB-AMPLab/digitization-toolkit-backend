@@ -4,7 +4,6 @@ from typing import Iterable, List, Optional
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
-import uuid
 import logging
 
 from app.api.deps import get_db_dependency
@@ -25,7 +24,7 @@ from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
-from app.core.capture_counter import next_capture_number
+from app.core.capture_naming import CaptureNameRefused, take_filename_index
 from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
@@ -382,6 +381,19 @@ def delete_record(
 # RecordImage endpoints (individual captures/images)
 # ==============================================================================
 
+# The suffix an upload is stored under: the client's, lowercased, when it is
+# one of these, otherwise the usual one for the declared content type.
+_UPLOAD_SUFFIXES = {".jpg", ".jpeg", ".png", ".tif", ".tiff", ".webp"}
+_UPLOAD_DEFAULT_SUFFIX = {"image/jpeg": ".jpg", "image/png": ".png", "image/tiff": ".tif", "image/webp": ".webp"}
+
+
+def _upload_suffix(file: UploadFile) -> str:
+	suffix = Path(file.filename).suffix.lower() if file.filename else ""
+	if suffix in _UPLOAD_SUFFIXES:
+		return suffix
+	return _UPLOAD_DEFAULT_SUFFIX.get(file.content_type, ".jpg")
+
+
 @router.post("/{rec_id}/images", response_model=RecordImageRead)
 async def add_image_to_record(
 	rec_id: int,
@@ -422,24 +434,32 @@ async def add_image_to_record(
 	
 	# The record's volume has a stem (refused above otherwise), so the upload
 	# goes to `<stem>/captures/` and its thumbnail to `<stem>/thumbnails/`, as
-	# a capture does, under a uuid name.
+	# a capture does.
 	from capture.project_manager import ensure_volume_dirs
 	from app.core.paths import CAPTURES_DIR, THUMBNAILS_DIR
 
-	volume = ensure_volume_dirs(rec.collection.filename_stem)
-	uploads_dir = volume / CAPTURES_DIR
-	thumbnails_dir = volume / THUMBNAILS_DIR
-	
-	# Generate unique filename
-	ext = Path(file.filename).suffix if file.filename else ".jpg"
-	unique_filename = f"{uuid.uuid4().hex}{ext}"
-	file_path = uploads_dir / unique_filename
-	
 	max_bytes = settings.MAX_UPLOAD_BYTES
 	# Fast reject before writing anything if the declared size already exceeds the cap
 	declared_size = getattr(file, "size", None)
 	if declared_size is not None and declared_size > max_bytes:
 		raise HTTPException(status_code=413, detail=f"File too large. Maximum size is {max_bytes} bytes")
+
+	stem = rec.collection.filename_stem
+	volume = ensure_volume_dirs(stem)
+	uploads_dir = volume / CAPTURES_DIR
+	thumbnails_dir = volume / THUMBNAILS_DIR
+
+	# An upload is one capture event for the record's volume: it takes the
+	# next number, in the transaction that writes its image, and is named
+	# as a single capture is, `<stem>-img_<nnnn>_c0.<ext>` (contract 1.1,
+	# section 3), with the same refusals. The name the client sent is not kept.
+	try:
+		filename_index = take_filename_index(db, rec.collection_id, stem, uploads_dir)
+	except CaptureNameRefused as refused:
+		db.rollback()
+		raise HTTPException(status_code=409, detail=refused.detail)
+	stored_filename = f"{filename_index}_c0{_upload_suffix(file)}"
+	file_path = uploads_dir / stored_filename
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
@@ -452,7 +472,7 @@ async def add_image_to_record(
 		logger.exception(f"Failed to save uploaded file: {e}")
 		raise HTTPException(status_code=500, detail="Failed to save file")
 
-	file_format = ext.lstrip(".").lower()
+	file_format = file_path.suffix.lstrip(".")
 	
 	# Try to get image dimensions
 	resolution_width = None
@@ -474,7 +494,7 @@ async def add_image_to_record(
 	# Create RecordImage
 	img = RecordImage(
 		record_id=rec_id,
-		filename=file.filename or unique_filename,
+		filename=stored_filename,
 		file_path=str(file_path),
 		thumbnail_path=thumbnail_path,
 		file_size=file_size,
@@ -490,9 +510,6 @@ async def add_image_to_record(
 	
 	db.add(img)
 	try:
-		# An upload is one capture event for the record's volume, counted in
-		# the transaction that writes its image.
-		next_capture_number(db, rec.collection_id)
 		db.commit()
 	except Exception as e:
 		db.rollback()
@@ -1087,7 +1104,9 @@ def update_record_status(
 	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
 	A retake only happens via the capture endpoints in app/api/cameras.py: it
 	supersedes the current images, leaves a captured record captured, and
-	moves a rejected one to in_review. The undo transitions above are plain
+	returns a rejected one to captured, writing the same rejected > captured
+	history row as the prepare-for-retake transition. The record reaches
+	review again only when an operator promotes its volume. The undo transitions above are plain
 	status resets with no new image, no reason and no rejection record; the
 	change itself is dated in record_status_changes, like every other.
 	"""

@@ -7,7 +7,8 @@ endpoints and the image upload refuse, with a 409, a capture into no volume
 (a record attached straight to a project), carrying VOLUME_REQUIRED_DETAIL,
 and a capture into a volume without a stem, carrying STEM_REQUIRED_DETAIL.
 The capture endpoints also refuse a retake that names a volume other than
-its record's, carrying RETAKE_VOLUME_DETAIL.
+its record's, carrying RETAKE_VOLUME_DETAIL, and a retake of a record that
+is neither captured nor rejected, carrying RETAKE_STATUS_DETAIL.
 They refuse before any camera is triggered or any file is written. The
 interface matches each 409 on its exact text, so the texts do not change.
 """
@@ -21,6 +22,7 @@ from app.models.collection import Collection
 STEM_REQUIRED_DETAIL = "This volume has no file name stem. Give it one before capturing into it."
 VOLUME_REQUIRED_DETAIL = "Captures must go into a volume."
 RETAKE_VOLUME_DETAIL = "A retake must go into the record's own volume."
+RETAKE_STATUS_DETAIL = "Only a captured or rejected record can be retaken."
 
 
 def locked_volume_query(db: Session, collection_id: int):

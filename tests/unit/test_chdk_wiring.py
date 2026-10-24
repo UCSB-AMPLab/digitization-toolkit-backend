@@ -152,6 +152,7 @@ def test_a_dual_capture_logs_the_pairs_wall_time(monkeypatch, tmp_path, caplog):
             CameraConfig(camera_index=1),
             check_camera=False,
             stagger_ms=0,
+            filename_index="pairing-img_0001",
         )
 
     line = "\n".join(

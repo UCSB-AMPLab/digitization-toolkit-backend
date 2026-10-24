@@ -42,6 +42,8 @@ def test_dual_capture_image(override_projects_root, skip_if_single_camera):
         cam1_config=cam1,
         cam2_config=cam2,
         include_resolution=True,
+        stem="xx-test-cameras",
+        filename_index="xx-test-cameras-img_0001",
     )
 
     # Verify files were created
@@ -97,7 +99,9 @@ def test_capture_performance(override_projects_root, skip_if_single_camera):
     times = []
     for i in range(3):
         start = time.time()
-        path1, path2, capture_id, pair_id = dual_capture_image(project_name, cam1, cam2)
+        path1, path2, capture_id, pair_id = dual_capture_image(
+            project_name, cam1, cam2, stem="xx-test-perf",
+            filename_index=f"xx-test-perf-img_{i + 1:04d}")
         elapsed = time.time() - start
         times.append(elapsed)
 

@@ -69,7 +69,8 @@ def test_a_storage_switch_during_a_capture_keeps_the_record_beside_the_image(
 
     monkeypatch.setattr(service, "capture_image", capture_then_switch)
     path, capture_id, _ = service.single_capture_image(
-        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a2"])
+        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a2"],
+        filename_index=f"{STEMS['a2']}-img_0001")
     image_root = Path(str(path)).resolve().parents[2]
     manifests = [m for m in (legacy["root"], other) if (m / STEMS["a2"] / "metadata" / "manifest.jsonl").exists()
                  and capture_id in (m / STEMS["a2"] / "metadata" / "manifest.jsonl").read_text()]

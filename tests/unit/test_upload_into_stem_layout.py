@@ -1,11 +1,11 @@
 """An upload into a volume with a stem is stored in `<stem>/captures/`, its thumbnail in `<stem>/thumbnails/`.
 
-The file keeps the uuid name uploads have always had (naming is step 3).
+The file is named as a single capture is, `<stem>-img_<nnnn>_c0.<ext>`
+(contract 1.1, section 3); test_capture_contract_naming.py covers the rules.
 Any other upload is refused before anything is written (step 2).
 """
 
 import io
-import re
 from pathlib import Path
 
 import pytest
@@ -68,7 +68,8 @@ def test_an_upload_into_a_stemmed_volume_goes_into_its_captures(client, db_sessi
     stored = Path(img.file_path)
     root = override_projects_root / "xx-test-001"
     assert stored.parent == root / "captures"
-    assert re.fullmatch(r"[0-9a-f]{32}\.jpg", stored.name)
+    assert stored.name == "xx-test-001-img_0001_c0.jpg"
+    assert img.filename == stored.name
     assert stored.read_bytes() == _jpeg()
     assert Path(img.thumbnail_path).parent == root / "thumbnails"
     assert not list(_uploads_dir().glob(f"{stored.stem}*"))

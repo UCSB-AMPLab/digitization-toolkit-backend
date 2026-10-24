@@ -248,15 +248,13 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     """
     Modify test collection to add markers automatically.
-    
-    - Tests with "camera" in the name get @pytest.mark.camera
-    - Tests with "slow" in the name get @pytest.mark.slow
+
+    - Tests with "backend" in the node id get @pytest.mark.backend
+
+    The camera marker is added in the backend's root conftest.py, by file
+    (HARDWARE_TEST_FILES there), not here.
     """
     for item in items:
-        # Auto-mark camera tests
-        if "camera" in item.nodeid.lower():
-            item.add_marker(pytest.mark.camera)
-        
         # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
