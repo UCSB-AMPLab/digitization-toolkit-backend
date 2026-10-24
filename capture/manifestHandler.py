@@ -343,40 +343,28 @@ def append_relocation_record(project_root: Path, capture_id: str, from_rel: str,
         _append_line(manifest_path, line)
 
 
+# Written whole and renamed over the manifest by an earlier version of
+# append_manifest_lines; a leftover is removed at startup (app.core.volume_layout).
 MANIFEST_PART_NAME = "manifest.jsonl.part"
 
 
 def append_manifest_lines(root: Path, lines: list) -> None:
-    """Add already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, replacing the file atomically.
+    """Append already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, in one write, fsynced.
 
-    For records copied from another manifest (app.core.volume_layout), which
-    run at startup, when nothing else writes the manifest. The current
-    bytes, a newline if the last line was torn, and the new lines are
-    written to `manifest.jsonl.part` beside it, fsynced, and renamed over
-    it, and the directory is fsynced. A crash therefore leaves the manifest
-    as it was and at most a stale `.part`, which the next copy overwrites.
-    Each line is one JSON object without its newline.
+    For records copied from another manifest (app.core.volume_layout). The
+    lines go through _append_line, as a capture record does: a newline
+    first if the last line is torn, then the lines in one O_APPEND write.
+    A power cut can tear the copy's last line; that line stays apart as
+    junk, which the index skips and logs, and the next startup's repair
+    finds the record missing and appends it again. The manifest is never
+    rewritten or renamed: on exFAT or vfat drives a rename over an existing
+    file is not shown to be crash-atomic, and this may be the volume's only
+    manifest. Each line is one JSON object without its newline.
     """
     if not lines:
         return
-    from .utils import _fsync_dir
-
     metadata_dir = root / "metadata"
     metadata_dir.mkdir(parents=True, exist_ok=True)
-    path = metadata_dir / "manifest.jsonl"
-    part = metadata_dir / MANIFEST_PART_NAME
+    data = "".join(line + "\n" for line in lines).encode("utf-8")
     with _manifest_append_lock:
-        current = path.read_bytes() if path.exists() else b""
-        if current and not current.endswith(b"\n"):
-            current += b"\n"
-        data = current + "".join(line + "\n" for line in lines).encode("utf-8")
-        fd = os.open(part, os.O_WRONLY | os.O_CREAT | os.O_TRUNC, 0o644)
-        try:
-            mv = memoryview(data)
-            while mv:
-                mv = mv[os.write(fd, mv):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
-        os.replace(part, path)
-        _fsync_dir(metadata_dir)
+        _append_line(metadata_dir / "manifest.jsonl", data)

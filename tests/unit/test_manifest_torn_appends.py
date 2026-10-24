@@ -1,13 +1,16 @@
 """A torn append to a capture manifest never swallows the next record.
 
-Every append (a capture record, a relocation record) first makes sure the
-manifest ends with a newline, writing one if a power cut left the last line
-torn, so the torn line stays a separate line, which the index skips and
-logs. The migration's copy of a volume's records is not appended: the whole
-manifest is written to `manifest.jsonl.part` and renamed over it, so a crash
-leaves the manifest as it was.
+Every append (a capture record, a relocation record, the migration's copy of
+a volume's records) first makes sure the manifest ends with a newline,
+writing one if a power cut left the last line torn, so the torn line stays a
+separate line, which the index skips and logs. A copy torn that way is
+appended again by the next run, so every record ends up present and parseable
+once. The copy is not written whole and renamed: on exFAT or vfat a rename
+over an existing file is not shown to be crash-atomic, and the manifest may
+be a volume's only one.
 
-The torn-write tests are the verifier's (round 4).
+The torn-write tests are the verifier's (round 4), the second adjusted in
+round 5 to the append.
 """
 
 import json
@@ -74,7 +77,7 @@ def _ok(l):
 
 
 @pytest.mark.unit
-def test_a_torn_copy_leaves_the_volume_manifest_whole_after_the_next_run(db_session, legacy, monkeypatch):
+def test_a_torn_copy_is_appended_again_and_its_junk_line_logged(db_session, legacy, monkeypatch, caplog):
     import capture.manifestHandler as mh
     import app.core.volume_layout as vl
 
@@ -92,10 +95,17 @@ def test_a_torn_copy_leaves_the_volume_manifest_whole_after_the_next_run(db_sess
     monkeypatch.setattr(mh.os, "write", real_write)
     vl.migrate_volume_layout(db_session)
     vl.migrate_volume_layout(db_session)
-    lines = (legacy["root"] / STEMS["a1"] / "metadata" / "manifest.jsonl").read_text().splitlines()
+    manifest = legacy["root"] / STEMS["a1"] / "metadata" / "manifest.jsonl"
+    lines = manifest.read_text().splitlines()
     parsed = [json.loads(l) for l in lines if _ok(l)]
-    assert len(parsed) == len([l for l in lines if l.strip()]), lines
+    # Every record present and parseable once; the torn line stays apart, as junk.
     assert [p["capture_id"] for p in parsed] == ["cap-i1"]
+    assert len([l for l in lines if l.strip() and not _ok(l)]) == 1, lines
+    caplog.clear()
+    with caplog.at_level("WARNING", logger="app.core.integrity"):
+        from app.core.integrity import build_fixity_index
+        assert "cap-i1" in build_fixity_index(legacy["root"].resolve()).captured
+    assert str(manifest) in caplog.text and "1 line" in caplog.text
 
 
 
@@ -161,6 +171,23 @@ def test_a_relocation_record_after_a_torn_line_is_read(override_projects_root, c
     append_relocation_record(vol, "cap-1", "captures/a.jpg", "captures/b.jpg", image_id=7, sha256="ab" * 32)
 
     assert build_fixity_index(override_projects_root.resolve()).by_image[("cap-1", 7)] == "ab" * 32
+
+
+@pytest.mark.unit
+def test_the_copy_appends_after_a_torn_last_line(db_session, legacy):
+    """The copy goes through the same append as a capture: a newline first, if the last line is torn."""
+    from app.core.volume_layout import migrate_volume_layout
+
+    _capture_records(db_session, legacy)
+    meta = legacy["root"] / STEMS["a1"] / "metadata"
+    meta.mkdir(parents=True)
+    (meta / "manifest.jsonl").write_text('{"capture_id": "cap-i1", "fi')  # a capture record a power cut tore
+
+    migrate_volume_layout(db_session)
+
+    lines = (meta / "manifest.jsonl").read_text().splitlines()
+    assert lines[0] == '{"capture_id": "cap-i1", "fi'
+    assert [json.loads(l)["capture_id"] for l in lines[1:]] == ["cap-i1"]
 
 
 @pytest.mark.unit

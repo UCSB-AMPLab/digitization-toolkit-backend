@@ -478,7 +478,7 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
     - in `metadata/`, `manifest.jsonl` when every record in it that can be
       read names a capture id of the volume's images, and the
-      `manifest.jsonl.part` a crashed copy leaves.
+      `manifest.jsonl.part` an earlier version's crashed copy left.
     Anything else is foreign: another entry at the top, a directory inside
     one of the four, or any other file. A directory is listed, not walked.
     Nothing when `<stem>/` does not exist.
@@ -515,7 +515,7 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
         if sub == THUMBNAILS_DIR:
             return name in thumbs or (name.endswith("_thumb.jpg") and stem_owned(f.name[: -len("_thumb.jpg")]))
         if sub == METADATA_DIR and f.name == MANIFEST_PART_NAME:
-            return True  # a crashed copy's; the next copy overwrites it (append_manifest_lines)
+            return True  # left by an earlier version's copy; removed at the start of a run
         if sub == METADATA_DIR and f.name == "manifest.jsonl":
             try:
                 lines = f.read_text(encoding="utf-8").splitlines()
@@ -1298,11 +1298,11 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
 def _remove_stale_parts(db: Session, root: Path, report: dict, dry_run: bool) -> None:
     """Remove each stemmed volume's leftover `metadata/manifest.jsonl.part`; count them.
 
-    append_manifest_lines writes a volume's manifest whole to that name and
-    renames it over the manifest, and only the startup migration calls it,
-    so at the start of a run a `.part` can only be what a crash left. The
-    manifest it would have replaced is intact. With dry_run it is counted
-    and kept. One query and one stat per stemmed volume.
+    An earlier version of append_manifest_lines wrote a volume's manifest
+    whole to that name and renamed it over the manifest; nothing writes it
+    now, so a `.part` is what a crash of that version left, and the manifest
+    it would have replaced is intact. With dry_run it is counted and kept.
+    One query and one stat per stemmed volume.
     """
     from capture.manifestHandler import MANIFEST_PART_NAME
 
