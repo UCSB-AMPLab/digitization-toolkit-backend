@@ -1,4 +1,3 @@
-import os
 import sys
 from pathlib import Path
 import time
@@ -43,7 +42,8 @@ from .backends import (
 from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir, projects_root
 
 from app.core.config import settings
-from app.core.paths import PREVIEW_SIDECAR_SUFFIX, is_raw_suffix, preview_sidecar_of
+from app.core.capture_naming import capture_filename_index, capture_name_taken  # noqa: F401 (re-exported)
+from app.core.paths import is_raw_suffix, preview_sidecar_of
 
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -259,61 +259,6 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
         atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
     except Exception as e:
         subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
-
-
-# The file name of a capture is `<filename index>_c<camera index>.<ext>`, and
-# the filename index is `<filename_stem>-img_<nnnn>` (exchange contract 1.1,
-# section 3). <nnnn> is the volume's capture number (app.core.capture_counter),
-# zero-padded to four digits; str.format pads and never truncates, so 10000
-# and above are written with five or more digits.
-CAPTURE_NUMBER_DIGITS = 4
-
-
-def capture_filename_index(stem: str, number: int) -> str:
-    """`<stem>-img_<nnnn>`: the shared part of a capture event's file names, and a dual capture's pair id."""
-    if not stem:
-        raise ValueError("A capture's file name needs its volume's file name stem")
-    if not isinstance(number, int) or isinstance(number, bool) or number < 1:
-        raise ValueError(f"Not a capture number: {number!r}")
-    return f"{stem}-img_{number:0{CAPTURE_NUMBER_DIGITS}d}"
-
-
-def capture_name_taken(output_dir: Path, name_stem: str) -> bool:
-    """True if a file in `output_dir`, or in its sidecar directory, already carries `name_stem`.
-
-    `name_stem` is a file name without its suffix (`<index>_c0`), or the
-    filename index alone (`<index>`), which covers every camera of the event.
-    A file carries it when its name, casefolded, is `name_stem` followed by
-    a suffix, by `_c<n>` for an index, or by `_preview.jpg`. The suffix is
-    not known before the shot (the gphoto2 backend writes `.cr2` for a
-    request for `.jpg`), so every suffix counts. Names are casefolded
-    because exFAT, vfat and APFS by default treat names differing only in
-    case as one. The sidecar directory is where preview_sidecar_of puts a
-    RAW master's `_preview.jpg`: `previews/` beside a `captures/` directory,
-    the directory itself otherwise. A directory that does not exist holds
-    nothing.
-    """
-    target = name_stem.casefold()
-
-    def carries(name: str) -> bool:
-        name = name.casefold()
-        if not name.startswith(target):
-            return False
-        rest = name[len(target):]
-        return rest.startswith(".") or rest.startswith("_c") or rest.startswith(PREVIEW_SIDECAR_SUFFIX)
-
-    dirs = [output_dir]
-    sidecar_dir = preview_sidecar_of(output_dir / "x.jpg").parent
-    if sidecar_dir != output_dir:
-        dirs.append(sidecar_dir)
-    for d in dirs:
-        try:
-            with os.scandir(d) as entries:
-                if any(carries(e.name) for e in entries):
-                    return True
-        except FileNotFoundError:
-            continue
-    return False
 
 
 def image_filename(

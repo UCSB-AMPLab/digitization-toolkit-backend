@@ -16,7 +16,7 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
-from app.core.capture_counter import next_capture_number
+from app.core.capture_naming import CaptureNameRefused, take_filename_index
 from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
@@ -96,33 +96,23 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 
 
 def _take_filename_index(db: Session, collection_id: int, stem: str, root) -> str:
-	"""Raise the volume's capture counter and return the event's `<stem>-img_<nnnn>`.
+	"""The event's `<stem>-img_<nnnn>` (app.core.capture_naming.take_filename_index), or a 409.
 
 	Called once per capture event, after the refusals and before the
-	camera is touched, in the transaction that writes the event's images, so
-	a capture that fails before its commit leaves the counter where it was
-	(app.core.capture_counter). The volume's row is already locked by
-	_refuse_capture_without_volume_or_stem, so the raise takes no new lock.
-
-	A number that a file in the volume's `captures/` or `previews/` already
-	carries (capture.service.capture_name_taken) is passed over and the
-	counter raised again, so no file is ever overwritten and no name is
-	given twice. That happens only when the counter is behind the disk: a
-	capture whose files and manifest record were written but whose commit
-	failed, or a catalogue restored from before captures still on the card.
+	camera is touched. The volume's row is already locked by
+	_refuse_capture_without_volume_or_stem, so the counter's raise takes no
+	new lock. A refused name (longer than a pair id holds) is rolled back
+	before the 409, so it consumes
+	no number; the rollback also releases the record and volume locks,
+	which the refused capture no longer needs.
 	"""
 	from capture.project_manager import image_output_dir
-	from capture.service import capture_filename_index, capture_name_taken
 
-	output_dir = image_output_dir("", None, stem, root)
-	while True:
-		number = next_capture_number(db, collection_id)
-		if number is None:
-			raise RuntimeError(f"Collection {collection_id} has no capture counter")
-		index = capture_filename_index(stem, number)
-		if not capture_name_taken(output_dir, index):
-			return index
-		logger.warning(f"Capture number {number} of collection {collection_id} is already on disk ({index}); taking the next")
+	try:
+		return take_filename_index(db, collection_id, stem, image_output_dir("", None, stem, root))
+	except CaptureNameRefused as refused:
+		db.rollback()
+		raise HTTPException(status_code=409, detail=refused.detail)
 
 
 class DeviceInfo(BaseModel):

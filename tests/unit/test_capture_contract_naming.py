@@ -395,3 +395,96 @@ def test_capture_image_refuses_a_name_taken_after_the_check(tmp_path, monkeypatc
             "P", CameraConfig(camera_index=0), output_filename=f"{STEM}-img_0001_c0.jpg",
             check_camera=False, stem=STEM, root=tmp_path)
     assert (captures / f"{STEM}-img_0001_c0.cr2").read_bytes() == b"older master"
+
+
+# ---------------------------------------------------------------------------
+# A name longer than a pair id holds
+# ---------------------------------------------------------------------------
+
+STEM_27 = "co-ahr-con-caj001-car001-xy"
+STEM_26 = "co-ahr-con-caj001-car001-x"
+
+
+def _volume_at(db_session, project, stem, counter):
+    from app.models.collection import Collection
+    v = Collection(name=stem, project_id=project.id, filename_stem=stem, capture_counter=counter)
+    db_session.add(v)
+    db_session.commit()
+    return v
+
+
+def _post(api, project, volume, dual=False, **extra):
+    payload = {"project_name": project.name, "collection_id": volume.id}
+    if not dual:
+        payload["camera_index"] = 0
+    payload.update(extra)
+    return api.post("/cameras/capture/dual" if dual else "/cameras/capture", json=payload)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dual", [False, True])
+def test_a_name_longer_than_a_pair_id_is_refused_before_the_camera_fires(
+        client, db_session, test_project, backend, override_projects_root, dual):
+    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+
+    v = _volume_at(db_session, test_project, STEM_27, 9999)
+
+    resp = _post(_client_as(client), test_project, v, dual=dual)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert backend.requested == [], "no camera fired"
+    assert _counter(db_session, v) == 9999, "the refused capture consumed no number"
+    assert not (override_projects_root / STEM_27 / "captures").exists() or not any(
+        (override_projects_root / STEM_27 / "captures").iterdir())
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dual", [False, True])
+def test_a_retake_whose_name_is_too_long_is_refused_and_the_record_is_left_as_it_was(
+        client, db_session, test_project, backend, override_projects_root, dual):
+    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+    from app.models.record import Record, RecordImage
+
+    v = _volume_at(db_session, test_project, STEM_27, 9999)
+    rec = Record(title="r", collection_id=v.id, status="rejected", capture_mode="dual" if dual else "single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=rec.id, filename="old.jpg", file_path="/old.jpg",
+                               format="jpg", role="single", is_current=True))
+    db_session.commit()
+
+    resp = _post(_client_as(client), test_project, v, dual=dual, record_id=rec.id)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert backend.requested == []
+    db_session.expire_all()
+    assert db_session.get(Record, rec.id).status == "rejected"
+    assert [i.is_current for i in _images(db_session, rec.id)] == [True]
+    assert _counter(db_session, v) == 9999
+
+
+@pytest.mark.unit
+def test_a_27_character_stem_still_captures_number_9999(
+        client, db_session, test_project, backend, override_projects_root):
+    v = _volume_at(db_session, test_project, STEM_27, 9998)
+
+    body = _dual(_client_as(client), test_project, v)
+
+    assert [Path(p).name for p in body["file_paths"]] == [
+        f"{STEM_27}-img_9999_c0.jpg", f"{STEM_27}-img_9999_c1.jpg"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dual", [False, True])
+def test_a_shorter_stem_is_not_refused_for_a_five_digit_number(
+        client, db_session, test_project, backend, override_projects_root, dual):
+    """Whether five digits are acceptable is not settled; only the 36-character limit is enforced."""
+    v = _volume_at(db_session, test_project, STEM_26, 9999)
+
+    body = (_dual if dual else _single)(_client_as(client), test_project, v)
+
+    names = [Path(p).name for p in body["file_paths"]] if dual else [Path(body["file_path"]).name]
+    assert all(n.startswith(f"{STEM_26}-img_10000_c") for n in names)
+    assert _counter(db_session, v) == 10000
