@@ -1348,3 +1348,39 @@ def test_an_orm_cascade_still_deletes_volumes_without_the_reservation(db_session
     assert db_session.get(Project, ids[0]) is None
     assert db_session.get(Collection, ids[1]) is None
     assert db_session.get(Collection, ids[2]) is None
+
+
+# ---------------------------------------------------------------------------
+# stem_reserved on the read schema
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stem,counter,image,expected", [
+    (None, 0, False, False),
+    (None, 3, True, False),
+    ("co-r-001", 0, False, False),
+    ("co-r-001", 2, False, True),
+    ("co-r-001", 0, True, True),
+], ids=["nothing", "no-stem-captured", "stem-unused", "stem-counted", "stem-image"])
+def test_the_read_schema_says_whether_the_stem_is_reserved(client, db_session,
+                                                          stem, counter, image, expected):
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem=stem, capture_counter=counter)
+    if image:
+        _image_in(db_session, v)
+    api = _client_as(client)
+
+    one = api.get(f"/collections/{v.id}").json()
+    listed = [c for c in api.get("/collections/").json() if c["id"] == v.id][0]
+
+    assert one["stem_reserved"] is expected, one
+    assert listed["stem_reserved"] is expected, listed
+    assert v.reserves_its_stem() is expected
+
+
+@pytest.mark.unit
+def test_stem_reserved_is_not_accepted_on_requests():
+    from app.schemas.collection import CollectionCreate, CollectionUpdate
+
+    assert "stem_reserved" not in CollectionCreate.model_fields
+    assert "stem_reserved" not in CollectionUpdate.model_fields

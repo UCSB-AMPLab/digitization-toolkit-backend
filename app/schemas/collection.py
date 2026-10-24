@@ -102,6 +102,12 @@ class CollectionRead(CollectionBase):
     custom_attributes: Optional[str] = None
     # Read-only: the capture path raises it, and no request schema accepts it.
     capture_counter: int = 0
+    # Whether the volume keeps its row to keep its stem: it has a stem and
+    # has captured, so DELETE refuses it even once its records are moved
+    # out. Lets the interface warn before "move the records, then delete".
+    # Read-only. Costs one image query per volume that has a stem and a
+    # counter of 0.
+    stem_reserved: bool = False
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None
     created_by: Optional[str] = None

@@ -209,6 +209,11 @@ class Collection(Base):
         """
         return self.filename_stem is not None and self.has_captured()
 
+    @property
+    def stem_reserved(self) -> bool:
+        """reserves_its_stem() as an attribute, for CollectionRead."""
+        return self.reserves_its_stem()
+
     @validates("capture_counter", include_removes=True)
     def _capture_counter_never_decreases(self, key, value, is_remove):
         """Refuse any write that would lower or clear a stored capture_counter.
