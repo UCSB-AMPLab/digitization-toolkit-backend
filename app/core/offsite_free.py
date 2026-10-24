@@ -50,7 +50,9 @@ may read the tenant's prefix (the upload key cannot), one object at a time
 under the upload's transfer_lock and bandwidth cap. Each freed object is
 copied to a staging file beside its final name, its SHA1 checked against
 the offsite row, and moved into place with os.replace, under the same hold.
-A file already at the path is never overwritten.
+A file already at the path is never overwritten. The volume must be wholly
+in `<stem>/`, as for freeing, and an object whose image is in the name-based
+layout when the work list is read stays freed, as `outside_own_folder`.
 
 Both write a JSONL manifest, one line per file, to the volume's
 `metadata/offsite-freed-<UTC>.jsonl` or `metadata/offsite-restored-<UTC>.jsonl`,
@@ -219,7 +221,7 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
     record outside every volume may come back into it in between (PATCH
     /records/{id}, when its keys are under this stem) with its files still
     in a project's tree, which a rename moves under no hold this one
-    excludes. Freeing refuses such an object (_layout_refusal).
+    excludes. Freeing and restore refuse such an object (_layout_refusal).
     """
     from app.core.image_upload import local_file
     from app.core.storage_ops import image_in_old_layout
@@ -256,7 +258,7 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
 
 
 def _layout_refusal(obj: _Object) -> Optional[dict]:
-    """An object whose image is in the name-based layout stays on the card (see _objects)."""
+    """An object whose image is in the name-based layout is neither freed nor restored (see _objects)."""
     if obj.old_layout:
         return obj.entry(reason="outside_own_folder")
     return None
@@ -818,7 +820,9 @@ def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[st
     stopped = None
     try:
         for obj in _objects(db, collection_id, freed=True):
-            entry, refusal = _restore_one(db, obj)
+            refusal = _layout_refusal(obj)
+            if refusal is None:
+                entry, refusal = _restore_one(db, obj)
             if refusal is not None:
                 logger.warning("Restore of %s (%s) refused: %s", obj.key, obj.kind, refusal["reason"])
                 refused.append(refusal)

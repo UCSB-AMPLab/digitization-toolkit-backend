@@ -944,6 +944,55 @@ def test_a_record_let_back_into_the_volume_mid_free_with_files_in_the_old_layout
 
 
 @pytest.mark.unit
+def test_a_record_let_back_into_the_volume_mid_restore_with_files_in_the_old_layout_is_not_restored(
+        read_remote, db_session, override_projects_root, monkeypatch):
+    """As for freeing: a freed record outside every volume may come back into it mid-restore.
+
+    With its files in a name-based tree, a project rename could move that
+    tree under the restore and leave the restored file away from its row;
+    such an object is refused and stays freed.
+    """
+    from datetime import datetime, timezone
+
+    from app.core import offsite_free
+    from app.models.offsite_object import OffsiteObject
+
+    vol, _, _ = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    old = _volume(db_session, name="Sin stem", stem=None)
+    stray = _image(db_session, old, override_projects_root, "f9.jpg", b"jpeg nine")
+    key = f"{TENANT}/{STEM}/captures/f9.jpg"
+    read_remote.put(key, b"jpeg nine")
+    now = datetime.now(timezone.utc)
+    db_session.add(OffsiteObject(record_image_id=stray.id, kind="capture", object_key=key,
+                                 local_sha1=_sha1(b"jpeg nine"), verified_at=now))
+    stray.master_freed_at, stray.master_freed_bytes = now, len(b"jpeg nine")
+    rec = stray.record
+    rec.collection_id, rec.project_id = None, old.project_id
+    db_session.commit()
+    stray_path = Path(stray.file_path)
+    stray_path.unlink()
+
+    original = offsite_free._require_own_folder
+    calls = []
+
+    def way_back_after_the_check(db, collection):
+        original(db, collection)
+        calls.append(collection.id)
+        if len(calls) == 2:  # the job's own check, after the request's
+            rec.collection_id, rec.project_id = vol.id, None
+            db.commit()
+
+    monkeypatch.setattr(offsite_free, "_require_own_folder", way_back_after_the_check)
+    result = _restore(db_session, vol)
+
+    assert len(calls) == 2
+    assert [(r["image_id"], r["reason"]) for r in result["refused"]] == [(stray.id, "outside_own_folder")]
+    assert result["restored"]["files"] == 3
+    assert not stray_path.exists()
+    assert _image_row(db_session, stray.id).master_freed_at is not None
+
+@pytest.mark.unit
 @pytest.mark.parametrize("freed", [False, True])
 def test_reading_the_objects_leaves_no_transaction_open(remote, db_session, override_projects_root, freed):
     """The work list is read and committed; no transaction stays open across the hashing and listing that follow."""
