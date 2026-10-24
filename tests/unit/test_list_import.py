@@ -1249,3 +1249,43 @@ def test_nul_in_an_unmapped_field_is_escaped_in_the_stored_json(client, db_sessi
     raw = _volumes(db_session)["xx-test-901"].custom_attributes
     assert "\x00" not in raw and "\\u0000" in raw
     assert json.loads(raw)["fisqua"]["notes"] == "a\u0000b"
+
+
+# ---------------------------------------------------------------------------
+# GET serves the highest run that parses
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("damage", ["garbage", "half_written", "not_an_object", "other_list", "chmod000"])
+def test_get_skips_a_latest_run_that_cannot_be_read(client, db_session, reports_root, caplog, damage):
+    _as("op", "admin")
+    _post_fixture(client, VALID)
+    _post_fixture(client, VALID)
+    latest = reports_root / VALID_ID / f"import-report_{VALID_ID}_run0002.json"
+    if damage == "garbage":
+        latest.write_text("{not json")
+    elif damage == "half_written":
+        latest.write_text(latest.read_text()[:40])
+    elif damage == "not_an_object":
+        latest.write_text("[1, 2]")
+    elif damage == "other_list":
+        latest.write_text(json.dumps({"listId": REJECTS_ID, "created": 9}))
+    else:
+        latest.chmod(0)
+    try:
+        resp = client.get(f"/imports/digitisation-list/{VALID_ID}/report")
+    finally:
+        latest.chmod(0o644)
+    assert resp.status_code == 200
+    assert resp.json()["created"] == 4  # run0001
+    assert f'filename="import-report_{VALID_ID}.json"' in resp.headers["content-disposition"]
+    assert any("run0002" in r.getMessage() for r in caplog.records)
+
+
+@pytest.mark.unit
+def test_get_is_a_404_when_no_run_parses(client, db_session, reports_root):
+    _as("op", "admin")
+    _post_fixture(client, VALID)
+    for run in (reports_root / VALID_ID).glob("*_run*.json"):
+        run.write_text("{not json")
+    assert client.get(f"/imports/digitisation-list/{VALID_ID}/report").status_code == 404

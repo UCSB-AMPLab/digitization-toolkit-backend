@@ -11,7 +11,7 @@ import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from fastapi.responses import FileResponse, JSONResponse
+from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker
@@ -26,7 +26,7 @@ from app.core.list_import import (
     ProjectNeedsAdmin,
     import_list,
     parse_list_file,
-    latest_report_path,
+    latest_report,
     report_filename,
 )
 from app.models.user import User
@@ -118,12 +118,18 @@ def get_import_report(
     list_id: str,
     current_user: User = Depends(allow_read_only),
 ):
-    """The latest stored import report for a list, as `import-report_<list-id>.json`."""
+    """The latest stored import report for a list, as `import-report_<list-id>.json`.
+
+    The highest-numbered run that parses as the list's report; runs that
+    do not are skipped (and logged). A 404 if none does.
+    """
     try:
-        path = latest_report_path(list_id)
+        found = latest_report(list_id)
     except ValueError:
         raise HTTPException(status_code=422, detail="The list id is not a UUID.")
-    if path is None:
-        raise HTTPException(status_code=404, detail="No import report is stored for this list.")
-    canonical = path.parent.name
-    return FileResponse(path, media_type="application/json", filename=report_filename(canonical))
+    if found is None:
+        raise HTTPException(status_code=404, detail="No readable import report is stored for this list.")
+    path, data = found
+    filename = report_filename(path.parent.name)
+    return Response(content=data, media_type="application/json",
+                    headers={"Content-Disposition": f'attachment; filename="{filename}"'})

@@ -825,8 +825,32 @@ def _create_run_exclusively(directory: Path, list_id: str, number: int, data: by
     return target
 
 
-def latest_report_path(list_id: str) -> Optional[Path]:
-    """The stored report with the highest run number for a list, or None. `list_id` must be a UUID."""
+def latest_report(list_id: str) -> Optional[tuple[Path, bytes]]:
+    """The highest-numbered run of a list that parses as its report, as (path, bytes), or None.
+
+    A run parses as the report when it is UTF-8 JSON holding an object
+    whose listId is this list's. A run that does not (one half written by
+    the no-hard-link fallback, damaged, or unreadable) is skipped and
+    logged, and the next lower run is tried. `list_id` must be a UUID.
+    The bytes returned are the ones that were parsed, so the caller serves
+    exactly what was checked.
+    """
     list_id = str(uuid.UUID(list_id))
-    runs = _run_files(reports_dir() / list_id, list_id)
-    return runs[-1][1] if runs else None
+    for _, path in reversed(_run_files(reports_dir() / list_id, list_id)):
+        try:
+            data = path.read_bytes()
+            body = json.loads(data.decode("utf-8"))
+        except (OSError, ValueError, RecursionError) as exc:
+            logger.warning("Skipping the import report %s, which cannot be read: %s", path.name, exc)
+            continue
+        if not isinstance(body, dict) or body.get("listId") != list_id:
+            logger.warning("Skipping the import report %s, which is not this list's report", path.name)
+            continue
+        return path, data
+    return None
+
+
+def latest_report_path(list_id: str) -> Optional[Path]:
+    """The path latest_report would serve, or None. `list_id` must be a UUID."""
+    found = latest_report(list_id)
+    return found[0] if found else None
