@@ -735,6 +735,13 @@ def trigger_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "single"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
@@ -828,18 +835,15 @@ def trigger_capture(
 				#
 				# Either way the record can only be redone in the capture mode it was
 				# originally taken with — a single capture can't turn a dual-mode
-				# record's pair back into one image.
+				# record's pair back into one image. That is checked at the top,
+				# before the camera is touched.
 				#
 				# record_id is the only signal this endpoint has, and it now means
 				# "retake" in the two states an operator can act in and "add an
 				# image to this record" in the two she cannot. No client uses the
 				# second: the frontend passes record_id only from its retake handler,
 				# and every folio is captured as its own record.
-				if record.capture_mode != "single":
-					raise HTTPException(
-						status_code=422,
-						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
-					)
+				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
 				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images
@@ -964,6 +968,13 @@ def trigger_dual_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "dual"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig
@@ -1035,11 +1046,7 @@ def trigger_dual_capture(
 				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
 				# be redone as a pair, and can't turn a single-mode record into two
 				# images.
-				if record.capture_mode != "dual":
-					raise HTTPException(
-						status_code=422,
-						detail=f"Record {record.id} was captured in '{record.capture_mode}' mode; use the single-capture endpoint to recapture it."
-					)
+				# Its capture mode was checked before the camera was touched.
 				is_recapture = True
 				recapture_promotes = record.status == "rejected"
 				from app.api.records import _supersede_current_images

@@ -238,6 +238,26 @@ def test_a_retake_of_a_missing_record_is_a_404_before_any_camera(client, db_sess
     assert _state(db_session, v.id) == before
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("mode,other", [("single", "dual"), ("dual", "single")])
+@pytest.mark.parametrize("status", ["captured", "rejected"])
+def test_a_retake_in_the_wrong_capture_mode_is_a_422_before_any_camera(
+        client, db_session, test_project, camera_calls, mode, other, status):
+    """A record is retaken only in the mode it was captured in."""
+    api = _client_as(client)
+    v = _volume(db_session, test_project, "V", "co-test-v")
+    rec = _record(db_session, v, other)
+    rec.status = status
+    db_session.commit()
+    before = _state(db_session, v.id)
+
+    resp = _capture(mode)(api, test_project, v.id, record_id=rec.id)
+
+    assert resp.status_code == 422, resp.text
+    assert camera_calls == [], "a retake in the wrong mode touches no camera"
+    assert _state(db_session, v.id) == before
+
+
 # ---------------------------------------------------------------------------
 # No capture outside a volume
 # ---------------------------------------------------------------------------
