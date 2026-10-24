@@ -21,7 +21,7 @@ from typing import Dict, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import OFFSITE_STAGING_DIR, RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
@@ -58,9 +58,11 @@ def _scan_roots() -> List[Path]:
 
 
 def _iter_image_files(root: Path):
-    """Yield original image files under root, skipping derived thumbnails."""
+    """Yield original image files under root, skipping derived thumbnails and the offsite upload's staged links."""
     for p in root.rglob("*"):
         if "thumbnails" in p.parts:
+            continue
+        if p.relative_to(root).parts[:1] == (OFFSITE_STAGING_DIR,):
             continue
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             yield p

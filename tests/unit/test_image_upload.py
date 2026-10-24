@@ -966,3 +966,20 @@ def test_no_transaction_is_open_while_rclone_runs(remote, db_session, override_p
     _run(db_session)
     assert [kind for kind, _ in seen].count("copy") == 2
     assert not [s for s in seen if s[1]], seen
+
+
+@pytest.mark.unit
+def test_the_integrity_check_does_not_count_a_staged_link(remote, db_session, override_projects_root):
+    from app.core import image_upload as iu
+    from app.core.integrity import run_integrity_check
+
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    staged = iu._stage(Path(img.file_path))
+    try:
+        assert staged.linked
+        report = run_integrity_check(db_session, verify_hashes=False)
+        assert iu.STAGING_DIR_NAME not in json.dumps(report, default=str)
+        assert report["summary"]["orphan_files"] == 0
+    finally:
+        staged.release()

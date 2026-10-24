@@ -84,6 +84,7 @@ from app.core.catalogue_backup import (
 )
 from app.core.paths import (
     CAPTURES_DIR,
+    OFFSITE_STAGING_DIR,
     PREVIEWS_DIR,
     RAW_SUFFIXES,
     is_raw_suffix,
@@ -104,7 +105,8 @@ TENANT_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
 
 # Under the projects root, so that a hard link to an image is on the image's
 # file system in the usual case. Removed after each object and swept at start.
-STAGING_DIR_NAME = ".captua-offsite-staging"
+# The integrity check skips it (app.core.integrity._iter_image_files).
+STAGING_DIR_NAME = OFFSITE_STAGING_DIR
 
 _UPLOAD_TIMEOUT_SECONDS = 60 * 60
 _SHA_CHUNK = 1024 * 1024

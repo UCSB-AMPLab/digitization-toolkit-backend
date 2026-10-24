@@ -33,6 +33,11 @@ THUMBNAILS_DIR = "thumbnails"  # thumbnails
 METADATA_DIR = "metadata"      # the volume's manifest.jsonl
 VOLUME_SUBDIRS = (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR)
 
+# Directly under the projects root: the hard links the offsite upload copies
+# from (app.core.image_upload). Each is another name for an image already
+# under a volume, so the integrity check does not count it as a file.
+OFFSITE_STAGING_DIR = ".captua-offsite-staging"
+
 
 def project_dir_name(project_name: str) -> str:
     """The name of a project's directory under the projects root.
