@@ -65,6 +65,13 @@ def _locked_collection_query(db: Session, collection_id: int):
     return db.query(Collection).filter(Collection.id == collection_id).with_for_update()
 
 
+def _volume_change_detail(collection_id: int, **changes) -> str:
+    """The detail of a volume-change event: the id, then each `label old -> new`."""
+    parts = [f"id={collection_id}"]
+    parts += [f"{label} {old!r} -> {new!r}" for label, (old, new) in changes.items()]
+    return "; ".join(parts)
+
+
 def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
@@ -339,6 +346,8 @@ def update_collection(
     # whose files the startup migration has not moved yet
     # (collections_in_old_layout). Files in `<stem>/` stay where they are.
     update_data = payload.model_dump(exclude_unset=True)
+    before = (collection.name, collection.filename_stem,
+              collection.project_id, collection.parent_collection_id)
     layout_changed = (
         ("name" in update_data and update_data["name"] != collection.name)
         or ("parent_collection_id" in update_data
@@ -399,6 +408,22 @@ def update_collection(
         # A failed move or commit puts every file already moved back.
         relocate_images_and_commit(db, moves, not_moved, f"Update of collection {collection_id}")
     db.refresh(collection)
+    # After the commit, so a refused or failed change logs nothing.
+    old_name, old_stem, old_project, old_parent = before
+    if (old_name, old_stem) != (collection.name, collection.filename_stem):
+        log_event(db, level="INFO", category="activity", action="collection_renamed",
+                  actor=current_user.username, subject=collection.name,
+                  detail=_volume_change_detail(
+                      collection_id,
+                      stem=(old_stem, collection.filename_stem),
+                      name=(old_name, collection.name)))
+    if (old_project, old_parent) != (collection.project_id, collection.parent_collection_id):
+        log_event(db, level="INFO", category="activity", action="collection_moved",
+                  actor=current_user.username, subject=collection.name,
+                  detail=_volume_change_detail(
+                      collection_id,
+                      project=(old_project, collection.project_id),
+                      parent=(old_parent, collection.parent_collection_id)))
     if not_moved:
         # Preview sidecars that stayed in the old directory (see relocate_image).
         # The key is outside CollectionRead, so this body bypasses response_model.
@@ -571,8 +596,24 @@ def delete_collection(
                 f"{col_dir}: {[str(p) for p in left]}"
             )
 
+    # Read before the delete. The checks above leave no record and no
+    # sub-collection, so the counts are zero; they are logged anyway, so the
+    # entry states what the volume held when it went.
+    image_count = (
+        db.query(func.count(RecordImage.id))
+        .join(Record, RecordImage.record_id == Record.id)
+        .filter(Record.collection_id == collection_id)
+        .scalar()
+    )
+    deleted = dict(id=collection.id, name=collection.name, stem=collection.filename_stem,
+                   project=collection.project_id, parent=collection.parent_collection_id)
     db.delete(collection)
     db.commit()
+    log_event(db, level="WARN", category="activity", action="collection_deleted",
+              actor=current_user.username, subject=deleted["name"],
+              detail=(f"id={deleted['id']}; stem {deleted['stem']!r}; project {deleted['project']}; "
+                      f"parent {deleted['parent']}; records={record_count}; images={image_count}; "
+                      f"sub-collections={child_count}"))
 
     return None
 
