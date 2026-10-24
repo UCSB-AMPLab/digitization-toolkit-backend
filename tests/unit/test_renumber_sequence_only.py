@@ -384,7 +384,8 @@ def test_rewrites_and_moves_lock_records_in_id_order_and_assign_in_listing_order
 
     def locking_selects():
         return [s for s in statements
-                if s.startswith("SELECT RECORDS.ID") and "FROM RECORDS" in s and "RECORDS.COLLECTION_ID =" in s]
+                if s.startswith("SELECT RECORDS.ID") and "RECORDS.TITLE" in s and "FROM RECORDS" in s
+                and "RECORDS.COLLECTION_ID =" in s]  # the row loads; the unlocked id re-read selects only ids
 
     for call in (lambda: api.post(f"/collections/{vid}/images/renumber"),
                  lambda: api.patch(f"/collections/{vid}/records/reorder", json={"ordered_ids": [id2, id1]}),
@@ -465,3 +466,141 @@ def test_captures_take_sequences_from_one_and_a_retake_keeps_its_own(
     assert _first(statements, "FROM RECORDS", "RECORDS.ID =") < _first(statements, "FROM COLLECTIONS", "COLLECTIONS.ID =")
     assert not any("MAX(RECORDS.SEQUENCE)" in s for s in statements)
     assert _sequences(db_session, vid) == {first.id: 1, second.id: 2}
+
+
+# ---------------------------------------------------------------------------
+# No record lock once the volume's row is held
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def pg_statements(db_session):
+    """Each ORM statement the session runs, compiled for PostgreSQL, and "ROLLBACK" for each rollback."""
+    from sqlalchemy import event
+    from sqlalchemy.dialects import postgresql
+
+    seen: list = []
+
+    def on_execute(state):
+        seen.append(" ".join(str(state.statement.compile(dialect=postgresql.dialect())).split()).upper())
+
+    def on_rollback(session):
+        seen.append("ROLLBACK")
+
+    event.listen(db_session, "do_orm_execute", on_execute)
+    event.listen(db_session, "after_rollback", on_rollback)
+    yield seen
+    event.remove(db_session, "do_orm_execute", on_execute)
+    event.remove(db_session, "after_rollback", on_rollback)
+
+
+def _assert_no_record_lock_while_the_volume_is_held(seen: list) -> int:
+    """Between a volume lock and the next rollback (or the end) no records row is locked; return the attempts."""
+    attempts, holding = 0, False
+    for s in seen:
+        if s == "ROLLBACK":
+            holding = False
+        elif "FROM COLLECTIONS" in s and s.endswith("FOR UPDATE"):
+            holding = True
+            attempts += 1
+        elif "FROM RECORDS" in s and "FOR UPDATE" in s:
+            assert not holding, seen
+    return attempts
+
+
+def _adding_a_record_on_each_volume_lock(monkeypatch, collection_id, times):
+    """Before each of the first `times` volume locks, another session adds a record to the volume and commits."""
+    import app.core.record_sequence as rs
+    from app.core.db import SessionLocal
+    from app.models.record import Record
+
+    real = rs.locked_volume_query
+    calls = {"n": 0}
+
+    def adding(db, cid):
+        calls["n"] += 1
+        if calls["n"] <= times:
+            other = SessionLocal()
+            try:
+                other.add(Record(title=f"added {calls['n']}", collection_id=collection_id, sequence=1,
+                                 status="captured", capture_mode="single"))
+                other.commit()
+            finally:
+                other.close()
+        return real(db, cid)
+
+    monkeypatch.setattr(rs, "locked_volume_query", adding)
+    return calls
+
+
+@pytest.mark.unit
+def test_the_recheck_after_the_volume_lock_takes_no_lock(db_session):
+    from sqlalchemy.dialects import postgresql
+    from app.core.record_sequence import _record_ids
+
+    sql = str(_record_ids(db_session, 1).statement.compile(dialect=postgresql.dialect())).upper()
+    assert "FROM RECORDS" in sql and "FOR UPDATE" not in sql, sql
+
+
+@pytest.mark.unit
+def test_a_renumber_and_a_reorder_lock_no_record_after_the_volume(client, db_session, pg_statements):
+    _p, vol = _volume(db_session)
+    r1, r2 = _record(db_session, vol.id, 2), _record(db_session, vol.id, 1)
+    vid, id1, id2 = vol.id, r1.id, r2.id
+    api = _as_operator(client)
+
+    pg_statements.clear()
+    assert api.post(f"/collections/{vid}/images/renumber").status_code == 200
+    assert _assert_no_record_lock_while_the_volume_is_held(pg_statements) == 1
+    assert any("FROM RECORDS" in s and "FOR UPDATE" in s for s in pg_statements)
+
+    pg_statements.clear()
+    assert api.patch(f"/collections/{vid}/records/reorder", json={"ordered_ids": [id1, id2]}).status_code == 200
+    assert _assert_no_record_lock_while_the_volume_is_held(pg_statements) == 1
+
+
+@pytest.mark.unit
+def test_a_record_added_before_the_volume_lock_makes_the_renumber_start_over_and_include_it(
+        client, db_session, pg_statements, monkeypatch):
+    from app.models.record import Record
+
+    _p, vol = _volume(db_session)
+    r1, r2 = _record(db_session, vol.id, 5), _record(db_session, vol.id, 3)
+    vid, id1, id2 = vol.id, r1.id, r2.id
+    calls = _adding_a_record_on_each_volume_lock(monkeypatch, vid, times=1)
+
+    pg_statements.clear()
+    resp = _as_operator(client).post(f"/collections/{vid}/images/renumber")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"renumbered": 3}
+    assert calls["n"] == 2
+    assert _assert_no_record_lock_while_the_volume_is_held(pg_statements) == 2
+    added = db_session.query(Record).filter(Record.title == "added 1").one().id
+    assert _sequences(db_session, vid) == {added: 1, id2: 2, id1: 3}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", ["renumber", "reorder"])
+def test_a_volume_that_keeps_changing_is_refused_with_a_409_after_five_attempts(
+        client, db_session, pg_statements, monkeypatch, route):
+    from app.core.record_sequence import LOCK_ATTEMPTS, VOLUME_CHANGED_MESSAGE
+
+    _p, vol = _volume(db_session)
+    r1, r2 = _record(db_session, vol.id, 5), _record(db_session, vol.id, 3)
+    vid, id1, id2 = vol.id, r1.id, r2.id
+    calls = _adding_a_record_on_each_volume_lock(monkeypatch, vid, times=LOCK_ATTEMPTS)
+    api = _as_operator(client)
+
+    pg_statements.clear()
+    if route == "renumber":
+        resp = api.post(f"/collections/{vid}/images/renumber")
+    else:
+        resp = api.patch(f"/collections/{vid}/records/reorder", json={"ordered_ids": [id1, id2]})
+
+    assert LOCK_ATTEMPTS == 5
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == VOLUME_CHANGED_MESSAGE == "The volume changed while it was being renumbered. Try again."
+    assert calls["n"] == LOCK_ATTEMPTS
+    assert _assert_no_record_lock_while_the_volume_is_held(pg_statements) == LOCK_ATTEMPTS
+    seqs = _sequences(db_session, vid)
+    assert (seqs[id1], seqs[id2]) == (5, 3)

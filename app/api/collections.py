@@ -28,7 +28,9 @@ from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
+    VOLUME_CHANGED_MESSAGE,
     ReorderIdsError,
+    VolumeChangedError,
     listing_order,
     next_sequences,
     renumber_volume_records,
@@ -555,13 +557,17 @@ def reorder_collection_records(
     list, counted from 1. A list that leaves a record out, repeats one or
     names one from elsewhere is refused with 422 and REORDER_IDS_MESSAGE,
     and nothing is written. The volume's records and then its row are locked
-    for the transaction (app/core/record_sequence.py).
+    for the transaction (app/core/record_sequence.py); if records keep being
+    added to the volume meanwhile, it answers 409 with VOLUME_CHANGED_MESSAGE.
     """
     try:
         reordered = reorder_volume_records(db, collection_id, payload.ordered_ids)
     except ReorderIdsError:
         db.rollback()
         raise HTTPException(status_code=422, detail=REORDER_IDS_MESSAGE)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
     if reordered is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
@@ -588,10 +594,15 @@ def renumber_images(
     is the records' `sequence`. Records of other volumes are not touched.
     The volume's records and then its row are locked for the transaction
     (app/core/record_sequence.py), so no record added to the volume
-    meanwhile can take a sequence the rewrite hands out. If the commit fails,
-    every sequence stays as it was.
+    meanwhile can take a sequence the rewrite hands out; if records keep
+    being added meanwhile, it answers 409 with VOLUME_CHANGED_MESSAGE. If the
+    commit fails, every sequence stays as it was.
     """
-    renumbered = renumber_volume_records(db, collection_id)
+    try:
+        renumbered = renumber_volume_records(db, collection_id)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
     if renumbered is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     collection = db.get(Collection, collection_id)

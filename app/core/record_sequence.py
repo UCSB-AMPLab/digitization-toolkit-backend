@@ -11,8 +11,9 @@ Two locks keep them distinct. A path that rewrites a volume's order locks the
 volume's records and then the volume's row. A path that adds records to a
 volume locks the volume's row and only then reads the highest sequence in it.
 Each holds its locks until it commits, so an addition reads the maximum
-either before a rewrite starts writing (and the rewrite then waits for it and
-includes its records) or after the rewrite has committed. Every path that
+either before a rewrite holds the volume's row (and the rewrite, which checks
+the volume's records again once it holds the row, starts over to include
+them) or after the rewrite has committed. Every path that
 takes both a record's row and its volume's takes the record's first
 (app/core/volume_stem.py), and a path that locks several records takes
 them in id order. On SQLite, which the test suite runs on, no lock clause is
@@ -32,6 +33,14 @@ REORDER_IDS_MESSAGE = "ordered_ids must name every record of the volume exactly 
 
 class ReorderIdsError(ValueError):
     """`ordered_ids` does not name every record of the volume exactly once."""
+
+
+VOLUME_CHANGED_MESSAGE = "The volume changed while it was being renumbered. Try again."
+LOCK_ATTEMPTS = 5
+
+
+class VolumeChangedError(RuntimeError):
+    """Records kept being added to the volume while its records were being locked."""
 
 
 def listing_order(records: List[Record]) -> List[Record]:
@@ -57,19 +66,35 @@ def _records_in_order(db: Session, collection_id: int) -> List[Record]:
     )
 
 
+def _record_ids(db: Session, collection_id: int):
+    """The query for the ids of the volume's records, read without a lock."""
+    return db.query(Record.id).filter(Record.collection_id == collection_id)
+
+
 def lock_volume_records(db: Session, collection_id: int) -> Tuple[Optional[Collection], List[Record]]:
     """Lock the volume's records, then its row; return the volume and its records in listing order.
 
-    The records are read a second time once the volume's row is held, so a
-    record a path added to the volume and committed while this one waited
-    for the row is included and locked. Returns (None, []) when no volume has
-    the id.
+    No record is locked once the volume's row is held: a retake holds its
+    record and then waits for the volume, so a record lock taken after the
+    volume's could close a cycle with it. Instead the ids of the volume's
+    records are read again without a lock once the row is held. A record
+    added to the volume and committed between the record locks and the
+    volume lock makes the two sets differ; the transaction is then rolled
+    back, releasing every lock, and the attempt starts over from the record
+    locks. Once the row is held no record can be added, because every path
+    that adds one takes the same row first. After LOCK_ATTEMPTS attempts that
+    each found the set changed, raises VolumeChangedError. Returns (None, [])
+    when no volume has the id.
     """
-    _records_in_order(db, collection_id)
-    volume = locked_volume_query(db, collection_id).first()
-    if volume is None:
-        return None, []
-    return volume, _records_in_order(db, collection_id)
+    for _ in range(LOCK_ATTEMPTS):
+        records = _records_in_order(db, collection_id)
+        volume = locked_volume_query(db, collection_id).first()
+        if volume is None:
+            return None, []
+        if {rid for (rid,) in _record_ids(db, collection_id)} == {r.id for r in records}:
+            return volume, records
+        db.rollback()
+    raise VolumeChangedError(VOLUME_CHANGED_MESSAGE)
 
 
 def _assign(records: List[Record]) -> None:
@@ -85,7 +110,7 @@ def renumber_volume_records(db: Session, collection_id: int) -> Optional[int]:
     without one go to the end. Only the volume's records are written, and no
     file is read or written. Nothing is committed here: the caller commits,
     and a rollback leaves every sequence as it was. Returns None when no
-    volume has the id.
+    volume has the id. Raises VolumeChangedError as lock_volume_records does.
     """
     volume, records = lock_volume_records(db, collection_id)
     if volume is None:
@@ -98,8 +123,9 @@ def reorder_volume_records(db: Session, collection_id: int, ordered_ids: List[in
     """Set the volume's records to 1..N in the order `ordered_ids` gives; return N.
 
     Raises ReorderIdsError, before anything is written, unless `ordered_ids`
-    names every record of the volume once and nothing else. Nothing is
-    committed here. Returns None when no volume has the id.
+    names every record of the volume once and nothing else, and
+    VolumeChangedError as lock_volume_records does. Nothing is committed
+    here. Returns None when no volume has the id.
     """
     volume, records = lock_volume_records(db, collection_id)
     if volume is None:
