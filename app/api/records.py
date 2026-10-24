@@ -25,6 +25,7 @@ from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
 from app.core.record_status import change_record_status
+from app.core.capture_counter import next_capture_number
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
 from app.core.export_jobs import export_jobs
@@ -472,6 +473,9 @@ async def add_image_to_record(
 	
 	db.add(img)
 	try:
+		# An upload is one capture event for the record's volume, counted in
+		# the transaction that writes its image.
+		next_capture_number(db, rec.collection_id)
 		db.commit()
 	except Exception as e:
 		db.rollback()
