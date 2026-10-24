@@ -501,15 +501,18 @@ class RunResult:
 
 
 def _image_state(db: Session, image_id: int) -> Optional[tuple]:
-    """(file_path, capture_id, collection_id) of an image as committed now, or None if it is gone.
+    """(file_path, capture_id, collection_id, filename_stem) of an image as committed now, or None if it is gone.
 
     A column query, so it reads the database rather than the session's
-    identity map.
+    identity map. The stem is that of the record's volume at this moment.
     """
+    from app.models.collection import Collection
     from app.models.record import Record, RecordImage
 
-    return (db.query(RecordImage.file_path, RecordImage.capture_id, Record.collection_id)
+    return (db.query(RecordImage.file_path, RecordImage.capture_id, Record.collection_id,
+                     Collection.filename_stem)
             .join(Record, RecordImage.record_id == Record.id)
+            .outerjoin(Collection, Record.collection_id == Collection.id)
             .filter(RecordImage.id == image_id)
             .one_or_none())
 
@@ -519,6 +522,7 @@ class _Read:
     staged: Staged
     path: Path
     capture_id: Optional[str]
+    stem: str                 # the volume's stem, as read under the hold
     digests: Optional[tuple]  # (sha1, sha256), or None when the file changed while read
 
 
@@ -539,8 +543,14 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     db.commit()  # no transaction stays open from here to the copy
     if first is None:
         return None
+    if first.collection_id is None or first.filename_stem is None:
+        # Moved out of every volume, or into one without a stem, since the
+        # work list was built: nothing to hold, and no stem to key it under.
+        result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                               "reason": "record not in a volume with a stem"})
+        return None
     try:
-        with export_jobs.hold_for_reading([first.collection_id] if first.collection_id else []):
+        with export_jobs.hold_for_reading([first.collection_id]):
             if _image_state(db, item.image_id) != first:
                 db.commit()
                 result.skipped.append({"image_id": item.image_id, "kind": item.kind,
@@ -571,7 +581,7 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
         result.skipped.append({"image_id": item.image_id, "kind": item.kind,
                                "reason": "files of the volume being changed"})
         return None
-    return _Read(staged, path, first.capture_id, stable_digests(staged.path))
+    return _Read(staged, path, first.capture_id, first.filename_stem, stable_digests(staged.path))
 
 
 def _fixity_index(result: RunResult, *, fresh: bool = False):
@@ -618,9 +628,9 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
         if row is not None:
             key = row.object_key
         elif item.kind == "capture":
-            key = capture_key(tenant, item.stem, path.name)
+            key = capture_key(tenant, read.stem, path.name)
         else:
-            key = preview_key(tenant, item.stem, path.name)
+            key = preview_key(tenant, read.stem, path.name)
 
         holder = _key_holder(db, key)
         if holder is not None and row is None:

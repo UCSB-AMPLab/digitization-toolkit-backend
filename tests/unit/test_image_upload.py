@@ -1074,3 +1074,49 @@ def test_a_file_that_can_be_neither_linked_nor_copied_is_skipped(
     result = _run(db_session)
     assert result["skipped"][0]["reason"] == "file could not be staged"
     assert remote.calls("copyto") == [] and _rows(db_session) == {}
+
+
+@pytest.mark.unit
+def test_a_record_moved_out_of_every_volume_after_the_work_list_is_skipped(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    real = iu.pending_work
+
+    def then_move(db):
+        work = real(db)
+        db.query(Record).filter(Record.id == img.record_id).update(
+            {"collection_id": None, "project_id": vol.project_id})
+        db.commit()
+        return work
+
+    monkeypatch.setattr(iu, "pending_work", then_move)
+    result = _run(db_session)
+    assert result["skipped"] == [{"image_id": img.id, "kind": "capture",
+                                  "reason": "record not in a volume with a stem"}]
+    assert remote.calls("copyto") == []
+
+
+@pytest.mark.unit
+def test_the_key_takes_the_stem_of_the_volume_the_record_is_in_when_it_is_read(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    img = _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    real = iu.pending_work
+
+    def then_move(db):
+        work = real(db)
+        db.query(Record).filter(Record.id == img.record_id).update({"collection_id": other.id})
+        db.commit()
+        return work
+
+    monkeypatch.setattr(iu, "pending_work", then_move)
+    _run(db_session)
+    assert _rows(db_session)[(img.id, "capture")].object_key == f"{TENANT}/xx-test-002/captures/f1.jpg"
