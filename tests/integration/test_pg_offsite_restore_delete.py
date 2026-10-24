@@ -37,7 +37,7 @@ HOLD = 1.5      # seconds the first side sleeps with the record's lock held
 SECOND = 0.5    # seconds before the second side starts
 JOIN = 60
 
-STEM = "co-test-v"
+STEM = "co-test-restore"  # not the other PG tests' stem: their fixtures share the projects root
 BYTES = b"the master's bytes"
 
 
