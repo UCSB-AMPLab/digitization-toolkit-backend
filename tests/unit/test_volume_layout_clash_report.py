@@ -227,3 +227,31 @@ def test_every_name_taken_after_planning_is_reported_previews_included(db_sessio
     for f in planted:
         assert str(f) in report["left_unreferenced"], f
         assert f.read_bytes() == b"arrived after planning"
+
+
+@pytest.mark.unit
+def test_a_directory_at_the_planned_name_after_planning_counts_as_taken(db_session, legacy, monkeypatch):
+    """A directory, not only a file, takes the name: the master moves to the next free one, not reported missing."""
+    import app.core.volume_layout as vl
+    from app.models.record import RecordImage
+
+    iid = legacy["i1"].id
+    planted = []
+
+    def plant(dst):
+        dst.mkdir(parents=True)
+        planted.append(dst)
+
+    _plant_after_planning(vl, monkeypatch, iid, plant)
+
+    report = vl.migrate_volume_layout(db_session)
+
+    moved = {m["image_id"]: m["to"] for m in report["moved"]}
+    assert moved[iid].endswith(f"IMG_0001_img{iid}.CR2")
+    assert not [s for s in report["skipped"] if s["image_id"] == iid]
+    db_session.expire_all()
+    master = vl.Path(db_session.get(RecordImage, iid).file_path)
+    assert master.name == f"IMG_0001_img{iid}.CR2" and master.read_bytes() == b"bytes of IMG_0001.CR2"
+    assert planted[0].is_dir()
+    # left_unreferenced lists files; the directory is not one.
+    assert str(planted[0].resolve()) not in report["left_unreferenced"]

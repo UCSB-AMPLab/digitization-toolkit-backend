@@ -870,7 +870,8 @@ def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
     """A name in dst's directory for a master whose planned name was taken after planning, and what took the others.
 
     For a RAW master the name its sidecar would take in `previews/` must be
-    free too. Returns (the name, the files found at every name passed over,
+    free too. A name is taken by any entry, a directory included. Returns
+    (the name, the files found at every name passed over,
     `dst` included: masters, and previews for a RAW master), the files
     resolved and listed by their names on disk, which may differ in case.
     """
@@ -879,10 +880,11 @@ def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
     for stem in [dst.stem] + list(itertools.islice(_suffixed_stems(src.stem, e["image_id"]), 10000)):
         cand = dst.with_name(f"{stem}{src.suffix}")
         sidecar = preview_sidecar_of(cand)
-        found = _entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else [])
-        if not found:
+        # Any entry takes a name, a directory included; only files are
+        # listed for the report, which names files no row references.
+        if not _taken_in(cand.parent, cand.name) and not (raw and _taken_in(sidecar.parent, sidecar.name)):
             return cand, taken
-        taken.extend(found)
+        taken.extend(_entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else []))
     raise AssertionError("unreachable")
 
 
