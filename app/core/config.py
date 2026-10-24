@@ -41,6 +41,10 @@ class Settings(BaseSettings):
     # (app.core.image_upload), and the catalogue backup with it, whose dump
     # goes under the same prefix. Read from offsite.env like the keys above.
     OFFSITE_TENANT: str = Field(default="", validation_alias="DTK_OFFSITE_TENANT")
+    # The age X25519 public key (age1...) every catalogue dump is encrypted to
+    # before upload (app.core.catalogue_backup). Unset or invalid: no dump is
+    # uploaded. The unit holds only this public half, never the private key.
+    OFFSITE_DUMP_RECIPIENT: str = Field(default="", validation_alias="DTK_OFFSITE_DUMP_RECIPIENT")
     # The interim push on the Rionegro unit has run at 750 KB/s since 2026-08-20
     # over a ~12 Mbps link without starving the UI; its settings are the defaults.
     OFFSITE_BWLIMIT: str = Field(default="750k", validation_alias="DTK_OFFSITE_BWLIMIT")

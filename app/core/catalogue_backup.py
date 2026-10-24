@@ -9,11 +9,19 @@ only on a card that was failing writes.
 Shape of a run:
 
 1. dump the catalogue through gzip to a temporary file under the data dir;
-2. upload it on the images' credential and bandwidth cap, through rclone;
-3. verify the local digest against the SHA1 the destination's listing reports;
-4. record the verified run in ``system_logs``, which is both the operator's
+2. encrypt it with age to the X25519 public key in OFFSITE_DUMP_RECIPIENT,
+   and remove the plaintext;
+3. upload the ciphertext (``<name>.sql.gz.age``) on the images' credential and
+   bandwidth cap, through rclone;
+4. verify the ciphertext's digest against the SHA1 the destination's listing
+   reports;
+5. record the verified run in ``system_logs``, which is both the operator's
    view and the date marker that decides whether today still needs a run;
-5. remove the temporary file — always, on every path.
+6. remove the temporary files — always, on every path.
+
+No plaintext dump is ever uploaded. With no recipient, or one that is not an
+age X25519 public key, the run writes no dump and records the error. The unit
+holds only the public key; whoever keeps the private key restores.
 
 The dump goes to ``<OFFSITE_REMOTE>/<OFFSITE_TENANT>/<OFFSITE_DB_PREFIX>/``
 (``db-backups`` by default): under the tenant's prefix, the only part of the
@@ -108,6 +116,56 @@ class BackupError(Exception):
 
 class VerificationUnavailable(BackupError):
     """The bucket listing could not answer, so nothing may be called verified."""
+
+
+class RecipientMisconfigured(BackupError):
+    """OFFSITE_DUMP_RECIPIENT is unset or not an age X25519 public key."""
+
+
+AGE_SUFFIX = ".age"
+_AGE_HEADER = b"age-encryption.org/v1\n"
+
+
+def dump_recipient():
+    """The age X25519 recipient every dump is encrypted to.
+
+    Raises RecipientMisconfigured when the setting is empty or is not an
+    `age1...` public key. A private key (`AGE-SECRET-KEY-...`) is refused as
+    any other invalid value is: the unit is given only the public half.
+    """
+    value = config.settings.OFFSITE_DUMP_RECIPIENT.strip()
+    if not value:
+        raise RecipientMisconfigured(
+            "DTK_OFFSITE_DUMP_RECIPIENT is not set; no catalogue dump is "
+            "uploaded unencrypted"
+        )
+    try:
+        import pyrage
+    except ImportError as exc:
+        raise BackupError(f"pyrage is not installed, so the dump cannot be encrypted: {exc}") from exc
+    try:
+        return pyrage.x25519.Recipient.from_str(value)
+    except pyrage.RecipientError as exc:
+        raise RecipientMisconfigured(
+            f"DTK_OFFSITE_DUMP_RECIPIENT is not an age X25519 public key (age1...): {exc}"
+        ) from exc
+
+
+def encrypt_dump(plain: Path, dest: Path, recipient) -> str:
+    """Encrypt `plain` to `recipient` into `dest` (created 0600, exclusively). Returns dest's SHA1."""
+    import pyrage
+
+    try:
+        fd = os.open(dest, os.O_WRONLY | os.O_CREAT | os.O_EXCL, 0o600)
+        with plain.open("rb") as src, os.fdopen(fd, "wb") as out:
+            pyrage.encrypt_io(src, out, [recipient])
+        digest = hashlib.sha1()
+        with dest.open("rb") as fh:
+            for chunk in iter(lambda: fh.read(1 << 20), b""):
+                digest.update(chunk)
+    except (OSError, pyrage.EncryptError) as exc:
+        raise BackupError(f"the catalogue dump could not be encrypted to {dest}: {exc}") from exc
+    return digest.hexdigest()
 
 
 # ---------------------------------------------------------------------------
@@ -248,7 +306,8 @@ def _sweep_stale_dumps() -> int:
     where the same single-process assumption is set out and its limits named).
     """
     try:
-        stale = sorted(_dump_dir().glob("catalogue-*.sql.gz"))
+        stale = sorted(_dump_dir().glob("catalogue-*.sql.gz")) + \
+            sorted(_dump_dir().glob("catalogue-*.sql.gz" + AGE_SUFFIX))
     except OSError:
         logger.exception("Could not scan the dump directory for stale dumps")
         return 0
@@ -425,7 +484,17 @@ def upload(local: Path) -> None:
 
     --no-check-dest because rclone's default destination HEAD needs readFiles
     and answers 401 against this write+list key. It cost the first attempt.
+
+    Refuses anything that is not age ciphertext, by name and by header, so a
+    plaintext dump cannot reach the bucket through this function.
     """
+    try:
+        with local.open("rb") as fh:
+            header = fh.read(len(_AGE_HEADER))
+    except OSError as exc:
+        raise BackupError(f"could not read {local} before upload: {exc}") from exc
+    if not local.name.endswith(AGE_SUFFIX) or header != _AGE_HEADER:
+        raise BackupError(f"refusing to upload {local.name}: it is not an age-encrypted dump")
     argv = _rclone_argv(
         "copy",
         str(local),
@@ -655,15 +724,30 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
             "verified_at": state["verified_at"],
         }
 
+    # Before the dump: with no key to encrypt to, there is nothing to upload,
+    # and a plaintext dump is never uploaded instead.
+    try:
+        recipient = dump_recipient()
+    except BackupError as exc:
+        logger.error("Catalogue backup not run: %s", exc)
+        _record(db, action=FAILED_ACTION, level="ERR", subject=None,
+                detail=f"not run: {exc}"[:500])
+        return {"status": "misconfigured", "error": str(exc)}
+
     # A fresh name per run, unique by its random token: a retry adds an object
     # rather than overwriting one, so nothing in this path can destroy a dump
     # that is already at the destination.
-    name = _object_name()
+    plain_name = _object_name()
+    name = plain_name + AGE_SUFFIX
+    plain = _dump_dir() / plain_name
     dump = _dump_dir() / name
 
     try:
         try:
-            raw_bytes, sha1 = write_dump(dump)
+            raw_bytes, _plain_sha1 = write_dump(plain)
+            sha1 = encrypt_dump(plain, dump, recipient)
+            # The plaintext goes as soon as the ciphertext exists.
+            plain.unlink(missing_ok=True)
             upload(dump)
             verify_against_listing(name, sha1)
             # Captured here, at the moment verification succeeded, rather than
@@ -688,7 +772,7 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
         # The destination by name, not a claim about its nature: OFFSITE_REMOTE
         # may be a bucket, a mounted disk or a local path.
         detail = (
-            f"verified at {remote_dir()}: {dump.stat().st_size} bytes gzipped, "
+            f"verified at {remote_dir()}: {dump.stat().st_size} bytes encrypted, "
             f"{raw_bytes} raw, sha1 {sha1}"
         )
         _record(db, action=VERIFIED_ACTION, level="INFO", subject=name,
@@ -725,10 +809,11 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
         # nothing to keep. Reached only after the run's outcome is decided. If
         # this unlink fails, or the process dies before reaching it, the sweep
         # at the head of the next run and at the next boot clears what is left.
-        try:
-            dump.unlink(missing_ok=True)
-        except OSError:
-            logger.exception("Could not remove the temporary dump %s", dump)
+        for path in (plain, dump):
+            try:
+                path.unlink(missing_ok=True)
+            except OSError:
+                logger.exception("Could not remove the temporary dump %s", path)
 
 
 # ---------------------------------------------------------------------------
