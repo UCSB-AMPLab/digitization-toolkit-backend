@@ -977,22 +977,44 @@ def offsite_keys_under_volume(db: Session, record_id: int, stem: Optional[str]) 
     if not stem or tenant is None:
         return False
     keys = _offsite_keys(db, record_id)
-    prefix = f"{tenant}/{stem}/"
-    return bool(keys) and all(k.startswith(prefix) for k in keys)
+    return bool(keys) and all(_key_stem(k, tenant) == stem for k in keys)
+
+
+def _key_stem(key: str, tenant: str) -> Optional[str]:
+    """The stem of a key of the form `<tenant>/<stem>/<rest>`, or None for any other key."""
+    head = f"{tenant}/"
+    if not key.startswith(head):
+        return None
+    stem, sep, rest = key[len(head):].partition("/")
+    return stem if stem and sep and rest else None
 
 
 def stranded_offsite_message(db: Session, record_id: int) -> str:
-    """The 409 detail for a record outside every volume refused the way back, naming the stems its keys are under.
+    """The 409 detail for a record outside every volume refused the way back.
 
-    The stem is a key's second segment, `<tenant>/<stem>/...`.
+    Only a key under the configured tenant, `<tenant>/<stem>/...`, names a
+    volume of this unit. With every key under one stem, the detail names it;
+    under several, it names them all and says the record can be put into no
+    volume. A key under any other prefix (an adopted key, or one under an
+    earlier tenant) or without a stem segment names no volume, and nor can
+    any key be matched while no valid tenant is configured; the detail then
+    says so, in the second case naming DTK_OFFSITE_TENANT.
     """
-    stems = sorted({k.strip("/").split("/")[1] for k in _offsite_keys(db, record_id) if k.count("/") >= 2})
-    if len(stems) == 1:
-        return (f"This record's files are stored offsite under the volume stem {stems[0]}, "
-                "so it can be put only into the volume with that stem"
-                + ("" if configured_tenant_or_none() else ", once DTK_OFFSITE_TENANT is set") + ".")
+    tenant = configured_tenant_or_none()
+    if tenant is None:
+        return ("This record's files are stored offsite, and no valid DTK_OFFSITE_TENANT is set, "
+                "so their keys cannot be matched to any volume of this unit. It can be put into a "
+                "volume only once DTK_OFFSITE_TENANT is set, and then only into the volume its keys are under.")
+    stems = [_key_stem(k, tenant) for k in _offsite_keys(db, record_id)]
+    if not stems or None in stems:
+        return ("This record's files are stored offsite under keys that name no volume of this unit, "
+                "so it can be put into no volume.")
+    names = sorted(set(stems))
+    if len(names) == 1:
+        return (f"This record's files are stored offsite under the volume stem {names[0]}, "
+                "so it can be put only into the volume with that stem.")
     return ("This record's files are stored offsite under more than one volume stem "
-            f"({', '.join(stems)}), so it can be put into no volume.")
+            f"({', '.join(names)}), so it can be put into no volume.")
 
 
 def configured_tenant_or_none() -> Optional[str]:

@@ -249,3 +249,45 @@ def test_a_record_leaving_its_volume_still_gets_the_original_message(admin, db_s
     a, b, rec, _ = _setup(db_session)
     assert admin.patch(f"/records/{rec.id}", json={"collection_id": b.id}).json()["detail"] == STORED_OFFSITE_MESSAGE
     assert admin.post(f"/projects/{a.project_id}/add_record/{rec.id}").json()["detail"] == STORED_OFFSITE_MESSAGE
+
+
+def _stranded_with_keys(db, *keys):
+    """A record outside every volume whose one image has an offsite row for each of `keys`."""
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    a, b, rec, _ = _setup(db, stored=False)
+    img = db.query(RecordImage).filter(RecordImage.record_id == rec.id).one()
+    for n, key in enumerate(keys):
+        db.add(OffsiteObject(record_image_id=img.id, kind="capture" if n == 0 else "preview",
+                             object_key=key, local_sha1="0" * 40))
+    db.commit()
+    _put_outside_every_volume(db, rec, a.project_id)
+    return a, b, rec
+
+
+NO_VOLUME = "name no volume of this unit"
+
+
+@pytest.mark.unit
+def test_a_key_under_an_earlier_tenant_names_no_volume(admin, db_session, tenant):
+    a, _, rec = _stranded_with_keys(db_session, "old-tenant/xx-test-001/captures/f1.jpg")
+    response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})
+    assert response.status_code == 409, response.text
+    detail = response.json()["detail"]
+    assert NO_VOLUME in detail and "only into" not in detail
+
+
+@pytest.mark.unit
+def test_a_key_outside_tenant_and_stem_alongside_good_ones_names_no_volume(admin, db_session, tenant):
+    a, _, rec = _stranded_with_keys(db_session, "captua-test/xx-test-001/captures/f1.jpg",
+                                    "adopted/xx-test-001/previews/f1_preview.jpg")
+    detail = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id}).json()["detail"]
+    assert NO_VOLUME in detail
+
+
+@pytest.mark.unit
+def test_a_key_with_no_stem_segment_names_no_volume_and_prints_no_empty_list(admin, db_session, tenant):
+    a, _, rec = _stranded_with_keys(db_session, "captua-test/f1.jpg")
+    detail = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id}).json()["detail"]
+    assert NO_VOLUME in detail and "()" not in detail
