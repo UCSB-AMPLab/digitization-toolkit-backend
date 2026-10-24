@@ -127,9 +127,13 @@ class Collection(Base):
         own volume's stem. Superseded images (is_current False) count, because
         a rejected file is kept under its name rather than deleted.
 
-        Reads the database with autoflush off, so an image added to the session
-        and not yet flushed is not seen. A volume that is not yet persisted has
-        no id and no images.
+        Two sources: images pending in the session (added and not yet
+        flushed), whose record is in this volume by collection_id or by the
+        `collection` relationship; then the database, read with autoflush
+        off so that the check itself flushes nothing. A pending image counts
+        so that a stem change in the same flush as the volume's first image
+        is refused. A volume that is not yet persisted has no id and no
+        images.
         """
         if self.id is None:
             return False
@@ -137,12 +141,24 @@ class Collection(Base):
         if session is None:
             return False
         with session.no_autoflush:
+            for obj in session.new:
+                if isinstance(obj, RecordImage) and self._holds_record(session, obj):
+                    return True
             return session.execute(
                 select(exists().where(
                     RecordImage.record_id == Record.id,
                     Record.collection_id == self.id,
                 ))
             ).scalar()
+
+    def _holds_record(self, session, image) -> bool:
+        """Whether a pending image's record, pending or stored, is in this volume."""
+        record = image.record
+        if record is None and image.record_id is not None:
+            record = session.get(Record, image.record_id)
+        if record is None:
+            return False
+        return record.collection is self or record.collection_id == self.id
 
     def has_captured(self) -> bool:
         """Whether the volume has ever captured: capture_counter above zero, or any image.

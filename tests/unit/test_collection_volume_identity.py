@@ -1052,3 +1052,48 @@ def test_two_concurrent_first_stems_do_not_overwrite(db_session):
 @pytest.mark.xfail(strict=True, reason=_SQLITE_CANNOT_LOCK)
 def test_two_concurrent_first_external_ids_do_not_overwrite(db_session):
     assert _two_sessions_race(db_session, "external_id", "co-ref-a", "co-ref-b") == "co-ref-a"
+
+
+# ---------------------------------------------------------------------------
+# An image pending in the session counts
+# ---------------------------------------------------------------------------
+
+def _pending_image(db_session, volume, *, record_pending=False, by_relationship=False):
+    """Add a record and image to the session without flushing the image."""
+    from app.models.record import Record, RecordImage
+
+    rec = Record(title="r", status="captured", capture_mode="single",
+                 **({"collection": volume} if by_relationship else {"collection_id": volume.id}))
+    db_session.add(rec)
+    if not record_pending:
+        db_session.flush()
+    img = RecordImage(filename="x.jpg", file_path="/tmp/x.jpg", format="jpeg", is_current=True,
+                      **({"record": rec} if record_pending else {"record_id": rec.id}))
+    db_session.add(img)
+    return img
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("record_pending,by_relationship", [
+    (False, False), (True, False), (True, True),
+], ids=["flushed-record", "pending-record", "pending-record-by-relationship"])
+def test_a_stem_change_in_the_same_flush_as_the_first_image_is_refused(
+        db_session, record_pending, by_relationship):
+    from app.models.record import ImmutableFieldError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-b-001")
+    _pending_image(db_session, v, record_pending=record_pending, by_relationship=by_relationship)
+
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = "co-b-002"
+
+
+@pytest.mark.unit
+def test_a_pending_image_in_another_volume_does_not_fix_this_stem(db_session):
+    p = _project(db_session)
+    other = _volume(db_session, p, "other")
+    v = _volume(db_session, p, "v", filename_stem="co-b-003")
+    _pending_image(db_session, other)
+
+    v.filename_stem = "co-b-004"
