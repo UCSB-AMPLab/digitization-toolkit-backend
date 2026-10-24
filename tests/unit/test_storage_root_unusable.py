@@ -10,8 +10,8 @@ D3, section 5c).
 
 `writable_projects_dir()` is the check for writers that build a path into the
 tree; they all do it through `capture.project_manager._projects_root()`:
-captures, project initialisation, relocations (collection re-parent into
-another project, move-records, move-collections), project rename, and the path computation of
+captures, project initialisation, relocations (collection rename or re-parent,
+move-records, move-collections), project rename, and the path computation of
 collection and project deletes. Writers that work beside an existing file use
 `refuse_writes_under_unusable_root()`: thumbnail regeneration and renumbering.
 Both raise `StorageUnavailableError`, which the app answers with 503.
@@ -129,9 +129,9 @@ def test_device_comparison_reads_the_root_filesystem(tmp_path):
 def test_path_helpers_refuse_and_create_nothing(pm, override, tmp_path):
     from app.core.storage_override import StorageUnavailableError
     override(tmp_path / "mounts" / "usb" / "dtk-projects")
-    for call in (lambda: pm.image_output_dir("P", 1),
+    for call in (lambda: pm.image_output_dir("P", "C"),
                  lambda: pm.project_capture_root("P"),
-                 lambda: pm.collection_capture_root("P", 1)):
+                 lambda: pm.collection_capture_root("P", "C")):
         with pytest.raises(StorageUnavailableError):
             call()
     assert not (tmp_path / "mounts").exists()
@@ -145,7 +145,7 @@ def test_capture_refuses_before_writing(pm, override, tmp_path, mock_camera_conf
     monkeypatch.setattr(service, "get_backend", lambda: called.append(1))
     override(tmp_path / "mounts" / "usb" / "dtk-projects")
     with pytest.raises(StorageUnavailableError):
-        service.capture_image("P", mock_camera_config, check_camera=False, collection_id=1)
+        service.capture_image("P", mock_camera_config, check_camera=False, collection_name="C")
     assert called == []
     assert not (tmp_path / "mounts").exists()
 
@@ -219,7 +219,7 @@ def _admin_client(client):
 
 
 @pytest.mark.unit
-def test_collection_reparent_into_another_project_answers_503_and_creates_nothing(client, db_session, pm, override, tmp_path):
+def test_collection_rename_answers_503_and_creates_nothing(client, db_session, pm, override, tmp_path):
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record, RecordImage
@@ -227,12 +227,8 @@ def test_collection_reparent_into_another_project_answers_503_and_creates_nothin
     proj = Project(name="P")
     db_session.add(proj)
     db_session.commit()
-    other = Project(name="Q")
-    db_session.add(other)
-    db_session.commit()
     col = Collection(name="C", project_id=proj.id)
-    host = Collection(name="H", project_id=other.id)
-    db_session.add_all([col, host])
+    db_session.add(col)
     db_session.commit()
     upload = tmp_path / "upload.jpg"
     upload.write_bytes(b"x")
@@ -244,13 +240,13 @@ def test_collection_reparent_into_another_project_answers_503_and_creates_nothin
     db_session.commit()
 
     override(tmp_path / "mounts" / "usb" / "dtk-projects")
-    resp = _admin_client(client).patch(f"/collections/{col.id}", json={"parent_collection_id": host.id})
+    resp = _admin_client(client).patch(f"/collections/{col.id}", json={"name": "D"})
     assert resp.status_code == 503, resp.text
     assert "not available" in resp.json()["detail"]
     assert upload.exists()
     assert not (tmp_path / "mounts").exists()
     db_session.expire_all()
-    assert db_session.get(Collection, col.id).parent_collection_id is None
+    assert db_session.get(Collection, col.id).name == "C"
 
 
 @pytest.mark.unit

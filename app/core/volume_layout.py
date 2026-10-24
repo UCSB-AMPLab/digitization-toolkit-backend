@@ -1,49 +1,64 @@
 """
-Move image files from the name-based collection layout to the id-based one.
+Move the files of each volume that has a file name stem into its stem layout.
 
-A collection's directory is `<project dir>/collection-<id>/` (see
-capture.project_manager.image_output_dir). Units that captured before that
-layout hold their files in `<project dir>/<secure collection name>/`, where two
-collections of one name share a directory and nested collections sit beside
-their parents. This module moves each file a row references into the
-directory of that row's record's collection, and rewrites the row.
+A volume with a stem keeps its files in `<projects root>/<stem>/`, with no
+project level (capture.project_manager.volume_root):
+
+    captures/     masters: CR2, or JPEG/TIFF
+    previews/     the `_preview.jpg` extracted from a RAW master
+    thumbnails/   thumbnails
+    metadata/     the volume's own manifest.jsonl, for captures made there
+
+Units that captured before stems hold their files in the name-based layout,
+`<project dir>/<secure volume name>/images/main/`, with each sidecar beside
+its master, thumbnails in `images/thumbnails/` and one `metadata/manifest.jsonl`
+per project. There two volumes of one name share a directory and nested
+volumes sit beside their parents. This module moves each file a row
+references into the stem layout of that row's record's volume, and rewrites
+the row. A volume without a stem is left exactly where it is; once an
+operator gives it one, the next run moves it. A run happens at every
+startup, so a stem set while the backend runs takes effect at the next
+restart; nothing moves when the stem is set.
 
 What is moved, and how:
 
-- The rows decide what to do. A row of a collection's record whose stored
-  path is under the active projects root but not in its collection's
-  directory is out of place; nothing else is looked at. Files are attributed
-  by the rows, never by the directory they are in, so each image of two
-  same-named collections sharing a directory goes to its own collection.
-- A row whose old path is gone but whose file is already in its collection's
-  directory, under its own name or under the name the migration gives a
+- The rows decide what to do. A row of a stemmed volume's record whose stored
+  path is under the active projects root but not in the volume's `captures/`
+  is out of place; nothing else is looked at. Files are attributed by the
+  rows, never by the directory they are in, so each image of two same-named
+  volumes sharing a directory goes to its own volume.
+- A row whose old path is gone but whose file is already in its volume's
+  `captures/`, under its own name or under the name the migration gives a
   clashing file (`<stem>_img<image id>`), and that no other row names, is
   pointed at that file, but only when the file's sha256 matches the one its
-  capture record in the project manifest holds (the only checksum the
-  system keeps for an image). This is the state after a database restored
-  from before the migration (rollback-update.sh) on files the migration
-  moved. A row with no such checksum, or whose candidate does not match, is
-  reported as missing and the candidate as a file no row references.
-- A RAW master's `_preview.jpg` sidecar moves with it and keeps the name its
-  master's final name derives. A sidecar that cannot follow is recorded in a
-  second file in the data directory, retried at every run, and reported until
-  it has moved.
-- A thumbnail moves to the collection's `images/thumbnails/`. A thumbnail row
-  naming a missing file is cleared, so the thumbnail endpoint regenerates it
-  beside the moved master. A thumbnail whose name is taken in the target
-  stays where it is, its row is cleared, and it is reported with the files no
-  row references.
-- No file is ever moved onto an existing one. Names are compared casefolded,
-  because exFAT, vfat and APFS by default treat names differing only in case
-  as one. A master whose name is taken in the target (by a file on disk or by
-  another planned move, or by a file of another record with the same stem,
-  which would name the same sidecar) is moved as `<stem>_img<image id>`
-  (`_2`, `_3`... after that if that is taken too), and the row's filename
-  follows when it held the stored file's name. The suffix comes from the
-  image id, so a dry run and the run after it choose the same names. A
-  renamed master with a capture id gets a relocation record in its project's
-  capture manifest before it moves, so the capture-time fixity check follows
-  it to its new name.
+  capture record in a capture manifest holds (the only checksum the system
+  keeps for an image). This is the state after a database restored from
+  before the migration (rollback-update.sh) on files the migration moved. A
+  row with no such checksum, or whose candidate does not match, is reported
+  as missing and the candidate as a file no row references.
+- A RAW master's `_preview.jpg` sidecar moves to the volume's `previews/`,
+  under the name its master's final name derives (preview_sidecar_of). A
+  sidecar that cannot follow is recorded in a second file in the data
+  directory, retried at every run, and reported until it has moved.
+- A thumbnail moves to the volume's `thumbnails/`. A thumbnail row naming a
+  missing file is cleared, so the thumbnail endpoint regenerates it beside
+  the moved master. A thumbnail whose name is taken in the target stays
+  where it is, its row is cleared, and it is reported with the files no row
+  references.
+- File names are kept. No file is ever moved onto an existing one. Names are
+  compared casefolded, because exFAT, vfat and APFS by default treat names
+  differing only in case as one. A master whose name is taken in
+  `captures/` (by a file on disk or by another planned move, or by a file of
+  another record with the same stem, which would name the same sidecar), or
+  whose sidecar's name is taken in `previews/`, is moved as
+  `<stem>_img<image id>` (`_2`, `_3`... after that if that is taken too), and
+  the row's filename follows when it held the stored file's name. The suffix
+  comes from the image id, so a dry run and the run after it choose the same
+  names. A renamed master with a capture id gets a relocation record in its
+  volume's capture manifest before it moves, so the capture-time fixity
+  check follows it to its new name. A move that keeps the name needs no
+  record: the integrity check finds the file by name under its capture id,
+  and the old per-project manifests stay where they are and are still read.
 - Only files under the active projects root move, and they stay on it. Files
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
@@ -51,21 +66,20 @@ What is moved, and how:
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
-Crash safety. The work is done one collection at a time. Before a
-collection's files move, the planned moves are written durably to a journal
-in the data directory. After the moves, the source and target directories
-are fsynced, then the rows are committed, then the journal is removed. A run
-that finds a journal completes it first: each file is found at its old or new
-path, moved if it has not been, and the rows are set to where the files are.
-A run is idempotent: a second run finds no row out of place and moves
-nothing.
+Crash safety. The work is done one volume at a time. Before a volume's files
+move, the planned moves are written durably to a journal in the data
+directory. After the moves, the source and target directories are fsynced,
+then the rows are committed, then the journal is removed. A run that finds a
+journal completes it first: each file is found at its old or new path, moved
+if it has not been, and the rows are set to where the files are. A run is
+idempotent: a second run finds no row out of place and moves nothing.
 
 The projects root comes from storage_override.writable_projects_dir, so an
 override root that cannot take writes raises StorageUnavailableError before
 anything is read or created.
 
 Triggered at every backend startup (migrate_volume_layout_at_startup, after
-the project rename reconciliation). On a migrated unit that costs three
+the project rename reconciliation). On a migrated unit that costs two
 queries and a string comparison per image row, with no filesystem access per
 row. Run by hand, with the backend stopped, as
 `python -m app.core.volume_layout [--dry-run]`; a dry run reports what would
@@ -85,10 +99,12 @@ from typing import Dict, Iterable, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import (
+    CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, THUMBNAILS_DIR, is_raw_suffix, preview_sidecar_of,
+    resolve_within_storage,
+)
 from app.core.storage_override import StorageUnavailableError
 from app.models.collection import Collection
-from app.models.project import Project
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
@@ -97,7 +113,7 @@ JOURNAL_NAME = "volume-layout.journal"
 SIDECARS_NAME = "volume-layout.sidecars"
 JOURNAL_VERSION = 2
 
-# A project directory's own subdirectories; never a collection's directory.
+# A project directory's own subdirectories; never a volume's directory.
 PROJECT_SUBDIRS = frozenset({"images", "metadata", "packages"})
 
 
@@ -135,7 +151,7 @@ def _read_json(path: Path, what: str) -> Optional[dict]:
 
 
 def write_layout_journal(payload: dict) -> None:
-    """Durably record the moves planned for one collection, before any of them happens."""
+    """Durably record the moves planned for one volume, before any of them happens."""
     _write_json(_journal_file(), payload)
 
 
@@ -229,45 +245,27 @@ def _root_forms() -> Tuple[Path, Set[str]]:
 
 
 def _expected_dirs(db: Session, root_forms: Set[str]) -> Dict[int, Set[str]]:
-    """Each collection's id-based image directory, as the strings a stored path's directory may equal.
+    """Each stemmed volume's `<stem>/captures`, as the strings a stored path's directory may equal.
 
-    Two queries (projects, collections); the tree is walked in memory.
+    One query; volumes without a stem are not in the result, so their rows
+    are never out of place.
     """
-    from capture.project_manager import collection_dir_name, secure_project_filename
-
-    projects = dict(db.query(Project.id, Project.name).all())
-    cols = {cid: (parent, pid) for cid, parent, pid in
-            db.query(Collection.id, Collection.parent_collection_id, Collection.project_id).all()}
-
-    def project_name(cid: int) -> Optional[str]:
-        seen: Set[int] = set()
-        while cid in cols and cid not in seen:
-            seen.add(cid)
-            parent, pid = cols[cid]
-            if pid:
-                return projects.get(pid)
-            if not parent:
-                return None
-            cid = parent
-        return None
-
     out: Dict[int, Set[str]] = {}
-    for cid in cols:
-        name = project_name(cid)
-        if name is None:
-            continue
-        tail = os.path.join(secure_project_filename(name), collection_dir_name(cid), "images", "main")
-        out[cid] = {os.path.join(r, tail) for r in root_forms}
+    for cid, stem in db.query(Collection.id, Collection.filename_stem).filter(
+            Collection.filename_stem.isnot(None)).all():
+        out[cid] = {os.path.join(r, stem, CAPTURES_DIR) for r in root_forms}
     return out
 
 
 def _out_of_place(db: Session, root_forms: Set[str]) -> List[Tuple[int, int]]:
-    """(image id, collection id) of every collection image stored under the root but not in its collection's directory.
+    """(image id, collection id) of every stemmed volume's image stored under the root but not in its `captures/`.
 
     One query over the image rows (id, file_path, collection_id) and a string
     comparison each; nothing on disk is touched.
     """
     expected = _expected_dirs(db, root_forms)
+    if not expected:
+        return []
     prefixes = tuple(r.rstrip(os.sep) + os.sep for r in root_forms)
     rows = (
         db.query(RecordImage.id, RecordImage.file_path, Record.collection_id)
@@ -277,9 +275,9 @@ def _out_of_place(db: Session, root_forms: Set[str]) -> List[Tuple[int, int]]:
     )
     out: List[Tuple[int, int]] = []
     for iid, fp, cid in rows:
-        if not fp or not fp.startswith(prefixes):
+        if cid not in expected or not fp or not fp.startswith(prefixes):
             continue
-        if os.path.dirname(fp) in expected.get(cid, ()):
+        if os.path.dirname(fp) in expected[cid]:
             continue
         out.append((iid, cid))
     return out
@@ -306,10 +304,11 @@ class _Dir:
     def has(self, name: str) -> bool:
         return name.casefold() in self.names
 
-    def master_taken(self, stem: str, suffix: str, record_id: int, raw: bool) -> bool:
+    def master_taken(self, stem: str, suffix: str, record_id: int, previews: Optional["_Dir"]) -> bool:
+        """Whether `<stem><suffix>` is taken here, or (`previews` given, for a RAW master) its sidecar's name there."""
         if self.has(f"{stem}{suffix}"):
             return True
-        if raw and self.has(preview_sidecar_of(Path(f"{stem}{suffix}")).name):
+        if previews is not None and previews.has(f"{stem}{PREVIEW_SIDECAR_SUFFIX}"):
             return True
         return bool(self.stems.get(stem.casefold(), set()) - {record_id})
 
@@ -388,12 +387,11 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     """Plan the work for the out-of-place rows under `root` (resolved). Reads only.
 
     Returns (batches, skipped, left_unreferenced). Each batch is
-    {"collection_id", "entries"}; each entry names one image's master move (or,
-    with "adopt", the file its row is pointed at) and the sidecar and
-    thumbnail moves that go with it.
+    {"collection_id", "entries"}; each entry names one image's master move to
+    `<stem>/captures/` (or, with "adopt", the file its row is pointed at) and
+    the moves to `<stem>/previews/` and `<stem>/thumbnails/` that go with it.
     """
     from capture.project_manager import image_output_dir
-    from app.core.storage_ops import resolve_project
 
     owners = _owners(db)
     manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
@@ -422,11 +420,14 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             continue
         if cid not in targets:
             collection = db.get(Collection, cid)
-            project = resolve_project(db, collection) if collection is not None else None
-            targets[cid] = image_output_dir(project.name, cid).resolve() if project is not None else None
+            stem = collection.filename_stem if collection is not None else None
+            try:
+                targets[cid] = image_output_dir("", stem=stem).resolve() if stem else None
+            except ValueError:
+                targets[cid] = None  # a stem the model's pattern would refuse
         target = targets[cid]
         if target is None:
-            skipped.append({"image_id": iid, "path": str(src), "reason": "no_project"})
+            skipped.append({"image_id": iid, "path": str(src), "reason": "no_stem"})
             continue
         if src.parent == target:
             continue  # stored through another spelling of the same directory
@@ -448,7 +449,8 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             "thumb_clear": None,
         }
         thumb = resolve_within_storage(img.thumbnail_path) if img.thumbnail_path else None
-        thumb_dir = target.parent / "thumbnails"
+        thumb_dir = target.parent / THUMBNAILS_DIR
+        previews_dir = target.parent / PREVIEWS_DIR
 
         if not src.is_file():
             if not manifest_index:
@@ -475,14 +477,15 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
 
         state = dir_state(target)
         raw = is_raw_suffix(src)
+        previews = dir_state(previews_dir) if raw else None
         key = (target, img.record_id, src.stem.casefold())
         if key in stem_for:
             stem = stem_for[key]
         else:
             stem = src.stem
-            if state.master_taken(stem, src.suffix, img.record_id, raw):
+            if state.master_taken(stem, src.suffix, img.record_id, previews):
                 stem = next(s for s in _suffixed_stems(src.stem, iid)
-                            if not state.master_taken(s, src.suffix, img.record_id, raw))
+                            if not state.master_taken(s, src.suffix, img.record_id, previews))
             stem_for[key] = stem
         dst = target / f"{stem}{src.suffix}"
         state.add(dst.name, img.record_id)
@@ -493,9 +496,9 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             sidecar = preview_sidecar_of(src)
             if sidecar.is_file() and sidecar not in carried and resolve_within_storage(str(sidecar)) is not None:
                 carried.add(sidecar)
-                sidecar_dst = preview_sidecar_of(dst)
+                sidecar_dst = preview_sidecar_of(dst)  # in previews_dir
                 entry["sidecar_from"], entry["sidecar_to"] = str(sidecar), str(sidecar_dst)
-                state.add(sidecar_dst.name, img.record_id)
+                previews.add(sidecar_dst.name, img.record_id)
 
         if img.thumbnail_path:
             if thumb is None or not thumb.is_file():
@@ -514,14 +517,14 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         batches.setdefault(cid, []).append(entry)
 
     left = _unreferenced_in_collection_dirs(db, root, owners, sources)
-    # A refused candidate sits in an id-based directory, which the scan above
+    # A refused candidate sits in a volume's `captures/`, which the scan above
     # does not walk, so it is added here unless a row has since claimed it.
     left += [str(p) for p in sorted(refused) if p not in owners and str(p) not in left]
     return ([{"collection_id": cid, "entries": e} for cid, e in batches.items()], skipped, left)
 
 
 def _collection_top(path: Path, root: Path) -> Optional[Path]:
-    """`<root>/<project>/<top>` for a path under a collection directory, or None."""
+    """`<root>/<project>/<top>` for a path under a name-based volume directory, or None."""
     try:
         parts = path.relative_to(root).parts
     except ValueError:
@@ -532,23 +535,22 @@ def _collection_top(path: Path, root: Path) -> Optional[Path]:
 
 
 def _unreferenced_in_collection_dirs(db: Session, root: Path, owners: Dict[Path, int], sources: Set[Path]) -> List[str]:
-    """Files no row references, in the name-based collection directories and in those files move out of.
+    """Files no row references, in the name-based volume directories and in those files move out of.
 
-    A name-based directory is any directory directly under a project's that is
-    neither one of the project's own (images, metadata, packages) nor
-    `collection-<id>` for an existing collection. The directories files move
+    A name-based directory is any directory directly under a project's that
+    is not one of the project's own (images, metadata, packages). A
+    directory directly under the root named by a volume's stem is a stem
+    layout, not a project's, and is not walked. The directories files move
     out of are scanned whatever their name.
     """
-    from capture.project_manager import collection_dir_name
-
-    id_dirs = {collection_dir_name(cid) for (cid,) in db.query(Collection.id).all()}
+    stems = {stem for (stem,) in db.query(Collection.filename_stem).filter(Collection.filename_stem.isnot(None)).all()}
     tops: Set[Path] = set()
     # A directory that cannot be listed (a drive's lost+found, say) is passed over.
     for project_dir in _listdir(root):
-        if not project_dir.is_dir():
+        if not project_dir.is_dir() or project_dir.name in stems:
             continue
         for top in _listdir(project_dir):
-            if top.is_dir() and top.name not in PROJECT_SUBDIRS and top.name not in id_dirs:
+            if top.is_dir() and top.name not in PROJECT_SUBDIRS:
                 tops.add(top)
     for p in sources:
         top = _collection_top(p, root)
@@ -591,17 +593,25 @@ def _settle(src: Path, dst: Path) -> Optional[Path]:
 
 
 def _free_name(e: dict, src: Path, dst: Path) -> Path:
-    """A name in dst's directory for a master whose planned name was taken after planning."""
+    """A name in dst's directory for a master whose planned name was taken after planning.
+
+    For a RAW master the name its sidecar would take in `previews/` must be free too.
+    """
     for stem in _suffixed_stems(src.stem, e["image_id"]):
         cand = dst.with_name(f"{stem}{src.suffix}")
+        sidecar = preview_sidecar_of(cand)
         if not _taken_in(cand.parent, cand.name) and not (
-                is_raw_suffix(src) and _taken_in(cand.parent, preview_sidecar_of(cand).name)):
+                is_raw_suffix(src) and _taken_in(sidecar.parent, sidecar.name)):
             return cand
     raise AssertionError("unreachable")
 
 
 def _record_relocation(root: Path, e: dict, src: Path, dst: Path) -> None:
-    """Append a relocation record for a renamed master with a capture id to its project's manifest.
+    """Append a relocation record for a renamed master with a capture id to its volume's manifest.
+
+    The manifest is the one under the top directory `dst` is in, which for a
+    master moved to `<stem>/captures/` is the volume's own
+    `<stem>/metadata/manifest.jsonl`, with both paths relative to `<stem>/`.
 
     The record carries the image id and the capture-time sha256 the
     manifests hold for the image now, before the move. With no such
@@ -618,9 +628,9 @@ def _record_relocation(root: Path, e: dict, src: Path, dst: Path) -> None:
         logger.warning(f"Volume layout: no capture checksum is held for image {e['image_id']} at {src}; "
                        f"no relocation record is written for its move to {dst}")
         return
-    project_root = root / dst.relative_to(root).parts[0]
-    append_relocation_record(project_root, e["capture_id"],
-                             os.path.relpath(src, project_root), os.path.relpath(dst, project_root),
+    top = root / dst.relative_to(root).parts[0]
+    append_relocation_record(top, e["capture_id"],
+                             os.path.relpath(src, top), os.path.relpath(dst, top),
                              image_id=e["image_id"], sha256=sha)
 
 
@@ -770,21 +780,21 @@ def _commit_batch(db: Session, root: Path, batch: dict, report: dict) -> None:
         _fsync_dir(d)
     if len(pending) != before:
         _write_pending_sidecars(pending)
-    _commit(db, f"the batch of collection {batch['collection_id']} (the journal is kept for the next run)")
+    _commit(db, f"the batch of volume {batch['collection_id']} (the journal is kept for the next run)")
     clear_layout_journal()
     _remove_emptied_dirs(originals, root)
 
 
 def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> None:
-    """Move each sidecar a previous run could not move to beside its master's current file.
+    """Move each sidecar a previous run could not move to where its master's current file names it.
 
     The sidecar's old and new paths were recorded when its move failed,
     because only then are both known: the capture manifest holds capture-time
     paths, which a later relocation makes stale, and a sidecar need not be in
     it. The entry is keyed by image id. When the master's row names another
     file than the one recorded (a renumber renamed it while the sidecar
-    waited), the sidecar goes beside that file, under the name its stem
-    derives (preview_sidecar_of), as a renumber would have named it, and the
+    waited), the sidecar goes where that file names it, under the name its
+    stem derives (preview_sidecar_of), as a renumber would have named it, and the
     entry is updated to match. An entry is dropped when the sidecar is at its
     destination and gone from its old path, when it is gone from both
     (logged), or when its image's row is gone: that is logged once, the file
@@ -843,6 +853,7 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
         try:
             if _taken_in(to.parent, to.name):
                 raise FileExistsError(errno.EEXIST, "name taken", str(to))
+            to.parent.mkdir(parents=True, exist_ok=True)  # `previews/` may not exist yet
             _move(frm, to)
             _fsync_dir(frm.parent)
             _fsync_dir(to.parent)
@@ -883,11 +894,11 @@ def _summary(entry: dict) -> dict:
 
 
 def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
-    """Move every collection's out-of-place files into its id-based directory; return a report.
+    """Move every stemmed volume's out-of-place files into its stem layout; return a report.
 
     In order: complete a pending journal, retry the sidecars that could not
     follow their masters, find the out-of-place rows, and move their files a
-    collection at a time. With dry_run, nothing is moved, written or created:
+    volume at a time. With dry_run, nothing is moved, written or created:
     the report lists the moves and row updates a run would make now, and a
     pending journal's entries are listed under "pending_journal_entries"
     without being replayed. Raises StorageUnavailableError when the active
@@ -911,7 +922,7 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
                 {"image_id": e["image_id"], "from": e["from"], "to": e["to"]} for e in pending.get("entries", [])
             ]
         else:
-            logger.warning(f"Volume layout: completing the interrupted batch of collection {pending.get('collection_id')}")
+            logger.warning(f"Volume layout: completing the interrupted batch of volume {pending.get('collection_id')}")
             _commit_batch(db, root, pending, report)
             report["completed_journal"] = True
 
@@ -947,7 +958,7 @@ def _log_report(report: dict) -> None:
     if report["moved"] or report["adopted"] or report["completed_journal"]:
         logger.warning(
             f"Volume layout: moved {len(report['moved'])} image(s) and pointed {len(report['adopted'])} row(s) at files "
-            f"already in id-based collection directories under {report['root']}"
+            f"already in volume directories under {report['root']}"
         )
     for f in report["failed"]:
         logger.error(f"Volume layout: image {f['image_id']} not moved, left at {f['path']}: {f['error']}")
@@ -988,7 +999,8 @@ def migrate_volume_layout_at_startup(db: Session) -> None:
 def main(argv: Optional[List[str]] = None) -> int:
     parser = argparse.ArgumentParser(
         prog="python -m app.core.volume_layout",
-        description="Move collection files into id-based directories (collection-<id>). Run with the backend stopped.",
+        description="Move the files of volumes with a file name stem into <stem>/{captures,previews,thumbnails}. "
+                    "Run with the backend stopped.",
     )
     parser.add_argument("--dry-run", action="store_true", help="report what would be done; write nothing")
     args = parser.parse_args(argv)

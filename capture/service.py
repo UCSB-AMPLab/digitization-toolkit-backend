@@ -40,7 +40,7 @@ from .backends import (
     Picamera2Backend,
     RpicamBackend,
 )
-from .project_manager import project_capture_root, image_output_dir
+from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir
 
 from app.core.config import settings
 from app.core.paths import is_raw_suffix, preview_sidecar_of
@@ -303,7 +303,8 @@ def capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         capture_output: bool = False,
-        collection_id: Optional[int] = None) -> str:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None) -> str:
     """
     Capture an image using the rpicam-still command.
     
@@ -314,6 +315,8 @@ def capture_image(
         check_camera (bool): Whether to check camera availability before capture (default is True).
         include_resolution (bool): Include resolution in auto-generated filename (default is False).
         capture_output (bool): Capture stderr/stdout for debugging (default is False for performance).
+        collection_name (str): The volume's name, for a volume without a stem (name-based layout).
+        stem (str): The volume's file name stem; the image goes to `<stem>/captures/`.
     Returns:
         str: The path to the captured image file.
     """
@@ -321,7 +324,10 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = image_output_dir(project_name, collection_id)
+    if stem:
+        # All four, so the RAW backend finds `previews/` for the sidecar.
+        ensure_volume_dirs(stem)
+    project_path = image_output_dir(project_name, collection_name, stem)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -373,7 +379,8 @@ def single_capture_image(
         camera_config: CameraConfig,
         check_camera: bool = True,
         include_resolution: bool = False,
-        collection_id: Optional[int] = None) -> tuple:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -396,12 +403,14 @@ def single_capture_image(
         camera_config=camera_config,
         check_camera=False,  # Already checked
         include_resolution=include_resolution,
-        collection_id=collection_id
+        collection_name=collection_name,
+        stem=stem
     )
     
     elapsed_time = time.time() - start_time
 
-    project_root = project_capture_root(project_name)
+    # The volume's own manifest for a volume with a stem, the project's otherwise
+    project_root = capture_manifest_root(project_name, stem)
 
     record = generate_manifest_record(
         project_name=project_name,
@@ -538,7 +547,8 @@ def dual_capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         stagger_ms: int = 20,
-        collection_id: Optional[int] = None) -> tuple:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -592,7 +602,8 @@ def dual_capture_image(
             check_camera=False,  # Already checked
             include_resolution=include_resolution,
             capture_output=False,  # Max performance
-            collection_id=collection_id
+            collection_name=collection_name,
+            stem=stem
         )
         elapsed = time.time() - start
         return path, elapsed, metadata
@@ -632,7 +643,7 @@ def dual_capture_image(
     img1_path, time1, metadata1 = results[cam1_config.camera_index]
     img2_path, time2, metadata2 = results[cam2_config.camera_index]
 
-    project_root = project_capture_root(project_name)
+    project_root = capture_manifest_root(project_name, stem)
 
     record = generate_manifest_record(
         project_name=project_name,

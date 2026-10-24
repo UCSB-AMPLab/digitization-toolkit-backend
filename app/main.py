@@ -38,9 +38,10 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         reconcile_pending_rename(db)
-        # Move files from the name-based collection directories into the
-        # id-based ones, completing a batch a crash interrupted; a no-op once
-        # the active root is done (app.core.volume_layout).
+        # Move the files of each volume with a file name stem from the
+        # name-based layout into `<stem>/`, completing a batch a crash
+        # interrupted; a no-op once every such volume is done
+        # (app.core.volume_layout).
         from app.core.volume_layout import migrate_volume_layout_at_startup
         migrate_volume_layout_at_startup(db)
     finally:

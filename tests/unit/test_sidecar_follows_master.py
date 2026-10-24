@@ -631,7 +631,7 @@ def _two_collections_with_a_raw_capture(db_session):
     b = Collection(name="B", project_id=project.id)
     db_session.add_all([a, b])
     db_session.commit()
-    src_dir = image_output_dir("proj", a.id)
+    src_dir = image_output_dir("proj", "A")
     src_dir.mkdir(parents=True)
     master = src_dir / "IMG_0020.CR2"
     master.write_bytes(b"raw")
@@ -674,22 +674,14 @@ def test_move_records_has_no_not_moved_key_when_everything_moved(client, db_sess
 
     assert resp.status_code == 200, resp.text
     assert resp.json() == {"moved": 1, "target_collection_id": b.id}
-    assert (image_output_dir("proj", b.id) / sidecar.name).exists()
+    assert (image_output_dir("proj", "B") / sidecar.name).exists()
 
 
 @pytest.mark.unit
-def test_reparent_into_another_project_lists_a_sidecar_left_behind(client, db_session, monkeypatch, capture_settings):
+def test_rename_collection_lists_a_sidecar_left_behind(client, db_session, monkeypatch, capture_settings):
     import shutil
-    from app.models.collection import Collection
-    from app.models.project import Project
 
     a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
-    other = Project(name="proj2")
-    db_session.add(other)
-    db_session.commit()
-    c = Collection(name="C", project_id=other.id)
-    db_session.add(c)
-    db_session.commit()
     real_move = shutil.move
 
     def move(src, dst, *args, **kw):
@@ -698,11 +690,11 @@ def test_reparent_into_another_project_lists_a_sidecar_left_behind(client, db_se
         return real_move(src, dst, *args, **kw)
 
     monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
-    resp = _as_operator(client).patch(f"/collections/{a.id}", json={"parent_collection_id": c.id})
+    resp = _as_operator(client).patch(f"/collections/{a.id}", json={"name": "A2"})
 
     assert resp.status_code == 200, resp.text
     body = resp.json()
-    assert body["parent_collection_id"] == c.id
+    assert body["name"] == "A2"
     assert body["not_moved"] == [sidecar.name]
 
 
@@ -713,7 +705,7 @@ def test_renumber_whose_commit_fails_puts_the_files_back(client, db_session, mon
     from app.models.record import RecordImage
 
     a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
-    image_dir = image_output_dir("proj", a.id)
+    image_dir = image_output_dir("proj", "A")
     before = {p.name: _digest(p) for p in image_dir.iterdir()}
 
     def failing_commit():
@@ -828,7 +820,7 @@ def test_renumber_500_says_whether_every_file_went_back(client, db_session, monk
     from capture.project_manager import image_output_dir
 
     a, _, sidecar = _two_collections_with_a_raw_capture(db_session)
-    image_dir = image_output_dir("proj", a.id)
+    image_dir = image_output_dir("proj", "A")
     real_replace = os.replace
     state = {"phase2": 0}
 

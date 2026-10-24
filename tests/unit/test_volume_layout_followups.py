@@ -1,7 +1,7 @@
 """Follow-ups to the volume layout migration: old journals, pending sidecars, adoption, fixity after renames.
 
-Uses the fixtures of test_volume_dir_by_id: the name-based `legacy` layout
-under the per-test projects root, and a writable data directory.
+Uses the fixtures of test_volume_layout_by_stem: the name-based `legacy`
+layout under the per-test projects root, and a writable data directory.
 """
 
 import json
@@ -10,7 +10,7 @@ from pathlib import Path
 
 import pytest
 
-from tests.unit.test_volume_dir_by_id import capture_settings, data_dir, legacy  # noqa: F401
+from tests.unit.test_volume_layout_by_stem import STEMS, capture_settings, data_dir, legacy  # noqa: F401
 
 
 # ---------------------------------------------------------------------------
@@ -25,7 +25,7 @@ def test_a_v1_journal_left_by_the_earlier_commits_is_completed(db_session, legac
 
     i2 = legacy["i2"]
     src = Path(i2.file_path).resolve()
-    dst = (legacy["root"] / "proj" / f"collection-{legacy['a2'].id}" / "images" / "main" / src.name).resolve()
+    dst = (legacy["root"] / STEMS["a2"] / "captures" / src.name).resolve()
     entry = {"image_id": i2.id, "record_id": i2.record_id, "collection_id": legacy["a2"].id,
              "file_path": i2.file_path, "filename": i2.filename, "from": str(src), "to": str(dst),
              "sidecar_from": None, "sidecar_to": None, "thumb_from": None, "thumb_to": None, "thumb_clear": None}
@@ -100,6 +100,7 @@ def test_a_pending_sidecar_whose_new_name_is_taken_is_kept_and_logged_with_both_
     db_session.expire_all()
     master = Path(db_session.get(RecordImage, legacy["i1"].id).file_path)
     taken = preview_sidecar_of(master)
+    taken.parent.mkdir(parents=True, exist_ok=True)
     taken.write_bytes(b"someone else's preview")
     old = (legacy["shared"] / "IMG_0001_preview.jpg").resolve()
 
@@ -128,7 +129,7 @@ def test_a_pending_sidecar_whose_master_row_is_gone_is_reported_once_as_unrefere
     _fail_sidecars_once(vl, monkeypatch, db_session)
     db_session.delete(db_session.get(RecordImage, legacy["i1"].id))
     db_session.commit()
-    c = Collection(name="Restored", project_id=legacy["proj"].id)
+    c = Collection(name="Restored", project_id=legacy["proj"].id, filename_stem="xx-test-restored")
     db_session.add(c)
     db_session.commit()
     f = override_projects_root / "proj" / "restored" / "images" / "main" / "R_0001.jpg"
@@ -163,14 +164,14 @@ def test_a_pending_sidecar_whose_master_row_is_gone_is_reported_once_as_unrefere
 # Adoption only by a checksum the system holds
 # ---------------------------------------------------------------------------
 
-def _project_and_collection(db, name="Proj", cname="Low"):
+def _project_and_collection(db, name="Proj", cname="Low", stem="xx-test-low"):
     from app.models.collection import Collection
     from app.models.project import Project
 
     p = Project(name=name)
     db.add(p)
     db.commit()
-    c = Collection(name=cname, project_id=p.id)
+    c = Collection(name=cname, project_id=p.id, filename_stem=stem)
     db.add(c)
     db.commit()
     return p, c
@@ -211,7 +212,7 @@ def test_a_row_whose_file_was_already_lost_is_not_pointed_at_another_file_of_the
     root = override_projects_root
     _p, c = _project_and_collection(db_session)
     lost = _image(db_session, c.id, root / "proj" / "low" / "images" / "main" / "fondo_0001.jpg")  # no file
-    other = root / "proj" / f"collection-{c.id}" / "images" / "main" / "fondo_0001.jpg"
+    other = root / "xx-test-low" / "captures" / "fondo_0001.jpg"
     other.parent.mkdir(parents=True)
     other.write_bytes(b"a different page, left by hand or by another collection")
     stored = lost.file_path
@@ -236,7 +237,7 @@ def test_a_file_whose_bytes_differ_from_the_capture_checksum_is_not_adopted(
     _p, c = _project_and_collection(db_session)
     lost = _image(db_session, c.id, root / "proj" / "low" / "images" / "main" / "fondo_0001.jpg", capture_id="cap-1")
     _manifest(root / "proj", "cap-1", "low/images/main/fondo_0001.jpg", b"the captured page")
-    other = root / "proj" / f"collection-{c.id}" / "images" / "main" / "fondo_0001.jpg"
+    other = root / "xx-test-low" / "captures" / "fondo_0001.jpg"
     other.parent.mkdir(parents=True)
     other.write_bytes(b"another page")
 
@@ -258,7 +259,7 @@ def test_a_file_whose_bytes_match_the_capture_checksum_is_adopted(
     _p, c = _project_and_collection(db_session)
     lost = _image(db_session, c.id, root / "proj" / "low" / "images" / "main" / "fondo_0001.jpg", capture_id="cap-1")
     _manifest(root / "proj", "cap-1", "low/images/main/fondo_0001.jpg", b"the captured page")
-    moved = root / "proj" / f"collection-{c.id}" / "images" / "main" / "fondo_0001.jpg"
+    moved = root / "xx-test-low" / "captures" / "fondo_0001.jpg"
     moved.parent.mkdir(parents=True)
     moved.write_bytes(b"the captured page")
 
@@ -282,7 +283,7 @@ def test_a_renamed_master_is_adopted_by_the_checksum_its_relocation_record_carri
     src = root / "proj" / "low" / "images" / "main" / "fondo_0001.jpg"
     img = _image(db_session, c.id, src, b"the captured page", capture_id="cap-1")
     _manifest(root / "proj", "cap-1", "low/images/main/fondo_0001.jpg", b"the captured page")
-    target = root / "proj" / f"collection-{c.id}" / "images" / "main"
+    target = root / "xx-test-low" / "captures"
     target.mkdir(parents=True)
     (target / "fondo_0001.jpg").write_bytes(b"unrelated")
     before = (img.file_path, img.filename)
@@ -306,16 +307,25 @@ def test_a_renamed_master_is_adopted_by_the_checksum_its_relocation_record_carri
 # Fixity after a rename made after the migration
 # ---------------------------------------------------------------------------
 
-def _manifest_lines(project_dir: Path) -> list:
-    return [json.loads(l) for l in (project_dir / "metadata" / "manifest.jsonl").read_text().splitlines() if l.strip()]
+def _manifest_lines(top: Path) -> list:
+    """The lines of the manifest under `top` (a project's directory or a volume's `<stem>/`); none if it has none."""
+    path = top / "metadata" / "manifest.jsonl"
+    if not path.exists():
+        return []
+    return [json.loads(l) for l in path.read_text().splitlines() if l.strip()]
 
 
-def _relocations(project_dir: Path) -> list:
-    return [l for l in _manifest_lines(project_dir) if l.get("record_type") == "relocation"]
+def _relocations(top: Path) -> list:
+    return [l for l in _manifest_lines(top) if l.get("record_type") == "relocation"]
+
+
+def _a2_volume(legacy) -> Path:
+    """Fondo A (the second)'s `<stem>/`, whose manifest takes the relocation records of its later renames."""
+    return legacy["root"] / STEMS["a2"]
 
 
 def _captured_i2(db_session, legacy):
-    """IMG_0002 with a capture record in the project manifest, then migrated into its id-based directory."""
+    """IMG_0002 with a capture record in the project manifest, then migrated into its volume's stem layout."""
     from app.core.volume_layout import migrate_volume_layout
     from app.models.record import RecordImage
 
@@ -344,9 +354,10 @@ def test_fixity_follows_a_master_renamed_by_a_renumber_after_the_migration(db_se
     new = Path(img.file_path)
     assert new.name != "IMG_0002.jpg"
 
-    proj = legacy["root"] / "proj"
-    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(proj)] == [
-        ("cap-0002", os.path.relpath(old, proj.resolve()), os.path.relpath(new, proj.resolve()))]
+    vol = _a2_volume(legacy)
+    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(vol)] == [
+        ("cap-0002", os.path.relpath(old, vol.resolve()), os.path.relpath(new, vol.resolve()))]
+    assert _relocations(legacy["root"] / "proj") == []
     assert verify_images_against_manifest([img]) == []
     new.write_bytes(b"bit rot")
     assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
@@ -363,7 +374,7 @@ def test_a_renumber_whose_commit_is_rolled_back_writes_no_relocation_record(db_s
     assert restore_original_names(applied) == []
     db_session.commit()  # a later commit on the same session carries nothing from the rolled-back renumber
 
-    assert _relocations(legacy["root"] / "proj") == []
+    assert _relocations(_a2_volume(legacy)) == []
 
 
 @pytest.mark.unit
@@ -387,22 +398,26 @@ def test_a_renumber_unwound_on_disk_writes_no_relocation_record(db_session, lega
     monkeypatch.setattr(so.os, "replace", real)
     db_session.commit()
 
-    assert _relocations(legacy["root"] / "proj") == []
+    assert _relocations(_a2_volume(legacy)) == []
 
 
 def _clash_setup(db_session, capture_settings_root):
-    """An image with a capture record in collection A, to be moved into collection B, where its name is taken."""
+    """An image with a capture record in volume A, to be moved into volume B, where its name is taken.
+
+    Both have stems, so the capture record is in A's own manifest and the
+    relocation record goes in B's.
+    """
     root = capture_settings_root
-    _p, a = _project_and_collection(db_session, cname="A")
+    _p, a = _project_and_collection(db_session, cname="A", stem="xx-test-a")
     from app.models.collection import Collection
 
-    b = Collection(name="B", project_id=_p.id)
+    b = Collection(name="B", project_id=_p.id, filename_stem="xx-test-b")
     db_session.add(b)
     db_session.commit()
-    src = root / "proj" / f"collection-{a.id}" / "images" / "main" / "folio_0001.jpg"
+    src = root / "xx-test-a" / "captures" / "folio_0001.jpg"
     img = _image(db_session, a.id, src, b"the captured page", capture_id="cap-1")
-    _manifest(root / "proj", "cap-1", f"collection-{a.id}/images/main/folio_0001.jpg", b"the captured page")
-    target = root / "proj" / f"collection-{b.id}" / "images" / "main"
+    _manifest(root / "xx-test-a", "cap-1", "captures/folio_0001.jpg", b"the captured page")
+    target = root / "xx-test-b" / "captures"
     target.mkdir(parents=True)
     (target / "folio_0001.jpg").write_bytes(b"another page")
     return img, src, target
@@ -424,9 +439,9 @@ def test_fixity_follows_a_master_renamed_on_a_clash_when_it_is_moved(
     new = Path(img.file_path)
     assert new.parent == target and new.name != "folio_0001.jpg"
     assert (target / "folio_0001.jpg").read_bytes() == b"another page"
-    proj = (override_projects_root / "proj").resolve()
-    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(proj)] == [
-        ("cap-1", os.path.relpath(src.resolve(), proj), os.path.relpath(new.resolve(), proj))]
+    vol = (override_projects_root / "xx-test-b").resolve()
+    assert [(r["capture_id"], r["from"], r["to"]) for r in _relocations(vol)] == [
+        ("cap-1", os.path.relpath(src.resolve(), vol), os.path.relpath(new.resolve(), vol))]
     assert verify_images_against_manifest([img]) == []
     new.write_bytes(b"bit rot")
     assert [m["record_image_id"] for m in verify_images_against_manifest([img])] == [img.id]
@@ -449,7 +464,7 @@ def test_a_clash_rename_whose_commit_fails_and_is_unwound_writes_no_relocation_r
     monkeypatch.undo()
 
     assert src.read_bytes() == b"the captured page"
-    assert _relocations(override_projects_root / "proj") == []
+    assert _relocations(override_projects_root / "xx-test-b") == []
 
 
 @pytest.mark.unit
@@ -469,7 +484,7 @@ def test_a_clash_rename_whose_commit_raised_but_landed_writes_its_relocation_rec
     monkeypatch.undo()
 
     assert not src.exists()
-    assert [r["capture_id"] for r in _relocations(override_projects_root / "proj")] == ["cap-1"]
+    assert [r["capture_id"] for r in _relocations(override_projects_root / "xx-test-b")] == ["cap-1"]
 
 
 @pytest.mark.unit
@@ -482,7 +497,7 @@ def test_relocation_records_of_later_renames_stay_out_of_the_bag_manifest(db_ses
     _captured_i2(db_session, legacy)
     renumber_collection_images(db_session, legacy["a2"])
     db_session.commit()
-    assert _relocations(legacy["root"] / "proj")
+    assert _relocations(_a2_volume(legacy))
 
     collection = db_session.get(Collection, legacy["a2"].id)
     records = db_session.query(Record).filter(Record.collection_id == collection.id).all()
@@ -520,15 +535,15 @@ def test_queued_relocations_are_scoped_to_the_renumbering_session(db_session, le
         other.commit()
     finally:
         other.close()
-    assert _relocations(legacy["root"] / "proj") == []
+    assert _relocations(_a2_volume(legacy)) == []
 
     db_session.commit()
-    assert [r["capture_id"] for r in _relocations(legacy["root"] / "proj")] == ["cap-0002"]
+    assert [r["capture_id"] for r in _relocations(_a2_volume(legacy))] == ["cap-0002"]
     # The rollback listener is gone; the commit listener that fired cannot remove
     # itself during its own dispatch, and stays, spent, until the next queue.
     assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
     db_session.commit()
-    assert len(_relocations(legacy["root"] / "proj")) == 1
+    assert len(_relocations(_a2_volume(legacy))) == 1
 
     from app.models.collection import Collection
 
@@ -537,7 +552,7 @@ def test_queued_relocations_are_scoped_to_the_renumbering_session(db_session, le
     renumber_collection_images(db_session, legacy["a2"])  # renames to otro_NNNN; the spent listener is removed
     assert sorted(n for n, _ in _storage_ops_listeners(db_session)) == ["after_commit", "after_soft_rollback"]
     db_session.commit()
-    assert len(_relocations(legacy["root"] / "proj")) == 2
+    assert len(_relocations(_a2_volume(legacy))) == 2
     assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_commit"]
 
 
@@ -554,11 +569,11 @@ def test_the_listeners_leave_the_session_when_its_queued_relocations_are_dropped
 
     assert [n for n, _ in _storage_ops_listeners(db_session)] == ["after_soft_rollback"]
     db_session.commit()
-    assert _relocations(legacy["root"] / "proj") == []
+    assert _relocations(_a2_volume(legacy)) == []
 
 
 # ---------------------------------------------------------------------------
-# Relocations applied in the order they happened, across project manifests
+# Relocations applied in the order they happened, across the manifests of several volumes
 # ---------------------------------------------------------------------------
 
 def _glob_in_order(monkeypatch, reverse: bool):
@@ -576,9 +591,9 @@ def _glob_in_order(monkeypatch, reverse: bool):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("reverse", [False, True])
-def test_a_relocation_chain_split_across_project_manifests_resolves_to_the_current_path(
+def test_a_relocation_chain_split_across_volume_manifests_resolves_to_the_current_path(
         db_session, capture_settings, data_dir, override_projects_root, monkeypatch, reverse):
-    """Captured in project A, moved into project B and renumbered there, then moved back to A on a name clash."""
+    """Captured in volume A, moved into volume B (another project) and renumbered there, then moved to C on a clash."""
     from app.core.integrity import verify_images_against_manifest
     from app.core.storage_ops import relocate_images_and_commit, renumber_collection_images
     from app.models.collection import Collection
@@ -586,24 +601,24 @@ def test_a_relocation_chain_split_across_project_manifests_resolves_to_the_curre
     from app.models.record import Record, RecordImage
 
     root = override_projects_root
-    pa, a = _project_and_collection(db_session, name="PA", cname="A")
+    pa, a = _project_and_collection(db_session, name="PA", cname="A", stem="xx-test-pa-a")
     pb = Project(name="PB")
     db_session.add(pb)
     db_session.commit()
-    b = Collection(name="B", project_id=pb.id)
-    c = Collection(name="C", project_id=pa.id)
+    b = Collection(name="B", project_id=pb.id, filename_stem="xx-test-pb-b")
+    c = Collection(name="C", project_id=pa.id, filename_stem="xx-test-pa-c")
     db_session.add_all([b, c])
     db_session.commit()
-    src = root / "pa" / f"collection-{a.id}" / "images" / "main" / "folio_0001.jpg"
+    src = root / "xx-test-pa-a" / "captures" / "folio_0001.jpg"
     img = _image(db_session, a.id, src, b"the captured page", capture_id="cap-1")
-    _manifest(root / "pa", "cap-1", f"collection-{a.id}/images/main/folio_0001.jpg", b"the captured page")
+    _manifest(root / "xx-test-pa-a", "cap-1", "captures/folio_0001.jpg", b"the captured page")
 
     rec = db_session.get(Record, img.record_id)
     rec.collection_id = b.id
-    relocate_images_and_commit(db_session, [(img, root / "pb" / f"collection-{b.id}" / "images" / "main")], [], "move")
+    relocate_images_and_commit(db_session, [(img, root / "xx-test-pb-b" / "captures")], [], "move")
     renumber_collection_images(db_session, db_session.get(Collection, b.id))
     db_session.commit()
-    c_dir = root / "pa" / f"collection-{c.id}" / "images" / "main"
+    c_dir = root / "xx-test-pa-c" / "captures"
     c_dir.mkdir(parents=True)
     (c_dir / "b_0001.jpg").write_bytes(b"another page")
     db_session.expire_all()
@@ -615,7 +630,8 @@ def test_a_relocation_chain_split_across_project_manifests_resolves_to_the_curre
     current = Path(img.file_path)
     assert current.parent == c_dir.resolve() or current.parent == c_dir
     assert current.name.startswith("b_0001_")
-    assert len(_relocations(root / "pa")) == 1 and len(_relocations(root / "pb")) == 1
+    assert len(_relocations(root / "xx-test-pb-b")) == 1 and len(_relocations(root / "xx-test-pa-c")) == 1
+    assert _relocations(root / "xx-test-pa-a") == []
 
     _glob_in_order(monkeypatch, reverse)
     assert verify_images_against_manifest([img]) == []
@@ -633,8 +649,8 @@ def _chain_setup(legacy):
 
     root = legacy["root"]
     a = "fondo_a/images/main/CHAIN.jpg"
-    b = "collection-9/images/main/CHAIN_img9.jpg"
-    c = "collection-9/images/main/fondo_a_0001.jpg"
+    b = "tomo_9/images/main/CHAIN_img9.jpg"
+    c = "tomo_9/images/main/fondo_a_0001.jpg"
     f = root / "proj" / c
     f.parent.mkdir(parents=True, exist_ok=True)
     f.write_bytes(b"captured bytes")
@@ -720,12 +736,12 @@ def test_two_renumbers_that_reuse_names_still_resolve_each_image(
     from app.models.record import Record, RecordImage
 
     root = override_projects_root
-    _p, c = _project_and_collection(db_session, cname="Tomo")
-    d = root / "proj" / f"collection-{c.id}" / "images" / "main"
+    _p, c = _project_and_collection(db_session, cname="Tomo", stem="xx-test-tomo")
+    d = root / "xx-test-tomo" / "captures"
     left = _image(db_session, c.id, d / "L.jpg", b"left page", capture_id="cap-pair")
     right = _image(db_session, c.id, d / "R.jpg", b"right page", capture_id="cap-pair")
     for f, data in (("L.jpg", b"left page"), ("R.jpg", b"right page")):
-        _manifest(root / "proj", "cap-pair", f"collection-{c.id}/images/main/{f}", data)
+        _manifest(root / "xx-test-tomo", "cap-pair", f"captures/{f}", data)
     rl, rr = db_session.get(Record, left.record_id), db_session.get(Record, right.record_id)
     rl.sequence, rr.sequence = 1, 2
     db_session.commit()
@@ -764,7 +780,7 @@ def test_every_written_relocation_record_names_its_image_and_checksum(db_session
     renumber_collection_images(db_session, legacy["a2"])
     db_session.commit()
 
-    records = [r for r in _relocations(legacy["root"] / "proj") if r["capture_id"] == "cap-0002"]
+    records = [r for r in _relocations(_a2_volume(legacy)) if r["capture_id"] == "cap-0002"]
     assert len(records) == 2
     assert all(r["image_id"] == legacy["i2"].id and r["sha256"] == sha for r in records)
     assert hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest() == sha
@@ -782,7 +798,7 @@ def renamed_capture_i2(db_session, legacy):
     proj = legacy["root"] / "proj"
     (proj / "metadata" / "manifest.jsonl").write_text("")
     _manifest(proj, "cap-0002", "fondo_a/images/main/IMG_0002.jpg", b"bytes of IMG_0002.jpg")
-    target = proj / f"collection-{legacy['a2'].id}" / "images" / "main"
+    target = _a2_volume(legacy) / "captures"
     target.mkdir(parents=True)
     (target / "IMG_0002.jpg").write_bytes(b"unrelated")
     return hashlib.sha256(b"bytes of IMG_0002.jpg").hexdigest()
@@ -803,9 +819,10 @@ def _renumber_with_failed_record(db, legacy, monkeypatch):
     img = db.get(RecordImage, legacy["i2"].id)
     img.capture_id = "cap-0002"
     db.commit()
-    proj = legacy["root"] / "proj"
-    (proj / "metadata" / "manifest.jsonl").write_text("")
-    _manifest(proj, "cap-0002", os.path.relpath(Path(img.file_path), proj.resolve()), Path(img.file_path).read_bytes())
+    (legacy["root"] / "proj" / "metadata" / "manifest.jsonl").write_text("")
+    # A capture made after the migration: its record is in the volume's own manifest.
+    vol = _a2_volume(legacy)
+    _manifest(vol, "cap-0002", os.path.relpath(Path(img.file_path), vol.resolve()), Path(img.file_path).read_bytes())
 
     def boom(*a, **k):
         raise OSError(28, "No space left on device")
@@ -899,7 +916,7 @@ def _unknown_outcome_move(db_session, root, monkeypatch, lands: bool, interrupt:
     with pytest.raises(_Interrupt if interrupt else so.HTTPException):
         so.relocate_images_and_commit(db_session, [(img, target)], [], "test move")
     monkeypatch.setattr(db_session, "commit", real_commit)
-    records = _relocations(root / "proj")
+    records = _relocations(root / "xx-test-b")
     return img, src, records
 
 
@@ -940,7 +957,7 @@ def test_an_unknown_outcome_commit_that_did_not_land_writes_the_record_and_the_f
     db_session.expire_all()
     row = db_session.get(RecordImage, img.id)
     assert Path(row.file_path) == src and not src.exists()
-    new = (override_projects_root / "proj").resolve() / records[0]["to"]
+    new = (override_projects_root / "xx-test-b").resolve() / records[0]["to"]
     assert new.is_file()
 
     row.file_path = str(new)  # the recovery by hand the ERROR log asks for

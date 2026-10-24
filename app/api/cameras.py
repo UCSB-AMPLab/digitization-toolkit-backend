@@ -45,11 +45,13 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 	return (current_max + 1) if current_max is not None else 0
 
 
-def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[int]]:
-	"""Authoritative (project_name, collection_id) for the on-disk capture path.
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
+	"""Authoritative (project_name, collection_name, stem) for the on-disk capture path.
 
-	The collection's directory is named by its id (image_output_dir), so the
-	id is returned, checked to name a collection attached to a project.
+	A volume with a file name stem captures into `<stem>/captures/`; one
+	without captures into its name-based directory under its project
+	(image_output_dir). Both are returned, with the stem None for a volume
+	without one; a project-level capture has neither.
 	"""
 	if collection_id:
 		col = db.query(Collection).filter(Collection.id == collection_id).first()
@@ -58,11 +60,11 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 		resolved = resolve_project_name(db, col)
 		if not resolved:
 			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
-		return resolved, col.id
+		return resolved, col.name, col.filename_stem
 	project = db.query(Project).filter(Project.name == project_name).first()
 	if not project:
 		raise HTTPException(status_code=422, detail="project_name does not match a known project")
-	return project.name, None
+	return project.name, None, None
 
 
 class DeviceInfo(BaseModel):
@@ -737,14 +739,15 @@ def trigger_capture(
 		camera_config = CameraConfig(**config_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, target_collection_id = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
-			collection_id=target_collection_id
+			collection_name=collection_name,
+			stem=stem
 		)
 		
 		# Extract image dimensions and EXIF data
@@ -963,7 +966,7 @@ def trigger_dual_capture(
 		cam1_config = CameraConfig(**config1_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, target_collection_id = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=project_name,
@@ -972,7 +975,8 @@ def trigger_dual_capture(
 			check_camera=False,
 			include_resolution=request.include_resolution_in_filename,
 			stagger_ms=request.stagger_ms,
-			collection_id=target_collection_id
+			collection_name=collection_name,
+			stem=stem
 		)
 
 		# Reuse the resolved project name so the DB record matches the on-disk tree

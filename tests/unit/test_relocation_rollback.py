@@ -2,8 +2,7 @@
 
 Three routes relocate image files with `relocate_image` and commit once at
 the end: POST /collections/{id}/move-records, PATCH /collections/{id} (a
-re-parent under a collection of another project; a rename moves no file),
-and POST /projects/{id}/move-collections. A failure
+rename or re-parent), and POST /projects/{id}/move-collections. A failure
 part-way through the moves, or at the commit, rolls the session back, so the
 rows keep their old paths; the files already moved are moved back to match
 them, RAW preview sidecars included.
@@ -40,7 +39,7 @@ def capture_settings(override_projects_root, monkeypatch):
 
 @pytest.fixture
 def layout(db_session, capture_settings):
-    """Projects "proj" and "proj2"; collections A and B in proj, C in proj2; three records in A.
+    """Projects "proj" and "proj2"; collections A and B in proj; three records in A.
 
     Two records hold a RAW master with its `_preview.jpg` sidecar, the third a
     JPEG master. Every image has a thumbnail file in `images/thumbnails`.
@@ -56,11 +55,10 @@ def layout(db_session, capture_settings):
     db_session.commit()
     a = Collection(name="A", project_id=proj.id)
     b = Collection(name="B", project_id=proj.id)
-    c = Collection(name="C", project_id=proj2.id)
-    db_session.add_all([a, b, c])
+    db_session.add_all([a, b])
     db_session.commit()
 
-    src_dir = image_output_dir("proj", a.id)
+    src_dir = image_output_dir("proj", "A")
     src_dir.mkdir(parents=True)
     thumb_dir = src_dir.parent / "thumbnails"
     thumb_dir.mkdir()
@@ -77,24 +75,23 @@ def layout(db_session, capture_settings):
         db_session.add(RecordImage(record_id=rec.id, filename=name, file_path=str(master),
                                    thumbnail_path=str(thumb), format=master.suffix.lstrip(".").lower()))
         db_session.commit()
-    return {"proj": proj, "proj2": proj2, "a": a, "b": b, "c": c, "src_dir": src_dir, "thumb_dir": thumb_dir}
+    return {"proj": proj, "proj2": proj2, "a": a, "b": b, "src_dir": src_dir, "thumb_dir": thumb_dir}
 
 
-# Each route: how to call it, and the (project name, collection id) of the
-# directory it moves A's images into.
+# Each route: how to call it, and the directory it moves A's images into.
 ROUTES = {
     "move_records": (
         lambda api, L: api.post(f"/collections/{L['a'].id}/move-records?target_collection_id={L['b'].id}"),
-        lambda L: ("proj", L["b"].id),
+        ("proj", "B"),
     ),
-    "reparent_collection": (
-        lambda api, L: api.patch(f"/collections/{L['a'].id}", json={"parent_collection_id": L["c"].id}),
-        lambda L: ("proj2", L["a"].id),
+    "rename_collection": (
+        lambda api, L: api.patch(f"/collections/{L['a'].id}", json={"name": "A2"}),
+        ("proj", "A2"),
     ),
     "move_collections": (
         lambda api, L: api.post(f"/projects/{L['proj'].id}/move-collections",
                                 json={"target_project_id": L["proj2"].id}),
-        lambda L: ("proj2", L["a"].id),
+        ("proj2", "A"),
     ),
 }
 
@@ -186,12 +183,12 @@ def test_a_move_that_succeeds_relocates_masters_and_sidecars(route, client, db_s
     from capture.project_manager import image_output_dir
     from app.models.record import RecordImage
 
-    call, target = ROUTES[route]
+    call, (project_name, collection_name) = ROUTES[route]
     resp = call(_as_operator(client), layout)
 
     assert resp.status_code == 200, resp.text
     assert "not_moved" not in resp.json()
-    new_dir = image_output_dir(*target(layout))
+    new_dir = image_output_dir(project_name, collection_name)
     assert sorted(p.name for p in new_dir.iterdir()) == [
         "IMG_0001.CR2", "IMG_0001_preview.jpg", "IMG_0002.CR2", "IMG_0002_preview.jpg", "IMG_0003.jpg",
     ]
@@ -211,7 +208,7 @@ def test_a_move_back_that_fails_is_logged_and_the_original_error_still_reported(
     from capture.project_manager import image_output_dir
 
     call, _ = ROUTES["move_records"]
-    new_dir = image_output_dir("proj", layout["b"].id)
+    new_dir = image_output_dir("proj", "B")
     real_move = shutil.move
     count = {"masters": 0}
 
@@ -282,14 +279,14 @@ def test_a_commit_that_landed_before_raising_keeps_the_files_moved(route, client
     from capture.project_manager import image_output_dir
     from app.models.record import RecordImage
 
-    call, target = ROUTES[route]
+    call, (project_name, collection_name) = ROUTES[route]
     _commit_lands_then_raises(monkeypatch, db_session)
     with caplog.at_level(logging.WARNING, logger="app.core.storage_ops"):
         resp = call(_as_operator(client), layout)
 
     assert resp.status_code == 200, resp.text
     assert "not_moved" not in resp.json()
-    new_dir = image_output_dir(*target(layout))
+    new_dir = image_output_dir(project_name, collection_name)
     db_session.expire_all()
     for img in db_session.query(RecordImage).all():
         assert Path(img.file_path) == (new_dir / img.filename).resolve()
@@ -304,7 +301,7 @@ def test_a_commit_whose_outcome_cannot_be_checked_leaves_the_files_moved(route, 
     from sqlalchemy.exc import OperationalError
     from capture.project_manager import image_output_dir
 
-    call, target = ROUTES[route]
+    call, (project_name, collection_name) = ROUTES[route]
     real_query = db_session.query
     state = {"down": False}
 
@@ -325,7 +322,7 @@ def test_a_commit_whose_outcome_cannot_be_checked_leaves_the_files_moved(route, 
     assert resp.status_code == 500, resp.text
     detail = resp.json()["detail"]
     assert "could not be determined" in detail
-    new_dir = image_output_dir(*target(layout))
+    new_dir = image_output_dir(project_name, collection_name)
     assert sorted(p.name for p in new_dir.iterdir()) == [
         "IMG_0001.CR2", "IMG_0001_preview.jpg", "IMG_0002.CR2", "IMG_0002_preview.jpg", "IMG_0003.jpg",
     ]
@@ -376,7 +373,7 @@ def test_an_interrupt_mid_loop_puts_the_files_back_and_propagates(db_session, la
         return real_move(src, dst, *args, **kw)
 
     monkeypatch.setattr("app.core.storage_ops.shutil.move", move)
-    target = image_output_dir("proj", layout["b"].id)
+    target = image_output_dir("proj", "B")
     moves = [(i, target) for i in db_session.query(RecordImage).order_by(RecordImage.id).all()]
     with pytest.raises(KeyboardInterrupt):
         relocate_images_and_commit(db_session, moves, [], "test move")
@@ -419,7 +416,7 @@ def test_a_failed_commit_whose_rollback_also_fails_is_an_unknown_outcome(client,
 
     assert resp.status_code == 500, resp.text
     assert "could not be determined" in resp.json()["detail"]
-    _assert_left_at_new_paths_and_logged(layout, image_output_dir("proj", layout["b"].id), caplog)
+    _assert_left_at_new_paths_and_logged(layout, image_output_dir("proj", "B"), caplog)
 
 
 @pytest.mark.unit
@@ -431,7 +428,7 @@ def test_an_interrupt_during_the_commit_moves_nothing_and_propagates(db_session,
     def commit():
         raise KeyboardInterrupt()
 
-    target = image_output_dir("proj", layout["b"].id)
+    target = image_output_dir("proj", "B")
     moves = [(i, target) for i in db_session.query(RecordImage).order_by(RecordImage.id).all()]
     monkeypatch.setattr(db_session, "commit", commit)
     with caplog.at_level(logging.ERROR, logger="app.core.storage_ops"):

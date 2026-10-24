@@ -28,12 +28,12 @@ from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
     collection_and_descendants,
+    collection_image_dir,
+    collection_root_dir,
     relocate_images_and_commit,
     remove_empty_dirs,
     renumber_collection_images,
     restore_original_names,
-    resolve_project,
-    resolve_project_name,
     surviving_images_under,
 )
 
@@ -252,12 +252,13 @@ def update_collection(
     
     Can update name, description, type, metadata, or move to different parent collection.
 
-    A collection's directory is named by its id and sits directly under its
-    project's (image_output_dir), so a rename or a re-parent inside the
-    project moves no file. A re-parent under a collection of another project
-    moves the files of every record in the collection and its sub-collections
-    into that project's directory, so it is refused with 409 while an export
-    of any of them is queued or running. Other edits are not refused.
+    A volume with a file name stem keeps its files in `<stem>/` under the
+    projects root, outside any project, so a rename or a re-parent moves none
+    of them. A volume without a stem keeps the name-based layout,
+    `<project>/<name>/images/main/`, so a rename or a re-parent moves the
+    files of each such volume in the subtree whose directory changes. That
+    is refused with 409 while an export of any of those volumes is queued or
+    running. Other edits are not refused.
     """
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
@@ -285,24 +286,27 @@ def update_collection(
             if not current:
                 break
     
-    # Only a change of project changes where the files live: the project's
-    # directory is named after it, the collection's after its id.
+    # Only volumes without a stem have a directory named after the volume
+    # and its project, so only they can have their files moved by a rename or
+    # a re-parent; a volume with a stem keeps its files where they are.
     update_data = payload.model_dump(exclude_unset=True)
-    old_project = resolve_project(db, collection)
-    new_project = old_project
-    if "parent_collection_id" in update_data and update_data["parent_collection_id"] != collection.parent_collection_id:
-        new_parent_id = update_data["parent_collection_id"]
-        # A null parent leaves the collection with no project (project_id is
-        # not set here), so no directory to move the files to.
-        new_project = resolve_project(db, db.get(Collection, new_parent_id)) if new_parent_id is not None else None
-    files_move = new_project is not None and (old_project is None or new_project.id != old_project.id)
+    layout_changed = (
+        ("name" in update_data and update_data["name"] != collection.name)
+        or ("parent_collection_id" in update_data
+            and update_data["parent_collection_id"] != collection.parent_collection_id)
+    )
     not_moved: List[str] = []
     moves: List = []
-    # Moving files to another project relocates the files of every record in
-    # the subtree, and an export of any collection in it reads those files by
-    # path, so the whole subtree is held against exports, before anything is
-    # changed, until the files have moved and the commit is done.
-    held_ids = collection_and_descendants(db, collection.id) if files_move else []
+    held_ids: List[int] = []
+    old_dirs: dict = {}
+    if layout_changed:
+        subtree = db.query(Collection).filter(
+            Collection.id.in_(collection_and_descendants(db, collection.id))).all()
+        old_dirs = {c.id: collection_image_dir(db, c) for c in subtree if not c.filename_stem}
+        # Their files are read by path by an export of any of them, so they
+        # are held against exports, before anything is changed, until the
+        # files have moved and the commit is done.
+        held_ids = sorted(old_dirs)
     with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_SUBTREE_MESSAGE):
         # Update fields. A change to external_id or filename_stem that the
         # model refuses (written once; fixed by the first image) is a 409.
@@ -317,13 +321,21 @@ def update_collection(
         if collection.parent_collection_id is not None:
             collection.project_id = None
 
-        if files_move:
-            from capture.project_manager import image_output_dir
-
-            records = db.query(Record).filter(Record.collection_id.in_(held_ids)).all()
-            for r in records:
-                target_dir = image_output_dir(new_project.name, r.collection_id)
-                moves.extend((img, target_dir) for img in r.images)
+        # Each volume without a stem whose directory the change moved has
+        # its records' files moved to the new directory. One given a stem in
+        # this same request is left to the startup migration.
+        if held_ids:
+            targets = {}
+            for c in db.query(Collection).filter(Collection.id.in_(held_ids)).all():
+                if c.filename_stem:
+                    continue
+                new_dir = collection_image_dir(db, c)
+                if new_dir is not None and new_dir != old_dirs.get(c.id):
+                    targets[c.id] = new_dir
+            if targets:
+                records = db.query(Record).filter(Record.collection_id.in_(list(targets))).all()
+                for r in records:
+                    moves.extend((img, targets[r.collection_id]) for img in r.images)
 
         # Flushed before any file is moved, so that a duplicate stem or
         # external_id, or an end date before the stored start, is refused
@@ -357,8 +369,6 @@ def move_collection_records(
     Move all records from one collection to another, relocating their image
     files on disk so the moved records keep pointing at existing files.
     """
-    from capture.project_manager import image_output_dir
-
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
@@ -367,10 +377,10 @@ def move_collection_records(
     if not target:
         raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
 
-    target_project_name = resolve_project_name(db, target)
-    if not target_project_name:
+    # `<stem>/captures` for a target with a stem, its name-based directory otherwise
+    target_dir = collection_image_dir(db, target)
+    if target_dir is None:
         raise HTTPException(status_code=422, detail="Target collection is not attached to a project")
-    target_dir = image_output_dir(target_project_name, target.id)
 
     # Locked, because the refusal below reads each record's status and the
     # relocation that follows is a filesystem move no transaction takes back.
@@ -441,8 +451,6 @@ def delete_collection(
     layout migration left there) stays, with the directories above it, and is
     logged at WARNING.
     """
-    from capture.project_manager import collection_capture_root
-
     # Under the row lock, so that a PATCH setting a first stem cannot land
     # between this check and the delete.
     collection = _locked_collection_query(db, collection_id).first()
@@ -461,8 +469,8 @@ def delete_collection(
             detail=f"Cannot delete a non-empty collection: {child_count} sub-collection(s) and {record_count} record(s) remain. Move or delete them first.",
         )
 
-    project_name = resolve_project_name(db, collection)
-    col_dir = collection_capture_root(project_name, collection.id) if project_name else None
+    # `<stem>/` for a volume with a stem, its name-based directory otherwise
+    col_dir = collection_root_dir(db, collection)
 
     if col_dir is not None:
         # Hard guard: never remove a directory that still holds a surviving record's files

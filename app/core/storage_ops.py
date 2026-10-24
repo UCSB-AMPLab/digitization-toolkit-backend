@@ -32,9 +32,9 @@ logger = logging.getLogger(__name__)
 # Relocation records for masters renamed after capture
 # ---------------------------------------------------------------------------
 
-# (project directory, capture id, image id, sha256, from, to), the paths
-# relative to the project directory, as
-# capture.manifestHandler.append_relocation_record takes them.
+# (manifest root, capture id, image id, sha256, from, to): the manifest root
+# is a project's directory or a stemmed volume's `<stem>/`, and the paths are
+# relative to it, as capture.manifestHandler.append_relocation_record takes them.
 Relocation = Tuple[Path, str, int, str, str, str]
 
 _QUEUED_RELOCATIONS = "storage_ops.queued_relocations"
@@ -66,8 +66,10 @@ def relocation_of(img: RecordImage, src: Path, dst: Path, fixity_index: FixityIn
     image at `src`, looked up before the record is written. With no such
     checksum there is nothing to carry: no record, and a WARNING; the export
     fixity gate then refuses the image by name. The record goes in the
-    manifest of the project `dst` is in, under the active projects root, the
-    root app.core.integrity indexes; a `dst` outside it gets none.
+    manifest of the top directory `dst` is in under the active projects root,
+    the root app.core.integrity indexes: the project's for a volume without a
+    stem, the volume's own `<stem>/metadata/manifest.jsonl` for one with a
+    stem. A `dst` outside the root gets none.
     """
     if not img.capture_id or src.name == dst.name:
         return None
@@ -80,13 +82,12 @@ def relocation_of(img: RecordImage, src: Path, dst: Path, fixity_index: FixityIn
         logger.warning(f"No capture checksum is held for image {img.id} at {src}; "
                        f"no relocation record is written for its rename to {dst}")
         return None
-    project_root = root / dst.relative_to(root).parts[0]
-    return (project_root, img.capture_id, img.id, sha,
-            os.path.relpath(src, project_root), os.path.relpath(dst, project_root))
+    top = root / dst.relative_to(root).parts[0]
+    return (top, img.capture_id, img.id, sha, os.path.relpath(src, top), os.path.relpath(dst, top))
 
 
 def write_relocation_records(records: Iterable[Relocation]) -> None:
-    """Append each relocation record to its project's capture manifest.
+    """Append each relocation record to its project's or volume's capture manifest.
 
     A record that cannot be written is logged at ERROR with everything it
     holds and not raised: the rows and files already agree. Until the record
@@ -215,6 +216,37 @@ def resolve_project_name(db: Session, collection: Collection) -> Optional[str]:
     return project.name if project else None
 
 
+def collection_root_dir(db: Session, collection: Collection) -> Optional[Path]:
+    """A volume's own directory on disk, in the layout its stem decides, or None.
+
+    `<projects root>/<stem>` for a volume with a stem (volume_root), wherever
+    it sits in the catalogue. `<project dir>/<secure name>` for one without
+    (collection_capture_root), or None when it has no project to place it
+    under.
+    """
+    from capture.project_manager import collection_capture_root, volume_root
+
+    if collection.filename_stem:
+        return volume_root(collection.filename_stem)
+    project_name = resolve_project_name(db, collection)
+    return collection_capture_root(project_name, collection.name) if project_name else None
+
+
+def collection_image_dir(db: Session, collection: Collection) -> Optional[Path]:
+    """The directory a volume's masters belong in, or None (see collection_root_dir).
+
+    `<stem>/captures` for a volume with a stem, `<project>/<name>/images/main`
+    for one without: what capture writes into (image_output_dir) and what a
+    move of records into the volume moves their files to.
+    """
+    from capture.project_manager import image_output_dir
+
+    if collection.filename_stem:
+        return image_output_dir("", stem=collection.filename_stem)
+    project_name = resolve_project_name(db, collection)
+    return image_output_dir(project_name, collection.name) if project_name else None
+
+
 def surviving_images_under(
     db: Session,
     directory: Path,
@@ -256,8 +288,8 @@ def _raw_sidecar_to_carry(master: Path) -> Optional[Path]:
 
     Only a RAW master carries one: the RAW backend writes the sidecar for it,
     and `/records/images/{id}/preview` and the thumbnail generator look for it
-    beside a RAW master only. A JPEG master is left alone even when a
-    `<stem>_preview.jpg` sits beside it, because in a multi-format capture
+    (preview_sidecar_of) for a RAW master only. A JPEG master is left alone
+    even when its `<stem>_preview.jpg` exists, because in a multi-format capture
     `folio.jpg` and `folio.CR2` name the same sidecar and it belongs to the
     CR2. The sidecar is returned only when it is a file inside the storage
     roots, the confinement the master gets.
@@ -302,9 +334,11 @@ def relocate_image(
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
 
-    A RAW master's `_preview.jpg` sidecar moves with it and is named from the
-    master's final name, so it keeps sitting beside the master under the name
-    the preview endpoint and later deletes derive (NEH-267). The master is moved
+    A RAW master's `_preview.jpg` sidecar moves with it and is named and
+    placed from the master's final path (preview_sidecar_of): beside the
+    master in the name-based layout, in the volume's `previews/` when the
+    master goes to a `captures/`, where the preview endpoint and later
+    deletes look for it (NEH-267). The master is moved
     first; if the sidecar then cannot be moved, the failure is logged at WARNING,
     the sidecar's file name is appended to `not_moved` when the caller passes a
     list, and the sidecar stays in the old directory. Raising there would make
@@ -315,7 +349,8 @@ def relocate_image(
     moved as `{stem}_{uuid8}{suffix}` instead; `img.filename` follows when it
     held the stored file's name, and is left alone when it holds an upload's
     original name. A renamed master with a capture id needs a relocation
-    record in its project's capture manifest (relocation_of); it is appended
+    record in the capture manifest of the project or volume it moves into
+    (relocation_of); it is appended
     to `relocations` when the caller passes a list, for the caller to write
     once the commit has landed, never on a move that is undone.
 
@@ -363,8 +398,11 @@ def relocate_image(
         img.filename = dst.name
 
     if sidecar is not None:
+        # In a volume's stem layout the sidecar goes to `previews/`, not beside
+        # the master (preview_sidecar_of), so its directory may not exist yet.
         sidecar_dst = preview_sidecar_of(dst)
         try:
+            sidecar_dst.parent.mkdir(parents=True, exist_ok=True)
             shutil.move(str(sidecar), str(sidecar_dst))
             if moved is not None:
                 moved.append((sidecar, sidecar_dst))
@@ -925,12 +963,11 @@ def renumber_collection_images(
     sources = {src for src, _ in file_moves} | carried
     # Every image of every record in the collection is a source, so a file
     # that is not one belongs elsewhere, and os.replace would overwrite it
-    # without a trace. A collection's directory is named by its id, but files
-    # not yet moved out of the name-based layout (app.core.volume_layout) can
-    # put two same-named collections in one directory, deriving the same
-    # `<prefix>_NNNN` names, and a file can be put there by hand. A same-stem
-    # file with another suffix names the same sidecar, the clash
-    # relocate_image refuses as well.
+    # without a trace. Two volumes without a stem and of the same name share
+    # one name-based directory (collection_capture_root uses only the name)
+    # and derive the same `<prefix>_NNNN` names, and a file can be put in a
+    # volume's `captures/` by hand. A same-stem file with another suffix
+    # names the same sidecar, the clash relocate_image refuses as well.
     for _, _, final in plan:
         if final.exists() and final.resolve() not in sources:
             raise ValueError(f"Renumbering would overwrite {final.name}, which no image in this collection owns")

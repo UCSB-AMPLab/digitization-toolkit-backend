@@ -82,7 +82,8 @@ def _image_files_to_unlink(
 	left rows pointing at masters that were already gone.
 
 	A RAW capture occupies two files on the card: the master the row points at,
-	and a JPEG preview the RAW backend writes next to it as `<stem>_preview.jpg`,
+	and a JPEG preview the RAW backend writes as `<stem>_preview.jpg`, beside it
+	in the name-based layout and in the volume's `previews/` in the stem layout,
 	which is what the review UI and the thumbnail generator can read. Removing
 	only the master leaves the preview with nothing referencing it, about 2.3 MB
 	per capture; on the Rionegro unit 2,403 such previews hold 5.5 GB of a 115 GB
@@ -93,7 +94,7 @@ def _image_files_to_unlink(
 	The sidecar's name is derived from the *resolved* path, so it stays inside
 	the storage roots `resolve_within_storage` confines the master to; a row
 	pointing outside them loses neither file. The name is the whole rule, with
-	no suffix check: a `_preview.jpg` beside a JPEG master is an orphan in the
+	no suffix check: a JPEG master's `_preview.jpg` is an orphan in the
 	same way, and a suffix list here would be a second copy of the backends'
 	RAW formats to keep in step.
 
@@ -646,7 +647,8 @@ def delete_image(
 
 # Masters whose bytes a browser cannot display are recognised by
 # `is_raw_suffix` (app/core/paths.py); the RAW backend writes a
-# `<stem>_preview.jpg` sidecar beside each one (capture/backends/gphoto2_backend.py).
+# `<stem>_preview.jpg` sidecar for each one, where preview_sidecar_of places it
+# (capture/backends/gphoto2_backend.py).
 
 # Masters a browser displays as they are, so they are their own preview.
 _BROWSER_DISPLAYABLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
@@ -791,7 +793,8 @@ def get_image_thumbnail(
 		# thumbnail's mkdir, rather than writing onto the SD card.
 		refuse_writes_under_unusable_root([source_path])
 		try:
-			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
+			# Next to the source's directory: `<stem>/thumbnails/` for a master in
+			# `<stem>/captures/`, `.../images/thumbnails/` for one in `.../images/main/`.
 			thumbnails_dir = source_path.parent.parent / "thumbnails"
 			generated = generate_thumbnail(thumb_source, thumbnails_dir)
 			if generated:

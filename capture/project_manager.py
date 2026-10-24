@@ -57,44 +57,79 @@ def project_capture_root(project_name: str) -> Path:
     return Path(_projects_root(), secure_project_filename(project_name))
 
 
-COLLECTION_DIR_PREFIX = "collection-"
+def volume_root(stem: str) -> Path:
+    """On-disk root of a volume that has a file name stem: `<projects root>/<stem>`.
 
+    The volume's directory sits directly under the projects root, with no
+    project level, so renaming a project, moving the volume to another
+    project or re-parenting it moves no file. It holds the four directories
+    of app.core.paths.VOLUME_SUBDIRS: `captures/`, `previews/`,
+    `thumbnails/` and `metadata/` (the volume's own manifest.jsonl).
 
-def collection_dir_name(collection_id: int) -> str:
-    """Name of a collection's directory under its project: `collection-<id>`.
-
-    The name comes from the id, never from the collection's name, so two
-    collections of one name never share a directory and a rename moves no
-    file. It is the same string the BagIt export writes as the bag's
-    External-Identifier. A str (a collection name passed by a caller written
-    for the old name-based layout), a bool or a float raises TypeError.
+    Raises ValueError for a stem that is not a lowercase slug within the
+    model's length cap (app.models.collection), so a stored value can never
+    name a path outside the root.
     """
-    if isinstance(collection_id, bool) or not isinstance(collection_id, int):
-        raise TypeError(f"collection_id must be an int, not {type(collection_id).__name__}")
-    return f"{COLLECTION_DIR_PREFIX}{collection_id}"
+    import re
+
+    from app.models.collection import FILENAME_STEM_MAX_LENGTH, FILENAME_STEM_PATTERN
+
+    if (not isinstance(stem, str) or len(stem) > FILENAME_STEM_MAX_LENGTH
+            or not re.fullmatch(FILENAME_STEM_PATTERN, stem)):
+        raise ValueError(f"Not a volume file name stem: {stem!r}")
+    return Path(_projects_root(), stem)
 
 
-def collection_capture_root(project_name: str, collection_id: int) -> Path:
-    """On-disk root of a collection: `<project dir>/collection-<id>`.
+def ensure_volume_dirs(stem: str) -> Path:
+    """Create the volume's four directories if they are missing; return its root."""
+    from app.core.paths import VOLUME_SUBDIRS
 
-    Every collection's directory sits directly under its project's, whatever
-    its depth in the collection tree, so a re-parent inside one project moves
-    no file. The tree lives in the database and in the export's metadata.
+    root = volume_root(stem)
+    for name in VOLUME_SUBDIRS:
+        (root / name).mkdir(parents=True, exist_ok=True)
+    return root
+
+
+def collection_capture_root(project_name: str, collection_name: str) -> Path:
+    """On-disk root of a volume without a stem: `<project dir>/<secure collection name>`.
+
+    The name-based layout every volume had before stems. Two volumes of one
+    name share the directory, and a nested volume's directory sits beside its
+    parent's. A volume keeps it until it is given a stem and the startup
+    migration (app.core.volume_layout) moves its files.
     """
-    return project_capture_root(project_name) / collection_dir_name(collection_id)
+    return project_capture_root(project_name) / secure_project_filename(collection_name)
 
 
-def image_output_dir(project_name: str, collection_id: Optional[int] = None) -> Path:
-    """Directory where captured images are written for a project or one of its collections.
+def image_output_dir(project_name: str, collection_name: Optional[str] = None,
+                     stem: Optional[str] = None) -> Path:
+    """Directory where captured images are written.
 
-    `<project dir>/collection-<id>/images/main` for a collection,
-    `<project dir>/images/main` for a project-level capture (collection_id None).
+    `<projects root>/<stem>/captures` for a volume with a stem,
+    `<project dir>/<collection name>/images/main` for a volume without one,
+    and `<project dir>/images/main` for a project-level capture (neither).
     """
-    if collection_id is not None:
-        root = collection_capture_root(project_name, collection_id)
+    from app.core.paths import CAPTURES_DIR
+
+    if stem:
+        return volume_root(stem) / CAPTURES_DIR
+    if collection_name:
+        root = collection_capture_root(project_name, collection_name)
     else:
         root = project_capture_root(project_name)
     return root / "images" / "main"
+
+
+def capture_manifest_root(project_name: str, stem: Optional[str] = None) -> Path:
+    """The directory whose `metadata/manifest.jsonl` takes a capture's record.
+
+    The volume's root for a volume with a stem, so each such volume has its
+    own manifest; the project's directory otherwise, as before stems. The
+    capture record's paths are relative to it.
+    """
+    if stem:
+        return volume_root(stem)
+    return project_capture_root(project_name)
 
 def load_calibration_profile(camera_index: int, calibration_dir: Path = None) -> dict:
     """
