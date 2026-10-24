@@ -14,6 +14,7 @@ from app.core.storage_ops import (
     rebase_stored_path,
     relocate_images_and_commit,
     remove_tree,
+    retire_project_manifest,
     surviving_images_under,
 )
 
@@ -361,6 +362,10 @@ def delete_project(
     """
     Delete an empty project and its (now unused) directory.
 
+    The project's capture manifest is not deleted: it is moved to
+    `<projects root>/.retired-manifests/` first (retire_project_manifest),
+    where the fixity index keeps reading it.
+
     Refuses (409) if the project still has collections or records (those must
     be moved or deleted first) or if its directory still holds files that a
     surviving record points at. A move relocates files, so the honest flow is
@@ -391,6 +396,22 @@ def delete_project(
             status_code=409,
             detail="Project directory still holds files referenced by other records. Move those records first.",
         )
+
+    # A capture manifest is never deleted: it may hold the capture-time
+    # checksums of volumes that have left the project. The project's own is
+    # retired out of the tree first; any other one in the tree stops the delete.
+    others = [m for m in project_dir.glob("**/metadata/manifest.jsonl")
+              if m != project_dir / "metadata" / "manifest.jsonl"] if project_dir.is_dir() else []
+    if others:
+        raise HTTPException(
+            status_code=409,
+            detail="Project directory holds a capture manifest other than its own. Move it out first.",
+        )
+    try:
+        retire_project_manifest(project_dir)
+    except OSError as e:
+        logger.error(f"Failed to retire the capture manifest of {project_dir}: {e}")
+        raise HTTPException(status_code=500, detail="Failed to keep the project's capture manifest; nothing was deleted")
 
     # Remove files first so a filesystem failure aborts before touching the DB
     try:

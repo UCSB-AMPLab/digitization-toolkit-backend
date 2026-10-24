@@ -633,6 +633,46 @@ def relocate_images_and_commit(
     _unlink_old_thumbnails(old_thumbnails)
 
 
+def _utc_stamp() -> str:
+    from datetime import datetime, timezone
+
+    return datetime.now(timezone.utc).strftime("%Y%m%dT%H%M%SZ")
+
+
+def retire_project_manifest(project_dir: Path) -> Optional[Path]:
+    """Move a project's metadata/manifest.jsonl out of its tree before the tree is removed; return where.
+
+    It goes to `<projects root>/.retired-manifests/<project dir>-<UTC
+    timestamp>-manifest.jsonl` (`-2`, `-3`... before `-manifest` if that name
+    is taken), where app.core.integrity keeps reading it, with its paths
+    still relative to the project directory its name carries. The manifest
+    holds the capture-time checksums of every volume captured in the
+    project before it had a stem, including volumes moved since to other
+    projects or into their stem layout. Renamed, never copied, so nothing
+    is lost if a step fails; the directories are fsynced. Returns None when
+    the project has no manifest. Raises OSError.
+    """
+    from capture.utils import _fsync_dir
+    from app.core.integrity import RETIRED_MANIFESTS_DIR
+
+    manifest = project_dir / "metadata" / "manifest.jsonl"
+    if not manifest.is_file():
+        return None
+    retired_dir = project_dir.parent / RETIRED_MANIFESTS_DIR
+    retired_dir.mkdir(exist_ok=True)
+    stamp = _utc_stamp()
+    target = retired_dir / f"{project_dir.name}-{stamp}-manifest.jsonl"
+    n = 2
+    while target.exists():
+        target = retired_dir / f"{project_dir.name}-{stamp}-{n}-manifest.jsonl"
+        n += 1
+    os.rename(manifest, target)
+    _fsync_dir(retired_dir)
+    _fsync_dir(manifest.parent)
+    logger.warning(f"Retired the capture manifest of {project_dir} to {target}")
+    return target
+
+
 def remove_tree(directory: Path) -> None:
     """Remove a directory tree. Raises OSError on failure (never silent)."""
     if directory.exists() and directory.is_dir():

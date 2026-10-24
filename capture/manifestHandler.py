@@ -334,3 +334,26 @@ def append_relocation_record(project_root: Path, capture_id: str, from_rel: str,
             os.fsync(fd)
         finally:
             os.close(fd)
+
+
+def append_manifest_lines(root: Path, lines: list) -> None:
+    """Append already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, in one write, fsynced.
+
+    For records copied from another manifest (app.core.volume_layout), which
+    are written as they are rather than built here. Each line is one JSON
+    object without its newline.
+    """
+    if not lines:
+        return
+    metadata_dir = root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    data = "".join(line + "\n" for line in lines).encode("utf-8")
+    with _manifest_append_lock:
+        fd = os.open(metadata_dir / "manifest.jsonl", os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
+        try:
+            mv = memoryview(data)
+            while mv:
+                mv = mv[os.write(fd, mv):]
+            os.fsync(fd)
+        finally:
+            os.close(fd)

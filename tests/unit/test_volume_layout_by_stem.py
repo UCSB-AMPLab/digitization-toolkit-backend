@@ -719,7 +719,10 @@ def _assert_migrated(db_session, L, manifest: bytes = b"{}\n"):
     from app.models.record import RecordImage
 
     root = L["root"]
-    assert _on_disk(root) == _expected_end_state(L, manifest)
+    # The volumes' own manifests (copies of their records) are checked in test_volume_fixity_carried.
+    on_disk = {k: v for k, v in _on_disk(root).items()
+               if not (k.split("/")[0] in STEMS.values() and k.endswith("/metadata/manifest.jsonl"))}
+    assert on_disk == _expected_end_state(L, manifest)
     db_session.expire_all()
     by_id = {i.id: i for i in db_session.query(RecordImage).all()}
 
@@ -1379,9 +1382,10 @@ def test_a_renamed_master_keeps_its_capture_time_fixity(db_session, legacy, rena
     assert Path(img.file_path).name == f"IMG_0002_img{img.id}.jpg"
     vol_manifest = legacy["root"] / STEMS["a2"] / "metadata" / "manifest.jsonl"
     lines = [json.loads(l) for l in vol_manifest.read_text().splitlines()]
-    assert [l["record_type"] for l in lines] == ["relocation"]
-    assert lines[0]["from"] == "../proj/fondo_a/images/main/IMG_0002.jpg"
-    assert lines[0]["to"] == f"captures/IMG_0002_img{img.id}.jpg"
+    # First the copy of its capture record, then the relocation record of the clash rename.
+    assert [(l.get("record_type"), "copied_from" in l) for l in lines] == [(None, True), ("relocation", False)]
+    assert lines[1]["from"] == "../proj/fondo_a/images/main/IMG_0002.jpg"
+    assert lines[1]["to"] == f"captures/IMG_0002_img{img.id}.jpg"
 
     assert verify_images_against_manifest([img]) == []
     Path(img.file_path).write_bytes(b"bit rot")

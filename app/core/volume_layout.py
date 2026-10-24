@@ -67,6 +67,12 @@ What is moved, and how:
   directory name, or a directory holding `images/`, `packages/` or
   `metadata/project_manifest.jsonl`) is not moved, and each of its images is
   reported as skipped with reason "stem_dir_is_project_tree".
+- Before a volume's files move, its capture records and their relocation
+  records are copied from every other manifest into
+  `<stem>/metadata/manifest.jsonl`, marked `copied_from` and with their
+  paths rebased onto `<stem>/`, so the volume carries its own fixity. The
+  manifests they come from are left as they are; the index gets the same
+  checksums from both (_volume_records_to_copy).
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
@@ -807,7 +813,99 @@ def _commit(db: Session, what: str) -> None:
         raise
 
 
+def _volume_records_to_copy(db: Session, root: Path, collection_id: int) -> Tuple[Optional[Path], List[str]]:
+    """The volume's `<stem>/` and the lines its manifest still lacks: its records from every other manifest.
+
+    A volume's records are the capture records of the capture ids of its
+    images, and the relocation records of those captures. Each copy keeps
+    every field of the line it is taken from, adds `copied_from` (the source
+    manifest, relative to the root; a line that is itself a copy keeps the
+    original's), and has its paths (`files[].relative_path`, `from`, `to`)
+    rebased from the source manifest's directory onto `<stem>/`, so each
+    names the same absolute file and the fixity index gets from the copy the
+    checksum it gets from the source. A line the volume's manifest already
+    holds is not copied again, so a replayed batch adds nothing.
+    """
+    from app.core.integrity import _manifests, manifest_base
+
+    collection = db.get(Collection, collection_id)
+    if collection is None or not collection.filename_stem:
+        return None, []
+    vol = root / collection.filename_stem
+    own = vol / "metadata" / "manifest.jsonl"
+    capture_ids = {cid for (cid,) in db.query(RecordImage.capture_id)
+                   .join(Record, RecordImage.record_id == Record.id)
+                   .filter(Record.collection_id == collection_id, RecordImage.capture_id.isnot(None)).all()}
+    if not capture_ids:
+        return vol, []
+    try:
+        present = set(own.read_text(encoding="utf-8").splitlines()) if own.exists() else set()
+    except OSError as e:
+        raise VolumeLayoutError(f"The manifest {own} is unreadable: {e}") from e
+
+    def rebase(rel: str, base: Path) -> str:
+        return os.path.relpath(os.path.normpath(base / rel), vol)
+
+    out: List[str] = []
+    for manifest in sorted(_manifests(root)):
+        if manifest.resolve() == own.resolve():
+            continue
+        base = manifest_base(manifest, root)
+        try:
+            lines = manifest.read_text(encoding="utf-8").splitlines()
+        except OSError as e:
+            logger.warning(f"Volume layout: could not read {manifest} to copy volume {collection_id}'s records: {e}")
+            continue
+        for line in lines:
+            try:
+                entry = json.loads(line)
+            except ValueError:
+                continue
+            if not isinstance(entry, dict) or entry.get("capture_id") not in capture_ids:
+                continue
+            if entry.get("record_type") == "relocation":
+                for key in ("from", "to"):
+                    if isinstance(entry.get(key), str):
+                        entry[key] = rebase(entry[key], base)
+            else:
+                for f in entry.get("files") or []:
+                    if isinstance(f, dict) and isinstance(f.get("relative_path"), str):
+                        f["relative_path"] = rebase(f["relative_path"], base)
+            entry.setdefault("copied_from", os.path.relpath(manifest, root))
+            copy = json.dumps(entry, ensure_ascii=False)
+            if copy not in present:
+                present.add(copy)
+                out.append(copy)
+    return vol, out
+
+
+def _copy_volume_records(db: Session, root: Path, collection_id: int, report: dict) -> None:
+    """Append the volume's records still missing from `<stem>/metadata/manifest.jsonl` to it.
+
+    Done before the batch's files move, so the volume carries its own
+    fixity from the moment its files are in `<stem>/`. A copy that cannot
+    be written is logged at ERROR and reported under "manifest_copy_failed";
+    the records stay in the manifests they were copied from, which the
+    index keeps reading, so the move goes on.
+    """
+    from capture.manifestHandler import append_manifest_lines
+
+    vol, lines = _volume_records_to_copy(db, root, collection_id)
+    if not lines:
+        return
+    try:
+        append_manifest_lines(vol, lines)
+        _fsync_dir(vol / "metadata")
+    except OSError as e:
+        logger.error(f"Volume layout: could not copy {len(lines)} record(s) of volume {collection_id} "
+                     f"into {vol / 'metadata' / 'manifest.jsonl'}: {e}")
+        report["manifest_copy_failed"].append({"collection_id": collection_id, "error": str(e)})
+        return
+    report["manifest_records_copied"] += len(lines)
+
+
 def _commit_batch(db: Session, root: Path, batch: dict, report: dict) -> None:
+    _copy_volume_records(db, root, batch["collection_id"], report)
     pending = _read_pending_sidecars()
     before = len(pending)
     originals, touched = _execute(db, root, batch, report, pending)
@@ -921,6 +1019,8 @@ def _new_report(root: Path, dry_run: bool) -> dict:
         "failed": [],
         "skipped": [],
         "left_unreferenced": [],
+        "manifest_records_copied": 0,
+        "manifest_copy_failed": [],
     }
 
 
@@ -974,6 +1074,7 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
     report["left_unreferenced"] += [p for p in left if p not in report["left_unreferenced"]]
     if dry_run:
         for b in batches:
+            report["manifest_records_copied"] += len(_volume_records_to_copy(db, root, b["collection_id"])[1])
             for e in b["entries"]:
                 (report["adopted"] if e["adopt"] else report["moved"]).append(
                     {"image_id": e["image_id"], "from": e["from"], "to": e["to"]} if e["adopt"] else _summary(e))

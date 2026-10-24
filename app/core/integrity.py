@@ -13,6 +13,7 @@ import hashlib
 import json
 import logging
 import random
+import re
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Dict, List, Optional, Set, Tuple
@@ -130,7 +131,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
 
     for manifest in _manifests(projects_dir):
-        project_root = manifest.parent.parent
+        project_root = manifest_base(manifest, projects_dir)
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
         except OSError:
@@ -197,26 +198,56 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     return index
 
 
+RETIRED_MANIFESTS_DIR = ".retired-manifests"
+# `<project dir>-<UTC timestamp>[-<n>]-manifest.jsonl` (storage_ops.retire_project_manifest)
+_RETIRED_NAME = re.compile(r"^(?P<dir>.+)-\d{8}T\d{6}Z(-\d+)?-manifest\.jsonl$")
+
+
 def _manifests(projects_dir: Path) -> List[Path]:
-    """Every capture manifest under `projects_dir`: each project's and each stemmed volume's metadata/manifest.jsonl."""
+    """Every capture manifest under `projects_dir`.
+
+    Each project's and each stemmed volume's metadata/manifest.jsonl, and the
+    manifests of deleted projects kept in `.retired-manifests/`.
+    """
     if not projects_dir.exists():
         return []
-    return list(projects_dir.glob("**/metadata/manifest.jsonl"))
+    found = list(projects_dir.glob("**/metadata/manifest.jsonl"))
+    found.extend(p for p in projects_dir.glob(f"{RETIRED_MANIFESTS_DIR}/*-manifest.jsonl")
+                 if _RETIRED_NAME.match(p.name))
+    return found
+
+
+def manifest_base(manifest: Path, projects_dir: Path) -> Path:
+    """The directory a manifest's paths are relative to.
+
+    The directory holding its `metadata/`: a project's directory or a
+    volume's `<stem>/`. A retired manifest's paths stay relative to the
+    project directory it was taken from, `<projects root>/<project dir>`,
+    which its name carries.
+    """
+    if manifest.parent.name == RETIRED_MANIFESTS_DIR:
+        m = _RETIRED_NAME.match(manifest.name)
+        if m:
+            return projects_dir / m.group("dir")
+    return manifest.parent.parent
 
 
 def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]:
-    """The capture records of `capture_ids`, as their manifest lines, from every manifest build_fixity_index reads.
+    """The capture records of `capture_ids`, as their manifest lines, one per capture.
 
-    A volume captured before it had a stem has its earlier capture records in
-    its project's manifest and its later ones in its own, so both are read,
-    as the fixity index reads them. Relocation records are left out: they are
-    the appliance's own bookkeeping of files renamed after capture. Manifests
-    are read in path order and each in line order; a line found twice (the
-    same record in two manifests) is kept once. Unreadable manifests and
+    Read from every manifest build_fixity_index reads. A volume captured
+    before it had a stem has its earlier capture records in its project's
+    manifest (or a retired one) and its later ones in its own, so all are
+    read. The startup migration copies a volume's records into its own
+    manifest, marked `copied_from`; where the capture-time record is still
+    there, it is the one returned, and a copy only for a capture whose
+    original no manifest holds. Relocation records are left out: they are the
+    appliance's own bookkeeping of files renamed after capture. Manifests are
+    read in path order and each in line order. Unreadable manifests and
     lines that are not JSON objects are skipped.
     """
-    kept: List[str] = []
-    seen: Set[str] = set()
+    originals: List[Tuple[str, str]] = []
+    copies: List[Tuple[str, str]] = []
     for manifest in sorted(_manifests(projects_dir)):
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
@@ -224,7 +255,7 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
             continue
         for line in lines:
             stripped = line.strip()
-            if not stripped or stripped in seen:
+            if not stripped:
                 continue
             try:
                 entry = json.loads(stripped)
@@ -232,8 +263,19 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
                 continue
             if (isinstance(entry, dict) and entry.get("capture_id") in capture_ids
                     and entry.get("record_type") != "relocation"):
-                seen.add(stripped)
-                kept.append(stripped)
+                (copies if "copied_from" in entry else originals).append((entry["capture_id"], stripped))
+    kept: List[str] = []
+    kept_lines: Set[str] = set()
+    seen: Set[str] = set()
+    for cid, line in originals:
+        if line not in kept_lines:
+            kept_lines.add(line)
+            kept.append(line)
+        seen.add(cid)
+    for cid, line in copies:
+        if cid not in seen:
+            kept.append(line)
+            seen.add(cid)
     return kept
 
 
