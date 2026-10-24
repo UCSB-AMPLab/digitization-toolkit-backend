@@ -11,9 +11,8 @@ from pathlib import Path
 from app.core import config
 from app.core.bag_export import SourceReadError, write_bag_zip
 from app.core.export_jobs import ExportError, ExportJob
-from app.core.integrity import verify_images_against_manifest
+from app.core.integrity import capture_record_lines, verify_images_against_manifest
 from app.core.paths import resolve_within_storage
-from app.core.storage_ops import resolve_project_name
 from app.models.collection import Collection
 from app.models.project import Project
 from sqlalchemy.orm import joinedload
@@ -320,31 +319,21 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
 
 
 def _filtered_manifest_blob(db, collection, records):
-    """The project's capture manifest, filtered to this collection's captures."""
-    from capture.project_manager import secure_project_filename
+    """The capture records of this collection's current images, from every capture manifest.
+
+    The records are found the way the fixity gate finds checksums
+    (app.core.integrity): in any manifest under the active projects root,
+    the project's or the volume's own, so a volume migrated into its stem
+    layout, whose earlier captures are recorded in its project's manifest
+    and later ones in `<stem>/metadata/manifest.jsonl`, has all of them in
+    its bag. Relocation records are the appliance's own bookkeeping of files
+    renamed after capture; the bag names its files itself, so only the
+    capture records go into it.
+    """
     capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
     if not capture_ids:
         return None
-    proj_name = resolve_project_name(db, collection)
-    if not proj_name:
-        return None
-    manifest_src = config.settings.projects_dir / secure_project_filename(proj_name) / "metadata" / "manifest.jsonl"
-    if not manifest_src.exists():
-        return None
-    kept = []
-    for line in manifest_src.read_text(encoding="utf-8").splitlines():
-        stripped = line.strip()
-        if not stripped:
-            continue
-        try:
-            entry = json.loads(stripped)
-        except json.JSONDecodeError:
-            continue
-        # Relocation records are the appliance's own bookkeeping of files
-        # renamed after capture; the bag names its files itself, so only the
-        # capture records go into it.
-        if entry.get("capture_id") in capture_ids and entry.get("record_type") != "relocation":
-            kept.append(stripped)
+    kept = capture_record_lines(config.settings.projects_dir.resolve(), capture_ids)
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 
 

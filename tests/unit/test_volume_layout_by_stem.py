@@ -1422,6 +1422,46 @@ def _approve(db_session, collection_id):
 
 
 @pytest.mark.unit
+def test_an_export_bag_after_the_migration_holds_the_moved_files_and_both_manifests_records(
+        db_session, legacy, monkeypatch, tmp_path, mock_camera_config):
+    """Records captured before the migration (project manifest) and after it (volume manifest) are both in the bag."""
+    import zipfile
+    import capture.service as service
+    from app.core import config
+    from app.core.export_jobs import ExportJob
+    from app.core.export_service import _do_export
+    from app.core.volume_layout import migrate_volume_layout
+    from app.models.record import Record, RecordImage
+
+    _capture_records(db_session, legacy)
+    migrate_volume_layout(db_session)
+    # A capture after the migration, into the volume's own layout and manifest.
+    monkeypatch.setattr(service, "get_backend", lambda: _FakeBackend(raw=False))
+    path, capture_id, _ = service.single_capture_image(
+        "Proj", mock_camera_config, check_camera=False, collection_name="Fondo A", stem=STEMS["a2"])
+    rec = Record(title="new", collection_id=legacy["a2"].id, status="approved", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=rec.id, filename=Path(str(path)).name, file_path=str(path),
+                               format="jpg", role="single", capture_id=capture_id))
+    db_session.commit()
+    _approve(db_session, legacy["a2"].id)
+    exports = config.settings.exports_dir
+
+    job = ExportJob(legacy["a2"].id)
+    _do_export(db_session, job, legacy["a2"].id)
+
+    with zipfile.ZipFile(exports / job.zip_filename) as z:
+        names = z.namelist()
+        manifest = [json.loads(l) for l in z.read(next(n for n in names if n.endswith("data/metadata/manifest.jsonl")))
+                    .decode().splitlines()]
+        payload = {n: z.read(n) for n in names if "/data/" in n and n.endswith((".jpg", ".CR2"))}
+    assert sorted(l["capture_id"] for l in manifest) == sorted(["cap-i2", "cap-i3a", "cap-i3b", capture_id])
+    assert sorted(payload.values()) == sorted([b"bytes of IMG_0002.jpg", b"bytes of IMG_0003.CR2",
+                                               b"bytes of IMG_0003.jpg", Path(str(path)).read_bytes()])
+
+
+@pytest.mark.unit
 def test_the_export_fixity_gate_checks_a_moved_file_after_the_migration(db_session, legacy):
     from app.core.export_jobs import ExportError
     from app.core.export_service import _fixity_gate

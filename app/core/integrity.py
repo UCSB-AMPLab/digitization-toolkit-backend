@@ -102,7 +102,10 @@ class FixityIndex:
 
 
 def build_fixity_index(projects_dir: Path) -> FixityIndex:
-    """Index every project's metadata/manifest.jsonl under `projects_dir`.
+    """Index every metadata/manifest.jsonl under `projects_dir`: each project's, and each stemmed volume's.
+
+    A capture record's paths are relative to the directory that holds its
+    `metadata/`: the project's directory, or the volume's `<stem>/`.
 
     Capture records give each file's sha256 by resolved path and by name (the
     name map is a fallback for when a stored absolute path differs from the
@@ -126,7 +129,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         return index
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
 
-    for manifest in projects_dir.glob("**/metadata/manifest.jsonl"):
+    for manifest in _manifests(projects_dir):
         project_root = manifest.parent.parent
         try:
             lines = manifest.read_text(encoding="utf-8").splitlines()
@@ -192,6 +195,46 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         if not changed:
             break
     return index
+
+
+def _manifests(projects_dir: Path) -> List[Path]:
+    """Every capture manifest under `projects_dir`: each project's and each stemmed volume's metadata/manifest.jsonl."""
+    if not projects_dir.exists():
+        return []
+    return list(projects_dir.glob("**/metadata/manifest.jsonl"))
+
+
+def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]:
+    """The capture records of `capture_ids`, as their manifest lines, from every manifest build_fixity_index reads.
+
+    A volume captured before it had a stem has its earlier capture records in
+    its project's manifest and its later ones in its own, so both are read,
+    as the fixity index reads them. Relocation records are left out: they are
+    the appliance's own bookkeeping of files renamed after capture. Manifests
+    are read in path order and each in line order; a line found twice (the
+    same record in two manifests) is kept once. Unreadable manifests and
+    lines that are not JSON objects are skipped.
+    """
+    kept: List[str] = []
+    seen: Set[str] = set()
+    for manifest in sorted(_manifests(projects_dir)):
+        try:
+            lines = manifest.read_text(encoding="utf-8").splitlines()
+        except OSError:
+            continue
+        for line in lines:
+            stripped = line.strip()
+            if not stripped or stripped in seen:
+                continue
+            try:
+                entry = json.loads(stripped)
+            except json.JSONDecodeError:
+                continue
+            if (isinstance(entry, dict) and entry.get("capture_id") in capture_ids
+                    and entry.get("record_type") != "relocation"):
+                seen.add(stripped)
+                kept.append(stripped)
+    return kept
 
 
 def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
