@@ -201,11 +201,14 @@ def pytest_configure(config):
 # @pytest.mark.camera, which CI deselects with -m "not camera". Marking by
 # file, not by the word "camera" in a test's node id, keeps tests that only
 # talk about cameras (fakes, refusals before any camera is touched) in CI.
-# The only place the camera marker is added automatically (tests/conftest.py
-# does not repeat it).
+# The match is on the file part of the node id, which pytest gives relative
+# to the rootdir (this directory, where pytest.ini is), so these paths are
+# written from here. The only place the camera marker is added automatically
+# (tests/conftest.py does not repeat it).
 HARDWARE_TEST_FILES = (
     "tests/test_cameras.py",
     "tests/integration/test_camera_capture_recapture_hardware.py",
+    "tests/integration/test_capture_integration.py",
 )
 
 
