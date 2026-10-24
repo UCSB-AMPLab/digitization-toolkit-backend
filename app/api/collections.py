@@ -253,13 +253,19 @@ def get_collection_offsite_state(
     nothing is uploaded and the volume cannot be freed. A route of its own rather
     than fields on CollectionRead, so listing volumes does not derive this
     for each of them.
+
+    `fisqua` is null when Fisqua is not configured. Otherwise `outbox` lists
+    the volume's capture manifests for Fisqua, newest first, each with its
+    delivery state (app.models.fisqua), and `status` is the latest status
+    Fisqua gave for the volume, or null.
     """
+    from app.core.fisqua_outbox import volume_fisqua_state
     from app.core.image_upload import volume_upload_state
 
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    return volume_upload_state(db, collection)
+    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id)}
 
 
 # ==============================================================================
@@ -931,6 +937,11 @@ def promote_collection(
 
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
+    # Queued in the handover's transaction, after the records' locks, so a
+    # handover and its manifest are committed together or not at all
+    # (app.core.fisqua_outbox). Nothing is queued when Fisqua is not configured.
+    from app.core.fisqua_outbox import enqueue_handover
+    enqueue_handover(db, collection)
     db.commit()
 
     log_event(db, level="INFO", category="activity", action="collection_promoted",
@@ -998,6 +1009,10 @@ def take_back_collection(
         ).scalars().all()
         record_bulk_status_changes(db, moved_ids, collection_id, "in_review", "captured", current_user.username)
         taken_back = len(moved_ids)
+    if taken_back:
+        # The handover is undone, so its manifest, if not yet sent, is not to be.
+        from app.core.fisqua_outbox import withdraw_unsent
+        withdraw_unsent(db, collection_id)
     db.commit()
     if not taken_back:
         return {"collection_id": collection_id, "taken_back": 0}

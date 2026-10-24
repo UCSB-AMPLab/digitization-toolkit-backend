@@ -1,5 +1,5 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
-from pydantic import Field
+from pydantic import Field, SecretStr
 from pathlib import Path
 
 class Settings(BaseSettings):
@@ -75,6 +75,21 @@ class Settings(BaseSettings):
     # the one-time commands (adopt, mark-freed, ...). Empty: offsite-hold in
     # DTK_DATA_DIR, /var/lib/dtk/offsite-hold on a unit.
     OFFSITE_HOLD_FILE: str = Field(default="", validation_alias="DTK_OFFSITE_HOLD_FILE")
+
+    # Fisqua, which the unit sends each handed-over volume's capture manifest
+    # to and asks for the volume's status (app.core.fisqua_outbox). Both
+    # empty by default; with either empty nothing is queued or sent. Every
+    # call is the unit's, over HTTPS, with this unit's token. The token is a
+    # SecretStr so that printing the settings never shows it; it is never
+    # logged and never returned by an API.
+    FISQUA_URL: str = Field(default="", validation_alias="DTK_FISQUA_URL")
+    FISQUA_TOKEN: SecretStr = Field(default=SecretStr(""), validation_alias="DTK_FISQUA_TOKEN")
+    # A send that fails is retried after FISQUA_RETRY_BASE_SECONDS, then
+    # twice as long after each further failure, never longer than
+    # FISQUA_RETRY_MAX_SECONDS. The worker runs after each image upload run
+    # (OFFSITE_BACKUP_INTERVAL_SECONDS), so that interval is the finest step.
+    FISQUA_RETRY_BASE_SECONDS: int = Field(default=300, validation_alias="DTK_FISQUA_RETRY_BASE")
+    FISQUA_RETRY_MAX_SECONDS: int = Field(default=6 * 3600, validation_alias="DTK_FISQUA_RETRY_MAX")
 
     app_version: str = "0.0.0-dev"
 

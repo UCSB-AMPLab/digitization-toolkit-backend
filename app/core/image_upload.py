@@ -1531,6 +1531,7 @@ class ImageUploadScheduler:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[dict] = None
+        self.last_fisqua_result: Optional[dict] = None
 
     def start(self) -> bool:
         sweep_staging()
@@ -1566,11 +1567,22 @@ class ImageUploadScheduler:
 
         db = SessionLocal()
         try:
-            self.last_result = run_image_upload(db, stop=self._stop)
+            try:
+                self.last_result = run_image_upload(db, stop=self._stop)
+            except Exception:
+                logger.exception("Scheduled image upload raised")
+                self.last_result = None
+            # After the upload, in this thread: a manifest waits for its
+            # volume's objects to be verified, which only this run does, so
+            # a volume received in this run is sent in this tick, and its
+            # manifest is never built while this run is changing what it
+            # reads (app.core.fisqua_outbox).
+            if not self._stop.is_set():
+                from app.core.fisqua_outbox import run_fisqua_outbox
+
+                db.rollback()
+                self.last_fisqua_result = run_fisqua_outbox(db, stop=self._stop)
             return self.last_result
-        except Exception:
-            logger.exception("Scheduled image upload raised")
-            return None
         finally:
             db.close()
 
