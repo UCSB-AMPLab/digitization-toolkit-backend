@@ -949,3 +949,27 @@ def test_an_existing_projects_description_is_never_overwritten(client, db_sessio
     db_session.expire_all()
     assert db_session.query(Project).one().description == existing
     assert report["projectNotesStored"] is False
+
+
+# ---------------------------------------------------------------------------
+# Rejects echo a bounded code
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("length, truncated", [(1_000_000, True), (121, True), (120, False)])
+def test_a_reject_echoes_at_most_120_characters_of_the_code(client, db_session, reports_root, length, truncated):
+    _as("op", "admin")
+    code = "x" * length
+    report = _post(client, _list_with([_item(code=code, stem="xx-test-994")])).json()
+    (reject,) = report["rejects"]
+    assert reject["referenceCode"] == code[:120]
+    assert reject["referenceCodeTruncated"] is truncated
+    stored = next((reports_root / VALID_ID).glob("*.json"))
+    assert stored.stat().st_size < 10_000
+
+
+@pytest.mark.unit
+def test_an_ordinary_reject_says_its_code_is_not_truncated(client, db_session, reports_root):
+    _as("op", "admin")
+    report = _post_fixture(client, REJECTS).json()
+    assert all(r["referenceCodeTruncated"] is False for r in report["rejects"])

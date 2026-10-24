@@ -422,10 +422,20 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     return project, True
 
 
+# How much of a reference code a reject echoes: a code can be any length in
+# the file, and the report should not carry a megabyte of one back.
+REJECT_CODE_MAX_LENGTH = 120
+
+
 def _reject(position: int, code: Any, reason: str) -> dict:
+    """A reject entry. A string code longer than REJECT_CODE_MAX_LENGTH is
+    cut to that length, and referenceCodeTruncated says whether it was."""
+    code = code if isinstance(code, str) else None
+    truncated = code is not None and len(code) > REJECT_CODE_MAX_LENGTH
     return {
         "position": position,
-        "referenceCode": code if isinstance(code, str) else None,
+        "referenceCode": code[:REJECT_CODE_MAX_LENGTH] if truncated else code,
+        "referenceCodeTruncated": truncated,
         "reason": reason,
         "message": REASONS[reason],
     }
