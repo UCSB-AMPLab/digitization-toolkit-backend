@@ -47,10 +47,9 @@ while it is hashed is skipped for this run.
 
 Each file is uploaded from a hard link made in a staging directory under the
 projects root, so a renumber that renames the file during the upload cannot
-change which bytes are sent. Where a hard link cannot be made (another file
-system, or one without hard links), the file is uploaded from its own path,
-and the listing check still decides: bytes that do not match the SHA1 taken
-before the upload are never marked verified.
+change which bytes are sent. Where a hard link cannot be made (a file system
+without hard links), a copy is made there instead, and removed after the
+upload.
 """
 
 import argparse
@@ -263,32 +262,47 @@ def sweep_staging() -> None:
 
 @dataclass
 class Staged:
+    """A private name for an image's bytes in the staging directory: a hard link, or a copy."""
     path: Path
-    linked: bool
+    linked: bool  # a hard link to the image's file; False for a copy
 
     def release(self) -> None:
-        if not self.linked:
-            return
         try:
             self.path.unlink(missing_ok=True)
             self.path.parent.rmdir()
         except OSError:
-            # Another link still in it, or a failed unlink; the sweep at the
+            # Another file still in it, or a failed unlink; the sweep at the
             # next start clears it.
             pass
 
 
-def _stage(path: Path) -> Staged:
-    """A hard link to `path` in the staging directory, or `path` itself when none can be made."""
+def _stage(path: Path) -> Optional[Staged]:
+    """A hard link to `path` in the staging directory, or a copy of it where no link can be made.
+
+    A copy where the projects root is on a file system without hard links
+    (an exFAT or FAT override drive), so the upload never reads the image by
+    its own name. None, with the copy removed, when neither can be made.
+    """
     staging = _staging_dir()
+    target = staging / f"{secrets.token_hex(6)}{path.suffix}"
     try:
         staging.mkdir(mode=0o700, exist_ok=True)
-        link = staging / f"{secrets.token_hex(6)}{path.suffix}"
-        os.link(path, link)
-        return Staged(link, True)
+        os.link(path, target)
+        return Staged(target, True)
     except OSError as exc:
-        logger.info("Uploading %s from its own path (no hard link: %s)", path, exc)
-        return Staged(path, False)
+        link_error = exc
+    try:
+        shutil.copyfile(path, target)
+    except OSError as exc:
+        logger.warning("Could not stage %s for upload (no hard link: %s; no copy: %s)",
+                       path, link_error, exc)
+        try:
+            target.unlink(missing_ok=True)
+        except OSError:
+            pass
+        return None
+    logger.info("Staged a copy of %s for upload (no hard link: %s)", path, link_error)
+    return Staged(target, False)
 
 
 def stable_digests(path: Path) -> Optional[tuple]:
@@ -514,10 +528,10 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     Under export_jobs.hold_for_reading, which a renumber, a record move, a
     rename or a delete cannot overlap (they take hold_for_file_changes): the
     row is re-read, the file is staged as a hard link, and the row is read a
-    third time and must name the same file. From then on the link holds this
-    image's bytes whatever happens to the name. Where no hard link can be
-    made, the file is hashed inside the hold instead, so the digest at least
-    is this image's; the listing after the copy then decides.
+    third time and must name the same file. Where no hard link can be made,
+    the file is copied into the staging directory instead, still under the
+    hold. From then on the staged file holds this image's bytes whatever
+    happens to its name, and it is what is hashed and uploaded.
     """
     from app.core.export_jobs import FilesChanging, export_jobs
 
@@ -540,7 +554,11 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
                                            "reason": "file not found", "path": first.file_path})
                 return None  # a RAW master without a preview has no preview to upload
             staged = _stage(path)
-            digests = None if staged.linked else stable_digests(staged.path)
+            if staged is None:
+                db.commit()
+                result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                                       "reason": "file could not be staged", "path": str(path)})
+                return None
             same = _image_state(db, item.image_id) == first
             db.commit()
             if not same:
@@ -553,9 +571,7 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
         result.skipped.append({"image_id": item.image_id, "kind": item.kind,
                                "reason": "files of the volume being changed"})
         return None
-    if staged.linked:
-        digests = stable_digests(staged.path)
-    return _Read(staged, path, first.capture_id, digests)
+    return _Read(staged, path, first.capture_id, stable_digests(staged.path))
 
 
 def _fixity_index(result: RunResult, *, fresh: bool = False):

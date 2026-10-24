@@ -1023,3 +1023,54 @@ def test_a_renumber_during_the_run_does_not_refuse_a_good_capture_for_fixity(
     assert result["refused"] == []
     rows = _rows(db_session)
     assert rows[(b_id, "capture")].verified_at is not None and rows[(b_id, "capture")].refusal is None
+
+
+@pytest.mark.unit
+def test_without_a_hard_link_a_private_copy_is_uploaded_and_removed(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+    from app.core.image_upload import STAGING_DIR_NAME, volume_upload_state
+
+    vol = _volume(db_session)
+    a = _image(db_session, vol, override_projects_root, f"{STEM}-img_0001_c1.jpg", b"AAAA", thumbnail=False)
+    b = _image(db_session, vol, override_projects_root, f"{STEM}-img_0002_c1.jpg", b"BBBB", thumbnail=False)
+
+    def no_link(*_a, **_k):
+        raise OSError(1, "Operation not permitted")  # what exFAT answers
+
+    monkeypatch.setattr(iu.os, "link", no_link)
+    real = iu.upload_file
+    sent = []
+
+    def renumber_then_copy(local, key):
+        if not sent:
+            _swap_names(db_session, a, b)  # the names change under the copy
+        sent.append(Path(local))
+        return real(local, key)
+
+    monkeypatch.setattr(iu, "upload_file", renumber_then_copy)
+    _run(db_session)
+    _run(db_session)
+
+    assert all(p.parent.name == STAGING_DIR_NAME for p in sent), "uploaded from a private copy, never by name"
+    assert not (override_projects_root / STAGING_DIR_NAME).exists()
+    bucket = remote.files()
+    rows = _rows(db_session)
+    for image, data in ((a, b"AAAA"), (b, b"BBBB")):
+        row = rows[(image.id, "capture")]
+        assert row.verified_at is not None and bucket[row.object_key] == data
+    assert volume_upload_state(db_session, vol)["received"] is True
+
+
+@pytest.mark.unit
+def test_a_file_that_can_be_neither_linked_nor_copied_is_skipped(
+        remote, db_session, override_projects_root, monkeypatch):
+    import app.core.image_upload as iu
+
+    vol = _volume(db_session)
+    _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+    monkeypatch.setattr(iu.os, "link", lambda *a, **k: (_ for _ in ()).throw(OSError(1, "no")))
+    monkeypatch.setattr(iu.shutil, "copyfile", lambda *a, **k: (_ for _ in ()).throw(OSError(28, "No space left")))
+    result = _run(db_session)
+    assert result["skipped"][0]["reason"] == "file could not be staged"
+    assert remote.calls("copyto") == [] and _rows(db_session) == {}
