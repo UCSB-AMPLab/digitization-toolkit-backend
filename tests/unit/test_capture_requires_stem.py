@@ -222,6 +222,22 @@ def test_a_retake_in_a_volume_with_a_stem_goes_through(client, db_session, test_
     assert _state(db_session, v.id)[2] == 1
 
 
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["single", "dual"])
+def test_a_retake_of_a_missing_record_is_a_404_before_any_camera(client, db_session, test_project,
+                                                                 camera_calls, mode):
+    api = _client_as(client)
+    v = _volume(db_session, test_project, "V", "co-test-v")
+    before = _state(db_session, v.id)
+
+    resp = _capture(mode)(api, test_project, v.id, record_id=999)
+
+    assert resp.status_code == 404, resp.text
+    assert resp.json()["detail"] == "Record 999 not found"
+    assert camera_calls == [], "a retake of a missing record touches no camera"
+    assert _state(db_session, v.id) == before
+
+
 # ---------------------------------------------------------------------------
 # No capture outside a volume
 # ---------------------------------------------------------------------------

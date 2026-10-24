@@ -46,24 +46,22 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 	return (current_max + 1) if current_max is not None else 0
 
 
-def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], record_id: Optional[int]) -> None:
+def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
 	"""409 when the capture would go into no volume, or into one without a filename_stem.
 
 	Every capture is named after its volume's stem (contract 1.1 §3), so the
 	request must name a volume: 0 counts as none, as it does for the capture
 	path. A retake is also checked against the volume its record is in, since
-	the request's volume need not be that one. Called first in each capture
-	endpoint, before any camera is touched.
+	the request's volume need not be that one. Called in each capture
+	endpoint before any camera is touched.
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
 	volume_ids = [collection_id]
-	if record_id is not None:
-		found = db.query(Record.id, Record.collection_id).filter(Record.id == record_id).first()
-		if found is not None:
-			if found.collection_id is None:
-				raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
-			volume_ids.append(found.collection_id)
+	if retake_record is not None:
+		if retake_record.collection_id is None:
+			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+		volume_ids.append(retake_record.collection_id)
 	if any(volume_lacks_stem(db, vid) for vid in volume_ids):
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
@@ -724,7 +722,19 @@ def trigger_capture(
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
 	"""
-	_refuse_capture_without_volume_or_stem(db, request.collection_id, request.record_id)
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
@@ -805,15 +815,9 @@ def trigger_capture(
 		# its collection (NEH-260); without this flag every retake would promote
 		# the record it was meant to leave with her.
 		recapture_promotes = False
-		if request.record_id:
-			# Link to existing record. Locked, as every path that moves a
-			# record's status or changes which of its images are current is:
-			# the status read here is what the retake writes over and what its
-			# history row names as the old status.
-			from app.api.records import _locked_record
-			record = _locked_record(db, request.record_id)
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
 			if record.status in ("captured", "rejected"):
 				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
 				# can redo a frame she can see is bad instead of waiting for a
@@ -947,7 +951,19 @@ def trigger_dual_capture(
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
 	"""
-	_refuse_capture_without_volume_or_stem(db, request.collection_id, request.record_id)
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig
@@ -1011,15 +1027,9 @@ def trigger_dual_capture(
 		# its collection (NEH-260); without this flag every retake would promote
 		# the record it was meant to leave with her.
 		recapture_promotes = False
-		if request.record_id:
-			# Link to existing record. Locked, as every path that moves a
-			# record's status or changes which of its images are current is:
-			# the status read here is what the retake writes over and what its
-			# history row names as the old status.
-			from app.api.records import _locked_record
-			record = _locked_record(db, request.record_id)
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
 			if record.status in ("captured", "rejected"):
 				# Retake, on the same terms as the single-capture endpoint above
 				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
