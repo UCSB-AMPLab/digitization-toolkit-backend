@@ -60,8 +60,13 @@ What is moved, and how:
   record: the integrity check finds the file by name under its capture id,
   and the old per-project manifests stay where they are and are still read.
 - A row whose master was freed from the card (app.core.offsite_free) and
-  whose file is absent is skipped with reason "freed", never "missing": the
-  file is stored offsite, and a restore puts it back at its stored path.
+  whose file is absent is never "missing": the file is stored offsite. No
+  file moves for it. Its row is pointed at the name the master would have
+  been moved to, by the same naming and collision rules, and reported under
+  "freed_paths_moved"; a restore writes the file there. That name, and a
+  freed RAW preview's, stays taken for every later move (_freed_paths),
+  though nothing is on disk at it. The master's kept preview and its
+  thumbnail move as usual.
 - Only files under the active projects root move, and they stay on it. Files
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
@@ -318,12 +323,17 @@ def _out_of_place(db: Session, root_forms: Set[str]) -> List[Tuple[int, int]]:
 class _Dir:
     """What a target directory holds, on disk and by planned moves: casefolded names and stems by owning record."""
 
-    def __init__(self, path: Path, owners: Dict[Path, int]):
+    def __init__(self, path: Path, owners: Dict[Path, int], reserved: Optional[Dict[Path, int]] = None):
         self.names: Dict[str, Optional[int]] = {}
         self.stems: Dict[str, Set[Optional[int]]] = {}
         for p in _listdir(path):
             if p.is_file():
                 self.add(p.name, owners.get(p.resolve()))
+        # A freed file's name is taken though no file is there: its row
+        # names it, and a restore will write it (_freed_paths).
+        for p, record_id in (reserved or {}).items():
+            if p.parent == path and not self.has(p.name):
+                self.add(p.name, record_id)
 
     def add(self, name: str, record_id: Optional[int]) -> None:
         self.names[name.casefold()] = record_id
@@ -388,6 +398,29 @@ def _owners(db: Session) -> Dict[Path, int]:
         if thumb is not None:
             owners[thumb] = record_id
     return owners
+
+
+def _freed_paths(db: Session) -> Dict[Path, int]:
+    """The paths of files freed from the card (app.core.offsite_free), resolved, with their record.
+
+    A freed master's stored path, and the `_preview.jpg` a RAW master with a
+    freed preview names. No file is at them, and each is reserved: a restore
+    writes the file back there, so no move may give the name to another.
+    """
+    out: Dict[Path, int] = {}
+    rows = (db.query(RecordImage.record_id, RecordImage.file_path,
+                     RecordImage.master_freed_at, RecordImage.preview_freed_at)
+            .filter((RecordImage.master_freed_at.isnot(None)) | (RecordImage.preview_freed_at.isnot(None)))
+            .all())
+    for record_id, fp, m_at, p_at in rows:
+        master = resolve_within_storage(fp)
+        if master is None:
+            continue
+        if m_at is not None:
+            out[master] = record_id
+        if p_at is not None and is_raw_suffix(master):
+            out[preview_sidecar_of(master)] = record_id
+    return out
 
 
 def _capture_checksum(index, capture_id: Optional[str], image_id: int, src: Path) -> Optional[str]:
@@ -648,9 +681,11 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     skipped: List[dict] = []
     sources: Set[Path] = set()
 
+    reserved = _freed_paths(db)
+
     def dir_state(path: Path) -> _Dir:
         if path not in dirs:
-            dirs[path] = _Dir(path, owners)
+            dirs[path] = _Dir(path, owners, reserved)
         return dirs[path]
 
     for iid, cid in sorted(out_of_place, key=lambda r: (r[1], r[0])):
@@ -698,12 +733,11 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             continue
         if src.parent == target:
             continue  # stored through another spelling of the same directory
-        if img.master_freed_at is not None and not src.is_file():
-            # Stored offsite and freed from the card: nothing here to move,
-            # and not missing (NEH-248). A restore puts it back at its
-            # stored path, and the next run moves it then.
-            skipped.append({"image_id": iid, "path": str(src), "reason": "freed"})
-            continue
+        # Stored offsite and freed from the card: not missing (NEH-248), and
+        # nothing to move. Planned as a move, by the same naming and
+        # collision rules, so the name it gets is reserved; _execute points
+        # the row at it and moves no master, and a restore writes it there.
+        freed = img.master_freed_at is not None and not src.is_file()
 
         entry = {
             "image_id": iid,
@@ -720,12 +754,14 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             "thumb_from": None,
             "thumb_to": None,
             "thumb_clear": None,
+            "freed": freed,
+            "preview_freed": False,
         }
         thumb = resolve_within_storage(img.thumbnail_path) if img.thumbnail_path else None
         thumb_dir = target.parent / THUMBNAILS_DIR
         previews_dir = target.parent / PREVIEWS_DIR
 
-        if not src.is_file():
+        if not src.is_file() and not freed:
             if not manifest_index:
                 from app.core.integrity import build_fixity_index
                 manifest_index.append(build_fixity_index(root))
@@ -773,7 +809,8 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
         dst = target / f"{stem}{src.suffix}"
         state.add(dst.name, img.record_id)
         entry["to"] = str(dst)
-        sources.add(src)
+        if not freed:
+            sources.add(src)
 
         if raw:
             sidecar = preview_sidecar_of(src)
@@ -782,6 +819,10 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 sidecar_dst = preview_sidecar_of(dst)  # in previews_dir
                 entry["sidecar_from"], entry["sidecar_to"] = str(sidecar), str(sidecar_dst)
                 previews.add(sidecar_dst.name, img.record_id)
+            elif img.preview_freed_at is not None and not sidecar.is_file():
+                # A freed preview follows its master's name; reserved like the master.
+                entry["preview_freed"] = True
+                previews.add(preview_sidecar_of(dst).name, img.record_id)
 
         if img.thumbnail_path:
             if thumb is None or not thumb.is_file():
@@ -879,7 +920,7 @@ def _settle(src: Path, dst: Path) -> Optional[Path]:
     return None
 
 
-def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
+def _free_name(e: dict, src: Path, dst: Path, reserved: Optional[Set[str]] = None) -> Tuple[Path, List[Path]]:
     """A name in dst's directory for a master whose planned name was taken after planning, and what took the others.
 
     For a RAW master the name its sidecar would take in `previews/` must be
@@ -887,18 +928,39 @@ def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
     (the name, the files found at every name passed over,
     `dst` included: masters, and previews for a RAW master), the files
     resolved and listed by their names on disk, which may differ in case.
+    A name in `reserved` (casefolded resolved paths: freed files, which have
+    no file on disk) is taken too.
     """
     taken: List[Path] = []
     raw = is_raw_suffix(src)
+    reserved = reserved or set()
     for stem in [dst.stem] + list(itertools.islice(_suffixed_stems(src.stem, e["image_id"]), 10000)):
         cand = dst.with_name(f"{stem}{src.suffix}")
         sidecar = preview_sidecar_of(cand)
         # Any entry takes a name, a directory included; only files are
         # listed for the report, which names files no row references.
-        if not _taken_in(cand.parent, cand.name) and not (raw and _taken_in(sidecar.parent, sidecar.name)):
+        if (not _taken_in(cand.parent, cand.name) and not (raw and _taken_in(sidecar.parent, sidecar.name))
+                and str(cand).casefold() not in reserved
+                and not (raw and str(sidecar).casefold() in reserved)):
             return cand, taken
         taken.extend(_entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else []))
     raise AssertionError("unreachable")
+
+
+def _taken_late(e: dict, dst: Path, reserved: Set[str]) -> bool:
+    """Whether a freed master's planned name was taken after planning: by a file, or another freed row's reservation.
+
+    For a RAW master, its preview's name in `previews/` too, unless the file
+    there is the entry's own preview, already moved by an interrupted run.
+    """
+    if dst.exists() or (str(dst).casefold() in reserved and str(dst) != e["file_path"]):
+        return True
+    if is_raw_suffix(dst):
+        side = preview_sidecar_of(dst)
+        own = bool(e["sidecar_from"]) and Path(e["sidecar_to"]) == side and not Path(e["sidecar_from"]).exists()
+        if side.exists() and not own:
+            return True
+    return False
 
 
 def _placed_this_run(report: dict) -> Set[Path]:
@@ -961,6 +1023,19 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
     """
     originals: List[Path] = []
     touched: Set[Path] = set()
+    cache: Dict[str, Set[str]] = {}
+
+    def reserved_now(db: Session, report: dict) -> Set[str]:
+        """Freed names, casefolded: the committed rows', and those this run has pointed rows at."""
+        if "db" not in cache:
+            cache["db"] = {str(p).casefold() for p in _freed_paths(db)}
+        out = set(cache["db"])
+        for m in report["freed_paths_moved"]:
+            out.add(str(Path(m["to"])).casefold())
+            if is_raw_suffix(Path(m["to"])):
+                out.add(str(preview_sidecar_of(Path(m["to"]))).casefold())
+        return out
+
     for e in batch["entries"]:
         src, dst = Path(e["from"]), Path(e["to"])
         img = db.get(RecordImage, e["image_id"])
@@ -985,9 +1060,15 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
                 report["thumbnails_cleared"].append({"image_id": e["image_id"], "reason": e["thumb_clear"]})
             continue
 
-        if src.exists() and dst.exists():
-            new_dst, taken = _free_name(e, src, dst)
-            logger.warning(f"Volume layout: {dst} was taken after planning; moving {src} to {new_dst}")
+        freed = e.get("freed", False)
+        if freed and src.exists():
+            # Freed, yet a file is at its path again: not this run's to decide.
+            report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "freed_but_present"})
+            continue
+        if (src.exists() and dst.exists()) or (freed and _taken_late(e, dst, reserved_now(db, report))):
+            new_dst, taken = _free_name(e, src, dst, reserved_now(db, report))
+            logger.warning(f"Volume layout: {dst} was taken after planning; "
+                           f"{'pointing freed' if freed else 'moving'} {src} to {new_dst}")
             # Only files no row references are strays: one a row names (a
             # master written since the plan, or a pending journal's) is that
             # row's, and so is every file this run has already put in place.
@@ -1006,25 +1087,44 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             write_layout_journal({"version": JOURNAL_VERSION, "root": str(root),
                                   "collection_id": batch["collection_id"], "entries": batch["entries"]})
             dst = new_dst
-        try:
-            if src.exists() and not dst.exists():
+        if freed:
+            # No master to move: the row is pointed at the reserved name, and
+            # the capture checksum follows a renamed one (_record_relocation).
+            try:
                 _record_relocation(root, e, src, dst)
-            at = _settle(src, dst)
-        except OSError as err:
-            logger.error(f"Volume layout: could not move {src} to {dst}; left at {src}: {err}")
-            report["failed"].append({"image_id": e["image_id"], "path": e["from"], "error": str(err)})
-            continue
-        if at != dst:
-            report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "missing"})
-            continue
-        if img.file_path != str(dst):
-            img.file_path = str(dst)
-            if img.filename == src.name:
-                img.filename = dst.name
-        originals.append(src)
-        touched.update({src.parent, dst.parent})
-        report["moved"].append({"image_id": e["image_id"], "record_id": e["record_id"],
-                                "collection_id": e["collection_id"], "from": e["from"], "to": e["to"]})
+            except OSError as err:
+                logger.error(f"Volume layout: could not record the relocation of freed {src} to {dst}: {err}")
+                report["failed"].append({"image_id": e["image_id"], "path": e["from"], "error": str(err)})
+                continue
+            if img.file_path != str(dst):
+                img.file_path = str(dst)
+                if img.filename == src.name:
+                    img.filename = dst.name
+            report["freed_paths_moved"].append({**_summary(e), "kind": "capture"})
+        else:
+            try:
+                if src.exists() and not dst.exists():
+                    _record_relocation(root, e, src, dst)
+                at = _settle(src, dst)
+            except OSError as err:
+                logger.error(f"Volume layout: could not move {src} to {dst}; left at {src}: {err}")
+                report["failed"].append({"image_id": e["image_id"], "path": e["from"], "error": str(err)})
+                continue
+            if at != dst:
+                report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "missing"})
+                continue
+            if img.file_path != str(dst):
+                img.file_path = str(dst)
+                if img.filename == src.name:
+                    img.filename = dst.name
+            originals.append(src)
+            touched.update({src.parent, dst.parent})
+            report["moved"].append({"image_id": e["image_id"], "record_id": e["record_id"],
+                                    "collection_id": e["collection_id"], "from": e["from"], "to": e["to"]})
+        if e.get("preview_freed", False):
+            report["freed_paths_moved"].append({**_summary(e), "kind": "preview",
+                                                "from": str(preview_sidecar_of(src)),
+                                                "to": str(preview_sidecar_of(dst))})
 
         if e["sidecar_from"]:
             s_src, s_dst = Path(e["sidecar_from"]), Path(e["sidecar_to"])
@@ -1316,6 +1416,7 @@ def _new_report(root: Path, dry_run: bool) -> dict:
         "out_of_place": 0,
         "moved": [],
         "adopted": [],
+        "freed_paths_moved": [],
         "sidecars_moved": [],
         "sidecars_not_moved": [],
         "sidecars_pending": [],
@@ -1393,6 +1494,9 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
             for b in batches:
                 report["manifest_records_copied"] += len(_volume_records_to_copy(db, root, b["collection_id"])[1])
                 for e in b["entries"]:
+                    if e.get("freed", False):
+                        report["freed_paths_moved"].append({**_summary(e), "kind": "capture"})
+                        continue
                     (report["adopted"] if e["adopt"] else report["moved"]).append(
                         {"image_id": e["image_id"], "from": e["from"], "to": e["to"]} if e["adopt"] else _summary(e))
             return report
@@ -1593,13 +1697,11 @@ def _log_report(report: dict) -> None:
         )
     for f in report["failed"]:
         logger.error(f"Volume layout: image {f['image_id']} not moved, left at {f['path']}: {f['error']}")
-    freed = [s for s in report["skipped"] if s["reason"] == "freed"]
-    if freed:
-        logger.info(f"Volume layout: {len(freed)} image(s) out of place are freed from the card "
-                    "(stored offsite); they are moved after a restore")
+    if report["freed_paths_moved"]:
+        logger.info(f"Volume layout: pointed {len(report['freed_paths_moved'])} freed file(s) (stored offsite, "
+                    "not on the card) at their names in their volumes' folders; nothing was moved for them")
     for s in report["skipped"]:
-        if s["reason"] != "freed":
-            logger.warning(f"Volume layout: image {s['image_id']} not moved ({s['reason']}): {s['path']}")
+        logger.warning(f"Volume layout: image {s['image_id']} not moved ({s['reason']}): {s['path']}")
     for s in report["sidecars_pending"] + report["sidecars_not_moved"]:
         logger.warning(f"Volume layout: sidecar not yet beside its master, still at {s.get('from') or s.get('path')}")
     for p in report["left_unreferenced"]:

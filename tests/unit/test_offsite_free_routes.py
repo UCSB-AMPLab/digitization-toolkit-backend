@@ -335,7 +335,8 @@ def test_the_run_manifests_are_the_volumes_own(remote, db_session, override_proj
 
 
 @pytest.mark.unit
-def test_an_out_of_place_freed_master_is_reported_as_freed_not_missing(remote, db_session, override_projects_root):
+def test_an_out_of_place_freed_master_is_pointed_into_its_folder_not_reported_missing(
+        remote, db_session, override_projects_root):
     from app.core.volume_layout import migrate_volume_layout
     from app.models.record import RecordImage
 
@@ -350,5 +351,5 @@ def test_an_out_of_place_freed_master_is_reported_as_freed_not_missing(remote, d
 
     report = migrate_volume_layout(db_session, dry_run=True)
 
-    skipped = {s["image_id"]: s["reason"] for s in report["skipped"]}
-    assert skipped.get(jpg.id) == "freed", report["skipped"]
+    assert not [s for s in report["skipped"] if s["image_id"] == jpg.id], report["skipped"]
+    assert [m["image_id"] for m in report["freed_paths_moved"]] == [jpg.id]
