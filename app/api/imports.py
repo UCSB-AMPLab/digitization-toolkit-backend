@@ -7,6 +7,7 @@ GET /imports/digitisation-list/{list_id}/report returns the latest stored
 import report for a list. The import itself is app/core/list_import.py.
 """
 
+import hashlib
 import logging
 
 from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
@@ -17,6 +18,7 @@ from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core.audit import log_event
 from app.core.list_import import (
+    ListIdReused,
     ListRefused,
     ListUnreadable,
     ProjectNeedsAdmin,
@@ -24,7 +26,6 @@ from app.core.list_import import (
     parse_list_file,
     latest_report_path,
     report_filename,
-    store_report,
 )
 from app.models.user import User
 
@@ -68,7 +69,10 @@ def import_digitisation_list(
 
     A file whose envelope this unit does not read is refused with a 422 and
     nothing is written. A list whose project does not exist yet needs an
-    admin: from an operator it is refused with a 403 and nothing is written. Otherwise the response is the report: counts
+    admin: from an operator it is refused with a 403 and nothing is written.
+    A list id already imported from a file with a different SHA-256 is
+    refused with a 409 and nothing is written. Otherwise the response is
+    the report: counts
     `created` and `skipped`, the volumes created, and the `rejects`, each
     with the item's position, referenceCode and reason. `reportStored` says
     whether the report was also kept on the unit for
@@ -82,18 +86,16 @@ def import_digitisation_list(
 
     try:
         report = import_list(db, document, current_user.username,
-                             may_create_project=current_user.role == "admin")
+                             may_create_project=current_user.role == "admin",
+                             file_sha256=hashlib.sha256(raw).hexdigest())
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
         raise HTTPException(status_code=403, detail=str(exc))
+    except ListIdReused as exc:
+        raise HTTPException(status_code=409, detail=str(exc))
 
-    try:
-        store_report(report)
-        stored = True
-    except OSError:
-        logger.exception("Could not store the import report for list %s", report["listId"])
-        stored = False
+    stored = report["reportStored"]
 
     log_event(
         db, level="INFO" if stored else "WARN", category="activity",
@@ -102,7 +104,7 @@ def import_digitisation_list(
         detail=(f"list {report['listId']}: {report['created']} created, "
                 f"{report['skipped']} skipped" + ("" if stored else "; report not stored")),
     )
-    return JSONResponse(content={**report, "reportStored": stored})
+    return JSONResponse(content=report)
 
 
 @router.get("/digitisation-list/{list_id}/report")

@@ -36,12 +36,15 @@ by a concurrent request between the check and the insert, or a CHECK) is
 reported as a reject, not raised.
 
 The report is returned and also written under
-`<DTK_DATA_DIR>/imports/<list-id>/`, one file per run, so an operator can
-fetch it again (latest_report_path).
+`<DTK_DATA_DIR>/imports/<list-id>/`, one numbered file per run, so an
+operator can fetch it again (latest_report_path). Each report records the
+SHA-256 of the uploaded file, and a list id already imported from a file
+with a different hash is refused (ListIdReused).
 """
 
 from __future__ import annotations
 
+import fcntl
 import json
 import logging
 import os
@@ -355,6 +358,11 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     }
 
 
+def _find_project(db: Session, name: str) -> Optional[Project]:
+    """The project the list's name refers to, or None."""
+    return db.query(Project).filter(Project.name == name).first()
+
+
 def _project_for(db: Session, name: str, actor: Optional[str], may_create_project: bool) -> tuple[Project, bool]:
     """The project named `name`, created if there is none. Returns (project, created).
 
@@ -364,7 +372,7 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     POST /projects needs an admin; without it, ProjectNeedsAdmin is raised
     before anything is written.
     """
-    project = db.query(Project).filter(Project.name == name).first()
+    project = _find_project(db, name)
     if project is not None:
         return project, False
     if not may_create_project:
@@ -376,7 +384,7 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     except IntegrityError:
         # Created by a concurrent request since the query above.
         db.rollback()
-        project = db.query(Project).filter(Project.name == name).first()
+        project = _find_project(db, name)
         if project is None:
             raise
         return project, False
@@ -393,17 +401,9 @@ def _reject(position: int, code: Any, reason: str) -> dict:
     }
 
 
-def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool) -> dict:
-    """Import a digitisation list and return its report.
-
-    Raises ListRefused, before writing anything, when the envelope is not
-    one this importer reads, and then ProjectNeedsAdmin, also before writing
-    anything, when no project of the list's name exists and
-    `may_create_project` is false. Otherwise commits the project (if new) and then
-    each volume on its own, and returns the report; it does not store it
-    (store_report does).
-    """
-    list_id, list_name, items = check_envelope(document)
+def _import_items(db: Session, list_id: str, list_name: str, items: list,
+                  actor: Optional[str], may_create_project: bool) -> dict:
+    """Find or create the project, then create each item's volume; return the report."""
     project, project_created = _project_for(db, list_name, actor, may_create_project)
     project_id = project.id
 
@@ -463,6 +463,113 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     }
 
 
+class ListIdReused(Exception):
+    """An earlier run of this list id had a file with a different SHA-256; nothing has been written."""
+
+
+LIST_ID_REUSED_MESSAGE = "This list id was already imported with different content."
+
+
+def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool,
+                file_sha256: Optional[str] = None) -> dict:
+    """Import a digitisation list, store its report, and return it.
+
+    Raises, before writing anything to the database or a report:
+    - ListRefused, when the envelope is not one this importer reads;
+    - ListIdReused, when an earlier stored run of the same list id records
+      a `fileSha256` other than `file_sha256` (an identical file may be
+      imported again);
+    - ProjectNeedsAdmin, when no project matches the list's name and
+      `may_create_project` is false.
+    Otherwise commits the project (if new) and then each volume on its own,
+    stores the report as the list's next run, and returns it with
+    `reportStored` saying whether that write succeeded (the stored file
+    does not carry that key).
+
+    Imports of the same list id are serialised by an exclusive lock on
+    `<reports_dir>/<list-id>/.lock`, held from the hash check to the
+    stored report, so two concurrent runs cannot both pass the check. If
+    the lock file cannot be created the import goes on unlocked and says
+    so in the log; the run file is still created exclusively.
+    """
+    list_id, list_name, items = check_envelope(document)
+    # Checked before the lock too, so that a refusal creates no lock file;
+    # _project_for checks again under the lock.
+    if not may_create_project and _find_project(db, list_name) is None:
+        raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
+    with _list_lock(list_id):
+        if file_sha256 is not None:
+            for earlier in _earlier_hashes(list_id):
+                if earlier is not None and earlier != file_sha256:
+                    raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+        report = _import_items(db, list_id, list_name, items, actor, may_create_project)
+        report["fileSha256"] = file_sha256
+        try:
+            store_report(report)
+            stored = True
+        except OSError:
+            logger.exception("Could not store the import report for list %s", list_id)
+            stored = False
+    return {**report, "reportStored": stored}
+
+
+class _list_lock:
+    """An exclusive flock on `<reports_dir>/<list-id>/.lock`, or nothing if it cannot be made."""
+
+    def __init__(self, list_id: str):
+        self.path = reports_dir() / list_id / ".lock"
+        self.fd = None
+
+    def __enter__(self):
+        try:
+            self.path.parent.mkdir(parents=True, exist_ok=True)
+            self.fd = os.open(self.path, os.O_RDWR | os.O_CREAT, 0o644)
+            fcntl.flock(self.fd, fcntl.LOCK_EX)
+        except OSError:
+            logger.exception("Could not lock %s; importing without the lock", self.path)
+            if self.fd is not None:
+                os.close(self.fd)
+                self.fd = None
+        return self
+
+    def __exit__(self, *exc):
+        if self.fd is not None:
+            try:
+                fcntl.flock(self.fd, fcntl.LOCK_UN)
+            finally:
+                os.close(self.fd)
+        return False
+
+
+def _run_files(directory: Path, list_id: str) -> list[tuple[int, Path]]:
+    """(run number, path) for each stored run of a list, in run order."""
+    runs = []
+    for path in directory.glob(f"import-report_{list_id}_run*.json"):
+        match = _RUN_RE.fullmatch(path.name[len(f"import-report_{list_id}_"):])
+        if match:
+            runs.append((int(match.group(1)), path))
+    return sorted(runs)
+
+
+_RUN_RE = re.compile(r"run(\d+)\.json")
+
+
+def _earlier_hashes(list_id: str) -> list:
+    """The fileSha256 of each stored run of a list; None for a run that cannot be read or has none."""
+    hashes = []
+    for _, path in _run_files(reports_dir() / list_id, list_id):
+        try:
+            hashes.append(json.loads(path.read_text(encoding="utf-8")).get("fileSha256"))
+        except (OSError, ValueError, AttributeError):
+            hashes.append(None)
+    return hashes
+
+
+def _next_run_number(directory: Path, list_id: str) -> int:
+    runs = _run_files(directory, list_id)
+    return runs[-1][0] + 1 if runs else 1
+
+
 def reports_dir() -> Path:
     """Where import reports are kept: `<DTK_DATA_DIR>/imports`."""
     return config.settings.data_dir / "imports"
@@ -474,39 +581,44 @@ def report_filename(list_id: str) -> str:
 
 
 def store_report(report: dict) -> Path:
-    """Write the report as `<reports_dir>/<list-id>/import-report_<list-id>_<time>.json`.
+    """Write the report as `<reports_dir>/<list-id>/import-report_<list-id>_run<NNNN>.json`.
 
-    One file per run, so a re-import's report does not replace the first
-    one's. The time is the report's importedAt without punctuation, so the
-    names sort in run order. Written to a temporary file and renamed, so a
-    reader never sees half a report. Raises OSError if it cannot be written.
+    One file per run, numbered from 1, so a re-import's report does not
+    replace the first one's, and the order does not depend on the clock.
+    The report is written to a temporary file and hard-linked to the run's
+    name, which fails if that name exists, so two runs never take the same
+    number and a reader never sees half a report; on a taken number the
+    next one is tried. `reportStored` is not written. Raises OSError if the
+    report cannot be written.
     """
     list_id = str(uuid.UUID(report["listId"]))  # never a path component from the file unchecked
-    stamp = re.sub(r"[^0-9TZ]", "", report["importedAt"])
     directory = reports_dir() / list_id
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / f"import-report_{list_id}_{stamp}.json"
+    body = {k: v for k, v in report.items() if k != "reportStored"}
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "w", encoding="utf-8") as handle:
-            json.dump(report, handle, ensure_ascii=False, indent=2)
+            json.dump(body, handle, ensure_ascii=False, indent=2)
             handle.flush()
             os.fsync(handle.fileno())
-        os.replace(tmp, target)
-    except BaseException:
+        number = _next_run_number(directory, list_id)
+        while True:
+            target = directory / f"import-report_{list_id}_run{number:04d}.json"
+            try:
+                os.link(tmp, target)
+                break
+            except FileExistsError:
+                number += 1
+    finally:
         try:
             os.unlink(tmp)
         except OSError:
             pass
-        raise
     return target
 
 
 def latest_report_path(list_id: str) -> Optional[Path]:
-    """The most recent stored report for a list, or None. `list_id` must be a UUID."""
+    """The stored report with the highest run number for a list, or None. `list_id` must be a UUID."""
     list_id = str(uuid.UUID(list_id))
-    directory = reports_dir() / list_id
-    if not directory.is_dir():
-        return None
-    runs = sorted(directory.glob(f"import-report_{list_id}_*.json"))
-    return runs[-1] if runs else None
+    runs = _run_files(reports_dir() / list_id, list_id)
+    return runs[-1][1] if runs else None

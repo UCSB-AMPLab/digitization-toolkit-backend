@@ -565,12 +565,12 @@ def test_fetching_a_report_that_does_not_exist(client, db_session, reports_root)
 
 @pytest.mark.unit
 def test_a_report_that_cannot_be_stored_still_returns_and_keeps_the_volumes(client, db_session, reports_root, monkeypatch):
-    import app.api.imports as imports
+    import app.core.list_import as li
 
     def fail(report):
         raise OSError("disk full")
 
-    monkeypatch.setattr(imports, "store_report", fail)
+    monkeypatch.setattr(li, "store_report", fail)
     _as("op", "admin")
     resp = _post_fixture(client, VALID)
     assert resp.status_code == 200
@@ -772,3 +772,99 @@ def test_no_dates_key_under_fisqua_when_dates_has_only_mapped_subfields(client, 
     _as("op", "admin")
     _post(client, _list_with([_item(code="xx-test-702", stem="xx-test-702")]))
     assert "dates" not in json.loads(_volumes(db_session)["xx-test-702"].custom_attributes)["fisqua"]
+
+
+# ---------------------------------------------------------------------------
+# Runs, the file hash and a reused list id
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_runs_are_numbered_and_the_highest_is_served(client, db_session, reports_root):
+    _as("op", "admin")
+    _post_fixture(client, VALID)
+    _post_fixture(client, VALID)
+    names = sorted(p.name for p in (reports_root / VALID_ID).glob("import-report_*.json"))
+    assert names == [f"import-report_{VALID_ID}_run0001.json", f"import-report_{VALID_ID}_run0002.json"]
+    assert client.get(f"/imports/digitisation-list/{VALID_ID}/report").json()["created"] == 0
+
+
+@pytest.mark.unit
+def test_the_latest_run_is_served_after_the_clock_goes_back(client, db_session, reports_root, monkeypatch):
+    """A unit without a real-time clock can boot with its clock behind the last run."""
+    import app.core.list_import as li
+    from datetime import datetime as real_dt, timezone
+
+    times = iter([real_dt(2026, 10, 23, 12, 0, tzinfo=timezone.utc),
+                  real_dt(2026, 1, 1, 0, 0, tzinfo=timezone.utc)])
+
+    class FakeDT(real_dt):
+        @classmethod
+        def now(cls, tz=None):
+            return next(times)
+
+    monkeypatch.setattr(li, "datetime", FakeDT)
+    _as("op", "admin")
+    assert _post_fixture(client, VALID).json()["created"] == 4
+    second = _post_fixture(client, VALID).json()
+    got = client.get(f"/imports/digitisation-list/{VALID_ID}/report").json()
+    assert got["importedAt"] == second["importedAt"] and got["created"] == 0
+
+
+@pytest.mark.unit
+def test_a_run_number_taken_meanwhile_is_skipped_not_overwritten(reports_root, monkeypatch):
+    import app.core.list_import as li
+
+    report = {"listId": VALID_ID, "importedAt": "x", "created": 1}
+    monkeypatch.setattr(li, "_next_run_number", lambda directory, list_id: 1)
+    first = li.store_report(report)
+    second = li.store_report({**report, "created": 2})
+    assert first.name.endswith("_run0001.json") and second.name.endswith("_run0002.json")
+    assert json.loads(first.read_text())["created"] == 1
+    assert not [p for p in (reports_root / VALID_ID).iterdir() if p.name.startswith(".tmp")]
+
+
+@pytest.mark.unit
+def test_the_report_carries_the_uploaded_files_sha256(client, db_session, reports_root):
+    import hashlib
+
+    _as("op", "admin")
+    report = _post_fixture(client, VALID).json()
+    assert report["fileSha256"] == hashlib.sha256(VALID.read_bytes()).hexdigest()
+    stored = json.loads(next((reports_root / VALID_ID).glob("*.json")).read_text(encoding="utf-8"))
+    assert stored["fileSha256"] == report["fileSha256"]
+
+
+@pytest.mark.unit
+def test_a_reused_list_id_with_different_content_is_refused_and_nothing_written(client, db_session, reports_root):
+    from app.models.project import Project
+
+    _as("op", "admin")
+    assert _post_fixture(client, VALID).status_code == 200
+    other = _list_with([_item(code="xx-test-997", stem="xx-test-997")])
+    other["list"]["name"] = "Otra canasta"
+    resp = _post(client, other)
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "This list id was already imported with different content."
+    assert [p.name for p in db_session.query(Project).all()] == ["Prueba válida"]
+    assert "xx-test-997" not in _volumes(db_session)
+    assert len(list((reports_root / VALID_ID).glob("import-report_*.json"))) == 1
+    assert client.get(f"/imports/digitisation-list/{VALID_ID}/report").json()["listName"] == "Prueba válida"
+
+
+@pytest.mark.unit
+def test_imports_of_one_list_id_are_serialised_by_the_lock(reports_root):
+    import threading
+    import app.core.list_import as li
+
+    entered = threading.Event()
+
+    def second():
+        with li._list_lock(VALID_ID):
+            entered.set()
+
+    with li._list_lock(VALID_ID):
+        t = threading.Thread(target=second)
+        t.start()
+        assert not entered.wait(0.3)
+    t.join(5)
+    assert entered.is_set()
