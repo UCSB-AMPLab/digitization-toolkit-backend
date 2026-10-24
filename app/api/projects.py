@@ -25,7 +25,7 @@ from app.models.record import Record
 # One definition of whether a record may change parents, and the loader that
 # locks the row the decision is made from (NEH-260).
 from app.api.records import _locked_record, assert_movable, RecordImage
-from app.models.collection import Collection
+from app.models.collection import Collection, stem_directory_collision
 from app.models.user import User
 from app.schemas.project import ProjectCreate, ProjectRead, ProjectBase, ProjectUpdate
 from app.schemas.project_member import ProjectMemberCreate, ProjectMemberRead
@@ -66,6 +66,7 @@ def create_project(
 ):
     if db.query(Project).filter(Project.name == payload.name).first():
         raise HTTPException(status_code=409, detail="Project with this name already exists")
+    _refuse_a_name_that_is_a_stem(db, payload.name)
     p = Project(name=payload.name, description=payload.description, fondo=payload.fondo, serie=payload.serie, signatura=payload.signatura, created_by=payload.created_by or current_user.username)
     db.add(p)
     db.commit()
@@ -153,6 +154,13 @@ def remove_record_from_project(
     return {"detail": "record removed"}
 
 
+def _refuse_a_name_that_is_a_stem(db: Session, name: str) -> None:
+    """409 when the project's directory would be named as a volume's stem (app.models.collection)."""
+    message = stem_directory_collision(db, project_name=name)
+    if message:
+        raise HTTPException(status_code=409, detail=message)
+
+
 def _without_stem(db: Session, collection_ids: List[int]) -> List[int]:
     """The ids among `collection_ids` of volumes without a file name stem (the name-based layout)."""
     if not collection_ids:
@@ -185,6 +193,8 @@ def update_project(
         existing = db.query(Project).filter(Project.name == payload.name).first()
         if existing:
             raise HTTPException(status_code=409, detail="Project with this name already exists")
+        # Before the tree moves: its new directory may not be a volume's stem.
+        _refuse_a_name_that_is_a_stem(db, payload.name)
 
     # A rename moves the project's whole tree, so every volume whose files are
     # in it is held against exports from before the change until the commit.

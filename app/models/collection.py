@@ -53,6 +53,40 @@ class StemReservedError(ImmutableFieldError):
     """A delete would free a stem whose file names have been issued."""
 
 
+class StemDirectoryCollisionError(ValueError):
+    """A stem and a project's directory name would name the same directory under the projects root.
+
+    A volume with a stem keeps its files in `<projects root>/<stem>/`, and a
+    project its tree in `<projects root>/<project directory>/`. Raised by the
+    before_flush listener _refuse_a_stem_that_is_a_project_directory, so
+    every writer meets it; the API answers 409 (app.main).
+    """
+
+
+def stem_directory_collision(session, stem=None, project_name=None):
+    """The message refusing `stem`, or a project named `project_name`, or None when there is no collision.
+
+    A stem collides with a project whose directory name (project_dir_name)
+    equals it; a project name collides with a volume whose stem equals its
+    directory name. Reads with autoflush off, so it can run inside a flush.
+    """
+    from app.core.paths import project_dir_name
+    from app.models.project import Project
+
+    with session.no_autoflush:
+        if stem is not None:
+            for (name,) in session.query(Project.name).all():
+                if project_dir_name(name) == stem:
+                    return (f"The file name stem {stem} is the directory of project {name!r}; "
+                            "a volume's files and a project's tree cannot share it.")
+        if project_name is not None:
+            directory = project_dir_name(project_name)
+            if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
+                return (f"The project name {project_name!r} would use the directory {directory}, "
+                        "which is a volume's file name stem.")
+    return None
+
+
 STEM_RESERVED_MESSAGE = (
     "This volume has a file name stem and has captured images, so it cannot be "
     "deleted; it keeps its stem so the name is never issued again."
@@ -370,3 +404,40 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
             )
+
+
+@event.listens_for(Session, "before_flush")
+def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances):
+    """Refuse a flush that gives a volume a stem equal to a project's directory, or the reverse.
+
+    Covers every writer: the collection and project routes, and the list
+    import, which creates volumes through the model. Only a new volume, a
+    changed stem, a new project or a renamed project is checked. Because of
+    the stem pattern, only a project name that folds to a lowercase
+    hyphenated slug can collide. Two writes in one flush that collide with
+    each other (a new project and a new volume) are compared too.
+    """
+    from app.core.paths import project_dir_name
+    from app.models.project import Project
+
+    pending = list(session.new) + list(session.dirty)
+    new_stems = {}
+    new_dirs = {}
+    for obj in pending:
+        if isinstance(obj, Collection) and obj.filename_stem is not None:
+            if obj in session.new or sa_inspect(obj).attrs.filename_stem.history.has_changes():
+                new_stems[obj.filename_stem] = obj
+        elif isinstance(obj, Project) and obj.name:
+            if obj in session.new or sa_inspect(obj).attrs.name.history.has_changes():
+                new_dirs[project_dir_name(obj.name)] = obj
+    for stem in new_stems:
+        message = stem_directory_collision(session, stem=stem)
+        if message is None and stem in new_dirs:
+            message = (f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
+                       "a volume's files and a project's tree cannot share it.")
+        if message:
+            raise StemDirectoryCollisionError(message)
+    for directory, project in new_dirs.items():
+        message = stem_directory_collision(session, project_name=project.name)
+        if message:
+            raise StemDirectoryCollisionError(message)

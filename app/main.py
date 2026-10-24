@@ -91,12 +91,19 @@ app.include_router(activity_router, prefix="/activity", tags=["activity"])
 
 
 from app.core.storage_override import StorageUnavailableError
+from app.models.collection import StemDirectoryCollisionError
 
 
 @app.exception_handler(StorageUnavailableError)
 async def storage_unavailable(request: Request, exc: StorageUnavailableError):
     """A write into the projects tree refused because the override root is not usable."""
     return JSONResponse(status_code=503, content={"detail": str(exc)})
+
+
+@app.exception_handler(StemDirectoryCollisionError)
+async def stem_directory_taken(request: Request, exc: StemDirectoryCollisionError):
+    """A stem and a project's directory name refused at a flush that no route checked first."""
+    return JSONResponse(status_code=409, content={"detail": {"message": str(exc)}})
 
 
 @app.get("/health")

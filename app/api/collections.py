@@ -10,7 +10,7 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.collection import STEM_RESERVED_MESSAGE, Collection
+from app.models.collection import STEM_RESERVED_MESSAGE, Collection, stem_directory_collision
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
@@ -108,6 +108,12 @@ def create_collection(
         created_by=payload.created_by or current_user.username
     )
     
+    # A stem may not name a project's directory (app.models.collection).
+    if payload.filename_stem is not None:
+        message = stem_directory_collision(db, stem=payload.filename_stem)
+        if message:
+            raise HTTPException(status_code=409, detail={"message": message})
+
     try:
         db.add(collection)
         db.commit()
@@ -286,6 +292,13 @@ def update_collection(
             if not current:
                 break
     
+    # A stem may not name a project's directory (app.models.collection).
+    new_stem = payload.model_dump(exclude_unset=True).get("filename_stem")
+    if new_stem is not None and new_stem != collection.filename_stem:
+        message = stem_directory_collision(db, stem=new_stem)
+        if message:
+            raise HTTPException(status_code=409, detail={"message": message})
+
     # Only volumes without a stem have a directory named after the volume
     # and its project, so only they can have their files moved by a rename or
     # a re-parent; a volume with a stem keeps its files where they are.

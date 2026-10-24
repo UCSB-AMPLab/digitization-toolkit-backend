@@ -34,6 +34,23 @@ METADATA_DIR = "metadata"      # the volume's manifest.jsonl
 VOLUME_SUBDIRS = (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR)
 
 
+def project_dir_name(project_name: str) -> str:
+    """The name of a project's directory under the projects root.
+
+    ASCII-folded, every character outside [a-zA-Z0-9._-] replaced by `_`,
+    leading dots stripped, lowercased. capture.project_manager's
+    secure_project_filename is this function. A volume's stem names a
+    directory in the same place, so the two are compared with
+    app.models.collection's StemDirectoryCollisionError check.
+    """
+    import re
+    import unicodedata
+
+    name = unicodedata.normalize('NFKD', project_name).encode('ascii', 'ignore').decode('ascii')
+    name = re.sub(r'[^a-zA-Z0-9._-]', '_', name)
+    return name.lstrip('.').lower()
+
+
 def is_raw_suffix(path: Path) -> bool:
     """True if `path` has a RAW master's suffix, in either case (`.CR2`, `.cr2`)."""
     return path.suffix.lower() in RAW_SUFFIXES

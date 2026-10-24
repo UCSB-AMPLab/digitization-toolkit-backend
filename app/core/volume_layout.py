@@ -63,6 +63,10 @@ What is moved, and how:
   elsewhere (uploads under the data directory, files on another drive) are
   not looked at. Files no row references stay where they are and are
   reported.
+- A volume whose `<stem>/` is a live project tree (a project of that
+  directory name, or a directory holding `images/`, `packages/` or
+  `metadata/project_manifest.jsonl`) is not moved, and each of its images is
+  reported as skipped with reason "stem_dir_is_project_tree".
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
@@ -383,6 +387,32 @@ def _adoptable(target: Path, src: Path, image_id: int, owners: Dict[Path, int],
     return None, refused
 
 
+# The target given to a volume whose `<stem>/` is a project's tree: nothing is moved.
+PROJECT_TREE = object()
+
+
+def _project_dir_names(db: Session) -> Set[str]:
+    from app.core.paths import project_dir_name
+    from app.models.project import Project
+
+    return {project_dir_name(name) for (name,) in db.query(Project.name).all()}
+
+
+def _is_project_tree(volume_dir: Path, project_dirs: Set[str]) -> bool:
+    """Whether `<stem>/` is a live project tree, so no volume's files may be moved into it.
+
+    Live: a project in the database has that directory name (a collision
+    written before the model refused it, app.models.collection), or the
+    directory holds what only a project's tree holds: `images/`,
+    `packages/` or `metadata/project_manifest.jsonl`, as a project no longer
+    in the database can leave it.
+    """
+    if volume_dir.name in project_dirs:
+        return True
+    return ((volume_dir / "images").exists() or (volume_dir / "packages").exists()
+            or (volume_dir / "metadata" / "project_manifest.jsonl").exists())
+
+
 def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple[List[dict], List[dict], List[str]]:
     """Plan the work for the out-of-place rows under `root` (resolved). Reads only.
 
@@ -394,6 +424,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     from capture.project_manager import image_output_dir
 
     owners = _owners(db)
+    project_dirs = _project_dir_names(db)
     manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
     refused: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
@@ -425,9 +456,14 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 targets[cid] = image_output_dir("", stem=stem).resolve() if stem else None
             except ValueError:
                 targets[cid] = None  # a stem the model's pattern would refuse
+            if targets[cid] is not None and _is_project_tree(targets[cid].parent, project_dirs):
+                targets[cid] = PROJECT_TREE
         target = targets[cid]
         if target is None:
             skipped.append({"image_id": iid, "path": str(src), "reason": "no_stem"})
+            continue
+        if target is PROJECT_TREE:
+            skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_is_project_tree"})
             continue
         if src.parent == target:
             continue  # stored through another spelling of the same directory
