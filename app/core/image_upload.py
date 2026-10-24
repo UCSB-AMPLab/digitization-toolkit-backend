@@ -46,8 +46,11 @@ has committed, and capture writes each file whole before that commit
 while it is hashed is skipped for this run.
 
 Each file is uploaded from a hard link made in a staging directory under the
-projects root, so a renumber that renames the file during the upload cannot
-change which bytes are sent. Where a hard link cannot be made (a file system
+projects root, so a move of the volume's records, a rename or a delete that
+changes the file's name during the upload cannot change which bytes are
+sent: the read hold (_read_object) lasts only while the file is staged, not
+while it is uploaded. A renumber renames nothing. Where a hard link cannot
+be made (a file system
 without hard links), a copy is made there instead, and removed after the
 upload.
 """
@@ -530,10 +533,18 @@ class _Read:
 def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     """Pin the bytes of the file the image's row names, or None (reported) when that cannot be done.
 
-    Under export_jobs.hold_for_reading, which a renumber, a record move, a
-    rename or a delete cannot overlap (they take hold_for_file_changes): the
-    row is re-read, the file is staged as a hard link, and the row is read a
-    third time and must name the same file. Where no hard link can be made,
+    Under export_jobs.hold_for_reading, which nothing that moves, renames or
+    deletes the volume's files can overlap: a move of its records
+    (move-records), a project or volume rename, a record or image delete and
+    freeing all take hold_for_file_changes. A single-record move (PATCH
+    /records/{id}) and a renumber take no hold and need none: the PATCH
+    rewrites the record's collection_id and sequence and a renumber its
+    sequence, and neither touches a file, so the path the row names still
+    holds the same bytes. A PATCH move that lands between this read and the
+    first offsite row is caught by _claim, which locks the record and reads
+    the image's row again, volume and stem included, before it writes. Under
+    the hold the row is re-read, the file is staged as a hard link, and the
+    row is read a third time and must name the same file. Where no hard link can be made,
     the file is copied into the staging directory instead, still under the
     hold. From then on the staged file holds this image's bytes whatever
     happens to its name, and it is what is hashed and uploaded.
@@ -620,8 +631,7 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
 def _fixity_index(result: RunResult, *, fresh: bool = False):
     """The capture-time sha256 index, built once per run and only when a run reaches a capture.
 
-    `fresh` rebuilds it: a renumber or a move during the run appends
-    relocation records the run's copy does not have.
+    `fresh` rebuilds it: a move during the run appends relocation records the run's copy does not have.
     """
     if result.fixity is None or fresh:
         from app.core.integrity import build_fixity_index
@@ -861,8 +871,8 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
             continue  # has a key already: an upload in progress, or refused
         # This command runs in a process of its own, outside the backend's
         # read hold, so the file is identified by its inode on both sides of
-        # the hash and the row must still name it afterwards: a renumber or a
-        # move in between makes the digest someone else's.
+        # the hash and the row must still name it afterwards: a move, a rename
+        # or a delete in between makes the digest someone else's.
         state = _image_state(db, item.image_id)
         path = local_file(item.kind, state.file_path) if state else None
         if path is None or not path.is_file():

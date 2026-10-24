@@ -109,8 +109,10 @@ class ExportJobRegistry:
         (app.core.image_upload): raises FilesChanging when a request holds any
         of the collections for file changes; otherwise, until the block exits,
         hold_for_file_changes refuses them with a 409. The check and the hold
-        are taken under the one lock, so a renumber, a move or a delete either
-        finished before the read began or starts after it ends. Meant for a
+        are taken under the one lock, so a move of the collection's records, a
+        rename or a delete either finished before the read began or starts
+        after it ends. A renumber and a single-record PATCH take no hold: they
+        rewrite rows and touch no file. Meant for a
         short span (the upload holds it to re-read a row and make a hard link),
         since a request refused here is the operator's to retry.
         """

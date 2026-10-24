@@ -25,8 +25,11 @@ The rules:
   the name-based layout is refused: a project or volume rename moves such
   files under a hold that does not exclude this one, while nothing running
   moves a file in `<stem>/` (see _require_own_folder).
-* **Under hold_for_file_changes**, so no export, record move, renumber or
-  offsite read of the volume runs meanwhile. No database transaction stays
+* **Under hold_for_file_changes**, so no export or offsite read of the
+  volume runs meanwhile. The hold does not exclude another holder; no record
+  being freed can be moved anyway, since each freed image has a verified
+  offsite row and such a record stays in its volume (records_stored_offsite),
+  and a renumber changes sequence only. No database transaction stays
   open across a listing, a hash or a copy.
 * **The row first, then the file.** A file's freed state is committed under
   its record's row lock, conditional on the row still naming that path, and
