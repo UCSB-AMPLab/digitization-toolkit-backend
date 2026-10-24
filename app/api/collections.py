@@ -462,6 +462,23 @@ def move_collection_records(
             },
         )
 
+    # A record whose images are in the bucket stays in its volume: their keys
+    # are under this volume's stem and never change. All or nothing, as above.
+    from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
+
+    stored = records_stored_offsite(db, [r.id for r in records])
+    if stored and target_collection_id != collection_id:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "message": (
+                    f"Cannot move: {len(stored)} record(s) have files already stored "
+                    f"offsite under this volume: {stored}."
+                ),
+                "blocking_record_ids": stored,
+            },
+        )
+
     # The moved records take the sequences after the target's highest, in
     # their listing order in the source, so no two records of the target
     # share one. The

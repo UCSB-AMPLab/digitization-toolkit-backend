@@ -870,6 +870,36 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 
 
 # ---------------------------------------------------------------------------
+# Records whose files are stored offsite
+# ---------------------------------------------------------------------------
+
+STORED_OFFSITE_MESSAGE = (
+    "This record's files are already stored offsite under this volume, "
+    "so it cannot be moved to another volume."
+)
+
+
+def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
+    """The ids, sorted, of those records with an image that has an offsite_objects row.
+
+    Any row counts, verified, pending or refused: each holds a key under the
+    volume's stem that never changes, so such a record stays in its volume.
+    """
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    ids = list(record_ids)
+    if not ids:
+        return []
+    rows = (db.query(RecordImage.record_id)
+            .join(OffsiteObject, OffsiteObject.record_image_id == RecordImage.id)
+            .filter(RecordImage.record_id.in_(ids))
+            .distinct()
+            .all())
+    return sorted(r for (r,) in rows)
+
+
+# ---------------------------------------------------------------------------
 # The received indicator, derived
 # ---------------------------------------------------------------------------
 
