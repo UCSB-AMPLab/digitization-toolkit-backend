@@ -358,6 +358,16 @@ def test_a_malformed_entry_is_refused_and_the_rest_adopted(masters, db_session, 
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("kind", [["preview"], {"preview": 1}])
+def test_a_kind_that_is_not_a_string_is_a_malformed_entry(masters, db_session, override_projects_root, kind):
+    vol, img, entries = _raw_volume(db_session, override_projects_root, masters)
+    entries[1]["kind"] = kind
+    report = _adopt(db_session, _map(vol, entries), apply=True)
+    assert [(r["image_id"], r["reason"]) for r in report["refused"]] == [(img.id, "malformed_entry")]
+    assert set(_rows(db_session)) == {(img.id, "capture")}
+
+
+@pytest.mark.unit
 def test_the_adopt_map_command_reports_as_json(masters, db_session, override_projects_root, capsys, tmp_path):
     from app.core.image_upload import main
 

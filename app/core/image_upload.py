@@ -1007,7 +1007,8 @@ def _map_entry_fields(entry) -> Optional[dict]:
     size, capture_id = entry.get("bytes"), entry.get("captureId")
     if (not isinstance(image_id, int) or isinstance(image_id, bool)
             or not isinstance(record_id, int) or isinstance(record_id, bool)
-            or kind not in _LAYOUT_DIR or not isinstance(name, str) or not name
+            or not isinstance(kind, str) or kind not in _LAYOUT_DIR
+            or not isinstance(name, str) or not name
             or not isinstance(sha1, str) or not _SHA1_PATTERN.match(sha1)
             or (size is not None and (not isinstance(size, int) or isinstance(size, bool)))
             or (capture_id is not None and not isinstance(capture_id, str))):
