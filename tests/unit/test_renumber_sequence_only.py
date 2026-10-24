@@ -233,3 +233,167 @@ def test_images_an_earlier_renumber_renamed_still_resolve_after_a_renumber(
     assert verify_images_against_manifest(imgs) == []
     Path(imgs[0].file_path).write_bytes(b"bit rot")
     assert [m["record_image_id"] for m in verify_images_against_manifest(imgs)] == [imgs[0].id]
+
+
+# ---------------------------------------------------------------------------
+# The other paths that set a record's sequence in a volume
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def statements(db_session):
+    """The SQL statements the session's engine runs, in order, upper-cased."""
+    from sqlalchemy import event
+
+    seen: list = []
+    engine = db_session.get_bind()
+
+    def record(conn, cursor, statement, params, context, executemany):
+        seen.append(" ".join(statement.split()).upper())
+
+    event.listen(engine, "before_cursor_execute", record)
+    yield seen
+    event.remove(engine, "before_cursor_execute", record)
+
+
+def _first(seen: list, *needles) -> int:
+    return next(i for i, s in enumerate(seen) if all(n in s for n in needles))
+
+
+@pytest.mark.unit
+def test_a_reorder_sets_one_to_n_in_the_order_given(client, db_session):
+    _p, vol = _volume(db_session)
+    a, b, c = (_record(db_session, vol.id, s) for s in (0, 0, None))
+
+    resp = _as_operator(client).patch(f"/collections/{vol.id}/records/reorder",
+                                      json={"ordered_ids": [c.id, a.id, b.id]})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json() == {"reordered": 3}
+    assert _sequences(db_session, vol.id) == {c.id: 1, a.id: 2, b.id: 3}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("which", ["missing", "repeated", "foreign"])
+def test_a_reorder_that_does_not_name_every_record_once_is_refused_and_writes_nothing(client, db_session, which):
+    from app.core.record_sequence import REORDER_IDS_MESSAGE
+
+    project, vol = _volume(db_session)
+    _p, other = _volume(db_session, name="Tomo 2", stem="xx-test-tomo-2", project=project)
+    a, b = _record(db_session, vol.id, 4), _record(db_session, vol.id, 9)
+    o = _record(db_session, other.id, 1)
+    ids = {"missing": [b.id], "repeated": [b.id, a.id, b.id], "foreign": [b.id, a.id, o.id]}[which]
+
+    resp = _as_operator(client).patch(f"/collections/{vol.id}/records/reorder", json={"ordered_ids": ids})
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == REORDER_IDS_MESSAGE
+    assert _sequences(db_session, vol.id) == {a.id: 4, b.id: 9}
+    assert _sequences(db_session, other.id) == {o.id: 1}
+
+
+@pytest.mark.unit
+def test_a_reorder_of_a_volume_that_does_not_exist_is_404(client, db_session):
+    resp = _as_operator(client).patch("/collections/9999/records/reorder", json={"ordered_ids": [1]})
+    assert resp.status_code == 404, resp.text
+
+
+@pytest.mark.unit
+def test_records_moved_into_a_volume_take_the_sequences_after_its_highest_in_their_order(
+        client, db_session, capture_settings, override_projects_root):
+    project, src = _volume(db_session)
+    _p, dst = _volume(db_session, name="Tomo 2", stem="xx-test-tomo-2", project=project)
+    t1, t5 = _record(db_session, dst.id, 1), _record(db_session, dst.id, 5)
+    s3, s1, snull = _record(db_session, src.id, 3), _record(db_session, src.id, 1), _record(db_session, src.id, None)
+
+    resp = _as_operator(client).post(f"/collections/{src.id}/move-records",
+                                     params={"target_collection_id": dst.id})
+
+    assert resp.status_code == 200, resp.text
+    assert _sequences(db_session, dst.id) == {t1.id: 1, t5.id: 5, s1.id: 6, s3.id: 7, snull.id: 8}
+    assert _sequences(db_session, src.id) == {}
+
+
+@pytest.mark.unit
+def test_a_record_moved_into_another_volume_takes_the_next_sequence_there(client, db_session):
+    project, a = _volume(db_session)
+    _p, b = _volume(db_session, name="Tomo 2", stem="xx-test-tomo-2", project=project)
+    r = _record(db_session, a.id, 1)
+    b1, b2 = _record(db_session, b.id, 1), _record(db_session, b.id, 2)
+
+    resp = _as_operator(client).patch(f"/records/{r.id}", json={"collection_id": b.id})
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["sequence"] == 3
+    assert _sequences(db_session, b.id) == {b1.id: 1, b2.id: 2, r.id: 3}
+
+    same = _as_operator(client).patch(f"/records/{r.id}", json={"collection_id": b.id, "title": "t"})
+    assert same.status_code == 200, same.text
+    assert same.json()["sequence"] == 3
+
+
+@pytest.mark.unit
+def test_a_record_created_in_a_volume_takes_the_next_sequence_there(client, db_session):
+    project, vol = _volume(db_session)
+    api = _as_operator(client)
+
+    first = api.post("/records/", json={"title": "a", "capture_mode": "single", "collection_id": vol.id,
+                                        "sequence": 40})
+    assert first.status_code == 200, first.text
+    assert first.json()["sequence"] == 1
+    _record(db_session, vol.id, 7)
+    second = api.post("/records/", json={"title": "b", "capture_mode": "single", "collection_id": vol.id})
+    assert second.json()["sequence"] == 8
+    loose = api.post("/records/", json={"title": "c", "capture_mode": "single", "project_id": project.id})
+    assert loose.status_code == 200, loose.text
+    assert loose.json()["sequence"] is None
+
+
+@pytest.mark.unit
+def test_the_record_lock_queries_lock_the_records_only(db_session):
+    from sqlalchemy.dialects import postgresql
+    from app.core.record_sequence import _records_in_order
+    from app.models.record import Record
+
+    captured = []
+    real_all = type(db_session.query(Record)).all
+
+    def spy(query):
+        captured.append(str(query.statement.compile(dialect=postgresql.dialect())).upper())
+        return real_all(query)
+
+    import unittest.mock as mock
+    with mock.patch.object(type(db_session.query(Record)), "all", spy):
+        _records_in_order(db_session, 1)
+    assert captured and captured[0].rstrip().endswith("FOR UPDATE OF RECORDS"), captured
+
+
+@pytest.mark.unit
+def test_rewrites_lock_the_records_before_the_volume_and_additions_read_the_maximum_after_it(
+        client, db_session, statements, capture_settings, override_projects_root):
+    """SQLite emits no lock clause; the order of the statements is what reaches PostgreSQL with one."""
+    project, vol = _volume(db_session)
+    _p, other = _volume(db_session, name="Tomo 2", stem="xx-test-tomo-2", project=project)
+    r = _record(db_session, vol.id, 1)
+    api = _as_operator(client)
+    # Read here: an expired object read inside a call would add its own SELECT.
+    vid, oid, rid = vol.id, other.id, r.id
+
+    def check(call, first_needles, then_needles):
+        statements.clear()
+        resp = call()
+        assert resp.status_code == 200, resp.text
+        assert _first(statements, *first_needles) < _first(statements, *then_needles), statements
+
+    volume_row = ("FROM COLLECTIONS", "COLLECTIONS.ID =")
+    record_rows = ("FROM RECORDS", "RECORDS.COLLECTION_ID =")
+    highest = ("MAX(RECORDS.SEQUENCE)",)
+    check(lambda: api.post(f"/collections/{vid}/images/renumber"), record_rows, volume_row)
+    check(lambda: api.patch(f"/collections/{vid}/records/reorder", json={"ordered_ids": [rid]}),
+          record_rows, volume_row)
+    check(lambda: api.post("/records/", json={"title": "x", "capture_mode": "single", "collection_id": vid}),
+          volume_row, highest)
+    check(lambda: api.patch(f"/records/{rid}", json={"collection_id": oid}), ("FROM RECORDS", "RECORDS.ID ="),
+          volume_row)
+    check(lambda: api.patch(f"/records/{rid}", json={"collection_id": vid}), volume_row, highest)
+    check(lambda: api.post(f"/collections/{vid}/move-records", params={"target_collection_id": oid}),
+          record_rows, highest)

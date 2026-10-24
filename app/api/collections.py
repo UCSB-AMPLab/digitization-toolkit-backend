@@ -26,7 +26,13 @@ from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
-from app.core.record_sequence import renumber_volume_records
+from app.core.record_sequence import (
+    REORDER_IDS_MESSAGE,
+    ReorderIdsError,
+    next_sequences,
+    renumber_volume_records,
+    reorder_volume_records,
+)
 from app.core.storage_ops import (
     collection_and_descendants,
     collection_image_dir,
@@ -387,6 +393,8 @@ def move_collection_records(
     """
     Move all records from one collection to another, relocating their image
     files on disk so the moved records keep pointing at existing files.
+    The moved records take the sequences after the target's highest, in the
+    order they were listed in the source.
     """
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
@@ -406,7 +414,7 @@ def move_collection_records(
     records = (
         db.query(Record)
         .filter(Record.collection_id == collection_id)
-        .order_by(Record.id)
+        .order_by(Record.sequence.nulls_last(), Record.id)
         .with_for_update(of=Record)
         .all()
     )
@@ -428,10 +436,19 @@ def move_collection_records(
             },
         )
 
+    # The moved records take the sequences after the target's highest, in
+    # their order here, so no two records of the target share one. The
+    # target's row is locked after the records, as every path that takes both
+    # does, and held until the commit (app/core/record_sequence.py).
+    sequences = next_sequences(db, target_collection_id, len(records))
+    if sequences is None:
+        raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
+
     not_moved: List[str] = []
     moves: List = []
-    for r in records:
+    for r, seq in zip(records, sequences):
         r.collection_id = target_collection_id
+        r.sequence = seq
         moves.extend((img, target_dir) for img in r.images)
     # Only the source is held: its records' files leave the paths an export of
     # it would read. The target's existing files are not touched, because
@@ -528,38 +545,25 @@ def reorder_collection_records(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Set the display order of records in a collection.
+    Set the order of a volume's records.
 
-    Body: { "ordered_ids": [3, 1, 5, 2, ...] }
-    Each record's `sequence` is set to its position (0-based) in the supplied list.
-    Records not included in the list keep their current sequence value.
-    All supplied IDs must belong to the given collection.
+    Body: { "ordered_ids": [3, 1, 5, 2, ...] }, every record of the volume
+    exactly once. Each record's `sequence` is set to its position in the
+    list, counted from 1. A list that leaves a record out, repeats one or
+    names one from elsewhere is refused with 422 and REORDER_IDS_MESSAGE,
+    and nothing is written. The volume's records and then its row are locked
+    for the transaction (app/core/record_sequence.py).
     """
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
-    if not collection:
+    try:
+        reordered = reorder_volume_records(db, collection_id, payload.ordered_ids)
+    except ReorderIdsError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=REORDER_IDS_MESSAGE)
+    if reordered is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    # Verify all IDs belong to this collection
-    records = (
-        db.query(Record)
-        .filter(Record.id.in_(payload.ordered_ids), Record.collection_id == collection_id)
-        .all()
-    )
-    found_ids = {r.id for r in records}
-    missing = [rid for rid in payload.ordered_ids if rid not in found_ids]
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Record IDs not found in collection {collection_id}: {missing}"
-        )
-
-    # Apply sequence values
-    id_to_seq = {rid: idx for idx, rid in enumerate(payload.ordered_ids)}
-    for rec in records:
-        rec.sequence = id_to_seq[rec.id]
-
     db.commit()
-    return {"reordered": len(records)}
+    return {"reordered": reordered}
 
 
 # ==============================================================================
@@ -579,15 +583,15 @@ def renumber_images(
     No file is renamed, moved or written, and no manifest line is written
     (contract 1.1 §3): a file's name carries its capture ordinal, and order
     is the records' `sequence`. Records of other volumes are not touched.
-    The volume's row is locked for the transaction, as a capture's raise of
-    its counter locks it, so the rewrite and a capture's commit do not
-    interleave. If the commit fails, every sequence stays as it was.
+    The volume's records and then its row are locked for the transaction
+    (app/core/record_sequence.py), so no record added to the volume
+    meanwhile can take a sequence the rewrite hands out. If the commit fails,
+    every sequence stays as it was.
     """
-    collection = _locked_collection_query(db, collection_id).first()
-    if not collection:
-        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-
     renumbered = renumber_volume_records(db, collection_id)
+    if renumbered is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    collection = db.get(Collection, collection_id)
     try:
         db.commit()
     except Exception:
