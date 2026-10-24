@@ -907,3 +907,45 @@ def test_a_new_project_is_stored_under_the_stripped_nfc_name(client, db_session,
     name = db_session.query(Project).one().name
     assert name == "Prueba válida" and name == unicodedata.normalize("NFC", name)
     assert resp.json()["projectName"] == name
+
+
+# ---------------------------------------------------------------------------
+# The list's notes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_new_project_takes_the_lists_notes_as_its_description(client, db_session, reports_root):
+    from app.models.project import Project
+
+    _as("op", "admin")
+    report = _post_fixture(client, VALID).json()
+    assert db_session.query(Project).one().description == _load(VALID)["list"]["notes"]
+    assert report["projectNotesStored"] is True
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("notes", [None, "", "   ", 5])
+def test_no_notes_leave_a_new_projects_description_empty(client, db_session, reports_root, notes):
+    from app.models.project import Project
+
+    doc = _load(VALID)
+    doc["list"]["notes"] = notes
+    _as("op", "admin")
+    report = _post(client, doc).json()
+    assert db_session.query(Project).one().description is None
+    assert report["projectNotesStored"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("existing", [None, "Descripción del administrador"])
+def test_an_existing_projects_description_is_never_overwritten(client, db_session, reports_root, existing):
+    from app.models.project import Project
+
+    p = Project(name="Prueba válida", description=existing)
+    db_session.add(p)
+    db_session.commit()
+    _as("op", "admin")
+    report = _post_fixture(client, VALID).json()
+    db_session.expire_all()
+    assert db_session.query(Project).one().description == existing
+    assert report["projectNotesStored"] is False

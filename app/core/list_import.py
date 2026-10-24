@@ -387,8 +387,13 @@ def _find_project(db: Session, name: str) -> Optional[Project]:
     return None
 
 
-def _project_for(db: Session, name: str, actor: Optional[str], may_create_project: bool) -> tuple[Project, bool]:
+def _project_for(db: Session, name: str, actor: Optional[str], may_create_project: bool,
+                 notes: Any = None) -> tuple[Project, bool]:
     """The project named `name`, created if there is none. Returns (project, created).
+
+    A project created here takes the list's `notes` (the contract's
+    "optional operator instructions") as its description, when they are a
+    non-blank string. An existing project's description is never touched.
 
     An existing project of that name is reused: a project is a grouping in
     the catalogue only, and re-importing a list has to land in the project
@@ -401,7 +406,8 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
         return project, False
     if not may_create_project:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
-    project = Project(name=_project_name(name), created_by=actor)
+    description = notes if isinstance(notes, str) and notes.strip() else None
+    project = Project(name=_project_name(name), description=description, created_by=actor)
     db.add(project)
     try:
         db.commit()
@@ -426,11 +432,13 @@ def _reject(position: int, code: Any, reason: str) -> dict:
 
 
 def _import_items(db: Session, list_id: str, list_name: str, items: list,
-                  actor: Optional[str], may_create_project: bool) -> dict:
+                  actor: Optional[str], may_create_project: bool, notes: Any = None) -> dict:
     """Find or create the project, then create each item's volume; return the report."""
-    project, project_created = _project_for(db, list_name, actor, may_create_project)
+    project, project_created = _project_for(db, list_name, actor, may_create_project, notes)
     project_id = project.id
     project_name = project.name
+    # Stored only when this import created the project with a description.
+    notes_stored = project_created and project.description is not None
 
     first_code = _first_positions(items, _reference_code)
     first_stem = _first_positions(items, lambda item: item.get("filenameStem"))
@@ -479,6 +487,7 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
         "projectId": project_id,
         "projectName": project_name,
         "projectCreated": project_created,
+        "projectNotesStored": notes_stored,
         "importedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "importedBy": actor,
         "created": len(created),
@@ -527,7 +536,8 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
             for earlier in _earlier_hashes(list_id):
                 if earlier is not None and earlier != file_sha256:
                     raise ListIdReused(LIST_ID_REUSED_MESSAGE)
-        report = _import_items(db, list_id, list_name, items, actor, may_create_project)
+        report = _import_items(db, list_id, list_name, items, actor, may_create_project,
+                               notes=document["list"].get("notes"))
         report["fileSha256"] = file_sha256
         try:
             store_report(report)
