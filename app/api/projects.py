@@ -122,6 +122,13 @@ def add_record_to_project(
         raise HTTPException(status_code=404, detail="Record not found")
     if (r.project_id, r.collection_id) != (p.id, None):
         assert_movable(r)
+        # A record whose images are in the bucket stays in its volume: their
+        # keys are under the volume's stem and never change. Checked under the
+        # record's lock, which the uploader takes before it writes a first
+        # offsite row (image_upload._claim).
+        from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
+        if records_stored_offsite(db, [r.id]):
+            raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
     # A record has one parent: attaching it to a project detaches it from any collection
     r.project_id = p.id
     r.collection_id = None

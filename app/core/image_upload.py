@@ -594,8 +594,9 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
 
     A new row freezes `key` and, from its commit on, keeps the record in its
     volume (records_stored_offsite). It is written under the record's row
-    lock, the lock both move paths take before their own check
-    (records.update_record, collections.move_collection_records), with the
+    lock, the lock every path that changes a record's volume takes before
+    its own check (records.update_record, collections.move_collection_records,
+    projects.add_record_to_project), with the
     image's row read again under it: either the move committed first, and
     the row here differs from `state` and nothing is written, or this commit
     comes first and the move then finds the row and answers 409. Only the

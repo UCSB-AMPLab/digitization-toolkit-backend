@@ -338,8 +338,10 @@ def update_record(
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
 			# A record whose images are in the bucket stays in its volume:
-			# their keys are under the volume's stem and never change.
-			if rec.collection_id is not None and new_parent[1] != rec.collection_id:
+			# their keys are under the volume's stem and never change. A
+			# record with such images that is outside every volume (one taken
+			# out before add_record checked this) is not put into one either.
+			if new_parent[1] != rec.collection_id:
 				from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
 				if records_stored_offsite(db, [rec.id]):
 					raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
