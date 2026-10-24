@@ -34,8 +34,8 @@ CAPTURE_NUMBER_DIGITS = 4
 # The last capture number a volume can take; the next would need five digits.
 MAX_CAPTURE_NUMBER = 10 ** CAPTURE_NUMBER_DIGITS - 1
 
-# How many numbers already on disk take_filename_index passes over before it
-# refuses the capture. More than a handful means the counter is far behind
+# How many taken numbers (on disk, in the manifest or offsite) take_filename_index
+# passes over before it refuses the capture. More than a handful means the counter is far behind
 # the card, which an operator cannot fix by trying again.
 MAX_NUMBERS_PASSED_OVER = 100
 
@@ -175,6 +175,31 @@ def manifest_capture_numbers(manifest: Path, stem: str) -> Set[int]:
         return set(numbers)
 
 
+def offsite_capture_numbers(db: Session, stem: str) -> Set[int]:
+    """The capture numbers that offsite_objects keys under the volume's stem carry.
+
+    A key carries a number when its second segment is `stem` and its file
+    name starts with `<stem>-img_<nnnn>_` (casefolded, as on disk), whatever
+    its first segment: the configured tenant, an earlier one, or a prefix
+    adopted from objects copied into the bucket under contract names. Those
+    copies exist only in the bucket, so nothing on the card holds their
+    numbers. One query, whatever the number of keys.
+    """
+    from app.models.offsite_object import OffsiteObject
+
+    name = re.compile(re.escape(stem) + r"-img_(\d+)_", re.IGNORECASE)
+    like = "%/" + stem.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_") + "/%"
+    numbers = set()
+    for (key,) in db.query(OffsiteObject.object_key).filter(OffsiteObject.object_key.like(like, escape="\\")):
+        segments = key.split("/")
+        if len(segments) < 3 or segments[1] != stem:
+            continue
+        m = name.match(segments[-1])
+        if m:
+            numbers.add(int(m.group(1)))
+    return numbers
+
+
 def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: Path) -> str:
     """Raise the volume's capture counter and return the event's `<stem>-img_<nnnn>`.
 
@@ -184,23 +209,27 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
     where it was. The caller holds the volume's row lock.
 
     A number that a file in `output_dir` (the volume's `captures/`) or its
-    `previews/` already carries (capture_name_taken), or that the volume's
-    `metadata/manifest.jsonl` names (manifest_capture_numbers), is passed
-    over and the counter raised again, so no file is ever overwritten and no
-    name is given twice. That happens only when the counter is behind: an
-    event whose files were written but whose commit failed, or a catalogue
-    restored from a backup older than captures made since, including ones
-    whose files have been deleted. The manifest is read once per call. The contract allows
+    `previews/` already carries (capture_name_taken), that the volume's
+    `metadata/manifest.jsonl` names (manifest_capture_numbers), or that an
+    offsite_objects key under the volume's stem carries
+    (offsite_capture_numbers) is passed over and the counter raised again,
+    so no file is ever overwritten and no name is given twice. That happens
+    only when the counter is behind: an event whose files were written but
+    whose commit failed, a catalogue restored from a backup older than
+    captures made since, including ones whose files have been deleted, or
+    numbers given to images that exist only in the bucket. The manifest and
+    the offsite keys are each read once per call. The contract allows
     gaps in <nnnn> and forbids reuse.
 
     Raises CaptureNameRefused, leaving the rollback to the caller, when the
     counter would pass MAX_CAPTURE_NUMBER (including while passing over
     taken numbers), or when more than MAX_NUMBERS_PASSED_OVER numbers in a
-    row are already on disk.
+    row are already taken.
     """
     from app.core.paths import METADATA_DIR
 
     in_manifest = manifest_capture_numbers(output_dir.parent / METADATA_DIR / "manifest.jsonl", stem)
+    offsite = offsite_capture_numbers(db, stem)
     for _ in range(MAX_NUMBERS_PASSED_OVER + 1):
         number: Optional[int] = next_capture_number(db, collection_id)
         if number is None:
@@ -210,7 +239,7 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
                            f"past {MAX_CAPTURE_NUMBER}; capture refused")
             raise CaptureNameRefused(CAPTURE_LIMIT_DETAIL)
         index = capture_filename_index(stem, number)
-        if number not in in_manifest and not capture_name_taken(output_dir, index):
+        if number not in in_manifest and number not in offsite and not capture_name_taken(output_dir, index):
             return index
-        logger.warning(f"Capture number {number} of collection {collection_id} is already on disk or in the manifest ({index}); taking the next")
+        logger.warning(f"Capture number {number} of collection {collection_id} is already on disk, in the manifest or offsite ({index}); taking the next")
     raise CaptureNameRefused(CAPTURE_NUMBERS_TAKEN_DETAIL)

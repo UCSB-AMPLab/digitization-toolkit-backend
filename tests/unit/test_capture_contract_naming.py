@@ -852,3 +852,96 @@ def test_a_stem_that_ends_another_does_not_read_its_numbers(tmp_path):
     m.write_text(_manifest_line("x-co-a", 4) + _manifest_line("co-a", 5))
     assert manifest_capture_numbers(m, "co-a") == {5}
     assert manifest_capture_numbers(m, "x-co-a") == {4}
+
+
+# ---------------------------------------------------------------------------
+# Numbers held only by keys in the bucket
+# ---------------------------------------------------------------------------
+#
+# Images copied into the bucket under contract names from a rename map exist
+# there and nowhere on the card; adopt records their keys in offsite_objects.
+# A number such a key carries under the volume's stem is passed over like one
+# on disk, whatever the tenant prefix the key sits under.
+
+def _offsite_key(db_session, key):
+    from app.models.offsite_object import OffsiteObject
+    db_session.add(OffsiteObject(record_image_id=None, kind="capture", object_key=key, local_sha1="0" * 40))
+    db_session.commit()
+
+
+@pytest.mark.unit
+def test_a_number_held_only_by_an_offsite_key_is_passed_over(
+        client, db_session, test_project, volume, backend, override_projects_root):
+    _offsite_key(db_session, f"rionegro/{STEM}/captures/{STEM}-img_0001_c0.cr2")
+    _offsite_key(db_session, f"rionegro/{STEM}/previews/{STEM}-img_0002_c1_preview.jpg")
+
+    body = _single(_client_as(client), test_project, volume)
+
+    assert Path(body["file_path"]).name == f"{STEM}-img_0003_c0.jpg"
+    assert _counter(db_session, volume) == 3
+
+
+@pytest.mark.unit
+def test_keys_under_an_earlier_tenant_also_hold_their_numbers(
+        client, db_session, test_project, volume, backend, override_projects_root, monkeypatch):
+    from app.core import config
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", "sbmal", raising=False)
+    _offsite_key(db_session, f"captua-test/{STEM}/captures/{STEM}-img_0001_c0.cr2")
+    _offsite_key(db_session, f"sbmal/{STEM}/captures/{STEM}-img_0002_c0_img7.cr2")
+
+    body = _single(_client_as(client), test_project, volume)
+
+    assert Path(body["file_path"]).name == f"{STEM}-img_0003_c0.jpg"
+
+
+@pytest.mark.unit
+def test_keys_of_other_volumes_or_other_names_hold_no_number(
+        client, db_session, test_project, volume, backend, override_projects_root):
+    _offsite_key(db_session, f"rionegro/x-{STEM}/captures/x-{STEM}-img_0001_c0.cr2")
+    _offsite_key(db_session, f"rionegro/other/captures/{STEM}-img_0001_c0.cr2")
+    _offsite_key(db_session, f"rionegro/{STEM}/captures/x-{STEM}-img_0001_c0.cr2")
+    _offsite_key(db_session, f"{STEM}/captures/{STEM}-img_0001_c0.cr2")
+
+    body = _single(_client_as(client), test_project, volume)
+
+    assert Path(body["file_path"]).name == f"{STEM}-img_0001_c0.jpg"
+
+
+@pytest.mark.unit
+def test_offsite_keys_count_towards_the_cap_on_numbers_passed_over(
+        client, db_session, test_project, volume, backend, override_projects_root, monkeypatch):
+    from app.core import capture_naming
+    monkeypatch.setattr(capture_naming, "MAX_NUMBERS_PASSED_OVER", 3)
+    _occupy(override_projects_root, [1, 2])
+    _offsite_key(db_session, f"rionegro/{STEM}/captures/{STEM}-img_0003_c0.cr2")
+    _offsite_key(db_session, f"rionegro/{STEM}/captures/{STEM}-img_0004_c0.cr2")
+
+    resp = _post(_client_as(client), test_project, volume)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == capture_naming.CAPTURE_NUMBERS_TAKEN_DETAIL
+    assert backend.requested == []
+    assert _counter(db_session, volume) == 0
+
+
+@pytest.mark.unit
+def test_offsite_keys_are_read_in_one_query_per_capture(db_session, volume, tmp_path):
+    from sqlalchemy import event
+    from app.core.capture_naming import take_filename_index
+
+    for n in range(1, 6):
+        _offsite_key(db_session, f"rionegro/{STEM}/captures/{STEM}-img_{n:04d}_c0.cr2")
+    statements = []
+
+    def count(conn, cursor, statement, *args):
+        if "offsite_objects" in statement:
+            statements.append(statement)
+
+    engine = db_session.get_bind()
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        index = take_filename_index(db_session, volume.id, STEM, tmp_path / "captures")
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert index == f"{STEM}-img_0006"
+    assert len(statements) == 1, statements
