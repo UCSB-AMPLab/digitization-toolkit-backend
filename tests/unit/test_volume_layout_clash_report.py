@@ -255,3 +255,43 @@ def test_a_directory_at_the_planned_name_after_planning_counts_as_taken(db_sessi
     assert planted[0].is_dir()
     # left_unreferenced lists files; the directory is not one.
     assert str(planted[0].resolve()) not in report["left_unreferenced"]
+
+
+@pytest.mark.unit
+def test_a_master_moved_earlier_in_the_batch_is_never_reported_as_unreferenced(db_session, legacy, monkeypatch):
+    """IMG_0002 is pushed by a late file into IMG_0002_img<id>.jpg, the name another row of the batch was planned to take.
+
+    Production sessions do not autoflush and the batch commits at its end, so
+    the earlier move is not yet in the database when the later entry meets it.
+    """
+    from sqlalchemy.orm import sessionmaker
+    import app.core.volume_layout as vl
+    from app.models.record import Record, RecordImage
+
+    i2 = legacy["i2"].id
+    other = legacy["root"] / "proj" / "tomo_1" / "images" / "main" / f"IMG_0002_img{i2}.jpg"
+    other.write_bytes(b"a page whose name is a clash name")
+    rec = Record(title="r", collection_id=legacy["a2"].id, status="captured", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    row = RecordImage(record_id=rec.id, filename=other.name, file_path=str(other), format="jpg", role="single")
+    db_session.add(row)
+    db_session.commit()
+
+    def plant(dst):
+        dst.parent.mkdir(parents=True, exist_ok=True)
+        dst.write_bytes(b"arrived after planning")
+
+    _plant_after_planning(vl, monkeypatch, i2, plant)
+    session = sessionmaker(bind=db_session.get_bind(), autoflush=False)()
+    try:
+        report = vl.migrate_volume_layout(session)
+    finally:
+        session.close()
+
+    moved = {m["image_id"]: vl.Path(m["to"]).resolve() for m in report["moved"]}
+    assert moved[i2].name == f"IMG_0002_img{i2}.jpg"
+    assert str(moved[i2]) not in report["left_unreferenced"]
+    assert str(moved[row.id]) not in report["left_unreferenced"]
+    late = (legacy["root"] / STEMS["a2"] / "captures" / "IMG_0002.jpg").resolve()
+    assert str(late) in report["left_unreferenced"]

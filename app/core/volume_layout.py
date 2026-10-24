@@ -888,6 +888,18 @@ def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
     raise AssertionError("unreachable")
 
 
+def _placed_this_run(report: dict) -> Set[Path]:
+    """Every file this run has moved or pointed a row at so far, resolved: masters, sidecars, thumbnails."""
+    out: Set[Path] = set()
+    for key in ("moved", "adopted", "sidecars_moved", "thumbnails_moved"):
+        for item in report[key]:
+            try:
+                out.add(Path(item["to"]).resolve())
+            except (KeyError, OSError, TypeError):
+                continue
+    return out
+
+
 def _entries_named(directory: Path, name: str) -> List[Path]:
     """The files in `directory` whose names casefold to `name`'s, resolved."""
     folded = name.casefold()
@@ -964,9 +976,11 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             new_dst, taken = _free_name(e, src, dst)
             logger.warning(f"Volume layout: {dst} was taken after planning; moving {src} to {new_dst}")
             # Only files no row references are strays: one a row names (a
-            # master moved here in this run, or written since the plan, or a
-            # pending journal's) is that row's.
-            owned = set(_owners(db)) if taken else set()
+            # master written since the plan, or a pending journal's) is that
+            # row's, and so is every file this run has already put in place.
+            # Those rows are not in the database yet: the batch commits at
+            # its end and the session does not autoflush.
+            owned = (set(_owners(db)) | _placed_this_run(report)) if taken else set()
             for f in taken:
                 if f in owned or str(f) in report["left_unreferenced"]:
                     continue
