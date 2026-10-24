@@ -876,3 +876,22 @@ def test_a_preview_digest_is_never_taken_from_the_masters_relocation_record(
 
     assert [(r["kind"], r["reason"]) for r in result["refused"]] == [("preview", "no_preview_digest")]
     assert _paths(override_projects_root, "f1.CR2")[1].exists()
+
+
+@pytest.mark.unit
+def test_a_preview_given_its_digest_by_the_backfill_is_freed(remote, db_session, override_projects_root):
+    """backfill-preview-digests (app.core.preview_digests) gives an older preview the digest freeing needs."""
+    from app.core.preview_digests import backfill_preview_digests
+
+    vol, raw, jpg = _received(db_session, override_projects_root, preview_digest=False)
+    raw_preview = _paths(override_projects_root, "f1.CR2")[1]
+
+    report = backfill_preview_digests(db_session, STEM, apply=True)
+    assert [e["image_id"] for e in report["backfilled"]] == [raw.id]
+    assert report["backfilled"][0]["checked_against_offsite"] is True
+
+    result = _free(db_session, vol)
+
+    assert result["refused"] == []
+    assert not raw_preview.exists()
+    assert _image_row(db_session, raw.id).preview_freed_at is not None
