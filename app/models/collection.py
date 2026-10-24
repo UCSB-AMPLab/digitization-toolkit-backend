@@ -1,6 +1,6 @@
 from datetime import datetime, timezone
 from sqlalchemy import event, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
-from sqlalchemy.orm import relationship, validates, object_session
+from sqlalchemy.orm import Session, relationship, validates, object_session
 
 from app.core.db import Base
 from app.models.record import ImmutableFieldError, Record, RecordImage
@@ -315,26 +315,26 @@ class Collection(Base):
     )
 
 
-@event.listens_for(Collection, "before_delete")
-def _refuse_to_delete_a_reserved_stem(mapper, connection, target):
-    """Refuse an ORM delete of a volume that reserves its stem.
+@event.listens_for(Session, "before_flush")
+def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
+    """Refuse a flush that would delete a volume that reserves its stem.
 
     DELETE /collections/{id} refuses this itself with a 409. This covers the
-    ORM cascades the API does not use: Project.collections and
-    Collection.child_collections both cascade deletes. It reads images on the
-    flush's own connection rather than through the session, which is
-    mid-flush. A database-level ON DELETE CASCADE or raw SQL goes around it.
+    ORM paths the API does not use: a direct session.delete(), and the
+    cascades from Project.collections and Collection.child_collections,
+    which have already put the volume in session.deleted by the time the
+    flush starts.
+
+    Decided before the flush rather than during it: Collection.records has
+    no cascade, so the flush that deletes a volume first sets
+    records.collection_id to NULL on its records, and an image check made
+    after that (a before_delete hook) finds none. Here the records still
+    point at the volume. A database-level ON DELETE CASCADE or raw SQL goes
+    around it.
     """
-    if target.filename_stem is None:
-        return
-    captured = (target.capture_counter or 0) > 0 or connection.execute(
-        select(exists().where(
-            RecordImage.record_id == Record.id,
-            Record.collection_id == target.id,
-        ))
-    ).scalar()
-    if captured:
-        raise StemReservedError(
-            f"collections.filename_stem is reserved: volume {target.id} has captured "
-            f"under it and cannot be deleted"
-        )
+    for obj in list(session.deleted):
+        if isinstance(obj, Collection) and obj.reserves_its_stem():
+            raise StemReservedError(
+                f"collections.filename_stem is reserved: volume {obj.id} has captured "
+                f"under it and cannot be deleted"
+            )

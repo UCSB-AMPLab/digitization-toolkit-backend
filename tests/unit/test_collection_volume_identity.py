@@ -1384,3 +1384,52 @@ def test_stem_reserved_is_not_accepted_on_requests():
 
     assert "stem_reserved" not in CollectionCreate.model_fields
     assert "stem_reserved" not in CollectionUpdate.model_fields
+
+
+# ---------------------------------------------------------------------------
+# The ORM delete refusal decides before the flush
+# ---------------------------------------------------------------------------
+#
+# Collection.records has no cascade, so in the flush that deletes a volume
+# the ORM first sets records.collection_id to NULL on its records. A check
+# made during the flush (before_delete) then finds no images. The Postgres
+# rehearsal showed a volume with a stem, images and a counter of 0 deleted
+# that way. The refusal is decided in before_flush, while the records still
+# point at the volume.
+
+def _reserved_by_images_only(db_session, p, *, parent=None):
+    """A volume with a stem and an image, and a counter of 0."""
+    from app.models.collection import Collection
+
+    if parent is None:
+        v = _volume(db_session, p, "imgs", filename_stem="co-z-001")
+    else:
+        v = Collection(name="imgs", parent_collection_id=parent.id, filename_stem="co-z-001")
+        db_session.add(v)
+        db_session.commit()
+    _image_in(db_session, v)
+    db_session.refresh(v)
+    v.records  # loaded, as an API path that touched them would have it
+    assert v.capture_counter == 0
+    return v
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", ["direct", "project-cascade", "child-cascade"])
+def test_a_volume_reserved_by_its_images_alone_is_not_deleted(db_session, path):
+    from app.models.collection import Collection, StemReservedError
+    from app.models.record import Record
+
+    p = _project(db_session)
+    top = _volume(db_session, p, "top") if path == "child-cascade" else None
+    v = _reserved_by_images_only(db_session, p, parent=top)
+    vid = v.id
+
+    target = {"direct": v, "project-cascade": p, "child-cascade": top}[path]
+    db_session.delete(target)
+    with pytest.raises(StemReservedError):
+        db_session.flush()
+    db_session.rollback()
+
+    assert db_session.get(Collection, vid) is not None
+    assert db_session.query(Record).filter(Record.collection_id == vid).count() == 1
