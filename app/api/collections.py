@@ -5,13 +5,14 @@ from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload, selectinload
 from sqlalchemy import and_, or_, select, func, update
+from sqlalchemy.exc import IntegrityError
 import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from app.models.collection import Collection
 from app.models.project import Project
-from app.models.record import Record, RecordImage, RecordStatusChange
+from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
 from app.schemas.record import RecordStatusChangeRead, ReorderRecords
@@ -22,6 +23,7 @@ from app.api.records import _apply_status_change, _assert_promotable, is_movable
 from app.core.audit import log_event
 from app.core.record_status import record_bulk_status_changes
 from app.core.config import settings
+from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
 from app.core.storage_ops import (
@@ -44,6 +46,14 @@ EXPORT_IN_SUBTREE_MESSAGE = (
     "An export of this collection, or of a collection inside it, is running. "
     "Wait for it to finish, then try again."
 )
+
+
+def _immutable_message(exc: ImmutableFieldError) -> str:
+    """The client-facing message for a refused identity change, without the stored values."""
+    text = str(exc)
+    if "filename_stem" in text:
+        return "The volume already has images, so its file name stem cannot be changed."
+    return "The volume's external identifier is written once and cannot be changed."
 
 
 @router.post("/", response_model=CollectionRead, status_code=201)
@@ -82,11 +92,23 @@ def create_collection(
         archival_metadata=payload.archival_metadata,
         project_id=payload.project_id,
         parent_collection_id=payload.parent_collection_id,
+        filename_stem=payload.filename_stem,
+        external_id=payload.external_id,
+        date=payload.date,
+        date_start=payload.date_start,
+        date_end=payload.date_end,
+        sequence=payload.sequence,
+        custom_attributes=payload.custom_attributes,
         created_by=payload.created_by or current_user.username
     )
     
-    db.add(collection)
-    db.commit()
+    try:
+        db.add(collection)
+        db.commit()
+    except IntegrityError as e:
+        # A duplicate filename_stem or external_id, or a CHECK on the row.
+        db.rollback()
+        raise integrity_conflict(e)
     db.refresh(collection)
     log_event(db, level="INFO", category="activity", action="collection_created",
               actor=current_user.username, subject=collection.name)
@@ -267,9 +289,14 @@ def update_collection(
     # the files have moved and the commit is done.
     held_ids = collection_and_descendants(db, collection.id) if layout_changed else []
     with export_jobs.hold_for_file_changes(held_ids, EXPORT_IN_SUBTREE_MESSAGE):
-        # Update fields
-        for field, value in update_data.items():
-            setattr(collection, field, value)
+        # Update fields. A change to external_id or filename_stem that the
+        # model refuses (written once; fixed by the first image) is a 409.
+        try:
+            for field, value in update_data.items():
+                setattr(collection, field, value)
+        except ImmutableFieldError as e:
+            db.rollback()
+            raise HTTPException(status_code=409, detail={"message": _immutable_message(e)})
 
         # A collection has exactly one parent: nesting it clears its direct project link
         if collection.parent_collection_id is not None:
@@ -288,6 +315,15 @@ def update_collection(
                 for r in records:
                     target_dir = image_output_dir(project_name, names.get(r.collection_id))
                     moves.extend((img, target_dir) for img in r.images)
+
+        # Flushed before any file is moved, so that a duplicate stem or
+        # external_id, or an end date before the stored start, is refused
+        # while nothing on disk has changed.
+        try:
+            db.flush()
+        except IntegrityError as e:
+            db.rollback()
+            raise integrity_conflict(e)
 
         # A failed move or commit puts every file already moved back.
         relocate_images_and_commit(db, moves, not_moved, f"Update of collection {collection_id}")
