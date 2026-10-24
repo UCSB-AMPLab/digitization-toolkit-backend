@@ -21,8 +21,15 @@ def _jpeg() -> bytes:
     return buf.getvalue()
 
 
+@pytest.fixture(autouse=True)
+def _records_data_dir(data_dir, monkeypatch):
+    """app.api.records binds settings at its import; point its data directory at this test's too."""
+    from app.api import records
+
+    monkeypatch.setattr(records.settings, "DTK_DATA_DIR", str(data_dir))
+
+
 def _uploads_dir() -> Path:
-    """The uploads directory of the settings app.api.records reads (bound at its import)."""
     from app.api import records
 
     return records.settings.data_dir / "uploads"
