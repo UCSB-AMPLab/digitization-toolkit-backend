@@ -89,3 +89,44 @@ def test_a_name_close_to_a_temp_name_is_still_foreign(db_session, legacy, rel):
     assert not [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
     assert {tuple(s["foreign"]) for s in report["skipped"] if s["reason"] == "stem_dir_occupied"} == {(rel,)}
     assert report["temp_files_left"] == []
+
+
+# ---------------------------------------------------------------------------
+# Thumbnails no row owns
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_an_unowned_thumbnail_named_as_the_generator_names_them_is_listed_and_the_volume_migrates(db_session, legacy):
+    """app.core.thumbnail.generate_thumbnail names its files `<uuid4 hex>_thumb.jpg`; one is regenerable."""
+    from app.core.volume_layout import migrate_volume_layout
+
+    thumb = legacy["root"] / STEMS["a2"] / "thumbnails" / f"{HEX}_thumb.jpg"
+    thumb.parent.mkdir(parents=True)
+    thumb.write_bytes(b"a thumbnail whose row was never committed")
+
+    report = migrate_volume_layout(db_session)
+
+    assert [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
+    assert not [s for s in report["skipped"] if s["reason"] == "stem_dir_occupied"]
+    assert report["orphan_thumbnails_left"] == [str(thumb.resolve())]
+    assert thumb.read_bytes() == b"a thumbnail whose row was never committed"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rel", [
+    f"thumbnails/{HEX[:31]}_thumb.jpg",
+    f"thumbnails/{HEX.upper()}_thumb.jpg",
+    f"thumbnails/{HEX}_thumb.png",
+    f"captures/{HEX}_thumb.jpg",            # the generator writes only into thumbnails/
+])
+def test_a_name_close_to_the_generators_is_still_foreign(db_session, legacy, rel):
+    from app.core.volume_layout import migrate_volume_layout
+
+    f = legacy["root"] / STEMS["a2"] / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"x")
+
+    report = migrate_volume_layout(db_session)
+
+    assert {tuple(s["foreign"]) for s in report["skipped"] if s["reason"] == "stem_dir_occupied"} == {(rel,)}
+    assert report["orphan_thumbnails_left"] == []
