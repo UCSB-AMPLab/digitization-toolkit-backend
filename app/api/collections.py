@@ -26,6 +26,16 @@ from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
 from app.core.export_service import run_export, workflow_blockers
+from app.core.record_sequence import (
+    REORDER_IDS_MESSAGE,
+    VOLUME_CHANGED_MESSAGE,
+    ReorderIdsError,
+    VolumeChangedError,
+    listing_order,
+    next_sequences,
+    renumber_volume_records,
+    reorder_volume_records,
+)
 from app.core.storage_ops import (
     collection_and_descendants,
     collection_image_dir,
@@ -35,8 +45,6 @@ from app.core.storage_ops import (
     legacy_image_dir,
     relocate_images_and_commit,
     remove_empty_dirs,
-    renumber_collection_images,
-    restore_original_names,
     surviving_images_under,
 )
 
@@ -388,6 +396,8 @@ def move_collection_records(
     """
     Move all records from one collection to another, relocating their image
     files on disk so the moved records keep pointing at existing files.
+    The moved records take the sequences after the target's highest, in the
+    order they were listed in the source.
     """
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
@@ -404,6 +414,7 @@ def move_collection_records(
 
     # Locked, because the refusal below reads each record's status and the
     # relocation that follows is a filesystem move no transaction takes back.
+    # Locked in id order, as every path that locks several records does.
     records = (
         db.query(Record)
         .filter(Record.collection_id == collection_id)
@@ -429,10 +440,20 @@ def move_collection_records(
             },
         )
 
+    # The moved records take the sequences after the target's highest, in
+    # their listing order in the source, so no two records of the target
+    # share one. The
+    # target's row is locked after the records, as every path that takes both
+    # does, and held until the commit (app/core/record_sequence.py).
+    sequences = next_sequences(db, target_collection_id, len(records))
+    if sequences is None:
+        raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
+
     not_moved: List[str] = []
     moves: List = []
-    for r in records:
+    for r, seq in zip(listing_order(records), sequences):
         r.collection_id = target_collection_id
+        r.sequence = seq
         moves.extend((img, target_dir) for img in r.images)
     # Only the source is held: its records' files leave the paths an export of
     # it would read. The target's existing files are not touched, because
@@ -529,42 +550,33 @@ def reorder_collection_records(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Set the display order of records in a collection.
+    Set the order of a volume's records.
 
-    Body: { "ordered_ids": [3, 1, 5, 2, ...] }
-    Each record's `sequence` is set to its position (0-based) in the supplied list.
-    Records not included in the list keep their current sequence value.
-    All supplied IDs must belong to the given collection.
+    Body: { "ordered_ids": [3, 1, 5, 2, ...] }, every record of the volume
+    exactly once. Each record's `sequence` is set to its position in the
+    list, counted from 1. A list that leaves a record out, repeats one or
+    names one from elsewhere is refused with 422 and REORDER_IDS_MESSAGE,
+    and nothing is written. The volume's records and then its row are locked
+    for the transaction (app/core/record_sequence.py); if records keep being
+    added to the volume meanwhile, it answers 409 with VOLUME_CHANGED_MESSAGE.
     """
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
-    if not collection:
+    try:
+        reordered = reorder_volume_records(db, collection_id, payload.ordered_ids)
+    except ReorderIdsError:
+        db.rollback()
+        raise HTTPException(status_code=422, detail=REORDER_IDS_MESSAGE)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
+    if reordered is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
-    # Verify all IDs belong to this collection
-    records = (
-        db.query(Record)
-        .filter(Record.id.in_(payload.ordered_ids), Record.collection_id == collection_id)
-        .all()
-    )
-    found_ids = {r.id for r in records}
-    missing = [rid for rid in payload.ordered_ids if rid not in found_ids]
-    if missing:
-        raise HTTPException(
-            status_code=422,
-            detail=f"Record IDs not found in collection {collection_id}: {missing}"
-        )
-
-    # Apply sequence values
-    id_to_seq = {rid: idx for idx, rid in enumerate(payload.ordered_ids)}
-    for rec in records:
-        rec.sequence = id_to_seq[rec.id]
-
     db.commit()
-    return {"reordered": len(records)}
+    return {"reordered": reordered}
 
 
 # ==============================================================================
-# Image renumbering
+# Renumbering (records' sequence only)
 # ==============================================================================
 
 @router.post("/{collection_id}/images/renumber", status_code=200)
@@ -574,76 +586,40 @@ def renumber_images(
     db: Session = Depends(get_db_dependency)
 ):
     """
-    Physically renumber every image file in a collection (documentary unit),
-    sequentially from 1, zero-padded to the total capture count. Never
-    renames anything else — only assigns fresh sequential filenames based on
-    current display order. If a file operation fails, or the commit after
-    the renames does, every renamed file is put back under its old name and
-    the database is left untouched; a file the unwind could not put back is
-    logged at ERROR and left under a temporary name, and the 500's detail
-    says that not every file went back.
+    Renumber a volume's records: set their `sequence` to 1..N in the order
+    they are listed in (`sequence`, NULLs last, then id), in one transaction.
 
-    Refused with 409 while an export of the collection is queued or running,
-    since the export reads the files by their current names.
+    No file is renamed, moved or written, and no manifest line is written
+    (contract 1.1 §3): a file's name carries its capture ordinal, and order
+    is the records' `sequence`. Records of other volumes are not touched.
+    The volume's records and then its row are locked for the transaction
+    (app/core/record_sequence.py), so no record added to the volume
+    meanwhile can take a sequence the rewrite hands out; if records keep
+    being added meanwhile, it answers 409 with VOLUME_CHANGED_MESSAGE. If the
+    commit fails, every sequence stays as it was.
     """
-    collection = db.query(Collection).filter(Collection.id == collection_id).first()
-    if not collection:
-        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-
-    with export_jobs.hold_for_file_changes([collection_id]):
-        return _renumber_held(db, collection, collection_id, current_user)
-
-
-def _renumber_held(db: Session, collection: Collection, collection_id: int, current_user: User) -> dict:
-    """The body of renumber_images, run while the collection is held against exports."""
-    applied: List = []
     try:
-        result = renumber_collection_images(db, collection, applied)
-    except ValueError as e:
-        raise HTTPException(status_code=422, detail=str(e))
-    except OSError as e:
-        not_restored = getattr(e, "not_restored", [])
-        if not_restored:
-            logger.error(
-                f"Renumber of collection {collection_id} failed on disk; "
-                f"{len(not_restored)} file(s) could not be put back under their old names: "
-                f"{[p.name for p in not_restored]}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail=f"Failed to renumber images on disk: {e}. Some files could not be put back under their old names",
-            )
-        raise HTTPException(
-            status_code=500,
-            detail=f"Failed to renumber images on disk: {e}. The files are back under their old names",
-        )
-
+        renumbered = renumber_volume_records(db, collection_id)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
+    if renumbered is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    collection = db.get(Collection, collection_id)
     try:
         db.commit()
     except Exception:
         db.rollback()
-        # The rows still name the old files, so the renames are reversed to match them.
-        not_restored = restore_original_names(applied)
-        if not_restored:
-            logger.exception(
-                f"Renumber DB commit failed for collection {collection_id}; "
-                f"{len(not_restored)} file(s) could not be put back under their old names: "
-                f"{[p.name for p in not_restored]}"
-            )
-            raise HTTPException(
-                status_code=500,
-                detail="Files were renumbered on disk but the database update failed, and some files could not be put back under their old names",
-            )
-        logger.exception(f"Renumber DB commit failed for collection {collection_id}; files put back under their old names")
+        logger.exception(f"Renumber DB commit failed for collection {collection_id}; no sequence was changed")
         raise HTTPException(
             status_code=500,
-            detail="The database update failed; the files are back under their old names. Please retry",
+            detail="The database update failed, so no record was renumbered. Please retry",
         )
 
     log_event(db, level="INFO", category="activity", action="images_renumbered",
               actor=current_user.username, subject=collection.name,
-              detail=f"Renumbered {result['renumbered']} images")
-    return result
+              detail=f"Renumbered {renumbered} records")
+    return {"renumbered": renumbered}
 
 
 # ==============================================================================

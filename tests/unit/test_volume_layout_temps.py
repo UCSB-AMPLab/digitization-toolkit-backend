@@ -7,8 +7,9 @@
   of the writers into them names its temporary file is not foreign: the
   migration neither moves nor deletes it, lists it under `temp_files_left`,
   and goes on with the volume. The names are those of capture.utils.atomic_write
-  (`<stem>.part<suffix>`, captures and previews), renumber_collection_images
-  (`.renumber_<32 hex><suffix>`, captures and previews) and the migration's own
+  (`<stem>.part<suffix>`, captures and previews), a renumber that renamed
+  files (`.renumber_<32 hex><suffix>`, captures and previews; units in service
+  may still hold one) and the migration's own
   cross-filesystem _move (`.<name>.part`, all three). Any other file no row
   owns is foreign and the volume is skipped.
 """

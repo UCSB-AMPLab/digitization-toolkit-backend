@@ -58,6 +58,12 @@ def _as_admin(client):
     return client
 
 
+def _tree(root: Path) -> dict:
+    """Every file under `root`: its relative path, inode, mtime and bytes."""
+    return {str(p.relative_to(root)): (p.stat().st_ino, p.stat().st_mtime_ns, p.read_bytes())
+            for p in sorted(root.rglob("*")) if p.is_file()}
+
+
 def _files(root: Path) -> dict:
     """Every file under `root`, by path relative to it, with a digest of its bytes."""
     return {
@@ -515,23 +521,6 @@ def test_deleting_a_stemmed_image_removes_its_master_preview_and_thumbnail(clien
     assert not (vol / "previews" / "IMG_0001_preview.jpg").exists()
     assert not (vol / "thumbnails" / "IMG_0001_thumb.jpg").exists()
     assert (vol / "metadata" / "manifest.jsonl").exists()
-
-
-@pytest.mark.unit
-def test_a_renumber_in_the_stem_layout_renames_the_sidecar_inside_previews(db_session, placed):
-    from app.core.paths import preview_sidecar_of
-    from app.core.storage_ops import renumber_collection_images
-    from app.models.record import RecordImage
-
-    renumber_collection_images(db_session, placed["a"])
-    db_session.commit()
-
-    db_session.expire_all()
-    master = Path(db_session.query(RecordImage).one().file_path)
-    assert master.parent == placed["vol"] / "captures" and master.name != "IMG_0001.CR2"
-    assert preview_sidecar_of(master).parent == placed["vol"] / "previews"
-    assert preview_sidecar_of(master).read_bytes() == b"preview"
-    assert not (placed["vol"] / "previews" / "IMG_0001_preview.jpg").exists()
 
 
 @pytest.mark.unit
@@ -1540,22 +1529,23 @@ def test_the_integrity_check_reports_an_orphaned_preview_in_the_stem_layout(db_s
 
 
 @pytest.mark.unit
-def test_a_renumber_works_in_each_layout_on_one_unit(db_session, legacy):
-    from app.core.paths import preview_sidecar_of
-    from app.core.storage_ops import renumber_collection_images
+def test_a_renumber_renames_no_file_in_either_layout_on_one_unit(client, db_session, legacy):
+    """A stemmed volume after the migration and one without a stem: sequences change, files and rows' paths do not."""
     from app.core.volume_layout import migrate_volume_layout
-    from app.models.collection import Collection
-    from app.models.record import RecordImage
+    from app.models.record import Record, RecordImage
 
     migrate_volume_layout(db_session)
+    db_session.expire_all()
+    before_rows = {i.id: (i.filename, i.file_path) for i in db_session.query(RecordImage).all()}
+    before_files = _tree(legacy["root"])
+
     for key in ("a1", "u"):
-        renumber_collection_images(db_session, db_session.get(Collection, legacy[key].id))
-        db_session.commit()
+        resp = _as_admin(client).post(f"/collections/{legacy[key].id}/images/renumber")
+        assert resp.status_code == 200, resp.text
 
     db_session.expire_all()
-    stemmed = Path(db_session.get(RecordImage, legacy["i1"].id).file_path)
-    unstemmed = Path(db_session.get(RecordImage, legacy["i9"].id).file_path)
-    assert stemmed.parent == (legacy["root"] / STEMS["a1"] / "captures").resolve()
-    assert preview_sidecar_of(stemmed).read_bytes() == b"preview of IMG_0001"
-    assert unstemmed.parent == legacy["u_dir"].resolve()
-    assert preview_sidecar_of(unstemmed).read_bytes() == b"preview of IMG_0009"
+    assert _tree(legacy["root"]) == before_files
+    assert {i.id: (i.filename, i.file_path) for i in db_session.query(RecordImage).all()} == before_rows
+    for key in ("a1", "u"):
+        seqs = [r.sequence for r in db_session.query(Record).filter(Record.collection_id == legacy[key].id)]
+        assert sorted(seqs) == list(range(1, len(seqs) + 1))

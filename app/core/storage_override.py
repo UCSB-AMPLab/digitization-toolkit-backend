@@ -134,7 +134,7 @@ def refuse_writes_under_unusable_root(paths) -> None:
     root that cannot take writes.
 
     For writers that work beside an existing file (a thumbnail next to its
-    source, a renumber renaming in place) rather than building a path through
+    source) rather than building a path through
     writable_projects_dir. A path outside the override root, such as an upload
     under the data directory, is not affected. Containment is judged on
     resolved paths, the root's and each path's, so a symlink on either side

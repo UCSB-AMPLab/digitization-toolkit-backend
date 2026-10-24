@@ -13,8 +13,9 @@ tree; they all do it through `capture.project_manager._projects_root()`:
 captures, project initialisation, relocations (collection rename or re-parent,
 move-records, move-collections), project rename, and the path computation of
 collection and project deletes. Writers that work beside an existing file use
-`refuse_writes_under_unusable_root()`: thumbnail regeneration and renumbering.
-Both raise `StorageUnavailableError`, which the app answers with 503.
+`refuse_writes_under_unusable_root()`: thumbnail regeneration.
+Both raise `StorageUnavailableError`, which the app answers with 503. A
+renumber writes no file, so it is not refused.
 POST /system/storage/activate refuses a target the same test would refuse.
 Record and image deletes are not checked: they create nothing. Reading the
 camera registry is never refused; under such a root it reads as no file, and
@@ -342,11 +343,11 @@ def test_thumbnail_of_a_file_outside_the_override_root_is_still_generated(
 
 
 @pytest.mark.unit
-def test_renumber_is_refused_under_a_refused_root_before_any_rename(client, db_session, pm, card_root):
+def test_renumber_under_a_refused_root_goes_ahead_and_writes_nothing_there(client, db_session, pm, card_root):
     c, img = _record_under(db_session, card_root)
     before = _entries(card_root)
     resp = _admin_client(client).post(f"/collections/{c.id}/images/renumber")
-    assert resp.status_code == 503, resp.text
+    assert resp.status_code == 200, resp.text
     assert _entries(card_root) == before
 
 
@@ -393,16 +394,6 @@ def test_thumbnail_is_refused_under_a_symlinked_refused_root(client, db_session,
     c, img = _record_under(db_session, root)
     before = _entries(real)
     resp = _admin_client(client).get(f"/records/images/{img.id}/thumbnail")
-    assert resp.status_code == 503, resp.text
-    assert _entries(real) == before
-
-
-@pytest.mark.unit
-def test_renumber_is_refused_under_a_symlinked_refused_root(client, db_session, pm, linked_card_root):
-    root, real = linked_card_root
-    c, img = _record_under(db_session, root)
-    before = _entries(real)
-    resp = _admin_client(client).post(f"/collections/{c.id}/images/renumber")
     assert resp.status_code == 503, resp.text
     assert _entries(real) == before
 

@@ -24,6 +24,7 @@ from app.schemas.record import (
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
 from app.core.capture_naming import CaptureNameRefused, take_filename_index
 from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
@@ -189,7 +190,18 @@ def create_record(
 	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Create a new archival record (document/object like a book, map, document)."""
+	"""Create a new archival record (document/object like a book, map, document).
+
+	A record created in a volume takes the sequence after the highest there,
+	under the volume's row lock (app/core/record_sequence.py); `sequence` in
+	the body is not used. A record outside a volume, or naming a volume that
+	does not exist, is given no sequence.
+	"""
+	sequence = None
+	if rec_in.collection_id is not None:
+		sequences = next_sequences(db, rec_in.collection_id, 1)
+		if sequences is not None:
+			sequence = sequences[0]
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
@@ -200,6 +212,7 @@ def create_record(
 		collection_id=rec_in.collection_id,
 		created_by=rec_in.created_by or current_user.username,
 		capture_mode=rec_in.capture_mode,
+		sequence=sequence,
 	)
 	try:
 		db.add(rec)
@@ -324,6 +337,16 @@ def update_record(
 		              data.get("collection_id", rec.collection_id))
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
+
+	# A record moved into another volume takes the sequence after the
+	# highest there, so no two records of that volume share one. The volume's
+	# row is locked after the record's (app/core/record_sequence.py). None is
+	# assigned for a volume id that matches no volume.
+	new_collection = data.get("collection_id")
+	if new_collection is not None and new_collection != rec.collection_id:
+		sequences = next_sequences(db, new_collection, 1)
+		if sequences is not None:
+			data["sequence"] = sequences[0]
 
 	for field, value in data.items():
 		setattr(rec, field, value)
