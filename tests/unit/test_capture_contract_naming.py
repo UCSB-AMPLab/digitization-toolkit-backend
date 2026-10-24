@@ -769,3 +769,47 @@ def test_the_manifest_records_the_same_left_and_right_as_the_rows(
     in_manifest = {Path(f["relative_path"]).stem[-3:]: f["role"] for f in line["files"]}
     assert rows == expected
     assert in_manifest == expected
+
+
+def _manifest_line(stem, n, idx=0):
+    rel = f"{stem}/captures/{stem}-img_{n:04d}_c{idx}.jpg"
+    return json.dumps({"capture_id": f"id{n}", "files": [{"relative_path": rel}]}) + "\n"
+
+
+@pytest.mark.unit
+def test_cache_in_place_overwrite_same_inode_is_stale(tmp_path):
+    """A restore that copies over the manifest keeps its inode and may not make it shorter."""
+    import os
+    from app.core.capture_naming import manifest_capture_numbers
+
+    m = tmp_path / "manifest.jsonl"
+    m.write_text("".join(_manifest_line("co-a", n) for n in (1, 2, 3)))
+    ino = os.stat(m).st_ino
+    assert manifest_capture_numbers(m, "co-a") == {1, 2, 3}
+    with open(m, "w") as f:
+        f.write("".join(_manifest_line("co-a", n) for n in (7, 8, 9, 10)))
+    assert os.stat(m).st_ino == ino
+
+    assert manifest_capture_numbers(m, "co-a") == {7, 8, 9, 10}
+
+
+@pytest.mark.unit
+def test_appends_after_a_long_manifest_are_still_read_incrementally(tmp_path):
+    from app.core.capture_naming import manifest_capture_numbers
+
+    m = tmp_path / "manifest.jsonl"
+    m.write_text("".join(_manifest_line("co-a", n) for n in range(1, 201)))
+    assert manifest_capture_numbers(m, "co-a") == set(range(1, 201))
+    with open(m, "a") as f:
+        f.write(_manifest_line("co-a", 201))
+    assert manifest_capture_numbers(m, "co-a") == set(range(1, 202))
+
+
+@pytest.mark.unit
+def test_a_stem_that_ends_another_does_not_read_its_numbers(tmp_path):
+    from app.core.capture_naming import manifest_capture_numbers
+
+    m = tmp_path / "manifest.jsonl"
+    m.write_text(_manifest_line("x-co-a", 4) + _manifest_line("co-a", 5))
+    assert manifest_capture_numbers(m, "co-a") == {5}
+    assert manifest_capture_numbers(m, "x-co-a") == {4}

@@ -111,11 +111,26 @@ def files_carrying(output_dir: Path, name_stem: str, first_only: bool = False) -
     return found
 
 
-# Per manifest path and stem: (device, inode, bytes read, the numbers found so far).
-# A manifest is append-only, so each call reads only what was appended since
-# the last; a file replaced, or shorter than what was read, is read again.
-_manifest_numbers_cache: Dict[Tuple[str, str], Tuple[int, int, int, Set[int]]] = {}
+# Per manifest path and stem: (device, inode, bytes read, fingerprint of what
+# was read, the numbers found so far). A manifest is append-only, so each call
+# reads only what was appended since the last. It is read again in full when
+# the file was replaced (another device or inode), is shorter than what was
+# read, or was rewritten in place (a restore copied over it): the bytes the
+# fingerprint covers are read back on every call and must be unchanged.
+_manifest_numbers_cache: Dict[Tuple[str, str], Tuple[int, int, int, bytes, Set[int]]] = {}
 _manifest_numbers_lock = threading.Lock()
+
+# The fingerprint: the first bytes read and the last bytes before the offset.
+_FINGERPRINT_HEAD = 4096
+_FINGERPRINT_TAIL = 512
+
+
+def _fingerprint(f, offset: int) -> bytes:
+    f.seek(0)
+    head = f.read(min(_FINGERPRINT_HEAD, offset))
+    tail_start = max(0, offset - _FINGERPRINT_TAIL)
+    f.seek(tail_start)
+    return head + b"\0" + f.read(offset - tail_start)
 
 
 def manifest_capture_numbers(manifest: Path, stem: str) -> Set[int]:
@@ -124,30 +139,35 @@ def manifest_capture_numbers(manifest: Path, stem: str) -> Set[int]:
     A number named there was given to a capture once, even if its file has
     since been deleted from the card and its row from the catalogue, so it
     must not be given again (a catalogue restored from a backup holds an
-    older counter). The text is searched for the name, not parsed as JSON,
-    and only the bytes up to the last newline count, so a line still being
-    appended is read on the next call. A manifest that does not exist names
-    nothing.
+    older counter). The text is searched for the name, not parsed as JSON;
+    the name must not follow a character a stem can hold, so `x-co-a-img_`
+    is not read as `co-a-img_`. Only the bytes up to the last newline count,
+    so a line still being appended is read on the next call. A manifest that
+    does not exist names nothing.
     """
-    pattern = re.compile(re.escape(stem.encode()) + rb"-img_(\d+)_c", re.IGNORECASE)
+    pattern = re.compile(rb"(?<![a-z0-9-])" + re.escape(stem.encode()) + rb"-img_(\d+)_c", re.IGNORECASE)
     key = (str(manifest), stem)
     with _manifest_numbers_lock:
         try:
-            st = os.stat(manifest)
+            f = open(manifest, "rb")
         except FileNotFoundError:
             _manifest_numbers_cache.pop(key, None)
             return set()
-        dev, ino, offset, numbers = _manifest_numbers_cache.get(key, (st.st_dev, st.st_ino, 0, set()))
-        if (dev, ino) != (st.st_dev, st.st_ino) or st.st_size < offset:
-            offset, numbers = 0, set()
-        if st.st_size > offset:
-            with open(manifest, "rb") as f:
+        with f:
+            st = os.fstat(f.fileno())
+            dev, ino, offset, printed, numbers = _manifest_numbers_cache.get(
+                key, (st.st_dev, st.st_ino, 0, b"", set()))
+            if ((dev, ino) != (st.st_dev, st.st_ino) or st.st_size < offset
+                    or (offset and _fingerprint(f, offset) != printed)):
+                offset, numbers = 0, set()
+            if st.st_size > offset:
                 f.seek(offset)
                 chunk = f.read(st.st_size - offset)
-            end = chunk.rfind(b"\n") + 1
-            numbers = numbers | {int(m.group(1)) for m in pattern.finditer(chunk, 0, end)}
-            offset += end
-        _manifest_numbers_cache[key] = (st.st_dev, st.st_ino, offset, numbers)
+                end = chunk.rfind(b"\n") + 1
+                numbers = numbers | {int(m.group(1)) for m in pattern.finditer(chunk, 0, end)}
+                offset += end
+            printed = _fingerprint(f, offset) if offset else b""
+        _manifest_numbers_cache[key] = (st.st_dev, st.st_ino, offset, printed, numbers)
         return set(numbers)
 
 
