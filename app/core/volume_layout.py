@@ -110,6 +110,7 @@ be done and writes nothing.
 
 import argparse
 import errno
+import itertools
 import json
 import logging
 import os
@@ -865,18 +866,30 @@ def _settle(src: Path, dst: Path) -> Optional[Path]:
     return None
 
 
-def _free_name(e: dict, src: Path, dst: Path) -> Path:
-    """A name in dst's directory for a master whose planned name was taken after planning.
+def _free_name(e: dict, src: Path, dst: Path) -> Tuple[Path, List[Path]]:
+    """A name in dst's directory for a master whose planned name was taken after planning, and what took the others.
 
-    For a RAW master the name its sidecar would take in `previews/` must be free too.
+    For a RAW master the name its sidecar would take in `previews/` must be
+    free too. Returns (the name, the files found at every name passed over,
+    `dst` included: masters, and previews for a RAW master), the files
+    resolved and listed by their names on disk, which may differ in case.
     """
-    for stem in _suffixed_stems(src.stem, e["image_id"]):
+    taken: List[Path] = []
+    raw = is_raw_suffix(src)
+    for stem in [dst.stem] + list(itertools.islice(_suffixed_stems(src.stem, e["image_id"]), 10000)):
         cand = dst.with_name(f"{stem}{src.suffix}")
         sidecar = preview_sidecar_of(cand)
-        if not _taken_in(cand.parent, cand.name) and not (
-                is_raw_suffix(src) and _taken_in(sidecar.parent, sidecar.name)):
-            return cand
+        found = _entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else [])
+        if not found:
+            return cand, taken
+        taken.extend(found)
     raise AssertionError("unreachable")
+
+
+def _entries_named(directory: Path, name: str) -> List[Path]:
+    """The files in `directory` whose names casefold to `name`'s, resolved."""
+    folded = name.casefold()
+    return [p.resolve() for p in _listdir(directory) if p.name.casefold() == folded and p.is_file()]
 
 
 def _record_relocation(root: Path, e: dict, src: Path, dst: Path) -> None:
@@ -946,13 +959,18 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             continue
 
         if src.exists() and dst.exists():
-            new_dst = _free_name(e, src, dst)
+            new_dst, taken = _free_name(e, src, dst)
             logger.warning(f"Volume layout: {dst} was taken after planning; moving {src} to {new_dst}")
-            if dst.resolve() not in {Path(m["to"]).resolve() for m in report["moved"]} \
-                    and str(dst.resolve()) not in report["left_unreferenced"]:
-                logger.warning(f"Volume layout: {dst} took the name of image {e['image_id']}'s master after "
-                               "planning and is left where it is")
-                report["left_unreferenced"].append(str(dst.resolve()))
+            # Only files no row references are strays: one a row names (a
+            # master moved here in this run, or written since the plan, or a
+            # pending journal's) is that row's.
+            owned = set(_owners(db)) if taken else set()
+            for f in taken:
+                if f in owned or str(f) in report["left_unreferenced"]:
+                    continue
+                logger.warning(f"Volume layout: {f} took a name image {e['image_id']}'s master was planned to "
+                               "take, after planning, and is left where it is")
+                report["left_unreferenced"].append(str(f))
             e["to"] = str(new_dst)
             if e["sidecar_from"]:
                 e["sidecar_to"] = str(preview_sidecar_of(new_dst))
