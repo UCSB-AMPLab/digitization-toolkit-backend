@@ -734,7 +734,9 @@ def trigger_capture(
 	# here, locked, as every path that
 	# moves a record's status or changes which of its images are current is:
 	# the status read here is what the retake writes over and what its
-	# history row names as the old status.
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -967,7 +969,9 @@ def trigger_dual_capture(
 	# here, locked, as every path that
 	# moves a record's status or changes which of its images are current is:
 	# the status read here is what the retake writes over and what its
-	# history row names as the old status.
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record

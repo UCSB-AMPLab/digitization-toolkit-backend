@@ -396,8 +396,12 @@ async def add_image_to_record(
 	Upload and attach an image to an existing record.
 	This is used when adding captures to a multi-page document.
 	"""
-	# Verify record exists
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	# Lock order, the same on every path that takes both: the record's row,
+	# then its volume's. The record is locked here, and the stem check below
+	# locks the volume. Read unlocked, the record was still locked later, by
+	# the image insert's foreign-key check (FOR KEY SHARE), after the volume:
+	# the opposite order to a retake, and the two deadlocked on PostgreSQL.
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 	# An upload is a capture event for the record's volume, refused on the

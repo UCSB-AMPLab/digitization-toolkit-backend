@@ -30,6 +30,9 @@ def locked_volume_query(db: Session, collection_id: int):
     capture's transaction ends. A PATCH clearing or setting the stem takes the
     same row the same way (app/api/collections.py), so it cannot land between
     the check and the commit. A capture holds the lock through the shot.
+
+    A path that also locks a record locks the record first and then this
+    row; the opposite order deadlocks against one that keeps to it.
     """
     return db.query(Collection).filter(Collection.id == collection_id).with_for_update()
 

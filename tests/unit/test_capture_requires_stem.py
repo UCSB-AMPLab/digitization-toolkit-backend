@@ -461,3 +461,39 @@ def test_every_stem_check_loads_the_volume_through_the_locked_loader():
     from app.api import records as records_api
     src = inspect.getsource(records_api.add_image_to_record)
     assert "volume_lacks_stem(db, rec.collection_id)" in src, "the upload does not run the locked stem check"
+
+
+# ---------------------------------------------------------------------------
+# One lock order: the record, then its volume
+# ---------------------------------------------------------------------------
+#
+# A path that takes both locks takes the record's row first and the volume's
+# second. An upload that locked the volume and then inserted an image, whose
+# foreign-key check takes FOR KEY SHARE on the record, deadlocked on
+# PostgreSQL 16 against a retake that held the record and wanted the volume.
+# The locked loaders' SQL is checked above and in test_workflow_row_locking.py;
+# here, the order in each path's source.
+
+def _before(src: str, first: str, second: str) -> bool:
+    assert first in src, f"{first!r} not in the source"
+    assert second in src, f"{second!r} not in the source"
+    return src.index(first) < src.index(second)
+
+
+@pytest.mark.unit
+def test_the_upload_locks_the_record_before_the_volume():
+    from app.api import records as records_api
+
+    src = inspect.getsource(records_api.add_image_to_record)
+    assert "db.query(Record).filter(Record.id == rec_id)" not in src, "the upload loads its record unlocked"
+    assert _before(src, "_locked_record(db, rec_id", "volume_lacks_stem(db, rec.collection_id)")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name", ["trigger_capture", "trigger_dual_capture"])
+def test_a_retake_locks_the_record_before_the_volume(name):
+    from app.api import cameras as cameras_api
+
+    src = inspect.getsource(getattr(cameras_api, name))
+    assert _before(src, "_locked_record(db, request.record_id)",
+                   "_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)")
