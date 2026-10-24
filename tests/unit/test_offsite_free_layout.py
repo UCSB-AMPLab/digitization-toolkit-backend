@@ -163,3 +163,54 @@ def test_a_freed_masters_name_taken_after_planning_gets_the_next_name_as_a_move_
     assert late.read_bytes() == b"written after planning"
     assert str(late.resolve()) in report["left_unreferenced"]
     assert (override_projects_root / STEM / "previews" / f"f1_img{img.id}_preview.jpg").read_bytes() == b"preview one"
+
+
+def _crash_after_the_commit(db, monkeypatch):
+    """Run the migration and stop it after the batch commits, before the journal is cleared."""
+    import app.core.volume_layout as vl
+
+    real = vl.clear_layout_journal
+    vl.clear_layout_journal = lambda: None
+    try:
+        first = _migrate(db)
+    finally:
+        vl.clear_layout_journal = real
+    assert vl.read_layout_journal() is not None, "the journal should be left behind"
+    return first
+
+
+@pytest.mark.unit
+def test_replaying_a_committed_freed_batch_changes_nothing(remote, db_session, override_projects_root, monkeypatch):
+    import app.core.volume_layout as vl
+
+    vol, img, old = _hand_freed(db_session, override_projects_root)
+    first = _crash_after_the_commit(db_session, monkeypatch)
+    new = override_projects_root / STEM / "captures" / "f1.CR2"
+    preview = override_projects_root / STEM / "previews" / "f1_preview.jpg"
+    assert [m["to"] for m in first["freed_paths_moved"]] == [str(new.resolve())]
+
+    replay = _migrate(db_session)
+
+    assert replay["completed_journal"] is True
+    assert replay["freed_paths_moved"] == [] and replay["moved"] == [], replay
+    assert _image_row(db_session, img.id).file_path == str(new.resolve())
+    assert preview.read_bytes() == b"preview one"
+    assert sorted(p.name for p in preview.parent.iterdir()) == ["f1_preview.jpg"]
+    assert vl.read_layout_journal() is None
+
+
+@pytest.mark.unit
+def test_replaying_a_committed_move_leaves_the_row_and_files_where_they_are(
+        remote, db_session, override_projects_root, monkeypatch):
+    """The same window on the ordinary move path."""
+    vol = _volume(db_session)
+    img, old = _old_layout_image(db_session, vol, override_projects_root, "f1.CR2", b"raw one", preview=b"preview one")
+    _crash_after_the_commit(db_session, monkeypatch)
+    new = override_projects_root / STEM / "captures" / "f1.CR2"
+
+    _migrate(db_session)
+
+    assert _image_row(db_session, img.id).file_path == str(new.resolve())
+    assert new.read_bytes() == b"raw one"
+    assert (override_projects_root / STEM / "previews" / "f1_preview.jpg").read_bytes() == b"preview one"
+    assert sorted(p.name for p in new.parent.iterdir()) == ["f1.CR2"]

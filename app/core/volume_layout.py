@@ -1065,6 +1065,14 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             # Freed, yet a file is at its path again: not this run's to decide.
             report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "freed_but_present"})
             continue
+        if freed and img.file_path == str(dst):
+            # A journal replayed after its batch committed: the row already
+            # names the destination, which is this image's own reservation,
+            # not another's, and its preview and thumbnail moved with that
+            # commit (a preview that could not follow is in the pending list,
+            # written before it). Nothing is left to do, as for a moved file
+            # found at its destination.
+            continue
         if (src.exists() and dst.exists()) or (freed and _taken_late(e, dst, reserved_now(db, report))):
             new_dst, taken = _free_name(e, src, dst, reserved_now(db, report))
             logger.warning(f"Volume layout: {dst} was taken after planning; "
