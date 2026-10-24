@@ -48,6 +48,7 @@ class _FakeBackend:
     def __init__(self, raw=False):
         self.raw = raw
         self.requested = []
+        self.fail_after_write = set()  # camera indexes that write their files, then raise
 
     def capture_image(self, output_path, camera_config, capture_output=False):
         from app.core.paths import preview_sidecar_of
@@ -60,6 +61,8 @@ class _FakeBackend:
             preview_sidecar_of(out).write_bytes(b"preview of " + out.name.encode())
         else:
             out.write_bytes(b"jpeg bytes of " + out.name.encode())
+        if camera_config.camera_index in self.fail_after_write:
+            raise RuntimeError(f"cam{camera_config.camera_index} failed after writing")
         return out, None
 
 
@@ -698,3 +701,51 @@ def test_the_manifest_is_read_incrementally_and_a_torn_last_line_waits(tmp_path)
     assert manifest_capture_numbers(m, "co-other") == set()
     m.write_text("")
     assert manifest_capture_numbers(m, STEM) == set(), "a replaced, shorter file is read again"
+
+
+# ---------------------------------------------------------------------------
+# A dual capture that fails partway
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("raw", [False, True])
+@pytest.mark.parametrize("failing", [{1}, {0}, {0, 1}])
+def test_a_dual_capture_that_fails_partway_leaves_no_file_of_either_side(
+        client, db_session, test_project, volume, backend, override_projects_root, raw, failing):
+    backend.raw = raw
+    backend.fail_after_write |= failing
+    api = _client_as(client)
+
+    resp = _post(api, test_project, volume, dual=True)
+
+    assert resp.status_code == 200 and resp.json()["success"] is False
+    vol = override_projects_root / STEM
+    assert _captures(override_projects_root) == []
+    assert list((vol / "previews").iterdir()) == []
+    assert _manifest_names(override_projects_root) == []
+    assert _counter(db_session, volume) == 0
+
+    backend.fail_after_write.clear()
+    body = _dual(api, test_project, volume)
+    assert [Path(p).stem for p in body["file_paths"]] == [f"{STEM}-img_0001_c0", f"{STEM}-img_0001_c1"]
+
+
+@pytest.mark.unit
+def test_a_failed_dual_capture_leaves_a_file_it_did_not_write(tmp_path, monkeypatch):
+    """A camera refused because its name was taken keeps the file that took it."""
+    from capture.camera import CameraConfig
+
+    b = _FakeBackend()
+    monkeypatch.setattr(capture_service, "get_backend", lambda: b)
+    captures = tmp_path / STEM / "captures"
+    captures.mkdir(parents=True)
+    other = captures / f"{STEM}-img_0001_c1.jpg"
+    other.write_bytes(b"not this capture's")
+
+    with pytest.raises(RuntimeError):
+        capture_service.dual_capture_image(
+            "P", CameraConfig(camera_index=0), CameraConfig(camera_index=1), check_camera=False,
+            stagger_ms=0, stem=STEM, filename_index=f"{STEM}-img_0001", root=tmp_path)
+
+    assert sorted(p.name for p in captures.iterdir()) == [other.name]
+    assert other.read_bytes() == b"not this capture's"

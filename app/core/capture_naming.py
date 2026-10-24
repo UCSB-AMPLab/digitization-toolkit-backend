@@ -79,6 +79,11 @@ def capture_name_taken(output_dir: Path, name_stem: str) -> bool:
     the directory itself otherwise. A directory that does not exist holds
     nothing.
     """
+    return bool(files_carrying(output_dir, name_stem, first_only=True))
+
+
+def files_carrying(output_dir: Path, name_stem: str, first_only: bool = False) -> list:
+    """The files in `output_dir` and its sidecar directory that carry `name_stem` (see capture_name_taken)."""
     target = name_stem.casefold()
 
     def carries(name: str) -> bool:
@@ -92,14 +97,18 @@ def capture_name_taken(output_dir: Path, name_stem: str) -> bool:
     sidecar_dir = preview_sidecar_of(output_dir / "x.jpg").parent
     if sidecar_dir != output_dir:
         dirs.append(sidecar_dir)
+    found = []
     for d in dirs:
         try:
             with os.scandir(d) as entries:
-                if any(carries(e.name) for e in entries):
-                    return True
+                for e in entries:
+                    if e.is_file() and carries(e.name):
+                        found.append(Path(e.path))
+                        if first_only:
+                            return found
         except FileNotFoundError:
             continue
-    return False
+    return found
 
 
 # Per manifest path and stem: (device, inode, bytes read, the numbers found so far).

@@ -42,7 +42,7 @@ from .backends import (
 from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir, projects_root
 
 from app.core.config import settings
-from app.core.capture_naming import capture_filename_index, capture_name_taken  # noqa: F401 (re-exported)
+from app.core.capture_naming import capture_filename_index, capture_name_taken, files_carrying  # noqa: F401 (re-exported)
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 
 LOG_FILE = settings.log_dir / "capture_service.log"
@@ -665,6 +665,21 @@ def dual_capture_image(
         # unlink it rather than leave a manifest-less orphan that looks like a page.
         for path, _elapsed, _meta in results.values():
             _unlink_capture_output(path)
+        # A camera that failed may have written its file (or its RAW sidecar)
+        # before failing, and returned no path. The event's name was free when
+        # it was taken (take_filename_index), so every file now carrying it was
+        # written by this capture; each camera's are removed, except for a
+        # camera refused because its name was already taken, whose file is
+        # not this capture's.
+        output_dir = image_output_dir(project_name, collection_name, stem, root)
+        for idx in (cam1_config.camera_index, cam2_config.camera_index):
+            if isinstance(errors.get(idx), FileExistsError):
+                continue
+            for target in files_carrying(output_dir, f"{filename_index}_c{idx}"):
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    subprocess_logger.warning(f"Could not remove {target} after a failed dual capture")
         raise RuntimeError(
             "Dual capture failed on camera(s) "
             + "; ".join(f"cam{i}: {e}" for i, e in sorted(errors.items()))
