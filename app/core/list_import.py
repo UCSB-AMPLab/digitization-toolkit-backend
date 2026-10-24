@@ -70,6 +70,7 @@ from app.models.collection import (
     StemDirectoryCollisionError,
     StemDirectoryOccupiedError,
     StemIsProjectDirectoryError,
+    stem_directory_conflict,
 )
 from app.models.project import Project
 
@@ -493,10 +494,9 @@ def _reject(position: int, code: Any, reason: str) -> dict:
     }
 
 
-def _import_items(db: Session, list_id: str, list_name: str, items: list,
-                  actor: Optional[str], may_create_project: bool, notes: Any = None) -> dict:
-    """Find or create the project, then create each item's volume; return the report."""
-    project, project_created = _project_for(db, list_name, actor, may_create_project, notes)
+def _import_items(db: Session, list_id: str, list_name: str, project: Project, project_created: bool,
+                  items: list, actor: Optional[str], notes: Any = None) -> dict:
+    """Create each item's volume in `project` (found or created by _project_for); return the report."""
     project_id = project.id
     project_name = project.name
     # Stored only when this import created the project with a description.
@@ -610,7 +610,14 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     - ListHashNotRecorded, when this is the list id's first hash and the
       hash file cannot be written;
     - ProjectNeedsAdmin, when no project matches the list's name and
-      `may_create_project` is false.
+      `may_create_project` is false;
+    - ListRefused, too, when the project to be created would use a volume's
+      stem as its directory.
+    These are decided before the list's hash is written, and a whole-list
+    refusal that still comes after it (the project deleted between the
+    check and its use) removes the hash this run wrote, so a refused file
+    leaves no hash and its corrected version can be imported under the
+    same id.
     Otherwise commits the project (if new) and then each volume on its own,
     stores the report as the list's next run, and returns it with
     `reportStored` saying whether that write succeeded (the stored file
@@ -628,10 +635,25 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     if not may_create_project and _find_project(db, list_name) is None:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
     with _list_lock(list_id):
+        # Every refusal of the whole list is decided before the hash is
+        # written, so a refused file leaves no hash for its corrected
+        # version to be refused against (ListIdReused).
+        _refuse_list_before_hash(db, list_name, may_create_project)
+        wrote_hash = False
         if file_sha256 is not None:
-            _check_hash(reports_dir() / list_id, list_id, file_sha256)
-        report = _import_items(db, list_id, list_name, items, actor, may_create_project,
-                               notes=document["list"].get("notes"))
+            wrote_hash = _check_hash(reports_dir() / list_id, list_id, file_sha256)
+        notes = document["list"].get("notes")
+        try:
+            project, project_created = _project_for(db, list_name, actor, may_create_project, notes)
+        except BaseException:
+            # A refusal the check above could not see (the project deleted
+            # since, a concurrent create): no volume exists yet, so the
+            # first hash this run wrote goes with it. One an earlier import
+            # recorded stays.
+            if wrote_hash:
+                _remove_hash_file(reports_dir() / list_id, list_id)
+            raise
+        report = _import_items(db, list_id, list_name, project, project_created, items, actor, notes=notes)
         report["fileSha256"] = file_sha256
         try:
             store_report(report)
@@ -704,7 +726,31 @@ def _run_files(directory: Path, list_id: str) -> list[tuple[int, Path]]:
 _RUN_RE = re.compile(r"run(\d+)\.json")
 
 
-def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
+def _refuse_list_before_hash(db: Session, list_name: str, may_create_project: bool) -> None:
+    """Raise what _project_for would raise for the whole list, before anything is written.
+
+    ProjectNeedsAdmin when no project matches the list's name and
+    `may_create_project` is false; ListRefused when the project to be
+    created would use a volume's stem as its directory. Read-only.
+    """
+    if _find_project(db, list_name) is not None:
+        return
+    if not may_create_project:
+        raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
+    error = stem_directory_conflict(db, project_name=_project_name(list_name))
+    if error is not None:
+        raise ListRefused(str(error))
+
+
+def _remove_hash_file(directory: Path, list_id: str) -> None:
+    """Remove the hash this run recorded for a list it then refused whole; a failure is logged."""
+    try:
+        (directory / HASH_FILE_NAME).unlink(missing_ok=True)
+    except OSError:
+        logger.exception("Could not remove the hash of refused list %s", list_id)
+
+
+def _check_hash(directory: Path, list_id: str, file_sha256: str) -> bool:
     """Refuse a file whose SHA-256 is not the one this list id was first imported with.
 
     Called under the list lock, before anything is created. The list's hash
@@ -720,11 +766,16 @@ def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
       ListIdReused. Otherwise the hash file is created now, exclusively;
       if another import created it meanwhile, it is compared as above, and
       if it cannot be written, ListHashNotRecorded.
+
+    Returns True when this call wrote the hash file, so the caller can
+    remove it if the list is then refused whole before any volume exists.
+    The exclusive create keeps its role: of two imports that both found no
+    hash file, only one writes it and goes on.
     """
     hash_file = directory / HASH_FILE_NAME
     if hash_file.exists():
         _compare_with_hash_file(hash_file, file_sha256)
-        return
+        return False
     for _, path in _run_files(directory, list_id):
         try:
             earlier = json.loads(path.read_text(encoding="utf-8")).get("fileSha256")
@@ -741,9 +792,11 @@ def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
         # wrote the hash since the check above: compare with it as if it
         # had been there from the start.
         _compare_with_hash_file(hash_file, file_sha256)
+        return False
     except OSError:
         logger.exception("Could not record the hash of list %s", list_id)
         raise ListHashNotRecorded(LIST_HASH_NOT_RECORDED_MESSAGE)
+    return True
 
 
 def _compare_with_hash_file(hash_file: Path, file_sha256: str) -> None:
