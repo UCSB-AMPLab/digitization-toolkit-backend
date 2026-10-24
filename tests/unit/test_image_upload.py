@@ -417,14 +417,26 @@ def test_not_found_is_absence_only_when_the_parent_listing_agrees(remote, db_ses
 
 
 @pytest.mark.unit
-def test_a_missing_remote_root_is_not_an_answer(remote, db_session, override_projects_root, monkeypatch):
-    from app.core import config
+def test_nothing_above_the_tenant_prefix_is_listed(remote, db_session, override_projects_root):
+    vol = _volume(db_session)
+    _image(db_session, vol, override_projects_root, "f1.jpg", b"one", thumbnail=False)
+
+    result = _run(db_session)  # the tenant prefix does not exist yet
+
+    assert result["uploaded"] == 1
+    root = str(remote.root).rstrip("/")
+    listed = [c[4].rstrip("/") for c in remote.calls("lsjson")]  # lsjson --hash --hash-type sha1 <path>
+    assert listed and all(p.startswith(f"{root}/{TENANT}") for p in listed), listed
+
+
+@pytest.mark.unit
+def test_a_key_outside_the_tenant_prefix_is_not_listed(remote, db_session):
     from app.core.catalogue_backup import VerificationUnavailable
     from app.core.image_upload import listed_object
 
-    monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", str(remote.root / "no-such-bucket"))
     with pytest.raises(VerificationUnavailable):
-        listed_object(f"{TENANT}/{STEM}/captures/x.jpg")
+        listed_object("ahr/tomo-6/images/a.CR2")
+    assert remote.calls("lsjson") == []
 
 
 @pytest.mark.unit

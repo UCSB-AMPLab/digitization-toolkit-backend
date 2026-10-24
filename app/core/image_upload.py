@@ -26,7 +26,8 @@ The rules a run follows:
 * **A listing that cannot answer stops the run** (VerificationUnavailable,
   from app.core.catalogue_backup). An unanswered listing is never read as an
   absent object. rclone's "directory not found" is accepted as absence only
-  when the parent directory's listing answers and does not show it.
+  when the parent directory's listing answers and does not show it, or for
+  the tenant prefix itself. Nothing above `<remote>/<tenant>/` is listed.
 * **Verified only from a listing.** An object is verified when a listing
   taken after the upload shows the key with the local SHA1. A copy command
   that succeeded is recorded as uploaded, and stays pending until then.
@@ -178,24 +179,32 @@ class Listed:
     sha1: Optional[str] = None
 
 
-def _entries(rel_dir: str) -> Optional[dict]:
+def _entries(rel_dir: str, tenant: str) -> Optional[dict]:
     """Name -> listing row for the directory `rel_dir` under the remote, or None if it is absent.
 
-    None only on positive evidence: rclone said "directory not found", and the
-    parent directory's listing answered and does not show `rel_dir`. A parent
-    that shows it means the two listings disagree, which is not an answer.
-    The remote's own root must answer.
+    Nothing above `<remote>/<tenant>/` is ever listed: the appliance key may
+    list only under its tenant's prefix. Below the tenant, None only on
+    positive evidence: rclone said "directory not found", and the parent's
+    listing answered and does not show `rel_dir`. A parent that shows it
+    means the two listings disagree, which is not an answer. The tenant
+    prefix itself counts as absent when its own listing reports "directory
+    not found" (nothing uploaded yet), and any other failure is an error.
+
+    To confirm on B2 with the real appliance key: that listing an empty
+    tenant prefix answers with an empty list or "directory not found"
+    (exit 3), never a refusal that exits 3.
     """
     rel_dir = rel_dir.strip("/")
+    if rel_dir != tenant and not rel_dir.startswith(tenant + "/"):
+        raise VerificationUnavailable(
+            f"{rel_dir} is not under the tenant prefix {tenant}/, and nothing above it is listed"
+        )
     rows = lsjson_rows(remote_path(rel_dir) + "/", absent_ok=True)
     if rows is None:
-        if "/" in rel_dir:
-            parent, leaf = rel_dir.rsplit("/", 1)
-            parent_entries = _entries(parent)
-        else:
-            leaf = rel_dir
-            root = config.settings.OFFSITE_REMOTE.rstrip("/")
-            parent_entries = {r.get("Name"): r for r in lsjson_rows(root + "/")}
+        if rel_dir == tenant:
+            return None
+        parent, leaf = rel_dir.rsplit("/", 1)
+        parent_entries = _entries(parent, tenant)
         if parent_entries is not None and leaf in parent_entries:
             raise VerificationUnavailable(
                 f"rclone reported {rel_dir} as not found, but its parent's listing shows it"
@@ -210,7 +219,10 @@ def listed_object(key: str) -> Listed:
     Raises VerificationUnavailable when a listing does not answer.
     """
     parent, name = key.strip("/").rsplit("/", 1)
-    entries = _entries(parent)
+    tenant = configured_tenant()
+    if tenant is None:
+        raise VerificationUnavailable("no tenant prefix is configured, so nothing is listed")
+    entries = _entries(parent, tenant)
     if entries is None or name not in entries:
         return Listed(present=False)
     row = entries[name]
