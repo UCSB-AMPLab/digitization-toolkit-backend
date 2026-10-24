@@ -530,3 +530,81 @@ def test_restore_shares_the_uploads_transfer_lock_and_bandwidth_cap(read_remote,
     assert len(copies) == 3
     for call in copies:
         assert call[call.index("--bwlimit") + 1] == "123k"
+
+
+# ---------------------------------------------------------------------------
+# A delete during a restore or a free (both run under a hold that a delete
+# shares, so they are serialised on the record's row lock instead)
+# ---------------------------------------------------------------------------
+
+from tests.unit.test_image_upload import api  # noqa: E402,F401
+
+
+@pytest.mark.unit
+def test_a_delete_committed_during_a_restores_copy_leaves_no_file_and_is_reported(
+        read_remote, api, db_session, override_projects_root, monkeypatch):
+    import app.core.offsite_free as of
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    jpg_id, jpg_record = jpg.id, jpg.record_id
+    jpg_master = _paths(override_projects_root, "f2.jpg")[0]
+    real = of._copy_from_bucket
+
+    def copy_then_delete(key, dest):
+        error = real(key, dest)
+        if key.endswith("/f2.jpg"):
+            response = api.delete(f"/records/{jpg_record}")
+            assert response.status_code == 200, response.text
+        return error
+
+    monkeypatch.setattr(of, "_copy_from_bucket", copy_then_delete)
+
+    result = _restore(db_session, vol)
+
+    assert not jpg_master.exists(), "the deleted image's master was written back to the card"
+    assert [(r["image_id"], r["kind"], r["reason"]) for r in result["refused"]] == [(jpg_id, "capture", "changed")]
+    assert result["restored"]["files"] == 2
+    leftovers = [p for p in (override_projects_root / STEM).rglob("*") if p.name.endswith(".part")]
+    assert leftovers == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("when", ["before_the_state_is_set", "after_the_state_is_committed"])
+def test_a_delete_during_freeing_leaves_a_consistent_state(
+        remote, api, db_session, override_projects_root, monkeypatch, when):
+    import app.core.offsite_free as of
+    from app.models.record import RecordImage
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    jpg_id, jpg_record, raw_id = jpg.id, jpg.record_id, raw.id
+    jpg_master = _paths(override_projects_root, "f2.jpg")[0]
+    real = of._set_freed
+    deleted = []
+
+    def delete():
+        response = api.delete(f"/records/{jpg_record}")
+        assert response.status_code == 200, response.text
+        deleted.append(True)
+
+    def set_freed(db, obj, *, at, size):
+        is_target = obj.image_id == jpg_id and at is not None and not deleted
+        if is_target and when == "before_the_state_is_set":
+            delete()
+        changed = real(db, obj, at=at, size=size)
+        if is_target and when == "after_the_state_is_committed":
+            delete()
+        return changed
+
+    monkeypatch.setattr(of, "_set_freed", set_freed)
+
+    result = _free(db_session, vol)
+
+    db_session.expire_all()
+    assert db_session.get(RecordImage, jpg_id) is None
+    assert not jpg_master.exists()
+    assert [(r["image_id"], r["reason"]) for r in result["refused"]] == [(jpg_id, "changed")]
+    assert result["freed"]["files"] == 2
+    assert {(f["image_id"], f["kind"]) for f in result["files"]} == {(raw_id, "capture"), (raw_id, "preview")}
+    row = _image_row(db_session, raw_id)
+    assert row.master_freed_at is not None and row.preview_freed_at is not None

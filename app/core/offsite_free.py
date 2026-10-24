@@ -315,6 +315,32 @@ def _now() -> datetime:
     return datetime.now(timezone.utc)
 
 
+def _image_exists(db: Session, image_id: int) -> bool:
+    from app.models.record import RecordImage
+
+    exists = db.query(RecordImage.id).filter(RecordImage.id == image_id).first() is not None
+    db.commit()
+    return exists
+
+
+def _lock_and_recheck(db: Session, obj: _Object, *, freed: bool) -> bool:
+    """Lock the object's record, then re-read its image: True when the row is there, names obj.file_path, and is freed (or not) as `freed` says.
+
+    Leaves the transaction open, holding the record's row lock, for the
+    caller to commit or roll back. Record before volume, as on every path;
+    delete_record and delete_image take this same lock before they decide
+    which files to unlink, and unlink only after their commit, so a delete
+    and anything done here under the lock cannot interleave.
+    """
+    from app.models.record import Record, RecordImage
+
+    at_col, _ = _columns(obj.kind)
+    db.query(Record.id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
+    row = (db.query(RecordImage.file_path, at_col)
+           .filter(RecordImage.id == obj.image_id).one_or_none())
+    return row is not None and row[0] == obj.file_path and (row[1] is not None) == freed
+
+
 def _set_freed(db: Session, obj: _Object, *, at: Optional[datetime], size: Optional[int]) -> bool:
     """Set (or, with at=None, clear) the object's freed state; True when the row still names obj.file_path.
 
@@ -323,15 +349,16 @@ def _set_freed(db: Session, obj: _Object, *, at: Optional[datetime], size: Optio
     record at a time, committed before the next, so no two record locks are
     ever held together.
     """
-    from app.models.record import Record, RecordImage
+    from app.models.record import RecordImage
 
     at_col, bytes_col = _columns(obj.kind)
-    db.query(Record.id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
-    q = db.query(RecordImage).filter(RecordImage.id == obj.image_id, RecordImage.file_path == obj.file_path)
-    q = q.filter(at_col.is_(None)) if at is not None else q.filter(at_col.isnot(None))
-    changed = q.update({at_col: at, bytes_col: size}, synchronize_session=False)
+    if not _lock_and_recheck(db, obj, freed=at is None):
+        db.rollback()
+        return False
+    (db.query(RecordImage).filter(RecordImage.id == obj.image_id)
+     .update({at_col: at, bytes_col: size}, synchronize_session=False))
     db.commit()
-    return changed == 1
+    return True
 
 
 class _RunManifest:
@@ -469,10 +496,19 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
             continue
         at = _now()
         if not _set_freed(db, obj, at=at, size=size):
-            refused.append(obj.entry(reason="image_changed"))
+            # Deleted, or its path changed, since the work list was read.
+            refused.append(obj.entry(reason="changed"))
             continue
+        # The record's lock is released at that commit, so a delete can run
+        # between it and the unlink. The delete removes the row and then the
+        # same file; whichever unlink comes second finds nothing. Either way
+        # the row and the card agree, and only the report has to say which.
         try:
             obj.path.unlink()
+        except FileNotFoundError:
+            if not _image_exists(db, obj.image_id):
+                refused.append(obj.entry(reason="changed"))
+                continue
         except OSError as exc:
             logger.warning("Freed state set but %s could not be removed; clearing it: %s", obj.path, exc)
             _set_freed(db, obj, at=None, size=None)
@@ -573,7 +609,7 @@ def _restore_one(db: Session, obj: _Object) -> tuple:
         if target.is_file() and _stable_sha1(target) == obj.sha1:
             if _set_freed(db, obj, at=None, size=None):
                 return obj.entry(bytes=target.stat().st_size, sha1=obj.sha1, already_present=True), None
-            return None, obj.entry(reason="image_changed")
+            return None, obj.entry(reason="changed")
         return None, obj.entry(reason="local_file_differs")
 
     target.parent.mkdir(parents=True, exist_ok=True)
@@ -589,22 +625,46 @@ def _restore_one(db: Session, obj: _Object) -> tuple:
         if copied != obj.sha1:
             return None, obj.entry(reason="sha1_differs", copied_sha1=copied, expected_sha1=obj.sha1)
         size = staging.stat().st_size
-        if target.exists():
-            return None, obj.entry(reason="local_file_differs")
-        os.replace(staging, target)
-        _fsync_dir(target.parent)
+        placed = _place(db, obj, staging, target)
     except OSError as exc:
+        db.rollback()
         return None, obj.entry(reason="could_not_write", error=str(exc)[:200])
     finally:
         try:
             staging.unlink(missing_ok=True)
         except OSError:
             pass
-    if not _set_freed(db, obj, at=None, size=None):
-        # The file is back but the row changed meanwhile; the next restore
-        # finds it in place and clears the state if it can.
-        return None, obj.entry(reason="image_changed")
+    if placed is not True:
+        return None, obj.entry(reason=placed)
     return obj.entry(bytes=size, sha1=obj.sha1), None
+
+
+def _place(db: Session, obj: _Object, staging: Path, target: Path):
+    """Move the verified staging copy into place and clear the freed state, under the record's lock.
+
+    True when placed; otherwise the refusal's reason, with the staging copy
+    left for the caller to remove. A delete that committed during the copy
+    leaves no row, so nothing is placed and nothing is written back to the
+    card ("changed"). A delete waiting on the lock runs after this commit and
+    removes the placed file with its row. If the commit fails after the
+    replace, the file is back and still marked freed; the next restore finds
+    it in place with the object's SHA1 and clears the state.
+    """
+    from app.models.record import RecordImage
+
+    at_col, bytes_col = _columns(obj.kind)
+    if not _lock_and_recheck(db, obj, freed=True):
+        db.rollback()
+        return "changed"
+    if target.exists():
+        db.rollback()
+        return "local_file_differs"
+    os.replace(staging, target)
+    _fsync_dir(target.parent)
+    (db.query(RecordImage).filter(RecordImage.id == obj.image_id)
+     .update({at_col: None, bytes_col: None}, synchronize_session=False))
+    db.commit()
+    return True
 
 
 def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[str]) -> dict:
@@ -832,7 +892,7 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
                 continue
             at = _now()
             if not _set_freed(db, obj, at=at, size=info.size if info.size is not None else 0):
-                unaccounted.append(obj.entry(reason="image_changed"))
+                unaccounted.append(obj.entry(reason="changed"))
                 continue
             entry["freed_at"] = at.isoformat()
             entry["method"] = "mark-freed"
