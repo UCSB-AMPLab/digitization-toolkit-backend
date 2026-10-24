@@ -75,9 +75,11 @@ What is moved, and how:
   checksums from both (_volume_records_to_copy).
 - A volume whose `<stem>/` already holds what is not its own (see
   _foreign_entries) is not moved, and each of its images is reported as
-  skipped with reason "stem_dir_occupied" and the foreign entries. A
-  volume's leftover `metadata/manifest.jsonl.part` is removed at the start
-  of every run ("stale_parts_removed").
+  skipped with reason "stem_dir_occupied" and the foreign entries. A file
+  named exactly as a writer into those directories names its temporary
+  file (_writer_temp) is not foreign: it is left where it is and listed
+  under "temp_files_left". A volume's leftover `metadata/manifest.jsonl.part`
+  is removed at the start of every run ("stale_parts_removed").
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
@@ -106,6 +108,7 @@ import errno
 import json
 import logging
 import os
+import re
 import shutil
 import sys
 from pathlib import Path
@@ -405,9 +408,57 @@ PROJECT_TREE = object()
 # The target given to a volume whose `<stem>/` holds what is not its own: nothing is moved.
 OCCUPIED = object()
 
+# storage_ops.renumber_collection_images phase 1: `.renumber_<uuid4().hex><suffix>`.
+_RENUMBER_TEMP = re.compile(r"^\.renumber_[0-9a-f]{32}(\.[^./]+)?$")
 
-def _foreign_entries(db: Session, volume_dir: Path, collection_id: int) -> List[str]:
+
+def _atomic_write_temp(name: str) -> bool:
+    """Whether `name` is the temporary name capture.utils.atomic_write gives some final file.
+
+    atomic_write writes `<final stem>.part<final suffix>` beside the final
+    file: `IMG.cr2` -> `IMG.part.cr2`, `IMG` -> `IMG.part`. True only when a
+    final name exists that gives exactly `name`.
+    """
+    p = Path(name)
+    if p.suffix == ".part":
+        final = p.stem
+        return bool(final) and Path(final).suffix == ""
+    if p.stem.endswith(".part") and len(p.stem) > len(".part"):
+        final_stem = p.stem[: -len(".part")]
+        return Path(final_stem + p.suffix).stem == final_stem
+    return False
+
+
+def _move_temp(name: str) -> bool:
+    """Whether `name` is the temporary name of this module's cross-filesystem _move: `.<final name>.part`."""
+    return name.startswith(".") and name.endswith(".part") and len(name) > len("..part")
+
+
+def _writer_temp(sub: str, name: str) -> bool:
+    """Whether a file in `<stem>/<sub>/` is named exactly as a writer into that directory names its temporary file.
+
+    captures/ and previews/: atomic_write (masters, the RAW preview, the EXIF
+    rewrite), a renumber's phase-1 name, and _move. thumbnails/: _move only
+    (thumbnails are written directly under a uuid name, never through a
+    temporary file).
+    """
+    from app.core.paths import CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+
+    if sub in (CAPTURES_DIR, PREVIEWS_DIR):
+        return _atomic_write_temp(name) or bool(_RENUMBER_TEMP.match(name)) or _move_temp(name)
+    if sub == THUMBNAILS_DIR:
+        return _move_temp(name)
+    return False
+
+
+def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
+                     temps: Optional[List[str]] = None) -> List[str]:
     """What `<stem>/` holds that is not the volume's, as paths relative to it; empty when nothing is.
+
+    A file named as a writer names its temporary file (_writer_temp), the
+    leftover of a write a power cut interrupted, is neither foreign nor
+    owned: its resolved path is appended to `temps` and it is left where it
+    is.
 
     The volume's are, inside the four directories only:
     - in `captures/`, a file named as one of its rows' masters is, or as the
@@ -476,6 +527,10 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int) -> List[
             foreign.append(entry.name)
             continue
         for f in _listdir(entry):
+            if f.is_file() and not owned(entry.name, f) and _writer_temp(entry.name, f.name):
+                if temps is not None:
+                    temps.append(str(f.resolve()))
+                continue
             if f.is_dir() or not owned(entry.name, f):
                 foreign.append(f"{entry.name}/{f.name}")
     return foreign
@@ -503,10 +558,10 @@ def _is_project_tree(volume_dir: Path, project_dirs: Set[str]) -> bool:
             or (volume_dir / "metadata" / "project_manifest.jsonl").exists())
 
 
-def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple[List[dict], List[dict], List[str]]:
+def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple[List[dict], List[dict], List[str], List[str]]:
     """Plan the work for the out-of-place rows under `root` (resolved). Reads only.
 
-    Returns (batches, skipped, left_unreferenced). Each batch is
+    Returns (batches, skipped, left_unreferenced, temp_files_left). Each batch is
     {"collection_id", "entries"}; each entry names one image's master move to
     `<stem>/captures/` (or, with "adopt", the file its row is pointed at) and
     the moves to `<stem>/previews/` and `<stem>/thumbnails/` that go with it.
@@ -516,6 +571,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     owners = _owners(db)
     project_dirs = _project_dir_names(db)
     occupied: Dict[int, List[str]] = {}
+    temps: List[str] = []
     manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
     refused: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
@@ -550,7 +606,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             if targets[cid] is not None and _is_project_tree(targets[cid].parent, project_dirs):
                 targets[cid] = PROJECT_TREE
             if isinstance(targets[cid], Path):
-                foreign = _foreign_entries(db, targets[cid].parent, cid)
+                foreign = _foreign_entries(db, targets[cid].parent, cid, temps)
                 if foreign:
                     occupied[cid] = foreign
                     logger.warning(f"Volume layout: {targets[cid].parent} already holds what is not volume {cid}'s, "
@@ -658,7 +714,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     # A refused candidate sits in a volume's `captures/`, which the scan above
     # does not walk, so it is added here unless a row has since claimed it.
     left += [str(p) for p in sorted(refused) if p not in owners and str(p) not in left]
-    return ([{"collection_id": cid, "entries": e} for cid, e in batches.items()], skipped, left)
+    return ([{"collection_id": cid, "entries": e} for cid, e in batches.items()], skipped, left, temps)
 
 
 def _collection_top(path: Path, root: Path) -> Optional[Path]:
@@ -1142,6 +1198,7 @@ def _new_report(root: Path, dry_run: bool) -> dict:
         "manifest_copy_failed": [],
         "manifests_repaired": {},
         "stale_parts_removed": 0,
+        "temp_files_left": [],
         "captures_without_record": {},
     }
 
@@ -1191,7 +1248,10 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
     out_of_place = _out_of_place(db, root_forms)
     report["out_of_place"] = len(out_of_place)
     if out_of_place:
-        batches, skipped, left = _plan(db, root, out_of_place)
+        batches, skipped, left, temps = _plan(db, root, out_of_place)
+        report["temp_files_left"] = temps
+        for t in temps:
+            logger.warning(f"Volume layout: temporary file of an interrupted write, left where it is: {t}")
         report["skipped"].extend(skipped)
         report["left_unreferenced"] += [p for p in left if p not in report["left_unreferenced"]]
         if dry_run:

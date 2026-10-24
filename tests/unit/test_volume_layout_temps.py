@@ -41,3 +41,51 @@ def test_a_stale_part_is_removed_at_the_start_of_the_run(db_session, legacy):
     assert not part.exists()
     assert (legacy["root"] / STEMS["a1"] / "metadata" / "manifest.jsonl").read_bytes() == manifest
     assert migrate_volume_layout(db_session)["stale_parts_removed"] == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rel", [
+    "captures/IMG_0099.part.cr2",           # atomic_write of IMG_0099.cr2
+    "captures/IMG_0099.part",               # atomic_write of a name with no suffix
+    f"captures/.renumber_{HEX}.jpg",        # renumber, phase 1
+    "previews/IMG_0099_preview.part.jpg",   # atomic_write of a RAW preview
+    f"previews/.renumber_{HEX}.jpg",
+    "captures/.IMG_0099.jpg.part",          # the migration's cross-filesystem move
+    "thumbnails/.IMG_0099_thumb.jpg.part",
+])
+def test_a_writers_temp_file_is_listed_left_alone_and_the_volume_migrates(db_session, legacy, rel):
+    from app.core.volume_layout import migrate_volume_layout
+
+    temp = legacy["root"] / STEMS["a2"] / rel
+    temp.parent.mkdir(parents=True, exist_ok=True)
+    temp.write_bytes(b"half a file")
+
+    report = migrate_volume_layout(db_session)
+
+    assert [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
+    assert not [s for s in report["skipped"] if s["reason"] == "stem_dir_occupied"]
+    assert report["temp_files_left"] == [str(temp.resolve())]
+    assert temp.read_bytes() == b"half a file"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rel", [
+    "captures/IMG_0099.partial.jpg",
+    "captures/IMG_0099.jpg.part",           # not atomic_write's (stem.part.suffix) nor _move's (leading dot)
+    "captures/.renumber_xyz.jpg",
+    f"captures/.renumber_{HEX[:31]}.jpg",
+    "thumbnails/IMG_0099_thumb.part.jpg",   # atomic_write never writes thumbnails
+    f"thumbnails/.renumber_{HEX}.jpg",      # nor does a renumber
+])
+def test_a_name_close_to_a_temp_name_is_still_foreign(db_session, legacy, rel):
+    from app.core.volume_layout import migrate_volume_layout
+
+    f = legacy["root"] / STEMS["a2"] / rel
+    f.parent.mkdir(parents=True, exist_ok=True)
+    f.write_bytes(b"x")
+
+    report = migrate_volume_layout(db_session)
+
+    assert not [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
+    assert {tuple(s["foreign"]) for s in report["skipped"] if s["reason"] == "stem_dir_occupied"} == {(rel,)}
+    assert report["temp_files_left"] == []
