@@ -222,9 +222,10 @@ def listed_object(key: str) -> Listed:
     answers the same way on the local backend, but on B2 it first looks the
     path up as an object (NewFs calls NewObject, which in rclone 1.70.2
     issues a HEAD on /file/<bucket>/<key>). That needs readFiles, which the
-    appliance key withholds, and when the lookup fails rclone lists the path
-    as a directory and reports "directory not found": a refused lookup read
-    as an absent object, the failure decision 2 is built against.
+    appliance key withholds, and when the lookup fails rclone treats the
+    path as a directory and lists under it, where the object is not: a
+    refused lookup then reads as an absent object, the failure decision 2
+    is built against. (Read from rclone's source, not tried against B2.)
 
     Raises VerificationUnavailable when a listing does not answer.
     """
