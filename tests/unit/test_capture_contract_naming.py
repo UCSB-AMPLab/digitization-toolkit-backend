@@ -488,3 +488,47 @@ def test_a_shorter_stem_is_not_refused_for_a_five_digit_number(
     names = [Path(p).name for p in body["file_paths"]] if dual else [Path(body["file_path"]).name]
     assert all(n.startswith(f"{STEM_26}-img_10000_c") for n in names)
     assert _counter(db_session, v) == 10000
+
+
+# ---------------------------------------------------------------------------
+# Numbers passed over, with a cap
+# ---------------------------------------------------------------------------
+
+def _occupy(root, numbers):
+    captures = root / STEM / "captures"
+    captures.mkdir(parents=True, exist_ok=True)
+    for n in numbers:
+        (captures / f"{STEM}-img_{n:04d}_c0.cr2").write_bytes(b"older")
+
+
+@pytest.mark.unit
+def test_up_to_the_cap_numbers_on_disk_are_passed_over(
+        client, db_session, test_project, volume, backend, override_projects_root, monkeypatch):
+    from app.core import capture_naming
+    monkeypatch.setattr(capture_naming, "MAX_NUMBERS_PASSED_OVER", 3)
+    _occupy(override_projects_root, [1, 2, 3])
+
+    body = _single(_client_as(client), test_project, volume)
+
+    assert Path(body["file_path"]).name == f"{STEM}-img_0004_c0.jpg"
+
+
+@pytest.mark.unit
+def test_more_numbers_on_disk_than_the_cap_refuse_the_capture(
+        client, db_session, test_project, volume, backend, override_projects_root, monkeypatch):
+    from app.core import capture_naming
+    monkeypatch.setattr(capture_naming, "MAX_NUMBERS_PASSED_OVER", 3)
+    _occupy(override_projects_root, [1, 2, 3, 4])
+
+    resp = _post(_client_as(client), test_project, volume)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == capture_naming.CAPTURE_NUMBERS_TAKEN_DETAIL
+    assert backend.requested == []
+    assert _counter(db_session, volume) == 0
+
+
+@pytest.mark.unit
+def test_the_default_cap_is_a_hundred():
+    from app.core.capture_naming import MAX_NUMBERS_PASSED_OVER
+    assert MAX_NUMBERS_PASSED_OVER == 100

@@ -101,8 +101,8 @@ def _take_filename_index(db: Session, collection_id: int, stem: str, root) -> st
 	Called once per capture event, after the refusals and before the
 	camera is touched. The volume's row is already locked by
 	_refuse_capture_without_volume_or_stem, so the counter's raise takes no
-	new lock. A refused name (longer than a pair id holds) is rolled back
-	before the 409, so it consumes
+	new lock. A refused name (longer than a pair id holds, or too many
+	numbers already on disk) is rolled back before the 409, so it consumes
 	no number; the rollback also releases the record and volume locks,
 	which the refused capture no longer needs.
 	"""

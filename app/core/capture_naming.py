@@ -28,9 +28,17 @@ logger = logging.getLogger(__name__)
 
 CAPTURE_NUMBER_DIGITS = 4
 
+# How many numbers already on disk take_filename_index passes over before it
+# refuses the capture. More than a handful means the counter is far behind
+# the card, which an operator cannot fix by trying again.
+MAX_NUMBERS_PASSED_OVER = 100
+
 # The interface matches each refusal on its exact text, so these do not change.
 CAPTURE_NAME_TOO_LONG_DETAIL = (
     "This capture's file name would be longer than the 36 characters a pair id holds. Nothing was captured."
+)
+CAPTURE_NUMBERS_TAKEN_DETAIL = (
+    "The next capture numbers of this volume are already taken by files on disk. Nothing was captured."
 )
 
 
@@ -106,11 +114,12 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
     gaps in <nnnn> and forbids reuse.
 
     Raises CaptureNameRefused, leaving the rollback to the caller, when the
-    index would be longer than PAIR_ID_MAX_LENGTH.
+    index would be longer than PAIR_ID_MAX_LENGTH, or when more than
+    MAX_NUMBERS_PASSED_OVER numbers in a row are already on disk.
     """
     from app.models.collection import PAIR_ID_MAX_LENGTH
 
-    while True:
+    for _ in range(MAX_NUMBERS_PASSED_OVER + 1):
         number: Optional[int] = next_capture_number(db, collection_id)
         if number is None:
             raise RuntimeError(f"Collection {collection_id} has no capture counter")
@@ -123,3 +132,4 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
         if not capture_name_taken(output_dir, index):
             return index
         logger.warning(f"Capture number {number} of collection {collection_id} is already on disk ({index}); taking the next")
+    raise CaptureNameRefused(CAPTURE_NUMBERS_TAKEN_DETAIL)
