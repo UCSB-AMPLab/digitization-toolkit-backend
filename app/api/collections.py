@@ -396,7 +396,7 @@ def export_capture_manifest(
               actor=current_user.username, subject=collection.filename_stem,
               detail=(f"volume {collection.id} id={doc['id']} records={counts['records']} "
                       f"images={counts['images']} previews={counts['previews']}"))
-    name = download_name(doc["project"]["name"], now)
+    name = download_name(doc["volumes"][0]["stem"], now)
     return JSONResponse(content=doc, headers={"Content-Disposition": f'attachment; filename="{name}"'})
 
 

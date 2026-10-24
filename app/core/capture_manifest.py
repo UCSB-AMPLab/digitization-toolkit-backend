@@ -454,8 +454,7 @@ def manifest_counts(doc: dict) -> dict:
             "previews": sum(1 for i in images if "previewObjectKey" in i)}
 
 
-def download_name(project_name: str, now: Optional[datetime] = None) -> str:
-    """`capture-manifest_<project>_<date>.json` (contract §4), the project as its directory name."""
-    from app.core.paths import project_dir_name
-
-    return f"capture-manifest_{project_dir_name(project_name)}_{(now or _now()).strftime('%Y-%m-%d')}.json"
+def download_name(stem: str, now: Optional[datetime] = None) -> str:
+    """`capture-manifest_<stem>_<date>.json`: one file per volume, so two volumes of a project
+    exported on the same day are not given the same name."""
+    return f"capture-manifest_{stem}_{(now or _now()).strftime('%Y-%m-%d')}.json"

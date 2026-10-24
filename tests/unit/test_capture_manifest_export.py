@@ -259,11 +259,11 @@ def test_envelope(client, vol):
 
 
 @pytest.mark.unit
-def test_download_is_named_for_the_project_and_date(client, vol):
+def test_download_is_named_for_the_stem_and_date(client, vol):
     vol.record()
     resp = _export(client, vol.col)
-    today = datetime.now(timezone.utc).strftime("%Y-%m-%d")
-    assert resp.headers["content-disposition"] == f'attachment; filename="capture-manifest_fondo_concejo_{today}.json"'
+    today = resp.json()["generatedAt"][:10]
+    assert resp.headers["content-disposition"] == f'attachment; filename="capture-manifest_{STEM}_{today}.json"'
     assert resp.headers["content-type"].startswith("application/json")
 
 
