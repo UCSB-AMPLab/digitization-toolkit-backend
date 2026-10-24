@@ -818,7 +818,9 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
     listed object carries its SHA1, that object's key is recorded as its key,
     verified, with no upload. Two or more listed objects with the SHA1, two
     local objects matching one listed object, or a key another row already
-    holds are reported and nothing is recorded for them. Nothing is uploaded
+    holds are reported and nothing is recorded for them. Each row is written
+    through _claim, so an image whose record moved, or whose file changed,
+    after it was hashed is reported under `changed` and not adopted. Nothing is uploaded
     and nothing at the destination changes.
 
     Without `apply` nothing is written either: the report says what would be
@@ -849,7 +851,8 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 
     report = {"prefix": prefix, "listed": len(listed), "listed_without_sha1": no_sha1,
               "adopted": [], "ambiguous_remote": [], "ambiguous_local": [],
-              "key_already_held": [], "unmatched": 0, "unreadable": [], "applied": apply}
+              "key_already_held": [], "changed": [], "unmatched": 0, "unreadable": [],
+              "applied": apply}
 
     candidates = {}  # key -> list of (image_id, kind, path, sha1)
     for item in pending_work(db):
@@ -885,21 +888,28 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
                 {"image_id": item.image_id, "kind": item.kind, "local_path": str(path),
                  "key": matches[0]})
         else:
-            candidates.setdefault(matches[0], []).append((item.image_id, item.kind, path, sha1))
+            candidates.setdefault(matches[0], []).append((item.image_id, item.kind, path, sha1, state))
 
     for key, owners in sorted(candidates.items()):
         if len(owners) > 1:
             report["ambiguous_local"].append(
                 {"key": key, "images": [{"image_id": i, "kind": k, "local_path": str(p)}
-                                        for i, k, p, _ in owners]})
+                                        for i, k, p, _, _ in owners]})
             continue
-        image_id, kind, path, sha1 = owners[0]
+        image_id, kind, path, sha1, state = owners[0]
         entry = {"image_id": image_id, "kind": kind, "local_path": str(path), "key": key, "sha1": sha1}
         if apply:
+            # Through _claim, as the uploader's rows: under the record's lock,
+            # and only if the image is still where it was when it was hashed.
+            # Hashing the other candidates can take a long time, and a move in
+            # that window would otherwise freeze this volume's key against a
+            # record that has left it.
             try:
-                db.add(OffsiteObject(record_image_id=image_id, kind=kind, object_key=key,
-                                     local_sha1=sha1, verified_at=_now()))
-                db.commit()
+                _claim(db, None, Work(image_id, kind, state.filename_stem, state.file_path),
+                       key, state, local_sha1=sha1, verified_at=_now())
+            except _ImageMoved:
+                report["changed"].append(entry)
+                continue
             except IntegrityError as exc:
                 db.rollback()
                 entry["error"] = str(exc.orig)[:200]
@@ -911,7 +921,8 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
         _log(db, action=ADOPT_ACTION, level="INFO", subject=prefix,
              detail=(f"adopted={len(report['adopted'])} ambiguous_remote={len(report['ambiguous_remote'])} "
                      f"ambiguous_local={len(report['ambiguous_local'])} "
-                     f"key_already_held={len(report['key_already_held'])} unmatched={report['unmatched']}"))
+                     f"key_already_held={len(report['key_already_held'])} "
+                     f"changed={len(report['changed'])} unmatched={report['unmatched']}"))
     return report
 
 

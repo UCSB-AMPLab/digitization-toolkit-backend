@@ -1300,3 +1300,36 @@ def test_no_key_is_reserved_for_a_record_that_moved_after_its_file_was_staged(
     result = _run(db_session)
     assert result["skipped"][0]["reason"] == "image changed while it was read"
     assert _rows(db_session) == {} and remote.calls("copyto") == []
+
+
+@pytest.mark.unit
+def test_adoption_records_nothing_for_a_record_moved_after_its_check(remote, db_session, override_projects_root, monkeypatch):
+    """The move happens while adoption hashes the next candidate, after the moved one passed its check."""
+    import app.core.image_upload as iu
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    a = _image(db_session, vol, override_projects_root, "a.jpg", b"AAAA", thumbnail=False)
+    b = _image(db_session, vol, override_projects_root, "b.jpg", b"BBBB", thumbnail=False)
+    remote.put("old/a.jpg", b"AAAA")
+    remote.put("old/b.jpg", b"BBBB")
+    a_id, a_record, b_id, other_id = a.id, a.record_id, b.id, other.id
+    real = iu.stable_sha1
+    calls = []
+
+    def hash_then_move(path):
+        out = real(path)
+        calls.append(path)
+        if len(calls) == 2:  # a has passed its check; b is being hashed
+            db_session.query(Record).filter(Record.id == a_record).update({"collection_id": other_id})
+            db_session.commit()
+        return out
+
+    monkeypatch.setattr(iu, "stable_sha1", hash_then_move)
+    report = iu.adopt_objects(db_session, "old", apply=True)
+
+    assert [e["image_id"] for e in report["adopted"]] == [b_id]
+    assert [e["image_id"] for e in report["changed"]] == [a_id]
+    assert report["changed"][0]["key"] == "old/a.jpg"
+    assert set(_rows(db_session)) == {(b_id, "capture")}
