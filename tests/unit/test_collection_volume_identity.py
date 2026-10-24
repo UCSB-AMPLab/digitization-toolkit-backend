@@ -1433,3 +1433,87 @@ def test_a_volume_reserved_by_its_images_alone_is_not_deleted(db_session, path):
 
     assert db_session.get(Collection, vid) is not None
     assert db_session.query(Record).filter(Record.collection_id == vid).count() == 1
+
+
+# ---------------------------------------------------------------------------
+# Delete-orphan: a volume removed from its parent's collection
+# ---------------------------------------------------------------------------
+#
+# Project.collections and Collection.child_collections are delete-orphan, so
+# removing a volume from either list deletes it at the next flush. The ORM
+# finds orphans during the flush, after before_flush has run, so such a
+# volume is not in session.deleted when the listener looks; the listener
+# reads the removals from the parents' relationship history instead.
+
+def _nested_reserved(db_session, p, *, stem="co-o-001", counter=1):
+    from app.models.collection import Collection
+
+    top = _volume(db_session, p, "top")
+    child = Collection(name="child", parent_collection_id=top.id,
+                       filename_stem=stem, capture_counter=counter)
+    db_session.add(child)
+    db_session.commit()
+    return top, child
+
+
+@pytest.mark.unit
+def test_an_orphaned_child_that_reserves_its_stem_is_not_deleted(db_session):
+    from app.models.collection import Collection, StemReservedError
+
+    p = _project(db_session)
+    top, child = _nested_reserved(db_session, p)
+    cid = child.id
+
+    top.child_collections.remove(child)
+    with pytest.raises(StemReservedError):
+        db_session.flush()
+    db_session.rollback()
+
+    assert db_session.get(Collection, cid) is not None
+
+
+@pytest.mark.unit
+def test_a_volume_orphaned_from_its_project_that_reserves_its_stem_is_not_deleted(db_session):
+    from app.models.collection import Collection, StemReservedError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-o-002", capture_counter=1)
+    vid = v.id
+
+    p.collections.remove(v)
+    with pytest.raises(StemReservedError):
+        db_session.flush()
+    db_session.rollback()
+
+    assert db_session.get(Collection, vid) is not None
+
+
+@pytest.mark.unit
+def test_an_orphaned_child_without_a_stem_is_still_deleted(db_session):
+    from app.models.collection import Collection
+
+    p = _project(db_session)
+    top, child = _nested_reserved(db_session, p, stem=None, counter=3)
+    cid = child.id
+
+    top.child_collections.remove(child)
+    db_session.commit()
+
+    assert db_session.get(Collection, cid) is None
+
+
+@pytest.mark.unit
+def test_a_child_moved_to_another_parent_in_the_same_flush_is_not_refused(db_session):
+    from app.models.collection import Collection
+
+    p = _project(db_session)
+    top, child = _nested_reserved(db_session, p)
+    other = _volume(db_session, p, "other")
+    cid = child.id
+
+    top.child_collections.remove(child)
+    other.child_collections.append(child)
+    db_session.commit()
+
+    db_session.expire_all()
+    assert db_session.get(Collection, cid).parent_collection_id == other.id

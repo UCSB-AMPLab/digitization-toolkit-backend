@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import event, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
+from sqlalchemy import event, inspect as sa_inspect, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
 from sqlalchemy.orm import Session, relationship, validates, object_session
 
 from app.core.db import Base
@@ -315,15 +315,45 @@ class Collection(Base):
     )
 
 
+# The delete-orphan relationships whose target is a volume: removing a volume
+# from one of these lists deletes it at the next flush unless it has been
+# given another parent.
+_ORPHANING_RELATIONSHIPS = ("child_collections", "collections")
+
+
+def _orphaned_volumes(session):
+    """Volumes removed from a delete-orphan parent list and not re-parented.
+
+    Read from each dirty parent's relationship history: the ORM decides
+    orphans during the flush, after before_flush, so they are not yet in
+    session.deleted. A volume that has a parent again by either relationship
+    (another collection, or a project) in the same flush is not an orphan.
+    """
+    for parent in list(session.dirty):
+        state = sa_inspect(parent)
+        for name in _ORPHANING_RELATIONSHIPS:
+            rel = state.mapper.relationships.get(name)
+            if rel is None or rel.mapper.class_ is not Collection:
+                continue
+            for child in state.attrs[name].history.deleted:
+                if child.parent_collection is None and child.project is None:
+                    yield child
+
+
 @event.listens_for(Session, "before_flush")
 def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
     """Refuse a flush that would delete a volume that reserves its stem.
 
     DELETE /collections/{id} refuses this itself with a 409. This covers the
-    ORM paths the API does not use: a direct session.delete(), and the
-    cascades from Project.collections and Collection.child_collections,
-    which have already put the volume in session.deleted by the time the
-    flush starts.
+    ORM paths the API does not use:
+    - a direct session.delete(), and the delete cascades from
+      Project.collections and Collection.child_collections, which put the
+      volume in session.deleted when session.delete() is called, before the
+      flush;
+    - a delete-orphan, where a volume is removed from one of those lists.
+      The ORM finds orphans during the flush, after this listener has run,
+      so such a volume is not in session.deleted here; _orphaned_volumes
+      reads the removals from the parents' history instead.
 
     Decided before the flush rather than during it: Collection.records has
     no cascade, so the flush that deletes a volume first sets
@@ -332,8 +362,10 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
     point at the volume. A database-level ON DELETE CASCADE or raw SQL goes
     around it.
     """
-    for obj in list(session.deleted):
-        if isinstance(obj, Collection) and obj.reserves_its_stem():
+    doomed = [obj for obj in list(session.deleted) if isinstance(obj, Collection)]
+    doomed.extend(_orphaned_volumes(session))
+    for obj in doomed:
+        if obj.reserves_its_stem():
             raise StemReservedError(
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
