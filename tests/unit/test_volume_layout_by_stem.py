@@ -190,7 +190,9 @@ def test_a_capture_into_a_stemmed_volume_writes_its_files_and_manifest_in_the_st
         assert list((vol / "previews").iterdir()) == []
     lines = [json.loads(l) for l in (vol / "metadata" / "manifest.jsonl").read_text().splitlines()]
     assert [l["capture_id"] for l in lines] == [capture_id]
-    assert [f["relative_path"] for f in lines[0]["files"]] == [f"captures/{master.name}"]
+    # A RAW master is followed by its preview (tests/unit/test_preview_digests.py).
+    assert [f["relative_path"] for f in lines[0]["files"]] == [f"captures/{master.name}"] + (
+        [f"previews/{master.stem}_preview.jpg"] if raw else [])
     assert not (override_projects_root / "p").exists()
     index = build_fixity_index(override_projects_root.resolve())
     assert index.expected(capture_id, None, master.resolve()) == hashlib.sha256(master.read_bytes()).hexdigest()
@@ -233,7 +235,8 @@ def test_a_dual_capture_into_a_stemmed_volume_writes_one_record_in_the_volume_ma
     lines = [json.loads(l) for l in (vol / "metadata" / "manifest.jsonl").read_text().splitlines()]
     assert [l["capture_id"] for l in lines] == [capture_id]
     assert sorted(f["relative_path"] for f in lines[0]["files"]) == sorted(
-        f"captures/{Path(str(p)).name}" for p in (p0, p1))
+        [f"captures/{Path(str(p)).name}" for p in (p0, p1)]
+        + [f"previews/{Path(str(p)).stem}_preview.jpg" for p in (p0, p1)])
 
 
 @pytest.mark.unit

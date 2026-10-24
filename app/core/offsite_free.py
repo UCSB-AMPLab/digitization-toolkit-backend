@@ -11,9 +11,10 @@ The rules:
 * **Only a received volume.** Every uploadable object of the volume must be
   verified (image_upload.volume_upload_state). Review state and Fisqua play
   no part.
-* **A RAW preview needs its sha256 first.** One whose capture records carry
-  no sha256 for it stays on the card, reported as `no_preview_digest`
-  (_digest_refusal); its master may still be freed.
+* **A RAW preview needs its sha256 first.** One whose capture manifests
+  carry no sha256 for it (in its capture record, or a `preview_digest`
+  record from `backfill-preview-digests`) stays on the card, reported as
+  `no_preview_digest` (_digest_refusal); its master may still be freed.
 * **Checked at the moment of freeing, file by file.** The local file's SHA1
   is recomputed and must equal its offsite row's `local_sha1`; then the
   bucket is listed again, and the listing must show the row's key with that
@@ -262,13 +263,16 @@ def _fixity_index():
 
 
 def _digest_refusal(obj: _Object, index) -> Optional[dict]:
-    """A RAW preview whose capture records carry no sha256 for it stays on the card.
+    """A RAW preview whose capture manifests carry no sha256 for it stays on the card.
 
     Fisqua needs a sha256 for every preview, computed on the unit from the
     local file; once freed, a preview without one could never get one. The
     lookup is the fixity index's (FixityIndex.expected) by the preview's
     path, then its name, under the image's capture id, and never by image
     id: a relocation record naming the image carries its master's sha256.
+    The index reads the digest from the capture record's `<role>_preview`
+    entry or a backfilled `preview_digest` record, and follows a renamed
+    master's relocation record to its preview.
     The master is checked on its own and may be freed.
     """
     if obj.kind != "preview" or obj.path is None:

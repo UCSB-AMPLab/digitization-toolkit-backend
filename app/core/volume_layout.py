@@ -1571,6 +1571,8 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
     skips the pass (a walk of the tree for the manifests' paths and a stat
     of each remain) and still reports them.
     """
+    from capture.manifestHandler import is_capture_record
+
     from app.core.integrity import read_manifest_lines
     from capture.manifestHandler import append_manifest_lines
 
@@ -1606,7 +1608,9 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
                 rec = json.loads(line)
             except ValueError:
                 continue
-            if isinstance(rec, dict) and rec.get("record_type") != "relocation" and rec.get("capture_id"):
+            # A relocation or preview_digest record names the capture but is
+            # not its capture record, so it does not stand in for one.
+            if is_capture_record(rec) and rec.get("capture_id"):
                 have.add(rec["capture_id"])
         missing = ids - have
         if missing:
@@ -1633,7 +1637,7 @@ def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], repo
         found = set()
         for line in copies[cid]:
             rec = json.loads(line)
-            if rec.get("record_type") != "relocation":
+            if is_capture_record(rec):
                 found.add(rec.get("capture_id"))
         nowhere = sorted(missing - found)
         if nowhere:

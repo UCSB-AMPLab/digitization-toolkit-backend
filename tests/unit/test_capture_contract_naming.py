@@ -265,10 +265,13 @@ def test_the_manifest_line_written_at_capture_carries_the_new_filenames(
     lines = [json.loads(l) for l in
              (override_projects_root / STEM / "metadata" / "manifest.jsonl").read_text().splitlines()]
     assert len(lines) == 2
-    assert [f["relative_path"] for f in lines[0]["files"]] == [f"captures/{STEM}-img_0001_c0.cr2"]
+    # Each RAW master is followed by its preview (tests/unit/test_preview_digests.py).
+    assert [f["relative_path"] for f in lines[0]["files"]] == [
+        f"captures/{STEM}-img_0001_c0.cr2", f"previews/{STEM}-img_0001_c0_preview.jpg"]
     assert lines[0]["pair_id"] is None
     assert sorted(f["relative_path"] for f in lines[1]["files"]) == [
-        f"captures/{STEM}-img_0002_c0.cr2", f"captures/{STEM}-img_0002_c1.cr2"]
+        f"captures/{STEM}-img_0002_c0.cr2", f"captures/{STEM}-img_0002_c1.cr2",
+        f"previews/{STEM}-img_0002_c0_preview.jpg", f"previews/{STEM}-img_0002_c1_preview.jpg"]
     assert lines[1]["pair_id"] == f"{STEM}-img_0002"
     # The rows point at the same capture events.
     assert _images(db_session, single["record_id"])[0].capture_id == lines[0]["capture_id"]

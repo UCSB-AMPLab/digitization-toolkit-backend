@@ -82,6 +82,9 @@ class FixityIndex:
     by_name: Dict[str, Dict[str, str]] = field(default_factory=dict)
     by_image: Dict[Tuple[str, int], Optional[str]] = field(default_factory=dict)
     captured: Set[str] = field(default_factory=set)
+    # Absolute paths of RAW previews the manifests give a digest for: a
+    # capture record's `<role>_preview` entries and `preview_digest` records.
+    previews: Set[str] = field(default_factory=set)
 
     def expected(self, capture_id: Optional[str], image_id: Optional[int], resolved: Path) -> Optional[str]:
         """The sha256 an image's file should have, or None if none can be resolved.
@@ -149,11 +152,32 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     `relocated_at` is information only and is never used for ordering,
     because a unit without a real-time clock can stamp a later rename with
     an earlier time.
+
+    A RAW preview's digest comes from either source: its `<role>_preview`
+    entry in the capture record (written at capture), or a `preview_digest`
+    record (capture.manifestHandler.PREVIEW_DIGEST_RECORD_TYPE, appended by
+    the backfill). Both are read into by_path and by_name under the capture
+    id, so FixityIndex.expected finds a preview with image_id None. A
+    `preview_digest` record is not a capture record: its capture id is not
+    added to `captured`, and it never enters by_image, which holds masters.
+    Each preview's path goes into `previews`.
+
+    A preview renamed with its master has no relocation record of its own:
+    app.core.storage_ops.relocate_image and the layout migration move a RAW
+    master's preview to the name preview_sidecar_of derives from the
+    master's new path, and write a record for the master only. So every
+    relocation record of a RAW master, with or without an image id, is also
+    read as one for its preview: the preview of `from` has moved to the
+    preview of `to`, and keeps its digest. Those are applied after the
+    masters' chains, swept the same way, so a preview renamed twice, by
+    records in any order or in different manifests, resolves.
     """
+    from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
     if not projects_dir.exists():
         return index
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
+    preview_moves: List[Tuple[str, str, str]] = []  # (capture_id, preview of from, preview of to), absolute
 
     for manifest in _manifests(projects_dir):
         project_root = manifest_base(manifest, projects_dir)
@@ -178,6 +202,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
             if not cid:
                 continue
             if rec.get("record_type") == "relocation":
+                _note_preview_move(preview_moves, cid, project_root, rec.get("from"), rec.get("to"))
                 image_id, sha = rec.get("image_id"), rec.get("sha256")
                 if isinstance(image_id, int) and sha:
                     key = (cid, image_id)
@@ -194,8 +219,12 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                     except OSError:
                         pass
                 continue
-            index.captured.add(cid)
-            for f in rec.get("files", []):
+            backfilled = rec.get("record_type") == PREVIEW_DIGEST_RECORD_TYPE
+            if not backfilled:
+                index.captured.add(cid)
+            for f in rec.get("files", []) or []:
+                if not isinstance(f, dict):
+                    continue
                 sha = f.get("sha256")
                 rel = f.get("relative_path")
                 if not sha or not rel:
@@ -206,6 +235,8 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                     continue
                 index.by_path.setdefault(cid, {})[abs_path] = sha
                 index.by_name.setdefault(cid, {})[Path(rel).name] = sha
+                if backfilled or str(f.get("role", "")).endswith("_preview"):
+                    index.previews.add(abs_path)
         if unparsed:
             logger.warning(f"Capture manifest {manifest}: skipped {unparsed} line(s) that are not JSON or not "
                            "UTF-8 (torn writes)")
@@ -225,7 +256,37 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                     changed = True
         if not changed:
             break
+
+    for _ in range(len(preview_moves) + 1):
+        changed = False
+        for cid, frm, to in preview_moves:
+            # By path, then by name under the capture id, as a master is
+            # found: the record's paths may predate an SD re-clone.
+            sha = index.by_path.get(cid, {}).get(frm) or index.by_name.get(cid, {}).get(Path(frm).name)
+            if not sha:
+                continue
+            if index.by_path.get(cid, {}).get(to) != sha or to not in index.previews:
+                index.by_path.setdefault(cid, {})[to] = sha
+                index.by_name.setdefault(cid, {})[Path(to).name] = sha
+                index.previews.add(to)
+                changed = True
+        if not changed:
+            break
     return index
+
+
+def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
+    """Record that a RAW master's relocation from `frm` to `to` moved its preview too (build_fixity_index)."""
+    if not (isinstance(frm, str) and isinstance(to, str) and frm and to):
+        return
+    if not (is_raw_suffix(Path(frm)) or is_raw_suffix(Path(to))):
+        return
+    try:
+        src = (project_root / frm).resolve()
+        dst = (project_root / to).resolve()
+    except OSError:
+        return
+    moves.append((cid, str(preview_sidecar_of(src)), str(preview_sidecar_of(dst))))
 
 
 RETIRED_MANIFESTS_DIR = ".retired-manifests"
@@ -272,11 +333,14 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
     manifest, marked `copied_from`; where the capture-time record is still
     there, it is the one returned, and a copy only for a capture whose
     original no manifest holds. An upload record with one of the capture ids
-    is returned as a capture record is. Relocation records are left out: they are the
-    appliance's own bookkeeping of files renamed after capture. Manifests are
+    is returned as a capture record is. Relocation and preview_digest records
+    are left out: they are the appliance's own bookkeeping, of files renamed
+    after capture and of preview digests computed after it. Manifests are
     read in path order and each in line order. Unreadable manifests and
     lines that are not JSON objects are skipped.
     """
+    from capture.manifestHandler import is_capture_record
+
     originals: List[Tuple[str, str]] = []
     copies: List[Tuple[str, str]] = []
     for manifest in sorted(_manifests(projects_dir)):
@@ -292,8 +356,7 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
                 entry = json.loads(stripped)
             except json.JSONDecodeError:
                 continue
-            if (isinstance(entry, dict) and entry.get("capture_id") in capture_ids
-                    and entry.get("record_type") != "relocation"):
+            if (is_capture_record(entry) and entry.get("capture_id") in capture_ids):
                 (copies if "copied_from" in entry else originals).append((entry["capture_id"], stripped))
     kept: List[str] = []
     kept_lines: Set[str] = set()
@@ -424,6 +487,10 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     manifest_paths: set = set()
     for paths in index.by_path.values():
         manifest_paths.update(paths.keys())
+    # A preview's manifest entry does not make it known: the manifest keeps
+    # the lines of deleted captures, so a preview counts as known only
+    # through its master, below.
+    manifest_paths -= index.previews
     known = referenced | manifest_paths
     # A RAW master's `_preview.jpg` sidecar has no row and no manifest entry of
     # its own, so it counts as known when its master is known and still on
