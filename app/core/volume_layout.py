@@ -75,7 +75,9 @@ What is moved, and how:
   checksums from both (_volume_records_to_copy).
 - A volume whose `<stem>/` already holds what is not its own (see
   _foreign_entries) is not moved, and each of its images is reported as
-  skipped with reason "stem_dir_occupied" and the foreign entries.
+  skipped with reason "stem_dir_occupied" and the foreign entries. A
+  volume's leftover `metadata/manifest.jsonl.part` is removed at the start
+  of every run ("stale_parts_removed").
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
@@ -1139,6 +1141,7 @@ def _new_report(root: Path, dry_run: bool) -> dict:
         "manifest_records_copied": 0,
         "manifest_copy_failed": [],
         "manifests_repaired": {},
+        "stale_parts_removed": 0,
         "captures_without_record": {},
     }
 
@@ -1182,6 +1185,7 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
             _commit_batch(db, root, pending, report)
             report["completed_journal"] = True
 
+    _remove_stale_parts(db, root, report, dry_run)
     _retry_sidecars(db, root, report, dry_run)
 
     out_of_place = _out_of_place(db, root_forms)
@@ -1208,6 +1212,31 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
 
     _repair_volume_manifests(db, root, root_forms, report, dry_run)
     return report
+
+
+def _remove_stale_parts(db: Session, root: Path, report: dict, dry_run: bool) -> None:
+    """Remove each stemmed volume's leftover `metadata/manifest.jsonl.part`; count them.
+
+    append_manifest_lines writes a volume's manifest whole to that name and
+    renames it over the manifest, and only the startup migration calls it,
+    so at the start of a run a `.part` can only be what a crash left. The
+    manifest it would have replaced is intact. With dry_run it is counted
+    and kept. One query and one stat per stemmed volume.
+    """
+    from capture.manifestHandler import MANIFEST_PART_NAME
+
+    for (stem,) in db.query(Collection.filename_stem).filter(Collection.filename_stem.isnot(None)).all():
+        part = root / stem / "metadata" / MANIFEST_PART_NAME
+        if not part.is_file():
+            continue
+        report["stale_parts_removed"] += 1
+        if dry_run:
+            continue
+        try:
+            part.unlink()
+            logger.warning(f"Volume layout: removed {part}, left by an interrupted manifest copy")
+        except OSError as e:
+            logger.error(f"Volume layout: could not remove {part}: {e}")
 
 
 def _repair_volume_manifests(db: Session, root: Path, root_forms: Set[str], report: dict, dry_run: bool) -> None:
