@@ -170,9 +170,31 @@ def _refuse_duplicate_keys(pairs):
     for key, value in pairs:
         if key in obj:
             shown = key if len(key) <= 120 else key[:120] + "..."
-            raise _DuplicateKey(shown)
+            # Echoed in the 400: a lone surrogate in it is escaped, so the
+            # response can be encoded.
+            raise _DuplicateKey(shown.encode("utf-8", "backslashreplace").decode("utf-8"))
         obj[key] = value
     return obj
+
+
+def _holds_lone_surrogate(document: Any) -> bool:
+    """Whether any key or string in the parsed document holds a code point from U+D800 to U+DFFF.
+
+    json.loads joins an escaped surrogate pair into one character, so only
+    a lone surrogate is left in a string. Walked without recursion.
+    """
+    stack = [document]
+    while stack:
+        value = stack.pop()
+        if isinstance(value, str):
+            if any("\ud800" <= ch <= "\udfff" for ch in value):
+                return True
+        elif isinstance(value, dict):
+            stack.extend(value.keys())
+            stack.extend(value.values())
+        elif isinstance(value, list):
+            stack.extend(value)
+    return False
 
 
 def parse_list_file(raw: bytes) -> Any:
@@ -181,15 +203,18 @@ def parse_list_file(raw: bytes) -> Any:
     A UTF-8 byte order mark is accepted. Refused: bytes that are not UTF-8;
     text that is not JSON, including a number beyond Python's digit limit
     and nesting deep enough to exhaust the recursion limit; NaN, Infinity
-    and -Infinity; and a key repeated within one object, at any depth.
+    and -Infinity; a key repeated within one object, at any depth; and a key
+    or string holding a lone surrogate, which json accepts as an escape
+    (`\\ud800`) but no UTF-8 encoder writes. Nothing is written before
+    this returns.
     """
     try:
         text = raw.decode("utf-8-sig")
     except UnicodeDecodeError:
         raise ListUnreadable("The file is not UTF-8 text.")
     try:
-        return json.loads(text, parse_constant=_refuse_constant,
-                          object_pairs_hook=_refuse_duplicate_keys)
+        document = json.loads(text, parse_constant=_refuse_constant,
+                              object_pairs_hook=_refuse_duplicate_keys)
     except _DuplicateKey as exc:
         raise ListUnreadable(f"The file is not valid for import: the key {str(exc)!r} appears twice in one object.")
     except RecursionError:
@@ -200,6 +225,12 @@ def parse_list_file(raw: bytes) -> Any:
         # The integer-conversion digit limit (sys.set_int_max_str_digits),
         # whose own text names interpreter settings an operator cannot use.
         raise ListUnreadable("The file contains a number too large to read.")
+    if _holds_lone_surrogate(document):
+        raise ListUnreadable(
+            "The file is not valid for import: a string in it holds an escaped lone surrogate "
+            "(such as \\ud800), which is not a character and cannot be stored."
+        )
+    return document
 
 
 class ProjectNeedsAdmin(Exception):
@@ -912,7 +943,13 @@ def store_report(report: dict) -> Path:
     directory = reports_dir() / list_id
     directory.mkdir(parents=True, exist_ok=True)
     body = {k: v for k, v in report.items() if k != "reportStored"}
-    data = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
+    try:
+        data = json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8")
+    except UnicodeEncodeError:
+        # A string UTF-8 cannot hold (a lone surrogate, which the parser
+        # refuses before an import starts): written with \\u escapes
+        # instead, so the report is still stored.
+        data = json.dumps(body, ensure_ascii=True, indent=2).encode("ascii")
     fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
     try:
         with os.fdopen(fd, "wb") as handle:
