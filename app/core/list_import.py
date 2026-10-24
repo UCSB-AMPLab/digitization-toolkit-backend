@@ -12,7 +12,9 @@ item becomes a volume (a row of `collections`):
     sequence       -> sequence
 
 Every other item field, `containerPath` and fields the contract does not
-name included, goes into `custom_attributes` as JSON under a `fisqua` key.
+name included, goes into `custom_attributes` as JSON under a `fisqua` key;
+`dates` subfields other than display, start and end go under `fisqua.dates`,
+which is left out when there are none.
 No records are created.
 
 The envelope is checked before anything is written: a file whose `contract`,
@@ -71,6 +73,8 @@ SUPPORTED_MAJOR_VERSION = "1"
 
 # The item fields that have a column; everything else goes under `fisqua`.
 MAPPED_ITEM_FIELDS = frozenset({"referenceCode", "filenameStem", "title", "dates", "sequence"})
+# The `dates` subfields that have a column; any other goes under fisqua.dates.
+MAPPED_DATES_FIELDS = frozenset({"display", "start", "end"})
 
 # Column widths the values must fit (app/models/collection.py, project.py).
 _NAME_MAX_LENGTH = Collection.__table__.columns["name"].type.length
@@ -336,6 +340,9 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "invalid_sequence", {}
 
     fisqua = {k: v for k, v in item.items() if k not in MAPPED_ITEM_FIELDS}
+    unmapped_dates = {k: v for k, v in dates.items() if k not in MAPPED_DATES_FIELDS}
+    if unmapped_dates:
+        fisqua["dates"] = unmapped_dates
     return None, {
         "external_id": code,
         "filename_stem": stem,

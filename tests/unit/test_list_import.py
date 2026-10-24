@@ -747,3 +747,28 @@ def test_text_that_is_not_json_is_refused_as_not_json(client500, db_session, rep
     resp = _post(client500, b"{not json")
     assert resp.status_code == 400
     assert resp.json()["detail"].startswith("The file is not valid JSON")
+
+
+# ---------------------------------------------------------------------------
+# Unknown dates subfields
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_unknown_dates_subfields_are_kept_under_fisqua_dates(client, db_session, reports_root):
+    _as("op", "admin")
+    item = _item(code="xx-test-701", stem="xx-test-701", typology="Libro",
+                 dates={"display": "1790", "start": "1790-01-01", "end": None,
+                        "calendar": "julian", "certainty": "approx"})
+    _post(client, _list_with([item]))
+    v = _volumes(db_session)["xx-test-701"]
+    assert json.loads(v.custom_attributes) == {
+        "fisqua": {"typology": "Libro", "dates": {"calendar": "julian", "certainty": "approx"}},
+    }
+    assert v.date == "1790"
+
+
+@pytest.mark.unit
+def test_no_dates_key_under_fisqua_when_dates_has_only_mapped_subfields(client, db_session, reports_root):
+    _as("op", "admin")
+    _post(client, _list_with([_item(code="xx-test-702", stem="xx-test-702")]))
+    assert "dates" not in json.loads(_volumes(db_session)["xx-test-702"].custom_attributes)["fisqua"]
