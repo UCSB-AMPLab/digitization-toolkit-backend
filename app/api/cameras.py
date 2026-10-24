@@ -16,7 +16,7 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
-from app.core.capture_naming import CaptureNameRefused, take_filename_index
+from app.core.capture_naming import RESOLUTION_IN_FILENAME_DETAIL, CaptureNameRefused, take_filename_index
 from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
@@ -115,6 +115,12 @@ def _take_filename_index(db: Session, collection_id: int, stem: str, root) -> st
 		raise HTTPException(status_code=409, detail=refused.detail)
 
 
+def _refuse_resolution_in_filename(include_resolution_in_filename: bool) -> None:
+	"""422 for a capture asking for its resolution in the file name, which would break the contract name."""
+	if include_resolution_in_filename:
+		raise HTTPException(status_code=422, detail=RESOLUTION_IN_FILENAME_DETAIL)
+
+
 class DeviceInfo(BaseModel):
 	"""Information about a detected camera device."""
 	hardware_id: str
@@ -154,7 +160,7 @@ class CaptureRequest(BaseModel):
 	project_name: str
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
-	include_resolution_in_filename: bool = False
+	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
 	# None (the default) leaves the registry's saved orientation from
 	# default_camera_config_from_registry in place; an explicit value,
@@ -174,7 +180,7 @@ class DualCaptureRequest(BaseModel):
 	"""Request body for dual capture endpoint."""
 	project_name: str
 	resolution: str = "medium"
-	include_resolution_in_filename: bool = False
+	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	stagger_ms: int = 20
 	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
 	# registry's saved orientation in place; an explicit value, including 0,
@@ -763,6 +769,7 @@ def trigger_capture(
 	# history row names as the old status. Lock order, the same on every
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
+	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -1002,6 +1009,7 @@ def trigger_dual_capture(
 	# history row names as the old status. Lock order, the same on every
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
+	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record

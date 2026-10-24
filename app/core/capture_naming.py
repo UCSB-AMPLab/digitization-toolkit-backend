@@ -40,6 +40,9 @@ CAPTURE_NAME_TOO_LONG_DETAIL = (
 CAPTURE_NUMBERS_TAKEN_DETAIL = (
     "The next capture numbers of this volume are already taken by files on disk. Nothing was captured."
 )
+RESOLUTION_IN_FILENAME_DETAIL = (
+    "A capture's file name cannot carry its resolution: the exchange contract fixes the name."
+)
 
 
 class CaptureNameRefused(Exception):

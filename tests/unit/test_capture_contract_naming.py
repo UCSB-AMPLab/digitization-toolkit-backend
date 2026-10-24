@@ -532,3 +532,28 @@ def test_more_numbers_on_disk_than_the_cap_refuse_the_capture(
 def test_the_default_cap_is_a_hundred():
     from app.core.capture_naming import MAX_NUMBERS_PASSED_OVER
     assert MAX_NUMBERS_PASSED_OVER == 100
+
+
+# ---------------------------------------------------------------------------
+# No resolution in the name
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dual", [False, True])
+def test_a_resolution_in_the_file_name_is_refused(
+        client, db_session, test_project, volume, backend, dual):
+    from app.core.capture_naming import RESOLUTION_IN_FILENAME_DETAIL
+
+    resp = _post(_client_as(client), test_project, volume, dual=dual, include_resolution_in_filename=True)
+
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"] == RESOLUTION_IN_FILENAME_DETAIL
+    assert backend.requested == []
+    assert _counter(db_session, volume) == 0
+
+
+@pytest.mark.unit
+def test_no_resolution_in_the_file_name_is_accepted(
+        client, db_session, test_project, volume, backend):
+    body = _single(_client_as(client), test_project, volume, include_resolution_in_filename=False)
+    assert Path(body["file_path"]).name == f"{STEM}-img_0001_c0.jpg"
