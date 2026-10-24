@@ -13,8 +13,16 @@ import uuid
 logger = logging.getLogger(__name__)
 
 # Default thumbnail dimensions
-DEFAULT_THUMBNAIL_WIDTH = 200
-DEFAULT_THUMBNAIL_HEIGHT = 200
+#
+# 600px covers the largest grid-view cell size in the frontend (GridView's
+# column-count slider goes down to 2 columns, which can render cells ~500-
+# 540px wide) with a bit of margin. At 200px, `object-fit: cover` was
+# upscaling the thumbnail to fill much larger cells, producing visibly
+# blurry grids — this only affects the display size, not the stored master
+# image, so the storage/bandwidth cost stays a small fraction of the
+# full-resolution capture either way.
+DEFAULT_THUMBNAIL_WIDTH = 600
+DEFAULT_THUMBNAIL_HEIGHT = 600
 DEFAULT_THUMBNAIL_FORMAT = "JPEG"
 DEFAULT_THUMBNAIL_QUALITY = 85
 
@@ -77,28 +85,24 @@ def generate_thumbnail(
         return None
 
 
-def delete_thumbnail(thumbnail_path: Optional[str]) -> bool:
+def delete_thumbnail(thumbnail_path: Optional[str]) -> None:
     """
-    Delete a thumbnail file.
-    
+    Delete a thumbnail file. An empty path or a file already gone is a no-op.
+
+    An OSError from the unlink propagates (NEH-263), so a thumbnail that cannot
+    be removed is never reported as removed, and each caller decides what the
+    failure means where it happens.
+
     Args:
         thumbnail_path: Path to the thumbnail file
-    
-    Returns:
-        True if deletion was successful or file didn't exist, False on error
+
+    Raises:
+        OSError: if the file exists and cannot be unlinked
     """
     if not thumbnail_path:
-        return True
-    
-    try:
-        thumb_file = Path(thumbnail_path)
-        if thumb_file.exists():
-            thumb_file.unlink()
-            logger.info(f"Deleted thumbnail: {thumbnail_path}")
-        return True
-    except Exception as e:
-        logger.error(f"Failed to delete thumbnail {thumbnail_path}: {e}")
-        return False
+        return
+    Path(thumbnail_path).unlink(missing_ok=True)
+    logger.info(f"Deleted thumbnail: {thumbnail_path}")
 
 
 def regenerate_thumbnail(
@@ -122,6 +126,10 @@ def regenerate_thumbnail(
     
     Returns:
         Path to the new thumbnail, or None if generation failed
+
+    Raises:
+        OSError: if the old thumbnail exists and cannot be unlinked; no new
+            thumbnail is generated in that case
     """
     # Delete old thumbnail
     delete_thumbnail(old_thumbnail_path)

@@ -257,6 +257,27 @@ def generate_manifest_record(
     )
     
 
+def _append_line(manifest_path: Path, line: bytes) -> None:
+    """Append one encoded JSONL line to a manifest in one O_APPEND write, fsynced.
+
+    If the file does not end with a newline (a power cut tore its last
+    line), a newline is written first, in the same write, so the torn line
+    stays a line of its own, which the index skips and logs, and never
+    swallows this record. Called under _manifest_append_lock.
+    """
+    fd = os.open(manifest_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            line = b"\n" + line
+        mv = memoryview(line)
+        while mv:  # one O_APPEND write keeps the JSONL line atomic
+            mv = mv[os.write(fd, mv):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
+
 def append_manifest_record(project_root: Path, record: Union[CaptureRecord, ProjectInfo], record_type: str = "capture"):
     """
     Append a capture or project record to the manifest file in the project directory.
@@ -278,17 +299,72 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     
     line = (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
     with _manifest_append_lock:
-        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            mv = memoryview(line)
-            while mv:  # one O_APPEND write keeps the JSONL line atomic
-                mv = mv[os.write(fd, mv):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _append_line(manifest_path, line)
 
     if record_type == "project":
         subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
     else:
         subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
         
+
+RELOCATION_RECORD_TYPE = "relocation"
+
+
+def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str, *,
+                             image_id: int, sha256: str) -> None:
+    """Append to the project's capture manifest that a captured file now lives under another name.
+
+    The manifest is append-only, so a file that is moved and renamed after
+    capture keeps its capture-time sha256 through this record rather than by
+    rewriting its capture record: `{"record_type": "relocation", "capture_id",
+    "image_id", "sha256", "from", "to", "relocated_at"}`, both paths relative
+    to `project_root` as the capture record's `relative_path` is. `image_id`
+    is the RecordImage id and `sha256` the capture-time checksum the system
+    held for that image when it was renamed, so app.core.integrity resolves
+    the image's checksum from this one record, in any order and whatever
+    names later renames reuse. `relocated_at` is information only. The line
+    is written with one O_APPEND write and fsynced, as append_manifest_record
+    writes.
+    """
+    metadata_dir = project_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = metadata_dir / "manifest.jsonl"
+    payload = {
+        "record_type": RELOCATION_RECORD_TYPE,
+        "capture_id": capture_id,
+        "image_id": image_id,
+        "sha256": sha256,
+        "from": from_rel,
+        "to": to_rel,
+        "relocated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(manifest_path, line)
+
+
+# Written whole and renamed over the manifest by an earlier version of
+# append_manifest_lines; a leftover is removed at startup (app.core.volume_layout).
+MANIFEST_PART_NAME = "manifest.jsonl.part"
+
+
+def append_manifest_lines(root: Path, lines: list) -> None:
+    """Append already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, in one write, fsynced.
+
+    For records copied from another manifest (app.core.volume_layout). The
+    lines go through _append_line, as a capture record does: a newline
+    first if the last line is torn, then the lines in one O_APPEND write.
+    A power cut can tear the copy's last line; that line stays apart as
+    junk, which the index skips and logs, and the next startup's repair
+    finds the record missing and appends it again. The manifest is never
+    rewritten or renamed: on exFAT or vfat drives a rename over an existing
+    file is not shown to be crash-atomic, and this may be the volume's only
+    manifest. Each line is one JSON object without its newline.
+    """
+    if not lines:
+        return
+    metadata_dir = root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    data = "".join(line + "\n" for line in lines).encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(metadata_dir / "manifest.jsonl", data)

@@ -1,11 +1,11 @@
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query
+from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy import func
 from app.models.record import Record, RecordImage
-from typing import List, Optional
-from pydantic import BaseModel
+from typing import List, Literal, Optional
+from pydantic import BaseModel, field_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -16,11 +16,17 @@ from app.models.project import Project
 from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
+from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
+from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
+from app.core.db_errors import integrity_conflict
+from app.core.record_status import change_record_status
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
+allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
@@ -40,8 +46,41 @@ def _next_record_sequence(db: Session, project_id: Optional[int], collection_id:
 	return (current_max + 1) if current_max is not None else 0
 
 
-def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str]]:
-	"""Authoritative (project_name, collection_name) for the on-disk capture path."""
+def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
+	"""409 when the capture would go into no volume, into one without a filename_stem,
+	or, for a request with a record_id, into a volume other than the record's;
+	404 when the volume named does not exist.
+
+	Every capture is named after its volume's stem (contract 1.1 §3), so the
+	request must name a volume: 0 counts as none, as it does for the capture
+	path. A request with a record_id must name the record's own volume: the
+	file is written under the volume the request names, while the record and
+	the counter raised are its own volume's. Called in each capture endpoint
+	before any camera is touched.
+	"""
+	if not collection_id:
+		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	# Locked, so a PATCH of the stem waits until this capture commits.
+	volume = locked_volume_query(db, collection_id).first()
+	if volume is None:
+		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+	if retake_record is not None:
+		if retake_record.collection_id is None:
+			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+		if retake_record.collection_id != collection_id:
+			raise HTTPException(status_code=409, detail=RETAKE_VOLUME_DETAIL)
+	if volume.filename_stem is None:
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
+
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
+	"""Authoritative (project_name, collection_name, stem) for the on-disk capture path.
+
+	A volume with a file name stem captures into `<stem>/captures/`; one
+	without captures into its name-based directory under its project
+	(image_output_dir). Both are returned, with the stem None for a volume
+	without one; a project-level capture has neither.
+	"""
 	if collection_id:
 		col = db.query(Collection).filter(Collection.id == collection_id).first()
 		if not col:
@@ -49,11 +88,11 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 		resolved = resolve_project_name(db, col)
 		if not resolved:
 			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
-		return resolved, col.name
+		return resolved, col.name, col.filename_stem
 	project = db.query(Project).filter(Project.name == project_name).first()
 	if not project:
 		raise HTTPException(status_code=422, detail="project_name does not match a known project")
-	return project.name, None
+	return project.name, None, None
 
 
 class DeviceInfo(BaseModel):
@@ -68,9 +107,26 @@ class DeviceInfo(BaseModel):
 	# Calibration data (populated when calibrated=True)
 	lens_position: Optional[float] = None
 	awb_gains: Optional[List[float]] = None
+	orientation: Optional[int] = None  # Saved rotation for this body, if ever set (NEH-71)
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+	# Which pages this body shoots: "odd", "even", or null when it has no
+	# parity (CHDK backend only; the file that carries it lives on the card).
+	# Not a side of the table - left and right are the kiosk's swap toggle.
+	side: Optional[str] = None
+	# Why this body may not capture, in words for the operator: two bodies on
+	# one parity, or a body with no identity. Null when it is ready.
+	error: Optional[str] = None
+
+
+_VALID_ROTATIONS = (0, 90, 180, 270)
+
+
+def _validate_rotate_deg(v: Optional[int]) -> Optional[int]:
+	if v is not None and v not in _VALID_ROTATIONS:
+		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}; got {v}")
+	return v
 
 
 class CaptureRequest(BaseModel):
@@ -79,10 +135,19 @@ class CaptureRequest(BaseModel):
 	camera_index: int = 0
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False
-	rotate_deg: int = 0  # Clockwise rotation applied post-capture: 0, 90, 180, 270
+	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
+	# None (the default) leaves the registry's saved orientation from
+	# default_camera_config_from_registry in place; an explicit value,
+	# including 0, overrides it (NEH-71 - the one behaviour change of the ticket).
+	rotate_deg: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
+
+	@field_validator("rotate_deg")
+	@classmethod
+	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
+		return _validate_rotate_deg(v)
 
 
 class DualCaptureRequest(BaseModel):
@@ -91,13 +156,21 @@ class DualCaptureRequest(BaseModel):
 	resolution: str = "medium"
 	include_resolution_in_filename: bool = False
 	stagger_ms: int = 20
-	rotate_deg_cam0: int = 0  # Clockwise rotation for camera 0: 0, 90, 180, 270
-	rotate_deg_cam1: int = 0  # Clockwise rotation for camera 1: 0, 90, 180, 270
+	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
+	# registry's saved orientation in place; an explicit value, including 0,
+	# overrides it (NEH-71 - see CaptureRequest.rotate_deg).
+	rotate_deg_cam0: Optional[int] = None
+	rotate_deg_cam1: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	sequence: Optional[int] = None  # Page number/order
 	left_camera_index: int = 0  # Which camera index maps to the left page (0 or 1)
 	collection_id: Optional[int] = None  # Collection to link the record to
+
+	@field_validator("rotate_deg_cam0", "rotate_deg_cam1")
+	@classmethod
+	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
+		return _validate_rotate_deg(v)
 
 
 class CaptureResponse(BaseModel):
@@ -179,6 +252,61 @@ def _get_camera_registry():
 		return None
 
 
+def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
+	"""Enrich raw backend device dicts with registry calibration data.
+
+	Shared by the enumeration and rescan routes so both return the same
+	DeviceInfo shape from the same backend dicts. A registry of None (import or
+	init failure) simply means nothing is enriched; enumeration still works.
+	"""
+	devices = []
+	for dev in raw_devices:
+		hw_id = dev["hardware_id"]
+		idx = dev["index"]
+
+		# Enrich with registry calibration data
+		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		calibrated = False
+		machine_id = None
+		label = None
+		lens_position = None
+		awb_gains = None
+		orientation = None
+
+		if camera_data:
+			focus_cal = camera_data.get("calibration", {}).get("focus", {})
+			calibrated = bool(focus_cal.get("success"))
+			machine_id = camera_data.get("machine_id")
+			label = camera_data.get("label")
+			lens_position = focus_cal.get("lens_position")
+			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
+			if awb_raw:
+				awb_gains = list(awb_raw)
+			# Report only a supported angle; a malformed stored value is
+			# shown as unset so the UI never receives an angle it cannot use.
+			stored = camera_data.get("orientation")
+			orientation = stored if type(stored) is int and stored in _VALID_ROTATIONS else None
+
+		devices.append(DeviceInfo(
+			hardware_id=hw_id,
+			model=dev.get("model", "unknown"),
+			index=idx,
+			location=dev.get("location"),
+			machine_id=machine_id,
+			label=label,
+			calibrated=calibrated,
+			lens_position=lens_position,
+			awb_gains=awb_gains,
+			orientation=orientation,
+			has_aperture_control=dev.get("has_aperture_control", False),
+			supports_zoom=dev.get("supports_zoom", False),
+			side=dev.get("side"),
+			error=dev.get("error"),
+		))
+
+	return devices
+
+
 @router.get("/devices", response_model=List[DeviceInfo])
 def list_camera_devices(current_user: User = Depends(allow_read_only)):
 	"""
@@ -198,44 +326,112 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		logger.error(f"Failed to list camera devices: {e}")
 		return []
 
-	devices = []
-	for dev in raw_devices:
-		hw_id = dev["hardware_id"]
-		idx = dev["index"]
+	return _device_infos(raw_devices, registry)
 
-		# Enrich with registry calibration data
-		camera_data = registry.get_camera_by_id(hw_id) if registry else None
-		calibrated = False
-		machine_id = None
-		label = None
-		lens_position = None
-		awb_gains = None
 
-		if camera_data:
-			focus_cal = camera_data.get("calibration", {}).get("focus", {})
-			calibrated = bool(focus_cal.get("success"))
-			machine_id = camera_data.get("machine_id")
-			label = camera_data.get("label")
-			lens_position = focus_cal.get("lens_position")
-			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
-			if awb_raw:
-				awb_gains = list(awb_raw)
+@router.post("/rescan", response_model=List[DeviceInfo])
+def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
+	"""
+	Re-detect the attached cameras and drop any stale device sessions.
 
-		devices.append(DeviceInfo(
-			hardware_id=hw_id,
-			model=dev.get("model", "unknown"),
-			index=idx,
-			location=dev.get("location"),
-			machine_id=machine_id,
-			label=label,
-			calibrated=calibrated,
-			lens_position=lens_position,
-			awb_gains=awb_gains,
-			has_aperture_control=dev.get("has_aperture_control", False),
-			supports_zoom=dev.get("supports_zoom", False),
-		))
+	The operator's recovery lever when a DSLR drops off USB or re-enumerates
+	onto a different port mid-session: the backend rebuilds its port map and
+	closes the sessions that no longer match it, so the next capture opens
+	against the hardware as it actually is. Returns the same DeviceInfo list as
+	GET /devices.
 
-	return devices
+	This mutates backend state, so it sits behind allow_contributor rather than
+	allow_read_only. A backend failure is a 503 rather than an empty list: an
+	empty list reads as "no cameras attached" and would hide the failure from
+	the operator who just asked for a rescan.
+	"""
+	registry = _get_camera_registry()
+
+	try:
+		from capture.service import get_backend
+		backend = get_backend()
+		raw_devices = backend.rescan()
+	except Exception as exc:
+		logger.exception(f"Camera rescan failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera rescan failed: {exc}")
+
+	return _device_infos(raw_devices, registry)
+
+
+class SideRequest(BaseModel):
+	"""Request body for assigning a CHDK body's page parity (NEH-231)."""
+	side: Literal["odd", "even"]
+
+
+@router.post("/side/{camera_index}", response_model=List[DeviceInfo])
+def set_camera_side(
+	camera_index: int,
+	request: SideRequest,
+	current_user: User = Depends(allow_admin),
+):
+	"""
+	Write which pages the body at this index shoots onto its own card.
+
+	ODD or EVEN is a page parity, not a side of the table: which of the two
+	the operator sees on the left is the kiosk's swap toggle, so a
+	right-to-left volume needs nothing from here. The mapping is fixed - EVEN
+	is camera 0, ODD is camera 1 - so assigning a parity usually moves the
+	body to the other index, and the response is the re-enumerated device
+	list rather than one row.
+
+	Admin-only: it rewrites a body's identity on the card, minting an id for
+	a body that has none, which is what lets a compact with no readable USB
+	serial capture at all.
+
+	Only the CHDK backend has cards to write, so another backend is a 501. A
+	parity another connected body already shoots is a 409, because assigning
+	it would leave two bodies shooting the same pages.
+
+	Two connected bodies therefore cannot exchange parities in one step, and
+	there is no order of requests that does it: each is refused by the other.
+	The procedure is to take one body out of the picture first - disconnect
+	it, POST /cameras/rescan so the appliance stops counting it, assign the
+	parity to the body that is still connected, then reconnect the first body,
+	rescan again and assign it the parity it should have. Both cards are
+	written, and the pair comes back with one ODD and one EVEN.
+	"""
+	try:
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		backend = get_backend()
+	except Exception as exc:
+		logger.exception(f"Camera backend unavailable: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera backend unavailable: {exc}")
+
+	name = backend.get_backend_name()
+	if name != "chdk" or not hasattr(backend, "assign_side"):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {name} backend has no page parity to assign; it is "
+				"written on a CHDK camera's own card"
+			),
+		)
+
+	from capture.backends.chdk_backend import SideConflictError
+
+	registry = _get_camera_registry()
+	try:
+		raw_devices = backend.assign_side(camera_index, request.side)
+	except SideConflictError as exc:
+		raise HTTPException(status_code=409, detail=str(exc))
+	except ValueError as exc:
+		raise HTTPException(status_code=422, detail=str(exc))
+	except RuntimeError as exc:
+		if "not connected" in str(exc):
+			raise HTTPException(status_code=404, detail=str(exc))
+		logger.exception(f"Assigning a page parity to camera {camera_index} failed: {exc}")
+		raise HTTPException(status_code=502, detail=str(exc))
+
+	return _device_infos(raw_devices, registry)
 
 
 @router.get("/capabilities")
@@ -273,16 +469,20 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 @router.get("/preview/{camera_index}")
 def get_camera_preview(
 	camera_index: int,
+	resolution: str = Query("medium"),
 	current_user: User = Depends(allow_read_only),
 ):
 	"""
-	Capture a low-resolution preview frame and return it as JPEG.
+	Capture a live preview frame and return it as JPEG.
 
 	Called by the frontend every PREVIEW_INTERVAL_MS milliseconds for the
-	live preview view.  Uses a lightweight config (1280x720, no AF, no denoise)
-	so frames are returned quickly without interfering with full captures.
+	live preview view.  The frame rides on the still configuration for
+	`resolution`, so it shows the field of view a capture at that resolution
+	would record, with no AF cycle and no denoise warmup.
 
-	Returns 404 when the requested camera is not connected.
+	Returns 422 for an unknown resolution, 404 when the requested camera is
+	not connected or the frame could not be captured (any RuntimeError from
+	the capture service), 500 on anything else.
 	"""
 	from fastapi.responses import Response
 
@@ -292,8 +492,10 @@ def get_camera_preview(
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
 	try:
-		jpeg_bytes = capture_preview_frame(camera_index)
+		jpeg_bytes = capture_preview_frame(camera_index, resolution)
 		return Response(content=jpeg_bytes, media_type="image/jpeg")
+	except ValueError as e:
+		raise HTTPException(status_code=422, detail=str(e))
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
@@ -446,6 +648,82 @@ def apply_camera_settings(
 		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
 
 
+def _is_capture_timeout(exc: BaseException) -> bool:
+	"""True if exc, or something it was raised from, is a CaptureTimeoutError.
+
+	capture/backends/gphoto2_backend.py:1418 wraps a CaptureTimeoutError in a
+	plain RuntimeError ("DSLR capture failed: ...") so a stalled DSLR body
+	can travel the same failure path as any other capture error, keeping the
+	original timeout as __cause__. Catching RuntimeError (or CaptureTimeoutError
+	itself, which is a RuntimeError subclass) would therefore either be too
+	broad or miss every real DSLR timeout wrapped this way, so this walks a
+	few links of the __cause__ / __context__ chain looking for the real class.
+	"""
+	from capture.backends.gphoto2_backend import CaptureTimeoutError
+
+	current = exc
+	for _ in range(5):
+		if current is None:
+			return False
+		if isinstance(current, CaptureTimeoutError):
+			return True
+		current = current.__cause__ or current.__context__
+	return False
+
+
+@router.post("/test-capture/{camera_index}")
+def test_capture(
+	camera_index: int,
+	resolution: str = Query("medium"),
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Take a real still capture - shutter, autofocus, the full backend path -
+	and return it inline as a JPEG, never stored (dashboard "Probar camaras"
+	button; NEH-166, option (a)).
+
+	Uses the literal-first path (/test-capture/{camera_index}, not
+	/{camera_index}/test-capture) to match this router's existing convention
+	for POST routes that take a camera_index (/focus/{camera_index},
+	/settings/{camera_index}), and to keep it unambiguous against any future
+	/{camera_index}-shaped route.
+
+	Checks the camera is connected before calling the service, mirroring
+	trigger_capture, rather than sniffing the RuntimeError message for
+	"not connected" after the fact.
+	"""
+	from capture.camera import IMG_SIZES
+
+	if resolution not in IMG_SIZES:
+		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
+
+	from capture.service import test_capture_bytes, is_camera_connected
+
+	if not is_camera_connected(camera_index):
+		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
+
+	try:
+		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
+	except RuntimeError as e:
+		if _is_capture_timeout(e):
+			raise HTTPException(status_code=504, detail=str(e))
+		raise HTTPException(status_code=500, detail=str(e))
+	except HTTPException:
+		raise
+	except Exception:
+		logger.exception("Test capture failed")
+		raise HTTPException(status_code=500, detail="Test capture failed")
+
+	return Response(
+		content=image_bytes,
+		media_type="image/jpeg",
+		headers={
+			"X-Capture-Seconds": f"{elapsed_time:.3f}",
+			"X-Capture-Bytes": str(len(image_bytes)),
+		},
+	)
+
+
 @router.post("/capture", response_model=CaptureResponse)
 def trigger_capture(
 	request: CaptureRequest,
@@ -457,6 +735,28 @@ def trigger_capture(
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
 	"""
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "single"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.camera import CameraConfig, IMG_SIZES
@@ -481,19 +781,23 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
-		if request.rotate_deg:
+		# NEH-71: omitted (None) leaves the registry's saved orientation from
+		# default_camera_config_from_registry in place; an explicit value,
+		# including 0, overrides it. This is the one behaviour change of the ticket.
+		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
 			camera_config=camera_config,
 			check_camera=False,  # Already checked
 			include_resolution=request.include_resolution_in_filename,
-			collection_name=collection_name
+			collection_name=collection_name,
+			stem=stem
 		)
 		
 		# Extract image dimensions and EXIF data
@@ -528,33 +832,60 @@ def trigger_capture(
 		effective_project_id = None if request.collection_id else project_id
 
 		# Get or create Record
-		if request.record_id:
-			# Link to existing record
-			record = db.query(Record).filter(Record.id == request.record_id).first()
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		is_recapture = False
+		# A retake promotes only a rejected record, moving it into the review
+		# queue. A captured one stays in the operator's hands until she promotes
+		# its collection (NEH-260); without this flag every retake would promote
+		# the record it was meant to leave with her.
+		recapture_promotes = False
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
+			if record.status in ("captured", "rejected"):
+				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
+				# can redo a frame she can see is bad instead of waiting for a
+				# reviewer to reject it and pick one of six image faults). An
+				# approved record is deliberately not retakeable: approved is the
+				# only state meaning something may already have left the appliance,
+				# so the path is reviewer undoes, reviewer rejects, operator retakes.
+				#
+				# Either way the record can only be redone in the capture mode it was
+				# originally taken with — a single capture can't turn a dual-mode
+				# record's pair back into one image. That is checked at the top,
+				# before the camera is touched.
+				#
+				# record_id is the only signal this endpoint has, and it now means
+				# "retake" in the two states an operator can act in and "add an
+				# image to this record" in the two she cannot. No client uses the
+				# second: the frontend passes record_id only from its retake handler,
+				# and every folio is captured as its own record.
+				# Its capture mode was checked before the camera was touched.
+				is_recapture = True
+				recapture_promotes = record.status == "rejected"
+				from app.api.records import _supersede_current_images
+				_supersede_current_images(record)
 		else:
 			# Create new record for this capture
 			record = Record(
 				title=request.record_title or f"{project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
-				object_typology="document",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
+				capture_mode="single",
 			)
 			db.add(record)
 			db.flush()  # Get the ID
 		
 		# Generate thumbnail alongside the captured images
-		# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
+		# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
 		thumbnail_path = None
 		try:
 			thumbnails_dir = file_path.parent.parent / "thumbnails"
 			thumb_source = file_path
-			if file_path.suffix.lower() == ".cr2":
-				preview = file_path.with_name(file_path.stem + "_preview.jpg")
+			if is_raw_suffix(file_path):
+				preview = preview_sidecar_of(file_path)
 				if preview.exists():
 					thumb_source = preview
 			thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
@@ -600,11 +931,17 @@ def trigger_capture(
 				raw_exif=str(exif_dict),
 			)
 			db.add(ex)
-		
+
+		if is_recapture and recapture_promotes:
+			change_record_status(db, record, "in_review", current_user.username)
+
+		# One capture event, counted in the transaction that writes its image.
+		next_capture_number(db, record.collection_id)
+
 		db.commit()
 		db.refresh(record)
 		db.refresh(img)
-		
+
 		logger.info(f"Created record {record.id}, image {img.id}, capture_id={capture_id}")
 		
 		return CaptureResponse(
@@ -634,6 +971,28 @@ def trigger_dual_capture(
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
 	"""
+	# A missing retake record and a capture outside a stemmed volume are
+	# refused before any camera is touched. The retaken record is loaded
+	# here, locked, as every path that
+	# moves a record's status or changes which of its images are current is:
+	# the status read here is what the retake writes over and what its
+	# history row names as the old status. Lock order, the same on every
+	# path that takes both: the record's row here, then the volume's in
+	# _refuse_capture_without_volume_or_stem.
+	retake_record = None
+	if request.record_id:
+		from app.api.records import _locked_record
+		retake_record = _locked_record(db, request.record_id)
+		if not retake_record:
+			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	# A retake is redone only in the mode the record was captured in.
+	if (retake_record is not None and retake_record.status in ("captured", "rejected")
+			and retake_record.capture_mode != "dual"):
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
+		)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.camera import CameraConfig
@@ -659,16 +1018,18 @@ def trigger_dual_capture(
 		config0_dict, _ = default_camera_config_from_registry(0, request.resolution)
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
 
-		if request.rotate_deg_cam0:
+		# NEH-71: see trigger_capture - omitted (None) leaves the registry's
+		# saved orientation in place; an explicit value, including 0, overrides it.
+		if request.rotate_deg_cam0 is not None:
 			config0_dict["rotate_deg"] = request.rotate_deg_cam0
-		if request.rotate_deg_cam1:
+		if request.rotate_deg_cam1 is not None:
 			config1_dict["rotate_deg"] = request.rotate_deg_cam1
 
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
 
 		path0, path1, capture_id, pair_id = dual_capture_image(
 			project_name=project_name,
@@ -677,7 +1038,8 @@ def trigger_dual_capture(
 			check_camera=False,
 			include_resolution=request.include_resolution_in_filename,
 			stagger_ms=request.stagger_ms,
-			collection_name=collection_name
+			collection_name=collection_name,
+			stem=stem
 		)
 
 		# Reuse the resolved project name so the DB record matches the on-disk tree
@@ -689,21 +1051,35 @@ def trigger_dual_capture(
 		effective_project_id = None if request.collection_id else project_id
 		
 		# Get or create Record
-		if request.record_id:
-			# Link to existing record (adding new pages to multi-page document)
-			record = db.query(Record).filter(Record.id == request.record_id).first()
-			if not record:
-				raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+		is_recapture = False
+		# A retake promotes only a rejected record, moving it into the review
+		# queue. A captured one stays in the operator's hands until she promotes
+		# its collection (NEH-260); without this flag every retake would promote
+		# the record it was meant to leave with her.
+		recapture_promotes = False
+		if retake_record is not None:
+			# Loaded and locked before the camera was touched; see the top.
+			record = retake_record
+			if record.status in ("captured", "rejected"):
+				# Retake, on the same terms as the single-capture endpoint above
+				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
+				# be redone as a pair, and can't turn a single-mode record into two
+				# images.
+				# Its capture mode was checked before the camera was touched.
+				is_recapture = True
+				recapture_promotes = record.status == "rejected"
+				from app.api.records import _supersede_current_images
+				_supersede_current_images(record)
 		else:
 			# Create new record for this dual capture
 			record = Record(
 				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
-				object_typology="book",  # Default to book for dual captures
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
 				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
 				created_by=current_user.username,
+				capture_mode="dual",
 			)
 			db.add(record)
 			db.flush()  # Get the ID
@@ -733,13 +1109,13 @@ def trigger_dual_capture(
 				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
 			
 			# Generate thumbnail alongside the captured images
-			# For RAW (.cr2), use the _preview.jpg extracted by rawpy if available
+			# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
 			thumbnail_path = None
 			try:
 				thumbnails_dir = file_path.parent.parent / "thumbnails"
 				thumb_source = file_path
-				if file_path.suffix.lower() == ".cr2":
-					preview = file_path.with_name(file_path.stem + "_preview.jpg")
+				if is_raw_suffix(file_path):
+					preview = preview_sidecar_of(file_path)
 					if preview.exists():
 						thumb_source = preview
 				thumbnail_path = generate_thumbnail(thumb_source, thumbnails_dir)
@@ -796,7 +1172,14 @@ def trigger_dual_capture(
 		role1 = "right" if request.left_camera_index == 0 else "left"
 		img0 = create_image_record(str(path0), 0, role0)
 		img1 = create_image_record(str(path1), 1, role1)
-		
+
+		if is_recapture and recapture_promotes:
+			change_record_status(db, record, "in_review", current_user.username)
+
+		# One capture event for the pair, counted in the transaction that
+		# writes both images.
+		next_capture_number(db, record.collection_id)
+
 		db.commit()
 		db.refresh(record)
 		
@@ -1072,6 +1455,79 @@ def apply_dslr_settings(
 		raise HTTPException(status_code=502, detail=str(e))
 
 
+class OrientationRequest(BaseModel):
+	"""Request body for setting a camera body's saved rotation (NEH-71)."""
+	orientation: Literal[0, 90, 180, 270]
+	# Hardware id the client resolved for this index (from GET /devices or
+	# POST /rescan). Checked against the index's current identity so a
+	# rescan racing this request can't save the value onto the wrong body.
+	hardware_id: str
+
+
+@router.put("/{camera_index}/orientation", response_model=DeviceInfo)
+def set_camera_orientation(
+	camera_index: int,
+	request: OrientationRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Persist the clockwise rotation to apply for the camera body at this index.
+
+	Saved to the registry keyed by hardware id (NEH-71), not by index, so it
+	survives reopening the app and rebooting the Pi - unlike the per-capture
+	rotate_deg fields, which are never persisted. Hardware ids are stable
+	across re-enumeration (NEH-129) while indices are not.
+
+	The request body carries the hardware id the client resolved for this
+	index. A rescan can put a different body on the same index between that
+	read and this write; if the index's current identity does not match the
+	one in the request, this returns 409 instead of silently saving the new
+	value under someone else's body (R30-4). The client should reload the
+	device list and try again.
+	"""
+	try:
+		from capture.camera_registry import CameraRegistry
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	registry = CameraRegistry()
+	hw_id, info = registry.get_camera_hardware_id(camera_index)
+
+	if hw_id is None:
+		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
+
+	if hw_id != request.hardware_id:
+		raise HTTPException(
+			status_code=409,
+			detail=(
+				f"Camera {camera_index} is now {hw_id}, not {request.hardware_id}; "
+				"reload the device list and try again"
+			),
+		)
+
+	if registry.get_camera_by_id(hw_id) is None:
+		# A body that was never calibrated must still be able to hold an
+		# orientation. Register it under the identity just checked above -
+		# never re-resolve it, per the same guard as the 409 check.
+		registry.register_resolved(hw_id, info, camera_index)
+
+	registry.update_orientation(hw_id, request.orientation)
+
+	try:
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as exc:
+		logger.exception(f"Camera enumeration failed after orientation update: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera enumeration failed: {exc}")
+
+	for device_info in _device_infos(raw_devices, registry):
+		if device_info.index == camera_index:
+			return device_info
+
+	raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
+
+
 @router.post("/", response_model=CameraSettingsRead)
 def create_camera_settings(
 	payload: CameraSettingsCreate,
@@ -1086,9 +1542,9 @@ def create_camera_settings(
 		db.add(cs)
 		db.commit()
 		db.refresh(cs)
-	except IntegrityError:
+	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Camera settings already exist for this record")
+		raise integrity_conflict(e)
 	return CameraSettingsRead.model_validate(cs)
 
 

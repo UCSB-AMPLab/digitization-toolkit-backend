@@ -2,20 +2,75 @@ from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel, field_validator, model_validator
 from datetime import datetime
+# Aliased: `date` is already a field name on RecordBase (the free-text display
+# date), so importing the type under its own name would shadow it.
+from datetime import date as dt_date
 
-# Valid status values
+# Valid status values. A record is born "captured", the state in which it is
+# still the operator's, and leaves it when she promotes the collection she has
+# finished (NEH-260).
+#
+# NEH-208 removed that state on the reading that a record enters the review
+# queue the instant it is taken. Three things followed: a fresh capture became
+# indistinguishable from work handed over for review, the operator could
+# neither redo nor delete her own frame until a reviewer formally rejected it,
+# and the state machine stopped matching the one the Fisqua exchange contract
+# describes, which is captured -> in_review -> approved | rejected.
+#
+# A reviewer can undo a mistaken approve or reject back to "in_review" (see
+# STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
+# formal rejection, so it carries no reason and no rejection record. The
+# change itself is dated in record_status_changes, like every other.
 RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 
-# Allowed status transitions: (from_status, to_status) -> set of roles that can perform it
+# Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
+#
+# captured -> in_review is promotion: the operator handing finished work over.
+# It is reachable per record, but the act she performs is per collection, so
+# the endpoint she uses is POST /collections/{id}/promote, which applies this
+# transition across the collection's captured records.
+#
+# rejected -> captured is prepare-for-retake: a rejected record returns to her
+# worklist, and is promoted again with its collection. Leaving captured is
+# guarded by the replacement-image invariant in app/api/records.py — the
+# table checks only the pair and the role.
+#
+# Three transitions are deliberately absent:
+#
+# - in_review -> rejected. Formal rejection is its own endpoint (POST
+#   /records/{id}/reject) with a mandatory predefined_reason. RecordStatusUpdate
+#   types its status as RecordStatus rather than a restricted literal, so this
+#   table is the only thing keeping the generic and bulk endpoints from writing
+#   "rejected" with no reason and no record_rejections row.
+# - in_review -> captured. Taking a handover back is a collection-level act
+#   (POST /collections/{id}/take-back) and stays out of the per-record and bulk
+#   paths, so one record cannot be withdrawn from a reviewer on its own.
+# - A retake, which supersedes the current images and is driven entirely by
+#   app/api/cameras.py rather than by a client-chosen status value. It leaves a
+#   captured record captured, and moves a rejected one to in_review.
+#
+# approved -> in_review and rejected -> in_review ARE here: these are the
+# "undo my mistake" resets a reviewer can trigger directly from the record
+# view (NEH-209) — no reason required since nothing formal is being
+# recorded, just moving the record back into the review queue.
 STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
-	("captured",  "in_review"): {"operator", "admin", "reviewer"},
-	("in_review", "rejected"):  {"reviewer", "admin"},
-	("in_review", "approved"):  {"reviewer", "admin"},
-	("in_review", "captured"):  {"operator", "admin"},
-	("rejected",  "captured"):  {"operator", "admin"},
-	("approved",  "rejected"):  {"reviewer", "admin"},
-	("approved",  "captured"):  {"admin"},
+	("captured", "in_review"): {"operator", "admin"},
+	("in_review", "approved"): {"reviewer", "admin"},
+	("approved", "in_review"): {"reviewer", "admin"},
+	("rejected", "in_review"): {"reviewer", "admin"},
+	("rejected", "captured"): {"operator", "admin"},
 }
+
+# The predefined rejection reasons, mirroring the list the annotation
+# feature's "Marcar error" already uses client-side
+# (LeftSidebar.svelte ERROR_TYPES) — this is the first place either list is
+# enforced server-side.
+PREDEFINED_REJECTION_REASONS = ("blur", "glare", "shadow", "focus", "exposure", "dirt")
+PredefinedRejectionReason = Literal["blur", "glare", "shadow", "focus", "exposure", "dirt"]
+
+# Which camera setup produced a document: one image, or an L+R pair fired
+# together on a single shutter press. Set once at capture time.
+CaptureMode = Literal["single", "dual"]
 
 
 # ==============================================================================
@@ -110,6 +165,11 @@ class RecordImageRead(RecordImageBase):
 	created_at: Optional[datetime]
 	camera_settings: Optional[CameraSettingsRead] = None
 	exif_data: Optional[ExifDataRead] = None
+	# Audit trail (NEH-208): False once a recapture has superseded this
+	# image — it stays queryable via GET /records/{id}/rejections but drops
+	# out of the default image list/gallery/export.
+	is_current: bool = True
+	superseded_at: Optional[datetime] = None
 
 	class Config:
 		from_attributes = True
@@ -122,14 +182,18 @@ class RecordImageRead(RecordImageBase):
 class RecordBase(BaseModel):
 	title: str
 	description: Optional[str] = None
-	object_typology: Optional[str] = None  # book, dossier, document, map, planimetry, other
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None  # JSON string for custom fields
+	# The birth state. The create path ignores it — create_record builds the
+	# Record without a status, so the model default governs there too.
 	status: RecordStatus = "captured"
 	sequence: Optional[int] = None
-	rejection_note: Optional[str] = None
+	# Required: the camera capture endpoints always set this explicitly;
+	# manual record creation (POST /records/) must declare it up front since
+	# rejection scope resolution and the recapture mode-match guard both
+	# depend on it (NEH-208).
+	capture_mode: CaptureMode
 
 
 class RecordCreate(RecordBase):
@@ -137,13 +201,17 @@ class RecordCreate(RecordBase):
 	collection_id: Optional[int] = None
 	created_by: Optional[str] = None
 
+	@model_validator(mode="after")
+	def _single_parent(self):
+		if self.project_id is not None and self.collection_id is not None:
+			raise ValueError("A record belongs to either a project or a collection, not both.")
+		return self
+
 
 class RecordUpdate(BaseModel):
 	title: Optional[str] = None
 	description: Optional[str] = None
-	object_typology: Optional[str] = None
 	author: Optional[str] = None
-	material: Optional[str] = None
 	date: Optional[str] = None
 	custom_attributes: Optional[str] = None
 	project_id: Optional[int] = None
@@ -152,6 +220,13 @@ class RecordUpdate(BaseModel):
 
 class RecordRead(RecordBase):
 	id: int
+	# The queryable form of `date`: the span the record's date covers, with
+	# day resolution. Read only: no writer exists yet, and who may set a
+	# range, and in what form, is not settled.
+	# Either end may be absent ("after 1750", "before 1800"); an end before
+	# its start is refused by the database.
+	date_start: Optional[dt_date] = None
+	date_end: Optional[dt_date] = None
 	project_id: Optional[int] = None
 	collection_id: Optional[int] = None
 	created_by: Optional[str] = None
@@ -169,13 +244,11 @@ class RecordRead(RecordBase):
 
 class RecordStatusUpdate(BaseModel):
 	status: RecordStatus
-	rejection_note: Optional[str] = None
 
 
 class BulkStatusUpdate(BaseModel):
 	record_ids: List[int]
 	status: RecordStatus
-	rejection_note: Optional[str] = None
 
 	@field_validator("record_ids")
 	@classmethod
@@ -183,6 +256,44 @@ class BulkStatusUpdate(BaseModel):
 		if not v:
 			raise ValueError("record_ids must not be empty")
 		return v
+
+
+# ==============================================================================
+# Rejection schemas (NEH-208)
+# ==============================================================================
+
+class RecordRejectRequest(BaseModel):
+	predefined_reason: PredefinedRejectionReason
+	comment: Optional[str] = None
+
+
+class RecordRejectionRead(BaseModel):
+	id: int
+	record_id: int
+	predefined_reason: str
+	comment: Optional[str] = None
+	rejected_by: Optional[str] = None
+	rejected_at: Optional[datetime]
+	# The image(s) this specific rejection flagged — both L and R for a
+	# dual-mode document, the one image for single-mode.
+	images: List[RecordImageRead] = []
+
+	class Config:
+		from_attributes = True
+
+
+class RecordStatusChangeRead(BaseModel):
+	id: int
+	# None once the record has been deleted; its history is kept.
+	record_id: Optional[int] = None
+	collection_id: Optional[int] = None
+	from_status: RecordStatus
+	to_status: RecordStatus
+	changed_by: Optional[str] = None
+	changed_at: datetime
+
+	class Config:
+		from_attributes = True
 
 
 # ==============================================================================

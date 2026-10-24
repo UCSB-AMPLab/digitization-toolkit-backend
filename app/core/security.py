@@ -22,19 +22,47 @@ def _b64u_decode(data: str) -> bytes:
     return base64.urlsafe_b64decode(data + padding)
 
 
+# PBKDF2-HMAC-SHA256 work factor. Self-describing hashes allow future increases;
+# login upgrades weaker hashes when the plaintext is available.
+_ALGO = "pbkdf2_sha256"
+PBKDF2_ITERATIONS = 600_000
+_LEGACY_ITERATIONS = 100_000  # original hashes were stored bare as "salt$hash"
+
+
+def _pbkdf2(password: str, salt: str, iterations: int) -> str:
+    return hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), iterations).hex()
+
+
 def hash_password(password: str) -> str:
     salt = secrets.token_hex(16)
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
-    return f"{salt}${dk.hex()}"
+    return f"{_ALGO}${PBKDF2_ITERATIONS}${salt}${_pbkdf2(password, salt, PBKDF2_ITERATIONS)}"
 
 
 def verify_password(password: str, hashed: str) -> bool:
     try:
-        salt, hash_hex = hashed.split("$", 1)
+        parts = hashed.split("$")
+        if len(parts) == 4 and parts[0] == _ALGO:
+            _, iters, salt, digest = parts
+            return hmac.compare_digest(_pbkdf2(password, salt, int(iters)), digest)
+        if len(parts) == 2:
+            # Legacy format: "salt$hash" at the original fixed iteration count.
+            salt, digest = parts
+            return hmac.compare_digest(_pbkdf2(password, salt, _LEGACY_ITERATIONS), digest)
     except Exception:
         return False
-    dk = hashlib.pbkdf2_hmac("sha256", password.encode("utf-8"), salt.encode("utf-8"), 100_000)
-    return hmac.compare_digest(dk.hex(), hash_hex)
+    return False
+
+
+def needs_rehash(hashed: str) -> bool:
+    """True when a stored hash uses a weaker scheme than the current default, so a
+    successful login can transparently re-hash the password at full strength."""
+    parts = hashed.split("$")
+    if len(parts) == 4 and parts[0] == _ALGO:
+        try:
+            return int(parts[1]) < PBKDF2_ITERATIONS
+        except ValueError:
+            return True
+    return True  # legacy 2-part or anything unrecognized
 
 
 def create_access_token(subject: str, expires_seconds: Optional[int] = None) -> str:

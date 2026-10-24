@@ -1,6 +1,6 @@
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
-from typing import List, Optional
+from typing import Iterable, List, Optional
 from sqlalchemy.orm import Session, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
@@ -9,7 +9,9 @@ import logging
 
 from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
-from app.models.record import Record, RecordImage, ExifData, RecordAnnotation
+from datetime import datetime, timezone
+
+from app.models.record import Record, RecordImage, ExifData, RecordAnnotation, RecordRejection
 from app.models.camera import CameraSettings
 from app.models.user import User
 from app.schemas.record import (
@@ -17,17 +19,25 @@ from app.schemas.record import (
 	RecordImageCreate, RecordImageRead, RecordImageUpdate,
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
+	RecordRejectRequest, RecordRejectionRead,
 )
 from app.core.config import settings
-from app.core.paths import resolve_within_storage
+from app.core.db_errors import integrity_conflict
+from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.record_status import change_record_status
+from app.core.capture_counter import next_capture_number
+from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
+from app.core.export_jobs import export_jobs
+from app.core.storage_override import refuse_writes_under_unusable_root
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+allow_reviewer = RoleChecker(["admin", "reviewer"])
 
 # Streamed uploads are copied in 1 MiB chunks so the size cap is enforced as bytes arrive, even when Content-Length is missing or wrong (e.g. chunked encoding).
 _UPLOAD_CHUNK = 1024 * 1024
@@ -52,6 +62,123 @@ def _save_upload_capped(src, dst_path: Path, max_bytes: int) -> int:
 	return total
 
 
+def _serialize_record(rec: Record, include_superseded: bool = False) -> RecordRead:
+	"""RecordRead.model_validate(rec), with images narrowed to current-only by default (NEH-208)."""
+	data = RecordRead.model_validate(rec)
+	if not include_superseded:
+		data.images = [img for img in data.images if img.is_current]
+	return data
+
+
+def _image_files_to_unlink(
+	raw_path: Optional[str],
+	raw_thumbnail_path: Optional[str],
+	sibling_paths: Iterable[Optional[str]] = (),
+) -> List[Path]:
+	"""The files on the card an image row's delete removes: master, `_preview.jpg` sidecar, thumbnail.
+
+	Nothing is unlinked here. The delete handlers call this while they hold the
+	record's row lock, commit the row deletion, and only then pass the list to
+	`_unlink_after_commit` (NEH-262). Unlinking first meant a commit that failed
+	left rows pointing at masters that were already gone.
+
+	A RAW capture occupies two files on the card: the master the row points at,
+	and a JPEG preview the RAW backend writes as `<stem>_preview.jpg`, beside it
+	in the name-based layout and in the volume's `previews/` in the stem layout,
+	which is what the review UI and the thumbnail generator can read. Removing
+	only the master leaves the preview with nothing referencing it, about 2.3 MB
+	per capture; on the Rionegro unit 2,403 such previews hold 5.5 GB of a 115 GB
+	card that reached 100% on 2026-10-14 and stopped capture (NEH-257). They also
+	make the card unreadable as evidence: a preview with no master and no row
+	looks, on the filesystem, exactly like a master that was lost.
+
+	The sidecar's name is derived from the *resolved* path, so it stays inside
+	the storage roots `resolve_within_storage` confines the master to; a row
+	pointing outside them loses neither file. The name is the whole rule, with
+	no suffix check: a JPEG master's `_preview.jpg` is an orphan in the
+	same way, and a suffix list here would be a second copy of the backends'
+	RAW formats to keep in step.
+
+	Because the name comes from the stem, two masters of one frame that differ
+	only in extension — `folio.jpg` and `folio.CR2`, which a multi-format
+	capture writes — name the same sidecar, and deleting either would take the
+	preview the other still needs. `sibling_paths` carries the stored paths of
+	the rows that will survive this delete; the sidecar is left out of the list
+	if any of them resolves to a master naming it. The master is in the list
+	either way, since the row pointing at it is going.
+
+	The thumbnail is included only when its stored path resolves inside the
+	storage roots, the same confinement the master gets.
+
+	The sidecar's name comes from `preview_sidecar_of` in app/core/paths.py,
+	which every site that derives it shares (NEH-264). `capture/service.py`
+	uses it too when it rolls back a capture that never reached the manifest;
+	that rollback and these handlers share the name rule and nothing else.
+	"""
+	paths: List[Path] = []
+	master = resolve_within_storage(raw_path)
+	if master is not None:
+		paths.append(master)
+		sidecar = preview_sidecar_of(master)
+		shared = False
+		for raw_sibling in sibling_paths:
+			sibling = resolve_within_storage(raw_sibling)
+			if sibling is not None and preview_sidecar_of(sibling) == sidecar:
+				shared = True
+				break
+		if not shared:
+			paths.append(sidecar)
+	thumbnail = resolve_within_storage(raw_thumbnail_path)
+	if thumbnail is not None:
+		paths.append(thumbnail)
+	return paths
+
+
+def _unlink_after_commit(paths: Iterable[Path]) -> List[str]:
+	"""Unlink files whose rows a committed transaction has already removed (NEH-262).
+
+	Called only after the commit succeeds. A file that cannot be unlinked is
+	logged at WARNING with its path and the next one is tried; the request still
+	succeeds, because the rows are gone and cannot be brought back from here.
+	That leaves a file on the card with no row, which can be found and removed
+	later. The opposite order left a row pointing at a master that no longer
+	existed, which cannot be repaired. A file already missing is not an error.
+
+	Returns the names of the files that could not be unlinked, in order, so the
+	handler can report them to the client (NEH-263); empty when every file went.
+	"""
+	not_removed: List[str] = []
+	for path in paths:
+		try:
+			path.unlink(missing_ok=True)
+		except OSError as e:
+			logger.warning(f"Row deleted but file could not be unlinked, left on disk: {path}: {e}")
+			not_removed.append(path.name)
+	return not_removed
+
+
+def _delete_response(detail: str, not_removed: List[str]) -> dict:
+	"""A delete endpoint's JSON body: `detail`, plus `not_removed` only when a file stayed on disk."""
+	body = {"detail": detail}
+	if not_removed:
+		body["not_removed"] = not_removed
+	return body
+
+
+def _collection_of(rec: Optional[Record]) -> List[int]:
+	"""The record's collection id as a list for export_jobs.hold_for_file_changes; empty when it has none."""
+	return [rec.collection_id] if rec is not None and rec.collection_id is not None else []
+
+
+def _supersede_current_images(record: Record) -> None:
+	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
+	now = datetime.now(timezone.utc)
+	for img in record.images:
+		if img.is_current:
+			img.is_current = False
+			img.superseded_at = now
+
+
 # ==============================================================================
 # Record endpoints (archival documents/objects)
 # ==============================================================================
@@ -66,14 +193,13 @@ def create_record(
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
-		object_typology=rec_in.object_typology,
 		author=rec_in.author,
-		material=rec_in.material,
 		date=rec_in.date,
 		custom_attributes=rec_in.custom_attributes,
 		project_id=rec_in.project_id,
 		collection_id=rec_in.collection_id,
 		created_by=rec_in.created_by or current_user.username,
+		capture_mode=rec_in.capture_mode,
 	)
 	try:
 		db.add(rec)
@@ -81,7 +207,7 @@ def create_record(
 		db.refresh(rec)
 	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail=f"Database integrity error: {str(e)}")
+		raise integrity_conflict(e)
 	
 	return RecordRead.model_validate(rec)
 
@@ -92,7 +218,6 @@ def list_records(
 	limit: int = Query(default=100, ge=1, le=1000),
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
-	object_typology: Optional[str] = Query(default=None, description="Filter by object type"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
@@ -105,8 +230,6 @@ def list_records(
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
 		query = query.filter(Record.collection_id == collection_id)
-	if object_typology is not None:
-		query = query.filter(Record.object_typology == object_typology)
 	if orphaned is True:
 		query = query.filter(Record.project_id == None, Record.collection_id == None)
 	
@@ -126,7 +249,7 @@ def list_records(
 	else:
 		query = query.order_by(Record.id)
 	recs = query.offset(skip).limit(limit).all()
-	return [RecordRead.model_validate(r) for r in recs]
+	return [_serialize_record(r) for r in recs]
 
 
 @router.get("/count")
@@ -155,7 +278,7 @@ def get_record(
 	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.patch("/{rec_id}", response_model=RecordRead)
@@ -165,11 +288,15 @@ def update_record(
 	current_user: User = Depends(allow_contributor),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Update a record's descriptive metadata."""
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	"""Update a record's descriptive metadata, and its parent while it is still
+	the operator's.
+
+	The row is locked because the decision below reads the status (NEH-260).
+	"""
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+
 	data = payload.model_dump(exclude_unset=True)
 
 	# A record has at most one parent: reject setting both, null the opposite when one is set
@@ -182,17 +309,33 @@ def update_record(
 	elif set_collection:
 		data["project_id"] = None
 
+	# Moving a record between collections is a withdrawal once it has been
+	# handed over, and the handover is a per-collection act by ruling
+	# (NEH-260): take the collection back, move what you like, promote it
+	# again. Without this check the whole-collection rule was reachable one
+	# record at a time — move it out, take the collection it landed in back,
+	# move it home — and it came back as the operator's while its siblings
+	# stayed in the queue. No race needed, three ordinary calls.
+	#
+	# Only a move is refused. Retitling or redating a record under review is
+	# ordinary cataloguing work and stays open to whoever may edit it.
+	if "project_id" in data or "collection_id" in data:
+		new_parent = (data.get("project_id", rec.project_id),
+		              data.get("collection_id", rec.collection_id))
+		if new_parent != (rec.project_id, rec.collection_id):
+			assert_movable(rec)
+
 	for field, value in data.items():
 		setattr(rec, field, value)
 
 	db.add(rec)
 	try:
 		db.commit()
-	except IntegrityError:
+	except IntegrityError as e:
 		db.rollback()
-		raise HTTPException(status_code=409, detail="Record parent assignment violates a database constraint")
+		raise integrity_conflict(e)
 	db.refresh(rec)
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.delete("/{rec_id}")
@@ -202,7 +345,7 @@ def delete_record(
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Delete a record and all its associated images (CASCADE)."""
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
@@ -216,18 +359,23 @@ def delete_record(
 	# Count images before delete/commit; rec.images is unusable once the row is expired
 	image_count = len(rec.images)
 
-	# Clean up image files and thumbnails; only unlink paths inside storage
+	# Collect the image files, their preview sidecars and thumbnails while the
+	# row lock is held; only paths inside storage are collected. They are
+	# unlinked after the commit, so a failed commit leaves every file in place
+	# (NEH-262). No sibling check here, unlike the single-image delete: every
+	# image of the record is going, so no surviving row can still need a
+	# sidecar two of these masters share.
+	files_to_unlink: List[Path] = []
 	for img in rec.images:
-		file_path = resolve_within_storage(img.file_path)
-		if file_path:
-			file_path.unlink(missing_ok=True)
-		thumbnail_path = resolve_within_storage(img.thumbnail_path)
-		if thumbnail_path:
-			delete_thumbnail(str(thumbnail_path))
+		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
 
-	db.delete(rec)
-	db.commit()
-	return {"detail": f"Record {rec_id} and {image_count} images deleted"}
+	# An export of the record's collection reads these files; refused while one
+	# runs. No check of the storage root here: a delete creates nothing.
+	with export_jobs.hold_for_file_changes(_collection_of(rec)):
+		db.delete(rec)
+		db.commit()
+		not_removed = _unlink_after_commit(files_to_unlink)
+	return _delete_response(f"Record {rec_id} and {image_count} images deleted", not_removed)
 
 
 # ==============================================================================
@@ -249,11 +397,21 @@ async def add_image_to_record(
 	Upload and attach an image to an existing record.
 	This is used when adding captures to a multi-page document.
 	"""
-	# Verify record exists
-	rec = db.query(Record).filter(Record.id == rec_id).first()
+	# Lock order, the same on every path that takes both: the record's row,
+	# then its volume's. The record is locked here, and the stem check below
+	# locks the volume. Read unlocked, the record was still locked later, by
+	# the image insert's foreign-key check (FOR KEY SHARE), after the volume:
+	# the opposite order to a retake, and the two deadlocked on PostgreSQL.
+	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
+	# An upload is a capture event for the record's volume, refused on the
+	# same terms as a capture, before anything is written.
+	if rec.collection_id is None:
+		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
+	if volume_lacks_stem(db, rec.collection_id):
+		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
 	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
@@ -262,9 +420,15 @@ async def add_image_to_record(
 			detail=f"Invalid file type. Allowed: {', '.join(allowed_types)}"
 		)
 	
-	# Create upload directory
-	uploads_dir = settings.data_dir / "uploads"
-	uploads_dir.mkdir(parents=True, exist_ok=True)
+	# The record's volume has a stem (refused above otherwise), so the upload
+	# goes to `<stem>/captures/` and its thumbnail to `<stem>/thumbnails/`, as
+	# a capture does, under a uuid name.
+	from capture.project_manager import ensure_volume_dirs
+	from app.core.paths import CAPTURES_DIR, THUMBNAILS_DIR
+
+	volume = ensure_volume_dirs(rec.collection.filename_stem)
+	uploads_dir = volume / CAPTURES_DIR
+	thumbnails_dir = volume / THUMBNAILS_DIR
 	
 	# Generate unique filename
 	ext = Path(file.filename).suffix if file.filename else ".jpg"
@@ -303,7 +467,6 @@ async def add_image_to_record(
 	# Generate thumbnail
 	thumbnail_path = None
 	try:
-		thumbnails_dir = settings.data_dir / "thumbnails"
 		thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
 	except Exception as e:
 		logger.warning(f"Failed to generate thumbnail for {file.filename}: {e}")
@@ -327,13 +490,22 @@ async def add_image_to_record(
 	
 	db.add(img)
 	try:
+		# An upload is one capture event for the record's volume, counted in
+		# the transaction that writes its image.
+		next_capture_number(db, rec.collection_id)
 		db.commit()
 	except Exception as e:
 		db.rollback()
 		# The DB row never persisted, so unlink the saved file and thumbnail to avoid orphaned files no record will reference.
-		file_path.unlink(missing_ok=True)
-		if thumbnail_path:
-			delete_thumbnail(str(thumbnail_path))
+		# A file that cannot be unlinked is logged at WARNING with its path and left on disk; the response is the 500 below either way.
+		try:
+			file_path.unlink(missing_ok=True)
+		except OSError as unlink_error:
+			logger.warning(f"Upload not recorded and its file could not be unlinked, left on disk: {file_path}: {unlink_error}")
+		try:
+			delete_thumbnail(thumbnail_path)
+		except OSError as unlink_error:
+			logger.warning(f"Upload not recorded and its thumbnail could not be unlinked, left on disk: {thumbnail_path}: {unlink_error}")
 		logger.exception(f"Failed to persist image record: {e}")
 		raise HTTPException(status_code=500, detail="Failed to save image record")
 	db.refresh(img)
@@ -344,19 +516,21 @@ async def add_image_to_record(
 @router.get("/{rec_id}/images", response_model=List[RecordImageRead])
 def list_record_images(
 	rec_id: int,
+	include_superseded: bool = Query(default=False, description="Include images superseded by a recapture (NEH-208)"),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Get all images for a specific record, ordered by sequence."""
+	"""Get all images for a specific record, ordered by sequence. Superseded (rejected-and-replaced) images are excluded by default."""
 	# Verify record exists
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	
-	images = db.query(RecordImage).filter(
-		RecordImage.record_id == rec_id
-	).order_by(RecordImage.sequence.nullslast(), RecordImage.created_at).all()
-	
+
+	query = db.query(RecordImage).filter(RecordImage.record_id == rec_id)
+	if not include_superseded:
+		query = query.filter(RecordImage.is_current.is_(True))
+	images = query.order_by(RecordImage.sequence.nullslast(), RecordImage.created_at).all()
+
 	return [RecordImageRead.model_validate(img) for img in images]
 
 
@@ -407,18 +581,138 @@ def delete_image(
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	
-	# Clean up files; only unlink paths inside storage
+
+	# The same lock delete_record carries, for the same reason (NEH-260).
+	# Until both guards say the same thing, emptying a record is a way around
+	# a locked record. 'rejected' stays unlocked by design, so an emptied
+	# rejected record is still reachable — which is why the promotion
+	# invariant also insists on at least one current image.
+	#
+	# The row is locked, not just read. Unlinking a master is not something a
+	# transaction can take back, and against the unlocked version a concurrent
+	# promotion and approval between this check and the unlink was reproduced:
+	# the file of an approved record was removed on the strength of a status
+	# that had already changed. The lock also stops this delete emptying a
+	# record that another request is promoting (see _apply_status_change).
+	# The files are chosen under this lock and unlinked only once the commit
+	# that removes the row has succeeded (NEH-262).
+	rec = _locked_record(db, img.record_id, with_images=False)
+	# Read the image again now the record is locked: a move that relocated
+	# its file and committed between the first read and the lock would
+	# otherwise leave the old paths in the list below.
+	img = (
+		db.query(RecordImage)
+		.filter(RecordImage.id == img_id)
+		.populate_existing()
+		.first()
+	)
+	if not img:
+		raise HTTPException(status_code=404, detail="Image not found")
+	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
+		raise HTTPException(
+			status_code=409,
+			detail=f"Cannot delete an image from a record with status '{rec.status}'. Move it to 'rejected' first."
+		)
+
+	# Collect the file, its preview sidecar and the thumbnail; only paths inside
+	# storage are collected. The record's other images survive this delete, and one of
+	# them may be a master of the same frame in another format, sharing this
+	# master's stem and therefore its `_preview.jpg` — so they are passed in and
+	# the sidecar is kept if any of them still names it. Superseded images count:
+	# their rows still point at files on the card (NEH-208).
+	siblings = [
+		other.file_path
+		for other in db.query(RecordImage).filter(
+			RecordImage.record_id == img.record_id,
+			RecordImage.id != img.id,
+		)
+	]
+	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
+
+	# An export of the record's collection reads this file if it is current;
+	# refused while one runs, and held from before the delete until the file
+	# is unlinked. A superseded image is not read by an export, so it is not
+	# held. No check of the storage root here: a delete creates nothing.
+	with export_jobs.hold_for_file_changes(_collection_of(rec) if img.is_current else []):
+		record_id = img.record_id
+		db.delete(img)
+
+		# An emptied approved record goes back to the queue, in the same
+		# transaction and under the same row lock as the delete that emptied it.
+		# It used to be a second read-and-write after the commit, which is the
+		# pattern this whole guard exists to remove: the status it read could
+		# already have moved. Counting the siblings rather than reading
+		# rec.images keeps the answer independent of when the delete is flushed.
+		remaining_current = (
+			db.query(RecordImage)
+			.filter(
+				RecordImage.record_id == record_id,
+				RecordImage.is_current.is_(True),
+				RecordImage.id != img_id,
+			)
+			.count()
+		)
+		if rec and rec.status == "approved" and remaining_current == 0:
+			change_record_status(db, rec, "in_review", current_user.username)
+			db.add(rec)
+
+		db.commit()
+		not_removed = _unlink_after_commit(files_to_unlink)
+	return _delete_response("Image deleted", not_removed)
+
+
+# Masters whose bytes a browser cannot display are recognised by
+# `is_raw_suffix` (app/core/paths.py); the RAW backend writes a
+# `<stem>_preview.jpg` sidecar for each one, where preview_sidecar_of places it
+# (capture/backends/gphoto2_backend.py).
+
+# Masters a browser displays as they are, so they are their own preview.
+_BROWSER_DISPLAYABLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
+
+# Content-Type for the stored master. Capture only writes .cr2 among the RAW
+# formats, so that one carries its conventional type; the other RAW suffixes
+# have no registered type and go out as application/octet-stream, which every
+# client saves as a file.
+_MASTER_MEDIA_TYPES = {
+	"jpg": "image/jpeg",
+	"jpeg": "image/jpeg",
+	"png": "image/png",
+	"tiff": "image/tiff",
+	"tif": "image/tiff",
+	"webp": "image/webp",
+	"cr2": "image/x-canon-cr2",
+}
+
+
+def _stored_master(db: Session, img_id: int) -> tuple[RecordImage, Path]:
+	"""The image row and its master's resolved path, or a 404.
+
+	A master whose stored path escapes the storage roots is reported as not
+	found, the same as a missing file.
+	"""
+	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
+	if not img:
+		raise HTTPException(status_code=404, detail="Image not found")
+	if not img.file_path:
+		raise HTTPException(status_code=404, detail="Image has no associated file")
 	file_path = resolve_within_storage(img.file_path)
-	if file_path:
-		file_path.unlink(missing_ok=True)
-	thumbnail_path = resolve_within_storage(img.thumbnail_path)
-	if thumbnail_path:
-		delete_thumbnail(str(thumbnail_path))
-	
-	db.delete(img)
-	db.commit()
-	return {"detail": "Image deleted"}
+	if file_path is None or not file_path.exists():
+		raise HTTPException(status_code=404, detail="File not found on disk")
+	return img, file_path
+
+
+def _raw_preview_sidecar(master: Path) -> Optional[Path]:
+	"""A RAW master's `_preview.jpg` sidecar, if it exists inside the storage roots.
+
+	Returns None for a master that is not RAW, and for a sidecar that is
+	missing or (through a symlink) resolves outside the storage roots.
+	"""
+	if not is_raw_suffix(master):
+		return None
+	sidecar = resolve_within_storage(str(preview_sidecar_of(master)))
+	if sidecar is None or not sidecar.is_file():
+		return None
+	return sidecar
 
 
 @router.get("/images/{img_id}/file")
@@ -427,41 +721,62 @@ def download_image_file(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Download the actual image file."""
-	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
-	if not img:
-		raise HTTPException(status_code=404, detail="Image not found")
-	
-	if not img.file_path:
-		raise HTTPException(status_code=404, detail="Image has no associated file")
+	"""Download the stored master, unchanged, under its own filename.
 
-	# Serve only files contained in the storage roots
-	file_path = resolve_within_storage(img.file_path)
-	if file_path is None or not file_path.exists():
-		raise HTTPException(status_code=404, detail="File not found on disk")
-
-	# For RAW files (e.g. CR2), serve the JPEG preview sidecar so browsers can display it
-	if file_path.suffix.lower() in (".cr2", ".nef", ".arw", ".raf", ".dng"):
-		preview_path = file_path.with_name(file_path.stem + "_preview.jpg")
-		if preview_path.exists():
-			file_path = preview_path
-
-	# Determine media type
-	media_type_map = {
-		"jpg": "image/jpeg",
-		"jpeg": "image/jpeg",
-		"png": "image/png",
-		"tiff": "image/tiff",
-		"tif": "image/tiff",
-		"webp": "image/webp",
-	}
+	A RAW master is sent as RAW bytes. Use `/images/{img_id}/preview` for
+	something a browser can display.
+	"""
+	img, file_path = _stored_master(db, img_id)
 	ext = file_path.suffix.lstrip(".").lower()
-	media_type = media_type_map.get(ext, "application/octet-stream")
-	
+	media_type = _MASTER_MEDIA_TYPES.get(ext, "application/octet-stream")
 	return FileResponse(
 		path=file_path,
 		filename=img.filename,
 		media_type=media_type
+	)
+
+
+@router.get("/images/{img_id}/preview")
+def get_image_preview(
+	img_id: int,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""A browser-displayable image of the capture, sent inline.
+
+	A JPEG, PNG or WebP master is its own preview. A RAW master is shown
+	through its `_preview.jpg` sidecar. Anything else (TIFF, a RAW master
+	without a sidecar) is a 404: this endpoint never sends RAW bytes.
+	"""
+	img, file_path = _stored_master(db, img_id)
+	suffix = file_path.suffix.lower()
+
+	if suffix in _BROWSER_DISPLAYABLE_SUFFIXES:
+		ext = suffix.lstrip(".")
+		return FileResponse(
+			path=file_path,
+			filename=img.filename,
+			media_type=_MASTER_MEDIA_TYPES[ext],
+			content_disposition_type="inline",
+		)
+
+	if is_raw_suffix(file_path):
+		sidecar = _raw_preview_sidecar(file_path)
+		if sidecar is None:
+			raise HTTPException(
+				status_code=404,
+				detail="No JPEG preview exists for this RAW image",
+			)
+		return FileResponse(
+			path=sidecar,
+			filename=preview_sidecar_of(Path(img.filename)).name,
+			media_type="image/jpeg",
+			content_disposition_type="inline",
+		)
+
+	raise HTTPException(
+		status_code=404,
+		detail=f"No browser-displayable preview for {suffix or 'this'} images",
 	)
 
 
@@ -471,7 +786,11 @@ def get_image_thumbnail(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Download the thumbnail for an image. Generates it on demand if missing."""
+	"""Download the thumbnail for an image. Generates it on demand if missing.
+
+	For a RAW master the thumbnail is generated from its `_preview.jpg`
+	sidecar when one exists, as capture does.
+	"""
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
@@ -484,10 +803,16 @@ def get_image_thumbnail(
 		source_path = resolve_within_storage(img.file_path)
 		if source_path is None or not source_path.exists():
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
+		thumb_source = _raw_preview_sidecar(source_path) or source_path
+		# The thumbnail is written beside the source. A source under an
+		# override root that cannot take writes is refused (503) before the
+		# thumbnail's mkdir, rather than writing onto the SD card.
+		refuse_writes_under_unusable_root([source_path])
 		try:
-			# Store alongside the source: PROJECTS_ROOT/{project}/images/thumbnails/
+			# Next to the source's directory: `<stem>/thumbnails/` for a master in
+			# `<stem>/captures/`, `.../images/thumbnails/` for one in `.../images/main/`.
 			thumbnails_dir = source_path.parent.parent / "thumbnails"
-			generated = generate_thumbnail(source_path, thumbnails_dir)
+			generated = generate_thumbnail(thumb_source, thumbnails_dir)
 			if generated:
 				img.thumbnail_path = generated
 				db.add(img)
@@ -593,17 +918,127 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def _locked_record(db: Session, rec_id: int, with_images: bool = True):
+	"""Load a record with its row locked for the rest of the transaction.
+
+	The record row is the mutex for its own workflow state: status moves and
+	changes to which images are current both take it, so a check made under it
+	is still true at commit. `of=Record` keeps the lock off the images, which
+	arrive through a LEFT OUTER JOIN — PostgreSQL refuses FOR UPDATE on the
+	nullable side of one.
+
+	On SQLite, which the test suite runs on, SQLAlchemy emits no FOR UPDATE at
+	all, so the tests exercise the surrounding logic and cannot demonstrate the
+	locking. That is verified by reading the emitted SQL, not by the suite.
+	"""
+	return _locked_record_query(db, rec_id, with_images).first()
+
+
+def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
+	"""The query _locked_record runs. Split out so a test can compile it
+	against the PostgreSQL dialect and read the lock clause off the SQL, which
+	is the only way to check it without a server — see
+	tests/unit/test_workflow_row_locking.py."""
+	query = db.query(Record)
+	if with_images:
+		query = query.options(joinedload(Record.images))
+	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+
+
+def is_movable(rec: Record) -> bool:
+	"""May this record change parents?
+
+	Only while it is still the operator's. Moving a handed-over record out of
+	its collection withdraws it from the review it is waiting for, and the
+	ruling of 2026-10-17 is that a withdrawal is a per-collection act
+	(NEH-260).
+	"""
+	return rec.status == "captured"
+
+
+def assert_movable(rec: Record) -> None:
+	"""Refuse a parent change on a record that is no longer the operator's.
+
+	Four routes change an existing record's parent: PATCH /records/{id},
+	POST /collections/{id}/move-records, and the two project attach/detach
+	routes. They all call this. The first version of this guard covered only
+	the two that were being edited at the time, and an adversarial round
+	defeated the rule through the project routes in two calls — so the
+	enumeration matters more than the check does.
+	"""
+	if not is_movable(rec):
+		raise HTTPException(
+			status_code=409,
+			detail=(
+				f"Record {rec.id} has status '{rec.status}' and cannot be moved. "
+				f"Take its collection back first, which returns the whole handover "
+				f"to the operator, then move it."
+			)
+		)
+
+
+def _assert_promotable(rec: Record) -> None:
+	"""
+	Refuse to let a record leave 'captured' unless the work is there to hand
+	over: at least one current image, and no current image carrying a
+	rejection_id (NEH-260).
+
+	The second clause is the substantive test. rejection_id is written in
+	reject_record below, on the images current at the moment of rejection, and
+	a retake supersedes those while the replacements carry none — so a marked
+	current image means the rejection has not been answered. The first clause
+	closes a vacuous pass: delete every current image and a purely negative
+	predicate holds on a record with nothing in it.
+
+	Two limits, stated rather than left to be found. This proves that no marked
+	image is still current, not that the work was redone — nothing links a
+	replacement image back to the rejection it answers. And rejection_id is
+	declared ondelete="SET NULL", so deleting a RecordRejection row would null
+	the link on images that are still current and still the rejected bytes. No
+	endpoint deletes rejections today; one added later has to account for it.
+	"""
+	current = [img for img in rec.images if img.is_current]
+	if not current:
+		raise HTTPException(
+			status_code=422,
+			detail=f"Record {rec.id} has no current image, so there is nothing to hand over."
+		)
+	marked = sorted(img.id for img in current if img.rejection_id is not None)
+	if marked:
+		raise HTTPException(
+			status_code=422,
+			detail=(
+				f"Record {rec.id} still carries the rejected image(s) {marked}. "
+				f"Retake it before handing it over."
+			)
+		)
+
+
 def _apply_status_change(
+	db: Session,
 	rec: Record,
 	new_status: str,
-	rejection_note: Optional[str],
-	user_role: str,
+	user: User,
 ) -> None:
 	"""
 	Validate and apply a status transition on a Record.
 	Raises HTTPException on invalid transition or insufficient role.
+
+	Every promotion goes through here — PATCH /{id}/status, POST /bulk-status
+	and POST /collections/{id}/promote all call it — so the invariant on
+	leaving 'captured' is enforced here rather than at each endpoint.
+
+	Callers must have the record's images loaded AND must hold the record row
+	under SELECT ... FOR UPDATE. Validating a snapshot is not enough: the
+	check and the write have to be one atomic step, or a second request can
+	change what was checked in between. Two sequences were reproduced against
+	the unlocked version — a concurrent reject landing a rejected image back
+	on a record this call then promoted, and a concurrent delete emptying a
+	record this call then promoted. Locking the record row serialises both,
+	because every path that moves a record's status or changes which of its
+	images are current takes the same lock first.
 	"""
-	current_status = rec.status or "captured"
+	current_status = rec.status
 	if current_status == new_status:
 		return  # no-op
 
@@ -613,14 +1048,16 @@ def _apply_status_change(
 			status_code=422,
 			detail=f"Transition '{current_status}' -> '{new_status}' is not allowed."
 		)
-	if user_role not in allowed_roles:
+	if user.role not in allowed_roles:
 		raise HTTPException(
 			status_code=403,
-			detail=f"Your role '{user_role}' cannot perform the '{current_status}' -> '{new_status}' transition."
+			detail=f"Your role '{user.role}' cannot perform the '{current_status}' -> '{new_status}' transition."
 		)
+	# Role first, then state: the wrong role learns nothing about the record.
+	if current_status == "captured":
+		_assert_promotable(rec)
 
-	rec.status = new_status
-	rec.rejection_note = rejection_note if new_status == "rejected" else None
+	change_record_status(db, rec, new_status, user.username)
 
 
 @router.patch("/{rec_id}/status", response_model=RecordRead)
@@ -634,23 +1071,35 @@ def update_record_status(
 	Change the QA status of a record.
 
 	Valid transitions and required roles:
-	- captured  > in_review : operator, admin, reviewer
-	- in_review > rejected  : reviewer, admin
+	- captured  > in_review : operator, admin  (promotion, NEH-260)
 	- in_review > approved  : reviewer, admin
-	- in_review > captured  : operator, admin  (cancel review)
-	- rejected  > captured  : operator, admin  (prepare for retake)
-	- approved  > rejected  : reviewer, admin  (flag for rework)
-	- approved  > captured  : admin only       (full reset)
+	- approved  > in_review : reviewer, admin  (undo a mistaken approve, NEH-209)
+	- rejected  > in_review : reviewer, admin  (undo a mistaken reject, NEH-209)
+	- rejected  > captured  : operator, admin  (prepare for retake, NEH-260)
+
+	Promotion is per record here, but the act an operator performs is per
+	collection: POST /collections/{id}/promote applies it across a
+	collection's captured records, and its inverse takes a handover back.
+	Leaving 'captured' also requires a current image carrying no rejection_id
+	— see _assert_promotable.
+
+	Formal rejection is not reachable through this endpoint — use POST
+	/{rec_id}/reject, which requires a mandatory predefined_reason (NEH-208).
+	A retake only happens via the capture endpoints in app/api/cameras.py: it
+	supersedes the current images, leaves a captured record captured, and
+	moves a rejected one to in_review. The undo transitions above are plain
+	status resets with no new image, no reason and no rejection record; the
+	change itself is dated in record_status_changes, like every other.
 	"""
-	rec = db.query(Record).options(joinedload(Record.images)).filter(Record.id == rec_id).first()
+	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
-	_apply_status_change(rec, payload.status, payload.rejection_note, current_user.role)
+	_apply_status_change(db, rec, payload.status, current_user)
 
 	db.commit()
 	db.refresh(rec)
-	return RecordRead.model_validate(rec)
+	return _serialize_record(rec)
 
 
 @router.post("/bulk-status", response_model=List[RecordRead])
@@ -665,10 +1114,15 @@ def bulk_update_status(
 
 	Returns the updated records.
 	"""
+	# Locked for the same reason the single-record path is, and ordered by id
+	# so two bulk calls over overlapping sets take the rows in the same order
+	# and cannot deadlock against each other.
 	records = (
 		db.query(Record)
 		.options(joinedload(Record.images))
 		.filter(Record.id.in_(payload.record_ids))
+		.order_by(Record.id)
+		.with_for_update(of=Record)
 		.all()
 	)
 	if not records:
@@ -678,18 +1132,11 @@ def bulk_update_status(
 	updated: list[Record] = []
 
 	for rec in records:
-		current_status = rec.status or "captured"
-		if current_status == payload.status:
-			updated.append(rec)
-			continue
-
-		allowed_roles = STATUS_TRANSITIONS.get((current_status, payload.status))
-		if allowed_roles is None or current_user.role not in allowed_roles:
+		try:
+			_apply_status_change(db, rec, payload.status, current_user)
+		except HTTPException:
 			skipped.append(rec.id)
 			continue
-
-		rec.status = payload.status
-		rec.rejection_note = payload.rejection_note if payload.status == "rejected" else None
 		updated.append(rec)
 
 	db.commit()
@@ -699,4 +1146,77 @@ def bulk_update_status(
 	if skipped:
 		logger.info(f"bulk-status: skipped {len(skipped)} records (invalid transition or insufficient role): {skipped}")
 
-	return [RecordRead.model_validate(r) for r in updated]
+	return [_serialize_record(r) for r in updated]
+
+
+# ==============================================================================
+# Rejection endpoints (NEH-208)
+# ==============================================================================
+
+@router.post("/{rec_id}/reject", response_model=RecordRead)
+def reject_record(
+	rec_id: int,
+	payload: RecordRejectRequest,
+	current_user: User = Depends(allow_reviewer),
+	db: Session = Depends(get_db_dependency)
+):
+	"""
+	Reject a record's current capture with a mandatory predefined reason.
+
+	Flags every current image as part of this rejection's audit trail (for a
+	dual-mode record that's both L and R — a dual-camera pair can only ever be
+	redone together, never one side alone) and moves the record to
+	'rejected'. Rejected images are never deleted or overwritten; they stay
+	queryable via GET /{rec_id}/rejections after a recapture supersedes them.
+	"""
+	# Locked: this writes rejection_id onto the current images and moves the
+	# status, both of which the promotion invariant reads (NEH-260).
+	rec = _locked_record(db, rec_id)
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	if rec.status != "in_review":
+		raise HTTPException(
+			status_code=422,
+			detail=f"Cannot reject a record with status '{rec.status}'. Only 'in_review' records can be rejected."
+		)
+
+	current_images = [img for img in rec.images if img.is_current]
+
+	rejection = RecordRejection(
+		record_id=rec.id,
+		predefined_reason=payload.predefined_reason,
+		comment=payload.comment,
+		rejected_by=current_user.username,
+	)
+	db.add(rejection)
+	db.flush()  # assign rejection.id before linking images
+
+	for img in current_images:
+		img.rejection_id = rejection.id
+
+	change_record_status(db, rec, "rejected", current_user.username)
+
+	db.commit()
+	db.refresh(rec)
+	return _serialize_record(rec)
+
+
+@router.get("/{rec_id}/rejections", response_model=List[RecordRejectionRead])
+def list_record_rejections(
+	rec_id: int,
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""List a record's rejection history, newest first, each with the image(s) it flagged."""
+	rec = db.query(Record).filter(Record.id == rec_id).first()
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+
+	rejections = (
+		db.query(RecordRejection)
+		.options(joinedload(RecordRejection.images))
+		.filter(RecordRejection.record_id == rec_id)
+		.order_by(RecordRejection.rejected_at.desc())
+		.all()
+	)
+	return [RecordRejectionRead.model_validate(r) for r in rejections]

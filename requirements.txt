@@ -24,6 +24,12 @@ pytest==9.0.2
 httpx==0.28.1
 python-multipart==0.0.20
 
+# IANA time zone data for GET /activity/daily?tz=. zoneinfo falls back to this
+# package when the image has no system zone files (python:3.11-slim may have
+# none). The pixi environment already gets conda-forge tzdata as a dependency
+# of python, so pixi.toml and pixi.lock are unchanged.
+tzdata>=2024.1
+
 # Image processing
 Pillow>=11.0.0
 piexif>=1.1.3
@@ -37,6 +43,9 @@ bagit>=1.9.0
 # Camera backends
 picamera2>=0.3.33
 gphoto2>=2.6.3,<3
+# CHDK bodies (NEH-231); pinned to a tag, see the note in pixi.toml
+pychdk @ git+https://github.com/UCSB-AMPLab/pychdk@v0.1.3
+pyusb>=1.2,<2
 # numpy 2.x breaks the ABI of the Debian-built picamera2 dependency chain
 # bridged into the native env (simplejpeg first); keep in lockstep with
 # the pixi.toml pin.

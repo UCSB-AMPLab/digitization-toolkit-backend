@@ -119,22 +119,20 @@ def test_schemas():
         project = ProjectCreate(name="Test Project", description="A test project")
         assert project.name == "Test Project"
         
-        # Test record creation with typology
+        # Test record creation (object_typology and material dropped in NEH-259)
         doc = RecordCreate(
             title="Test Record",
             description="A test record",
-            object_typology="book",
             author="John Doe",
-            material="paper",
-            date="2024-01-01"
+            date="2024-01-01",
+            capture_mode="single"
         )
-        assert doc.object_typology == "book"
         assert doc.author == "John Doe"
+        assert doc.capture_mode == "single"
         
         # Test record update
         doc_update = RecordUpdate(
             title="Updated Title",
-            object_typology="document",
             custom_attributes='{"custom": "value"}'
         )
         assert doc_update.title == "Updated Title"

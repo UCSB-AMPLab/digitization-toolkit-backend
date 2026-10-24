@@ -50,15 +50,19 @@ def get_system_logs(
 @router.get("/integrity")
 def integrity_check(
     verify_hashes:  bool = Query(default=True, description="Recompute sha256 and compare against the capture manifest"),
-    max_hash_checks: int = Query(default=0, ge=0, description="Cap on files hashed (0 = no cap)"),
+    full: bool = Query(default=False, description="Hash every manifested file. Off by default: a full sweep re-hashes every capture, which is I/O-punishing on a unit holding tens of thousands of images"),
+    max_hash_checks: int = Query(default=1000, ge=1, description="Upper bound on files hashed when not running a full sweep; a random sample is taken above this many eligible files"),
     current_user: User = Depends(allow_admin),
     db: Session        = Depends(get_db_dependency),
 ):
     """Reconcile the database against the image files and the capture manifest.
 
-    Reports images whose files are missing, image files no row or manifest
-    references, bytes that no longer match the capture-time sha256, and parentless
+    Reports images whose files are missing, image files with no row or manifest
+    reference, bytes that no longer match the capture-time sha256, and parentless
     records. Read-only and admin-only. Run after an SD re-clone or DB restore.
+
+    Hash verification defaults to a bounded random sample; pass full=true for the
+    exhaustive (and much slower) sweep.
     """
     from app.core.integrity import run_integrity_check
     from app.core import audit
@@ -66,7 +70,7 @@ def integrity_check(
     report = run_integrity_check(
         db,
         verify_hashes=verify_hashes,
-        max_hash_checks=(max_hash_checks or None),
+        max_hash_checks=(None if full else max_hash_checks),
     )
     summary = report["summary"]
     audit.log_event(
@@ -77,7 +81,9 @@ def integrity_check(
         actor=current_user.username,
         detail=(
             f"missing_files={summary['missing_files']} orphan_files={summary['orphan_files']} "
-            f"manifest_mismatches={summary['manifest_mismatches']} hashes_checked={summary['hashes_checked']}"
+            f"manifest_mismatches={summary['manifest_mismatches']} "
+            f"hashes_checked={summary['hashes_checked']}/{summary['hashes_eligible']} "
+            f"sampled={summary['hash_sampled']}"
         ),
     )
     return report
@@ -105,6 +111,32 @@ def get_temperature(current_user: User = Depends(allow_read_only)):
         return {"temperature": None, "unit": "C", "available": False}
     except (FileNotFoundError, subprocess.TimeoutExpired, Exception):
         return {"temperature": None, "unit": "C", "available": False}
+
+
+@router.get("/catalogue-backup")
+def get_catalogue_backup_state(
+    current_user: User = Depends(allow_read_only),
+    db: Session      = Depends(get_db_dependency),
+):
+    """Report when the catalogue was last verified offsite (NEH-249).
+
+    Read-only, and deliberately visible to every role that can see the rest of
+    the system panel: a backup whose state nobody can see is a backup nobody
+    knows has stopped. `last_verified_at` is null on a unit that has never
+    completed a verified dump, which is the condition worth noticing — it is
+    what was true of the Rionegro unit for the six weeks before its card
+    filled.
+    """
+    from app.core.catalogue_backup import last_verified_backup
+    from app.core.config import settings
+
+    state = last_verified_backup(db)
+    return {
+        "enabled":          bool(settings.OFFSITE_REMOTE.strip()),
+        "last_verified_at": state["verified_at"] if state else None,
+        "object":           state["object"] if state else None,
+        "detail":           state["detail"] if state else None,
+    }
 
 
 # ---------------------------------------------------------------------------
@@ -178,45 +210,53 @@ class ActivateStorageRequest(BaseModel):
 
 @router.get("/storage")
 def get_storage_info(current_user: User = Depends(allow_read_only)):
-    """Return current projects path and disk usage figures."""
-    from app.core.config import settings
-    from app.core.storage_override import get_storage_override, StorageOverrideError
+    """Return current projects path and disk usage figures.
 
-    # An unreadable override is surfaced as an error, not treated as "no override"
-    try:
-        projects_path = settings.projects_dir
-        is_override = get_storage_override() is not None
-    except StorageOverrideError as e:
+    The default root is created if it is missing. An override root never is:
+    when it is missing or not on a mounted drive (see
+    storage_override.override_root_problem) the response says available:false
+    and gives the reason in unavailable_reason, which is null otherwise.
+    """
+    from app.core.config import settings
+    from app.core.storage_override import get_storage_override_or_fallback, override_root_problem
+
+    # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
+    override, override_invalid = get_storage_override_or_fallback()
+    projects_path = settings.projects_dir
+
+    def unavailable(reason: str) -> dict:
         return {
-            "projects_path": None,
-            "is_override":   True,
-            "error":         str(e),
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
+            "projects_path":      str(projects_path),
+            "is_override":        override is not None,
+            "override_invalid":   override_invalid,
+            "total_bytes":        0,
+            "used_bytes":         0,
+            "free_bytes":         0,
+            "available":          False,
+            "unavailable_reason": reason,
         }
 
+    if override is not None:
+        problem = override_root_problem(projects_path)
+        if problem:
+            return unavailable(problem)
+
     try:
-        projects_path.mkdir(parents=True, exist_ok=True)
+        if override is None:
+            projects_path.mkdir(parents=True, exist_ok=True)
         usage = shutil.disk_usage(projects_path)
     except OSError:
-        return {
-            "projects_path": str(projects_path),
-            "is_override":   is_override,
-            "total_bytes":   0,
-            "used_bytes":    0,
-            "free_bytes":    0,
-            "available":     False,
-        }
+        return unavailable("The storage path for projects cannot be read.")
 
     return {
-        "projects_path": str(projects_path),
-        "is_override":   is_override,
-        "total_bytes":   usage.total,
-        "used_bytes":    usage.used,
-        "free_bytes":    usage.free,
-        "available":     True,
+        "projects_path":      str(projects_path),
+        "is_override":        override is not None,
+        "override_invalid":   override_invalid,
+        "total_bytes":        usage.total,
+        "used_bytes":         usage.used,
+        "free_bytes":         usage.free,
+        "available":          True,
+        "unavailable_reason": None,
     }
 
 
@@ -342,7 +382,7 @@ def unmount_device(
 
     msg = "Device unmounted successfully."
     if override_cleared:
-        msg += "Storage reverted to the default."
+        msg += " Storage reverted to the default."
     return {"message": msg, "override_cleared": override_cleared}
 
 
@@ -362,6 +402,13 @@ def activate_storage(
         raise HTTPException(status_code=400, detail="The path does not exist.")
     if not target.is_dir():
         raise HTTPException(status_code=400, detail="The path is not a directory.")
+    # The same test every writer applies to the stored root (see
+    # storage_override.override_root_problem), applied to the target before
+    # anything is created in it: a directory on the root filesystem is on the
+    # SD card, as an empty mount point with no drive mounted is.
+    from app.core.storage_override import override_root_problem
+    if override_root_problem(target):
+        raise HTTPException(status_code=400, detail="The path is not on a mounted drive.")
 
     # Use a clearly-labelled subdirectory so files aren't dumped into the root.
     projects_path = target / "dtk-projects"

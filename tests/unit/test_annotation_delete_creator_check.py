@@ -29,7 +29,7 @@ def _client_as(client, username, role):
 def _make_annotation(db_session, created_by):
     from app.models.record import Record, RecordAnnotation
 
-    rec = Record(title="r", created_by="someone")
+    rec = Record(title="r", created_by="someone", capture_mode="single")
     db_session.add(rec)
     db_session.commit()
 
