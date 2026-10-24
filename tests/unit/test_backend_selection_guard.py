@@ -14,10 +14,11 @@ the first capture, so a guard that lived only in the dispatch would let the
 service start, answer /health, and fail at the moment someone tried to
 photograph something.
 
-This file is deliberately not named for the subsystem it tests.
-tests/conftest.py adds @pytest.mark.camera to any test whose NODE ID contains
-"camera", and CI runs `pytest -m "not camera"` -- so a file or a test named for
-the camera backend would be silently deselected and prove nothing.
+This file is deliberately not named for the subsystem it tests. Until
+2026-10-23 tests/conftest.py added @pytest.mark.camera to any test whose node
+id contained "camera", and CI runs `pytest -m "not camera"`, so a file or a
+test named for the camera backend was silently deselected. It now marks only
+the hardware files in HARDWARE_TEST_FILES (the backend's root conftest.py).
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 """

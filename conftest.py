@@ -197,16 +197,28 @@ def pytest_configure(config):
     )
 
 
+# The files whose tests need camera hardware. Every test in them gets
+# @pytest.mark.camera, which CI deselects with -m "not camera". Marking by
+# file, not by the word "camera" in a test's node id, keeps tests that only
+# talk about cameras (fakes, refusals before any camera is touched) in CI.
+# The only place the camera marker is added automatically (tests/conftest.py
+# does not repeat it).
+HARDWARE_TEST_FILES = (
+    "tests/test_cameras.py",
+    "tests/integration/test_camera_capture_recapture_hardware.py",
+)
+
+
 def pytest_collection_modifyitems(config, items):
     """
     Modify test collection to add markers automatically.
-    
-    - Tests with "camera" in the name get @pytest.mark.camera
-    - Tests with "slow" in the name get @pytest.mark.slow
+
+    - Tests in HARDWARE_TEST_FILES get @pytest.mark.camera
+    - Tests with "backend" in the node id get @pytest.mark.backend
     """
     for item in items:
-        # Auto-mark camera tests
-        if "camera" in item.nodeid.lower():
+        # Auto-mark hardware tests
+        if item.nodeid.split("::", 1)[0] in HARDWARE_TEST_FILES:
             item.add_marker(pytest.mark.camera)
         
         # Auto-mark backend tests
