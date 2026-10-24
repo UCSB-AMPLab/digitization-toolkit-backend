@@ -941,6 +941,32 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
 # Records whose files are stored offsite
 # ---------------------------------------------------------------------------
 
+def offsite_keys_under_volume(db: Session, record_id: int, stem: Optional[str]) -> bool:
+    """Whether every offsite_objects key of the record's images lies under `<tenant>/<stem>/`.
+
+    The way back into a volume for a record that is outside every volume
+    with files offsite: its keys then name that volume again. False when the
+    volume has no stem, the tenant is unset or not a tenant prefix, or the
+    record has no offsite row at all (it needs no way back).
+    """
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    if not stem:
+        return False
+    try:
+        tenant = configured_tenant()
+    except ImageUploadMisconfigured:
+        return False
+    if tenant is None:
+        return False
+    keys = [k for (k,) in (db.query(OffsiteObject.object_key)
+                           .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+                           .filter(RecordImage.record_id == record_id).all())]
+    prefix = f"{tenant}/{stem}/"
+    return bool(keys) and all(k.startswith(prefix) for k in keys)
+
+
 STORED_OFFSITE_MESSAGE = (
     "This record's files are already stored offsite under this volume, "
     "so it cannot be moved to another volume."

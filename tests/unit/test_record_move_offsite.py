@@ -6,7 +6,8 @@ that is elsewhere. Every path that changes records.collection_id answers
 409: PATCH /records/{id} with another parent, POST
 /collections/{id}/move-records, and POST /projects/{id}/add_record/{rec},
 which takes a record out of its volume. A record already outside every
-volume (one that left before these checks existed) is not let into one.
+volume (one that left before these checks existed) is let back only into
+the volume its keys are under, `<tenant>/<stem>/`.
 """
 
 import pytest
@@ -122,7 +123,7 @@ def _put_outside_every_volume(db, rec, project_id):
 
 
 @pytest.mark.unit
-def test_patch_refuses_to_put_a_record_stored_offsite_into_a_volume(admin, db_session):
+def test_patch_refuses_to_put_a_record_stored_offsite_into_a_volume(admin, db_session, tenant):
     a, b, rec, _ = _setup(db_session)
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": b.id})
@@ -132,9 +133,45 @@ def test_patch_refuses_to_put_a_record_stored_offsite_into_a_volume(admin, db_se
     assert db_session.get(type(rec), rec.id).collection_id is None
 
 
+@pytest.fixture
+def tenant(monkeypatch):
+    from app.core import config
+
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", "captua-test")
+
+
 @pytest.mark.unit
-def test_patch_refuses_to_put_a_record_stored_offsite_back_into_its_own_volume(admin, db_session):
-    """Refused too: which volume the keys were frozen under is not checked, any row stops it."""
+def test_patch_puts_a_record_stored_offsite_back_into_the_volume_its_keys_are_under(admin, db_session, tenant):
+    """Its keys name that volume's stem again, so nothing in the bucket is left naming a record elsewhere."""
+    a, _, rec, _ = _setup(db_session)
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})
+    assert response.status_code == 200, response.text
+    db_session.expire_all()
+    back = db_session.get(type(rec), rec.id)
+    assert (back.project_id, back.collection_id) == (None, a.id)
+
+
+@pytest.mark.unit
+def test_the_way_back_is_refused_when_one_key_lies_under_another_volume(admin, db_session, tenant):
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    a, _, rec, _ = _setup(db_session)
+    img = RecordImage(record_id=rec.id, filename="f9.jpg", file_path="/nonexistent/f9.jpg", format="JPG")
+    db_session.add(img)
+    db_session.commit()
+    db_session.add(OffsiteObject(record_image_id=img.id, kind="capture",
+                                 object_key="captua-test/xx-test-002/captures/f9.jpg", local_sha1="1" * 40))
+    db_session.commit()
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})
+    assert response.status_code == 409, response.text
+
+
+@pytest.mark.unit
+def test_the_way_back_is_refused_without_a_configured_tenant(admin, db_session):
+    """The keys cannot be matched to `<tenant>/<stem>/` without the tenant, so the move is refused."""
     a, _, rec, _ = _setup(db_session)
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})

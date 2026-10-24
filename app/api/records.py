@@ -340,11 +340,17 @@ def update_record(
 			# A record whose images are in the bucket stays in its volume:
 			# their keys are under the volume's stem and never change. A
 			# record with such images that is outside every volume (one taken
-			# out before add_record checked this) is not put into one either.
+			# out before add_record checked this) may go back only into the
+			# volume all its keys are under, `<tenant>/<stem>/`.
 			if new_parent[1] != rec.collection_id:
-				from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
+				from app.core.image_upload import (
+					STORED_OFFSITE_MESSAGE, offsite_keys_under_volume, records_stored_offsite)
+				from app.models.collection import Collection
 				if records_stored_offsite(db, [rec.id]):
-					raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
+					target = (db.get(Collection, new_parent[1])
+					          if rec.collection_id is None and new_parent[1] is not None else None)
+					if target is None or not offsite_keys_under_volume(db, rec.id, target.filename_stem):
+						raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
 
 	# A record moved into another volume takes the sequence after the
 	# highest there, so no two records of that volume share one. The volume's
