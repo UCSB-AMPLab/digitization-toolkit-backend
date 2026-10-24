@@ -16,6 +16,7 @@ from app.api.collections import router as collections_router
 from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
 from app.api.activity import router as activity_router
+from app.api.imports import router as imports_router
 
 # Define lifespan event to initialize the database
 @asynccontextmanager
@@ -88,6 +89,7 @@ app.include_router(auth_router, prefix="/auth", tags=["auth"])
 app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(system_router, prefix="/system", tags=["system"])
 app.include_router(activity_router, prefix="/activity", tags=["activity"])
+app.include_router(imports_router, prefix="/imports", tags=["imports"])
 
 
 from app.core.storage_override import StorageUnavailableError
