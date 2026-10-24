@@ -160,18 +160,6 @@ def freed_detail(db: Session, image, kind: str) -> dict:
     }
 
 
-def freed_master_count(db: Session, collection_id: int) -> int:
-    """How many current images of the volume have their master freed (an export reads only those)."""
-    from app.models.record import Record, RecordImage
-
-    return (db.query(RecordImage.id)
-            .join(Record, RecordImage.record_id == Record.id)
-            .filter(Record.collection_id == collection_id,
-                    RecordImage.is_current.is_(True),
-                    RecordImage.master_freed_at.isnot(None))
-            .count())
-
-
 # ---------------------------------------------------------------------------
 # Objects
 # ---------------------------------------------------------------------------
