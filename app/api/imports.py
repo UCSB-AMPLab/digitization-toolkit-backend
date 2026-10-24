@@ -18,7 +18,9 @@ from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core.audit import log_event
 from app.core.list_import import (
+    ListHashNotRecorded,
     ListIdReused,
+    ListUnverifiable,
     ListRefused,
     ListUnreadable,
     ProjectNeedsAdmin,
@@ -70,8 +72,10 @@ def import_digitisation_list(
     A file whose envelope this unit does not read is refused with a 422 and
     nothing is written. A list whose project does not exist yet needs an
     admin: from an operator it is refused with a 403 and nothing is written.
-    A list id already imported from a file with a different SHA-256 is
-    refused with a 409 and nothing is written. Otherwise the response is
+    A list id already imported from a file with a different SHA-256, or
+    whose earlier import's hash cannot be read, is refused with a 409; if
+    the list's hash cannot be recorded, with a 503. Nothing is written in
+    either case. Otherwise the response is
     the report: counts
     `created` and `skipped`, the volumes created, and the `rejects`, each
     with the item's position, referenceCode and reason. `reportStored` says
@@ -92,8 +96,10 @@ def import_digitisation_list(
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
         raise HTTPException(status_code=403, detail=str(exc))
-    except ListIdReused as exc:
+    except (ListIdReused, ListUnverifiable) as exc:
         raise HTTPException(status_code=409, detail=str(exc))
+    except ListHashNotRecorded as exc:
+        raise HTTPException(status_code=503, detail=str(exc))
 
     stored = report["reportStored"]
 

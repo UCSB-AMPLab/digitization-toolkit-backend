@@ -973,3 +973,127 @@ def test_an_ordinary_reject_says_its_code_is_not_truncated(client, db_session, r
     _as("op", "admin")
     report = _post_fixture(client, REJECTS).json()
     assert all(r["referenceCodeTruncated"] is False for r in report["rejects"])
+
+
+# ---------------------------------------------------------------------------
+# The hash check cannot be skipped
+# ---------------------------------------------------------------------------
+
+def _second_import(db_session):
+    import app.core.list_import as li
+
+    return li.import_list(db_session, _list_with([_item(code="xx-test-902", stem="xx-test-902")]),
+                          "a", True, file_sha256="2" * 64)
+
+
+@pytest.mark.unit
+def test_the_first_import_records_the_lists_hash(db_session, reports_root):
+    import app.core.list_import as li
+
+    li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    assert (reports_root / VALID_ID / "sha256").read_text().strip() == "1" * 64
+    assert not list((reports_root / VALID_ID).glob(".tmp-*"))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("damage", ["garbage", "chmod000", "not_stored", "no_hash_in_report"])
+def test_a_damaged_earlier_run_still_refuses_different_content(db_session, reports_root, monkeypatch, damage):
+    import app.core.list_import as li
+
+    def fail(report):
+        raise OSError(28, "No space left on device")
+
+    # A context, not monkeypatch.undo(), which would also undo reports_root.
+    with monkeypatch.context() as m:
+        if damage == "not_stored":
+            m.setattr(li, "store_report", fail)
+        first = li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    runs = list((reports_root / VALID_ID).glob("*_run*.json"))
+    if damage == "garbage":
+        runs[0].write_text("{not json")
+    elif damage == "chmod000":
+        runs[0].chmod(0)
+    elif damage == "no_hash_in_report":
+        runs[0].write_text(json.dumps({"listId": VALID_ID}))
+    try:
+        with pytest.raises(li.ListIdReused):
+            _second_import(db_session)
+    finally:
+        for r in runs:
+            r.chmod(0o644)
+    assert first["reportStored"] is (damage != "not_stored")
+    assert "xx-test-902" not in _volumes(db_session)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("damage", ["garbage", "chmod000", "no_hash_in_report"])
+def test_an_unreadable_earlier_run_without_a_hash_file_refuses_any_import(db_session, reports_root, damage):
+    """A run stored before the hash file, or one whose hash file was lost: nothing to check against."""
+    import app.core.list_import as li
+
+    li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    (reports_root / VALID_ID / "sha256").unlink()
+    (run,) = (reports_root / VALID_ID).glob("*_run*.json")
+    if damage == "garbage":
+        run.write_text("{not json")
+    elif damage == "chmod000":
+        run.chmod(0)
+    else:
+        run.write_text(json.dumps({"listId": VALID_ID}))
+    try:
+        with pytest.raises(li.ListUnverifiable):
+            li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    finally:
+        run.chmod(0o644)
+    assert not (reports_root / VALID_ID / "sha256").exists()
+    assert len(list((reports_root / VALID_ID).glob("*_run*.json"))) == 1
+
+
+@pytest.mark.unit
+def test_a_readable_earlier_run_without_a_hash_file_is_checked_and_the_file_written(db_session, reports_root):
+    import app.core.list_import as li
+
+    li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    (reports_root / VALID_ID / "sha256").unlink()
+    with pytest.raises(li.ListIdReused):
+        _second_import(db_session)
+    li.import_list(db_session, _list_with([_item()]), "a", True, file_sha256="1" * 64)
+    assert (reports_root / VALID_ID / "sha256").read_text().strip() == "1" * 64
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("damage", ["chmod000", "garbage"])
+def test_an_unreadable_hash_file_refuses_the_import_with_a_409(client, db_session, reports_root, damage):
+    from app.models.project import Project
+
+    _as("op", "admin")
+    assert _post_fixture(client, VALID).status_code == 200
+    sha = reports_root / VALID_ID / "sha256"
+    if damage == "chmod000":
+        sha.chmod(0)
+    else:
+        sha.write_text("not a hash")
+    try:
+        resp = _post_fixture(client, VALID)
+    finally:
+        sha.chmod(0o644)
+    assert resp.status_code == 409
+    assert resp.json()["detail"] == "An earlier import of this list cannot be checked."
+    assert len(list((reports_root / VALID_ID).glob("*_run*.json"))) == 1
+    assert db_session.query(Project).count() == 1
+
+
+@pytest.mark.unit
+def test_a_hash_file_that_cannot_be_written_refuses_the_import(client, db_session, reports_root, monkeypatch):
+    import app.core.list_import as li
+    from app.models.project import Project
+
+    def fail(directory, digest):
+        raise OSError(30, "Read-only file system")
+
+    monkeypatch.setattr(li, "_write_hash_file", fail)
+    _as("op", "admin")
+    resp = _post_fixture(client, VALID)
+    assert resp.status_code == 503
+    assert db_session.query(Project).count() == 0
+    assert _volumes(db_session) == {}

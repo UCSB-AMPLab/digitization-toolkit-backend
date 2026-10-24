@@ -514,15 +514,38 @@ class ListIdReused(Exception):
 LIST_ID_REUSED_MESSAGE = "This list id was already imported with different content."
 
 
+class ListUnverifiable(Exception):
+    """An earlier import of this list id exists but its hash cannot be read; nothing has been written."""
+
+
+LIST_UNVERIFIABLE_MESSAGE = "An earlier import of this list cannot be checked."
+
+
+class ListHashNotRecorded(Exception):
+    """The list's hash file could not be written, so the import was not started."""
+
+
+LIST_HASH_NOT_RECORDED_MESSAGE = (
+    "Captua could not record this list's hash on the unit, so it did not import the list."
+)
+
+HASH_FILE_NAME = "sha256"
+_SHA256_RE = re.compile(r"[0-9a-f]{64}")
+
+
 def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool,
                 file_sha256: Optional[str] = None) -> dict:
     """Import a digitisation list, store its report, and return it.
 
     Raises, before writing anything to the database or a report:
     - ListRefused, when the envelope is not one this importer reads;
-    - ListIdReused, when an earlier stored run of the same list id records
-      a `fileSha256` other than `file_sha256` (an identical file may be
+    - ListIdReused, when the list id was imported before from a file with
+      a SHA-256 other than `file_sha256` (an identical file may be
       imported again);
+    - ListUnverifiable, when the list id was imported before and that
+      import's hash cannot be read (see _check_hash);
+    - ListHashNotRecorded, when this is the list id's first hash and the
+      hash file cannot be written;
     - ProjectNeedsAdmin, when no project matches the list's name and
       `may_create_project` is false.
     Otherwise commits the project (if new) and then each volume on its own,
@@ -543,9 +566,7 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
     with _list_lock(list_id):
         if file_sha256 is not None:
-            for earlier in _earlier_hashes(list_id):
-                if earlier is not None and earlier != file_sha256:
-                    raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+            _check_hash(reports_dir() / list_id, list_id, file_sha256)
         report = _import_items(db, list_id, list_name, items, actor, may_create_project,
                                notes=document["list"].get("notes"))
         report["fileSha256"] = file_sha256
@@ -599,15 +620,65 @@ def _run_files(directory: Path, list_id: str) -> list[tuple[int, Path]]:
 _RUN_RE = re.compile(r"run(\d+)\.json")
 
 
-def _earlier_hashes(list_id: str) -> list:
-    """The fileSha256 of each stored run of a list; None for a run that cannot be read or has none."""
-    hashes = []
-    for _, path in _run_files(reports_dir() / list_id, list_id):
+def _check_hash(directory: Path, list_id: str, file_sha256: str) -> None:
+    """Refuse a file whose SHA-256 is not the one this list id was first imported with.
+
+    Called under the list lock, before anything is created. The list's hash
+    is kept in `<directory>/sha256`, written by the first import before it
+    creates anything, so it exists even when that import's report could not
+    be stored, and damage to a report cannot hide it.
+
+    - With a hash file: it is the reference. If it cannot be read or does
+      not hold a hash, ListUnverifiable.
+    - Without one: every stored run is read for its fileSha256 (runs
+      stored before hash files existed). A run that cannot be read, or has
+      no hash, is ListUnverifiable. A run with another hash is
+      ListIdReused. Otherwise the hash file is written now, and if that
+      fails, ListHashNotRecorded.
+    """
+    hash_file = directory / HASH_FILE_NAME
+    if hash_file.exists():
         try:
-            hashes.append(json.loads(path.read_text(encoding="utf-8")).get("fileSha256"))
+            recorded = hash_file.read_text(encoding="ascii").strip()
+        except (OSError, UnicodeDecodeError):
+            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+        if not _SHA256_RE.fullmatch(recorded):
+            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+        if recorded != file_sha256:
+            raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+        return
+    for _, path in _run_files(directory, list_id):
+        try:
+            earlier = json.loads(path.read_text(encoding="utf-8")).get("fileSha256")
         except (OSError, ValueError, AttributeError):
-            hashes.append(None)
-    return hashes
+            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+        if not isinstance(earlier, str):
+            raise ListUnverifiable(LIST_UNVERIFIABLE_MESSAGE)
+        if earlier != file_sha256:
+            raise ListIdReused(LIST_ID_REUSED_MESSAGE)
+    try:
+        _write_hash_file(directory, file_sha256)
+    except OSError:
+        logger.exception("Could not record the hash of list %s", list_id)
+        raise ListHashNotRecorded(LIST_HASH_NOT_RECORDED_MESSAGE)
+
+
+def _write_hash_file(directory: Path, digest: str) -> None:
+    """Write `<directory>/sha256` through a temporary file and a rename."""
+    directory.mkdir(parents=True, exist_ok=True)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".sha256")
+    try:
+        with os.fdopen(fd, "w", encoding="ascii") as handle:
+            handle.write(digest + "\n")
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, directory / HASH_FILE_NAME)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _next_run_number(directory: Path, list_id: str) -> int:
