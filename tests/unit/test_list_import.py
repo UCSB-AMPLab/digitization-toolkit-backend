@@ -685,7 +685,9 @@ def test_nan_and_infinity_are_refused(client500, db_session, reports_root, const
 def test_a_number_beyond_the_parsers_digit_limit_is_a_400(client500, db_session, reports_root):
     _as("op", "admin")
     body = _single().replace('"sequence": 1', '"sequence": 1, "extent": ' + "9" * 5000)
-    assert _post(client500, body.encode()).status_code == 400
+    resp = _post(client500, body.encode())
+    assert resp.status_code == 400
+    assert resp.json()["detail"] == "The file contains a number too large to read."
     assert _volumes(db_session) == {}
 
 

@@ -179,10 +179,12 @@ def parse_list_file(raw: bytes) -> Any:
         raise ListUnreadable(f"The file is not valid for import: the key {str(exc)!r} appears twice in one object.")
     except RecursionError:
         raise ListUnreadable("The file is not valid JSON that can be read: it is nested too deeply.")
-    except ValueError as exc:
-        # json.JSONDecodeError, and the ValueError for an integer over the
-        # interpreter's digit limit.
+    except json.JSONDecodeError as exc:
         raise ListUnreadable(f"The file is not valid JSON: {exc}")
+    except ValueError:
+        # The integer-conversion digit limit (sys.set_int_max_str_digits),
+        # whose own text names interpreter settings an operator cannot use.
+        raise ListUnreadable("The file contains a number too large to read.")
 
 
 class ProjectNeedsAdmin(Exception):
