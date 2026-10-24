@@ -895,3 +895,49 @@ def test_a_preview_given_its_digest_by_the_backfill_is_freed(remote, db_session,
     assert result["refused"] == []
     assert not raw_preview.exists()
     assert _image_row(db_session, raw.id).preview_freed_at is not None
+
+
+@pytest.mark.unit
+def test_a_record_let_back_into_the_volume_mid_free_with_files_in_the_old_layout_is_not_freed(
+        remote, db_session, override_projects_root, monkeypatch):
+    """A record outside every volume may come back into the one its keys are under (PATCH /records/{id}).
+
+    If it comes back between the job's _require_own_folder and its reading
+    of the objects, with its files still in a name-based tree, a project
+    rename could move them under the free; such an object is refused.
+    """
+    from datetime import datetime, timezone
+
+    from app.core import offsite_free
+    from app.models.offsite_object import OffsiteObject
+
+    vol, _, _ = _received(db_session, override_projects_root)
+    old = _volume(db_session, name="Sin stem", stem=None)
+    stray = _image(db_session, old, override_projects_root, "f9.jpg", b"jpeg nine")
+    key = f"{TENANT}/{STEM}/captures/f9.jpg"
+    remote.put(key, b"jpeg nine")
+    db_session.add(OffsiteObject(record_image_id=stray.id, kind="capture", object_key=key,
+                                 local_sha1=_sha1(b"jpeg nine"), verified_at=datetime.now(timezone.utc)))
+    rec = stray.record
+    rec.collection_id, rec.project_id = None, old.project_id
+    db_session.commit()
+    stray_path = Path(stray.file_path)
+
+    original = offsite_free._require_own_folder
+    calls = []
+
+    def way_back_after_the_check(db, collection):
+        original(db, collection)
+        calls.append(collection.id)
+        if len(calls) == 2:  # the job's own check, after the request's
+            rec.collection_id, rec.project_id = vol.id, None
+            db.commit()
+
+    monkeypatch.setattr(offsite_free, "_require_own_folder", way_back_after_the_check)
+    result = _free(db_session, vol)
+
+    assert len(calls) == 2
+    assert [(r["image_id"], r["reason"]) for r in result["refused"]] == [(stray.id, "outside_own_folder")]
+    assert result["freed"]["files"] == 3
+    assert stray_path.read_bytes() == b"jpeg nine"
+    assert _image_row(db_session, stray.id).master_freed_at is None

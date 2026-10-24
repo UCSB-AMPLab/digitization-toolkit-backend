@@ -24,13 +24,18 @@ The rules:
 * **Only a volume wholly in `<stem>/`.** A volume with any image still in
   the name-based layout is refused: a project or volume rename moves such
   files under a hold that does not exclude this one, while nothing running
-  moves a file in `<stem>/` (see _require_own_folder).
+  moves a file in `<stem>/` (see _require_own_folder). A record outside
+  every volume can still come back into this one after that check (PATCH
+  /records/{id}, when its keys are under this stem) with its files in a
+  project's tree, so each object whose image is in the name-based layout is
+  refused again when the work list is read, as `outside_own_folder`.
 * **Under hold_for_file_changes**, so no export or offsite read of the
-  volume runs meanwhile. The hold does not exclude another holder; no record
-  being freed can be moved anyway, since each freed image has a verified
-  offsite row and such a record stays in its volume (records_stored_offsite),
-  and a renumber changes sequence only. No database transaction stays
-  open across a listing, a hash or a copy.
+  volume runs meanwhile. The hold does not exclude another holder. No record
+  being freed can leave the volume, since each freed image has a verified
+  offsite row and such a record stays in its volume (records_stored_offsite);
+  one that comes in is covered by the rule above, and a renumber changes
+  sequence only. No database transaction stays open across a listing, a
+  hash or a copy.
 * **The row first, then the file.** A file's freed state is committed under
   its record's row lock, conditional on the row still naming that path, and
   the file is unlinked only after that commit. A failed unlink clears the
@@ -195,6 +200,7 @@ class _Object:
     sha1: str               # the offsite row's local_sha1
     freed_bytes: Optional[int] = None
     capture_id: Optional[str] = None
+    old_layout: bool = False  # storage_ops.image_in_old_layout, as read with the row
 
     def entry(self, **extra) -> dict:
         return {"image_id": self.image_id, "kind": self.kind,
@@ -202,10 +208,22 @@ class _Object:
 
 
 def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
-    """The volume's objects with a verified offsite row, freed or not, in image then kind order."""
+    """The volume's objects with a verified offsite row, freed or not, in image then kind order.
+
+    Each is marked when its image is in the name-based layout. The volume was
+    checked wholly in `<stem>/` a moment before (_require_own_folder), but a
+    record outside every volume may come back into it in between (PATCH
+    /records/{id}, when its keys are under this stem) with its files still
+    in a project's tree, which a rename moves under no hold this one
+    excludes. Freeing refuses such an object (_layout_refusal).
+    """
     from app.core.image_upload import local_file
+    from app.core.storage_ops import image_in_old_layout
+    from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
+
+    collection = db.get(Collection, collection_id)
 
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,
                      RecordImage.master_freed_at, RecordImage.master_freed_bytes,
@@ -224,8 +242,16 @@ def _objects(db: Session, collection_id: int, *, freed: bool) -> list:
         if (at is not None) != freed:
             continue
         out.append(_Object(image_id, record_id, kind, file_path, local_file(kind, file_path), key, sha1, size,
-                           capture_id))
+                           capture_id,
+                           old_layout=collection is None or image_in_old_layout(collection, file_path)))
     return out
+
+
+def _layout_refusal(obj: _Object) -> Optional[dict]:
+    """An object whose image is in the name-based layout stays on the card (see _objects)."""
+    if obj.old_layout:
+        return obj.entry(reason="outside_own_folder")
+    return None
 
 
 @dataclass
@@ -507,7 +533,8 @@ def plan_free(db: Session, collection_id: int) -> dict:
     files, refused = [], []
     index = _fixity_index()
     for obj in objects:
-        refusal = _digest_refusal(obj, index) or _listing_refusal(obj, listed.get(obj.key))
+        refusal = (_layout_refusal(obj) or _digest_refusal(obj, index)
+                   or _listing_refusal(obj, listed.get(obj.key)))
         if refusal is None and (obj.path is None or not obj.path.is_file()):
             refusal = obj.entry(reason="local_file_missing")
         if refusal is not None:
@@ -551,7 +578,7 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
     refused, hashed = [], []
     index = _fixity_index()
     for obj in objects:
-        refusal = _digest_refusal(obj, index)
+        refusal = _layout_refusal(obj) or _digest_refusal(obj, index)
         if refusal is not None:
             refused.append(refusal)
             continue
