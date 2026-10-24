@@ -276,6 +276,7 @@ def db_session(override_projects_root):
     # Import all models so their tables are registered on Base.metadata
     from app.models import (  # noqa: F401
         user, project, project_member, collection, record, camera, system_log,
+        offsite_object,
     )
     
     # Use temporary file-based SQLite for testing
