@@ -50,7 +50,7 @@ from datetime import date, datetime, timezone
 from pathlib import Path
 from typing import Any, Optional
 
-from sqlalchemy.exc import IntegrityError
+from sqlalchemy.exc import IntegrityError, SQLAlchemyError
 from sqlalchemy.orm import Session
 
 # The module, not the settings object, so that a reloaded config is seen.
@@ -78,6 +78,9 @@ _EXTERNAL_ID_MAX_LENGTH = Collection.__table__.columns["external_id"].type.lengt
 _DATE_MAX_LENGTH = Collection.__table__.columns["date"].type.length
 _PROJECT_NAME_MAX_LENGTH = Project.__table__.columns["name"].type.length
 
+# collections.sequence is an Integer, which is int4 on Postgres.
+_SEQUENCE_MIN, _SEQUENCE_MAX = -(2**31), 2**31 - 1
+
 _STEM_RE = re.compile(FILENAME_STEM_PATTERN)
 # date.fromisoformat also takes forms such as 17900101; the contract's dates
 # are ISO calendar dates written out in full.
@@ -102,7 +105,7 @@ REASONS = {
         "characters and whose start and end are ISO dates (YYYY-MM-DD) or null."
     ),
     "end_date_before_start": "The end date is before the start date.",
-    "invalid_sequence": "The sequence is not an integer.",
+    "invalid_sequence": f"The sequence is not an integer from {-(2**31)} to {2**31 - 1}.",
     "reference_code_on_unit": "A volume on this unit already has this referenceCode.",
     "filename_stem_on_unit": "A volume on this unit already has this filenameStem.",
     "refused_by_database": "The database refused the volume.",
@@ -276,7 +279,10 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
 
     sequence = item.get("sequence")
     # bool is an int subclass; true is not a sequence number.
-    if sequence is not None and (isinstance(sequence, bool) or not isinstance(sequence, int)):
+    if sequence is not None and (
+        isinstance(sequence, bool) or not isinstance(sequence, int)
+        or not _SEQUENCE_MIN <= sequence <= _SEQUENCE_MAX
+    ):
         return "invalid_sequence", {}
 
     fisqua = {k: v for k, v in item.items() if k not in MAPPED_ITEM_FIELDS}
@@ -369,6 +375,14 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
             db.rollback()
             reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
             rejects.append(_reject(position, code, reason))
+            continue
+        except SQLAlchemyError:
+            # Any other database failure on this item (a lost connection, a
+            # full disk, a value the driver cannot bind) costs this item
+            # only: it is rolled back and reported, and the import goes on.
+            logger.exception("Import of list %s: item %d refused by the database", list_id, position)
+            db.rollback()
+            rejects.append(_reject(position, code, "refused_by_database"))
             continue
         created.append({
             "position": position,

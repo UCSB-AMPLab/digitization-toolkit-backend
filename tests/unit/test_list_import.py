@@ -589,3 +589,74 @@ def test_the_import_is_logged(client, db_session, reports_root):
     assert entry.actor == "op"
     assert entry.subject == "Prueba de rechazos"
     assert entry.detail == f"list {REJECTS_ID}: 2 created, 8 skipped"
+
+
+# ---------------------------------------------------------------------------
+# One bad item never stops the others
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def client500(db_session):
+    """A client that returns a 500 instead of raising, so a crash shows as a status."""
+    from fastapi.testclient import TestClient
+    from app.main import app
+    from app.api.deps import get_db_dependency
+
+    def override_get_db():
+        yield db_session
+
+    app.dependency_overrides[get_db_dependency] = override_get_db
+    yield TestClient(app, raise_server_exceptions=False)
+    app.dependency_overrides.clear()
+
+
+def _numbered(n, start=1):
+    return [_item(code=f"xx-test-{i:05d}", stem=f"xx-test-{i:05d}") for i in range(start, start + n)]
+
+
+@pytest.mark.unit
+def test_a_database_failure_on_one_item_does_not_stop_the_rest(client500, db_session, reports_root, monkeypatch):
+    """An OperationalError on item 2's commit: items 1 and 3 are created and the report is written."""
+    from sqlalchemy.exc import OperationalError
+
+    real_commit = db_session.commit
+    calls = {"n": 0}
+
+    def flaky():
+        calls["n"] += 1
+        if calls["n"] == 3:  # 1 = the project, 2 = item 1, 3 = item 2
+            raise OperationalError("INSERT", {}, Exception("disk I/O error"))
+        return real_commit()
+
+    monkeypatch.setattr(db_session, "commit", flaky)
+    _as("op", "admin")
+    resp = _post(client500, _list_with(_numbered(3)))
+    monkeypatch.setattr(db_session, "commit", real_commit)
+    assert resp.status_code == 200, resp.text
+    report = resp.json()
+    assert _reasons(report) == [(2, "xx-test-00002", "refused_by_database")]
+    assert report["created"] == 2
+    assert set(_volumes(db_session)) == {"xx-test-00001", "xx-test-00003"}
+    assert report["reportStored"] is True
+    assert len(list(reports_root.rglob("import-report_*.json"))) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("sequence, ok", [
+    (2**63, False), (2**31, False), (-(2**31) - 1, False),
+    (2**31 - 1, True), (-(2**31), True), (0, True),
+])
+def test_sequence_is_bounded_to_int4(client500, db_session, reports_root, sequence, ok):
+    _as("op", "admin")
+    items = [_item(code="xx-test-800", stem="xx-test-800"),
+             _item(code="xx-test-801", stem="xx-test-801", sequence=sequence),
+             _item(code="xx-test-802", stem="xx-test-802")]
+    resp = _post(client500, _list_with(items))
+    assert resp.status_code == 200, resp.text
+    vols = _volumes(db_session)
+    if ok:
+        assert set(vols) == {"xx-test-800", "xx-test-801", "xx-test-802"}
+        assert vols["xx-test-801"].sequence == sequence
+    else:
+        assert _reasons(resp.json()) == [(2, "xx-test-801", "invalid_sequence")]
+        assert set(vols) == {"xx-test-800", "xx-test-802"}
