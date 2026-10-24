@@ -29,6 +29,7 @@ from app.core.export_service import run_export, workflow_blockers
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
     ReorderIdsError,
+    listing_order,
     next_sequences,
     renumber_volume_records,
     reorder_volume_records,
@@ -411,10 +412,11 @@ def move_collection_records(
 
     # Locked, because the refusal below reads each record's status and the
     # relocation that follows is a filesystem move no transaction takes back.
+    # Locked in id order, as every path that locks several records does.
     records = (
         db.query(Record)
         .filter(Record.collection_id == collection_id)
-        .order_by(Record.sequence.nulls_last(), Record.id)
+        .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
@@ -437,7 +439,8 @@ def move_collection_records(
         )
 
     # The moved records take the sequences after the target's highest, in
-    # their order here, so no two records of the target share one. The
+    # their listing order in the source, so no two records of the target
+    # share one. The
     # target's row is locked after the records, as every path that takes both
     # does, and held until the commit (app/core/record_sequence.py).
     sequences = next_sequences(db, target_collection_id, len(records))
@@ -446,7 +449,7 @@ def move_collection_records(
 
     not_moved: List[str] = []
     moves: List = []
-    for r, seq in zip(records, sequences):
+    for r, seq in zip(listing_order(records), sequences):
         r.collection_id = target_collection_id
         r.sequence = seq
         moves.extend((img, target_dir) for img in r.images)

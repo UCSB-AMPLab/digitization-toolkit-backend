@@ -14,8 +14,9 @@ Each holds its locks until it commits, so an addition reads the maximum
 either before a rewrite starts writing (and the rewrite then waits for it and
 includes its records) or after the rewrite has committed. Every path that
 takes both a record's row and its volume's takes the record's first
-(app/core/volume_stem.py). On SQLite, which the test suite runs on, no lock
-clause is emitted.
+(app/core/volume_stem.py), and a path that locks several records takes
+them in id order. On SQLite, which the test suite runs on, no lock clause is
+emitted.
 """
 from typing import List, Optional, Tuple
 
@@ -33,12 +34,23 @@ class ReorderIdsError(ValueError):
     """`ordered_ids` does not name every record of the volume exactly once."""
 
 
+def listing_order(records: List[Record]) -> List[Record]:
+    """`records` sorted as they are listed and exported: sequence (NULLs last), then id."""
+    return sorted(records, key=lambda r: (r.sequence is None, r.sequence or 0, r.id))
+
+
 def _records_in_order(db: Session, collection_id: int) -> List[Record]:
-    """The volume's records in listing order, each row locked: sequence (NULLs last), then id."""
-    return (
+    """The volume's records, each row locked, in listing order.
+
+    The rows are locked in id order, as every path that locks several
+    records does (promotion, take-back, bulk status, move-records): two such
+    paths over the same rows then wait on each other instead of deadlocking.
+    They are sorted into listing order after they are read.
+    """
+    return listing_order(
         db.query(Record)
         .filter(Record.collection_id == collection_id)
-        .order_by(Record.sequence.nulls_last(), Record.id)
+        .order_by(Record.id)
         .with_for_update(of=Record)
         .populate_existing()
         .all()

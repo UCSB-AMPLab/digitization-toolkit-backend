@@ -364,7 +364,39 @@ def test_the_record_lock_queries_lock_the_records_only(db_session):
     import unittest.mock as mock
     with mock.patch.object(type(db_session.query(Record)), "all", spy):
         _records_in_order(db_session, 1)
-    assert captured and captured[0].rstrip().endswith("FOR UPDATE OF RECORDS"), captured
+    assert captured and captured[0].rstrip().endswith("ORDER BY RECORDS.ID FOR UPDATE OF RECORDS"), captured
+
+
+@pytest.mark.unit
+def test_rewrites_and_moves_lock_records_in_id_order_and_assign_in_listing_order(
+        client, db_session, statements, capture_settings, override_projects_root):
+    """Record 1 at sequence 2 and record 2 at sequence 1: the rows are taken by id, as promotion takes them.
+
+    Taken in sequence order, a renumber and a promotion over the same two
+    rows could each hold one and wait for the other on PostgreSQL.
+    """
+    project, vol = _volume(db_session)
+    _p, other = _volume(db_session, name="Tomo 2", stem="xx-test-tomo-2", project=project)
+    r1, r2 = _record(db_session, vol.id, 2), _record(db_session, vol.id, 1)
+    vid, oid, id1, id2 = vol.id, other.id, r1.id, r2.id
+    assert id1 < id2
+    api = _as_operator(client)
+
+    def locking_selects():
+        return [s for s in statements
+                if s.startswith("SELECT RECORDS.ID") and "FROM RECORDS" in s and "RECORDS.COLLECTION_ID =" in s]
+
+    for call in (lambda: api.post(f"/collections/{vid}/images/renumber"),
+                 lambda: api.patch(f"/collections/{vid}/records/reorder", json={"ordered_ids": [id2, id1]}),
+                 lambda: api.post(f"/collections/{vid}/move-records", params={"target_collection_id": oid})):
+        statements.clear()
+        resp = call()
+        assert resp.status_code == 200, resp.text
+        selects = locking_selects()
+        assert selects, statements
+        assert all(s.split(" ORDER BY ", 1)[1].split(" LIMIT ")[0] == "RECORDS.ID" for s in selects), selects
+        target = oid if "move-records" in str(resp.url) else vid
+        assert _sequences(db_session, target) == {id2: 1, id1: 2}
 
 
 @pytest.mark.unit
