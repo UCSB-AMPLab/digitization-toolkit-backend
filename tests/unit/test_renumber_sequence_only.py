@@ -397,3 +397,39 @@ def test_rewrites_lock_the_records_before_the_volume_and_additions_read_the_maxi
     check(lambda: api.patch(f"/records/{rid}", json={"collection_id": vid}), volume_row, highest)
     check(lambda: api.post(f"/collections/{vid}/move-records", params={"target_collection_id": oid}),
           record_rows, highest)
+
+
+# ---------------------------------------------------------------------------
+# Capture
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_captures_take_sequences_from_one_and_a_retake_keeps_its_own(
+        client, db_session, test_project, monkeypatch, tmp_path, statements):
+    from app.models.collection import Collection
+    from app.models.record import Record
+    from tests.unit.test_capture_birth_and_retake import (
+        _capture, _capture_dual, _client_as, _install_capture_fakes,
+    )
+
+    _install_capture_fakes(monkeypatch, tmp_path)
+    vol = Collection(name="V", project_id=test_project.id, filename_stem="co-test-v")
+    db_session.add(vol)
+    db_session.commit()
+    vid, pname = vol.id, test_project.name
+    api = _client_as(client, "op", "operator")
+
+    statements.clear()
+    assert _capture(api, pname, collection_id=vid).status_code == 200
+    assert _first(statements, "FROM COLLECTIONS", "COLLECTIONS.ID =") < _first(statements, "MAX(RECORDS.SEQUENCE)")
+    assert _capture_dual(api, pname, collection_id=vid).status_code == 200
+    first, second = db_session.query(Record).filter(Record.collection_id == vid).order_by(Record.id).all()
+    assert (first.sequence, second.sequence) == (1, 2)
+    rid = first.id
+
+    statements.clear()
+    resp = _capture(api, pname, collection_id=vid, record_id=rid)
+    assert resp.status_code == 200, resp.text
+    assert _first(statements, "FROM RECORDS", "RECORDS.ID =") < _first(statements, "FROM COLLECTIONS", "COLLECTIONS.ID =")
+    assert not any("MAX(RECORDS.SEQUENCE)" in s for s in statements)
+    assert _sequences(db_session, vid) == {first.id: 1, second.id: 2}

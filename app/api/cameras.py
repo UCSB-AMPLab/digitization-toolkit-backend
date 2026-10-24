@@ -2,7 +2,6 @@ from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
-from sqlalchemy import func
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
 from pydantic import BaseModel, field_validator
@@ -21,6 +20,7 @@ from app.core.volume_stem import RETAKE_STATUS_DETAIL, RETAKE_VOLUME_DETAIL, STE
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
+from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
 
 router = APIRouter()
@@ -31,19 +31,18 @@ allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
-def _next_record_sequence(db: Session, project_id: Optional[int], collection_id: Optional[int]) -> int:
-	"""Next monotonic record sequence within a collection (or project).
+def _next_record_sequence(db: Session, collection_id: int) -> int:
+	"""The sequence a new capture's record takes: the one after the highest in its volume, from 1.
 
 	Assigned at capture time so export order never depends on the wall clock,
-	which is unreliable on a Pi without an RTC after a power cut.
+	which is unreliable on a Pi without an RTC after a power cut. The maximum
+	is read under the volume's row lock (next_sequences), which the capture
+	already holds from _refuse_capture_without_volume_or_stem and keeps until
+	it commits, so two captures, or a capture and a renumber, cannot hand out
+	the same value. A retake keeps its record's sequence and does not call
+	this.
 	"""
-	query = db.query(func.max(Record.sequence))
-	if collection_id is not None:
-		query = query.filter(Record.collection_id == collection_id)
-	else:
-		query = query.filter(Record.project_id == project_id)
-	current_max = query.scalar()
-	return (current_max + 1) if current_max is not None else 0
+	return next_sequences(db, collection_id, 1)[0]
 
 
 def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[int], retake_record: Optional[Record]) -> None:
@@ -903,7 +902,7 @@ def trigger_capture(
 				description=f"Captured at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
-				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
+				sequence=_next_record_sequence(db, request.collection_id),
 				created_by=current_user.username,
 				capture_mode="single",
 			)
@@ -1117,7 +1116,7 @@ def trigger_dual_capture(
 				description=f"Dual camera capture at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
-				sequence=_next_record_sequence(db, effective_project_id, request.collection_id),
+				sequence=_next_record_sequence(db, request.collection_id),
 				created_by=current_user.username,
 				capture_mode="dual",
 			)
