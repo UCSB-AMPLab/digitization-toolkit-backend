@@ -40,7 +40,7 @@ from .backends import (
     Picamera2Backend,
     RpicamBackend,
 )
-from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir
+from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir, projects_root
 
 from app.core.config import settings
 from app.core.paths import is_raw_suffix, preview_sidecar_of
@@ -304,7 +304,8 @@ def capture_image(
         include_resolution: bool = False,
         capture_output: bool = False,
         collection_name: Optional[str] = None,
-        stem: Optional[str] = None) -> str:
+        stem: Optional[str] = None,
+        root: Optional[Path] = None) -> str:
     """
     Capture an image using the rpicam-still command.
     
@@ -317,6 +318,8 @@ def capture_image(
         capture_output (bool): Capture stderr/stdout for debugging (default is False for performance).
         collection_name (str): The volume's name, for a volume without a stem (name-based layout).
         stem (str): The volume's file name stem; the image goes to `<stem>/captures/`.
+        root (Path): The projects root, read once by the caller for the whole
+            capture; read here when not given.
     Returns:
         str: The path to the captured image file.
     """
@@ -324,10 +327,12 @@ def capture_image(
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
+    if root is None:
+        root = projects_root()
     if stem:
         # All four, so the RAW backend finds `previews/` for the sidecar.
-        ensure_volume_dirs(stem)
-    project_path = image_output_dir(project_name, collection_name, stem)
+        ensure_volume_dirs(stem, root)
+    project_path = image_output_dir(project_name, collection_name, stem, root)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
@@ -397,20 +402,25 @@ def single_capture_image(
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
     start_time = time.time()
-    
+
+    # Read once: the image and its manifest record go under the same root
+    # even if an admin activates another drive while the shutter is open.
+    root = projects_root()
+
     output_path, metadata = capture_image(
         project_name=project_name,
         camera_config=camera_config,
         check_camera=False,  # Already checked
         include_resolution=include_resolution,
         collection_name=collection_name,
-        stem=stem
+        stem=stem,
+        root=root
     )
     
     elapsed_time = time.time() - start_time
 
     # The volume's own manifest for a volume with a stem, the project's otherwise
-    project_root = capture_manifest_root(project_name, stem)
+    project_root = capture_manifest_root(project_name, stem, root)
 
     record = generate_manifest_record(
         project_name=project_name,
@@ -592,7 +602,9 @@ def dual_capture_image(
     )
     
     timing = {}
-    
+    # Read once for both cameras and the manifest record (see single_capture_image).
+    root = projects_root()
+
     def capture_with_timing(config, fname):
         start = time.time()
         path, metadata = capture_image(
@@ -603,7 +615,8 @@ def dual_capture_image(
             include_resolution=include_resolution,
             capture_output=False,  # Max performance
             collection_name=collection_name,
-            stem=stem
+            stem=stem,
+            root=root
         )
         elapsed = time.time() - start
         return path, elapsed, metadata
@@ -643,7 +656,7 @@ def dual_capture_image(
     img1_path, time1, metadata1 = results[cam1_config.camera_index]
     img2_path, time2, metadata2 = results[cam2_config.camera_index]
 
-    project_root = capture_manifest_root(project_name, stem)
+    project_root = capture_manifest_root(project_name, stem, root)
 
     record = generate_manifest_record(
         project_name=project_name,
