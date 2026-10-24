@@ -88,6 +88,7 @@ REASONS = {
     "item_not_an_object": "The item is not a JSON object.",
     "missing_reference_code": "The item has no referenceCode.",
     "invalid_reference_code": f"The referenceCode is not a string of at most {_EXTERNAL_ID_MAX_LENGTH} characters.",
+    "reference_code_padded": "The referenceCode begins or ends with whitespace.",
     "reference_code_duplicated_in_list": "An earlier item in this list has the same referenceCode.",
     "missing_filename_stem": "The item has no filenameStem.",
     "filename_stem_not_a_slug": "The filenameStem is not lowercase letters and digits separated by single hyphens.",
@@ -113,7 +114,7 @@ _CONSTRAINT_REASONS = {
     "check_collection_date_range": "end_date_before_start",
     "check_collection_filename_stem_pattern": "filename_stem_not_a_slug",
     "check_collection_filename_stem_length": "filename_stem_too_long",
-    "check_collection_external_id_trimmed": "invalid_reference_code",
+    "check_collection_external_id_trimmed": "reference_code_padded",
 }
 
 
@@ -166,11 +167,15 @@ def check_envelope(document: Any) -> tuple[str, str, list]:
 
 
 def _reference_code(item: dict) -> Any:
-    """The item's referenceCode, stripped as the volume API strips it; '' counts as missing."""
+    """The item's referenceCode exactly as the file gives it; a blank string counts as missing.
+
+    A code is never stripped: codes are exchanged as Fisqua canonicalises
+    them, and Captua never modifies one, so a padded code is a reject
+    (reference_code_padded), not a code to tidy.
+    """
     code = item.get("referenceCode")
-    if isinstance(code, str):
-        code = code.strip()
-        return code or None
+    if isinstance(code, str) and not code.strip():
+        return None
     return code
 
 
@@ -211,6 +216,8 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "missing_reference_code", {}
     if not isinstance(code, str) or len(code) > _EXTERNAL_ID_MAX_LENGTH:
         return "invalid_reference_code", {}
+    if code != code.strip():
+        return "reference_code_padded", {}
     if first_code.get(code) != position:
         return "reference_code_duplicated_in_list", {}
 

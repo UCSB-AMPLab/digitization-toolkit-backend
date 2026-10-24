@@ -289,12 +289,14 @@ def test_missing_dates_and_sequence_are_stored_as_null(client, db_session, repor
 
 
 @pytest.mark.unit
-def test_a_padded_reference_code_is_stored_stripped(client, db_session, reports_root):
+@pytest.mark.parametrize("code", [" xx-test-970", "xx-test-970 ", "\txx-test-970\n"])
+def test_a_padded_reference_code_is_rejected_not_stripped(client, db_session, reports_root, code):
+    """Codes are exchanged as Fisqua canonicalises them, and Captua never modifies one."""
     _as("op", "operator")
-    report = _post(client, _list_with([_item(code="  xx-test-970 ")])).json()
-    assert report["created"] == 1
-    assert report["volumes"][0]["referenceCode"] == "xx-test-970"
-    assert "xx-test-970" in _volumes(db_session)
+    report = _post(client, _list_with([_item(code=code, stem="xx-test-970")])).json()
+    assert report["created"] == 0
+    assert _reasons(report) == [(1, code, "reference_code_padded")]
+    assert _volumes(db_session) == {}
 
 
 @pytest.mark.unit
