@@ -299,7 +299,7 @@ def update_collection(
     # A stem may not name a project's directory (app.models.collection).
     new_stem = payload.model_dump(exclude_unset=True).get("filename_stem")
     if new_stem is not None and new_stem != collection.filename_stem:
-        message = stem_directory_collision(db, stem=new_stem)
+        message = stem_directory_collision(db, stem=new_stem, collection=collection)
         if message:
             raise HTTPException(status_code=409, detail={"message": message})
 

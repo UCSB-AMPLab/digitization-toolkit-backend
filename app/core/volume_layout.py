@@ -73,6 +73,9 @@ What is moved, and how:
   paths rebased onto `<stem>/`, so the volume carries its own fixity. The
   manifests they come from are left as they are; the index gets the same
   checksums from both (_volume_records_to_copy).
+- A volume whose `<stem>/` already holds what is not its own (see
+  _foreign_entries) is not moved, and each of its images is reported as
+  skipped with reason "stem_dir_occupied" and the foreign entries.
 - Directories left empty by the moves are removed (rmdir only), never a
   project directory or a project's own `images/`, `metadata/` or `packages/`.
 
@@ -397,6 +400,81 @@ def _adoptable(target: Path, src: Path, image_id: int, owners: Dict[Path, int],
 PROJECT_TREE = object()
 
 
+# The target given to a volume whose `<stem>/` holds what is not its own: nothing is moved.
+OCCUPIED = object()
+
+
+def _foreign_entries(db: Session, volume_dir: Path, collection_id: int) -> List[str]:
+    """What `<stem>/` holds that is not the volume's, as paths relative to it; empty when nothing is.
+
+    The volume's are, inside the four directories only:
+    - in `captures/`, a file named as one of its rows' masters is, or as the
+      migration names a clashing one (`<stem>_img<image id>...`), so a
+      restored row's moved file can still be adopted;
+    - in `previews/`, the `_preview.jpg` of such a name;
+    - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
+    - in `metadata/`, `manifest.jsonl` when every record in it that can be
+      read names a capture id of the volume's images.
+    Anything else is foreign: another entry at the top, a directory inside
+    one of the four, or any other file. A directory is listed, not walked.
+    Nothing when `<stem>/` does not exist.
+    """
+    from app.core.paths import CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+
+    if not volume_dir.is_dir():
+        return []
+    rows = (db.query(RecordImage.id, RecordImage.file_path, RecordImage.thumbnail_path, RecordImage.capture_id)
+            .join(Record, RecordImage.record_id == Record.id)
+            .filter(Record.collection_id == collection_id).all())
+    stems: List[Tuple[str, str, str]] = []  # (exact stem, clash prefix, suffix), casefolded
+    thumbs: Set[str] = set()
+    capture_ids = {cid for _, _, _, cid in rows if cid}
+    for iid, fp, tp, _ in rows:
+        if fp:
+            p = Path(fp)
+            stems.append((p.stem.casefold(), f"{p.stem}_img{iid}".casefold(), p.suffix.casefold()))
+        if tp:
+            thumbs.add(Path(tp).name.casefold())
+
+    def stem_owned(stem: str) -> bool:
+        stem = stem.casefold()
+        return any(stem == exact or stem.startswith(prefix) for exact, prefix, _ in stems)
+
+    def owned(sub: str, f: Path) -> bool:
+        name = f.name.casefold()
+        if sub == CAPTURES_DIR:
+            return any((Path(name).stem == exact or Path(name).stem.startswith(prefix)) and Path(name).suffix == suffix
+                       for exact, prefix, suffix in stems)
+        if sub == PREVIEWS_DIR:
+            return name.endswith(PREVIEW_SIDECAR_SUFFIX) and stem_owned(f.name[: -len(PREVIEW_SIDECAR_SUFFIX)])
+        if sub == THUMBNAILS_DIR:
+            return name in thumbs or (name.endswith("_thumb.jpg") and stem_owned(f.name[: -len("_thumb.jpg")]))
+        if sub == METADATA_DIR and f.name == "manifest.jsonl":
+            try:
+                lines = f.read_text(encoding="utf-8").splitlines()
+            except OSError:
+                return False
+            for line in lines:
+                try:
+                    rec = json.loads(line)
+                except ValueError:
+                    continue
+                if isinstance(rec, dict) and rec.get("capture_id") not in capture_ids:
+                    return False
+            return True
+        return False
+
+    foreign: List[str] = []
+    for entry in _listdir(volume_dir):
+        if entry.name not in (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR) or not entry.is_dir():
+            foreign.append(entry.name)
+            continue
+        for f in _listdir(entry):
+            if f.is_dir() or not owned(entry.name, f):
+                foreign.append(f"{entry.name}/{f.name}")
+    return foreign
+
+
 def _project_dir_names(db: Session) -> Set[str]:
     from app.core.paths import project_dir_name
     from app.models.project import Project
@@ -431,6 +509,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
 
     owners = _owners(db)
     project_dirs = _project_dir_names(db)
+    occupied: Dict[int, List[str]] = {}
     manifest_index: list = []  # a FixityIndex, built on the first row whose file is missing
     refused: Set[Path] = set()
     targets: Dict[int, Optional[Path]] = {}
@@ -464,9 +543,20 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 targets[cid] = None  # a stem the model's pattern would refuse
             if targets[cid] is not None and _is_project_tree(targets[cid].parent, project_dirs):
                 targets[cid] = PROJECT_TREE
+            if isinstance(targets[cid], Path):
+                foreign = _foreign_entries(db, targets[cid].parent, cid)
+                if foreign:
+                    occupied[cid] = foreign
+                    logger.warning(f"Volume layout: {targets[cid].parent} already holds what is not volume {cid}'s, "
+                                   f"so its files are not moved there: {foreign}")
+                    targets[cid] = OCCUPIED
         target = targets[cid]
         if target is None:
             skipped.append({"image_id": iid, "path": str(src), "reason": "no_stem"})
+            continue
+        if target is OCCUPIED:
+            skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_occupied",
+                            "foreign": occupied[cid]})
             continue
         if target is PROJECT_TREE:
             skipped.append({"image_id": iid, "path": str(src), "reason": "stem_dir_is_project_tree"})

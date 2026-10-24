@@ -63,12 +63,48 @@ class StemDirectoryCollisionError(ValueError):
     """
 
 
-def stem_directory_collision(session, stem=None, project_name=None):
+def _stem_directory_is_someone_elses(session, stem, collection) -> bool:
+    """Whether `<projects root>/<stem>/` exists with a file in it and `collection` has no image there.
+
+    A directory holding only empty directories is free. Reads the disk under
+    the projects root as configured, without the storage-override write
+    check, so it never raises for an unusable drive.
+    """
+    from pathlib import Path
+
+    from app.core import config
+
+    root = config.settings.projects_dir
+    directory = root / stem
+    try:
+        if not directory.is_dir() or not any(p.is_file() for p in directory.rglob("*")):
+            return False
+    except OSError:
+        return True
+    if collection is not None and collection.id is not None:
+        prefix = (root.resolve() / stem)
+        rows = session.execute(
+            select(RecordImage.file_path).where(RecordImage.record_id == Record.id,
+                                                Record.collection_id == collection.id)
+        ).scalars().all()
+        for fp in rows:
+            try:
+                if fp and Path(fp).resolve().is_relative_to(prefix):
+                    return False
+            except (OSError, ValueError):
+                continue
+    return True
+
+
+def stem_directory_collision(session, stem=None, project_name=None, collection=None):
     """The message refusing `stem`, or a project named `project_name`, or None when there is no collision.
 
     A stem collides with a project whose directory name (project_dir_name)
-    equals it; a project name collides with a volume whose stem equals its
-    directory name. Reads with autoflush off, so it can run inside a flush.
+    equals it, and with a `<projects root>/<stem>/` that already exists on
+    disk with a file in it when `collection` (the volume taking the stem, or
+    None for one not yet created) has no image there. A project name
+    collides with a volume whose stem equals its directory name. Reads with
+    autoflush off, so it can run inside a flush.
     """
     from app.core.paths import project_dir_name
     from app.models.project import Project
@@ -79,6 +115,9 @@ def stem_directory_collision(session, stem=None, project_name=None):
                 if project_dir_name(name) == stem:
                     return (f"The file name stem {stem} is the directory of project {name!r}; "
                             "a volume's files and a project's tree cannot share it.")
+            if _stem_directory_is_someone_elses(session, stem, collection):
+                return (f"The directory {stem} already exists in the projects root and holds files that are "
+                        "not this volume's; a volume's files are never merged into it.")
         if project_name is not None:
             directory = project_dir_name(project_name)
             if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
@@ -430,8 +469,8 @@ def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances
         elif isinstance(obj, Project) and obj.name:
             if obj in session.new or sa_inspect(obj).attrs.name.history.has_changes():
                 new_dirs[project_dir_name(obj.name)] = obj
-    for stem in new_stems:
-        message = stem_directory_collision(session, stem=stem)
+    for stem, volume in new_stems.items():
+        message = stem_directory_collision(session, stem=stem, collection=volume)
         if message is None and stem in new_dirs:
             message = (f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
                        "a volume's files and a project's tree cannot share it.")
