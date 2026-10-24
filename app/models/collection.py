@@ -63,6 +63,18 @@ class StemDirectoryCollisionError(ValueError):
     """
 
 
+class StemIsProjectDirectoryError(StemDirectoryCollisionError):
+    """The stem is the directory name of a project."""
+
+
+class StemDirectoryOccupiedError(StemDirectoryCollisionError):
+    """`<projects root>/<stem>/` already holds files that are not the volume's."""
+
+
+class ProjectNameIsStemError(StemDirectoryCollisionError):
+    """A project's directory name would be a volume's stem."""
+
+
 def _stem_directory_is_someone_elses(session, stem, collection) -> bool:
     """Whether `<projects root>/<stem>/` exists with a file in it and `collection` has no image there.
 
@@ -96,15 +108,17 @@ def _stem_directory_is_someone_elses(session, stem, collection) -> bool:
     return True
 
 
-def stem_directory_collision(session, stem=None, project_name=None, collection=None):
-    """The message refusing `stem`, or a project named `project_name`, or None when there is no collision.
+def stem_directory_conflict(session, stem=None, project_name=None, collection=None):
+    """The StemDirectoryCollisionError refusing `stem`, or a project named `project_name`, or None.
 
     A stem collides with a project whose directory name (project_dir_name)
-    equals it, and with a `<projects root>/<stem>/` that already exists on
-    disk with a file in it when `collection` (the volume taking the stem, or
-    None for one not yet created) has no image there. A project name
-    collides with a volume whose stem equals its directory name. Reads with
-    autoflush off, so it can run inside a flush.
+    equals it (StemIsProjectDirectoryError), and with a
+    `<projects root>/<stem>/` that already exists on disk with a file in it
+    when `collection` (the volume taking the stem, or None for one not yet
+    created) has no image there (StemDirectoryOccupiedError). A project name
+    collides with a volume whose stem equals its directory name
+    (ProjectNameIsStemError). Reads with autoflush off, so it can run inside
+    a flush. The error is returned, not raised.
     """
     from app.core.paths import project_dir_name
     from app.models.project import Project
@@ -113,17 +127,26 @@ def stem_directory_collision(session, stem=None, project_name=None, collection=N
         if stem is not None:
             for (name,) in session.query(Project.name).all():
                 if project_dir_name(name) == stem:
-                    return (f"The file name stem {stem} is the directory of project {name!r}; "
-                            "a volume's files and a project's tree cannot share it.")
+                    return StemIsProjectDirectoryError(
+                        f"The file name stem {stem} is the directory of project {name!r}; "
+                        "a volume's files and a project's tree cannot share it.")
             if _stem_directory_is_someone_elses(session, stem, collection):
-                return (f"The directory {stem} already exists in the projects root and holds files that are "
-                        "not this volume's; a volume's files are never merged into it.")
+                return StemDirectoryOccupiedError(
+                    f"The directory {stem} already exists in the projects root and holds files that are "
+                    "not this volume's; a volume's files are never merged into it.")
         if project_name is not None:
             directory = project_dir_name(project_name)
             if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
-                return (f"The project name {project_name!r} would use the directory {directory}, "
-                        "which is a volume's file name stem.")
+                return ProjectNameIsStemError(
+                    f"The project name {project_name!r} would use the directory {directory}, "
+                    "which is a volume's file name stem.")
     return None
+
+
+def stem_directory_collision(session, stem=None, project_name=None, collection=None):
+    """The message of stem_directory_conflict, or None when there is no collision."""
+    error = stem_directory_conflict(session, stem=stem, project_name=project_name, collection=collection)
+    return str(error) if error is not None else None
 
 
 STEM_RESERVED_MESSAGE = (
@@ -470,13 +493,14 @@ def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances
             if obj in session.new or sa_inspect(obj).attrs.name.history.has_changes():
                 new_dirs[project_dir_name(obj.name)] = obj
     for stem, volume in new_stems.items():
-        message = stem_directory_collision(session, stem=stem, collection=volume)
-        if message is None and stem in new_dirs:
-            message = (f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
-                       "a volume's files and a project's tree cannot share it.")
-        if message:
-            raise StemDirectoryCollisionError(message)
+        error = stem_directory_conflict(session, stem=stem, collection=volume)
+        if error is None and stem in new_dirs:
+            error = StemIsProjectDirectoryError(
+                f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
+                "a volume's files and a project's tree cannot share it.")
+        if error is not None:
+            raise error
     for directory, project in new_dirs.items():
-        message = stem_directory_collision(session, project_name=project.name)
-        if message:
-            raise StemDirectoryCollisionError(message)
+        error = stem_directory_conflict(session, project_name=project.name)
+        if error is not None:
+            raise error
