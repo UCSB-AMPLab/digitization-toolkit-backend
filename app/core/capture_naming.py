@@ -3,11 +3,12 @@
 Each image of a capture event is `<filename index>_c<camera index>.<ext>`,
 and the filename index is `<filename_stem>-img_<nnnn>`. <nnnn> is the
 volume's capture number (app.core.capture_counter), zero-padded to four
-digits; str.format pads and never truncates, so 10000 and above are written
-with five or more digits. The filename index doubles as a dual capture's
-pair id, so it has to fit in record_images.pair_id (PAIR_ID_MAX_LENGTH, 36):
-an index that would not is refused before any file is written, whatever the
-capture mode, as the contract requires.
+digits. No volume goes past MAX_CAPTURE_NUMBER (9999), whatever the length
+of its stem: a capture or upload that would need a larger number is refused
+before any file is written. That keeps the filename index, which doubles as
+a dual capture's pair id, within record_images.pair_id (PAIR_ID_MAX_LENGTH,
+36): a stem holds at most FILENAME_STEM_MAX_LENGTH (27) characters, and
+`-img_` plus four digits is nine more.
 
 take_filename_index is the one place a capture or an upload takes its
 number. The callers turn its CaptureNameRefused into a 409 carrying the
@@ -30,14 +31,17 @@ logger = logging.getLogger(__name__)
 
 CAPTURE_NUMBER_DIGITS = 4
 
+# The last capture number a volume can take; the next would need five digits.
+MAX_CAPTURE_NUMBER = 10 ** CAPTURE_NUMBER_DIGITS - 1
+
 # How many numbers already on disk take_filename_index passes over before it
 # refuses the capture. More than a handful means the counter is far behind
 # the card, which an operator cannot fix by trying again.
 MAX_NUMBERS_PASSED_OVER = 100
 
 # The interface matches each refusal on its exact text, so these do not change.
-CAPTURE_NAME_TOO_LONG_DETAIL = (
-    "This capture's file name would be longer than the 36 characters a pair id holds. Nothing was captured."
+CAPTURE_LIMIT_DETAIL = (
+    "This volume has reached the limit of 9999 captures. A new volume is needed. Nothing was captured."
 )
 CAPTURE_NUMBERS_TAKEN_DETAIL = (
     "The next capture numbers of this volume are already taken by files on disk. Nothing was captured."
@@ -190,23 +194,22 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
     gaps in <nnnn> and forbids reuse.
 
     Raises CaptureNameRefused, leaving the rollback to the caller, when the
-    index would be longer than PAIR_ID_MAX_LENGTH, or when more than
-    MAX_NUMBERS_PASSED_OVER numbers in a row are already on disk.
+    counter would pass MAX_CAPTURE_NUMBER (including while passing over
+    taken numbers), or when more than MAX_NUMBERS_PASSED_OVER numbers in a
+    row are already on disk.
     """
     from app.core.paths import METADATA_DIR
-    from app.models.collection import PAIR_ID_MAX_LENGTH
 
     in_manifest = manifest_capture_numbers(output_dir.parent / METADATA_DIR / "manifest.jsonl", stem)
     for _ in range(MAX_NUMBERS_PASSED_OVER + 1):
         number: Optional[int] = next_capture_number(db, collection_id)
         if number is None:
             raise RuntimeError(f"Collection {collection_id} has no capture counter")
+        if number > MAX_CAPTURE_NUMBER:
+            logger.warning(f"Collection {collection_id} would need capture number {number}, "
+                           f"past {MAX_CAPTURE_NUMBER}; capture refused")
+            raise CaptureNameRefused(CAPTURE_LIMIT_DETAIL)
         index = capture_filename_index(stem, number)
-        # A longer number only makes a longer name, so the first too long is final.
-        if len(index) > PAIR_ID_MAX_LENGTH:
-            logger.warning(f"Capture number {number} of collection {collection_id} makes {index}, "
-                           f"longer than {PAIR_ID_MAX_LENGTH} characters; capture refused")
-            raise CaptureNameRefused(CAPTURE_NAME_TOO_LONG_DETAIL)
         if number not in in_manifest and not capture_name_taken(output_dir, index):
             return index
         logger.warning(f"Capture number {number} of collection {collection_id} is already on disk or in the manifest ({index}); taking the next")
