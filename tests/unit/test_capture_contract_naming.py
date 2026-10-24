@@ -179,7 +179,7 @@ def test_a_name_is_taken_under_any_suffix_case_or_as_a_sidecar(tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_single_captures_are_named_by_the_counter_with_the_camera_index(
+def test_single_captures_are_named_by_the_counter_and_the_c_suffix(
         client, db_session, test_project, volume, backend, override_projects_root):
     api = _client_as(client)
 
@@ -198,7 +198,7 @@ def test_single_captures_are_named_by_the_counter_with_the_camera_index(
 
 
 @pytest.mark.unit
-def test_a_dual_capture_shares_one_number_and_differs_in_the_camera_index(
+def test_a_dual_capture_shares_one_number_and_differs_in_the_c_suffix(
         client, db_session, test_project, volume, backend, override_projects_root):
     api = _client_as(client)
     volume.capture_counter = 6
@@ -423,7 +423,7 @@ def _post(api, project, volume, dual=False, **extra):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("dual", [False, True])
-def test_a_name_longer_than_a_pair_id_is_refused_before_the_camera_fires(
+def test_a_name_longer_than_a_pair_id_is_refused_before_the_shutter_fires(
         client, db_session, test_project, backend, override_projects_root, dual):
     from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
 
