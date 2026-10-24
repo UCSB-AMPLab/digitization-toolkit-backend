@@ -53,6 +53,45 @@ class StemReservedError(ImmutableFieldError):
     """A delete would free a stem whose file names have been issued."""
 
 
+class StemHeldOffsiteError(ValueError):
+    """A stem would be given to a volume while offsite objects are keyed under it.
+
+    Raised by the before_flush listener _refuse_a_stem_held_offsite, so every
+    writer meets it; the API answers 409 (app.main).
+    """
+
+
+def offsite_keys_under_stem(session, stem, collection=None) -> bool:
+    """Whether any offsite_objects key lies under `<tenant>/<stem>/`, for any tenant.
+
+    A key holds the stem when its second path segment is the stem and
+    something follows it: `<tenant>/<stem>/<rest>`. The tenant is not
+    compared with DTK_OFFSITE_TENANT, because keys under an earlier tenant,
+    or kept while upload is disabled, name objects issued under the stem
+    all the same. With `collection` given, a key whose image belongs to a
+    record in that volume is not counted. A key whose image was deleted
+    (record_image_id NULL, or an id no image has) always counts. Reads with
+    autoflush off, so it can run inside a flush.
+    """
+    from app.models.offsite_object import OffsiteObject
+
+    if not stem:
+        return False
+    # The stem alphabet [a-z0-9-] holds no LIKE wildcard.
+    query = select(OffsiteObject.object_key).where(OffsiteObject.object_key.like(f"%/{stem}/%"))
+    if collection is not None and collection.id is not None:
+        own = select(RecordImage.id).where(RecordImage.record_id == Record.id,
+                                           Record.collection_id == collection.id)
+        query = query.where((OffsiteObject.record_image_id.is_(None))
+                            | (OffsiteObject.record_image_id.not_in(own)))
+    with session.no_autoflush:
+        for key in session.execute(query).scalars():
+            parts = key.split("/", 2)
+            if len(parts) == 3 and parts[0] and parts[1] == stem and parts[2]:
+                return True
+    return False
+
+
 class StemDirectoryCollisionError(ValueError):
     """A stem and a project's directory name would name the same directory under the projects root.
 
@@ -288,14 +327,22 @@ class Collection(Base):
         return record.collection is self or record.collection_id == self.id
 
     def has_captured(self) -> bool:
-        """Whether the volume has ever captured: capture_counter above zero, or any image.
+        """Whether the volume has ever captured: capture_counter above zero, any image,
+        or an offsite object keyed under its stem.
 
         The counter keeps the answer after the volume's records are deleted or
         moved out. next_capture_number raises it for each capture and upload
         into the volume; the image check covers images that reach the volume
         without one, such as those on a record moved in from another volume.
+        Neither covers such an image once its record is deleted, but its
+        offsite_objects row keeps its key `<tenant>/<stem>/...`
+        (offsite_keys_under_stem), so a key under the stem counts for any
+        tenant and whether or not its image still exists.
         """
-        return (self.capture_counter or 0) > 0 or self.has_images()
+        if (self.capture_counter or 0) > 0 or self.has_images():
+            return True
+        session = object_session(self)
+        return session is not None and offsite_keys_under_stem(session, self.filename_stem)
 
     def reserves_its_stem(self) -> bool:
         """Whether the volume has a stem and has captured, so its row must be kept.
@@ -468,6 +515,26 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
             )
+
+
+@event.listens_for(Session, "before_flush")
+def _refuse_a_stem_held_offsite(session, flush_context, instances):
+    """Refuse a flush that gives a volume a stem with offsite objects keyed under it.
+
+    Covers every writer: the collection routes and the list import. Only a
+    new volume or a changed stem is checked. Keys of images of the volume's
+    own records do not count, so a volume whose stem was cleared can be given
+    it back while every key under it is its own.
+    """
+    for obj in list(session.new) + list(session.dirty):
+        if not isinstance(obj, Collection) or obj.filename_stem is None:
+            continue
+        if obj not in session.new and not sa_inspect(obj).attrs.filename_stem.history.has_changes():
+            continue
+        if offsite_keys_under_stem(session, obj.filename_stem, collection=obj):
+            raise StemHeldOffsiteError(
+                f"Images are stored offsite under the file name stem {obj.filename_stem}, "
+                "so it cannot be given to this volume.")
 
 
 @event.listens_for(Session, "before_flush")

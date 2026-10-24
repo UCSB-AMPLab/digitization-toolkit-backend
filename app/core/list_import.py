@@ -69,6 +69,7 @@ from app.models.collection import (
     Collection,
     StemDirectoryCollisionError,
     StemDirectoryOccupiedError,
+    StemHeldOffsiteError,
     StemIsProjectDirectoryError,
     stem_directory_conflict,
 )
@@ -126,6 +127,9 @@ REASONS = {
     "filename_stem_directory_occupied": (
         "A directory named as the filenameStem already holds files on this unit, and no volume's files "
         "are ever merged into it."
+    ),
+    "filename_stem_held_offsite": (
+        "Images are stored offsite under this filenameStem, so it cannot be given to a new volume."
     ),
 }
 
@@ -643,6 +647,12 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             db.rollback()
             reason = _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
             rejects.append(_reject(position, code, reason))
+            continue
+        except StemHeldOffsiteError:
+            # The model's flush listener found offsite keys under the stem;
+            # this item only is rolled back and reported.
+            db.rollback()
+            rejects.append(_reject(position, code, "filename_stem_held_offsite"))
             continue
         except SQLAlchemyError:
             # Any other database failure on this item (a lost connection, a

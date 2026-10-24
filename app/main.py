@@ -99,7 +99,7 @@ app.include_router(imports_router, prefix="/imports", tags=["imports"])
 
 
 from app.core.storage_override import StorageUnavailableError
-from app.models.collection import StemDirectoryCollisionError
+from app.models.collection import StemDirectoryCollisionError, StemHeldOffsiteError
 
 
 @app.exception_handler(StorageUnavailableError)
@@ -111,6 +111,12 @@ async def storage_unavailable(request: Request, exc: StorageUnavailableError):
 @app.exception_handler(StemDirectoryCollisionError)
 async def stem_directory_taken(request: Request, exc: StemDirectoryCollisionError):
     """A stem and a project's directory name refused at a flush that no route checked first."""
+    return JSONResponse(status_code=409, content={"detail": {"message": str(exc)}})
+
+
+@app.exception_handler(StemHeldOffsiteError)
+async def stem_held_offsite(request: Request, exc: StemHeldOffsiteError):
+    """A stem with offsite objects keyed under it, refused at a flush."""
     return JSONResponse(status_code=409, content={"detail": {"message": str(exc)}})
 
 

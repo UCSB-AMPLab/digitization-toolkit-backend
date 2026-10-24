@@ -29,7 +29,7 @@ if mode == "import_noflock":
 from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from app.core.db import Base  # noqa: E402
-from app.models import user, project, project_member, collection, record, camera, system_log  # noqa: E402,F401
+from app.models import user, project, project_member, collection, record, camera, system_log, offsite_object  # noqa: E402,F401
 
 engine = create_engine(f"sqlite:///{dbfile}")
 Base.metadata.create_all(engine)
