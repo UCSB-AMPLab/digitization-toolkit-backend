@@ -132,6 +132,31 @@ def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[P
             pass
     return str(Path("images/main") / p.name)
 
+def _preview_file(master: Union[str, Path], role: str, project_root: Optional[Path]) -> Optional["CaptureFile"]:
+    """The `<role>_preview` entry for a RAW master's `_preview.jpg` sidecar, or None when it has none.
+
+    The RAW backend extracts the sidecar inside capture_image, and the
+    rotation there rewrites it, both before the capture record is generated,
+    so the digest is of the bytes as they will stay. A JPEG master has no
+    sidecar whatever is beside it.
+    """
+    from app.core.paths import is_raw_suffix, preview_sidecar_of
+
+    path = Path(master)
+    if not is_raw_suffix(path):
+        return None
+    sidecar = preview_sidecar_of(path)
+    if not sidecar.is_file():
+        return None
+    return CaptureFile(
+        role=f"{role}_preview",
+        relative_path=_relative_capture_path(sidecar, project_root),
+        bytes=os.path.getsize(sidecar),
+        mimetype="image/jpeg",
+        sha256=compute_sha256(sidecar),
+    )
+
+
 def generate_manifest_project(
     project_name: str,
     paths: Dict[str, str] = None,
@@ -219,6 +244,9 @@ def generate_manifest_record(
                 mimetype="application/octet-stream",  # Binary raw sensor data
                 sha256=compute_sha256(raw_path)
             ))
+            preview = _preview_file(raw_path, role, project_root)
+            if preview is not None:
+                files.append(preview)
         else:
             # Single format
             files.append(CaptureFile(
@@ -228,6 +256,12 @@ def generate_manifest_record(
                 mimetype=f"image/{config.encoding}",
                 sha256=compute_sha256(path)
             ))
+            # A RAW master's preview is the image Fisqua's pipeline reads
+            # (exchange contract 1.1, section 4), so its digest is recorded
+            # here, with the master's, rather than in a record of its own.
+            preview = _preview_file(path, role, project_root)
+            if preview is not None:
+                files.append(preview)
     
     # Build cameras list with metadata
     cameras = []
@@ -308,6 +342,21 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
         
 
 RELOCATION_RECORD_TYPE = "relocation"
+
+# A RAW preview's sha256 computed after capture, by
+# `python -m app.core.image_upload backfill-preview-digests` for previews
+# captured before capture recorded them (app.core.preview_digests).
+PREVIEW_DIGEST_RECORD_TYPE = "preview_digest"
+
+# Records that carry a capture id but are not capture records: the fixity
+# index reads them, but the export bag, the startup repair of a volume's
+# manifest and the index's set of captured ids do not count them.
+NON_CAPTURE_RECORD_TYPES = frozenset({RELOCATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE})
+
+
+def is_capture_record(entry) -> bool:
+    """Whether a decoded manifest line is a capture record (an upload record is one)."""
+    return isinstance(entry, dict) and entry.get("record_type") not in NON_CAPTURE_RECORD_TYPES
 
 
 def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str, *,
