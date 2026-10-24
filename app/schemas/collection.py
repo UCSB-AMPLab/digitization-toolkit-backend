@@ -62,6 +62,10 @@ class CollectionBase(BaseModel):
 
 class CollectionCreate(VolumeIdentityFields, CollectionBase):
     """Create a collection. Must specify either project_id OR parent_collection_id."""
+    # filename_stem is optional here for now, although contract 1.1 §3 says a
+    # volume created on the device must be given one. It becomes required
+    # once the stem screen (step 2) and the list import (step 8) give an
+    # operator a source for it.
     project_id: Optional[int] = Field(None, description="Parent project (for top-level collections)")
     parent_collection_id: Optional[int] = Field(None, description="Parent collection (for nested subcollections)")
     created_by: Optional[str] = None

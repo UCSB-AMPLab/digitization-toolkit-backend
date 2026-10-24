@@ -1167,3 +1167,23 @@ def test_a_blank_external_id_on_the_orm_is_a_named_409_through_the_handler(db_se
     exc = integrity_conflict(caught.value)
     assert exc.status_code == 409
     assert exc.detail["constraint"] == "check_collection_external_id_trimmed", exc.detail
+
+
+# ---------------------------------------------------------------------------
+# The stem is optional on create for now
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_volume_can_be_created_without_a_stem_for_now(client, db_session):
+    """Contract 1.1 requires one; it becomes required with its sources.
+
+    Those are the stem screen and the list import. Until they exist an
+    operator has no way to supply one, so create accepts its absence.
+    """
+    p = _project(db_session)
+    api = _client_as(client)
+
+    resp = api.post("/collections/", json={"name": "no stem", "project_id": p.id})
+
+    assert resp.status_code == 201, resp.text
+    assert resp.json()["filename_stem"] is None
