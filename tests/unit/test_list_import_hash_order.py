@@ -190,3 +190,26 @@ def test_without_the_lock_a_late_refusal_keeps_the_hash_another_run_is_importing
     assert out["B"] == "created 1" and out["hash at end"] == "111111"
     assert vols == ["xx-test-001"]
     assert str(h) in caplog.text
+
+
+@pytest.mark.unit
+def test_a_hash_that_cannot_be_removed_is_logged_with_its_path(client, db_session, reports_root, monkeypatch, caplog):
+    import app.core.list_import as li
+
+    _as("adm", "admin")
+    doc = _list_with([_item(code="xx-test-950", stem="xx-test-950")])
+    directory = reports_root / doc["id"]
+
+    def refused(*a, **k):
+        directory.chmod(0o555)
+        raise li.ProjectNeedsAdmin(li.PROJECT_NEEDS_ADMIN_MESSAGE)
+
+    monkeypatch.setattr(li, "_project_for", refused)
+    with caplog.at_level("ERROR", logger="app.core.list_import"):
+        try:
+            assert _post(client, doc).status_code == 403
+        finally:
+            directory.chmod(0o755)
+
+    assert (directory / "sha256").exists()
+    assert str(directory / "sha256") in caplog.text

@@ -759,10 +759,12 @@ def _refuse_list_before_hash(db: Session, list_name: str, may_create_project: bo
 
 def _remove_hash_file(directory: Path, list_id: str) -> None:
     """Remove the hash this run recorded for a list it then refused whole; a failure is logged."""
+    hash_file = directory / HASH_FILE_NAME
     try:
-        (directory / HASH_FILE_NAME).unlink(missing_ok=True)
+        hash_file.unlink(missing_ok=True)
     except OSError:
-        logger.exception("Could not remove the hash of refused list %s", list_id)
+        logger.exception("Could not remove the hash of refused list %s; remove %s by hand before importing "
+                         "a corrected file under this id", list_id, hash_file)
 
 
 def _check_hash(directory: Path, list_id: str, file_sha256: str) -> bool:
