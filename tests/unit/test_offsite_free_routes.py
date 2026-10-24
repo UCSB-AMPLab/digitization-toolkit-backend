@@ -118,6 +118,22 @@ def test_the_route_refusals_are_409_with_plain_messages(remote, client, db_sessi
     r = client.post(f"/collections/{vol.id}/offsite/restore")
     assert (r.status_code, r.json()["detail"]["message"]) == (409, NO_READ_REMOTE_MESSAGE)
 
+    from app.core.offsite_free import NOT_IN_OWN_FOLDER_MESSAGE
+    from app.models.record import RecordImage
+    legacy = _volume(db_session, name="Tomo 3", stem="xx-test-003")
+    img = _image(db_session, legacy, override_projects_root, "h1.jpg", b"h")
+    _run(db_session)
+    old = override_projects_root / "p" / "tomo3" / "images" / "main" / "h1.jpg"
+    old.parent.mkdir(parents=True)
+    Path(img.file_path).rename(old)
+    row = db_session.get(RecordImage, img.id)
+    row.file_path = str(old)
+    db_session.commit()
+    r = client.post(f"/collections/{legacy.id}/offsite/free")
+    assert (r.status_code, r.json()["detail"]["message"]) == (409, NOT_IN_OWN_FOLDER_MESSAGE)
+    assert r.json()["detail"]["images_outside_own_folder"] == 1
+    assert old.exists()
+
     assert _paths(override_projects_root, "f2.jpg")[0].exists()
 
 

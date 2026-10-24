@@ -17,6 +17,10 @@ The rules:
   same SHA1. A file that fails either check stays on the card and is
   reported. A listing that does not answer (VerificationUnavailable) frees
   nothing.
+* **Only a volume wholly in `<stem>/`.** A volume with any image still in
+  the name-based layout is refused: a project or volume rename moves such
+  files under a hold that does not exclude this one, while nothing running
+  moves a file in `<stem>/` (see _require_own_folder).
 * **Under hold_for_file_changes**, so no export, record move, renumber or
   offsite read of the volume runs meanwhile. No database transaction stays
   open across a listing, a hash or a copy.
@@ -99,6 +103,13 @@ LISTING_MESSAGE = (
 NO_READ_REMOTE_MESSAGE = (
     "Restore is not set up on this unit: it needs read access to the offsite bucket "
     "(DTK_OFFSITE_READ_REMOTE), and none is configured."
+)
+NOT_IN_OWN_FOLDER_MESSAGE = (
+    "Some of this volume's files have not yet been moved into the volume's own folder, "
+    "so its files cannot be freed from the card or restored. Captua moves them the next "
+    "time it starts. If they are still not moved after a restart, the backend's log says "
+    "why (for example, the folder already holds files that are not this volume's); once "
+    "that is cleared and Captua has restarted, the volume can be freed."
 )
 JOB_RUNNING_MESSAGE = (
     "Files of this volume are already being freed or restored. Wait for that to finish."
@@ -263,6 +274,38 @@ def _volume(db: Session, collection_id: int):
     return collection
 
 
+def _require_own_folder(db: Session, collection) -> None:
+    """Refuse a volume with any image still in the name-based layout.
+
+    Only such files move while the backend runs, under holds that do not
+    exclude this one: a project rename moves the project's directory tree,
+    and a project move or a volume rename or re-parent relocates the files
+    storage_ops.image_in_old_layout picks out. `<stem>/` sits directly under
+    the projects root, outside every project's directory, so none of them
+    touches it. Files in `<stem>/` are moved by nothing but the startup
+    layout migration, which runs before any request. So a volume wholly in
+    `<stem>/` cannot have a file moved under a free or a restore.
+    """
+    from app.core.storage_ops import image_in_old_layout
+    from app.models.record import Record, RecordImage
+
+    paths = (db.query(RecordImage.file_path)
+             .join(Record, RecordImage.record_id == Record.id)
+             .filter(Record.collection_id == collection.id).all())
+    db.commit()
+    outside = [fp for (fp,) in paths if image_in_old_layout(collection, fp)]
+    if outside:
+        raise FreeRefused(NOT_IN_OWN_FOLDER_MESSAGE, detail={
+            "folder": f"{collection.filename_stem}/", "images_outside_own_folder": len(outside)})
+
+
+def _stem_volume(db: Session, collection_id: int):
+    """The volume, refused unless it has a stem and every image is in `<stem>/`."""
+    collection = _volume(db, collection_id)
+    _require_own_folder(db, collection)
+    return collection
+
+
 def _require_received(db: Session, collection) -> None:
     from app.core.image_upload import volume_upload_state
 
@@ -416,7 +459,7 @@ def plan_free(db: Session, collection_id: int) -> dict:
     are not recomputed here (that is the long part), so a file that would
     fail the local check is reported only when it is freed.
     """
-    collection = _volume(db, collection_id)
+    collection = _stem_volume(db, collection_id)
     _require_received(db, collection)
     hold = _Hold(collection_id)
     try:
@@ -465,6 +508,7 @@ def _stable_sha1(path: Path) -> Optional[str]:
 
 def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str]) -> dict:
     """Hash, list again, and free what passes. Runs under the caller's hold."""
+    _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     objects = _objects(db, collection_id, freed=False)
     refused, hashed = [], []
     for obj in objects:
@@ -531,7 +575,7 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
 def _prepare_free(db: Session, collection_id: int):
     """The checks a free must pass before it starts; returns (collection, hold). The caller releases the hold."""
-    collection = _volume(db, collection_id)
+    collection = _stem_volume(db, collection_id)
     _require_received(db, collection)
     hold = _Hold(collection_id)
     try:
@@ -683,6 +727,7 @@ def _place(db: Session, obj: _Object, staging: Path, target: Path):
 
 
 def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[str]) -> dict:
+    _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     manifest = _RunManifest(stem, "restored")
     restored, refused = [], []
     for obj in _objects(db, collection_id, freed=True):
@@ -706,7 +751,7 @@ def _restore_work(db: Session, collection_id: int, stem: str, actor: Optional[st
 
 
 def _prepare_restore(db: Session, collection_id: int):
-    collection = _volume(db, collection_id)
+    collection = _stem_volume(db, collection_id)
     if not config.settings.OFFSITE_READ_REMOTE.strip():
         raise FreeRefused(NO_READ_REMOTE_MESSAGE)
     return collection, _Hold(collection_id)
@@ -777,6 +822,8 @@ class OffsiteJobRegistry:
                 job.state = "done"
             except VerificationUnavailable as exc:
                 job.state, job.error = "failed", f"{LISTING_MESSAGE} ({exc})"
+            except FreeRefused as exc:
+                job.state, job.error = "failed", exc.message
             except Exception as exc:
                 job.state, job.error = "failed", str(exc)[:500]
                 logger.exception("Offsite %s job for volume %s failed", job.action, job.collection_id)

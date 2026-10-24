@@ -674,3 +674,73 @@ def test_a_missing_thumbnail_of_a_local_raw_whose_preview_is_freed_answers_410_w
     assert r.status_code == 410, r.text
     detail = r.json()["detail"]
     assert detail["kind"] == "preview" and detail["key"] == f"{TENANT}/{STEM}/previews/f1_preview.jpg"
+
+
+# ---------------------------------------------------------------------------
+# A volume still partly in the name-based layout
+# ---------------------------------------------------------------------------
+
+def _partly_in_the_old_layout(db, root):
+    """A received volume one of whose images the layout migration has not yet moved into `<stem>/`."""
+    from app.models.record import RecordImage
+
+    vol, raw, jpg = _received(db, root)
+    old = root / "p" / "tomo" / "images" / "main" / "f2.jpg"
+    old.parent.mkdir(parents=True)
+    _paths(root, "f2.jpg")[0].rename(old)
+    row = db.get(RecordImage, jpg.id)
+    row.file_path = str(old)
+    db.commit()
+    return vol, raw, jpg, old
+
+
+@pytest.mark.unit
+def test_a_volume_not_yet_in_its_own_folder_is_refused_for_freeing_and_the_dry_run(
+        remote, db_session, override_projects_root):
+    from app.core.offsite_free import NOT_IN_OWN_FOLDER_MESSAGE, plan_free
+
+    vol, raw, jpg, old = _partly_in_the_old_layout(db_session, override_projects_root)
+
+    for attempt in (lambda: _free(db_session, vol), lambda: plan_free(db_session, vol.id)):
+        refused = _refusal(attempt)
+        assert refused.status_code == 409 and refused.message == NOT_IN_OWN_FOLDER_MESSAGE
+    assert old.read_bytes() == b"jpeg two"
+    assert all(p.exists() for p in _paths(override_projects_root, "f1.CR2"))
+    assert _image_row(db_session, raw.id).master_freed_at is None
+
+
+@pytest.mark.unit
+def test_a_volume_not_yet_in_its_own_folder_is_refused_for_restore(read_remote, db_session, override_projects_root):
+    from app.core.offsite_free import NOT_IN_OWN_FOLDER_MESSAGE
+    from app.models.record import RecordImage
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    _free(db_session, vol)
+    row = db_session.get(RecordImage, jpg.id)
+    row.file_path = str(override_projects_root / "p" / "tomo" / "images" / "main" / "f2.jpg")
+    db_session.commit()
+
+    refused = _refusal(lambda: _restore(db_session, vol))
+
+    assert refused.status_code == 409 and refused.message == NOT_IN_OWN_FOLDER_MESSAGE
+    assert not _paths(override_projects_root, "f1.CR2")[0].exists()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("work", ["free", "restore"])
+def test_the_job_checks_the_layout_again(read_remote, db_session, override_projects_root, work):
+    import app.core.offsite_free as of
+
+    vol, raw, jpg = _received(db_session, override_projects_root)
+    if work == "restore":
+        _free(db_session, vol)
+    from app.models.record import RecordImage
+    row = db_session.get(RecordImage, jpg.id)
+    row.file_path = str(override_projects_root / "p" / "tomo" / "images" / "main" / "f2.jpg")
+    db_session.commit()
+    fn = of._free_work if work == "free" else of._restore_work
+
+    refused = _refusal(lambda: fn(db_session, vol.id, STEM, "adm"))
+
+    assert refused.message == of.NOT_IN_OWN_FOLDER_MESSAGE
+    assert _paths(override_projects_root, "f1.CR2")[1].exists() == (work == "free")
