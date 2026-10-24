@@ -7,6 +7,7 @@ grow for as long as the backend runs. A running job is never dropped.
     python -m pytest tests/unit/test_offsite_job_registry.py
 """
 
+import logging
 import threading
 
 import pytest
@@ -67,3 +68,21 @@ def test_a_queued_or_running_job_is_never_dropped():
         gate.set()
         assert hold.released.wait(10)
 
+
+@pytest.mark.unit
+def test_storage_unavailable_fails_the_job_with_its_message_and_one_warning(caplog):
+    from app.core.offsite_free import OffsiteJobRegistry
+    from app.core.storage_override import StorageUnavailableError
+
+    def work():
+        raise StorageUnavailableError("The external drive is not connected.")
+
+    registry = OffsiteJobRegistry()
+    with caplog.at_level(logging.WARNING, logger="app.core.offsite_free"):
+        job = _finish(registry, registry.reserve(1, "restore"), work)
+
+    assert (job.state, job.error) == ("failed", "The external drive is not connected.")
+    records = [r for r in caplog.records if r.name == "app.core.offsite_free"]
+    assert [r.levelno for r in records] == [logging.WARNING]
+    assert records[0].exc_info is None, "no traceback"
+    assert "The external drive is not connected." in records[0].getMessage()

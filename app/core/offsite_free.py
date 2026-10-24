@@ -75,6 +75,7 @@ from sqlalchemy.orm import Session
 from app.core import config
 from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1, transfer_lock
 from app.core.paths import METADATA_DIR
+from app.core.storage_override import StorageUnavailableError
 
 logger = logging.getLogger(__name__)
 
@@ -908,6 +909,12 @@ class OffsiteJobRegistry:
                 job.state, job.error = "failed", f"{LISTING_MESSAGE} ({exc})"
             except FreeRefused as exc:
                 job.state, job.error = "failed", exc.message
+            except StorageUnavailableError as exc:
+                # The drive the projects root is on is gone or not writable
+                # (restore checks before each file it writes). Its message is
+                # the operator's; a traceback says nothing more.
+                job.state, job.error = "failed", str(exc)
+                logger.warning("Offsite %s job for volume %s stopped: %s", job.action, job.collection_id, exc)
             except Exception as exc:
                 job.state, job.error = "failed", str(exc)[:500]
                 logger.exception("Offsite %s job for volume %s failed", job.action, job.collection_id)
