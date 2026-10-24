@@ -121,6 +121,34 @@ def _put_outside_every_volume(db, rec, project_id):
     db.add(rec)
     db.commit()
 
+@pytest.mark.unit
+def test_add_record_moves_a_record_stored_offsite_and_outside_every_volume_to_another_project(admin, db_session):
+    """Its volume does not change (it has none), so neither does anything its keys name; PATCH allows the same."""
+    from app.models.project import Project
+
+    a, _, rec, _ = _setup(db_session)
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    q = Project(name="Q")
+    db_session.add(q)
+    db_session.commit()
+    response = admin.post(f"/projects/{q.id}/add_record/{rec.id}")
+    assert response.status_code == 200, response.text
+    db_session.expire_all()
+    moved = db_session.get(type(rec), rec.id)
+    assert (moved.project_id, moved.collection_id) == (q.id, None)
+
+
+@pytest.mark.unit
+def test_add_record_reattaches_a_record_stored_offsite_removed_from_its_project(admin, db_session):
+    a, _, rec, _ = _setup(db_session)
+    _put_outside_every_volume(db_session, rec, a.project_id)
+    assert admin.post(f"/projects/{a.project_id}/remove_record/{rec.id}").status_code == 200
+    response = admin.post(f"/projects/{a.project_id}/add_record/{rec.id}")
+    assert response.status_code == 200, response.text
+    db_session.expire_all()
+    back = db_session.get(type(rec), rec.id)
+    assert (back.project_id, back.collection_id) == (a.project_id, None)
+
 
 @pytest.mark.unit
 def test_patch_refuses_to_put_a_record_stored_offsite_into_a_volume(admin, db_session, tenant):
