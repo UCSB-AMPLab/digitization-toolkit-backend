@@ -170,6 +170,11 @@ class RecordImageRead(RecordImageBase):
 	# out of the default image list/gallery/export.
 	is_current: bool = True
 	superseded_at: Optional[datetime] = None
+	# Set when the file was freed from the card with its verified object in
+	# the offsite bucket (app.core.offsite_free): stored offsite, not missing.
+	# The master, and a RAW master's preview, each on its own.
+	master_freed_at: Optional[datetime] = None
+	preview_freed_at: Optional[datetime] = None
 
 	class Config:
 		from_attributes = True

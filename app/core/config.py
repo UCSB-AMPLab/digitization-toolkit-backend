@@ -41,6 +41,12 @@ class Settings(BaseSettings):
     # (app.core.image_upload), and the catalogue backup with it, whose dump
     # goes under the same prefix. Read from offsite.env like the keys above.
     OFFSITE_TENANT: str = Field(default="", validation_alias="DTK_OFFSITE_TENANT")
+    # A second rclone remote, with the same layout as OFFSITE_REMOTE (remote
+    # plus bucket), whose key may read objects under the tenant prefix. Only
+    # restoring a freed volume reads through it (app.core.offsite_free); the
+    # upload key stays write + list. Empty: restore is unavailable and its
+    # route answers 409.
+    OFFSITE_READ_REMOTE: str = Field(default="", validation_alias="DTK_OFFSITE_READ_REMOTE")
     # The age X25519 public key (age1...) every catalogue dump is encrypted to
     # before upload (app.core.catalogue_backup). Unset or invalid: no dump is
     # uploaded. The unit holds only this public half, never the private key.

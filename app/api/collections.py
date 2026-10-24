@@ -53,6 +53,7 @@ logger = logging.getLogger(__name__)
 
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+allow_admin = RoleChecker(["admin"])
 
 EXPORT_IN_SUBTREE_MESSAGE = (
     "An export of this collection, or of a collection inside it, is running. "
@@ -257,6 +258,100 @@ def get_collection_offsite_state(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     return volume_upload_state(db, collection)
+
+
+# ==============================================================================
+# Freeing a received volume from the card, and restoring it (app.core.offsite_free)
+# ==============================================================================
+#
+# Under /{id}/offsite, beside the received indicator they depend on. GET of
+# /offsite/free is the dry run (it lists the bucket and changes nothing);
+# POST runs the free. Both POSTs answer 202 with a job to poll, as the export
+# does, because hashing a volume's masters outlasts the proxy's read timeout;
+# what can be refused at once is refused before the job starts, with 409.
+
+def _offsite_refused(exc) -> HTTPException:
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+@router.get("/{collection_id}/offsite/free")
+def plan_free_collection(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Dry run: which masters and previews freeing would remove, their count and bytes, and what it would refuse and why."""
+    from app.core.offsite_free import FreeRefused, plan_free
+
+    try:
+        return plan_free(db, collection_id)
+    except FreeRefused as exc:
+        raise _offsite_refused(exc)
+
+
+def _job_body(collection_id: int, job) -> dict:
+    return {"job_id": job.id, "state": job.state, "action": job.action,
+            "status_url": f"/collections/{collection_id}/offsite/jobs/{job.id}"}
+
+
+@router.post("/{collection_id}/offsite/free", status_code=202)
+def free_collection(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Free the volume's masters and RAW previews from the card; thumbnails stay.
+
+    Refused with 409 when the volume has no stem, when not every one of its
+    objects is verified in the bucket, while an export of it is queued or
+    running or its files are being read for upload, and when the bucket
+    cannot be listed. Each file is freed only when its local SHA1 and the
+    bucket listing's both equal its offsite row's; the job's result lists
+    the files freed and those refused.
+    """
+    from app.core.offsite_free import FreeRefused, start_free
+
+    try:
+        job = start_free(db, collection_id, current_user.username)
+    except FreeRefused as exc:
+        raise _offsite_refused(exc)
+    return _job_body(collection_id, job)
+
+
+@router.post("/{collection_id}/offsite/restore", status_code=202)
+def restore_collection(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
+
+    Refused with 409 when the volume has no stem, when no read remote is
+    configured (DTK_OFFSITE_READ_REMOTE), and while an export of it is
+    queued or running or its files are being read for upload.
+    """
+    from app.core.offsite_free import FreeRefused, start_restore
+
+    try:
+        job = start_restore(db, collection_id, current_user.username)
+    except FreeRefused as exc:
+        raise _offsite_refused(exc)
+    return _job_body(collection_id, job)
+
+
+@router.get("/{collection_id}/offsite/jobs/{job_id}")
+def offsite_job_status(
+    collection_id: int,
+    job_id: str,
+    current_user: User = Depends(allow_admin),
+):
+    """The state of a free or restore job, with its result once done."""
+    from app.core.offsite_free import offsite_jobs
+
+    job = offsite_jobs.get(job_id)
+    if job is None or job.collection_id != collection_id:
+        raise HTTPException(status_code=404, detail="Job not found")
+    return job.to_dict()
 
 
 @router.get("/{collection_id}/hierarchy", response_model=CollectionWithChildren)
@@ -945,6 +1040,16 @@ def export_collection_bagit(
                 "message": f"Cannot export: {len(image_less)} record(s) have no image: {image_less}",
                 "blocking_record_ids": image_less,
             },
+        )
+
+    # A master freed from the card is in the bucket, not here, and a bag is
+    # built from the card. 409: the volume's state, which a restore changes.
+    from app.core.offsite_free import FREED_EXPORT_MESSAGE
+    freed = [i.id for r in records for i in r.images if i.is_current and i.master_freed_at is not None]
+    if freed:
+        raise HTTPException(
+            status_code=409,
+            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed},
         )
 
     # One export per collection at a time: a retry returns the running job instead of

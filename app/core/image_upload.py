@@ -961,16 +961,20 @@ def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
 # ---------------------------------------------------------------------------
 
 def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) -> dict:
-    """Per stemmed volume: total, verified, pending, refused, last verification, refusals.
+    """Per stemmed volume: total, verified, pending, refused, last verification, refusals, freed.
 
     A volume's uploadable objects are each image's capture, and, for a RAW
     master, its preview when the preview has a row or its file is on disk.
+    `freed_files` and `freed_bytes` count the objects whose local file was
+    freed from the card (app.core.offsite_free); they are counted among the
+    verified too, since freeing needs a verified object.
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
-    q = (db.query(RecordImage.id, RecordImage.file_path, Collection.id)
+    q = (db.query(RecordImage.id, RecordImage.file_path, Collection.id,
+                  RecordImage.master_freed_bytes, RecordImage.preview_freed_bytes)
          .join(Record, RecordImage.record_id == Record.id)
          .join(Collection, Record.collection_id == Collection.id)
          .filter(Collection.filename_stem.isnot(None)))
@@ -982,16 +986,21 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
     images = q.all()
 
     rows = {}
-    image_ids = [i for i, _, _ in images]
+    image_ids = [i for i, *_ in images]
     for start in range(0, len(image_ids), 500):
         chunk = image_ids[start:start + 500]
         for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
             rows[(row.record_image_id, row.kind)] = row
 
-    out = {cid: {"total": 0, "verified": 0, "refused": 0, "last_verified_at": None, "refusals": []}
+    out = {cid: {"total": 0, "verified": 0, "refused": 0, "last_verified_at": None, "refusals": [],
+                 "freed_files": 0, "freed_bytes": 0}
            for (cid,) in stemmed.all()}
-    for image_id, file_path, cid in images:
+    for image_id, file_path, cid, master_freed, preview_freed in images:
         state = out[cid]
+        for freed_bytes in (master_freed, preview_freed):
+            if freed_bytes is not None:
+                state["freed_files"] += 1
+                state["freed_bytes"] += freed_bytes
         kinds = ["capture"]
         if is_raw_suffix(Path(file_path)):
             if (image_id, "preview") in rows:
@@ -1028,7 +1037,8 @@ def volume_upload_state(db: Session, collection) -> dict:
             "uploadable": collection.filename_stem is not None}
     if collection.filename_stem is None:
         return {**base, "total": 0, "verified": 0, "pending": 0, "refused": 0,
-                "last_verified_at": None, "received": False, "refusals": []}
+                "last_verified_at": None, "received": False, "refusals": [],
+                "freed_files": 0, "freed_bytes": 0}
     return {**base, **_object_counts(db, [collection.id])[collection.id]}
 
 
@@ -1051,6 +1061,8 @@ def unit_upload_summary(db: Session) -> dict:
         "verified": sum(s["verified"] for s in per_volume.values()),
         "pending": sum(s["pending"] for s in per_volume.values()),
         "refused": sum(s["refused"] for s in per_volume.values()),
+        "freed_files": sum(s["freed_files"] for s in per_volume.values()),
+        "freed_bytes": sum(s["freed_bytes"] for s in per_volume.values()),
         "last_verified_at": max(last) if last else None,
         "last_run": image_upload_scheduler.last_result,
     }
@@ -1138,13 +1150,26 @@ def main(argv: Optional[list] = None) -> int:
     adopt.add_argument("prefix", help="remote prefix, relative to DTK_OFFSITE_REMOTE")
     adopt.add_argument("--apply", action="store_true",
                        help="write the rows; without it, only report what would be recorded")
+    mark = sub.add_parser(
+        "mark-freed",
+        help="mark as freed a volume's files already removed from the card whose verified objects "
+             "a fresh listing shows with the same SHA1 (deletes nothing)",
+    )
+    mark.add_argument("stem", help="the volume's file name stem")
+    mark.add_argument("--apply", action="store_true",
+                      help="write the freed state; without it, only report what would be marked")
     args = parser.parse_args(argv)
 
     from app.core.db import SessionLocal
 
     db = SessionLocal()
     try:
-        report = adopt_objects(db, args.prefix, apply=args.apply)
+        if args.command == "mark-freed":
+            from app.core.offsite_free import mark_freed
+
+            report = mark_freed(db, args.stem, apply=args.apply)
+        else:
+            report = adopt_objects(db, args.prefix, apply=args.apply)
     except (ValueError, VerificationUnavailable) as exc:
         print(f"error: {exc}", file=sys.stderr)
         return 2

@@ -752,8 +752,21 @@ _MASTER_MEDIA_TYPES = {
 }
 
 
-def _stored_master(db: Session, img_id: int) -> tuple[RecordImage, Path]:
-	"""The image row and its master's resolved path, or a 404.
+def _freed(db: Session, img: RecordImage, kind: str) -> HTTPException:
+	"""410 for a file freed from the card (app.core.offsite_free), with its object key.
+
+	410 Gone and not 404: the file was removed on purpose and is stored
+	offsite, and a client must never read it as lost (NEH-248). Not a 409
+	either: nothing the client can change in this request would make the
+	file servable; an admin's restore of the volume does.
+	"""
+	from app.core.offsite_free import freed_detail
+
+	return HTTPException(status_code=410, detail=freed_detail(db, img, kind))
+
+
+def _image_row(db: Session, img_id: int) -> tuple[RecordImage, Path]:
+	"""The image row and its master's resolved path (which may not exist), or a 404.
 
 	A master whose stored path escapes the storage roots is reported as not
 	found, the same as a missing file.
@@ -764,7 +777,17 @@ def _stored_master(db: Session, img_id: int) -> tuple[RecordImage, Path]:
 	if not img.file_path:
 		raise HTTPException(status_code=404, detail="Image has no associated file")
 	file_path = resolve_within_storage(img.file_path)
-	if file_path is None or not file_path.exists():
+	if file_path is None:
+		raise HTTPException(status_code=404, detail="File not found on disk")
+	return img, file_path
+
+
+def _stored_master(db: Session, img_id: int) -> tuple[RecordImage, Path]:
+	"""The image row and its master's resolved path, a 410 for a freed master, or a 404."""
+	img, file_path = _image_row(db, img_id)
+	if img.master_freed_at is not None:
+		raise _freed(db, img, "capture")
+	if not file_path.exists():
 		raise HTTPException(status_code=404, detail="File not found on disk")
 	return img, file_path
 
@@ -813,11 +836,21 @@ def get_image_preview(
 	"""A browser-displayable image of the capture, sent inline.
 
 	A JPEG, PNG or WebP master is its own preview. A RAW master is shown
-	through its `_preview.jpg` sidecar. Anything else (TIFF, a RAW master
-	without a sidecar) is a 404: this endpoint never sends RAW bytes.
+	through its `_preview.jpg` sidecar, also when the master itself was
+	freed from the card. Anything else (TIFF, a RAW master without a
+	sidecar) is a 404: this endpoint never sends RAW bytes. A freed file is
+	a 410 with its object key.
 	"""
-	img, file_path = _stored_master(db, img_id)
+	img, file_path = _image_row(db, img_id)
 	suffix = file_path.suffix.lower()
+
+	if is_raw_suffix(file_path):
+		if img.preview_freed_at is not None:
+			raise _freed(db, img, "preview")
+		if img.master_freed_at is None and not file_path.exists():
+			raise HTTPException(status_code=404, detail="File not found on disk")
+	else:
+		img, file_path = _stored_master(db, img_id)
 
 	if suffix in _BROWSER_DISPLAYABLE_SUFFIXES:
 		ext = suffix.lstrip(".")
@@ -857,7 +890,8 @@ def get_image_thumbnail(
 	"""Download the thumbnail for an image. Generates it on demand if missing.
 
 	For a RAW master the thumbnail is generated from its `_preview.jpg`
-	sidecar when one exists, as capture does.
+	sidecar when one exists, as capture does. Freeing keeps thumbnails; one
+	that is missing for an image whose source was freed is a 410.
 	"""
 	img = db.query(RecordImage).filter(RecordImage.id == img_id).first()
 	if not img:
@@ -869,9 +903,17 @@ def get_image_thumbnail(
 		if not img.file_path:
 			raise HTTPException(status_code=404, detail="Image has no source file for thumbnail generation")
 		source_path = resolve_within_storage(img.file_path)
-		if source_path is None or not source_path.exists():
+		# A RAW master's thumbnail is made from its preview, never from the
+		# RAW (which Pillow cannot read), so a freed preview is a 410 whether
+		# or not the master is on the card (a partial free or restore).
+		if source_path is not None and is_raw_suffix(source_path) and img.preview_freed_at is not None:
+			raise _freed(db, img, "preview")
+		sidecar = _raw_preview_sidecar(source_path) if source_path is not None else None
+		if source_path is not None and img.master_freed_at is not None and sidecar is None:
+			raise _freed(db, img, "capture")
+		if source_path is None or not (source_path.exists() or sidecar is not None):
 			raise HTTPException(status_code=404, detail="Source image file not found on disk")
-		thumb_source = _raw_preview_sidecar(source_path) or source_path
+		thumb_source = sidecar or source_path
 		# The thumbnail is written beside the source. A source under an
 		# override root that cannot take writes is refused (503) before the
 		# thumbnail's mkdir, rather than writing onto the SD card.
