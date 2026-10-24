@@ -128,13 +128,12 @@ def get_catalogue_backup_state(
     what was true of the Rionegro unit for the six weeks before its card
     filled.
     """
-    from app.core.catalogue_backup import last_verified_backup
-    from app.core.config import settings
+    from app.core.catalogue_backup import is_configured, last_verified_backup
     from app.core.image_upload import unit_upload_summary
 
     state = last_verified_backup(db)
     return {
-        "enabled":          bool(settings.OFFSITE_REMOTE.strip()),
+        "enabled":          is_configured(),
         "last_verified_at": state["verified_at"] if state else None,
         "object":           state["object"] if state else None,
         "detail":           state["detail"] if state else None,

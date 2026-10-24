@@ -162,6 +162,7 @@ def offsite(tmp_path, monkeypatch, db_session):
 
     monkeypatch.setattr(settings, "OFFSITE_REMOTE", "b2stub:bucket", raising=False)
     monkeypatch.setattr(settings, "OFFSITE_DB_PREFIX", "db-backups", raising=False)
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", "captua-test", raising=False)
     monkeypatch.setattr(settings, "OFFSITE_BWLIMIT", "750k", raising=False)
     monkeypatch.setattr(settings, "PG_DUMP_COMMAND", str(pg_dump), raising=False)
 
@@ -683,6 +684,50 @@ def test_the_upload_skips_the_destination_check_and_caps_bandwidth(offsite, rclo
 
 
 @pytest.mark.unit
+def test_the_dump_goes_under_the_tenant_prefix(offsite, rclone):
+    """The appliance key may write only under <tenant>/, so the dump does too."""
+    dump = offsite.dump_dir / _LISTED_NAME
+    dump.write_bytes(b"x")
+
+    offsite.real_upload(dump)
+    offsite.real_listing_sha1(_LISTED_NAME)
+
+    copy = next(c for c in rclone.calls if "copy" in c)
+    assert copy[copy.index(str(dump)) + 1] == "b2stub:bucket/captua-test/db-backups/"
+    ls = next(c for c in rclone.calls if "lsjson" in c)
+    assert "b2stub:bucket/captua-test/db-backups/" in ls
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("tenant", ["", "  ", "/"])
+def test_the_run_is_disabled_without_a_tenant(offsite, db_session, monkeypatch, tenant):
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", tenant, raising=False)
+
+    assert cb.run_catalogue_backup(db_session)["status"] == "disabled"
+    assert offsite.upload_calls() == []
+    scheduler = cb.CatalogueBackupScheduler()
+    try:
+        assert scheduler.start() is False
+    finally:
+        scheduler.stop()
+
+
+@pytest.mark.unit
+def test_a_tenant_that_is_not_a_prefix_stops_the_run(offsite, db_session, monkeypatch):
+    from app.core.config import settings
+
+    cb = offsite.module
+    monkeypatch.setattr(settings, "OFFSITE_TENANT", "../elsewhere", raising=False)
+
+    result = cb.run_catalogue_backup(db_session)
+    assert result["status"] == "misconfigured", result
+    assert offsite.upload_calls() == []
+
+
+@pytest.mark.unit
 def test_the_listing_asks_for_sha1_hashes_and_reads_the_one_it_gets(offsite, rclone):
     found = offsite.real_listing_sha1(_LISTED_NAME)
 
@@ -1098,11 +1143,11 @@ def test_a_verified_run_names_the_configured_destination(
     assert result["status"] == "verified", result
 
     state = cb.last_verified_backup(db_session)
-    assert "/mnt/offsite-dump/db-backups" in state["detail"], state
+    assert "/mnt/offsite-dump/captua-test/db-backups" in state["detail"], state
     assert "bucket" not in state["detail"].lower(), state
 
     logged = " ".join(record.getMessage() for record in caplog.records)
-    assert "/mnt/offsite-dump/db-backups" in logged, logged
+    assert "/mnt/offsite-dump/captua-test/db-backups" in logged, logged
     assert "in the bucket" not in logged, logged
 
 

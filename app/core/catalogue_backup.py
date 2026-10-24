@@ -15,6 +15,11 @@ Shape of a run:
    view and the date marker that decides whether today still needs a run;
 5. remove the temporary file — always, on every path.
 
+The dump goes to ``<OFFSITE_REMOTE>/<OFFSITE_TENANT>/<OFFSITE_DB_PREFIX>/``
+(``db-backups`` by default): under the tenant's prefix, the only part of the
+bucket the appliance key may write. An empty tenant disables the backup, as an
+empty remote does.
+
 ``OFFSITE_REMOTE`` is whatever rclone destination the unit is configured with,
 and that is deliberately not validated as remote-shaped: a venue with no usable
 uplink may be given a local path or a mounted disk. So nothing here asserts
@@ -167,10 +172,38 @@ def _rclone_argv(*args: str) -> list[str]:
     return argv
 
 
+def _tenant() -> Optional[str]:
+    """The tenant prefix (app.core.image_upload.configured_tenant), or None when unset.
+
+    Raises ImageUploadMisconfigured, a BackupError, for a value that is not a
+    prefix. Imported here rather than at the top: image_upload imports this
+    module.
+    """
+    from app.core.image_upload import configured_tenant
+
+    return configured_tenant()
+
+
+def is_configured() -> bool:
+    """Whether a remote and a valid tenant prefix are configured."""
+    if not config.settings.OFFSITE_REMOTE.strip():
+        return False
+    try:
+        return _tenant() is not None
+    except BackupError:
+        return False
+
+
 def remote_dir() -> str:
+    """`<remote>/<tenant>/<OFFSITE_DB_PREFIX>`: the dump goes under the tenant's
+    prefix, the only part of the bucket the appliance key may write.
+    """
+    tenant = _tenant()
+    if tenant is None:
+        raise BackupError("no tenant prefix is configured (DTK_OFFSITE_TENANT)")
     prefix = config.settings.OFFSITE_DB_PREFIX.strip("/")
     remote = config.settings.OFFSITE_REMOTE.rstrip("/")
-    return f"{remote}/{prefix}" if prefix else remote
+    return f"{remote}/{tenant}/{prefix}" if prefix else f"{remote}/{tenant}"
 
 
 def _dump_dir() -> Path:
@@ -593,7 +626,8 @@ def _record(db: Session, *, action: str, level: str, subject: Optional[str],
 def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     """Dump, upload, verify, record. Never raises; the caller gets a status.
 
-    Statuses: "disabled" (no remote configured), "up-to-date" (already verified
+    Statuses: "disabled" (no remote or no tenant prefix configured),
+    "misconfigured" (a tenant that is not a prefix), "up-to-date" (already verified
     today), "verified", "failed" (the bucket answered and the answer was bad, or
     the dump or upload failed), "aborted" (verification could not answer).
     """
@@ -604,6 +638,13 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     _sweep_stale_dumps()
 
     if not config.settings.OFFSITE_REMOTE.strip():
+        return {"status": "disabled"}
+    try:
+        tenant = _tenant()
+    except BackupError as exc:
+        logger.error("Catalogue backup not run: %s", exc)
+        return {"status": "misconfigured", "error": str(exc)}
+    if tenant is None:
         return {"status": "disabled"}
 
     if not needs_run_today(db, today):
@@ -733,9 +774,10 @@ class CatalogueBackupScheduler:
         # Ahead of the configured check: an abandoned dump is cleared even on
         # a unit whose remote has since been removed.
         _sweep_stale_dumps()
-        if not config.settings.OFFSITE_REMOTE.strip():
+        if not is_configured():
             logger.info(
-                "Offsite catalogue backup is not configured; no schedule started"
+                "Offsite catalogue backup is not configured (remote and tenant "
+                "prefix); no schedule started"
             )
             return False
         if self._thread is not None and self._thread.is_alive():
