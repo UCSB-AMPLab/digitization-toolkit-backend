@@ -7,9 +7,10 @@ record `captured`: a captured record stays where it is, and a rejected one
 returns to `captured` (decision 8, ruled 2026-10-24). It reaches review again
 only when the operator promotes the volume, as a new capture does.
 
-An approved record is deliberately not retakeable. Approved is the only state
-that means something may already have left the appliance, and the supersede
-chain preserves the old image without recording that a bag was built from it.
+A record in review or approved is not retakeable, and the capture is refused
+with a 409 before anything happens. Approved is the only state that means
+something may already have left the appliance, and the supersede chain
+preserves the old image without recording that a bag was built from it.
 
 The hardware is stood in for as test_record_typology_dropped.py does.
 
@@ -206,21 +207,32 @@ def test_a_captured_record_can_only_be_retaken_in_its_own_capture_mode(
 
 
 @pytest.mark.unit
-def test_an_approved_record_is_not_retaken(client, db_session, test_project,
-                                           volume, monkeypatch, tmp_path):
-    """The supersede branch must not fire: approved work may already have left."""
+@pytest.mark.parametrize("mode", ["single", "dual"])
+@pytest.mark.parametrize("status", ["in_review", "approved"])
+def test_a_record_in_review_or_approved_is_not_retaken(client, db_session, test_project,
+                                                       volume, monkeypatch, tmp_path, status, mode):
+    """Refused before any number is taken or camera touched: the record is a reviewer's,
+    and approved work may already have left the appliance."""
+    from app.core.volume_stem import RETAKE_STATUS_DETAIL
+    from app.models.collection import Collection
     _install_capture_fakes(monkeypatch, tmp_path)
-    rec, old = _record_with_image(db_session, volume, "approved")
+    calls = []
+    monkeypatch.setattr(capture_service, "single_capture_image", lambda *a, **k: calls.append("single"))
+    monkeypatch.setattr(capture_service, "dual_capture_image", lambda *a, **k: calls.append("dual"))
+    rec, old = _record_with_image(db_session, volume, status, capture_mode=mode)
     api = _client_as(client, "op", "operator")
 
-    resp = _capture(api, test_project.name, collection_id=volume.id, record_id=rec.id)
-    assert resp.status_code == 200, resp.text
+    take = _capture if mode == "single" else _capture_dual
+    resp = take(api, test_project.name, collection_id=volume.id, record_id=rec.id)
 
-    db_session.refresh(rec)
-    db_session.refresh(old)
-    assert rec.status == "approved"
-    assert old.is_current is True, "the approved capture must still be the current one"
-    assert old.superseded_at is None
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == RETAKE_STATUS_DETAIL
+    assert calls == []
+    db_session.expire_all()
+    assert db_session.get(Collection, volume.id).capture_counter == 0
+    assert db_session.get(type(rec), rec.id).status == status
+    old = db_session.get(type(old), old.id)
+    assert old.is_current is True and old.superseded_at is None
 
 
 if __name__ == "__main__":

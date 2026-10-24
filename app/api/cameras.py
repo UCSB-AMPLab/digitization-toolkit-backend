@@ -17,7 +17,7 @@ from app.models.collection import Collection
 from app.schemas.camera import CameraSettingsCreate, CameraSettingsRead, CameraSettingsUpdate
 from app.core.thumbnail import generate_thumbnail
 from app.core.capture_naming import RESOLUTION_IN_FILENAME_DETAIL, CaptureNameRefused, take_filename_index
-from app.core.volume_stem import RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
+from app.core.volume_stem import RETAKE_STATUS_DETAIL, RETAKE_VOLUME_DETAIL, STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
@@ -71,6 +71,19 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 			raise HTTPException(status_code=409, detail=RETAKE_VOLUME_DETAIL)
 	if volume.filename_stem is None:
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+
+
+def _refuse_retake_out_of_the_operators_hands(retake_record: Optional[Record]) -> None:
+	"""409 for a retake of a record that is neither captured nor rejected.
+
+	A record in review or approved is a reviewer's: a capture with its
+	record_id would add a current image beside the one being reviewed, with
+	no supersede and no status change. Approved is also the only state
+	meaning something may already have left the appliance. Called after the
+	volume refusals, before any number is taken or camera touched.
+	"""
+	if retake_record is not None and retake_record.status not in ("captured", "rejected"):
+		raise HTTPException(status_code=409, detail=RETAKE_STATUS_DETAIL)
 
 
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
@@ -777,9 +790,9 @@ def trigger_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	_refuse_retake_out_of_the_operators_hands(retake_record)
 	# A retake is redone only in the mode the record was captured in.
-	if (retake_record is not None and retake_record.status in ("captured", "rejected")
-			and retake_record.capture_mode != "single"):
+	if retake_record is not None and retake_record.capture_mode != "single":
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
@@ -872,28 +885,17 @@ def trigger_capture(
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
-			if record.status in ("captured", "rejected"):
-				# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
-				# can redo a frame she can see is bad instead of waiting for a
-				# reviewer to reject it and pick one of six image faults). An
-				# approved record is deliberately not retakeable: approved is the
-				# only state meaning something may already have left the appliance,
-				# so the path is reviewer undoes, reviewer rejects, operator retakes.
-				#
-				# Either way the record can only be redone in the capture mode it was
-				# originally taken with — a single capture can't turn a dual-mode
-				# record's pair back into one image. That is checked at the top,
-				# before the camera is touched.
-				#
-				# record_id is the only signal this endpoint has, and it now means
-				# "retake" in the two states an operator can act in and "add an
-				# image to this record" in the two she cannot. No client uses the
-				# second: the frontend passes record_id only from its retake handler,
-				# and every folio is captured as its own record.
-				# Its capture mode was checked before the camera was touched.
-				is_recapture = True
-				from app.api.records import _supersede_current_images
-				_supersede_current_images(record)
+			# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
+			# can redo a frame she can see is bad instead of waiting for a
+			# reviewer to reject it and pick one of six image faults). A record
+			# in review or approved was refused at the top: approved is the only
+			# state meaning something may already have left the appliance, so
+			# the path is reviewer undoes, reviewer rejects, operator retakes.
+			# The record can only be redone in the capture mode it was taken
+			# with, also checked at the top, before the camera was touched.
+			is_recapture = True
+			from app.api.records import _supersede_current_images
+			_supersede_current_images(record)
 		else:
 			# Create new record for this capture
 			record = Record(
@@ -1017,9 +1019,9 @@ def trigger_dual_capture(
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	_refuse_retake_out_of_the_operators_hands(retake_record)
 	# A retake is redone only in the mode the record was captured in.
-	if (retake_record is not None and retake_record.status in ("captured", "rejected")
-			and retake_record.capture_mode != "dual"):
+	if retake_record is not None and retake_record.capture_mode != "dual":
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
@@ -1101,15 +1103,13 @@ def trigger_dual_capture(
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
-			if record.status in ("captured", "rejected"):
-				# Retake, on the same terms as the single-capture endpoint above
-				# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
-				# be redone as a pair, and can't turn a single-mode record into two
-				# images.
-				# Its capture mode was checked before the camera was touched.
-				is_recapture = True
-				from app.api.records import _supersede_current_images
-				_supersede_current_images(record)
+			# Retake, on the same terms as the single-capture endpoint above
+			# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
+			# be redone as a pair, and can't turn a single-mode record into two
+			# images; status and mode were checked before the camera was touched.
+			is_recapture = True
+			from app.api.records import _supersede_current_images
+			_supersede_current_images(record)
 		else:
 			# Create new record for this dual capture
 			record = Record(
