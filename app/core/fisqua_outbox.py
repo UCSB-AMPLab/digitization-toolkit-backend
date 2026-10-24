@@ -38,9 +38,10 @@ overwritten. The worker takes no lock on records or on the volume row. The
 handover paths write these rows after locking the volume's records, which is
 the order every path takes (records, then the volume).
 
-The token is never logged, stored or returned: scrub() takes it out of every
-error text before it is written to a row or a log, and the settings hold it
-as a SecretStr.
+The token is never logged, stored or returned: redact() takes it out of
+every string the transport returns (answer, problems, status, ids, errors,
+at any depth) before anything is written to a row or a log, scrub() out of
+every error text, and the settings hold it as a SecretStr.
 """
 
 import logging
@@ -84,11 +85,25 @@ def fisqua_configured() -> bool:
 
 def scrub(text: Any) -> str:
     """`text` as a string with the token taken out, truncated to LAST_ERROR_LIMIT."""
-    out = str(text)
+    return redact(str(text))[:LAST_ERROR_LIMIT]
+
+
+def redact(value: Any) -> Any:
+    """`value` with the token taken out of every string in it, keys included, at any depth.
+
+    Applied to everything a transport returns before it is stored, logged or
+    served: Fisqua's answer, its problems, its status and ids.
+    """
     token = _token()
-    if token:
-        out = out.replace(token, "[token]")
-    return out[:LAST_ERROR_LIMIT]
+    if not token:
+        return value
+    if isinstance(value, str):
+        return value.replace(token, "[token]")
+    if isinstance(value, dict):
+        return {redact(k): redact(v) for k, v in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [redact(v) for v in value]
+    return value
 
 
 def retry_delay(attempts: int) -> timedelta:
@@ -151,18 +166,22 @@ def enqueue_handover(db: Session, collection):
     """Queue a new manifest for a volume just handed over; supersede its unsent ones.
 
     Does not commit: the caller commits it with the handover. Returns the new
-    row, or None when Fisqua is not configured.
+    row, or None when Fisqua is not configured (the unsent rows are
+    superseded all the same).
     """
     from app.models.fisqua import FisquaOutbox
 
-    if not fisqua_configured():
-        return None
+    # Whatever the configuration: a manifest queued while Fisqua was
+    # configured is no longer the volume's handover, and must not be sent
+    # if the configuration returns.
     db.execute(
         update(FisquaOutbox)
         .where(FisquaOutbox.collection_id == collection.id, FisquaOutbox.state.in_(UNSENT))
         .values(state="superseded", next_attempt_at=None)
         .execution_options(synchronize_session=False)
     )
+    if not fisqua_configured():
+        return None
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
@@ -171,11 +190,13 @@ def enqueue_handover(db: Session, collection):
 
 
 def withdraw_unsent(db: Session, collection_id: int) -> None:
-    """Withdraw a volume's unsent manifests when its handover is taken back. Does not commit."""
+    """Withdraw a volume's unsent manifests when its handover is taken back. Does not commit.
+
+    Whatever the configuration, so a row queued while Fisqua was configured
+    is not sent for an undone handover once the configuration returns.
+    """
     from app.models.fisqua import FisquaOutbox
 
-    if not fisqua_configured():
-        return
     db.execute(
         update(FisquaOutbox)
         .where(FisquaOutbox.collection_id == collection_id, FisquaOutbox.state.in_(UNSENT))
@@ -253,6 +274,14 @@ def _promote(db: Session, row, result: _Run) -> None:
         result.promoted += 1
 
 
+def _redacted(answer: TransportResult) -> TransportResult:
+    """The transport's answer with the token taken out of every payload it carries."""
+    return TransportResult(outcome=answer.outcome, response=redact(answer.response),
+                           external_id=redact(answer.external_id), error=redact(answer.error),
+                           problems=redact(answer.problems), status=redact(answer.status),
+                           status_at=answer.status_at)
+
+
 def _send(db: Session, row, transport, now: datetime, result: _Run) -> None:
     from app.models.fisqua import FisquaOutbox
 
@@ -265,6 +294,7 @@ def _send(db: Session, row, transport, now: datetime, result: _Run) -> None:
         answer = transport.send_manifest(manifest)
     except Exception as exc:  # the transport is not trusted to classify every failure
         answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+    answer = _redacted(answer)
 
     if answer.outcome == "delivered":
         _move(db, row.id, "sending", state="delivered", delivered_at=now, response=answer.response,
@@ -291,6 +321,7 @@ def _poll(db: Session, row, transport, now: datetime, result: _Run) -> None:
         answer = transport.get_status(row.external_id)
     except Exception as exc:
         answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+    answer = _redacted(answer)
     if answer.outcome != "status":
         logger.warning("Asking Fisqua for the status of volume %s failed: %s",
                        row.collection_id, scrub(answer.error or answer.outcome))

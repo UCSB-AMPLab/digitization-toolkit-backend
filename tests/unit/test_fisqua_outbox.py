@@ -162,6 +162,47 @@ def test_take_back_withdraws_the_unsent_row_and_a_new_handover_adds_another(clie
 
 
 @pytest.mark.unit
+def test_a_take_back_while_unconfigured_still_withdraws_the_queued_row(client, db_session, vol, fisqua, monkeypatch):
+    from pydantic import SecretStr
+
+    from app.core import config
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport())  # promoted, then an error: failed
+    assert _rows(db_session, vol.col)[0].state == "failed"
+
+    monkeypatch.setattr(config.settings, "FISQUA_URL", "")
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(""))
+    _take_back(client, vol.col)
+    monkeypatch.setattr(config.settings, "FISQUA_URL", URL)
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(TOKEN))
+
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
+    assert transport.sent == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn"]
+
+
+@pytest.mark.unit
+def test_a_handover_while_unconfigured_still_supersedes_the_queued_row(client, db_session, vol, fisqua, monkeypatch):
+    from app.core import config
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _take_back(client, vol.col)
+    _handover(client, vol.col)  # configured: withdrawn, waiting_for_upload
+
+    monkeypatch.setattr(config.settings, "FISQUA_URL", "")
+    vol.record(status="captured")
+    _handover(client, vol.col)  # unconfigured: no new row, the queued one is superseded
+    monkeypatch.setattr(config.settings, "FISQUA_URL", URL)
+
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    assert transport.sent == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn", "superseded"]
+
+
+@pytest.mark.unit
 def test_a_new_handover_supersedes_an_unsent_row_and_leaves_a_delivered_one(client, db_session, vol, fisqua):
     vol.record(status="captured")
     _handover(client, vol.col)
@@ -575,16 +616,43 @@ def test_the_token_never_reaches_logs_rows_or_responses(client, db_session, vol,
     caplog.set_level(logging.DEBUG)
     vol.record(status="captured")
     _handover(client, vol.col)
-    # A transport whose error message echoes the request, token included.
+    # A transport whose answers echo the request, token included, at any depth.
+    echoed = {"headers": {"Authorization": f"Bearer {TOKEN}"},
+              "trace": [f"sent {TOKEN}", {"nested": [TOKEN, 3, None]}]}
     transport = FakeTransport(
-        sends=[TransportResult(outcome="error", error=f"401 for Authorization: Bearer {TOKEN}"),
-               RuntimeError(f"token {TOKEN} rejected")])
+        sends=[TransportResult(outcome="error", error=f"401 for Authorization: Bearer {TOKEN}",
+                               response=echoed),
+               RuntimeError(f"token {TOKEN} rejected"),
+               TransportResult(outcome="refused", response=echoed, error=f"bad {TOKEN}",
+                               problems=[{"rule": "auth", "detail": f"token {TOKEN} unknown"}])])
     _run(db_session, transport)
     row = _rows(db_session, vol.col)[0]
     assert TOKEN not in row.last_error
-    _run(db_session, transport, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
+    assert TOKEN not in str(row.response)
+    assert row.response["trace"][1]["nested"][1:] == [3, None]
+    later = datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1)
+    _run(db_session, transport, now=later)
     row = _rows(db_session, vol.col)[0]
     assert TOKEN not in (row.last_error or "")
+    _run(db_session, transport, now=later + timedelta(days=1))
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "refused" and row.refusal == "fisqua"
+    for value in (row.response, row.problems, row.last_error):
+        assert TOKEN not in str(value)
+
+    # A delivery and a status answer that echo it too.
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(
+        sends=[TransportResult(outcome="delivered", external_id="fq-2", response=echoed)],
+        statuses=[TransportResult(outcome="status", status=f"ok {TOKEN}",
+                                  problems=[{"x": TOKEN}], response=echoed)]))
+    from app.models.fisqua import FisquaStatus
+    db_session.expire_all()
+    st = db_session.get(FisquaStatus, vol.col.id)
+    assert st is not None
+    for value in (st.status, st.problems, _rows(db_session, vol.col)[-1].response):
+        assert TOKEN not in str(value)
 
     texts = [caplog.text]
     texts += [_as(client, "admin").get(f"/collections/{vol.col.id}/offsite").text]
