@@ -17,6 +17,9 @@ whose files are still on disk.
   then the name in its key). `previewSha256` is looked up the same way for
   the preview's file. Neither is ever computed here: a missing digest refuses
   the export.
+* A current RAW image must have a preview: Fisqua's runner reads pages with
+  Pillow and cannot decode a RAW, so one without a preview row or file
+  refuses the export.
 * Only current images are listed. A superseded image stays in the bucket and
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
@@ -66,6 +69,7 @@ RULES = (
     "capture_id_missing",
     "not_uploaded",
     "preview_not_uploaded",
+    "raw_without_preview",
     "upload_refused",
     "key_outside",
     "filename_form",
@@ -350,6 +354,11 @@ def _image_entry(img, rec, rows, index, tenant, capture_prefix, preview_prefix, 
         elif pstate == "pending" or (pstate == "absent" and preview_path.is_file()):
             found.add("preview_not_uploaded", rec.id, img.id)
             ok = False
+        elif pstate == "absent":
+            # Fisqua's pipeline reads the preview where there is one,
+            # otherwise the capture, and its runner has no RAW decoder.
+            found.add("raw_without_preview", rec.id, img.id, note=_key_name(img.file_path))
+            ok = False
         elif pstate == "verified":
             preview_key = prow.object_key
             if filename is not None and preview_prefix is not None:
@@ -411,6 +420,10 @@ def _problems(found: _Collector, tenant: Optional[str], stem: Optional[str]) -> 
             f"The previews of {len(found.images['preview_not_uploaded'])} RAW image(s) are not yet verified "
             f"in the offsite bucket (records {_ids(r)}). Wait for the offsite upload to verify them, "
             "then export again."),
+        "raw_without_preview": lambda r, n: (
+            f"{len(n)} RAW image(s) have no preview, offsite or on disk (records {_ids(r)}): "
+            f"{'; '.join(n[:_LIST_LIMIT])}. Fisqua cannot read a RAW file, so those records have to be "
+            "captured again."),
         "upload_refused": lambda r, n: (
             f"The offsite upload refused {len(n)} object(s) (records {_ids(r)}): {'; '.join(n[:_LIST_LIMIT])}. "
             "Resolve each refusal shown in the volume's offsite state, then export again."),

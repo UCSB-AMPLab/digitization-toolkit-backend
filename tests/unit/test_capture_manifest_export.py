@@ -411,15 +411,29 @@ def test_a_jpeg_capture_has_no_preview_fields(client, vol):
 
 
 @pytest.mark.unit
-def test_a_raw_capture_with_no_preview_anywhere_travels_without_one(client, vol):
+def test_refused_with_a_raw_capture_that_has_no_preview(client, vol):
+    # Fisqua's runner reads pages with Pillow and has no RAW decoder, so a RAW
+    # with no preview has nothing Fisqua can read.
+    vol.record()
     rec = vol.record(layout=("single",), ext="cr2", preview_digest_recorded=False)
     [img] = rec.images
     vol.db.delete(vol.row(img, "preview"))
     vol.db.commit()
+    (vol.root / "previews" / f"{Path(img.filename).stem}_preview.jpg").unlink()
+    problems = _refusal(_export(client, vol.col))
+    assert problems["raw_without_preview"]["record_ids"] == [rec.id]
+    assert problems["raw_without_preview"]["image_ids"] == [img.id]
+    assert "captured again" in problems["raw_without_preview"]["message"]
+
+
+@pytest.mark.unit
+def test_a_superseded_raw_without_a_preview_does_not_block(client, vol):
+    rec = vol.record(layout=("single",), ext="cr2", upload=False, preview_digest_recorded=False)
+    [old] = rec.images
     (vol.root / "previews" / f"{STEM}-img_0001_c0_preview.jpg").unlink()
-    resp = _export(client, vol.col)
-    assert resp.status_code == 200, resp.text
-    assert "previewObjectKey" not in _images(resp.json())[0]
+    vol.supersede(rec)
+    vol.capture(rec, ("single",), ext="cr2")
+    assert _export(client, vol.col).status_code == 200
 
 
 # ---------------------------------------------------------------------------
