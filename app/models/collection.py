@@ -1,5 +1,5 @@
 from datetime import datetime, timezone
-from sqlalchemy import Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select
+from sqlalchemy import Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
 from sqlalchemy.orm import relationship, validates, object_session
 
 from app.core.db import Base
@@ -56,7 +56,7 @@ class Collection(Base):
     # column is wider than the cap so that an overlong stem is refused by the
     # named length CHECK on every engine, rather than by Postgres's varchar
     # limit as a different kind of error. Fixed once it is set and the volume
-    # has an image — see _filename_stem_is_fixed_by_the_first_image.
+    # has captured — see _filename_stem_is_fixed_by_the_first_capture.
     filename_stem = Column(String(255), nullable=True)
 
     # external_id: Fisqua's reference code for the item. Unique through one
@@ -73,6 +73,13 @@ class Collection(Base):
     date_end = Column(Date, nullable=True)
     sequence = Column(Integer, nullable=True)
     custom_attributes = Column(Text, nullable=True)
+
+    # Every capture the volume has ever had, superseded ones included (exchange
+    # contract 1.1, section 3): the source of `<nnnn>` in its file names, so a
+    # number is never reused. It never decreases — see
+    # _capture_counter_never_decreases — and a CHECK refuses a negative value.
+    # Nothing raises it yet; the capture path will.
+    capture_counter = Column(Integer, nullable=False, default=0, server_default=text("0"))
 
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -137,32 +144,69 @@ class Collection(Base):
                 ))
             ).scalar()
 
-    @validates("filename_stem", include_removes=True)
-    def _filename_stem_is_fixed_by_the_first_image(self, key, value, is_remove):
-        """Refuse a change to a set filename_stem once the volume holds an image.
+    def has_captured(self) -> bool:
+        """Whether the volume has ever captured: capture_counter above zero, or any image.
 
-        Before the first image the stem is free: set, changed or cleared.
-        A NULL stem may be set once whether or not the volume has images,
+        The counter keeps the answer after the volume's records are deleted or
+        moved out; the image check covers images the counter does not yet
+        count, since nothing raises it until the capture path does.
+        """
+        return (self.capture_counter or 0) > 0 or self.has_images()
+
+    @validates("capture_counter", include_removes=True)
+    def _capture_counter_never_decreases(self, key, value, is_remove):
+        """Refuse any write that would lower or clear a stored capture_counter.
+
+        A number once given to a capture is never given again, so the counter
+        can only rise. Raising it and rewriting the same value are allowed.
+        With nothing stored (a volume not yet flushed) any value is allowed.
+
+        An ORM attribute guard: `query().update()` and raw SQL go around it,
+        apart from the CHECK refusing a negative value.
+        """
+        current = self.capture_counter
+        if is_remove:
+            if current is not None:
+                raise ImmutableFieldError(
+                    f"collections.capture_counter never decreases and cannot be removed "
+                    f"(volume {self.id}: {current!r})"
+                )
+            return value
+        if current is not None and (value is None or value < current):
+            raise ImmutableFieldError(
+                f"collections.capture_counter never decreases "
+                f"(volume {self.id}: {current!r} -> {value!r})"
+            )
+        return value
+
+    @validates("filename_stem", include_removes=True)
+    def _filename_stem_is_fixed_by_the_first_capture(self, key, value, is_remove):
+        """Refuse a change to a set filename_stem once the volume has captured.
+
+        Before the first capture the stem is free: set, changed or cleared.
+        A NULL stem may be set once whether or not the volume has captured,
         because that is how a volume captured before stems existed gets one
-        from an operator. Once a stem is set and the volume has an image,
-        files exist whose names were built from it, so any other value — a
-        different stem, NULL, or a removal — is refused. Assigning the
+        from an operator. Once a stem is set and the volume has captured
+        (has_captured), files exist or have existed whose names were built
+        from it, so any other value — a different stem, NULL, or a removal —
+        is refused. That holds after the volume's records are deleted or
+        moved out, because the counter does not go down. Assigning the
         identical value is allowed, since it changes nothing.
 
         An ORM attribute guard, like the external_id one: `query().update()`
-        and raw SQL go around it. "Has an image" is has_images().
+        and raw SQL go around it.
         """
         current = self.filename_stem
         if is_remove:
-            if current is not None and self.has_images():
+            if current is not None and self.has_captured():
                 raise ImmutableFieldError(
-                    f"collections.filename_stem is fixed once the volume has an image "
+                    f"collections.filename_stem is fixed once the volume has captured "
                     f"and cannot be removed (volume {self.id}: {current!r})"
                 )
             return value
-        if current is not None and value != current and self.has_images():
+        if current is not None and value != current and self.has_captured():
             raise ImmutableFieldError(
-                f"collections.filename_stem is fixed once the volume has an image "
+                f"collections.filename_stem is fixed once the volume has captured "
                 f"(volume {self.id}: {current!r} -> {value!r})"
             )
         return value
@@ -177,6 +221,10 @@ class Collection(Base):
         CheckConstraint(
             'date_start IS NULL OR date_end IS NULL OR date_end >= date_start',
             name='check_collection_date_range'
+        ),
+        CheckConstraint(
+            'capture_counter >= 0',
+            name='check_collection_capture_counter'
         ),
         UniqueConstraint('filename_stem', name='collections_filename_stem_key'),
         # length() counts characters on both Postgres and SQLite.

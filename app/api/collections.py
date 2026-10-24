@@ -52,7 +52,7 @@ def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
     if "filename_stem" in text:
-        return "The volume already has images, so its file name stem cannot be changed."
+        return "The volume has already captured images, so its file name stem cannot be changed."
     return "The volume's external identifier is written once and cannot be changed."
 
 

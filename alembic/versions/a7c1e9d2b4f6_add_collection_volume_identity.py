@@ -31,23 +31,48 @@ no layout change, no import and no export.
   the same columns `records` has, with `check_collection_date_range` refusing
   an end before its start in the form `check_record_date_range` uses.
 - `sequence` and `custom_attributes` (Text holding JSON), as on `records`.
+- `capture_counter`: Integer, NOT NULL, server default 0, and
+  `check_collection_capture_counter` refusing a negative value. It counts
+  every capture the volume has ever had, superseded ones included, and is the
+  source of `<nnnn>`, so a number is never reused. That it never decreases is
+  on the model.
+
+The counter is backfilled from what each volume holds. One capture event is
+one `record_images.capture_id`: the capture path writes one manifest record
+per event, whose `capture_id` is a fresh UUID (capture/manifestHandler.py,
+CaptureRecord), and a dual capture gives both of its images that same
+`capture_id` (app/api/cameras.py), so a spread counts once. `pair_id` cannot
+be the key, because a single capture leaves it NULL. So for each volume the
+count is the number of distinct non-empty `capture_id`s among the images of
+its own records, plus one for each image with a NULL or empty `capture_id`
+(an upload that came with none). Superseded images (`is_current` false) count
+like current ones. Images in a nested volume's records count for that volume,
+not for its parent. A volume with no images gets 0.
+
+The backfill can only count images that still exist. A capture whose record
+was deleted before this revision left no row, so it is not counted, and a
+volume whose records were moved out counts what it holds now.
 
 Every column applies to every row the same way, nested volumes
 (`parent_collection_id`) included.
 
-The stem's rule that it is fixed once it is set and the volume has an image
-is on the model, for the same reason as external_id's.
+The stem's rule, that once set it is fixed when the volume has captured
+(`capture_counter > 0` or any image), is on the model, for the same reason as
+external_id's.
 
 Written with batch_alter_table so the revision also runs on SQLite, which
 cannot add a constraint to an existing table; on Postgres batch mode emits
 plain ALTER TABLE statements and copies nothing.
 
-On upgrade there is nothing to back-fill and nothing to lose: every existing
-row gets NULL in every new column, NULLs do not collide under a unique
-constraint or index, and every CHECK passes on NULL.
+On upgrade nothing is lost: every existing row gets NULL in every new column
+but `capture_counter`, which is backfilled as above. NULLs do not collide
+under a unique constraint or index, and every CHECK passes on NULL or on a
+count, which is never negative.
 
 Downgrade drops the constraints, the index and the columns, and with them any
-stem, reference code or date range a volume holds. On a unit at this revision
+stem, reference code, date range or capture count a volume holds. The count
+can be backfilled again from the images that remain, but numbers given to
+captures since deleted are not recoverable from it. On a unit at this revision
 none is written until an operator or the importer writes one; from then on a
 dump taken before the upgrade is the rollback mechanism -- see
 docs/releases/0.1.0-beta/migration-rehearsal.md in the workspace.
@@ -73,6 +98,20 @@ STEM_PATTERN_SQLITE = (
 )
 
 
+# Distinct capture events among the images of each volume's own records: one
+# per distinct non-empty capture_id, one per image without one. COALESCE
+# because SUM over no rows is NULL.
+BACKFILL_CAPTURE_COUNTER = """
+UPDATE collections SET capture_counter = COALESCE((
+    SELECT COUNT(DISTINCT NULLIF(ri.capture_id, ''))
+           + SUM(CASE WHEN NULLIF(ri.capture_id, '') IS NULL THEN 1 ELSE 0 END)
+    FROM record_images ri
+    JOIN records r ON r.id = ri.record_id
+    WHERE r.collection_id = collections.id
+), 0)
+"""
+
+
 def _stem_pattern_check():
     dialect = op.get_bind().dialect.name
     if dialect == 'postgresql':
@@ -92,6 +131,9 @@ def upgrade() -> None:
         batch.add_column(sa.Column('date_end', sa.Date(), nullable=True))
         batch.add_column(sa.Column('sequence', sa.Integer(), nullable=True))
         batch.add_column(sa.Column('custom_attributes', sa.Text(), nullable=True))
+        batch.add_column(sa.Column('capture_counter', sa.Integer(), nullable=False,
+                                   server_default=sa.text('0')))
+        batch.create_check_constraint('check_collection_capture_counter', 'capture_counter >= 0')
         batch.create_unique_constraint('collections_filename_stem_key', ['filename_stem'])
         batch.create_index('ix_collections_external_id', ['external_id'], unique=True)
         batch.create_check_constraint(
@@ -105,6 +147,8 @@ def upgrade() -> None:
         if pattern is not None:
             batch.create_check_constraint('check_collection_filename_stem_pattern', pattern)
 
+    op.execute(BACKFILL_CAPTURE_COUNTER)
+
 
 def downgrade() -> None:
     pattern = _stem_pattern_check()
@@ -113,8 +157,10 @@ def downgrade() -> None:
             batch.drop_constraint('check_collection_filename_stem_pattern', type_='check')
         batch.drop_constraint('check_collection_filename_stem_length', type_='check')
         batch.drop_constraint('check_collection_date_range', type_='check')
+        batch.drop_constraint('check_collection_capture_counter', type_='check')
         batch.drop_index('ix_collections_external_id')
         batch.drop_constraint('collections_filename_stem_key', type_='unique')
+        batch.drop_column('capture_counter')
         batch.drop_column('custom_attributes')
         batch.drop_column('sequence')
         batch.drop_column('date_end')

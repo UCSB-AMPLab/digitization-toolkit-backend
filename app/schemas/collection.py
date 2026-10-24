@@ -83,6 +83,8 @@ class CollectionRead(CollectionBase):
     date_end: Optional[dt_date] = None
     sequence: Optional[int] = None
     custom_attributes: Optional[str] = None
+    # Read-only: the capture path raises it, and no request schema accepts it.
+    capture_counter: int = 0
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None
     created_by: Optional[str] = None

@@ -626,7 +626,10 @@ def _load_migration(backend_root):
 
 
 def _pre_migration_schema(engine):
-    """`projects` (enough of it) and `collections` as they stand at f5a6b7c8d9e0."""
+    """`collections` as it stands at f5a6b7c8d9e0, and enough of its neighbours.
+
+    `records` and `record_images` carry only the columns the backfill reads.
+    """
     md = sa.MetaData()
     sa.Table("projects", md,
              sa.Column("id", sa.Integer, primary_key=True),
@@ -647,6 +650,17 @@ def _pre_migration_schema(engine):
                  "(project_id IS NOT NULL AND parent_collection_id IS NULL) OR "
                  "(project_id IS NULL AND parent_collection_id IS NOT NULL)",
                  name="check_collection_parent"))
+    sa.Table("records", md,
+             sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("collection_id", sa.Integer,
+                       sa.ForeignKey("collections.id", ondelete="SET NULL")))
+    sa.Table("record_images", md,
+             sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("record_id", sa.Integer,
+                       sa.ForeignKey("records.id", ondelete="CASCADE"), nullable=False),
+             sa.Column("capture_id", sa.String(36)),
+             sa.Column("pair_id", sa.String(36)),
+             sa.Column("is_current", sa.Boolean, nullable=False))
     md.create_all(engine)
 
 
@@ -660,7 +674,7 @@ def _run(engine, fn):
 
 
 NEW_COLUMNS = {"filename_stem", "external_id", "date", "date_start", "date_end",
-               "sequence", "custom_attributes"}
+               "sequence", "custom_attributes", "capture_counter"}
 
 
 @pytest.fixture
@@ -709,7 +723,8 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, sqlite_en
     checks = {c["name"] for c in insp.get_check_constraints("collections")}
     assert {"check_collection_parent", "check_collection_date_range",
             "check_collection_filename_stem_pattern",
-            "check_collection_filename_stem_length"} <= checks, checks
+            "check_collection_filename_stem_length",
+            "check_collection_capture_counter"} <= checks, checks
     assert "collections_filename_stem_key" in {u["name"] for u in insp.get_unique_constraints("collections")}
     ix = {i["name"]: i for i in insp.get_indexes("collections")}
     assert ix["ix_collections_external_id"]["unique"] in (1, True)
@@ -725,6 +740,10 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, sqlite_en
         assert rows[4].parent_collection_id == 1 and rows[4].project_id is None
         assert json.loads(rows[0].archival_metadata) == {"k": 1}
         assert all(r[5:] == (None,) * 7 for r in rows), "no value is generated for any row"
+        with sqlite_engine.begin() as conn:
+            counters = [r[0] for r in conn.execute(sa.text(
+                "SELECT capture_counter FROM collections ORDER BY id"))]
+        assert counters == [0] * 5, "a volume with no images counts no captures"
     else:
         assert rows == []
 
@@ -752,3 +771,208 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, sqlite_en
     with sqlite_engine.begin() as conn:
         names = [r[0] for r in conn.execute(sa.text("SELECT name FROM collections ORDER BY id"))]
     assert names == (["Tomo 1", "Tomo 2", "Tomo 3", "Tomo 4", "Legajo"] if populated else [])
+
+
+# ---------------------------------------------------------------------------
+# The capture counter
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_migration_backfills_the_capture_counter_from_capture_events(backend_root, sqlite_engine):
+    """One capture event is one capture_id; an image with none is an event of its own.
+
+    Volume 1: a dual spread (two images, one capture_id), a single capture,
+    and a superseded single whose retake is current: four events from five
+    images. Volume 2: two uploads with no capture_id and one with an empty
+    one: three events. Volume 3: a record with no images: zero. Volume 4,
+    nested in volume 1: its image counts for volume 4, not for volume 1.
+    """
+    mod = _load_migration(backend_root)
+    _pre_migration_schema(sqlite_engine)
+    with sqlite_engine.begin() as conn:
+        def x(q, **kw):
+            conn.execute(sa.text(q), kw)
+        x("INSERT INTO projects (id, name) VALUES (1, 'P')")
+        for i in (1, 2, 3):
+            x("INSERT INTO collections (id, name, project_id, created_at) "
+              "VALUES (:i, :n, 1, CURRENT_TIMESTAMP)", i=i, n=f"V{i}")
+        x("INSERT INTO collections (id, name, parent_collection_id, created_at) "
+          "VALUES (4, 'child', 1, CURRENT_TIMESTAMP)")
+        for rid, cid in ((10, 1), (11, 1), (12, 1), (20, 2), (30, 3), (40, 4)):
+            x("INSERT INTO records (id, collection_id) VALUES (:r, :c)", r=rid, c=cid)
+        imgs = [
+            (10, "cap-dual", "0001", True), (10, "cap-dual", "0001", True),     # spread
+            (11, "cap-single", None, True),                                      # single
+            (12, "cap-rejected", None, False), (12, "cap-retake", None, True),   # retake
+            (20, None, None, True), (20, None, None, True), (20, "", None, True),  # uploads
+            (40, "cap-child", None, True),
+        ]
+        for rid, cap, pair, cur in imgs:
+            x("INSERT INTO record_images (record_id, capture_id, pair_id, is_current) "
+              "VALUES (:r, :c, :p, :cur)", r=rid, c=cap, p=pair, cur=cur)
+
+    _run(sqlite_engine, mod.upgrade)
+
+    with sqlite_engine.begin() as conn:
+        got = dict(conn.execute(sa.text("SELECT id, capture_counter FROM collections")).all())
+    assert got == {1: 4, 2: 3, 3: 0, 4: 1}, got
+
+
+@pytest.mark.unit
+def test_capture_counter_is_not_null_default_zero_and_checked():
+    from app.models.collection import Collection
+
+    col = Collection.__table__.columns["capture_counter"]
+    assert col.nullable is False
+    assert isinstance(col.type, sa.Integer)
+    assert col.server_default is not None and str(col.server_default.arg) == "0"
+    assert "check_collection_capture_counter" in {
+        c.name for c in Collection.__table__.constraints if isinstance(c, sa.CheckConstraint)}
+
+
+@pytest.mark.unit
+def test_a_new_volume_starts_at_zero(db_session):
+    p = _project(db_session)
+    v = _volume(db_session, p)
+    db_session.refresh(v)
+    assert v.capture_counter == 0
+
+
+@pytest.mark.unit
+def test_the_database_refuses_a_negative_counter(db_session):
+    p = _project(db_session)
+    v = _volume(db_session, p)
+    with pytest.raises(IntegrityError):
+        db_session.execute(sa.text("UPDATE collections SET capture_counter = -1 WHERE id = :i"),
+                           {"i": v.id})
+    db_session.rollback()
+
+
+@pytest.mark.unit
+def test_the_counter_can_be_raised(db_session):
+    p = _project(db_session)
+    v = _volume(db_session, p)
+    v.capture_counter = 1
+    db_session.commit()
+    v.capture_counter = 5
+    db_session.commit()
+    v.capture_counter = 5
+    db_session.commit()
+    db_session.refresh(v)
+    assert v.capture_counter == 5
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("op", ["lower", "zero", "clear", "delete"])
+def test_the_counter_never_decreases(db_session, op):
+    from app.models.record import ImmutableFieldError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, capture_counter=3)
+    with pytest.raises(ImmutableFieldError):
+        if op == "lower":
+            v.capture_counter = 2
+        elif op == "zero":
+            v.capture_counter = 0
+        elif op == "clear":
+            v.capture_counter = None
+        else:
+            del v.capture_counter
+    db_session.rollback()
+    db_session.refresh(v)
+    assert v.capture_counter == 3
+
+
+@pytest.mark.unit
+def test_the_counter_guard_holds_in_a_fresh_identity_map(db_session):
+    from app.models.collection import Collection
+    from app.models.record import ImmutableFieldError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, capture_counter=2)
+    vid = v.id
+    db_session.expunge_all()
+    reloaded = db_session.query(Collection).filter(Collection.id == vid).one()
+    with pytest.raises(ImmutableFieldError):
+        reloaded.capture_counter = 1
+
+
+@pytest.mark.unit
+def test_no_request_schema_accepts_the_counter():
+    """The capture path raises it; no client writes it."""
+    from app.schemas.collection import CollectionCreate, CollectionUpdate
+
+    assert "capture_counter" not in CollectionCreate.model_fields
+    assert "capture_counter" not in CollectionUpdate.model_fields
+
+
+@pytest.mark.unit
+def test_the_read_schema_returns_the_counter(client, db_session):
+    p = _project(db_session)
+    v = _volume(db_session, p, capture_counter=7)
+    api = _client_as(client)
+
+    body = api.get(f"/collections/{v.id}").json()
+
+    assert body["capture_counter"] == 7, body
+
+
+def _volume_that_has_captured(db_session):
+    """A volume with a stem, one image, and the count the capture path will keep."""
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-x-040", capture_counter=1)
+    _image_in(db_session, v)
+    return p, v
+
+
+@pytest.mark.unit
+def test_the_stem_stays_fixed_after_every_record_in_the_volume_is_deleted(db_session):
+    from app.models.record import ImmutableFieldError, Record
+
+    p, v = _volume_that_has_captured(db_session)
+    for rec in db_session.query(Record).filter(Record.collection_id == v.id).all():
+        db_session.delete(rec)
+    db_session.commit()
+    assert not v.has_images()
+
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = "co-x-041"
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = None
+
+
+@pytest.mark.unit
+def test_the_stem_stays_fixed_after_every_record_is_moved_out(db_session):
+    from app.models.record import ImmutableFieldError, Record
+
+    p, v = _volume_that_has_captured(db_session)
+    other = _volume(db_session, p, "other")
+    for rec in db_session.query(Record).filter(Record.collection_id == v.id).all():
+        rec.collection_id = other.id
+    db_session.commit()
+    assert not v.has_images()
+
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = "co-x-042"
+
+
+@pytest.mark.unit
+def test_a_counter_above_zero_fixes_a_set_stem_without_any_image(db_session):
+    from app.models.record import ImmutableFieldError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, filename_stem="co-x-043", capture_counter=2)
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = "co-x-044"
+
+
+@pytest.mark.unit
+def test_a_counted_volume_with_no_stem_still_takes_its_first(db_session):
+    from app.models.record import ImmutableFieldError
+
+    p = _project(db_session)
+    v = _volume(db_session, p, capture_counter=4)
+    v.filename_stem = "co-x-045"
+    db_session.commit()
+    with pytest.raises(ImmutableFieldError):
+        v.filename_stem = "co-x-046"
