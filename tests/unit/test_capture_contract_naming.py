@@ -557,3 +557,86 @@ def test_no_resolution_in_the_file_name_is_accepted(
         client, db_session, test_project, volume, backend):
     body = _single(_client_as(client), test_project, volume, include_resolution_in_filename=False)
     assert Path(body["file_path"]).name == f"{STEM}-img_0001_c0.jpg"
+
+
+# ---------------------------------------------------------------------------
+# Uploads
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def upload_data(monkeypatch, tmp_path):
+    import app.api.records as records_api
+    monkeypatch.setattr(records_api.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+
+
+def _upload(api, record_id, name="page.jpg", content_type="image/jpeg"):
+    return api.post(f"/records/{record_id}/images", files={"file": (name, b"not really an image", content_type)})
+
+
+def _record_in(db_session, volume):
+    from app.models.record import Record
+    rec = Record(title="r", collection_id=volume.id, capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    return rec
+
+
+@pytest.mark.unit
+def test_an_upload_is_named_as_a_single_capture_with_its_number(
+        client, db_session, test_project, volume, upload_data, override_projects_root):
+    rec = _record_in(db_session, volume)
+    volume.capture_counter = 4
+    db_session.commit()
+
+    resp = _upload(_client_as(client), rec.id, name="Scan 12.JPG")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["filename"] == f"{STEM}-img_0005_c0.jpg"
+    assert Path(resp.json()["file_path"]) == override_projects_root / STEM / "captures" / f"{STEM}-img_0005_c0.jpg"
+    assert _counter(db_session, volume) == 5
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name,content_type,suffix", [
+    ("page.TIFF", "image/tiff", ".tiff"),
+    ("page", "image/png", ".png"),
+    ("page.exe", "image/webp", ".webp"),
+])
+def test_an_upload_keeps_a_known_suffix_and_otherwise_takes_its_types(
+        client, db_session, test_project, volume, upload_data, name, content_type, suffix):
+    rec = _record_in(db_session, volume)
+
+    resp = _upload(_client_as(client), rec.id, name=name, content_type=content_type)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["filename"] == f"{STEM}-img_0001_c0{suffix}"
+
+
+@pytest.mark.unit
+def test_an_upload_passes_over_a_number_on_disk(
+        client, db_session, test_project, volume, upload_data, override_projects_root):
+    rec = _record_in(db_session, volume)
+    _occupy(override_projects_root, [1])
+
+    resp = _upload(_client_as(client), rec.id)
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["filename"] == f"{STEM}-img_0002_c0.jpg"
+    assert (override_projects_root / STEM / "captures" / f"{STEM}-img_0001_c0.cr2").read_bytes() == b"older"
+
+
+@pytest.mark.unit
+def test_an_upload_whose_name_is_too_long_is_refused_and_writes_nothing(
+        client, db_session, test_project, upload_data, override_projects_root):
+    from app.core.capture_naming import CAPTURE_NAME_TOO_LONG_DETAIL
+
+    v = _volume_at(db_session, test_project, STEM_27, 9999)
+    rec = _record_in(db_session, v)
+
+    resp = _upload(_client_as(client), rec.id)
+
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"] == CAPTURE_NAME_TOO_LONG_DETAIL
+    assert _counter(db_session, v) == 9999
+    assert _images(db_session, rec.id) == []
+    assert not any((override_projects_root / STEM_27 / "captures").iterdir())
