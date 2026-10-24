@@ -983,3 +983,43 @@ def test_the_integrity_check_does_not_count_a_staged_link(remote, db_session, ov
         assert report["summary"]["orphan_files"] == 0
     finally:
         staged.release()
+
+
+@pytest.mark.unit
+def test_a_renumber_during_the_run_does_not_refuse_a_good_capture_for_fixity(
+        remote, db_session, override_projects_root, monkeypatch):
+    """The run's fixity index predates the relocation records a renumber writes."""
+    import app.core.image_upload as iu
+    from app.models.record import RecordImage
+    from capture.manifestHandler import append_relocation_record
+
+    vol = _volume(db_session)
+    a = _image(db_session, vol, override_projects_root, f"{STEM}-img_0001_c1.jpg", b"AAAA", thumbnail=False)
+    b = _image(db_session, vol, override_projects_root, f"{STEM}-img_0002_c2.jpg", b"BBBB", thumbnail=False)
+    db_session.query(RecordImage).filter(RecordImage.id.in_([a.id, b.id])).update(
+        {"capture_id": "cap-1"}, synchronize_session=False)
+    db_session.commit()
+    for name, data in ((a, b"AAAA"), (b, b"BBBB")):
+        _manifest(override_projects_root, STEM, "cap-1", f"captures/{Path(name.file_path).name}", data)
+    a_id, b_id = a.id, b.id
+    real = iu._process
+    done = []
+
+    def process(db, tenant, item, result):
+        real(db, tenant, item, result)
+        if not done:
+            done.append(1)
+            a_, b_ = db.get(RecordImage, a_id), db.get(RecordImage, b_id)
+            pa, pb = Path(a_.file_path), Path(b_.file_path)
+            _swap_names(db, a_, b_)
+            root = override_projects_root / STEM
+            append_relocation_record(root, "cap-1", f"captures/{pa.name}", f"captures/{pb.name}",
+                                     image_id=a_id, sha256=hashlib.sha256(b"AAAA").hexdigest())
+            append_relocation_record(root, "cap-1", f"captures/{pb.name}", f"captures/{pa.name}",
+                                     image_id=b_id, sha256=hashlib.sha256(b"BBBB").hexdigest())
+
+    monkeypatch.setattr(iu, "_process", process)
+    result = _run(db_session)
+    assert result["refused"] == []
+    rows = _rows(db_session)
+    assert rows[(b_id, "capture")].verified_at is not None and rows[(b_id, "capture")].refusal is None

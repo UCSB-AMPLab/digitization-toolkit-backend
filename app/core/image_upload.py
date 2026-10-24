@@ -558,9 +558,13 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
     return _Read(staged, path, first.capture_id, digests)
 
 
-def _fixity_index(result: RunResult):
-    """The capture-time sha256 index, built once per run and only when a run reaches a capture."""
-    if result.fixity is None:
+def _fixity_index(result: RunResult, *, fresh: bool = False):
+    """The capture-time sha256 index, built once per run and only when a run reaches a capture.
+
+    `fresh` rebuilds it: a renumber or a move during the run appends
+    relocation records the run's copy does not have.
+    """
+    if result.fixity is None or fresh:
         from app.core.integrity import build_fixity_index
 
         result.fixity = build_fixity_index(config.settings.projects_dir.resolve())
@@ -622,6 +626,10 @@ def _process(db: Session, tenant: str, item: Work, result: RunResult) -> None:
 
         if item.kind == "capture":
             expected = _fixity_index(result).expected(read.capture_id, item.image_id, path)
+            if expected is not None and expected != sha256:
+                # Refused only on the manifests as they stand now, never on
+                # the copy read at the start of the run.
+                expected = _fixity_index(result, fresh=True).expected(read.capture_id, item.image_id, path)
             if expected is not None and expected != sha256:
                 _refuse(db, row, item, key, result, reason="fixity", local_sha1=sha1,
                         detail={"local_path": str(path), "local_sha256": sha256,
