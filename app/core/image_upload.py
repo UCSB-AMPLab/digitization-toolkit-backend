@@ -218,6 +218,14 @@ def _entries(rel_dir: str, tenant: str) -> Optional[dict]:
 def listed_object(key: str) -> Listed:
     """What the listing of `key`'s directory reports at `key`.
 
+    The directory is listed, not the key. `rclone lsjson` on a file path
+    answers the same way on the local backend, but on B2 it first looks the
+    path up as an object (NewFs calls NewObject, which in rclone 1.70.2
+    issues a HEAD on /file/<bucket>/<key>). That needs readFiles, which the
+    appliance key withholds, and when the lookup fails rclone lists the path
+    as a directory and reports "directory not found": a refused lookup read
+    as an absent object, the failure decision 2 is built against.
+
     Raises VerificationUnavailable when a listing does not answer.
     """
     parent, name = key.strip("/").rsplit("/", 1)
