@@ -11,16 +11,17 @@ the volume is verified in the bucket and hands it to the transport. States:
 - `ready`: the manifest is built (`manifest`) and waits for the transport.
 - `sending`: the worker has claimed it and is calling the transport. A row
   found in this state when a run begins was left by a crash, and is retried.
-- `delivered`: the transport says Fisqua accepted it (`delivered_at`,
-  `response`, and `external_id` when Fisqua named one, which the status poll
-  uses).
+- `delivered`: Fisqua accepted it (`delivered_at`, `response`, and in
+  `external_id` the volumeId Fisqua gave it). The status poll asks by the
+  volume's reference code (collections.external_id), not by this id.
 - `refused`: final, with `refusal` saying by whom. `not_exportable`: the unit
   could not build the manifest, and `problems` lists the capture_manifest
   problems, as GET /collections/{id}/capture-manifest gives them.
   `fisqua`: Fisqua refused it, with its answer in `response` and any
   problems it named in `problems`.
-- `failed`: the last attempt ended in a transport error (`last_error`); the
-  worker tries again at `next_attempt_at`.
+- `failed`: the last attempt ended in a transient error (`last_error`); the
+  worker tries again at `next_attempt_at`. A poll that finds Fisqua holding
+  this manifest id marks it `delivered`.
 - `superseded`: a later handover of the volume queued a newer manifest
   before this one was sent.
 - `withdrawn`: the handover was taken back before this one was sent.

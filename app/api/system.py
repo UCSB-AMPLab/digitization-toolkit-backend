@@ -133,6 +133,7 @@ def get_catalogue_backup_state(
     it is removed. `hold_file` is its path. Both are under `images` too.
     """
     from app.core.catalogue_backup import is_configured, last_verified_backup
+    from app.core.fisqua_outbox import unit_fisqua_summary
     from app.core.image_upload import unit_upload_summary
     from app.core.offsite_hold import hold_state
 
@@ -145,6 +146,9 @@ def get_catalogue_backup_state(
         **hold_state(),
         # Per-volume counts are on GET /collections/{id}/offsite.
         "images":           unit_upload_summary(db),
+        # Delivery to Fisqua: configured, environment, the unit-level auth
+        # error while Fisqua refuses the token, the last send and poll.
+        "fisqua":           unit_fisqua_summary(),
     }
 
 

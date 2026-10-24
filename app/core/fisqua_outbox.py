@@ -1,50 +1,65 @@
-"""Delivering each handed-over volume's capture manifest to Fisqua, and asking for its status.
+"""Delivering each handed-over volume's capture manifest to Fisqua, and polling its status (contract 1.2).
 
-Every call is the unit's: HTTPS to Fisqua with this unit's token
-(DTK_FISQUA_URL, DTK_FISQUA_TOKEN). Fisqua's side (paths, token format,
-answers, status names, what a second manifest for a volume does) is not
-agreed yet, so the calls themselves sit behind FisquaTransport, and this
-version has only NullTransport, which sends nothing. What is here does not
-depend on that:
+Every call is the unit's: HTTPS to `<tenant>.fisqua.org` (or the staging
+host) with this unit's token (DTK_FISQUA_ENV, DTK_FISQUA_TOKEN; see
+app.core.config). The HTTP calls and the reading of Fisqua's answers are in
+app.core.fisqua_http, and every name on Fisqua's side in
+app.core.fisqua_contract. Here:
 
 * **Enqueue at handover** (enqueue_handover). A handover that promotes at
   least one record adds a `waiting_for_upload` row in the same transaction,
-  with a fresh manifest id. Any older row of the volume not yet sent
-  (`waiting_for_upload`, `ready`, `failed`) becomes `superseded`. A take-back
-  makes those rows `withdrawn` (withdraw_unsent). A row being sent, or
-  already delivered or refused, is left as it is.
+  with a fresh manifest id, when Fisqua is configured. Any older row of the
+  volume not yet sent (`waiting_for_upload`, `ready`, `failed`) becomes
+  `superseded`, and a take-back makes those rows `withdrawn`
+  (withdraw_unsent), whatever the configuration. A row being sent, or
+  already delivered or refused, is left as it is: nothing is sent to Fisqua
+  on a take-back, and Fisqua replaces an older manifest with a newer one
+  until a run has started on it, after which it refuses the newer one.
 * **Promotion to ready** (run_fisqua_outbox). A `waiting_for_upload` row is
   promoted once the volume is received (app.core.image_upload's received
   indicator: every object verified in the bucket). The manifest is built
   then, under export_jobs.hold_for_reading, with the row's manifest id, and
-  stored on the row, so a retry sends the same document. A volume the
+  stored on the row, so a retry sends the same document; Fisqua answers a
+  repeated id with its original answer, so a resend is safe. A volume the
   builder refuses is `refused` with refusal `not_exportable` and the
   builder's problems on the row. A volume with no stem can never be
   received, so it is built at once, and refused for that.
-* **Sending.** Each `ready` row, and each `failed` row whose
-  `next_attempt_at` has come, is claimed (`sending`, one more attempt) and
-  handed to the transport. Its answer makes the row `delivered` or `refused`
-  (refusal `fisqua`); a transport error, or an exception from it, makes it
-  `failed`, to be tried again after retry_delay. Retries never stop: the
-  unit is often offline for days, and a manifest it gave up on would never
-  reach Fisqua.
-* **Status poll.** For each volume whose latest delivered row has an
-  `external_id`, the transport is asked for its status, and the answer is
-  kept in fisqua_status. A poll that fails leaves the last answer in place.
+* **Sending**, after each image upload run. Each `ready` row, and each
+  `failed` row whose `next_attempt_at` has come, is claimed (`sending`, one
+  more attempt) and handed to the transport. Its answer makes the row
+  `delivered` or `refused` (refusal `fisqua`); a transient error makes it
+  `failed`, to be tried again after retry_delay, or after Fisqua's
+  Retry-After when that is longer. Retries never stop: the unit is often
+  offline for days. A 401 or 403 stops sending and polling for the whole
+  unit (record_auth_error) until the token changes: the row goes back to
+  `ready`.
+* **Status poll** (poll_fisqua_status), on its own ten-minute schedule
+  (FisquaStatusScheduler). Every volume with a manifest that has reached
+  Fisqua, or may have, is asked for by its reference code
+  (collections.external_id, the manifest's `externalId`), in batches of at
+  most MAX_REFS_PER_CALL, until Fisqua reports a final state for the
+  volume's latest manifest. The answer is kept in fisqua_status. An answer
+  naming the manifest id of a row whose send failed marks that row
+  delivered, so a lost answer to a POST is recovered.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
 overwritten. The worker takes no lock on records or on the volume row. The
 handover paths write these rows after locking the volume's records, which is
-the order every path takes (records, then the volume).
+the order every path takes (records, then the volume). The send step and
+the poll run in different threads and are serialised by _step_lock.
 
 The token is never logged, stored or returned: redact() takes it out of
 every string the transport returns (answer, problems, status, ids, errors,
 at any depth) before anything is written to a row or a log, scrub() out of
-every error text, and the settings hold it as a SecretStr.
+every error text, and the settings hold it as a SecretStr. The unit-level
+auth error keeps only a short fingerprint of the token that failed.
 """
 
+import hashlib
+import json
 import logging
+import os
 import threading
 import uuid
 from dataclasses import dataclass
@@ -55,6 +70,7 @@ from sqlalchemy import update
 from sqlalchemy.orm import Session
 
 from app.core import config
+from app.core import fisqua_contract as fc
 
 logger = logging.getLogger(__name__)
 
@@ -78,9 +94,36 @@ def _token() -> str:
     return config.settings.FISQUA_TOKEN.get_secret_value().strip()
 
 
+def fisqua_environment() -> Optional[str]:
+    """`production` or `staging`, or None when DTK_FISQUA_ENV is empty or names neither."""
+    env = config.settings.FISQUA_ENV.strip().lower()
+    return env if env in fc.ENVIRONMENTS else None
+
+
+def _tenant() -> Optional[str]:
+    from app.core.image_upload import configured_tenant_or_none
+
+    return configured_tenant_or_none()
+
+
 def fisqua_configured() -> bool:
-    """True when both the Fisqua URL and this unit's token are set."""
-    return bool(config.settings.FISQUA_URL.strip()) and bool(_token())
+    """True when the environment, this unit's token and a valid offsite tenant are all set."""
+    return fisqua_environment() is not None and bool(_token()) and _tenant() is not None
+
+
+def base_url() -> Optional[str]:
+    """Fisqua's base URL for this unit: DTK_FISQUA_BASE_URL if set, else the environment's host for the tenant."""
+    if not fisqua_configured():
+        return None
+    override = config.settings.FISQUA_BASE_URL.strip()
+    if override:
+        return override.rstrip("/")
+    return fc.ENVIRONMENTS[fisqua_environment()].format(tenant=_tenant())
+
+
+def token_fingerprint(token: Optional[str] = None) -> str:
+    """The first 8 hex digits of the token's sha256: enough to tell two tokens apart, nothing more."""
+    return hashlib.sha256((token if token is not None else _token()).encode()).hexdigest()[:8]
 
 
 def scrub(text: Any) -> str:
@@ -135,27 +178,100 @@ class TransportResult:
     problems: Any = None
     status: Optional[str] = None
     status_at: Optional[datetime] = None
+    # The HTTP status of the answer, when there was one.
+    status_code: Optional[int] = None
+    # Seconds Fisqua asked the unit to wait (Retry-After), when it did.
+    retry_after: Optional[float] = None
+    # get_status: one entry per volume Fisqua reported.
+    volumes: Optional[list] = None
 
 
 class FisquaTransport(Protocol):
     def send_manifest(self, manifest: dict) -> TransportResult: ...
 
-    def get_status(self, external_id: str) -> TransportResult: ...
+    def get_status(self, refs: list) -> TransportResult: ...
 
 
 class NullTransport:
-    """Sends nothing. The worker leaves `ready` rows as they are and polls nothing."""
+    """Sends nothing, for a unit with Fisqua not configured. The worker leaves `ready` rows as they are."""
 
     def send_manifest(self, manifest: dict) -> TransportResult:
-        return TransportResult(outcome="error", error="no transport to Fisqua in this version")
+        return TransportResult(outcome="error", error="Fisqua is not configured")
 
-    def get_status(self, external_id: str) -> TransportResult:
-        return TransportResult(outcome="error", error="no transport to Fisqua in this version")
+    def get_status(self, refs: list) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
 def get_transport() -> FisquaTransport:
-    """The transport for the configured Fisqua. NullTransport until Fisqua's side is agreed."""
-    return NullTransport()
+    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured."""
+    url = base_url()
+    if url is None:
+        return NullTransport()
+    from app.core.fisqua_http import HttpFisquaTransport
+
+    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS)
+
+
+# ---------------------------------------------------------------------------
+# The unit-level auth error
+# ---------------------------------------------------------------------------
+#
+# A file in the data directory rather than a row: it is one fact about the
+# unit, not about a volume, and it has to survive a restart, or each restart
+# would send once more with a token Fisqua has already refused.
+
+AUTH_ERROR_FILE = "fisqua-auth-error.json"
+_auth_lock = threading.Lock()
+
+
+def _auth_path():
+    return config.settings.data_dir / AUTH_ERROR_FILE
+
+
+def record_auth_error(status_code: Optional[int], now: datetime) -> None:
+    """Stop sending and polling until the token changes. Keeps the time, the HTTP status and the fingerprint."""
+    path = _auth_path()
+    entry = {"at": now.isoformat(), "status_code": status_code, "token_fingerprint": token_fingerprint()}
+    with _auth_lock:
+        path.parent.mkdir(parents=True, exist_ok=True)
+        tmp = path.with_suffix(".tmp")
+        tmp.write_text(json.dumps(entry), encoding="utf-8")
+        os.replace(tmp, path)
+    logger.error("Fisqua refused this unit's token (HTTP %s, fingerprint %s); sending and polling "
+                 "stop until the token is changed", status_code, entry["token_fingerprint"])
+
+
+def auth_error() -> Optional[dict]:
+    """The recorded auth error, while the token is still the one that failed; None otherwise.
+
+    A record for another token is removed: the token was changed, so sending resumes.
+    """
+    path = _auth_path()
+    with _auth_lock:
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except FileNotFoundError:
+            return None
+        except (OSError, ValueError):
+            entry = None
+        if isinstance(entry, dict) and entry.get("token_fingerprint") == token_fingerprint():
+            try:
+                at = datetime.fromisoformat(entry["at"])
+            except (KeyError, TypeError, ValueError):
+                at = None
+            return {"at": at, "status_code": entry.get("status_code"),
+                    "token_fingerprint": entry["token_fingerprint"]}
+        try:
+            path.unlink()
+        except OSError:
+            pass
+        if entry is not None:
+            logger.info("The Fisqua token was changed since it was refused; sending resumes")
+        return None
+
+
+# Serialises the send step (the upload thread) and the status poll (its own thread).
+_step_lock = threading.Lock()
 
 
 # ---------------------------------------------------------------------------
@@ -233,7 +349,6 @@ class _Run:
     delivered: int = 0
     refused: int = 0
     failed: int = 0
-    polled: int = 0
     waiting: int = 0
 
     def as_dict(self) -> dict:
@@ -279,16 +394,34 @@ def _redacted(answer: TransportResult) -> TransportResult:
     return TransportResult(outcome=answer.outcome, response=redact(answer.response),
                            external_id=redact(answer.external_id), error=redact(answer.error),
                            problems=redact(answer.problems), status=redact(answer.status),
-                           status_at=answer.status_at)
+                           status_at=answer.status_at, status_code=answer.status_code,
+                           retry_after=answer.retry_after, volumes=redact(answer.volumes))
 
 
-def _send(db: Session, row, transport, now: datetime, result: _Run) -> None:
+def _keep_status(db: Session, collection_id: int, manifest_id: Optional[str], state: Optional[str],
+                 entered_at: Optional[datetime], problems: Any, now: datetime) -> None:
+    from app.models.fisqua import FisquaStatus
+
+    status = db.get(FisquaStatus, collection_id)
+    if status is None:
+        status = FisquaStatus(collection_id=collection_id, status_checked_at=now)
+        db.add(status)
+    status.manifest_id = manifest_id
+    status.status = state
+    status.status_at = _naive(entered_at)
+    status.status_checked_at = now
+    status.problems = problems
+    db.commit()
+
+
+def _send(db: Session, row, transport, now: datetime, result: _Run) -> bool:
+    """Send one row. False when Fisqua refused the token, and sending is to stop."""
     from app.models.fisqua import FisquaOutbox
 
     attempts = row.attempts + 1
     if not _move(db, row.id, ("ready", "failed"), state="sending", attempts=attempts,
                  last_attempt_at=now, next_attempt_at=None):
-        return
+        return True
     manifest = db.query(FisquaOutbox.manifest).filter(FisquaOutbox.id == row.id).scalar()
     try:
         answer = transport.send_manifest(manifest)
@@ -297,9 +430,18 @@ def _send(db: Session, row, transport, now: datetime, result: _Run) -> None:
     answer = _redacted(answer)
 
     if answer.outcome == "delivered":
-        _move(db, row.id, "sending", state="delivered", delivered_at=now, response=answer.response,
-              external_id=answer.external_id, last_error=None)
+        if _move(db, row.id, "sending", state="delivered", delivered_at=now, response=answer.response,
+                 external_id=answer.external_id, last_error=None):
+            _keep_status(db, row.collection_id, row.manifest_id, answer.status, None, None, now)
         result.delivered += 1
+    elif answer.outcome == "auth_error":
+        # Not this manifest's fault: it goes back to ready, to be sent as it
+        # is once the token is changed.
+        _move(db, row.id, "sending", state="ready", attempts=attempts - 1,
+              last_error=scrub(answer.error or "Fisqua refused this unit's token"))
+        record_auth_error(answer.status_code, now)
+        result.status = "auth_error"
+        return False
     elif answer.outcome == "refused":
         _move(db, row.id, "sending", state="refused", refusal="fisqua", response=answer.response,
               problems=answer.problems, last_error=scrub(answer.error) if answer.error else None)
@@ -307,55 +449,25 @@ def _send(db: Session, row, transport, now: datetime, result: _Run) -> None:
         logger.warning("Fisqua refused manifest %s of volume %s", row.manifest_id, row.collection_id)
     else:
         error = scrub(answer.error or f"unexpected outcome {answer.outcome!r}")
+        wait = retry_delay(attempts)
+        if answer.retry_after is not None:
+            wait = max(wait, timedelta(seconds=answer.retry_after))
         _move(db, row.id, "sending", state="failed", last_error=error, response=answer.response,
-              next_attempt_at=now + retry_delay(attempts))
+              next_attempt_at=now + wait)
         result.failed += 1
         logger.warning("Sending manifest %s of volume %s to Fisqua failed (attempt %s): %s",
                        row.manifest_id, row.collection_id, attempts, error)
-
-
-def _poll(db: Session, row, transport, now: datetime, result: _Run) -> None:
-    from app.models.fisqua import FisquaStatus
-
-    try:
-        answer = transport.get_status(row.external_id)
-    except Exception as exc:
-        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-    answer = _redacted(answer)
-    if answer.outcome != "status":
-        logger.warning("Asking Fisqua for the status of volume %s failed: %s",
-                       row.collection_id, scrub(answer.error or answer.outcome))
-        return
-    status = db.get(FisquaStatus, row.collection_id)
-    if status is None:
-        status = FisquaStatus(collection_id=row.collection_id, status_checked_at=now)
-        db.add(status)
-    status.manifest_id = row.manifest_id
-    status.status = answer.status
-    status.status_at = _naive(answer.status_at)
-    status.status_checked_at = now
-    status.problems = answer.problems
-    db.commit()
-    result.polled += 1
-
-
-def _latest_delivered(db: Session) -> list:
-    """Per volume, its most recently delivered row."""
-    from app.models.fisqua import FisquaOutbox
-
-    latest = {}
-    for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "delivered")
-                .order_by(FisquaOutbox.delivered_at, FisquaOutbox.id)):
-        latest[row.collection_id] = row
-    return list(latest.values())
+    return True
 
 
 def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = None,
                       now: Optional[datetime] = None, stop: Optional[threading.Event] = None) -> dict:
-    """One pass: recover, promote, send, poll. Never raises; the caller gets counts and a status.
+    """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
     Statuses: "disabled" (Fisqua not configured), "no_transport" (rows are
-    promoted, nothing is sent or polled), "done", "stopped".
+    promoted, nothing is sent), "auth_error" (Fisqua refused the token: rows
+    are promoted, nothing is sent until the token changes), "done",
+    "stopped", "error".
     """
     from app.models.fisqua import FisquaOutbox
 
@@ -371,44 +483,214 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             return True
         return False
 
-    try:
-        # Only this step sends, and one at a time, so a row found `sending`
-        # was left by a run that did not finish. Fisqua may or may not have
-        # it; it is sent again, with the same manifest id.
-        for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
-            _move(db, row_id, "sending", state="failed", next_attempt_at=now,
-                  last_error="interrupted while sending")
+    with _step_lock:
+        try:
+            # Only this step sends, and one at a time, so a row found
+            # `sending` was left by a run that did not finish. Fisqua may or
+            # may not have it; it is sent again with the same manifest id,
+            # and Fisqua answers a repeated id with its original answer.
+            for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
+                _move(db, row_id, "sending", state="failed", next_attempt_at=now,
+                      last_error="interrupted while sending")
 
-        for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
-                    .order_by(FisquaOutbox.id).all()):
-            if stopping():
+            for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
+                        .order_by(FisquaOutbox.id).all()):
+                if stopping():
+                    return result.as_dict()
+                _promote(db, row, result)
+
+            if isinstance(transport, NullTransport):
+                result.status = "no_transport"
                 return result.as_dict()
-            _promote(db, row, result)
-
-        if isinstance(transport, NullTransport):
-            result.status = "no_transport"
-            return result.as_dict()
-
-        due = (db.query(FisquaOutbox)
-               .filter((FisquaOutbox.state == "ready")
-                       | ((FisquaOutbox.state == "failed") & (FisquaOutbox.next_attempt_at <= now)))
-               .order_by(FisquaOutbox.id).all())
-        for row in due:
-            if stopping():
+            if auth_error() is not None:
+                result.status = "auth_error"
                 return result.as_dict()
-            _send(db, row, transport, now, result)
 
-        for row in _latest_delivered(db):
-            if row.external_id is None:
-                continue
-            if stopping():
-                return result.as_dict()
-            _poll(db, row, transport, now, result)
-    except Exception:
-        db.rollback()
-        logger.exception("The Fisqua outbox step raised")
-        result.status = "error"
+            due = (db.query(FisquaOutbox)
+                   .filter((FisquaOutbox.state == "ready")
+                           | ((FisquaOutbox.state == "failed") & (FisquaOutbox.next_attempt_at <= now)))
+                   .order_by(FisquaOutbox.id).all())
+            for row in due:
+                if stopping():
+                    return result.as_dict()
+                if not _send(db, row, transport, now, result):
+                    break
+        except Exception:
+            db.rollback()
+            logger.exception("The Fisqua outbox step raised")
+            result.status = "error"
     return result.as_dict()
+
+
+# ---------------------------------------------------------------------------
+# The status poll
+# ---------------------------------------------------------------------------
+
+SENT = ("delivered", "failed")
+
+
+def _parse_time(value: Any) -> Optional[datetime]:
+    if not isinstance(value, str) or not value.strip():
+        return None
+    try:
+        return _naive(datetime.fromisoformat(value.strip().replace("Z", "+00:00")))
+    except ValueError:
+        return None
+
+
+def volumes_to_poll(db: Session) -> dict:
+    """{reference code: (collection id, newest sent row)} for every volume whose latest manifest is not final.
+
+    A row counts as sent once it is delivered, or once an attempt failed:
+    Fisqua may have it, and a poll by reference recovers a lost answer. A
+    volume with no reference code cannot be asked for.
+    """
+    from app.models.collection import Collection
+    from app.models.fisqua import FisquaOutbox, FisquaStatus
+
+    newest = {}
+    rows = (db.query(FisquaOutbox)
+            .filter(FisquaOutbox.state.in_(SENT), FisquaOutbox.attempts > 0)
+            .order_by(FisquaOutbox.id))
+    for row in rows:
+        newest[row.collection_id] = row
+    out = {}
+    for cid, row in newest.items():
+        collection = db.get(Collection, cid)
+        if collection is None or not collection.external_id:
+            continue
+        status = db.get(FisquaStatus, cid)
+        if (status is not None and status.status in fc.FINAL_STATES
+                and status.manifest_id == row.manifest_id):
+            continue
+        out[collection.external_id] = (cid, row)
+    return out
+
+
+def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = None,
+                       now: Optional[datetime] = None) -> dict:
+    """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises."""
+    from app.models.fisqua import FisquaOutbox
+
+    if not fisqua_configured():
+        return {"status": "disabled"}
+    transport = transport if transport is not None else get_transport()
+    if isinstance(transport, NullTransport):
+        return {"status": "no_transport"}
+    now = _naive(now) or _now()
+    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "recovered": 0}
+    with _step_lock:
+        try:
+            if auth_error() is not None:
+                return {**result, "status": "auth_error"}
+            wanted = volumes_to_poll(db)
+            db.rollback()
+            refs = sorted(wanted)
+            result["asked"] = len(refs)
+            for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
+                chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
+                result["calls"] += 1
+                try:
+                    answer = transport.get_status(chunk)
+                except Exception as exc:
+                    answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+                answer = _redacted(answer)
+                if answer.outcome == "auth_error":
+                    record_auth_error(answer.status_code, now)
+                    return {**result, "status": "auth_error"}
+                if answer.outcome != "status":
+                    logger.warning("Asking Fisqua for the status of %s volume(s) failed: %s",
+                                   len(chunk), scrub(answer.error or answer.outcome))
+                    result["status"] = "error"
+                    continue
+                for entry in answer.volumes or []:
+                    ref = entry.get(fc.F_REF)
+                    if ref not in wanted or ref not in chunk:
+                        continue
+                    cid, _row = wanted[ref]
+                    manifest_id = entry.get(fc.F_MANIFEST_ID)
+                    manifest_id = manifest_id if isinstance(manifest_id, str) else None
+                    state = entry.get(fc.F_STATE)
+                    problems = entry.get(fc.F_PROBLEMS)
+                    _keep_status(db, cid, manifest_id, state if isinstance(state, str) else None,
+                                 _parse_time(entry.get(fc.F_ENTERED_AT)),
+                                 problems if problems else None, now)
+                    result["answered"] += 1
+                    if manifest_id is not None:
+                        lost = (db.query(FisquaOutbox.id)
+                                .filter(FisquaOutbox.collection_id == cid,
+                                        FisquaOutbox.manifest_id == manifest_id,
+                                        FisquaOutbox.state == "failed")
+                                .scalar())
+                        db.rollback()
+                        volume_id = entry.get(fc.F_VOLUME_ID)
+                        if lost is not None and _move(
+                                db, lost, "failed", state="delivered", delivered_at=now,
+                                response=entry, last_error=None, next_attempt_at=None,
+                                external_id=str(volume_id) if volume_id not in (None, "") else None):
+                            result["recovered"] += 1
+        except Exception:
+            db.rollback()
+            logger.exception("The Fisqua status poll raised")
+            result["status"] = "error"
+    return result
+
+
+class FisquaStatusScheduler:
+    """Polls Fisqua every FISQUA_POLL_INTERVAL_SECONDS (ten minutes), in a thread of its own.
+
+    A tick with no volume to ask for makes no call, so the poll runs only
+    while some sent volume is not final.
+    """
+
+    def __init__(self) -> None:
+        self._stop = threading.Event()
+        self._thread: Optional[threading.Thread] = None
+        self.last_result: Optional[dict] = None
+
+    def start(self) -> bool:
+        if not fisqua_configured():
+            logger.info("Fisqua is not configured; no status poll started")
+            return False
+        if self._thread is not None and self._thread.is_alive():
+            return True
+        self._stop.clear()
+        self._thread = threading.Thread(target=self._loop, name="fisqua-status", daemon=True)
+        self._thread.start()
+        return True
+
+    def stop(self, timeout: float = 5.0) -> None:
+        self._stop.set()
+        thread, self._thread = self._thread, None
+        if thread is not None and thread.is_alive():
+            thread.join(timeout=timeout)
+
+    def is_running(self) -> bool:
+        return self._thread is not None and self._thread.is_alive()
+
+    def _loop(self) -> None:
+        if self._stop.wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
+            return
+        while True:
+            self.tick()
+            if self._stop.wait(config.settings.FISQUA_POLL_INTERVAL_SECONDS):
+                return
+
+    def tick(self) -> Optional[dict]:
+        from app.core.db import SessionLocal
+
+        db = SessionLocal()
+        try:
+            self.last_result = poll_fisqua_status(db)
+            return self.last_result
+        except Exception:
+            logger.exception("Scheduled Fisqua status poll raised")
+            return None
+        finally:
+            db.close()
+
+
+fisqua_status_scheduler = FisquaStatusScheduler()
 
 
 # ---------------------------------------------------------------------------
@@ -423,9 +705,12 @@ _OUTBOX_FIELDS = ("manifest_id", "stem", "state", "created_at", "attempts", "nex
 def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     """The `fisqua` object of the volume's offsite state, or None when Fisqua is not configured.
 
-    `outbox` lists the volume's manifests newest first (at most
-    OUTBOX_LISTED), without the manifest itself; `status` is Fisqua's latest
-    word on the volume, or None.
+    `environment` is `production` or `staging`. `auth_error` is the
+    unit-level stop (time, HTTP status, token fingerprint) while Fisqua
+    refuses this unit's token, else None. `outbox` lists the volume's
+    manifests newest first (at most OUTBOX_LISTED), without the manifest
+    itself; `status` is Fisqua's latest word on the volume, or None, with its
+    problems whatever the state.
     """
     from app.models.fisqua import FisquaOutbox, FisquaStatus
 
@@ -435,10 +720,26 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
             .order_by(FisquaOutbox.id.desc()).limit(OUTBOX_LISTED).all())
     status = db.get(FisquaStatus, collection_id)
     return {
+        "environment": fisqua_environment(),
+        "auth_error": auth_error(),
         "outbox": [{name: getattr(row, name) for name in _OUTBOX_FIELDS} for row in rows],
         "status": None if status is None else {
             "status": status.status, "status_at": status.status_at,
             "status_checked_at": status.status_checked_at, "problems": status.problems,
             "manifest_id": status.manifest_id,
         },
+    }
+
+
+def unit_fisqua_summary() -> dict:
+    """The unit-level Fisqua state for the system panel: configured, environment, auth error, last runs."""
+    from app.core.image_upload import image_upload_scheduler
+
+    configured = fisqua_configured()
+    return {
+        "configured": configured,
+        "environment": fisqua_environment() if configured else None,
+        "auth_error": auth_error() if configured else None,
+        "last_send": image_upload_scheduler.last_fisqua_result,
+        "last_poll": fisqua_status_scheduler.last_result,
     }

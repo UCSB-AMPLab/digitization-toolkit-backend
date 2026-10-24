@@ -19,18 +19,21 @@ import pytest
 from tests.unit.test_capture_manifest_export import TENANT, Volume, _as, tenant, vol  # noqa: F401
 
 TOKEN = "fisqua-secret-token-8c1f2e"
-URL = "https://fisqua.example.org"
+ENV = "staging"
 
 
 @pytest.fixture
-def fisqua(monkeypatch, tenant):
+def fisqua(monkeypatch, tenant, tmp_path):
     from pydantic import SecretStr
 
     from app.core import config
-    monkeypatch.setattr(config.settings, "FISQUA_URL", URL)
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", ENV)
+    monkeypatch.setattr(config.settings, "FISQUA_BASE_URL", "")
     monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(TOKEN))
     monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "b2unit:bucket")
-    return URL
+    # The unit-level auth error is a file in the data directory.
+    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    return ENV
 
 
 class FakeTransport:
@@ -50,9 +53,9 @@ class FakeTransport:
             raise answer
         return answer
 
-    def get_status(self, external_id):
+    def get_status(self, refs):
         from app.core.fisqua_outbox import TransportResult
-        self.polled.append(external_id)
+        self.polled.append(list(refs))
         answer = self.statuses.pop(0) if self.statuses else TransportResult(outcome="error", error="no answer")
         if isinstance(answer, Exception):
             raise answer
@@ -88,6 +91,21 @@ def _run(db, transport, now=None):
     return run_fisqua_outbox(db, transport=transport, now=now)
 
 
+def _poll(db, transport, now=None):
+    from app.core.fisqua_outbox import poll_fisqua_status
+    return poll_fisqua_status(db, transport=transport, now=now)
+
+
+def _entry(ref, manifest_id, state="received", volume_id="fq-1", entered_at=None, problems=()):
+    return {"ref": ref, "volumeId": volume_id, "manifestId": manifest_id, "state": state,
+            "enteredAt": entered_at, "problems": list(problems)}
+
+
+def _status(*entries):
+    from app.core.fisqua_outbox import TransportResult
+    return TransportResult(outcome="status", volumes=list(entries), response=list(entries))
+
+
 # ---------------------------------------------------------------------------
 # Enqueue at handover
 # ---------------------------------------------------------------------------
@@ -115,13 +133,17 @@ def test_no_row_without_fisqua_configured(client, db_session, vol):
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("url,token", [(URL, ""), ("", TOKEN), ("  ", "  ")])
-def test_a_half_configured_fisqua_is_not_configured(client, db_session, vol, monkeypatch, url, token):
+@pytest.mark.parametrize("env,token,tenant_value", [
+    (ENV, "", TENANT), ("", TOKEN, TENANT), ("  ", "  ", TENANT), ("prod", TOKEN, TENANT),
+    (ENV, TOKEN, ""), (ENV, TOKEN, "Not A Tenant"),
+])
+def test_a_half_configured_fisqua_is_not_configured(client, db_session, vol, monkeypatch, env, token, tenant_value):
     from pydantic import SecretStr
 
     from app.core import config
-    monkeypatch.setattr(config.settings, "FISQUA_URL", url)
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", env)
     monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(token))
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", tenant_value)
     vol.record(status="captured")
     _handover(client, vol.col)
     assert _rows(db_session, vol.col) == []
@@ -171,10 +193,10 @@ def test_a_take_back_while_unconfigured_still_withdraws_the_queued_row(client, d
     _run(db_session, FakeTransport())  # promoted, then an error: failed
     assert _rows(db_session, vol.col)[0].state == "failed"
 
-    monkeypatch.setattr(config.settings, "FISQUA_URL", "")
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
     monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(""))
     _take_back(client, vol.col)
-    monkeypatch.setattr(config.settings, "FISQUA_URL", URL)
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", ENV)
     monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(TOKEN))
 
     transport = FakeTransport(sends=[_delivered()])
@@ -191,10 +213,10 @@ def test_a_handover_while_unconfigured_still_supersedes_the_queued_row(client, d
     _take_back(client, vol.col)
     _handover(client, vol.col)  # configured: withdrawn, waiting_for_upload
 
-    monkeypatch.setattr(config.settings, "FISQUA_URL", "")
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
     vol.record(status="captured")
     _handover(client, vol.col)  # unconfigured: no new row, the queued one is superseded
-    monkeypatch.setattr(config.settings, "FISQUA_URL", URL)
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", ENV)
 
     transport = FakeTransport(sends=[_delivered()])
     _run(db_session, transport)
@@ -465,8 +487,18 @@ def test_the_null_transport_leaves_ready_rows_ready(client, db_session, vol, fis
 
 
 @pytest.mark.unit
-def test_the_default_transport_is_the_null_one(fisqua):
-    from app.core.fisqua_outbox import NullTransport, get_transport
+def test_the_configured_transport_is_https_to_the_tenants_host(fisqua, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_http import HttpFisquaTransport
+    from app.core.fisqua_outbox import NullTransport, base_url, get_transport
+    assert base_url() == f"https://{TENANT}.staging.fisqua.org"
+    assert isinstance(get_transport(), HttpFisquaTransport)
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "Production")
+    assert base_url() == f"https://{TENANT}.fisqua.org"
+    monkeypatch.setattr(config.settings, "FISQUA_BASE_URL", "http://127.0.0.1:8787/")
+    assert base_url() == "http://127.0.0.1:8787"
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
+    assert base_url() is None
     assert isinstance(get_transport(), NullTransport)
 
 
@@ -475,7 +507,7 @@ def test_not_configured_the_step_does_nothing(client, db_session, vol, fisqua, m
     from app.core import config
     vol.record(status="captured")
     _handover(client, vol.col)
-    monkeypatch.setattr(config.settings, "FISQUA_URL", "")
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
     transport = FakeTransport(sends=[_delivered()])
     assert _run(db_session, transport)["status"] == "disabled"
     assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
@@ -511,27 +543,90 @@ def test_the_step_runs_even_when_the_upload_run_raised(db_session, monkeypatch):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_the_latest_delivered_manifest_is_polled_and_its_status_kept(client, db_session, vol, fisqua):
-    from app.core.fisqua_outbox import TransportResult
+def test_delivery_keeps_fisquas_state_and_the_poll_keeps_its_status(client, db_session, vol, fisqua):
     from app.models.fisqua import FisquaStatus
     vol.record(status="captured")
     _handover(client, vol.col)
-    at = datetime(2026, 10, 24, 9, 30, 0)
-    transport = FakeTransport(
-        sends=[_delivered("fq-9")],
-        statuses=[TransportResult(outcome="status", status="en_revision", status_at=at,
-                                  problems=[{"page": 3, "issue": "blur"}], response={"state": "en_revision"})])
-    now = datetime(2026, 10, 24, 12, 0, 0)
-    _run(db_session, transport, now=now)  # delivers, then polls
-    assert transport.polled == ["fq-9"]
-
+    from app.core.fisqua_outbox import TransportResult
+    _run(db_session, FakeTransport(sends=[TransportResult(outcome="delivered", external_id="fq-9",
+                                                          status="received", response={})]))
+    row = _rows(db_session, vol.col)[0]
     db_session.expire_all()
     st = db_session.get(FisquaStatus, vol.col.id)
-    assert st.status == "en_revision"
-    assert st.status_at == at
+    assert st.status == "received" and st.manifest_id == row.manifest_id
+
+    now = datetime(2026, 10, 24, 12, 0, 0)
+    transport = FakeTransport(statuses=[_status(_entry(
+        vol.col.external_id, row.manifest_id, state="review_pending", volume_id="fq-9",
+        entered_at="2026-10-24T09:30:00Z", problems=[{"rule": "blur", "message": "page 3"}]))])
+    result = _poll(db_session, transport, now=now)
+    assert transport.polled == [[vol.col.external_id]]
+    assert result["answered"] == 1
+    db_session.expire_all()
+    st = db_session.get(FisquaStatus, vol.col.id)
+    assert st.status == "review_pending"
+    assert st.status_at == datetime(2026, 10, 24, 9, 30, 0)
     assert st.status_checked_at == now
-    assert st.problems == [{"page": 3, "issue": "blur"}]
-    assert st.manifest_id == _rows(db_session, vol.col)[0].manifest_id
+    assert st.problems == [{"rule": "blur", "message": "page 3"}]
+
+
+@pytest.mark.unit
+def test_the_poll_asks_by_the_reference_the_manifest_carries(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    row = _rows(db_session, vol.col)[0]
+    assert row.manifest["volumes"][0]["externalId"] == vol.col.external_id
+    transport = FakeTransport(statuses=[_status()])
+    _poll(db_session, transport)
+    assert transport.polled == [[row.manifest["volumes"][0]["externalId"]]]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("final", ["published", "refused", "superseded"])
+def test_a_final_state_stops_the_poll(client, db_session, vol, fisqua, final):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    mid = _rows(db_session, vol.col)[0].manifest_id
+    ref = vol.col.external_id
+    transport = FakeTransport(statuses=[_status(_entry(ref, mid, state="running")),
+                                        _status(_entry(ref, mid, state=final))])
+    _poll(db_session, transport)
+    _poll(db_session, transport)
+    assert _poll(db_session, transport)["calls"] == 0
+    assert len(transport.polled) == 2
+
+
+@pytest.mark.unit
+def test_a_final_state_for_an_older_manifest_does_not_stop_the_poll(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    old = _rows(db_session, vol.col)[0].manifest_id
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    transport = FakeTransport(statuses=[_status(_entry(vol.col.external_id, old, state="superseded")),
+                                        _status()])
+    _poll(db_session, transport)
+    _poll(db_session, transport)
+    assert len(transport.polled) == 2
+
+
+@pytest.mark.unit
+def test_problems_are_kept_in_any_state(client, db_session, vol, fisqua):
+    from app.models.fisqua import FisquaStatus
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    mid = _rows(db_session, vol.col)[0].manifest_id
+    _poll(db_session, FakeTransport(statuses=[_status(_entry(
+        vol.col.external_id, mid, state="published", problems=[{"rule": "x", "message": "y"}]))]))
+    db_session.expire_all()
+    assert db_session.get(FisquaStatus, vol.col.id).problems == [{"rule": "x", "message": "y"}]
+    body = _as(client, "reviewer").get(f"/collections/{vol.col.id}/offsite").json()
+    assert body["fisqua"]["status"]["problems"] == [{"rule": "x", "message": "y"}]
 
 
 @pytest.mark.unit
@@ -540,24 +635,85 @@ def test_a_poll_error_keeps_the_last_status(client, db_session, vol, fisqua):
     from app.models.fisqua import FisquaStatus
     vol.record(status="captured")
     _handover(client, vol.col)
-    transport = FakeTransport(sends=[_delivered("fq-9")],
-                              statuses=[TransportResult(outcome="status", status="recibido"),
+    _run(db_session, FakeTransport(sends=[_delivered("fq-9")]))
+    mid = _rows(db_session, vol.col)[0].manifest_id
+    transport = FakeTransport(statuses=[_status(_entry(vol.col.external_id, mid, state="queued")),
                                         TransportResult(outcome="error", error="timeout")])
     t1 = datetime(2026, 10, 24, 12, 0, 0)
-    _run(db_session, transport, now=t1)
-    _run(db_session, transport, now=t1 + timedelta(hours=1))
+    _poll(db_session, transport, now=t1)
+    _poll(db_session, transport, now=t1 + timedelta(minutes=10))
     db_session.expire_all()
     st = db_session.get(FisquaStatus, vol.col.id)
-    assert st.status == "recibido" and st.status_checked_at == t1
+    assert st.status == "queued" and st.status_checked_at == t1
 
 
 @pytest.mark.unit
-def test_a_delivery_with_no_external_id_is_not_polled(client, db_session, vol, fisqua):
+def test_the_poll_recovers_a_lost_answer_to_a_send(client, db_session, vol, fisqua):
     vol.record(status="captured")
     _handover(client, vol.col)
-    transport = FakeTransport(sends=[_delivered(external_id=None)])
-    _run(db_session, transport)
-    assert transport.polled == []
+    _run(db_session, FakeTransport())  # the answer was lost: failed
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "failed"
+    result = _poll(db_session, FakeTransport(statuses=[_status(_entry(
+        vol.col.external_id, row.manifest_id, state="registered", volume_id="fq-42"))]))
+    assert result["recovered"] == 1
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "delivered" and row.external_id == "fq-42"
+    assert row.next_attempt_at is None
+
+
+@pytest.mark.unit
+def test_a_volume_never_sent_is_not_polled(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(), now=None)
+    from app.models.fisqua import FisquaOutbox
+    db_session.query(FisquaOutbox).update({"state": "ready", "attempts": 0})
+    db_session.commit()
+    transport = FakeTransport()
+    assert _poll(db_session, transport)["calls"] == 0
+
+
+@pytest.mark.unit
+def test_the_poll_batches_at_most_100_refs_per_call(client, db_session, override_projects_root, fisqua):
+    from tests.unit.test_capture_manifest_export import Volume
+    from app.models.fisqua import FisquaOutbox
+    from app.core.fisqua_outbox import _now
+    vols = [Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}") for n in range(1, 251)]
+    for v in vols:
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=str(uuid.uuid4()), stem=v.stem,
+                                    state="delivered", attempts=1, delivered_at=_now(), created_at=_now()))
+    db_session.commit()
+    transport = FakeTransport(statuses=[_status(), _status(), _status()])
+    result = _poll(db_session, transport)
+    assert [len(c) for c in transport.polled] == [100, 100, 50]
+    assert sorted(r for c in transport.polled for r in c) == sorted(v.col.external_id for v in vols)
+    assert result["calls"] == 3
+
+
+@pytest.mark.unit
+def test_the_status_scheduler_polls_on_its_own_interval(fisqua, monkeypatch):
+    from app.core import config, fisqua_outbox
+    assert config.settings.FISQUA_POLL_INTERVAL_SECONDS == 600
+    seen = []
+    monkeypatch.setattr(fisqua_outbox, "poll_fisqua_status", lambda db: seen.append(1) or {"status": "done"})
+    monkeypatch.setattr(config.settings, "OFFSITE_BACKUP_DELAY_SECONDS", 0)
+    monkeypatch.setattr(config.settings, "FISQUA_POLL_INTERVAL_SECONDS", 0.05)
+    import time
+    scheduler = fisqua_outbox.FisquaStatusScheduler()
+    assert scheduler.start()
+    time.sleep(0.3)
+    scheduler.stop()
+    assert len(seen) >= 2
+
+
+@pytest.mark.unit
+def test_the_status_scheduler_does_not_start_unconfigured(monkeypatch):
+    from app.core import fisqua_outbox
+    from app.core import config
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
+    assert fisqua_outbox.FisquaStatusScheduler().start() is False
 
 
 # ---------------------------------------------------------------------------
@@ -581,8 +737,9 @@ def test_offsite_state_carries_the_outbox_and_the_status(client, db_session, vol
     [entry] = body["fisqua"]["outbox"]
     assert entry["state"] == "waiting_for_upload"
 
-    _run(db_session, FakeTransport(sends=[_delivered("fq-1")],
-                                   statuses=[TransportResult(outcome="status", status="recibido")]))
+    _run(db_session, FakeTransport(sends=[_delivered("fq-1")]))
+    mid = _rows(db_session, vol.col)[0].manifest_id
+    _poll(db_session, FakeTransport(statuses=[_status(_entry(vol.col.external_id, mid, state="registered"))]))
     body = _as(client, "reviewer").get(f"/collections/{vol.col.id}/offsite").json()
     fq = body["fisqua"]
     [entry] = fq["outbox"]
@@ -591,7 +748,8 @@ def test_offsite_state_carries_the_outbox_and_the_status(client, db_session, vol
     assert set(entry) == {"manifest_id", "stem", "state", "created_at", "attempts", "next_attempt_at",
                           "last_attempt_at", "last_error", "refusal", "problems", "response",
                           "external_id", "delivered_at"}
-    assert fq["status"]["status"] == "recibido"
+    assert fq["status"]["status"] == "registered"
+    assert fq["environment"] == ENV and fq["auth_error"] is None
     assert set(fq["status"]) == {"status", "status_at", "status_checked_at", "problems", "manifest_id"}
 
 
@@ -644,9 +802,10 @@ def test_the_token_never_reaches_logs_rows_or_responses(client, db_session, vol,
     vol.record(status="captured")
     _handover(client, vol.col)
     _run(db_session, FakeTransport(
-        sends=[TransportResult(outcome="delivered", external_id="fq-2", response=echoed)],
-        statuses=[TransportResult(outcome="status", status=f"ok {TOKEN}",
-                                  problems=[{"x": TOKEN}], response=echoed)]))
+        sends=[TransportResult(outcome="delivered", external_id="fq-2", response=echoed)]))
+    mid = _rows(db_session, vol.col)[-1].manifest_id
+    _poll(db_session, FakeTransport(statuses=[_status(_entry(
+        vol.col.external_id, mid, state=f"ok {TOKEN}", problems=[{"x": TOKEN}]))]))
     from app.models.fisqua import FisquaStatus
     db_session.expire_all()
     st = db_session.get(FisquaStatus, vol.col.id)

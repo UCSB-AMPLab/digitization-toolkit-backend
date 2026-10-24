@@ -77,19 +77,29 @@ class Settings(BaseSettings):
     OFFSITE_HOLD_FILE: str = Field(default="", validation_alias="DTK_OFFSITE_HOLD_FILE")
 
     # Fisqua, which the unit sends each handed-over volume's capture manifest
-    # to and asks for the volume's status (app.core.fisqua_outbox). Both
-    # empty by default; with either empty nothing is queued or sent. Every
-    # call is the unit's, over HTTPS, with this unit's token. The token is a
-    # SecretStr so that printing the settings never shows it; it is never
-    # logged and never returned by an API.
-    FISQUA_URL: str = Field(default="", validation_alias="DTK_FISQUA_URL")
+    # to and asks for its volumes' status (app.core.fisqua_outbox, contract
+    # 1.2). FISQUA_ENV is `production` or `staging`, and picks the host
+    # `<tenant>.fisqua.org` or `<tenant>.staging.fisqua.org`, with the
+    # tenant from DTK_OFFSITE_TENANT (app.core.fisqua_contract). Empty: not
+    # configured, and nothing is queued or sent. FISQUA_BASE_URL replaces
+    # that host, for tests and development only. Every call is the unit's,
+    # over HTTPS, with this unit's token, a SecretStr so that printing the
+    # settings never shows it; it is never logged and never returned by an API.
+    FISQUA_ENV: str = Field(default="", validation_alias="DTK_FISQUA_ENV")
+    FISQUA_BASE_URL: str = Field(default="", validation_alias="DTK_FISQUA_BASE_URL")
     FISQUA_TOKEN: SecretStr = Field(default=SecretStr(""), validation_alias="DTK_FISQUA_TOKEN")
     # A send that fails is retried after FISQUA_RETRY_BASE_SECONDS, then
     # twice as long after each further failure, never longer than
-    # FISQUA_RETRY_MAX_SECONDS. The worker runs after each image upload run
-    # (OFFSITE_BACKUP_INTERVAL_SECONDS), so that interval is the finest step.
+    # FISQUA_RETRY_MAX_SECONDS; a Retry-After from Fisqua is a floor. Sends
+    # run after each image upload run (OFFSITE_BACKUP_INTERVAL_SECONDS),
+    # so that interval is the finest step.
     FISQUA_RETRY_BASE_SECONDS: int = Field(default=300, validation_alias="DTK_FISQUA_RETRY_BASE")
     FISQUA_RETRY_MAX_SECONDS: int = Field(default=6 * 3600, validation_alias="DTK_FISQUA_RETRY_MAX")
+    # Status is polled on its own schedule, every ten minutes while any sent
+    # volume is not in a final state.
+    FISQUA_POLL_INTERVAL_SECONDS: int = Field(default=600, validation_alias="DTK_FISQUA_POLL_INTERVAL")
+    # Read and write timeout of each call; connecting has ten seconds.
+    FISQUA_TIMEOUT_SECONDS: float = Field(default=60.0, validation_alias="DTK_FISQUA_TIMEOUT")
 
     app_version: str = "0.0.0-dev"
 
