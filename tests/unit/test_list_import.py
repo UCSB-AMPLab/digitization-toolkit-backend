@@ -868,3 +868,42 @@ def test_imports_of_one_list_id_are_serialised_by_the_lock(reports_root):
         assert not entered.wait(0.3)
     t.join(5)
     assert entered.is_set()
+
+
+# ---------------------------------------------------------------------------
+# Matching project names
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("variant", [
+    "prueba válida", "PRUEBA VÁLIDA", "Prueba válida ", " Prueba válida", "\tPrueba válida\n",
+    "Prueba válida",  # NFD: a + combining acute
+])
+def test_a_list_name_variant_reuses_the_existing_project(client, db_session, reports_root, variant):
+    from app.models.project import Project
+
+    project_id = _existing_project(db_session, "Prueba válida")
+    doc = _load(VALID)
+    doc["list"]["name"] = variant
+    _as("op", "operator")  # an operator may import only into an existing project
+    resp = _post(client, doc)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["projectId"] == project_id
+    assert resp.json()["projectCreated"] is False
+    assert resp.json()["projectName"] == "Prueba válida"
+    assert db_session.query(Project).count() == 1
+
+
+@pytest.mark.unit
+def test_a_new_project_is_stored_under_the_stripped_nfc_name(client, db_session, reports_root):
+    import unicodedata
+    from app.models.project import Project
+
+    doc = _load(VALID)
+    doc["list"]["name"] = "  Prueba válida  "
+    _as("op", "admin")
+    resp = _post(client, doc)
+    assert resp.json()["projectCreated"] is True
+    name = db_session.query(Project).one().name
+    assert name == "Prueba válida" and name == unicodedata.normalize("NFC", name)
+    assert resp.json()["projectName"] == name

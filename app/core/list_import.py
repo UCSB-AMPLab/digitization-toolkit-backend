@@ -50,6 +50,7 @@ import logging
 import os
 import re
 import tempfile
+import unicodedata
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -229,7 +230,7 @@ def check_envelope(document: Any) -> tuple[str, str, list]:
     name = meta.get("name") if isinstance(meta, dict) else None
     if not isinstance(name, str) or not name.strip():
         raise ListRefused("The file has no list name, which the project is named after.")
-    if len(name) > _PROJECT_NAME_MAX_LENGTH:
+    if len(_project_name(name)) > _PROJECT_NAME_MAX_LENGTH:
         raise ListRefused(f"The list name is longer than {_PROJECT_NAME_MAX_LENGTH} characters.")
     items = document.get("items")
     if not isinstance(items, list):
@@ -358,9 +359,32 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     }
 
 
+def _project_name(name: str) -> str:
+    """The list name as a project is stored under: stripped, in NFC."""
+    return unicodedata.normalize("NFC", name.strip())
+
+
+def _name_key(name: str) -> str:
+    """What two project names are compared by: stripped, NFC, case-folded.
+
+    Accents are kept: "válida" and "valida" are different names, as are
+    "Peña" and "Pena".
+    """
+    return _project_name(name).casefold()
+
+
 def _find_project(db: Session, name: str) -> Optional[Project]:
-    """The project the list's name refers to, or None."""
-    return db.query(Project).filter(Project.name == name).first()
+    """The project whose name matches the list's name by _name_key, or None.
+
+    Compared in Python, since neither engine normalises Unicode; a unit
+    holds tens of projects. If several existing projects match (POST
+    /projects compares names exactly), the oldest is used.
+    """
+    key = _name_key(name)
+    for project in db.query(Project).order_by(Project.id).all():
+        if _name_key(project.name) == key:
+            return project
+    return None
 
 
 def _project_for(db: Session, name: str, actor: Optional[str], may_create_project: bool) -> tuple[Project, bool]:
@@ -377,7 +401,7 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
         return project, False
     if not may_create_project:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
-    project = Project(name=name, created_by=actor)
+    project = Project(name=_project_name(name), created_by=actor)
     db.add(project)
     try:
         db.commit()
@@ -406,6 +430,7 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
     """Find or create the project, then create each item's volume; return the report."""
     project, project_created = _project_for(db, list_name, actor, may_create_project)
     project_id = project.id
+    project_name = project.name
 
     first_code = _first_positions(items, _reference_code)
     first_stem = _first_positions(items, lambda item: item.get("filenameStem"))
@@ -452,7 +477,7 @@ def _import_items(db: Session, list_id: str, list_name: str, items: list,
         "listId": list_id,
         "listName": list_name,
         "projectId": project_id,
-        "projectName": list_name,
+        "projectName": project_name,
         "projectCreated": project_created,
         "importedAt": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
         "importedBy": actor,
