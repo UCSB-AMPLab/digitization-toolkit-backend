@@ -18,7 +18,16 @@ from app.core import config
 # (capture/backends/gphoto2_backend.py, _write_raw_preview). Capture writes
 # only .cr2 among these today; the rest are recognised so that a RAW master
 # of another make is never treated as displayable.
-RAW_SUFFIXES = frozenset({".cr2", ".nef", ".arw", ".raf", ".dng", ".raw"})
+#
+# The same list as Fisqua's RAW_EXTENSIONS (fisqua app/lib/capture/manifest.ts),
+# copied exactly: Fisqua decides from a capture's filename whether its page
+# needs a preview, and a capture Fisqua counts as RAW must be counted so here
+# too, or a volume the unit sends without a preview is refused by Fisqua
+# (preview-missing) rather than here. Keep the two lists the same.
+RAW_SUFFIXES = frozenset(f".{ext}" for ext in (
+    "3fr", "arw", "cr2", "cr3", "crw", "dcr", "dng", "erf", "iiq", "kdc", "mef", "mos", "mrw",
+    "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2", "srf", "srw", "x3f",
+))
 
 # What the RAW backend appends to a master's stem to name its preview sidecar.
 PREVIEW_SIDECAR_SUFFIX = "_preview.jpg"

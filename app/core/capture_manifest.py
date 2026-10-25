@@ -20,7 +20,8 @@ whose files are still on disk.
   the export.
 * A current RAW image must have a preview: Fisqua's runner reads pages with
   Pillow and cannot decode a RAW, so one without a preview row or file
-  refuses the export.
+  refuses the export. An image is RAW when its file on disk or the name in
+  its capture key has one of app.core.paths.RAW_SUFFIXES, Fisqua's list.
 * Only current images are listed. A superseded image stays in the bucket and
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
@@ -356,7 +357,11 @@ def _image_entry(img, rec, rows, index, tenant, capture_prefix, preview_prefix, 
 
     preview_key = None
     preview_path = None
-    if is_raw_suffix(Path(img.file_path)):
+    # RAW when the file on disk is, or when the name its offsite key carries
+    # is: an adopted object is matched by SHA1, so its key can name a RAW
+    # while the file on disk does not, and Fisqua decides from the key's name.
+    raw_key = cap is not None and is_raw_suffix(Path(_key_name(cap.object_key)))
+    if is_raw_suffix(Path(img.file_path)) or raw_key:
         preview_path = preview_sidecar_of(_resolved(img.file_path))
         prow = rows.get((img.id, "preview"))
         pstate = _object_state(prow)

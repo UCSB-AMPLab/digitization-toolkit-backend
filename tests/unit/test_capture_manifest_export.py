@@ -131,7 +131,8 @@ class Volume:
                 entry["sha256"] = _sha256(data)
             files.append(entry)
             preview = None
-            if ext.lower() in ("cr2", "nef", "dng"):
+            from app.core.paths import RAW_SUFFIXES
+            if f".{ext.lower()}" in RAW_SUFFIXES:
                 pname = f"{self.stem}-img_{n:04d}_c{cam}_preview.jpg"
                 pdata = f"{pname} bytes".encode()
                 (self.root / "previews" / pname).write_bytes(pdata)
@@ -962,3 +963,47 @@ def test_the_fisqua_checks_here_catch_what_they_should(client, vol):
     bad = json.loads(json.dumps(doc))
     bad["volumes"][0]["records"][0]["images"][0]["objectKey"] = "other/captures/x.cr2"
     assert any("outside" in p for p in fisqua_registration_problems(bad, TENANT))
+
+
+# ---------------------------------------------------------------------------
+# RAW, as Fisqua decides it
+# ---------------------------------------------------------------------------
+
+# Fisqua's RAW_EXTENSIONS (fisqua app/lib/capture/manifest.ts), which decide
+# from a capture's filename whether its page needs a preview.
+FISQUA_RAW_EXTENSIONS = (
+    "3fr", "arw", "cr2", "cr3", "crw", "dcr", "dng", "erf", "iiq", "kdc", "mef", "mos", "mrw",
+    "nef", "nrw", "orf", "pef", "raf", "raw", "rw2", "rwl", "sr2", "srf", "srw", "x3f",
+)
+
+
+@pytest.mark.unit
+def test_the_unit_knows_the_raw_suffixes_fisqua_knows():
+    from app.core.paths import RAW_SUFFIXES
+    assert RAW_SUFFIXES == frozenset(f".{ext}" for ext in FISQUA_RAW_EXTENSIONS)
+
+
+@pytest.mark.unit
+def test_a_jpeg_on_disk_whose_offsite_key_is_raw_needs_a_preview(client, vol):
+    """An adopted object is matched by SHA1, so its key's name can be RAW while the file on disk is not."""
+    vol.record()
+    rec = vol.record(layout=("single",), upload=False)
+    [img] = rec.images
+    data = f"{img.filename} bytes".encode()
+    raw_name = f"{Path(img.filename).stem}.cr3"
+    vol.offsite(img, "capture", f"{vol.tenant}/{vol.stem}/captures/{raw_name}", data)
+    problems = _refusal(_export(client, vol.col))
+    assert problems["raw_without_preview"]["image_ids"] == [img.id]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ext", ["cr3", "orf", "rw2"])
+def test_a_raw_master_of_another_make_without_a_preview_is_refused(client, vol, ext):
+    vol.record()
+    rec = vol.record(layout=("single",), ext=ext, preview_digest_recorded=False)
+    [img] = rec.images
+    vol.db.delete(vol.row(img, "preview"))
+    vol.db.commit()
+    (vol.root / "previews" / f"{Path(img.filename).stem}_preview.jpg").unlink()
+    problems = _refusal(_export(client, vol.col))
+    assert problems["raw_without_preview"]["image_ids"] == [img.id]
