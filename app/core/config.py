@@ -119,9 +119,9 @@ class Settings(BaseSettings):
         # one of them, so provisioning owns a file of its own.
         #
         # offsite.env is written WHOLE by scripts/provision-rclone.sh alone, and
-        # holds only DTK_OFFSITE_* and DTK_RCLONE_* keys. Absent on a unit that
-        # has never been provisioned, which is why a missing file must not be an
-        # error.
+        # holds only DTK_OFFSITE_* and DTK_RCLONE_* keys, and the Fisqua keys
+        # DTK_FISQUA_TOKEN and DTK_FISQUA_ENV. Absent on a unit that has never
+        # been provisioned, which is why a missing file must not be an error.
         env_file=("../.env", "/var/lib/dtk/offsite.env"),
         env_file_encoding="utf-8",
         extra="ignore"  # Ignore extra fields from .env like uvicorn_host
