@@ -100,9 +100,12 @@ REFUSED_ACTION = "image_upload_refused"
 RUN_ACTION = "image_upload_run"
 ADOPT_ACTION = "image_upload_adopted"
 
-# A tenant prefix is a single path segment of the stem alphabet: lowercase
-# letters and digits, joined by single hyphens ("sbmal", "ahr", "captua-test").
-TENANT_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# A tenant prefix is Fisqua's tenant slug: 1 to 63 lowercase letters, digits
+# and single hyphens, starting with a letter and not ending with a hyphen
+# ("sbmal", "ahr", "captua-test"), and none of TENANT_RESERVED. The same rule
+# as valid_tenant in the superproject's scripts/provision-rclone.sh.
+TENANT_PATTERN = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+TENANT_RESERVED = frozenset({"platform", "www", "api", "admin", "app"})
 # The tenant is also the capture manifest's generatedBy.instance, which
 # Fisqua caps at 256 characters, and a host label in Fisqua's
 # <tenant>.fisqua.org, which DNS caps at 63.
@@ -132,9 +135,9 @@ class UploadFailed(BackupError):
 def configured_tenant() -> Optional[str]:
     """The tenant prefix, or None when image upload is disabled.
 
-    Raises ImageUploadMisconfigured for a value that is not one path segment
-    of the stem alphabet, or is longer than TENANT_MAX_LENGTH, so a mistyped
-    prefix never becomes a key.
+    Raises ImageUploadMisconfigured for a value that is not Fisqua's tenant
+    slug (TENANT_PATTERN, at most TENANT_MAX_LENGTH, none of TENANT_RESERVED),
+    so a mistyped prefix never becomes a key.
     """
     value = config.settings.OFFSITE_TENANT.strip().strip("/")
     if not value:
@@ -142,7 +145,11 @@ def configured_tenant() -> Optional[str]:
     if not TENANT_PATTERN.match(value):
         raise ImageUploadMisconfigured(
             f"DTK_OFFSITE_TENANT={value!r} is not a tenant prefix "
-            "(lowercase letters and digits joined by single hyphens)"
+            "(lowercase letters, digits and single hyphens, starting with a letter)"
+        )
+    if value in TENANT_RESERVED:
+        raise ImageUploadMisconfigured(
+            f"DTK_OFFSITE_TENANT={value!r} is reserved by Fisqua and cannot be a tenant prefix"
         )
     if len(value) > TENANT_MAX_LENGTH:
         raise ImageUploadMisconfigured(
