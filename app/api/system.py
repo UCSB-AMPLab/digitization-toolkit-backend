@@ -127,9 +127,14 @@ def get_catalogue_backup_state(
     completed a verified dump, which is the condition worth noticing — it is
     what was true of the Rionegro unit for the six weeks before its card
     filled.
+
+    `held` is true while the offsite upload hold file exists
+    (app.core.offsite_hold): no dump is taken and no image is uploaded until
+    it is removed. `hold_file` is its path. Both are under `images` too.
     """
     from app.core.catalogue_backup import is_configured, last_verified_backup
     from app.core.image_upload import unit_upload_summary
+    from app.core.offsite_hold import hold_state
 
     state = last_verified_backup(db)
     return {
@@ -137,6 +142,7 @@ def get_catalogue_backup_state(
         "last_verified_at": state["verified_at"] if state else None,
         "object":           state["object"] if state else None,
         "detail":           state["detail"] if state else None,
+        **hold_state(),
         # Per-volume counts are on GET /collections/{id}/offsite.
         "images":           unit_upload_summary(db),
     }

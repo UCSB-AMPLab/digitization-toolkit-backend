@@ -68,6 +68,13 @@ class Settings(BaseSettings):
     # half hour while the unit is powered.
     OFFSITE_BACKUP_DELAY_SECONDS: int = Field(default=300, validation_alias="DTK_OFFSITE_BACKUP_DELAY")
     OFFSITE_BACKUP_INTERVAL_SECONDS: int = Field(default=1800, validation_alias="DTK_OFFSITE_BACKUP_INTERVAL")
+    # While this file exists, nothing is sent offsite: the image upload, the
+    # catalogue dump and freeing stop (app.core.offsite_hold), and each tick
+    # reads it again, so creating or removing it needs no restart. An upgrade
+    # creates it before writing the tenant to offsite.env and removes it after
+    # the one-time commands (adopt, mark-freed, ...). Empty: offsite-hold in
+    # DTK_DATA_DIR, /var/lib/dtk/offsite-hold on a unit.
+    OFFSITE_HOLD_FILE: str = Field(default="", validation_alias="DTK_OFFSITE_HOLD_FILE")
 
     app_version: str = "0.0.0-dev"
 
@@ -120,6 +127,10 @@ class Settings(BaseSettings):
         """The projects root when no storage override is in effect."""
         return Path(self.PROJECTS_ROOT) if self.PROJECTS_ROOT else (self.data_dir / "projects")
     
+    @property
+    def offsite_hold_file(self) -> Path:
+        return Path(self.OFFSITE_HOLD_FILE) if self.OFFSITE_HOLD_FILE else (self.data_dir / "offsite-hold")
+
     @property
     def exports_dir(self) -> Path:
         return Path(self.EXPORTS_ROOT) if self.EXPORTS_ROOT else (self.data_dir / "exports")

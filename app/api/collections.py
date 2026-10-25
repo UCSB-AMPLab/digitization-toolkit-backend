@@ -248,7 +248,9 @@ def get_collection_offsite_state(
 
     `received` is true when the volume has objects to upload and every one is
     verified. `refusals` lists each object refused because the bucket already
-    held another file at its key, with both SHA1s. A route of its own rather
+    held another file at its key, with both SHA1s. `held` and `hold_file`
+    report the unit's offsite upload hold (app.core.offsite_hold), under which
+    nothing is uploaded and the volume cannot be freed. A route of its own rather
     than fields on CollectionRead, so listing volumes does not derive this
     for each of them.
     """
@@ -304,8 +306,9 @@ def free_collection(
 
     Refused with 409 when the volume has no stem, when not every one of its
     objects is verified in the bucket, while an export of it is queued or
-    running or its files are being read for upload, and when the bucket
-    cannot be listed. Each file is freed only when its local SHA1 and the
+    running or its files are being read for upload, when the bucket
+    cannot be listed, and while the offsite upload hold file exists
+    (app.core.offsite_hold; the detail carries `hold_file`). Each file is freed only when its local SHA1 and the
     bucket listing's both equal its offsite row's; the job's result lists
     the files freed and those refused.
     """

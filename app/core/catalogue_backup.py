@@ -78,7 +78,7 @@ from sqlalchemy.orm import Session
 # override_projects_root fixture) rebuild the Settings object with
 # importlib.reload, so a module-level binding to the old instance would go
 # stale. Every read below goes through config.settings.
-from app.core import config
+from app.core import config, offsite_hold
 
 logger = logging.getLogger(__name__)
 
@@ -696,9 +696,11 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     """Dump, upload, verify, record. Never raises; the caller gets a status.
 
     Statuses: "disabled" (no remote or no tenant prefix configured),
-    "misconfigured" (a tenant that is not a prefix), "up-to-date" (already verified
-    today), "verified", "failed" (the bucket answered and the answer was bad, or
-    the dump or upload failed), "aborted" (verification could not answer).
+    "misconfigured" (a tenant that is not a prefix), "held" (the upload hold
+    file exists, app.core.offsite_hold: no dump is taken), "up-to-date"
+    (already verified today), "verified", "failed" (the bucket answered and
+    the answer was bad, or the dump or upload failed), "aborted" (verification
+    could not answer).
     """
     # Before the disabled and up-to-date checks, not after them: both return
     # early, and a dump left behind by a failed unlink or a killed process has
@@ -715,6 +717,10 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
         return {"status": "misconfigured", "error": str(exc)}
     if tenant is None:
         return {"status": "disabled"}
+
+    # Read on every run, after the sweep: a held unit still clears its card.
+    if offsite_hold.held("catalogue backup"):
+        return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
 
     if not needs_run_today(db, today):
         state = last_verified_backup(db)
@@ -851,6 +857,9 @@ class CatalogueBackupScheduler:
         login_throttle.py rest on the same assumption for their module-level
         singletons. If the appliance ever needs more than one worker, this has
         to move to a lock or to a timer first.
+
+        It starts while the upload hold exists (app.core.offsite_hold); each
+        run reads the hold, so creating or removing it needs no restart.
 
         Startup also sweeps the dump directory. stop() joins a daemon thread for
         five seconds and then lets the process exit, so a run can die between
