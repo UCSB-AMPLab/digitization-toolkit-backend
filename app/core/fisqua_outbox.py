@@ -558,6 +558,23 @@ def _keep_status(db: Session, collection_id: int, manifest_id: Optional[str], st
     db.commit()
 
 
+OBJECT_MISSING_ACTION = "fisqua_object_missing"
+
+
+def _log_object_missing(db: Session, row, problems: Any) -> None:
+    """An incident, logged at ERR: Fisqua did not find objects this unit had verified in the bucket (§9.2)."""
+    from app.core import audit
+
+    missing = [p for p in problems or [] if isinstance(p, dict) and p.get(fc.F_RULE) == fc.RULE_OBJECT_MISSING]
+    if not missing:
+        return
+    keys = [str(p.get(fc.F_KEY)) for p in missing]
+    logger.error("Fisqua found %s object(s) of manifest %s missing from the masters bucket, which this unit "
+                 "had verified: %s", len(missing), row.manifest_id, ", ".join(keys))
+    audit.log_event(db, level="ERR", category="system", action=OBJECT_MISSING_ACTION, subject=row.stem,
+                    detail=scrub(f"manifest {row.manifest_id} missing={len(missing)} keys: " + ", ".join(keys)))
+
+
 def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _Run) -> bool:
     """Send one row. False when Fisqua refused the token, and sending is to stop.
 
@@ -598,6 +615,7 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
               cancel_requested=None)
         result.refused += 1
         logger.warning("Fisqua refused manifest %s of volume %s", row.manifest_id, row.collection_id)
+        _log_object_missing(db, row, answer.problems)
     else:
         error = scrub(answer.error or f"unexpected outcome {answer.outcome!r}")
         wait = retry_delay(attempts)

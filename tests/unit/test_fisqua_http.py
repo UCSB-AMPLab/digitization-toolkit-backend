@@ -593,3 +593,31 @@ def test_the_fisqua_objects_report_the_hold(client, db_session, queued, hold):
         assert body["fisqua"]["held"] is held and body["fisqua"]["hold_file"] == str(hold)
         system = _as(client, "reviewer").get("/system/catalogue-backup").json()
         assert system["fisqua"]["held"] is held and system["fisqua"]["hold_file"] == str(hold)
+
+
+@pytest.mark.unit
+def test_object_missing_is_refused_and_logged_as_an_incident(db_session, queued, caplog):
+    """§9.2: Fisqua found an object Captua had verified absent from the masters bucket."""
+    from app.core import fisqua_contract as fc
+    from app.models.system_log import SystemLog
+    assert fc.RULE_OBJECT_MISSING == "object-missing"
+    keys = [f"{queued.stem}/captures/{queued.stem}-img_0001_c0.jpg",
+            f"{queued.stem}/captures/{queued.stem}-img_0001_c1.jpg"]
+    problems = [{"rule": "object-missing", "message": "not in the masters bucket", "key": k,
+                 "captureId": "c-1", "role": role} for k, role in zip(keys, ("left", "right"))]
+    caplog.set_level(logging.DEBUG)
+    _send(db_session, Server(httpx.Response(422, json={"problems": problems})))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.refusal == "fisqua" and row.problems == problems
+    [entry] = db_session.query(SystemLog).filter(SystemLog.action == "fisqua_object_missing").all()
+    assert entry.level == "ERR" and entry.category == "system"
+    assert entry.subject == queued.stem
+    assert "2" in entry.detail and all(k in entry.detail for k in keys)
+    assert TOKEN not in entry.detail and TOKEN not in caplog.text
+
+
+@pytest.mark.unit
+def test_another_422_is_not_logged_as_object_missing(db_session, queued):
+    from app.models.system_log import SystemLog
+    _send(db_session, Server(httpx.Response(422, json={"problems": [{"rule": "reference-code", "message": "x"}]})))
+    assert db_session.query(SystemLog).filter(SystemLog.action == "fisqua_object_missing").count() == 0

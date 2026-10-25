@@ -54,6 +54,10 @@ F_VOLUMES = "volumes"
 RULE_ID_REUSED = "id-reused"
 RULE_REFERENCE_CODE = "reference-code"  # 422: the manifest's volume has no reference code
 RULE_RUN_STARTED = "run-started"  # 409: a newer manifest for a volume a run has started on
+# 422: an object the manifest names was not in the masters bucket when it
+# arrived; each problem names its key, captureId and role (§9.2).
+RULE_OBJECT_MISSING = "object-missing"
+F_KEY = "key"
 # Not Fisqua's: the problems the unit records for a 413 or a 400 with no problems in it.
 RULE_TOO_LARGE = "payload-too-large"
 RULE_BAD_REQUEST = "bad-request"
