@@ -20,7 +20,9 @@ Answers to POST of a manifest (the codes are in fisqua_contract):
 
 Answers to GET of the status: 2xx with the volumes, the same configuration
 errors, the rest error. Answers to GET of a volume's QC decisions (§9.5):
-2xx with an object, the same configuration errors, the rest error.
+2xx with an object, 404 with rule no-decisions as nothing to apply yet
+(read again at the next poll), the same configuration errors otherwise,
+the rest error.
 """
 
 from datetime import datetime, timezone
@@ -156,6 +158,15 @@ def read_status_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def _has_rule(body: Any, rule: str) -> bool:
+    """Whether the body names `rule`, at its top level or in its problems."""
+    if not isinstance(body, dict):
+        return False
+    if body.get(fc.F_RULE) == rule:
+        return True
+    return any(isinstance(p, dict) and p.get(fc.F_RULE) == rule for p in body.get(fc.F_PROBLEMS) or [])
+
+
 def read_decisions_answer(response: httpx.Response) -> TransportResult:
     code = response.status_code
     body = _json(response)
@@ -164,6 +175,9 @@ def read_decisions_answer(response: httpx.Response) -> TransportResult:
             return TransportResult(outcome="error", response=body, status_code=code,
                                    error=f"Fisqua answered HTTP {code} without a decisions object")
         return TransportResult(outcome="decisions", response=body, status_code=code)
+    if code == 404 and _has_rule(body, fc.RULE_NO_DECISIONS):
+        # Nothing decided yet, or not yet visible: not a configuration error.
+        return TransportResult(outcome="no_decisions", response=body, status_code=code)
     stop = _config_error(code, body)
     if stop is not None:
         return stop

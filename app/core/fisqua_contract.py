@@ -115,7 +115,16 @@ F_DECIDED_AT = "decidedAt"
 # GET, with the volume's reference code quoted into the path.
 DECISIONS_PATH = "/api/capture/v1/volumes/{ref}/decisions"
 
-# Fields of the decisions answer.
+# A 404 on the decisions read with this rule: an unknown reference, or one
+# with nothing decided yet. Not a configuration error: the unit reads
+# decisions only when status offered a decisionsId, so this is a race, and
+# the set is read again at the next poll. A 404 without it, or on another
+# path, stays a configuration error.
+RULE_NO_DECISIONS = "no-decisions"
+
+# Fields of the decisions answer. captuaRecordId is an integer, as in the
+# manifest; decidedBy is the reviewer's display name, or "Fisqua reviewer"
+# when none is set, never an email.
 F_RECORDS = "records"
 F_CAPTUA_RECORD_ID = "captuaRecordId"
 F_DECISION = "decision"
