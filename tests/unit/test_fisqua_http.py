@@ -835,3 +835,352 @@ def test_a_version_refused_volume_taken_back_is_not_resent(client, db_session, q
     _send(db_session, server)
     assert server.requests == []
     assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+# ---------------------------------------------------------------------------
+# While a version stop holds, one manifest is sent every DTK_FISQUA_RETRY_MAX seconds
+# to learn whether Fisqua now reads what this software writes
+# ---------------------------------------------------------------------------
+
+T0 = datetime(2026, 10, 1, 12, 0, 0)
+
+
+def _interval():
+    from app.core import config
+    return timedelta(seconds=config.settings.FISQUA_RETRY_MAX_SECONDS)
+
+
+def _stopped(db_session, queued):
+    """The unit stopped for version at T0, by a refusal of the queued volume's manifest."""
+    from app.core.fisqua_outbox import config_error
+    assert _send(db_session, Server(_version_refusal()), now=T0)["status"] == "config_error"
+    assert config_error()["reason"] == "version"
+
+
+@pytest.mark.unit
+def test_no_retest_before_the_interval(db_session, queued):
+    _stopped(db_session, queued)
+    server = Server(_ok())
+    assert _send(db_session, server, now=T0 + _interval() - timedelta(seconds=1))["status"] == "config_error"
+    assert server.requests == []
+
+
+@pytest.mark.unit
+def test_a_retest_after_the_interval_sends_one_manifest_as_a_normal_send_would(
+        client, db_session, queued, override_projects_root, caplog):
+    _stopped(db_session, queued)
+    other = _second_volume(client, db_session, override_projects_root)
+    server = Server(_version_refusal(), _ok(), _ok())
+    with caplog.at_level(logging.INFO):
+        _send(db_session, server, now=T0 + _interval())
+    [request] = server.requests
+    sent = json.loads(request.content)
+    # The oldest volume handed over: the one refused, handed over again under a new id.
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "refused"]
+    assert sent["id"] == rows[1].manifest_id != rows[0].manifest_id
+    assert sent == rows[1].manifest
+    # The other volume is not built while the stop holds.
+    assert _rows(db_session, other.col)[0].state == "waiting_for_upload"
+    assert f"Fisqua version stop retest: sending manifest {rows[1].manifest_id} of volume {queued.col.id}" \
+        in caplog.text
+    assert TOKEN not in caplog.text
+
+
+@pytest.mark.unit
+def test_an_accepted_retest_clears_the_stop_and_sending_resumes(
+        client, db_session, queued, override_projects_root, caplog):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    other = _second_volume(client, db_session, override_projects_root)
+    server = Server(_ok(), _ok())
+    with caplog.at_level(logging.INFO):
+        result = _send(db_session, server, now=T0 + _interval())
+    assert config_error() is None
+    assert result["status"] == "done"
+    assert len(server.requests) == 2
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused", "delivered"]
+    assert [r.state for r in _rows(db_session, other.col)] == ["delivered"]
+    retest = _rows(db_session, queued.col)[1].manifest_id
+    assert (f"Fisqua version stop retest: manifest {retest} accepted; the stop is cleared and sending resumes"
+            in caplog.text)
+    assert TOKEN not in caplog.text
+    # Once only: nothing more is handed over again.
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval() + timedelta(minutes=10))
+    assert server.requests == []
+
+
+@pytest.mark.unit
+def test_a_retest_refused_again_for_version_keeps_the_stop_and_moves_the_next_retest(
+        db_session, queued, caplog):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    with caplog.at_level(logging.INFO):
+        assert _send(db_session, Server(_version_refusal("envelope")), now=first)["status"] == "config_error"
+    stop = config_error()
+    assert stop["reason"] == "version" and stop["at"] == first
+    retest = _rows(db_session, queued.col)[-1].manifest_id
+    assert f"Fisqua version stop retest: manifest {retest} refused again for version; the stop holds" \
+        in caplog.text
+
+    server = Server(_ok())
+    _send(db_session, server, now=first + _interval() - timedelta(seconds=1))
+    assert server.requests == []
+    _send(db_session, server, now=first + _interval())
+    assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("failure", [httpx.Response(503), httpx.Response(429), httpx.ConnectError("offline")])
+def test_a_retest_that_fails_in_transit_keeps_the_stop_and_is_tried_again_at_the_next_interval(
+        db_session, queued, caplog, failure):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    server = Server(failure)
+    with caplog.at_level(logging.INFO):
+        _send(db_session, server, now=first)
+    [request] = server.requests
+    stop = config_error()
+    assert stop["reason"] == "version" and stop["at"] == T0 and stop["retest_at"] == first
+    retest = json.loads(request.content)["id"]
+    assert f"Fisqua version stop retest: sending manifest {retest} failed; the stop holds" in caplog.text
+
+    server = Server(_ok())
+    _send(db_session, server, now=first + _interval() - timedelta(seconds=1))
+    assert server.requests == []
+    _send(db_session, server, now=first + _interval())
+    # The same manifest, under the same id: Fisqua may have had it.
+    [request] = server.requests
+    assert json.loads(request.content)["id"] == retest
+    assert config_error() is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer, reason", [
+    (httpx.Response(401), "token"), (httpx.Response(404), "not_found"),
+    (httpx.Response(302, headers={"Location": "https://elsewhere.test/"}), "redirect")])
+def test_a_retest_answered_with_a_configuration_error_replaces_the_stop(db_session, queued, answer, reason):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    _send(db_session, Server(answer), now=first)
+    assert config_error()["reason"] == reason
+    # That stop clears only on a configuration change: no retest.
+    server = Server(_ok())
+    _send(db_session, server, now=first + 10 * _interval())
+    assert server.requests == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code, reason", [(401, "token"), (404, "not_found"), (302, "redirect")])
+def test_a_stop_for_another_reason_is_never_retested(db_session, queued, code, reason):
+    from app.core.fisqua_outbox import config_error, record_config_error
+    record_config_error(code, reason, T0)
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + 10 * _interval())
+    assert server.requests == []
+    assert config_error()["reason"] == reason
+
+
+@pytest.mark.unit
+def test_with_no_volume_to_send_no_retest_is_made_and_the_stop_stays(client, db_session, queued):
+    from app.core.fisqua_outbox import config_error
+    from tests.unit.test_fisqua_outbox import _take_back
+    _stopped(db_session, queued)
+    _take_back(client, queued.col)
+    server = Server(_ok())
+    assert _send(db_session, server, now=T0 + _interval())["status"] == "config_error"
+    assert server.requests == []
+    assert config_error()["reason"] == "version"
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+@pytest.mark.unit
+def test_a_retest_waits_for_the_call_budget(db_session, queued, monkeypatch):
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(limit=0))
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval())
+    assert server.requests == []
+    assert config_error().get("retest_at") is None
+
+
+@pytest.mark.unit
+def test_the_status_poll_stays_stopped_during_a_version_stop(db_session, queued):
+    _stopped(db_session, queued)
+    server = Server(httpx.Response(200, json={"volumes": []}))
+    assert _poll(db_session, server, now=T0 + 10 * _interval())["status"] == "config_error"
+    assert server.requests == []
+
+
+@pytest.mark.unit
+def test_a_retest_refused_for_its_content_clears_the_stop(db_session, queued, caplog):
+    """Fisqua read the manifest, so it reads this software's manifests: the stop is lifted."""
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    refusal = httpx.Response(400, json={"problems": [{"rule": "pages", "message": "x"}]})
+    with caplog.at_level(logging.INFO):
+        _send(db_session, Server(refusal), now=T0 + _interval())
+    assert config_error() is None
+    retest = _rows(db_session, queued.col)[-1].manifest_id
+    assert (f"Fisqua version stop retest: manifest {retest} refused for its content, not its version; "
+            "the stop is cleared and sending resumes") in caplog.text
+
+
+@pytest.mark.unit
+def test_a_retest_failed_in_transit_waits_for_a_retry_after_longer_than_the_interval(db_session, queued):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    wait = 4 * _interval()
+    _send(db_session, Server(httpx.Response(503, headers={"Retry-After": str(int(wait.total_seconds()))})),
+          now=first)
+    server = Server(_ok())
+    _send(db_session, server, now=first + wait - timedelta(seconds=1))
+    assert server.requests == []
+    _send(db_session, server, now=first + wait)
+    assert len(server.requests) == 1
+    assert config_error() is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", ["accepted", "content"])
+def test_a_retest_answered_before_the_stop_was_removed_clears_it_with_no_call(
+        db_session, queued, monkeypatch, answer):
+    """The process ended after the answer was kept on the row and before the stop file was removed."""
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    real, interrupted = fisqua_outbox._clear_version_stop, [True]
+    monkeypatch.setattr(fisqua_outbox, "_clear_version_stop",
+                        lambda fingerprint: False if interrupted[0] else real(fingerprint))
+    reply = _ok() if answer == "accepted" else httpx.Response(422, json={"problems": [{"rule": "pages",
+                                                                                      "message": "x"}]})
+    _send(db_session, Server(reply), now=T0 + _interval())
+    assert config_error()["reason"] == "version"
+    interrupted[0] = False
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval() + timedelta(minutes=10))
+    assert server.requests == []
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_shutdown_makes_no_retest(db_session, queued):
+    import threading
+
+    from app.core.fisqua_outbox import run_fisqua_outbox
+    _stopped(db_session, queued)
+    shutdown = threading.Event()
+    shutdown.set()
+    server = Server(_ok())
+    result = run_fisqua_outbox(db_session, transport=_transport(server), now=T0 + _interval(), stop=shutdown)
+    assert result["status"] == "stopped"
+    assert server.requests == []
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("panel_first", [False, True])
+def test_an_update_after_a_retest_failed_in_transit_sends_the_new_codes_manifest(
+        db_session, queued, monkeypatch, panel_first):
+    """The retest row was built by the code Fisqua refused; after the update it is built again, not resent."""
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    failed = Server(httpx.Response(503))
+    _send(db_session, failed, now=first)
+    old_id = json.loads(failed.requests[0].content)["id"]
+    [_refused, retest] = _rows(db_session, queued.col)
+    assert retest.state == "failed" and retest.manifest_id == old_id
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    if panel_first:
+        # The system panel reads the stop before the next pass does.
+        assert config_error() is None
+    server = Server(_ok())
+    result = _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    sent = json.loads(request.content)
+    assert sent["id"] != old_id
+    assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert result["status"] == "done"
+    assert config_error() is None
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "delivered"]
+    assert rows[1].id == retest.id and rows[1].manifest_id == sent["id"]
+    # Nothing is left to rebuild or resend.
+    later = Server(_ok())
+    _send(db_session, later, now=first + timedelta(hours=2))
+    assert later.requests == []
+
+
+@pytest.mark.unit
+def test_a_pending_rebuild_survives_a_new_configuration_stop(db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error, record_config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    failed = Server(httpx.Response(503))
+    _send(db_session, failed, now=first)
+    old_id = json.loads(failed.requests[0].content)["id"]
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    assert config_error() is None
+    # The poll meets a token error before the next send pass.
+    record_config_error(401, "token", first + timedelta(minutes=5))
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", __import__("pydantic").SecretStr(OTHER_TOKEN))
+    server = Server(_ok())
+    _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    assert json.loads(request.content)["id"] != old_id
+
+
+@pytest.mark.unit
+def test_a_retest_manifest_built_but_not_sent_is_built_again_after_an_update(db_session, queued, monkeypatch):
+    """The budget ran out after the retest built its manifest; the update must not send that manifest."""
+    from app.core import config, fisqua_outbox
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    full = fisqua_outbox.call_budget
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(limit=0))
+    _send(db_session, Server(_ok()), now=T0 + _interval())
+    built = _rows(db_session, queued.col)[-1]
+    assert built.state == "ready" and built.attempts == 0
+    monkeypatch.setattr(fisqua_outbox, "call_budget", full)
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    assert config_error() is None
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval() + timedelta(hours=1))
+    [request] = server.requests
+    assert json.loads(request.content)["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_retest_answered_with_a_token_error_is_built_again_after_an_update(db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    _send(db_session, Server(httpx.Response(401)), now=first)
+    assert config_error()["reason"] == "token"
+    # The token stop holds: the retest row is not rebuilt yet, under the code Fisqua refused.
+    _send(db_session, Server(_ok()), now=first + timedelta(minutes=10))
+    retest = _rows(db_session, queued.col)[-1]
+    assert retest.state == "ready"
+    old_id = retest.manifest_id
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    sent = json.loads(request.content)
+    assert sent["id"] != old_id
+    assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert config_error() is None

@@ -40,10 +40,17 @@ app.core.fisqua_contract. Here:
   the environment, the base URL or the token changes: the row goes back to
   `ready`. A 400 for `version`, `envelope` or `shape` (Fisqua cannot read
   what this software writes) refuses its manifest for good and stops the
-  unit with reason `version` until the software changes; nothing is built
-  meanwhile, manifests built but never sent are built again under new ids,
-  and once an update clears the stop each volume whose newest manifest was
-  refused for it is handed over again under a new id.
+  unit with reason `version` until the software changes or Fisqua reads
+  its manifests again. Nothing is built meanwhile, and manifests built but
+  never sent are built again under new ids, except for a retest: every
+  DTK_FISQUA_RETRY_MAX seconds (six hours) from the stop or the last
+  retest, one manifest, for the oldest volume handed over and received, is
+  built and sent as any other (_retest_version_stop). If Fisqua accepts it
+  the stop is removed; refused again for version, the stop holds for
+  another interval. Once an update or a retest clears the stop, each volume
+  whose newest manifest was refused for version is handed over again under
+  a new id, and a retest manifest still unanswered when an update cleared
+  the stop is built again under a new id (_rebuild_stale_retest).
 * **The offsite upload hold** (app.core.offsite_hold). While its file exists
   a send pass and a poll tick each answer "held" at their start, with no
   call to Fisqua and nothing promoted; removing it resumes the next pass.
@@ -203,8 +210,10 @@ def config_fingerprint() -> str:
     too. The installed code is app.core.version.code_identity (the backend
     commit and the release, or the process start when no commit can be
     read), so that an update, or failing that a restart, clears a stop for
-    a manifest Fisqua could not read (reason `version`). Neither the token
-    nor a full hash of it is kept anywhere.
+    a manifest Fisqua could not read (reason `version`); a retest that
+    Fisqua accepts clears it too, without any change here
+    (_retest_version_stop). Neither the token nor a full hash of it is kept
+    anywhere.
     """
     from app.core import version
 
@@ -323,25 +332,82 @@ def _config_error_path():
     return config.settings.data_dir / CONFIG_ERROR_FILE
 
 
-def record_config_error(status_code: Optional[int], reason: Optional[str], now: datetime) -> None:
-    """Stop sending and polling until the configuration changes. Keeps the time, the HTTP status, why, and the fingerprint."""
+def _write_stop(entry: dict) -> None:
+    """Write the stop file atomically. The caller holds _config_lock."""
     path = _config_error_path()
+    path.parent.mkdir(parents=True, exist_ok=True)
+    tmp = path.with_suffix(".tmp")
+    tmp.write_text(json.dumps(entry), encoding="utf-8")
+    os.replace(tmp, path)
+
+
+def record_config_error(status_code: Optional[int], reason: Optional[str], now: datetime) -> None:
+    """Stop sending and polling. Keeps the time, the HTTP status, why, and the fingerprint.
+
+    A stop for `token`, `not_found` or `redirect` holds until the
+    configuration changes. A stop for `version` holds until the software
+    changes, or until a retest (_retest_version_stop) finds that Fisqua
+    reads this software's manifests again. Recording a stop replaces any
+    earlier one, and with it the time of the last retest.
+    """
     entry = {"at": now.isoformat(), "status_code": status_code, "reason": reason,
              "config_fingerprint": config_fingerprint()}
     with _config_lock:
-        path.parent.mkdir(parents=True, exist_ok=True)
-        tmp = path.with_suffix(".tmp")
-        tmp.write_text(json.dumps(entry), encoding="utf-8")
-        os.replace(tmp, path)
+        old = _read_stop_file()
+        entry.update({key: old[key] for key in PENDING_KEYS if key in old})
+        if old.get("reason") == fc.VERSION_REASON and reason != fc.VERSION_REASON:
+            # A configuration stop in place of a version stop: what the
+            # retests built is still the refused code's, to be built again
+            # once this stop goes (_current_stop, _rebuild_stale_retest).
+            entry[REBUILD_UNSENT_KEY] = True
+            if isinstance(old.get("retest_row"), int):
+                entry[REBUILD_KEY] = old["retest_row"]
+        _write_stop(entry)
+    if reason == fc.VERSION_REASON:
+        logger.error("Fisqua answered HTTP %s (%s) for this unit's manifests (fingerprint %s); sending and "
+                     "polling stop until the software is updated, or until a retest every %s s finds that "
+                     "Fisqua reads its manifests", status_code, reason, entry["config_fingerprint"],
+                     int(_retest_interval().total_seconds()))
+        return
     logger.error("Fisqua answered HTTP %s (%s) for this unit's configuration (fingerprint %s); sending and "
                  "polling stop until DTK_FISQUA_ENV, DTK_FISQUA_BASE_URL or DTK_FISQUA_TOKEN is changed",
                  status_code, reason, entry["config_fingerprint"])
 
 
-def config_error() -> Optional[dict]:
-    """The recorded configuration error, while the configuration is still the one that failed; None otherwise.
+def _parse_stop_time(value: Any) -> Optional[datetime]:
+    try:
+        return datetime.fromisoformat(value) if value is not None else None
+    except (TypeError, ValueError):
+        return None
 
-    A record for another configuration is removed: it was changed, so sending resumes.
+
+# Keys, in the stop file, of work left by a version stop an update cleared
+# (_rebuild_stale_retest): the retest row to build again, and whether the
+# manifests built but never sent are to be built again.
+REBUILD_KEY = "rebuild_retest_row"
+REBUILD_UNSENT_KEY = "rebuild_unsent"
+PENDING_KEYS = (REBUILD_KEY, REBUILD_UNSENT_KEY)
+
+
+def _read_stop_file() -> dict:
+    """The stop file's content as a dict ({} when absent or unreadable). The caller holds _config_lock."""
+    try:
+        entry = json.loads(_config_error_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return entry if isinstance(entry, dict) else {}
+
+
+def _current_stop() -> Optional[dict]:
+    """The stop file's entry, while the configuration is still the one that failed; None otherwise.
+
+    A record for another configuration is removed: it was changed, so sending
+    resumes. When that record is a version stop (or carries work one left),
+    the file keeps only that work (PENDING_KEYS): the last retest row, and
+    the manifests built but never sent, for the next send pass to build
+    again under the new code (_rebuild_stale_retest). They were built by
+    the code Fisqua refused. No database work is done here, under
+    _config_lock.
     """
     path = _config_error_path()
     with _config_lock:
@@ -351,20 +417,124 @@ def config_error() -> Optional[dict]:
             return None
         except (OSError, ValueError):
             entry = None
-        if isinstance(entry, dict) and entry.get("config_fingerprint") == config_fingerprint():
-            try:
-                at = datetime.fromisoformat(entry["at"])
-            except (KeyError, TypeError, ValueError):
-                at = None
-            return {"at": at, "status_code": entry.get("status_code"), "reason": entry.get("reason"),
-                    "config_fingerprint": entry["config_fingerprint"]}
+        if not isinstance(entry, dict):
+            entry = None if entry is None else {}
+        if entry is not None and entry.get("config_fingerprint") == config_fingerprint():
+            return entry
+        if entry and set(entry) <= set(PENDING_KEYS):
+            return None  # only work left by a cleared version stop: no stop
+        pending = {key: entry[key] for key in PENDING_KEYS if key in entry} if entry else {}
+        if entry and entry.get("reason") == fc.VERSION_REASON:
+            pending[REBUILD_UNSENT_KEY] = True
+            if isinstance(entry.get("retest_row"), int):
+                pending[REBUILD_KEY] = entry["retest_row"]
         try:
-            path.unlink()
+            if pending:
+                _write_stop(pending)
+            else:
+                path.unlink()
         except OSError:
             pass
         if entry is not None:
             logger.info("The Fisqua configuration was changed since Fisqua refused it; sending resumes")
         return None
+
+
+def _rebuild_stale_retest(db: Session) -> None:
+    """Build again what a version stop's retests built, once an update cleared the stop. Commits.
+
+    Those manifests were built by the code Fisqua refused; sent as they are,
+    they would be refused again and stop the unit under the new code. Built
+    and never sent (a retest that found no call left in the budget, or a
+    shutdown): _rebuild_unsent, as after any version refusal. The last
+    retest row, still `ready` or `failed` (its answer lost or a transient
+    failure), goes back to `waiting_for_upload` the same way, under a new
+    manifest id (Fisqua may hold the old one) and with no attempt. Run at
+    the start of a send pass, under _step_lock and outside _config_lock,
+    once the file holds only these keys; they are then removed from it.
+    """
+    with _config_lock:
+        entry = _read_stop_file()
+        row_id, unsent = entry.get(REBUILD_KEY), entry.get(REBUILD_UNSENT_KEY)
+    # Only once no stop holds: under a stop that carries them (a
+    # configuration stop that replaced a version stop) the code may still
+    # be the refused one.
+    if "config_fingerprint" in entry or (not isinstance(row_id, int) and not unsent):
+        return
+    if unsent:
+        _rebuild_unsent(db)
+    if isinstance(row_id, int) and _move(
+            db, row_id, ("ready", "failed"), state="waiting_for_upload", manifest=None, reference_code=None,
+            manifest_id=str(uuid.uuid4()), attempts=0, next_attempt_at=None, last_error=None, response=None):
+        logger.info("Fisqua retest manifest of outbox row %s is built again under the updated software", row_id)
+    with _config_lock:
+        entry = _read_stop_file()
+        if (entry.get(REBUILD_KEY), entry.get(REBUILD_UNSENT_KEY)) != (row_id, unsent):
+            return
+        for key in PENDING_KEYS:
+            entry.pop(key, None)
+        try:
+            if entry:
+                _write_stop(entry)
+            else:
+                _config_error_path().unlink()
+        except OSError:
+            pass
+
+
+def config_error() -> Optional[dict]:
+    """The recorded stop, while the configuration is still the one that failed; None otherwise.
+
+    A record for another configuration (environment, base URL, token or
+    installed code: config_fingerprint) is removed, so sending resumes. A
+    stop for `version` is also removed when a retest is accepted
+    (_retest_version_stop); `retest_at` is the time of its last retest, or
+    None before the first.
+    """
+    entry = _current_stop()
+    if entry is None:
+        return None
+    return {"at": _parse_stop_time(entry.get("at")), "status_code": entry.get("status_code"),
+            "reason": entry.get("reason"), "config_fingerprint": entry["config_fingerprint"],
+            "retest_at": _parse_stop_time(entry.get("retest_at"))}
+
+
+def _retest_interval() -> timedelta:
+    """How long a version stop waits between retests: DTK_FISQUA_RETRY_MAX (six hours by default)."""
+    return timedelta(seconds=max(1, config.settings.FISQUA_RETRY_MAX_SECONDS))
+
+
+def _note_retest(fingerprint: str, now: datetime, row_id: int) -> None:
+    """Keep the time of a retest, and the row it sends, on the version stop it tests. Under _config_lock."""
+    with _config_lock:
+        try:
+            entry = json.loads(_config_error_path().read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return
+        if (not isinstance(entry, dict) or entry.get("reason") != fc.VERSION_REASON
+                or entry.get("config_fingerprint") != fingerprint):
+            return
+        entry["retest_at"] = now.isoformat()
+        entry["retest_row"] = row_id
+        _write_stop(entry)
+
+
+def _clear_version_stop(fingerprint: str) -> bool:
+    """Remove the version stop with this fingerprint, if it is still the one recorded. True if it was."""
+    path = _config_error_path()
+    with _config_lock:
+        try:
+            entry = json.loads(path.read_text(encoding="utf-8"))
+        except (OSError, ValueError):
+            return False
+        if (not isinstance(entry, dict) or entry.get("reason") != fc.VERSION_REASON
+                or entry.get("config_fingerprint") != fingerprint):
+            return False
+        try:
+            path.unlink()
+        except OSError:
+            return False
+        return True
 
 
 # Serialises the send step (the upload thread) and the status poll (its own thread).
@@ -708,6 +878,18 @@ def _resend_version_refusals(db: Session) -> int:
     back or is being captured, and its next handover will be sent. Returns
     how many were handed over again.
     """
+    again = 0
+    for row, collection in _version_refused_volumes(db):
+        enqueue_handover(db, collection)
+        db.commit()
+        again += 1
+        logger.info("Volume %s handed to Fisqua again under a new manifest id after a version refusal",
+                    row.collection_id)
+    return again
+
+
+def _version_refused_volumes(db: Session) -> list:
+    """[(refused row, volume)], oldest row first, for each volume _resend_version_refusals would hand over again."""
     from sqlalchemy import func
 
     from app.models.collection import Collection
@@ -718,8 +900,9 @@ def _resend_version_refusals(db: Session) -> int:
               .group_by(FisquaOutbox.collection_id).subquery())
     rows = (db.query(FisquaOutbox)
             .join(newest, FisquaOutbox.id == newest.c[1])
-            .filter(FisquaOutbox.state == "refused", FisquaOutbox.refusal == "fisqua").all())
-    again = 0
+            .filter(FisquaOutbox.state == "refused", FisquaOutbox.refusal == "fisqua")
+            .order_by(FisquaOutbox.id).all())
+    found = []
     for row in rows:
         if not _version_refusal(row.problems):
             continue
@@ -728,12 +911,162 @@ def _resend_version_refusals(db: Session) -> int:
         collection = db.get(Collection, row.collection_id)
         if captured is not None or collection is None:
             continue
-        enqueue_handover(db, collection)
-        db.commit()
-        again += 1
-        logger.info("Volume %s handed to Fisqua again under a new manifest id after a version refusal",
-                    row.collection_id)
-    return again
+        found.append((row, collection))
+    return found
+
+
+def _retest_candidates(db: Session, retest_row: Optional[int]) -> list:
+    """What a version stop's retest may send, in the order it tries them: [(kind, row id, volume or None)].
+
+    First the row the last retest sent, if its answer was lost or it failed
+    in transit (`failed` or `ready`): it is sent again under its id, as any
+    retry is. Then, oldest row first, a `ready` row never attempted (built
+    under the stopped software, and only by a retest), a `waiting_for_upload`
+    row, and a volume whose newest manifest was refused for version
+    (_version_refused_volumes), which would be handed over again under a new
+    id. A `failed` row of another send is left for after the stop: it may
+    hold a manifest built by older software.
+    """
+    from app.models.fisqua import FisquaOutbox
+
+    first = []
+    if retest_row is not None:
+        state = db.query(FisquaOutbox.state).filter(FisquaOutbox.id == retest_row).scalar()
+        if state in ("ready", "failed"):
+            first.append(("send", retest_row, None))
+    rest = [("send" if state == "ready" else "build", row_id, None)
+            for row_id, state in (db.query(FisquaOutbox.id, FisquaOutbox.state)
+                                  .filter(((FisquaOutbox.state == "ready") & (FisquaOutbox.attempts == 0))
+                                          | (FisquaOutbox.state == "waiting_for_upload"))
+                                  .all())
+            if row_id != retest_row]
+    rest.extend(("hand_over", row.id, collection) for row, collection in _version_refused_volumes(db))
+    return first + sorted(rest, key=lambda item: item[1])
+
+
+def _retest_read(state: Optional[str], problems: Any) -> bool:
+    """Whether a retest row's outcome shows Fisqua read its manifest: accepted, or refused for something else."""
+    return state == "delivered" or (state == "refused" and not _version_refusal(problems))
+
+
+def _retest_cleared(fingerprint: str, manifest_id: str, state: str, result: "_Run") -> bool:
+    """Remove the version stop after a retest Fisqua read, and say so in the journal. False if it was not removed."""
+    if not _clear_version_stop(fingerprint):
+        return False
+    if state == "delivered":
+        logger.info("Fisqua version stop retest: manifest %s accepted; the stop is cleared and sending "
+                    "resumes", manifest_id)
+    else:
+        logger.info("Fisqua version stop retest: manifest %s refused for its content, not its version; "
+                    "the stop is cleared and sending resumes", manifest_id)
+    result.status = "done"
+    return True
+
+
+def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], result: "_Run",
+                         stopping: Callable[[], bool]) -> bool:
+    """Send one manifest while a version stop holds, once every _retest_interval. True when the stop cleared.
+
+    Due DTK_FISQUA_RETRY_MAX seconds after the stop was recorded or last
+    retested, whichever is later. The manifest is the one a normal send
+    would make: the first of _retest_candidates that is, or can now be,
+    built (_promote) is claimed and sent by _send, after a call from the
+    shared call_budget, under the step lock the pass holds. Its answer:
+
+    * accepted, or refused for anything but version, envelope or shape
+      (Fisqua read it): the stop is removed, and the pass goes on as after
+      an update, handing over again the volumes refused for version;
+    * refused for version, envelope or shape: _send records the stop again
+      with this time, so the next retest is an interval later;
+    * a transient failure: the stop holds; its row is sent again, under
+      the same id, at the next retest;
+    * a configuration error (token, not_found, redirect): _send records it
+      in place of the version stop, as for any send.
+
+    A retest whose answer was recorded on its row but whose stop was not
+    then removed (the process ended between the two) is settled from the
+    row first, with no call. A row that failed in transit waits for its own
+    next_attempt_at too, so a Retry-After longer than the interval holds.
+    With nothing to send, no call left in the budget, or a shutdown under
+    way (`stopping`), nothing is sent and the time of the last retest is
+    left as it was.
+    """
+    from app.models.fisqua import FisquaOutbox
+
+    stop = _current_stop()
+    if stop is None or stop.get("reason") != fc.VERSION_REASON or isinstance(transport, NullTransport):
+        return False
+    now = _naive(clock())
+    fingerprint = stop["config_fingerprint"]
+    retest_row = stop.get("retest_row")
+    last = None
+    if retest_row is not None:
+        last = (db.query(FisquaOutbox.manifest_id, FisquaOutbox.state, FisquaOutbox.problems,
+                         FisquaOutbox.next_attempt_at)
+                .filter(FisquaOutbox.id == retest_row).first())
+        db.rollback()
+        if last is not None and _retest_read(last.state, last.problems):
+            return _retest_cleared(fingerprint, last.manifest_id, last.state, result)
+    since = [t for t in (_parse_stop_time(stop.get("at")), _parse_stop_time(stop.get("retest_at")))
+             if t is not None]
+    if since and now < max(since) + _retest_interval():
+        return False
+    if last is not None and last.state == "failed" and last.next_attempt_at is not None \
+            and _naive(last.next_attempt_at) > now:
+        return False
+    if stopping():
+        return False
+
+    row = None
+    for kind, row_id, collection in _retest_candidates(db, retest_row):
+        if kind == "hand_over":
+            new = enqueue_handover(db, collection)
+            db.commit()
+            if new is None:
+                continue
+            row_id, kind = new.id, "build"
+        if kind == "build":
+            waiting = db.get(FisquaOutbox, row_id)
+            if waiting is None or waiting.state != "waiting_for_upload":
+                db.rollback()
+                continue
+            _promote(db, waiting, result)
+        db.expire_all()
+        candidate = db.get(FisquaOutbox, row_id)
+        if candidate is not None and candidate.state in ("ready", "failed"):
+            row = candidate
+            break
+        db.rollback()
+    if row is None or stopping():
+        db.rollback()
+        return False
+    if not call_budget.take():
+        db.rollback()
+        return False
+
+    manifest_id, volume_id = row.manifest_id, row.collection_id
+    logger.info("Fisqua version stop retest: sending manifest %s of volume %s", manifest_id, volume_id)
+    _note_retest(fingerprint, now, row.id)
+    _send(db, row, transport, clock, result)
+    state, problems = (db.query(FisquaOutbox.state, FisquaOutbox.problems)
+                       .filter(FisquaOutbox.id == row.id).one())
+    db.rollback()
+    after = _current_stop()
+    wait = int(_retest_interval().total_seconds())
+
+    if after is not None and after.get("reason") != fc.VERSION_REASON:
+        logger.info("Fisqua version stop retest: manifest %s was answered with a configuration error (%s); "
+                    "that stop replaces the version stop", manifest_id, after.get("reason"))
+        return False
+    if _retest_read(state, problems):
+        return _retest_cleared(fingerprint, manifest_id, state, result)
+    if state == "refused":
+        logger.info("Fisqua version stop retest: manifest %s refused again for version; the stop holds and "
+                    "the next retest is in %s s", manifest_id, wait)
+        return False
+    logger.info("Fisqua version stop retest: sending manifest %s failed; the stop holds and the next retest "
+                "is in %s s", manifest_id, wait)
+    return False
 
 
 def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _Run) -> bool:
@@ -849,12 +1182,21 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                 _end_send(db, row_id, state="failed", next_attempt_at=now,
                           last_error="interrupted while sending")
 
+            # Read the stop first: an update that cleared a version stop
+            # leaves its retest row to be built again.
+            config_error()
+            _rebuild_stale_retest(db)
+
             # Not `stop`: that is the caller's shutdown event, which stopping() reads.
             unit_stop = config_error()
             if unit_stop is not None and unit_stop.get("reason") == fc.VERSION_REASON:
-                # Nothing is built under the software Fisqua could not read.
-                result.status = "config_error"
-                return result.as_dict()
+                # Nothing is built under the software Fisqua could not read,
+                # but the one manifest of a retest, once an interval.
+                if not _retest_version_stop(db, transport, clock, result, stopping):
+                    if result.status != "stopped":
+                        result.status = "config_error"
+                    return result.as_dict()
+                unit_stop = None
             if unit_stop is None:
                 _resend_version_refusals(db)
 
@@ -1229,9 +1571,9 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     `held` and `hold_file` are the offsite upload hold's (app.core.offsite_hold),
     under which nothing is sent or polled. `environment` is `production` or
     `staging`. `config_error` is the
-    unit-level stop (time, HTTP status, reason `token`, `not_found` or
-    `redirect`, configuration fingerprint) while Fisqua refuses this unit's
-    configuration, else None. `outbox` lists the volume's
+    unit-level stop (time, HTTP status, reason `token`, `not_found`,
+    `redirect` or `version`, configuration fingerprint, time of the last
+    retest of a version stop) while it holds, else None. `outbox` lists the volume's
     manifests newest first (at most OUTBOX_LISTED), without the manifest
     itself; `status` is Fisqua's latest word on the volume, or None, with its
     problems whatever the state.

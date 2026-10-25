@@ -19,7 +19,8 @@
   (app.core.fisqua_outbox.config_fingerprint): the backend commit and the
   release, so the stop clears when the installed code changes. With no
   commit readable it carries the time this process started, so the stop
-  clears on every restart rather than never.
+  clears on every restart rather than never. The stop also clears when a
+  periodic retest is accepted by Fisqua.
 
 A tag known only from an object inside a pack file, or from packed-refs
 without the fully-peeled trait, cannot be peeled without reading the pack;
