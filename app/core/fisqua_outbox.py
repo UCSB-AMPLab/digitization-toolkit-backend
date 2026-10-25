@@ -1135,6 +1135,11 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
         if answer.outcome == "config_error":
             record_config_error(answer.status_code, answer.reason, now)
             return False
+        if answer.outcome == "no_decisions":
+            # Status offered a set the read does not show yet. The offer stays
+            # unread, so the volume is polled and the set read again next tick.
+            logger.info("Fisqua has no decisions to give for volume %s yet; read again at the next poll", cid)
+            continue
         if answer.outcome != "decisions":
             logger.warning("Reading Fisqua's decisions for volume %s failed: %s",
                            cid, scrub(answer.error or answer.outcome))

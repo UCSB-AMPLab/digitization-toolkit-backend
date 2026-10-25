@@ -870,3 +870,68 @@ def test_an_unchanged_pair_is_applied(db_session, handed):
     _decide(fake, row, [_approve(a)])
     _poll(db_session, fake)
     assert _refresh(db_session, a).status == "approved"
+
+
+# ---------------------------------------------------------------------------
+# The decisions answer as finalised: integer ids, display names, 404 no-decisions
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [
+    {"problems": [{"rule": "no-decisions", "message": "nothing decided for this reference"}]},
+    {"rule": "no-decisions"},
+])
+def test_404_no_decisions_on_the_read_is_nothing_yet_not_a_stop(client, db_session, handed, body):
+    """A race with the status answer: no stop, nothing applied, read again at the next poll."""
+    from app.core.fisqua_outbox import config_error
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a)])
+    fake.decisions_answer = httpx.Response(404, json=body)
+    result = _poll(db_session, fake)
+    assert result["status"] != "config_error"
+    assert config_error() is None
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col) is None or _decisions_state(client, vol.col)["decisions_id"] is None
+
+    fake.decisions_answer = None
+    _poll(db_session, fake)
+    assert len(fake.decision_calls()) == 2
+    assert _refresh(db_session, a).status == "approved"
+
+
+@pytest.mark.unit
+def test_404_with_another_rule_on_the_read_still_stops_the_unit(db_session, handed):
+    from app.core.fisqua_outbox import config_error
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a)])
+    fake.decisions_answer = httpx.Response(404, json={"problems": [{"rule": "not-found"}]})
+    assert _poll(db_session, fake)["status"] == "config_error"
+    assert config_error()["status_code"] == 404
+
+
+@pytest.mark.unit
+def test_404_no_decisions_on_a_manifest_post_is_still_a_configuration_error(db_session, fisqua):
+    from app.core.fisqua_http import read_send_answer
+    answer = read_send_answer(httpx.Response(404, json={"problems": [{"rule": "no-decisions"}]}))
+    assert answer.outcome == "config_error"
+
+
+@pytest.mark.unit
+def test_an_integer_record_id_is_matched(db_session, handed):
+    vol, (a, b), row, fake = handed
+    decision = _approve(a)
+    assert isinstance(decision["captuaRecordId"], int)
+    _decide(fake, row, [decision])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"
+
+
+@pytest.mark.unit
+def test_the_default_reviewer_name_is_kept_as_given(db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_reject(a, decidedBy="Fisqua reviewer")])
+    _poll(db_session, fake)
+    [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
+    assert rej.rejected_by == "Fisqua: Fisqua reviewer"
+    assert _history(db_session, a)[-1][2] == "Fisqua: Fisqua reviewer"
