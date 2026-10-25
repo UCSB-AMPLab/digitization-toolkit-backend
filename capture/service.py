@@ -263,6 +263,34 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
             f"Could not set EXIF orientation on {file_path.name}: {type(e).__name__}: {e}")
 
 
+def _capture_paths(actual_path) -> list[Path]:
+    """Every file a backend reports for one capture, as Paths.
+
+    A multi-format capture (Picamera2Backend with raw) reports a
+    (jpeg_path, raw_path) tuple; each element is a file, and the tuple's
+    string form names none.
+    """
+    if isinstance(actual_path, (tuple, list)):
+        return [Path(str(p)) for p in actual_path]
+    return [Path(str(actual_path))]
+
+
+def _rotate_capture_files(paths: list[Path], rotate_deg: int) -> None:
+    """Record rotate_deg on every JPEG of a capture.
+
+    Each JPEG master gets the tag, and so does the `_preview.jpg` extracted
+    from a RAW master. The RAW master itself is passed to _apply_rotation
+    too, which leaves it as the camera wrote it.
+    """
+    if not rotate_deg:
+        return
+    for p in paths:
+        _apply_rotation(p, rotate_deg)
+        preview = preview_sidecar_of(p)
+        if is_raw_suffix(p) and preview.exists():
+            _apply_rotation(preview, rotate_deg)
+
+
 def image_filename(
     camera_index: int,
     index: str,
@@ -363,14 +391,7 @@ def capture_image(
         actual_path, metadata = result, None
 
     # Apply clockwise rotation if requested (e.g. for portrait manuscripts)
-    rotate_deg = getattr(camera_config, "rotate_deg", 0)
-    if rotate_deg:
-        _apply_rotation(Path(str(actual_path)), rotate_deg)
-        # Also rotate the _preview.jpg extracted from a RAW master, if present
-        master = Path(str(actual_path))
-        preview = preview_sidecar_of(master)
-        if is_raw_suffix(master) and preview.exists():
-            _apply_rotation(preview, rotate_deg)
+    _rotate_capture_files(_capture_paths(actual_path), getattr(camera_config, "rotate_deg", 0))
 
     return actual_path, metadata
     
@@ -518,28 +539,10 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
         else:
             actual_path, _metadata = result, None
 
-        # actual_path may be a single path or, for a multi-format capture
-        # (Picamera2Backend returns (jpeg_path, raw_path) for raw captures),
-        # a tuple/list of paths - never stringify the tuple
-        # itself, or _apply_rotation gets handed a nonexistent path built
-        # from Python's tuple repr.
-        paths = (
-            [Path(str(p)) for p in actual_path]
-            if isinstance(actual_path, (tuple, list))
-            else [Path(str(actual_path))]
-        )
-
-        # Apply clockwise rotation if requested - mirrors capture_image's own
-        # rotation block above (including its rotation of a RAW _preview.jpg
-        # sidecar, if one was extracted) - but for every file of a
-        # multi-path capture, not just the first.
-        rotate_deg = getattr(camera_config, "rotate_deg", 0)
-        if rotate_deg:
-            for p in paths:
-                _apply_rotation(p, rotate_deg)
-                preview = preview_sidecar_of(p)
-                if is_raw_suffix(p) and preview.exists():
-                    _apply_rotation(preview, rotate_deg)
+        # The same rotation capture_image applies, so the test still shows
+        # the page the way a real capture would store it.
+        paths = _capture_paths(actual_path)
+        _rotate_capture_files(paths, getattr(camera_config, "rotate_deg", 0))
 
         # Pick the bytes to return.
         if isinstance(actual_path, (tuple, list)):
