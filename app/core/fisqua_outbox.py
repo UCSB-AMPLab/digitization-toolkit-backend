@@ -568,7 +568,7 @@ def _log_object_missing(db: Session, row, problems: Any) -> None:
     missing = [p for p in problems or [] if isinstance(p, dict) and p.get(fc.F_RULE) == fc.RULE_OBJECT_MISSING]
     if not missing:
         return
-    keys = [str(p.get(fc.F_KEY)) for p in missing]
+    keys = [f"{p.get(fc.F_OBJECT_KEY)} ({p.get(fc.F_KIND)})" for p in missing]
     logger.error("Fisqua found %s object(s) of manifest %s missing from the masters bucket, which this unit "
                  "had verified: %s", len(missing), row.manifest_id, ", ".join(keys))
     audit.log_event(db, level="ERR", category="system", action=OBJECT_MISSING_ACTION, subject=row.stem,

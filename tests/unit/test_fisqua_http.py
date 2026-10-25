@@ -603,8 +603,9 @@ def test_object_missing_is_refused_and_logged_as_an_incident(db_session, queued,
     assert fc.RULE_OBJECT_MISSING == "object-missing"
     keys = [f"{queued.stem}/captures/{queued.stem}-img_0001_c0.jpg",
             f"{queued.stem}/captures/{queued.stem}-img_0001_c1.jpg"]
-    problems = [{"rule": "object-missing", "message": "not in the masters bucket", "key": k,
-                 "captureId": "c-1", "role": role} for k, role in zip(keys, ("left", "right"))]
+    problems = [{"rule": "object-missing", "message": "not in the masters bucket", "objectKey": k,
+                 "captureId": "c-1", "role": role, "kind": kind}
+                for k, role, kind in zip(keys, ("left", "right"), ("capture", "preview"))]
     caplog.set_level(logging.DEBUG)
     _send(db_session, Server(httpx.Response(422, json={"problems": problems})))
     row = _rows(db_session, queued.col)[0]
@@ -612,7 +613,8 @@ def test_object_missing_is_refused_and_logged_as_an_incident(db_session, queued,
     [entry] = db_session.query(SystemLog).filter(SystemLog.action == "fisqua_object_missing").all()
     assert entry.level == "ERR" and entry.category == "system"
     assert entry.subject == queued.stem
-    assert "2" in entry.detail and all(k in entry.detail for k in keys)
+    assert "missing=2" in entry.detail
+    assert f"{keys[0]} (capture)" in entry.detail and f"{keys[1]} (preview)" in entry.detail
     assert TOKEN not in entry.detail and TOKEN not in caplog.text
 
 
