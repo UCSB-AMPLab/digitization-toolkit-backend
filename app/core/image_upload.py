@@ -1545,10 +1545,20 @@ class ImageUploadScheduler:
     is created and removed without a restart. stop() is checked between
     objects; an upload in progress when the process exits is finished by
     nobody, and the next run's listing decides what it left.
+
+    wake() starts a run now instead of at the end of the wait: a handover
+    calls it, so a volume handed over is uploaded, verified and sent to
+    Fisqua (the tick's send pass) without waiting out the interval. The loop
+    waits on one Event that wake() and stop() both set, and clears it before
+    each run, so a wake during a run queues one more run, however many wakes
+    come, and no second run ever starts beside the first. The hold, the
+    Fisqua call budget and its cooldowns apply to a woken run as to any.
     """
 
     def __init__(self) -> None:
         self._stop = threading.Event()
+        # Set by wake() and by stop(): ends the loop's wait early.
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[dict] = None
         self.last_fisqua_result: Optional[dict] = None
@@ -1561,12 +1571,14 @@ class ImageUploadScheduler:
         if self._thread is not None and self._thread.is_alive():
             return True
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, name="image-upload", daemon=True)
         self._thread.start()
         return True
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        self._wake.set()
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
@@ -1574,12 +1586,26 @@ class ImageUploadScheduler:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def wake(self) -> None:
+        """Start a run now rather than at the end of the wait; one more after a run in progress.
+
+        Does nothing when no schedule is running (offsite not configured).
+        """
+        if self.is_running():
+            self._wake.set()
+
+    def _wait(self, seconds: float) -> bool:
+        """Wait `seconds` or until woken; clear the wake. True when stopping."""
+        self._wake.wait(seconds)
+        self._wake.clear()
+        return self._stop.is_set()
+
     def _loop(self) -> None:
-        if self._stop.wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
+        if self._wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
             return
         while True:
             self.tick()
-            if self._stop.wait(config.settings.OFFSITE_BACKUP_INTERVAL_SECONDS):
+            if self._wait(config.settings.OFFSITE_BACKUP_INTERVAL_SECONDS):
                 return
 
     def tick(self) -> Optional[dict]:

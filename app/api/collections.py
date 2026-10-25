@@ -947,6 +947,11 @@ def promote_collection(
     from app.core.fisqua_outbox import enqueue_handover
     enqueue_handover(db, collection)
     db.commit()
+    # After the commit, so the woken worker sees the queued manifest: the
+    # volume is uploaded, verified and sent now rather than at the next
+    # interval. A no-op when offsite upload is not configured.
+    from app.core.image_upload import image_upload_scheduler
+    image_upload_scheduler.wake()
 
     log_event(db, level="INFO", category="activity", action="collection_promoted",
               actor=current_user.username, subject=collection.name,
