@@ -170,6 +170,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     from app.core.image_upload import ImageUploadMisconfigured, configured_tenant
     from app.core.integrity import build_fixity_index
     from app.core.storage_ops import resolve_project
+    from app.core.version import system_version
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record
 
@@ -286,7 +287,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         "id": str(new_id()),
         "generatedAt": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generatedBy": {"system": "captua", "instance": tenant,
-                        "systemVersion": config.settings.app_version},
+                        "systemVersion": system_version()},
         # The unit does not record which digitisation list a volume came
         # from, so there is no list id to reply to.
         "inReplyTo": None,

@@ -1,6 +1,7 @@
 from pydantic_settings import BaseSettings, SettingsConfigDict
 from pydantic import Field, SecretStr
 from pathlib import Path
+from typing import Optional
 
 class Settings(BaseSettings):
     # Deployment environment
@@ -101,7 +102,9 @@ class Settings(BaseSettings):
     # Read and write timeout of each call; connecting has ten seconds.
     FISQUA_TIMEOUT_SECONDS: float = Field(default=60.0, validation_alias="DTK_FISQUA_TIMEOUT")
 
-    app_version: str = "0.0.0-dev"
+    # APP_VERSION: overrides the release read from the superproject's VERSION
+    # file (app.core.version). Unset on a unit; the file is the source.
+    app_version: Optional[str] = None
 
     model_config = SettingsConfigDict(
         # Two files, and the LATER one wins on a conflict. Verified on the pinned

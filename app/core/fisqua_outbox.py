@@ -196,15 +196,19 @@ def base_url() -> Optional[str]:
 
 
 def config_fingerprint() -> str:
-    """8 hex digits of the sha256 of (environment, base URL, token, software version).
+    """8 hex digits of the sha256 of (environment, base URL, token, installed code).
 
     Enough to tell two configurations apart. The base URL is the one calls
     go to, so a change of DTK_FISQUA_BASE_URL or of the tenant changes it
-    too; the software version (settings.app_version) is there so that an
-    update clears a stop for a manifest Fisqua could not read (reason
-    `version`). Neither the token nor a full hash of it is kept anywhere.
+    too. The installed code is app.core.version.code_identity (the backend
+    commit and the release, or the process start when no commit can be
+    read), so that an update, or failing that a restart, clears a stop for
+    a manifest Fisqua could not read (reason `version`). Neither the token
+    nor a full hash of it is kept anywhere.
     """
-    parts = [fisqua_environment() or "", base_url() or "", _token(), config.settings.app_version]
+    from app.core import version
+
+    parts = [fisqua_environment() or "", base_url() or "", _token(), version.code_identity()]
     return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:8]
 
 

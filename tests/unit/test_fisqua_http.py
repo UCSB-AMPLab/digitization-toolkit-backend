@@ -818,7 +818,7 @@ def test_a_software_update_clears_the_stop_and_resends_under_a_new_id(
     assert [r.state for r in rows] == ["refused", "delivered"]
     assert rows[1].manifest_id != refused.manifest_id
     assert json.loads(server.requests[0].content)["id"] == rows[1].manifest_id
-    assert json.loads(server.requests[0].content)["generatedBy"]["systemVersion"] == "0.1.1"
+    assert json.loads(server.requests[0].content)["generatedBy"]["systemVersion"].startswith("0.1.1")
     # Once only: the refused row is no longer the volume's newest.
     _send(db_session, Server(_ok()))
     assert len(_rows(db_session, queued.col)) == 2
