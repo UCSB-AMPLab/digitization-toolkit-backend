@@ -35,7 +35,18 @@ def fisqua(monkeypatch, tenant, tmp_path):
     monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "b2unit:bucket")
     # The unit-level auth error is a file in the data directory.
     monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    # The call budget is process-wide; each test starts with a full one.
+    from app.core import fisqua_outbox
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget())
     return ENV
+
+
+class FakeClock:
+    def __init__(self, t=1000.0):
+        self.t = t
+
+    def __call__(self):
+        return self.t
 
 
 class FakeTransport:
@@ -611,9 +622,15 @@ def test_at_most_60_manifests_are_sent_per_pass(client, db_session, override_pro
         db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=str(uuid.uuid4()), stem=v.stem,
                                     state="ready", attempts=0, manifest={"id": "m"}, created_at=_now()))
     db_session.commit()
+    from app.core import fisqua_outbox
+    clock = FakeClock()
+    fisqua_outbox.call_budget = fisqua_outbox.CallBudget(clock=clock)
     transport = FakeTransport(sends=[_delivered() for _ in range(70)])
     _run(db_session, transport)
     assert len(transport.sent) == 60
+    _run(db_session, transport)  # the same minute: nothing
+    assert len(transport.sent) == 60
+    clock.t += 61
     _run(db_session, transport)
     assert len(transport.sent) == 70
     db_session.expire_all()
@@ -1212,3 +1229,79 @@ def test_a_take_back_marks_a_sending_row_for_cancellation(client, db_session, vo
     _take_back(client, vol.col)
     row = _rows(db_session, vol.col)[0]
     assert (row.state, row.cancel_requested) == ("sending", "withdrawn")
+
+
+
+# ---------------------------------------------------------------------------
+# One budget of calls a minute for every Fisqua request
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_call_budget_is_a_sliding_window():
+    from app.core.fisqua_outbox import CallBudget
+    clock = FakeClock()
+    budget = CallBudget(limit=3, window=60.0, clock=clock)
+    assert [budget.take() for _ in range(4)] == [True, True, True, False]
+    clock.t += 30
+    assert budget.take() is False
+    clock.t += 30.01  # the first three leave the window
+    assert [budget.take() for _ in range(4)] == [True, True, True, False]
+
+
+@pytest.mark.unit
+def test_the_call_budget_is_thread_safe():
+    import threading
+
+    from app.core.fisqua_outbox import CallBudget
+    budget = CallBudget(limit=60, clock=FakeClock())
+    taken = []
+    lock = threading.Lock()
+
+    def worker():
+        for _ in range(50):
+            if budget.take():
+                with lock:
+                    taken.append(1)
+    threads = [threading.Thread(target=worker) for _ in range(8)]
+    for t in threads:
+        t.start()
+    for t in threads:
+        t.join()
+    assert len(taken) == 60
+
+
+@pytest.mark.unit
+def test_sixty_sends_leave_no_call_for_a_poll_in_the_same_minute(client, db_session, override_projects_root, fisqua):
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    clock = FakeClock()
+    fisqua_outbox.call_budget = fisqua_outbox.CallBudget(clock=clock)
+    vols = [Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}") for n in range(1, 61)]
+    for v in vols:
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=str(uuid.uuid4()), stem=v.stem,
+                                    state="ready", attempts=0, manifest={"id": "m"}, created_at=_now()))
+    db_session.commit()
+    transport = FakeTransport(sends=[_delivered() for _ in range(60)], statuses=[_status(), _status()])
+    _run(db_session, transport)
+    assert len(transport.sent) == 60
+    result = _poll(db_session, transport)
+    assert transport.polled == [] and result["status"] == "rate_limited"
+    clock.t += 61
+    result = _poll(db_session, transport)
+    assert len(transport.polled) == 1 and result["calls"] == 1
+
+
+@pytest.mark.unit
+def test_a_pass_that_runs_out_of_budget_leaves_the_rest_ready(client, db_session, vol, fisqua):
+    from app.core import fisqua_outbox
+    clock = FakeClock()
+    fisqua_outbox.call_budget = fisqua_outbox.CallBudget(limit=0, clock=clock)
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    transport = FakeTransport(sends=[_delivered()])
+    result = _run(db_session, transport)
+    assert transport.sent == [] and result["status"] == "rate_limited"
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "ready" and row.attempts == 0

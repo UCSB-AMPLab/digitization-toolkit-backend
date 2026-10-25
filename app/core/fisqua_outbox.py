@@ -76,7 +76,9 @@ import json
 import logging
 import os
 import threading
+import time
 import uuid
+from collections import deque
 from dataclasses import dataclass
 from datetime import datetime, timedelta, timezone
 from typing import Any, Callable, Optional, Protocol
@@ -353,6 +355,39 @@ def config_error() -> Optional[dict]:
 
 # Serialises the send step (the upload thread) and the status poll (its own thread).
 _step_lock = threading.Lock()
+
+
+class CallBudget:
+    """The contract's calls a minute (fisqua_contract.CALLS_PER_MINUTE), shared by every request to Fisqua.
+
+    A sliding window: a call may be made when fewer than `limit` were made
+    in the last `window` seconds. One per process, taken by each manifest
+    POST, status GET and decisions GET before it is made; a pass that finds
+    it spent stops, and its remaining work waits for the next pass.
+    Thread-safe: the send step and the poll run in different threads.
+    """
+
+    def __init__(self, limit: int = fc.CALLS_PER_MINUTE, window: float = 60.0,
+                 clock: Callable[[], float] = time.monotonic):
+        self._limit = limit
+        self._window = window
+        self._clock = clock
+        self._calls: deque = deque()
+        self._lock = threading.Lock()
+
+    def take(self) -> bool:
+        """Count one call and return True, or return False when the window is full."""
+        with self._lock:
+            now = self._clock()
+            while self._calls and self._calls[0] <= now - self._window:
+                self._calls.popleft()
+            if len(self._calls) >= self._limit:
+                return False
+            self._calls.append(now)
+            return True
+
+
+call_budget = CallBudget()
 
 
 # ---------------------------------------------------------------------------
@@ -638,7 +673,8 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                       clock: Optional[Callable[[], datetime]] = None) -> dict:
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
-    Statuses: "disabled" (Fisqua not configured), "held" (the offsite upload
+    Statuses: "rate_limited" (the shared call_budget was spent: the rest is
+    sent at a later pass), "disabled" (Fisqua not configured), "held" (the offsite upload
     hold exists, app.core.offsite_hold: nothing is promoted or sent, and no
     call is made), "no_transport" (rows are promoted, nothing is sent), "config_error" (Fisqua refused the
     configuration: rows are promoted, nothing is sent until it changes), "done",
@@ -698,6 +734,9 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             for row in due:
                 if stopping():
                     return result.as_dict()
+                if not call_budget.take():
+                    result.status = "rate_limited"
+                    break
                 if not _send(db, row, transport, clock, result):
                     break
         except Exception:
@@ -799,6 +838,9 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             offered = {}
             for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
                 chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
+                if not call_budget.take():
+                    result["status"] = "rate_limited"
+                    break
                 result["calls"] += 1
                 try:
                     answer = transport.get_status(chunk)
@@ -864,23 +906,22 @@ def _keep_offered(db: Session, collection_id: int, decisions_id: str) -> None:
 def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, result: dict) -> bool:
     """Read and apply each offered decisions set not applied or seen stale already (§9.5).
 
-    At most the contract's calls a minute, less the status calls this tick
-    made; the rest are read at the next tick. False when Fisqua refused the
-    unit's configuration, and the poll is to stop.
+    Each read takes a call from the shared call_budget; when it is spent,
+    the rest are read at a later tick. False when Fisqua refused the unit's
+    configuration, and the poll is to stop.
     """
     from app.core.fisqua_decisions import apply_decisions
     from app.models.fisqua import FisquaStatus
 
-    budget = max(0, fc.CALLS_PER_MINUTE - result["calls"])
     for cid, (ref, decisions_id) in sorted(offered.items()):
         status = db.get(FisquaStatus, cid)
         seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
         db.rollback()
         if decisions_id in seen:
             continue
-        if budget <= 0:
+        if not call_budget.take():
+            result["status"] = "rate_limited"
             break
-        budget -= 1
         result["decisions_fetched"] += 1
         try:
             answer = transport.get_decisions(ref)
