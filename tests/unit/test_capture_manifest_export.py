@@ -306,7 +306,12 @@ def test_a_volume_with_no_recorded_reference_code_travels_with_its_stem(client, 
 
 @pytest.mark.unit
 def test_a_recorded_reference_code_travels_as_it_is(client, db_session, override_projects_root, tenant):
-    v = Volume(db_session, override_projects_root, external_id="xx-other-009")
+    """The model refuses a code other than the stem now (backend #140); a row from before still travels as recorded."""
+    import sqlalchemy as sa
+    v = Volume(db_session, override_projects_root, external_id=None)
+    db_session.execute(sa.text("UPDATE collections SET external_id = 'xx-other-009' WHERE id = :id"), {"id": v.col.id})
+    db_session.commit()
+    db_session.expire_all()
     v.record()
     resp = _export(client, v.col)
     assert resp.status_code == 200, resp.text

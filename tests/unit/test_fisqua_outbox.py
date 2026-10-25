@@ -43,6 +43,16 @@ def fisqua(monkeypatch, tenant, tmp_path):
     return ENV
 
 
+def _reference_before_the_rule(db, col, value):
+    """A reference code written around the stem rule (raw SQL), as a row from before it was."""
+    import sqlalchemy as sa
+    # The test client shares this session: drop what a refused request left in it.
+    db.rollback()
+    db.execute(sa.text("UPDATE collections SET external_id = :v WHERE id = :id"), {"v": value, "id": col.id})
+    db.commit()
+    db.expire_all()
+
+
 class FakeClock:
     def __init__(self, t=1000.0):
         self.t = t
@@ -278,8 +288,13 @@ def test_a_volume_with_neither_stem_nor_reference_code_is_refused_for_its_stem(c
 @pytest.mark.unit
 def test_a_volume_whose_reference_code_differs_from_its_stem_is_refused_at_handover(
         client, db_session, override_projects_root, fisqua):
-    """Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code, unchanged."""
-    v = Volume(db_session, override_projects_root, stem="xx-test-001", external_id="xx-other-009")
+    """Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code, unchanged.
+
+    The model refuses such a pair now (ReferenceCodeDiffersFromStemError);
+    this is a row written before the rule, which the outbox still refuses.
+    """
+    v = Volume(db_session, override_projects_root, stem="xx-test-001", external_id=None)
+    _reference_before_the_rule(db_session, v.col, "xx-other-009")
     v.record(status="captured")
     _handover(client, v.col)
     [row] = _rows(db_session, v.col)
@@ -1325,8 +1340,11 @@ def test_a_reference_code_set_differently_while_uploads_wait_is_refused_at_build
     rec = v.record(status="captured", upload=False)
     _handover(client, v.col)
     assert _rows(db_session, v.col)[0].state == "waiting_for_upload"
+    # The API refuses the change now (backend #140); a row changed around it
+    # is still refused when its manifest is built.
     resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-other-777"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 409, resp.text
+    _reference_before_the_rule(db_session, v.col, "xx-other-777")
     _upload_all(v, rec)
 
     transport = FakeTransport(sends=[_delivered()])

@@ -656,8 +656,12 @@ def test_status_and_decisions_are_asked_for_by_the_reference_sent(client, db_ses
     assert row.state == "delivered"
     assert row.reference_code == v.stem == row.manifest["volumes"][0]["externalId"]
 
+    # The API refuses a reference code other than the stem now (backend #140);
+    # a row given one around it is still asked for under the reference sent.
     resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-other-777"})
-    assert resp.status_code == 200, resp.text
+    assert resp.status_code == 409, resp.text
+    from tests.unit.test_fisqua_outbox import _reference_before_the_rule
+    _reference_before_the_rule(db_session, v.col, "xx-other-777")
 
     fake = Fisqua(v.stem)
     fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}

@@ -460,9 +460,12 @@ def _reference_problem(collection) -> Optional[dict]:
     stem and status is polled by the reference code, so a volume whose
     recorded code differs would be filed under one and asked for by the
     other. With no code recorded the stem is the code; a volume with no stem
-    is refused for that when its manifest is built. Checked at handover and
-    again when the manifest is built, since a first external_id can be set
-    while the uploads are pending.
+    is refused for that when its manifest is built.
+
+    The model now refuses such a pair for every ORM writer
+    (app.models.collection, ReferenceCodeDiffersFromStemError), so the API
+    cannot produce one. This stays, at handover and again when the manifest
+    is built, for rows written before that rule or around it (raw SQL).
     """
     recorded = (collection.external_id or "").strip()
     if collection.filename_stem is not None and recorded and recorded != collection.filename_stem:
