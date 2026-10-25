@@ -30,6 +30,8 @@ The rules:
   /records/{id}, when its keys are under this stem) with its files in a
   project's tree, so each object whose image is in the name-based layout is
   refused again when the work list is read, as `outside_own_folder`.
+* **Not during the upload hold.** While the offsite upload hold file exists
+  (app.core.offsite_hold) a free is refused; the dry run and restore are not.
 * **Under hold_for_file_changes**, so no export or offsite read of the
   volume runs meanwhile. The hold does not exclude another holder. A record
   with a verified offsite row cannot be moved out of the volume
@@ -129,6 +131,10 @@ NOT_IN_OWN_FOLDER_MESSAGE = (
     "time it starts. If they are still not moved after a restart, the backend's log says "
     "why (for example, the folder already holds files that are not this volume's); once "
     "that is cleared and Captua has restarted, the volume can be freed."
+)
+HOLD_MESSAGE = (
+    "Offsite uploads are on hold on this unit while it is being upgraded, so no "
+    "files can be freed from the card. Try again once the upgrade has finished."
 )
 JOB_RUNNING_MESSAGE = (
     "Files of this volume are already being freed or restored. Wait for that to finish."
@@ -654,7 +660,17 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
 
 def _prepare_free(db: Session, collection_id: int):
-    """The checks a free must pass before it starts; returns (collection, hold). The caller releases the hold."""
+    """The checks a free must pass before it starts; returns (collection, hold). The caller releases the hold.
+
+    Refused while the offsite upload hold exists (app.core.offsite_hold): an
+    upgrade's one-time commands may still be completing the volume's offsite
+    rows and freed state. Read when a free starts; a free already running
+    when the file is created runs to its end.
+    """
+    from app.core import offsite_hold
+
+    if offsite_hold.is_held():
+        raise FreeRefused(HOLD_MESSAGE, detail={"hold_file": str(offsite_hold.hold_file())})
     collection = _stem_volume(db, collection_id)
     _require_received(db, collection)
     hold = _Hold(collection_id)

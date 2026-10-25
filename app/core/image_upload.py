@@ -74,7 +74,7 @@ from sqlalchemy import and_, func, or_
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session, aliased
 
-from app.core import config
+from app.core import config, offsite_hold
 from app.core.catalogue_backup import (
     BackupError,
     VerificationUnavailable,
@@ -788,8 +788,10 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
     """One pass over the pending objects. Never raises; the caller gets a status.
 
     Statuses: "disabled" (no remote or no tenant), "misconfigured" (a tenant
-    that is not a prefix), "done", "stopped" (asked to stop between objects),
-    "aborted" (a listing did not answer), "failed" (an upload failed).
+    that is not a prefix), "held" (the hold file exists, app.core.offsite_hold:
+    nothing is listed or uploaded; also the status of a run stopped between
+    objects because the file appeared), "done", "stopped" (asked to stop between
+    objects), "aborted" (a listing did not answer), "failed" (an upload failed).
     """
     result = RunResult()
     if not config.settings.OFFSITE_REMOTE.strip():
@@ -801,11 +803,22 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
         return {"status": "misconfigured", "error": str(exc)}
     if tenant is None:
         return {"status": "disabled"}
+    # Read on every run, so a hold created or removed while the backend runs
+    # takes effect at the next tick.
+    if offsite_hold.held("image upload"):
+        return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
 
     try:
         for item in pending_work(db):
             if stop is not None and stop.is_set():
                 result.status = "stopped"
+                break
+            # Between objects too, so a hold created during a long drain
+            # stops it after the object in progress.
+            if offsite_hold.is_held():
+                result.status = "held"
+                logger.info("offsite uploads are on hold: %s exists; image upload stopped",
+                            offsite_hold.hold_file())
                 break
             try:
                 _process(db, tenant, item, result)
@@ -827,7 +840,7 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
     worked = (result.uploaded or result.already_present or result.unverified
               or result.refused or result.conflicts or result.error)
     if worked:
-        level = "INFO" if result.status in ("done", "stopped") and not result.refused else "WARN"
+        level = "INFO" if result.status in ("done", "stopped", "held") and not result.refused else "WARN"
         _log(db, action=RUN_ACTION, level=level, subject=result.status,
              detail=(f"uploaded={result.uploaded} already_present={result.already_present} "
                      f"unverified={result.unverified} refused={len(result.refused)} "
@@ -1461,9 +1474,9 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
 
 
 def volume_upload_state(db: Session, collection) -> dict:
-    """The received indicator of one volume."""
+    """The received indicator of one volume, with the unit's upload hold (`held`, `hold_file`)."""
     base = {"collection_id": collection.id, "filename_stem": collection.filename_stem,
-            "uploadable": collection.filename_stem is not None}
+            "uploadable": collection.filename_stem is not None, **offsite_hold.hold_state()}
     if collection.filename_stem is None:
         return {**base, "total": 0, "verified": 0, "pending": 0, "refused": 0,
                 "last_verified_at": None, "received": False, "refusals": [],
@@ -1472,7 +1485,7 @@ def volume_upload_state(db: Session, collection) -> dict:
 
 
 def unit_upload_summary(db: Session) -> dict:
-    """Totals over every stemmed volume, for the system panel."""
+    """Totals over every stemmed volume, for the system panel, with the upload hold (`held`, `hold_file`)."""
     try:
         tenant = configured_tenant()
         misconfigured = None
@@ -1494,6 +1507,7 @@ def unit_upload_summary(db: Session) -> dict:
         "freed_bytes": sum(s["freed_bytes"] for s in per_volume.values()),
         "last_verified_at": max(last) if last else None,
         "last_run": image_upload_scheduler.last_result,
+        **offsite_hold.hold_state(),
     }
 
 
@@ -1506,7 +1520,9 @@ class ImageUploadScheduler:
 
     The same single-process assumption as CatalogueBackupScheduler.start, and
     the same delay and interval settings. A run drains every pending object
-    one at a time, then waits for the interval. stop() is checked between
+    one at a time, then waits for the interval. It starts while the upload
+    hold exists, and each run reads the hold (run_image_upload), so the hold
+    is created and removed without a restart. stop() is checked between
     objects; an upload in progress when the process exits is finished by
     nobody, and the next run's listing decides what it left.
     """
