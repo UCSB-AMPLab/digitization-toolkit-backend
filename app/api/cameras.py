@@ -799,7 +799,7 @@ def trigger_capture(
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
-		from capture.camera import CameraConfig, IMG_SIZES
+		from capture.camera import CameraConfig, IMG_SIZES, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
 		from PIL.ExifTags import TAGS
@@ -939,6 +939,7 @@ def trigger_capture(
 			pair_id=pair_id,
 			role="single",
 			uploaded_by=current_user.username,
+			rotate_deg=recorded_rotation(camera_config),
 		)
 		
 		db.add(img)
@@ -1028,7 +1029,7 @@ def trigger_dual_capture(
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
-		from capture.camera import CameraConfig
+		from capture.camera import CameraConfig, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
 		from PIL import Image
 		from PIL.ExifTags import TAGS
@@ -1124,7 +1125,7 @@ def trigger_dual_capture(
 			db.flush()  # Get the ID
 		
 		# Helper to process captured image
-		def create_image_record(file_path_str: str, camera_idx: int, role: str):
+		def create_image_record(file_path_str: str, camera_idx: int, role: str, camera_config):
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
@@ -1178,6 +1179,7 @@ def trigger_dual_capture(
 				sequence=request.sequence,
 				role=role,
 				uploaded_by=current_user.username,
+				rotate_deg=recorded_rotation(camera_config),
 			)
 			
 			db.add(img)
@@ -1206,8 +1208,8 @@ def trigger_dual_capture(
 			return img
 		
 		# Create RecordImages for both captures with the roles computed above
-		img0 = create_image_record(str(path0), 0, role0)
-		img1 = create_image_record(str(path1), 1, role1)
+		img0 = create_image_record(str(path0), 0, role0, cam0_config)
+		img1 = create_image_record(str(path1), 1, role1, cam1_config)
 
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.

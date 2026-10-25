@@ -164,6 +164,22 @@ def test_without_the_lock_a_late_refusal_keeps_the_hash_another_run_is_importing
         return real_pf(db, name, actor, may, notes)
 
     monkeypatch.setattr(li, "_project_for", pf)
+    # A must write the first hash. Started together, B could reach the exclusive create first; A would
+    # then compare against B's hash, write nothing, and be refused with no hash of its own to keep or log.
+    real_check = li._check_hash
+    a_wrote_hash = threading.Event()
+
+    def check(directory, list_id, file_sha256):
+        t = threading.current_thread().name
+        if t == "B":
+            a_wrote_hash.wait(10)
+        try:
+            return real_check(directory, list_id, file_sha256)
+        finally:
+            if t == "A":
+                a_wrote_hash.set()
+
+    monkeypatch.setattr(li, "_check_hash", check)
     sa, sb, sc = _sessions(db_session, 3)
     doc_h1 = _list_with([_item(code="xx-test-001", stem="xx-test-001")])
     doc_h2 = _list_with([_item(code="xx-test-002", stem="xx-test-002")])

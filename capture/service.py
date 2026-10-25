@@ -221,24 +221,27 @@ def is_camera_connected(camera_index: int = 0) -> bool:
 
 
 # EXIF Orientation tag values for clockwise rotations.
-# The image/sensor data is never modified; viewers that honour EXIF display the page upright, so the preservation master keeps full fidelity.
+# The pixel data is never modified; viewers that honour EXIF display the page upright.
 _EXIF_ORIENTATION_FOR_DEG = {
     90: 6,    # 90 deg CW  > EXIF "rotated 90 CW"
     180: 3,   # 180 deg    > EXIF "rotated 180"
     270: 8,   # 270 deg CW > EXIF "rotated 90 CCW"
 }
 
-# Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
-# Tag ID 0x0112 = 274 decimal.
+# The EXIF Orientation tag, 0x0112 = 274 decimal.
 _EXIF_ORIENTATION_TAG = 0x0112
 
 
 def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
-    """Record a clockwise rotation losslessly via the EXIF Orientation tag.
+    """Record a clockwise rotation losslessly in a JPEG's EXIF Orientation tag.
 
-    Applies to JPEG and CR2 masters: the pixel/sensor data is never re-encoded,
-    only the orientation metadata is set, so the preservation master keeps full
-    fidelity. Skips 0 deg and unsupported file types.
+    Applies to a JPEG master and to a RAW master's `_preview.jpg`: the pixel
+    data is never re-encoded, only the orientation tag is set. A RAW master
+    (`.cr2`, `.dng`, `.raw`) is a preservation master and is left as the
+    camera wrote it; piexif can insert only into a JPEG in any case. Its
+    rotation is recorded beside it instead
+    (capture.camera.recorded_rotation). Skips 0 deg
+    and every file that is not a JPEG, silently.
     """
     deg = rotate_deg % 360
     if deg == 0:
@@ -247,7 +250,7 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
     exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
     if exif_val is None:
         return
-    if file_path.suffix.lower() not in (".jpg", ".jpeg", ".cr2"):
+    if file_path.suffix.lower() not in (".jpg", ".jpeg"):
         return
 
     try:
@@ -255,10 +258,12 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
         exif_dict = piexif.load(str(file_path))
         exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
         exif_bytes = piexif.dump(exif_dict)
-        # Durable: write the tag into a temp copy, then atomically replace the master
+        # Durable: write the tag into a temp copy, then atomically replace the file
         atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
     except Exception as e:
-        subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
+        # piexif raises some errors with no message (InvalidImageDataError), so name the type.
+        subprocess_logger.warning(
+            f"Could not set EXIF orientation on {file_path.name}: {type(e).__name__}: {e}")
 
 
 def image_filename(

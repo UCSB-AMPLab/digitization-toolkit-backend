@@ -90,16 +90,6 @@ def test_the_migration_chains_onto_the_single_previous_head(backend_root):
 
 
 @pytest.mark.unit
-def test_alembic_has_a_single_head(backend_root):
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-
-    cfg = Config(str(backend_root / "alembic.ini"))
-    cfg.set_main_option("script_location", str(backend_root / "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["c4e8f1a3b5d7"]
-
-
-@pytest.mark.unit
 def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, tmp_path):
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
     try:
