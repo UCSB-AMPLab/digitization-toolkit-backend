@@ -1755,8 +1755,12 @@ def main(argv: Optional[List[str]] = None) -> int:
     parser.add_argument("--dry-run", action="store_true", help="report what would be done; write nothing")
     args = parser.parse_args(argv)
 
-    from app.core.db import SessionLocal
+    from app.core.db import SessionLocal, init_db
 
+    # Run as `python -m`, nothing has imported app.main, which is what
+    # registers the models for the backend; without them the first query
+    # fails resolving relationship("Project") on Record.
+    init_db()
     db = SessionLocal()
     try:
         report = migrate_volume_layout(db, dry_run=args.dry_run)

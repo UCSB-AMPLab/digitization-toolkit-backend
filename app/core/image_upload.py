@@ -1613,8 +1613,12 @@ def main(argv: Optional[list] = None) -> int:
                                help="write the counter; without it, only report what would be set")
     args = parser.parse_args(argv)
 
-    from app.core.db import SessionLocal
+    from app.core.db import SessionLocal, init_db
 
+    # Run as `python -m`, nothing has imported app.main, which is what
+    # registers the models for the backend; without them the first query
+    # fails resolving relationship("Project") on Record.
+    init_db()
     db = SessionLocal()
     try:
         if args.command == "mark-freed":
