@@ -112,8 +112,9 @@ def read_send_answer(response: httpx.Response, sent_id: Optional[str] = None) ->
                                    error=f"Fisqua answered HTTP {code} without a {fc.F_VOLUME_ID}")
         answered = body.get(fc.F_MANIFEST_ID)
         if sent_id is not None and answered != sent_id:
-            logger.warning("Fisqua answered HTTP %s for manifest %r to the POST of manifest %s; retried",
-                           code, answered, sent_id)
+            # Not the value Fisqua gave: it is unredacted here.
+            logger.warning("Fisqua answered HTTP %s naming another manifest id, or none, to the POST "
+                           "of manifest %s; retried", code, sent_id)
             return TransportResult(outcome="error", response=body, status_code=code,
                                    error=(f"Fisqua answered HTTP {code} with {fc.F_MANIFEST_ID} {answered!r}, "
                                           f"not the {sent_id} sent"))

@@ -509,8 +509,12 @@ def test_the_token_echoed_by_fisqua_never_reaches_rows_logs_or_the_api(client, d
     _send(db_session, server, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
     queued.record(status="captured")
     _handover(client, queued.col)
+    # A 200 naming another manifest, the token as its id: retried, and not logged.
+    _send(db_session, Server(httpx.Response(200, json={"volumeId": "v", "state": "received",
+                                                       "manifestId": f"m-{TOKEN}"})))
     _send(db_session, Server(lambda req: httpx.Response(200, json={
-        "volumeId": f"v-{TOKEN}", "state": TOKEN, "manifestId": json.loads(req.content)["id"], **echo})))
+        "volumeId": f"v-{TOKEN}", "state": TOKEN, "manifestId": json.loads(req.content)["id"], **echo})),
+          now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=3))
     mid = _rows(db_session, queued.col)[-1].manifest_id
     _poll(db_session, Server(httpx.Response(200, json=[{"ref": queued.col.external_id, "manifestId": mid,
                                                         "state": f"s {TOKEN}", "problems": [{"m": TOKEN}]}])))
@@ -623,3 +627,85 @@ def test_another_422_is_not_logged_as_object_missing(db_session, queued):
     from app.models.system_log import SystemLog
     _send(db_session, Server(httpx.Response(422, json={"problems": [{"rule": "reference-code", "message": "x"}]})))
     assert db_session.query(SystemLog).filter(SystemLog.action == "fisqua_object_missing").count() == 0
+
+
+
+# ---------------------------------------------------------------------------
+# Retry-After on status and decisions answers
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code", [429, 503])
+def test_retry_after_on_a_status_answer_stops_the_pass_and_cools_the_poll(
+        db_session, override_projects_root, fisqua, monkeypatch, code):
+    import uuid as _uuid
+
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    from tests.unit.test_capture_manifest_export import Volume
+    from tests.unit.test_fisqua_outbox import FakeClock
+    clock = FakeClock()
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(clock=clock))
+    vols = [Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}") for n in range(1, 151)]
+    for v in vols:
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=str(_uuid.uuid4()), stem=v.stem,
+                                    state="delivered", attempts=1, delivered_at=_now(), created_at=_now()))
+    db_session.commit()
+    server = Server(httpx.Response(code, headers={"Retry-After": "120"}), httpx.Response(200, json={"volumes": []}))
+    result = _poll(db_session, server)
+    assert len(server.requests) == 1  # the second batch is not asked for
+    assert result["status"] == "cooling_down"
+
+    server = Server(httpx.Response(200, json={"volumes": []}), httpx.Response(200, json={"volumes": []}))
+    clock.t += 119
+    assert _poll(db_session, server)["status"] == "cooling_down"
+    assert server.requests == []
+    clock.t += 2
+    assert _poll(db_session, server)["calls"] == 2
+
+
+@pytest.mark.unit
+def test_a_status_error_without_retry_after_does_not_cool_the_poll(db_session, queued):
+    _send(db_session, Server(_ok()))
+    _poll(db_session, Server(httpx.Response(503)))
+    server = Server(httpx.Response(200, json={"volumes": []}))
+    _poll(db_session, server)
+    assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+def test_retry_after_on_a_decisions_answer_cools_the_poll(db_session, queued, monkeypatch):
+    from app.core import fisqua_outbox
+    from tests.unit.test_fisqua_outbox import FakeClock
+    clock = FakeClock()
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(clock=clock))
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, queued.col)[0]
+    entry = {"volumes": [{"ref": queued.stem, "manifestId": row.manifest_id, "state": "review_pending",
+                          "decisionsId": "d-1", "problems": []}]}
+    server = Server(httpx.Response(200, json=entry), httpx.Response(429, headers={"Retry-After": "300"}))
+    assert _poll(db_session, server)["status"] == "cooling_down"
+    decisions = {"decisionsId": "d-1", "decidedAt": "2026-10-25T10:00:00Z", "manifestId": row.manifest_id,
+                 "records": []}
+    later = Server(httpx.Response(200, json=entry), httpx.Response(200, json=decisions))
+    clock.t += 200
+    _poll(db_session, later)
+    assert later.requests == []
+    clock.t += 101
+    result = _poll(db_session, later)
+    assert [r.url.path for r in later.requests] == [
+        "/api/capture/v1/volumes/status", f"/api/capture/v1/volumes/{queued.stem}/decisions"]
+    assert result["decisions_applied"] == 1
+
+
+@pytest.mark.unit
+def test_the_cooldown_does_not_hold_back_sends(db_session, queued, monkeypatch):
+    from app.core import fisqua_outbox
+    from tests.unit.test_fisqua_outbox import FakeClock
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(clock=FakeClock()))
+    fisqua_outbox.call_budget.cool_down(600)
+    server = Server(_ok())
+    _send(db_session, server)
+    assert len(server.requests) == 1

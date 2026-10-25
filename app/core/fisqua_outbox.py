@@ -375,6 +375,17 @@ class CallBudget:
         self._calls: deque = deque()
         self._lock = threading.Lock()
 
+    def cool_down(self, seconds: float) -> None:
+        """Hold back polling and decisions requests for `seconds` (Fisqua's Retry-After); a later, longer one wins."""
+        with self._lock:
+            until = self._clock() + max(0.0, float(seconds))
+            self._cool_until = max(getattr(self, "_cool_until", 0.0), until)
+
+    def cooling(self) -> bool:
+        """Whether a Retry-After from a status or decisions answer has not yet passed."""
+        with self._lock:
+            return self._clock() < getattr(self, "_cool_until", float("-inf"))
+
     def take(self) -> bool:
         """Count one call and return True, or return False when the window is full."""
         with self._lock:
@@ -830,6 +841,10 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
         try:
             if config_error() is not None:
                 return {**result, "status": "config_error"}
+            # Fisqua asked the unit to wait (Retry-After on a status or
+            # decisions answer); sends keep their own per-row backoff.
+            if call_budget.cooling():
+                return {**result, "status": "cooling_down"}
             wanted = volumes_to_poll(db)
             db.rollback()
             refs = sorted(wanted)
@@ -853,6 +868,9 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                 if answer.outcome != "status":
                     logger.warning("Asking Fisqua for the status of %s volume(s) failed: %s",
                                    len(chunk), scrub(answer.error or answer.outcome))
+                    if answer.retry_after is not None:
+                        call_budget.cool_down(answer.retry_after)
+                        return {**result, "status": "cooling_down"}
                     result["status"] = "error"
                     continue
                 for entry in answer.volumes or []:
@@ -934,6 +952,10 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
         if answer.outcome != "decisions":
             logger.warning("Reading Fisqua's decisions for volume %s failed: %s",
                            cid, scrub(answer.error or answer.outcome))
+            if answer.retry_after is not None:
+                call_budget.cool_down(answer.retry_after)
+                result["status"] = "cooling_down"
+                break
             result["status"] = "error"
             continue
         applied = apply_decisions(db, cid, answer.response, now)
