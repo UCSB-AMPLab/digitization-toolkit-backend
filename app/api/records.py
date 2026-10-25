@@ -1286,6 +1286,8 @@ def reject_record(
 ):
 	"""
 	Reject a record's current capture with a mandatory predefined reason.
+	The comment is optional, except for the reason 'other', which is refused
+	with 422 unless the comment says what is wrong.
 
 	Flags every current image as part of this rejection's audit trail (for a
 	dual-mode record that's both L and R — a dual-camera pair can only ever be

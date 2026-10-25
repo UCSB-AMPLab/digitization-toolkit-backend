@@ -61,12 +61,21 @@ STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
 	("rejected", "captured"): {"operator", "admin"},
 }
 
-# The predefined rejection reasons, mirroring the list the annotation
-# feature's "Marcar error" already uses client-side
-# (LeftSidebar.svelte ERROR_TYPES) — this is the first place either list is
-# enforced server-side.
-PREDEFINED_REJECTION_REASONS = ("blur", "glare", "shadow", "focus", "exposure", "dirt")
-PredefinedRejectionReason = Literal["blur", "glare", "shadow", "focus", "exposure", "dirt"]
+# The predefined rejection reasons. The first six mirror the list the
+# annotation feature's "Marcar error" uses client-side; the last three were
+# added later: framing (a page cut off or badly framed), obstruction (a
+# finger, weight or object in the shot) and other (anything else, which
+# must be described in the comment — see RecordRejectRequest). The table
+# holds the same list in check_record_rejection_reason; change both together,
+# with a migration.
+PREDEFINED_REJECTION_REASONS = (
+	"blur", "glare", "shadow", "focus", "exposure", "dirt",
+	"framing", "obstruction", "other",
+)
+PredefinedRejectionReason = Literal[
+	"blur", "glare", "shadow", "focus", "exposure", "dirt",
+	"framing", "obstruction", "other",
+]
 
 # Which camera setup produced a document: one image, or an L+R pair fired
 # together on a single shutter press. Set once at capture time.
@@ -273,6 +282,14 @@ class BulkStatusUpdate(BaseModel):
 class RecordRejectRequest(BaseModel):
 	predefined_reason: PredefinedRejectionReason
 	comment: Optional[str] = None
+
+	@model_validator(mode="after")
+	def _other_needs_a_comment(self) -> "RecordRejectRequest":
+		# 'other' names no defect, so the comment is the only record of what
+		# was wrong. The other reasons keep the comment optional.
+		if self.predefined_reason == "other" and not (self.comment or "").strip():
+			raise ValueError("A rejection with reason 'other' needs a comment saying what is wrong.")
+		return self
 
 
 class RecordRejectionRead(BaseModel):

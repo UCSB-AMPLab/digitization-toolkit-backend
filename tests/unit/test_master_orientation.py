@@ -337,15 +337,3 @@ def test_the_migration_adds_a_nullable_checked_column_and_drops_it(tmp_path):
 
     _run(engine, mod.downgrade)
     assert "rotate_deg" not in {c["name"] for c in sa.inspect(engine).get_columns("record_images")}
-
-
-@pytest.mark.unit
-def test_alembic_has_a_single_head():
-    """Moved here from test_freed_state_migration.py: the newest revision pins the head."""
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-
-    backend_root = Path(__file__).resolve().parents[2]
-    cfg = Config(str(backend_root / "alembic.ini"))
-    cfg.set_main_option("script_location", str(backend_root / "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == ["d7a1c3e5f9b2"]

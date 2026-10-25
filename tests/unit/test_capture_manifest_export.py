@@ -394,6 +394,20 @@ def test_records_in_sequence_order_with_every_status(client, vol):
 
 
 @pytest.mark.unit
+def test_the_new_reasons_travel_as_the_old_ones_do(client, vol):
+    vol.record(status="approved", sequence=1)  # Fisqua needs one page to register
+    vol.record(status="rejected", sequence=5, rejection=("framing", None))
+    vol.record(status="rejected", sequence=2, rejection=("obstruction", "  "))
+    vol.record(status="rejected", sequence=3, rejection=("obstruction", "weight on the gutter"))
+    vol.record(status="rejected", sequence=4, rejection=("other", "folio out of order"))
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    records = resp.json()["volumes"][0]["records"]
+    assert [r["rejectionNote"] for r in records] == [
+        None, "obstruction", "weight on the gutter", "folio out of order", "framing"]
+
+
+@pytest.mark.unit
 def test_a_rejected_record_whose_images_were_all_superseded_travels_with_none(client, vol):
     vol.record()
     rej = vol.record(status="rejected", rejection=("blur", None))
