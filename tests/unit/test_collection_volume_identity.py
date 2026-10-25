@@ -11,6 +11,8 @@ rely on, and the rules that keep it stable:
 - `filename_stem` can be set and changed until the volume holds its first
   image, superseded images included; a NULL stem may be set once even after
   that, and a set stem on a volume with images is fixed;
+- when both are set they are the same value (tests in
+  test_reference_code_is_the_stem.py);
 - both are unique, and a duplicate is a 409 through the sanitised
   constraint-violation handler;
 - a stem is a lowercase slug, short enough that `<stem>-img_<nnnn>` fits
@@ -249,17 +251,18 @@ def test_many_volumes_can_have_neither(db_session):
 @pytest.mark.unit
 @pytest.mark.parametrize("field,value,constraint", [
     ("filename_stem", "co-x-002", "collections_filename_stem_key"),
-    ("external_id", "CO.AHRB.2", "ix_collections_external_id"),
+    ("external_id", "co-x-010", "ix_collections_external_id"),
 ])
 def test_a_duplicate_on_post_is_a_sanitised_409(client, db_session, field, value, constraint):
     p = _project(db_session)
     _volume(db_session, p, "a", **{field: value})
     api = _client_as(client)
 
-    # Both cases carry a stem, which create requires; the duplicate field
-    # comes last so that it overrides the stem in the stem case.
+    # Both cases carry a stem, which create requires. In the external_id
+    # case the stem is the same value, since a volume's reference code is
+    # its stem; the existing volume has no stem, so only the code collides.
     resp = api.post("/collections/", json={"name": "b", "project_id": p.id,
-                                           "filename_stem": "co-x-009", field: value})
+                                           "filename_stem": value, field: value})
 
     assert resp.status_code == 409, resp.text
     detail = resp.json()["detail"]
@@ -588,7 +591,7 @@ def test_post_and_get_round_trip_every_new_field(client, db_session):
 
     created = api.post("/collections/", json={
         "name": "Tomo 6", "project_id": p.id, "collection_type": "volume",
-        "filename_stem": "co-ahrb-aht-006", "external_id": "CO.AHRB.AHT.6",
+        "filename_stem": "co-ahrb-aht-006", "external_id": "co-ahrb-aht-006",
         "date": "1750-1760", "date_start": "1750-01-01", "date_end": "1760-12-31",
         "sequence": 6, "custom_attributes": attrs,
     })
@@ -596,7 +599,7 @@ def test_post_and_get_round_trip_every_new_field(client, db_session):
 
     body = api.get(f"/collections/{created.json()['id']}").json()
     assert body["filename_stem"] == "co-ahrb-aht-006"
-    assert body["external_id"] == "CO.AHRB.AHT.6"
+    assert body["external_id"] == "co-ahrb-aht-006"
     assert body["date"] == "1750-1760"
     assert body["date_start"] == "1750-01-01"
     assert body["date_end"] == "1760-12-31"
@@ -1143,9 +1146,11 @@ def test_a_padded_duplicate_external_id_is_a_409(client, db_session):
     api = _client_as(client)
 
     first = api.post("/collections/", json={"name": "A", "project_id": p.id,
-                                            "filename_stem": "co-ahr-a", "external_id": "co-ahr-1"})
-    padded = api.post("/collections/", json={"name": "B", "project_id": p.id,
-                                             "filename_stem": "co-ahr-b", "external_id": "co-ahr-1 "})
+                                            "filename_stem": "co-ahr-1", "external_id": "co-ahr-1"})
+    # A volume without a stem, so that the padded code meets the unique
+    # index rather than the rule that a volume's reference code is its stem.
+    b = _volume(db_session, p, "B")
+    padded = api.patch(f"/collections/{b.id}", json={"external_id": "co-ahr-1 "})
 
     assert first.status_code == 201, first.text
     assert padded.status_code == 409, padded.text

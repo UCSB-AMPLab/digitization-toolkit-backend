@@ -61,6 +61,27 @@ class StemHeldOffsiteError(ValueError):
     """
 
 
+class ReferenceCodeDiffersFromStemError(ValueError):
+    """A volume would have both a reference code and a stem, and they would differ.
+
+    A volume's Fisqua reference code is its file name stem: Fisqua refuses a
+    handover whose code differs from the stem, and external_id is written
+    once, so such a pair could never be sent or repaired. Raised by the
+    before_flush listener _refuse_a_reference_code_that_is_not_the_stem, so
+    every writer meets it; the API answers 409 (app.main).
+    """
+
+    reason = "reference_code_differs_from_stem"
+
+    def __init__(self, external_id: str, filename_stem: str):
+        self.external_id = external_id
+        self.filename_stem = filename_stem
+        super().__init__(
+            f"The reference code {external_id!r} is not the file name stem {filename_stem!r}; "
+            "a volume's reference code is its file name stem."
+        )
+
+
 def offsite_keys_under_stem(session, stem, collection=None) -> bool:
     """Whether any offsite_objects key lies under `<tenant>/<stem>/`, for any tenant.
 
@@ -226,7 +247,8 @@ class Collection(Base):
 
     # external_id: Fisqua's reference code for the item. Unique through one
     # unique index, which is also the lookup the exchange uses. Written once —
-    # see _external_id_is_write_once.
+    # see _external_id_is_write_once. When it and filename_stem are both set
+    # they are the same value — see _refuse_a_reference_code_that_is_not_the_stem.
     external_id = Column(String(255), nullable=True, unique=True, index=True)
 
     # Descriptive fields, mirroring the same columns on records: a free-text
@@ -515,6 +537,32 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
             )
+
+
+@event.listens_for(Session, "before_flush")
+def _refuse_a_reference_code_that_is_not_the_stem(session, flush_context, instances):
+    """Refuse a flush that leaves a volume with an external_id and a stem that differ.
+
+    Covers every writer: the collection routes and the list import. Checked
+    on the values the flush will write rather than in the attribute
+    validators, so that a request setting both at once is judged on the
+    pair, whatever order the attributes are assigned in. Either one NULL is
+    allowed: a volume without a reference code is read as having its stem
+    for one. Only a new volume or a changed stem or external_id is checked,
+    so a row written before this rule is not refused for an unrelated edit.
+    `query().update()` and raw SQL go around it.
+    """
+    for obj in list(session.new) + list(session.dirty):
+        if not isinstance(obj, Collection):
+            continue
+        if obj.filename_stem is None or obj.external_id is None:
+            continue
+        if obj not in session.new:
+            attrs = sa_inspect(obj).attrs
+            if not (attrs.filename_stem.history.has_changes() or attrs.external_id.history.has_changes()):
+                continue
+        if obj.filename_stem != obj.external_id:
+            raise ReferenceCodeDiffersFromStemError(obj.external_id, obj.filename_stem)
 
 
 @event.listens_for(Session, "before_flush")
