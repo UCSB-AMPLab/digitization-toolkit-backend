@@ -194,10 +194,29 @@ def test_400_with_problems_is_refused(db_session, queued):
 
 @pytest.mark.unit
 @pytest.mark.parametrize("body", [{"error": "bad"}, {"problems": []}, None])
-def test_400_without_problems_is_retried(db_session, queued, body):
+def test_400_without_problems_is_refused_with_a_local_problem(db_session, queued, body):
+    """Contract 1.2 §9.2: every 400 is final, with or without problems."""
     answer = httpx.Response(400, json=body) if body is not None else httpx.Response(400)
-    _send(db_session, Server(answer))
-    assert _rows(db_session, queued.col)[0].state == "failed"
+    server = Server(answer)
+    _send(db_session, server)
+    _send(db_session, server, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.refusal == "fisqua"
+    assert [p["rule"] for p in row.problems] == ["bad-request"]
+    assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+def test_a_later_manifest_is_sent_after_a_refusal(client, db_session, queued):
+    """A refused manifest does not hold the volume: a later one, with a new id, is checked afresh."""
+    _send(db_session, Server(httpx.Response(400)))
+    queued.record(status="captured")
+    _handover(client, queued.col)
+    server = Server(_ok())
+    _send(db_session, server)
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "delivered"]
+    assert json.loads(server.requests[0].content)["id"] == rows[1].manifest_id
 
 
 @pytest.mark.unit

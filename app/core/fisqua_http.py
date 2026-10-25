@@ -9,9 +9,11 @@ Answers to POST of a manifest (the codes are in fisqua_contract):
 
     2xx with a volumeId          delivered (Fisqua's state kept)
     401, 403, 404, any 3xx       config_error: the unit stops sending and polling
-    422, 413                     refused, final, with Fisqua's problems
-    400, 409 with problems       refused, final, with Fisqua's problems
-    400, 409 without problems    error, retried
+    400, 413, 422                refused, final, with Fisqua's problems
+                                 (400, 413 without: a local bad-request,
+                                 payload-too-large problem)
+    409 with problems            refused, final, with Fisqua's problems
+    409 without problems         error, retried
     429, 5xx                     error, retried; Retry-After is a floor
     anything else                error, retried
     timeout, connection error    error, retried
@@ -125,6 +127,10 @@ def read_send_answer(response: httpx.Response, sent_id: Optional[str] = None) ->
         return TransportResult(outcome="refused", response=body, status_code=code,
                                problems=_problems(body) or [{fc.F_RULE: fc.RULE_TOO_LARGE,
                                                              "message": "Fisqua refused the manifest as too large."}])
+    if code == 400:
+        return TransportResult(outcome="refused", response=body, status_code=code,
+                               problems=_problems(body) or [{fc.F_RULE: fc.RULE_BAD_REQUEST,
+                                                             "message": "Fisqua refused the manifest as malformed."}])
     if code in fc.REFUSED_ALWAYS:
         return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body))
     if code in fc.REFUSED_WITH_PROBLEMS and _problems(body) is not None:

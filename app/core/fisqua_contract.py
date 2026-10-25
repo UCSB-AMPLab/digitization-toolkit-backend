@@ -54,16 +54,20 @@ F_VOLUMES = "volumes"
 RULE_ID_REUSED = "id-reused"
 RULE_REFERENCE_CODE = "reference-code"  # 422: the manifest's volume has no reference code
 RULE_RUN_STARTED = "run-started"  # 409: a newer manifest for a volume a run has started on
-# Not Fisqua's: the problem the unit records for a 413 with no problems in it.
+# Not Fisqua's: the problems the unit records for a 413 or a 400 with no problems in it.
 RULE_TOO_LARGE = "payload-too-large"
+RULE_BAD_REQUEST = "bad-request"
 
 # How the unit reads an HTTP status from Fisqua (app.core.fisqua_http).
-# Refused, final, for that manifest id.
-REFUSED_ALWAYS = (413, 422)
-# Refused, final, when the body holds a non-empty `problems` array (400: a
-# malformed body; 409: the id reused, or a newer manifest for a volume a run
-# has started on). Without problems: retried.
-REFUSED_WITH_PROBLEMS = (400, 409)
+# Refused, final, for that manifest id, with or without problems (§9.2:
+# 400 is a malformed body).
+REFUSED_ALWAYS = (400, 413, 422)
+# Refused, final, when the body holds a non-empty `problems` array (the id
+# reused, or a newer manifest for a volume a run has started on). Without
+# problems: retried.
+REFUSED_WITH_PROBLEMS = (409,)
+# A refused manifest does not hold the volume: a later one, with a new id,
+# is checked afresh (§9.3).
 # A configuration error: sending and polling stop for the whole unit until
 # the environment, the base URL or the token changes. Fisqua sends no
 # redirect, and following one would carry the token elsewhere, so every 3xx
