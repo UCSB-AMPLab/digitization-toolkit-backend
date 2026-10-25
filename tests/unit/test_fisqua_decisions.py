@@ -745,3 +745,47 @@ def test_a_reserved_call_is_not_taken_by_status(monkeypatch):
     budget = CallBudget(limit=3, clock=FakeClock())
     assert [budget.take(reserve=1) for _ in range(3)] == [True, True, False]
     assert budget.take() is True and budget.take() is False
+
+
+@pytest.mark.unit
+def test_decisions_reads_rotate_so_failing_front_volumes_starve_none(
+        db_session, override_projects_root, fisqua, monkeypatch):
+    import uuid as _uuid
+
+    from app.core import fisqua_contract as fc
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox, FisquaStatus
+    from tests.unit.test_fisqua_outbox import FakeClock
+
+    class FrontFails(ManyVolumes):
+        def __call__(self, request):
+            ref = request.url.path.split("/")[-2]
+            if request.url.path.endswith("/decisions") and ref in ("xx-test-001", "xx-test-002"):
+                self.requests.append(request)
+                return httpx.Response(503)
+            return super().__call__(request)
+
+    clock = FakeClock()
+    # One status call (all five in one batch) and two decisions reads a minute.
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(limit=3, clock=clock))
+    monkeypatch.setattr(fc, "DECISIONS_RESERVED_CALLS", 2)
+    manifests = {}
+    cids = {}
+    for n in range(1, 6):
+        v = Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}")
+        mid = str(_uuid.uuid4())
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=mid, stem=v.stem,
+                                    reference_code=v.stem, state="delivered", attempts=1,
+                                    delivered_at=_now(), created_at=_now()))
+        manifests[v.stem], cids[v.stem] = mid, v.col.id
+    db_session.commit()
+    fake = FrontFails(manifests)
+    for _ in range(4):
+        _poll(db_session, fake)
+        clock.t += 61
+    assert set(fake.decision_refs()) == set(manifests)
+    db_session.expire_all()
+    applied = {ref for ref, cid in cids.items() if db_session.get(FisquaStatus, cid).decisions_id}
+    assert applied == {"xx-test-003", "xx-test-004", "xx-test-005"}

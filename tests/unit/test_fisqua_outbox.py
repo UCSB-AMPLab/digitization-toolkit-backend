@@ -39,6 +39,7 @@ def fisqua(monkeypatch, tenant, tmp_path):
     from app.core import fisqua_outbox
     monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget())
     monkeypatch.setattr(fisqua_outbox, "_status_cursor", None)
+    monkeypatch.setattr(fisqua_outbox, "_decisions_cursor", None)
     return ENV
 
 

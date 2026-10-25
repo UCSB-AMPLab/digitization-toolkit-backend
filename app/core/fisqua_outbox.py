@@ -411,6 +411,10 @@ call_budget = CallBudget()
 # it, so when the budget cannot cover every batch in one tick the later
 # references are asked for at the next tick instead of never.
 _status_cursor: Optional[str] = None
+# The same for decisions reads: the reference of the last set read. A set
+# that keeps waiting (pending_handover) or failing goes behind the others at
+# the next tick instead of taking the decisions calls every tick.
+_decisions_cursor: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -969,13 +973,22 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     """Read and apply each offered decisions set not applied or seen stale already (§9.5).
 
     Each read takes a call from the shared call_budget; when it is spent,
-    the rest are read at a later tick. False when Fisqua refused the unit's
+    the rest are read at a later tick. Reads start after the reference read
+    last (_decisions_cursor), so no volume's set is starved by others that
+    keep waiting or failing. False when Fisqua refused the unit's
     configuration, and the poll is to stop.
     """
+    global _decisions_cursor
+    from bisect import bisect_right
+
     from app.core.fisqua_decisions import apply_decisions
     from app.models.fisqua import FisquaStatus
 
-    for cid, (ref, decisions_id) in sorted(offered.items()):
+    order = sorted(offered.items(), key=lambda item: item[1][0])
+    if _decisions_cursor is not None:
+        at = bisect_right([ref for _cid, (ref, _d) in order], _decisions_cursor)
+        order = order[at:] + order[:at]
+    for cid, (ref, decisions_id) in order:
         status = db.get(FisquaStatus, cid)
         seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
         db.rollback()
@@ -985,6 +998,7 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
             result["status"] = "rate_limited"
             break
         result["decisions_fetched"] += 1
+        _decisions_cursor = ref
         try:
             answer = transport.get_decisions(ref)
         except Exception as exc:
