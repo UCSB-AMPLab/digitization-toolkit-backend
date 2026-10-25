@@ -8,10 +8,12 @@ app.core.fisqua_contract. Here:
 
 * **Enqueue at handover** (enqueue_handover). A handover that promotes at
   least one record adds a `waiting_for_upload` row in the same transaction,
-  with a fresh manifest id, when Fisqua is configured. A volume with no
-  Fisqua reference code (collections.external_id) is never sent: its row is
-  `refused` (`not_exportable`) at once, with the problem `no_reference_code`
-  saying how to add one; the manifest download is not affected. Any older row of the
+  with a fresh manifest id, when Fisqua is configured. A volume's reference
+  code is its recorded external_id, else its stem
+  (capture_manifest.reference_code); a volume whose recorded external_id is
+  not its stem is `refused` (`not_exportable`) at once, with the problem
+  `reference_code_differs` (contract 1.2 §8). A volume with no stem is
+  refused at promotion, for `no_stem`. Any older row of the
   volume not yet sent (`waiting_for_upload`, `ready`, `failed`) becomes
   `superseded`, and a take-back makes those rows `withdrawn`
   (withdraw_unsent), whatever the configuration. A row being sent, or
@@ -40,7 +42,7 @@ app.core.fisqua_contract. Here:
 * **Status poll** (poll_fisqua_status), on its own ten-minute schedule
   (FisquaStatusScheduler). Every volume with a manifest that has reached
   Fisqua, or may have, is asked for by its reference code
-  (collections.external_id, the manifest's `externalId`), in batches of at
+  (the recorded external_id, else the stem: the manifest's `externalId`), in batches of at
   most MAX_REFS_PER_CALL, until Fisqua reports a final state for the
   volume's latest manifest. The answer is kept in fisqua_status. `unknown`
   (Fisqua does not know the volume; usually its manifest was not received)
@@ -85,16 +87,6 @@ UNSENT = ("waiting_for_upload", "ready", "failed")
 
 # The problem recorded for a handover of a volume with no Fisqua reference
 # code (collections.external_id), in the shape of capture_manifest's problems.
-NO_REFERENCE_CODE_PROBLEM = {
-    "rule": "no_reference_code",
-    "message": ("The volume has no Fisqua reference code, so it is not sent to Fisqua. Set the volume's "
-                "reference code (external_id) in its details, then take the handover back and hand the "
-                "volume over again."),
-    "record_ids": [],
-    "image_ids": [],
-}
-
-
 def reference_code_differs_problem(stem: str, reference_code: str) -> dict:
     """The problem for a volume whose reference code is not its file name stem (contract 1.2 §8)."""
     return {
@@ -378,17 +370,13 @@ def enqueue_handover(db: Session, collection):
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
-    if not (collection.external_id or "").strip():
-        # Ruled: a volume with no Fisqua reference code is not sent. A row
-        # refused here, rather than no row, so the volume page says why and
-        # how to fix it.
-        row.state, row.refusal, row.problems = "refused", "not_exportable", [NO_REFERENCE_CODE_PROBLEM]
-        row.last_error = NO_REFERENCE_CODE_PROBLEM["message"]
-    elif collection.filename_stem is not None and collection.external_id != collection.filename_stem:
+    recorded = (collection.external_id or "").strip()
+    if collection.filename_stem is not None and recorded and recorded != collection.filename_stem:
         # Contract 1.2 §8: the stem is the reference code, unchanged. Keys use
         # the stem and status is polled by the reference code, so a volume
-        # whose two differ would be filed under one and asked for by the
-        # other. A volume with no stem is refused for that at promotion.
+        # whose recorded code differs would be filed under one and asked for
+        # by the other. With no code recorded the stem is the code; a volume
+        # with no stem is refused for that at promotion.
         problem = reference_code_differs_problem(collection.filename_stem, collection.external_id)
         row.state, row.refusal, row.problems = "refused", "not_exportable", [problem]
         row.last_error = problem["message"]
@@ -647,7 +635,8 @@ def volumes_to_poll(db: Session) -> dict:
 
     A row counts as sent once it is delivered, or once an attempt failed:
     Fisqua may have it, and a poll by reference recovers a lost answer. A
-    volume with no reference code cannot be asked for. One query, selecting
+    volume with neither a recorded reference code nor a stem cannot be asked
+    for. One query, selecting
     only ids and names: the outbox keeps every manifest and answer a volume
     ever had, and none of them is needed to choose what to ask for.
     """
@@ -665,12 +654,15 @@ def volumes_to_poll(db: Session) -> dict:
     # final rather than as NULL, which NOT would also drop.
     final = and_(func.coalesce(FisquaStatus.status, "").in_(fc.FINAL_STATES),
                  func.coalesce(FisquaStatus.manifest_id, "") == FisquaOutbox.manifest_id)
-    rows = (db.query(Collection.external_id, Collection.id, FisquaOutbox.manifest_id)
+    # The reference code as capture_manifest.reference_code gives it: the
+    # recorded external_id, else the stem.
+    ref = func.coalesce(func.nullif(func.trim(Collection.external_id), ""), Collection.filename_stem)
+    rows = (db.query(ref, Collection.id, FisquaOutbox.manifest_id)
             .select_from(newest)
             .join(FisquaOutbox, FisquaOutbox.id == newest.c.row_id)
             .join(Collection, Collection.id == newest.c.collection_id)
             .outerjoin(FisquaStatus, FisquaStatus.collection_id == newest.c.collection_id)
-            .filter(Collection.external_id.isnot(None), Collection.external_id != "")
+            .filter(ref.isnot(None))
             .filter(or_(FisquaStatus.collection_id.is_(None), not_(final)))
             .all())
     return {ref: (cid, manifest_id) for ref, cid, manifest_id in rows}

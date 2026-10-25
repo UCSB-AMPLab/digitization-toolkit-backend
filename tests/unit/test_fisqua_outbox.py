@@ -177,31 +177,66 @@ def test_a_refused_handover_enqueues_nothing(client, db_session, vol, fisqua):
 
 
 @pytest.mark.unit
-def test_a_volume_with_no_reference_code_is_refused_at_handover_and_never_sent(
+def test_a_volume_with_no_recorded_reference_code_is_sent_and_polled_under_its_stem(
         client, db_session, override_projects_root, fisqua):
+    """Ruled: the stem is the reference code (contract 1.2 §8) when external_id is not recorded."""
     v = Volume(db_session, override_projects_root, external_id=None)
     v.record(status="captured")
     assert _handover(client, v.col)["promoted"] == 1
+    assert _rows(db_session, v.col)[0].state == "waiting_for_upload"
 
-    [row] = _rows(db_session, v.col)
-    assert row.state == "refused" and row.refusal == "not_exportable"
-    [problem] = row.problems
-    assert problem["rule"] == "no_reference_code"
-    assert "reference code" in problem["message"] and "external_id" in problem["message"]
-    assert row.manifest is None
-
-    transport = FakeTransport(sends=[_delivered()])
+    transport = FakeTransport(sends=[_delivered()], statuses=[_status()])
     _run(db_session, transport)
+    [row] = _rows(db_session, v.col)
+    assert row.state == "delivered"
+    assert transport.sent[0]["volumes"][0]["externalId"] == v.stem
     _poll(db_session, transport)
-    assert transport.sent == [] and transport.polled == []
-    assert _rows(db_session, v.col)[0].state == "refused"
+    assert transport.polled == [[v.stem]]
 
-    body = _as(client, "reviewer").get(f"/collections/{v.col.id}/offsite").json()
-    assert body["fisqua"]["outbox"][0]["problems"][0]["rule"] == "no_reference_code"
-    # The manifest download is unaffected.
+    # The download carries the same code, so the file and the link agree.
     resp = _as(client, "operator").get(f"/collections/{v.col.id}/capture-manifest")
     assert resp.status_code == 200, resp.text
-    assert resp.json()["volumes"][0]["externalId"] is None
+    assert resp.json()["volumes"][0]["externalId"] == v.stem
+
+
+@pytest.mark.unit
+def test_the_poll_takes_the_stem_when_no_reference_code_is_recorded(
+        client, db_session, override_projects_root, fisqua):
+    from app.core.fisqua_outbox import _now, volumes_to_poll
+    from app.models.fisqua import FisquaOutbox
+    v = Volume(db_session, override_projects_root, external_id=None)
+    db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id="m-1", stem=v.stem, state="delivered",
+                                attempts=1, delivered_at=_now(), created_at=_now()))
+    db_session.commit()
+    assert volumes_to_poll(db_session) == {v.stem: (v.col.id, "m-1")}
+
+
+@pytest.mark.unit
+def test_a_volume_with_neither_stem_nor_reference_code_is_refused_for_its_stem(client, db_session, fisqua):
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record, RecordImage
+    proj = Project(name="P")
+    db_session.add(proj)
+    db_session.commit()
+    col = Collection(name="Tomo", project_id=proj.id)
+    db_session.add(col)
+    db_session.commit()
+    rec = Record(title="r", collection_id=col.id, status="captured", capture_mode="single", sequence=1)
+    db_session.add(rec)
+    db_session.commit()
+    db_session.add(RecordImage(record_id=rec.id, filename="f.jpg", file_path="/f.jpg", format="jpg",
+                               role="single", is_current=True))
+    db_session.commit()
+    _handover(client, col)
+    transport = FakeTransport()
+    _run(db_session, transport)
+    _poll(db_session, transport)
+    [row] = _rows(db_session, col)
+    assert row.state == "refused" and row.refusal == "not_exportable"
+    assert "no_stem" in {p["rule"] for p in row.problems}
+    assert "no_reference_code" not in {p["rule"] for p in row.problems}
+    assert transport.sent == [] and transport.polled == []
 
 
 @pytest.mark.unit
@@ -228,19 +263,6 @@ def test_a_volume_whose_reference_code_is_its_stem_is_queued(client, db_session,
     vol.record(status="captured")
     _handover(client, vol.col)
     assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
-
-
-@pytest.mark.unit
-def test_once_the_reference_code_is_set_a_new_handover_queues_a_manifest(
-        client, db_session, override_projects_root, fisqua):
-    v = Volume(db_session, override_projects_root, external_id=None)
-    v.record(status="captured")
-    _handover(client, v.col)
-    resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-test-001"})
-    assert resp.status_code == 200, resp.text
-    _take_back(client, v.col)
-    _handover(client, v.col)
-    assert [r.state for r in _rows(db_session, v.col)] == ["refused", "waiting_for_upload"]
 
 
 @pytest.mark.unit

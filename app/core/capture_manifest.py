@@ -26,6 +26,11 @@ whose files are still on disk.
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
   2026-10-17: the manifest carries every record's status).
+* `externalId` is the volume's recorded reference code (collections.external_id)
+  or, when none is recorded, its stem: contract 1.2 §8 makes a volume's
+  filenameStem its Fisqua reference code, unchanged, and the unit's
+  interface has no field for external_id (ruled). The download and the
+  manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
 
 The export is refused, with every problem named, when Fisqua's registration
 (fisqua-dev scripts/lib/capture-registration.ts) would refuse the file or
@@ -287,13 +292,19 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         "project": {"captuaProjectId": project.id, "name": project.name},
         "transfer": {"channel": "upload", "root": f"{tenant}/"},
         "volumes": [{
-            "externalId": collection.external_id,
+            "externalId": reference_code(collection),
             "captuaCollectionId": collection.id,
             "stem": stem,
             "title": collection.name,
             "records": out_records,
         }],
     }
+
+
+def reference_code(collection) -> Optional[str]:
+    """The volume's Fisqua reference code: its recorded external_id, else its stem (module header)."""
+    recorded = (collection.external_id or "").strip()
+    return recorded or collection.filename_stem
 
 
 def _object_state(row) -> str:

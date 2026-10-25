@@ -13,7 +13,8 @@ the volume is verified in the bucket and hands it to the transport. States:
   found in this state when a run begins was left by a crash, and is retried.
 - `delivered`: Fisqua accepted it (`delivered_at`, `response`, and in
   `external_id` the volumeId Fisqua gave it). The status poll asks by the
-  volume's reference code (collections.external_id), not by this id.
+  volume's reference code (its recorded external_id, else its stem), not
+  by this id.
 - `refused`: final, with `refusal` saying by whom. `not_exportable`: the unit
   could not build the manifest, and `problems` lists the capture_manifest
   problems, as GET /collections/{id}/capture-manifest gives them.

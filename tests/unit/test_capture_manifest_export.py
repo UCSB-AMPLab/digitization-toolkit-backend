@@ -292,13 +292,24 @@ def test_each_export_is_logged_with_volume_id_and_counts(client, vol, db_session
 
 
 @pytest.mark.unit
-def test_a_volume_created_on_the_unit_travels_with_a_null_external_id(client, db_session, override_projects_root, tenant):
-    # Contract §4: Fisqua surfaces it as unmatched for an archivist to link.
+def test_a_volume_with_no_recorded_reference_code_travels_with_its_stem(client, db_session, override_projects_root, tenant):
+    # Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code,
+    # unchanged; ruled that the stem stands in when external_id is not
+    # recorded (it superseded 1.1 §4's null, surfaced as unmatched).
     v = Volume(db_session, override_projects_root, external_id=None)
     v.record()
     resp = _export(client, v.col)
     assert resp.status_code == 200, resp.text
-    assert resp.json()["volumes"][0]["externalId"] is None
+    assert resp.json()["volumes"][0]["externalId"] == v.stem
+
+
+@pytest.mark.unit
+def test_a_recorded_reference_code_travels_as_it_is(client, db_session, override_projects_root, tenant):
+    v = Volume(db_session, override_projects_root, external_id="xx-other-009")
+    v.record()
+    resp = _export(client, v.col)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["volumes"][0]["externalId"] == "xx-other-009"
 
 
 # ---------------------------------------------------------------------------
