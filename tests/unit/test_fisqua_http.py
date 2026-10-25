@@ -525,3 +525,71 @@ def test_the_token_echoed_by_fisqua_never_reaches_rows_logs_or_the_api(client, d
     texts += [str(r.detail) for r in db_session.query(SystemLog).all()]
     for text in texts:
         assert TOKEN not in text
+
+
+# ---------------------------------------------------------------------------
+# The offsite upload hold (app.core.offsite_hold)
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def hold(monkeypatch, tmp_path):
+    from app.core import config
+    path = tmp_path / "offsite-hold"
+    monkeypatch.setattr(config.settings, "OFFSITE_HOLD_FILE", str(path))
+    return path
+
+
+@pytest.mark.unit
+def test_while_held_a_pass_sends_nothing_and_builds_nothing(db_session, queued, hold, caplog):
+    hold.touch()
+    server = Server(_ok())
+    with caplog.at_level(logging.INFO, logger="app.core.offsite_hold"):
+        result = _send(db_session, server)
+    assert result == {"status": "held", "hold_file": str(hold)}
+    assert server.requests == []
+    assert _rows(db_session, queued.col)[0].state == "waiting_for_upload"
+    assert "fisqua outbox" in caplog.text
+
+    hold.unlink()
+    server = Server(_ok())
+    assert _send(db_session, server)["status"] == "done"
+    assert len(server.requests) == 1
+    assert _rows(db_session, queued.col)[0].state == "delivered"
+
+
+@pytest.mark.unit
+def test_while_held_the_poll_asks_nothing(db_session, queued, hold, caplog):
+    _send(db_session, Server(_ok()))
+    hold.touch()
+    server = Server(httpx.Response(200, json={"volumes": []}))
+    with caplog.at_level(logging.INFO, logger="app.core.offsite_hold"):
+        result = _poll(db_session, server)
+    assert result == {"status": "held", "hold_file": str(hold)}
+    assert server.requests == []
+    assert "fisqua status poll" in caplog.text
+
+    hold.unlink()
+    server = Server(httpx.Response(200, json={"volumes": []}))
+    assert _poll(db_session, server)["calls"] == 1
+    assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+def test_the_scheduled_poll_tick_is_held_too(db_session, queued, hold, monkeypatch):
+    from app.core import fisqua_outbox
+    hold.touch()
+    called = []
+    monkeypatch.setattr(fisqua_outbox, "get_transport", lambda: called.append(1) or _transport(Server()))
+    result = fisqua_outbox.FisquaStatusScheduler().tick()
+    assert result["status"] == "held" and called == []
+
+
+@pytest.mark.unit
+def test_the_fisqua_objects_report_the_hold(client, db_session, queued, hold):
+    for held in (False, True):
+        if held:
+            hold.touch()
+        body = _as(client, "reviewer").get(f"/collections/{queued.col.id}/offsite").json()
+        assert body["fisqua"]["held"] is held and body["fisqua"]["hold_file"] == str(hold)
+        system = _as(client, "reviewer").get("/system/catalogue-backup").json()
+        assert system["fisqua"]["held"] is held and system["fisqua"]["hold_file"] == str(hold)

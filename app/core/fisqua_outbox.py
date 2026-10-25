@@ -39,6 +39,9 @@ app.core.fisqua_contract. Here:
   stops sending and polling for the whole unit (record_config_error) until
   the environment, the base URL or the token changes: the row goes back to
   `ready`.
+* **The offsite upload hold** (app.core.offsite_hold). While its file exists
+  a send pass and a poll tick each answer "held" at their start, with no
+  call to Fisqua and nothing promoted; removing it resumes the next pass.
 * **Status poll** (poll_fisqua_status), on its own ten-minute schedule
   (FisquaStatusScheduler). Every volume with a manifest that has reached
   Fisqua, or may have, is asked for by its reference code
@@ -78,7 +81,7 @@ from typing import Any, Callable, Optional, Protocol
 from sqlalchemy import update
 from sqlalchemy.orm import Session
 
-from app.core import config
+from app.core import config, offsite_hold
 from app.core import fisqua_contract as fc
 
 logger = logging.getLogger(__name__)
@@ -551,8 +554,9 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                       clock: Optional[Callable[[], datetime]] = None) -> dict:
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
-    Statuses: "disabled" (Fisqua not configured), "no_transport" (rows are
-    promoted, nothing is sent), "config_error" (Fisqua refused the
+    Statuses: "disabled" (Fisqua not configured), "held" (the offsite upload
+    hold exists, app.core.offsite_hold: nothing is promoted or sent, and no
+    call is made), "no_transport" (rows are promoted, nothing is sent), "config_error" (Fisqua refused the
     configuration: rows are promoted, nothing is sent until it changes), "done",
     "stopped", "error".
     """
@@ -560,6 +564,11 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    # Promotion too: while the hold exists the one-time commands are still
+    # completing the objects' state, and a volume can read as received, or
+    # not exportable, on what they have not yet written.
+    if offsite_hold.held("fisqua outbox"):
+        return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
     transport = transport if transport is not None else get_transport()
     if clock is None:
         fixed = _naive(now)
@@ -670,11 +679,17 @@ def volumes_to_poll(db: Session) -> dict:
 
 def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = None,
                        now: Optional[datetime] = None) -> dict:
-    """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises."""
+    """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises.
+
+    Answers "held", with no call, while the offsite upload hold exists
+    (app.core.offsite_hold).
+    """
     from app.models.fisqua import FisquaOutbox
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    if offsite_hold.held("fisqua status poll"):
+        return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
     transport = transport if transport is not None else get_transport()
     if isinstance(transport, NullTransport):
         return {"status": "no_transport"}
@@ -806,7 +821,9 @@ _OUTBOX_FIELDS = ("manifest_id", "stem", "state", "created_at", "attempts", "nex
 def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     """The `fisqua` object of the volume's offsite state, or None when Fisqua is not configured.
 
-    `environment` is `production` or `staging`. `config_error` is the
+    `held` and `hold_file` are the offsite upload hold's (app.core.offsite_hold),
+    under which nothing is sent or polled. `environment` is `production` or
+    `staging`. `config_error` is the
     unit-level stop (time, HTTP status, reason `token`, `not_found` or
     `redirect`, configuration fingerprint) while Fisqua refuses this unit's
     configuration, else None. `outbox` lists the volume's
@@ -824,6 +841,7 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     return {
         "environment": fisqua_environment(),
         "config_error": config_error(),
+        **offsite_hold.hold_state(),
         "outbox": [{name: getattr(row, name) for name in _OUTBOX_FIELDS} for row in rows],
         "status": None if status is None else {
             "status": status.status, "status_at": status.status_at,
@@ -844,6 +862,7 @@ def unit_fisqua_summary() -> dict:
         "token_invalid": token_invalid(),
         "environment": fisqua_environment() if configured else None,
         "config_error": config_error() if configured else None,
+        **offsite_hold.hold_state(),
         "last_send": image_upload_scheduler.last_fisqua_result,
         "last_poll": fisqua_status_scheduler.last_result,
     }
