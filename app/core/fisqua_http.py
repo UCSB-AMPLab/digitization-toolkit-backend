@@ -24,10 +24,14 @@ from datetime import datetime, timezone
 from email.utils import parsedate_to_datetime
 from typing import Any, Iterable, Optional
 
+import logging
+
 import httpx
 
 from app.core import fisqua_contract as fc
 from app.core.fisqua_outbox import TransportResult
+
+logger = logging.getLogger(__name__)
 
 CONNECT_TIMEOUT_SECONDS = 10.0
 
@@ -90,7 +94,12 @@ def _transient(response: httpx.Response, body: Any) -> TransportResult:
                            retry_after=retry_after_seconds(response.headers.get(fc.RETRY_AFTER_HEADER)))
 
 
-def read_send_answer(response: httpx.Response) -> TransportResult:
+def read_send_answer(response: httpx.Response, sent_id: Optional[str] = None) -> TransportResult:
+    """The answer to a POST of the manifest whose id is `sent_id`.
+
+    A 2xx must name that manifest: one naming another id, or none, is
+    retried (and logged), since the unit cannot tell what Fisqua accepted.
+    """
     code = response.status_code
     body = _json(response)
     if 200 <= code < 300:
@@ -98,6 +107,13 @@ def read_send_answer(response: httpx.Response) -> TransportResult:
         if volume_id in (None, ""):
             return TransportResult(outcome="error", response=body, status_code=code,
                                    error=f"Fisqua answered HTTP {code} without a {fc.F_VOLUME_ID}")
+        answered = body.get(fc.F_MANIFEST_ID)
+        if sent_id is not None and answered != sent_id:
+            logger.warning("Fisqua answered HTTP %s for manifest %r to the POST of manifest %s; retried",
+                           code, answered, sent_id)
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=(f"Fisqua answered HTTP {code} with {fc.F_MANIFEST_ID} {answered!r}, "
+                                          f"not the {sent_id} sent"))
         state = body.get(fc.F_STATE)
         return TransportResult(outcome="delivered", response=body, status_code=code,
                                external_id=str(volume_id),
@@ -157,7 +173,7 @@ class HttpFisquaTransport:
             response = self._client.post(self._base + fc.MANIFESTS_PATH, json=manifest, headers=self._headers())
         except httpx.HTTPError as exc:
             return _failed(exc)
-        return read_send_answer(response)
+        return read_send_answer(response, sent_id=manifest.get("id") if isinstance(manifest, dict) else None)
 
     def get_status(self, refs: Iterable[str]) -> TransportResult:
         refs = list(refs)

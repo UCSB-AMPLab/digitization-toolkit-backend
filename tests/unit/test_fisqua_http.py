@@ -57,8 +57,12 @@ def _poll(db, server, now=None):
     return poll_fisqua_status(db, transport=_transport(server), now=now)
 
 
-def _ok(manifest_id="m", state="received", volume_id="fq-v1"):
-    return httpx.Response(200, json={"state": state, "manifestId": manifest_id, "volumeId": volume_id})
+def _ok(state="received", volume_id="fq-v1"):
+    """Fisqua's 200 to a POST, naming the manifest id it was sent, as the contract has it."""
+    def answer(request):
+        sent = json.loads(request.content)["id"] if request.content else None
+        return httpx.Response(200, json={"state": state, "manifestId": sent, "volumeId": volume_id})
+    return answer
 
 
 @pytest.fixture
@@ -113,6 +117,28 @@ def test_200_is_delivered_with_the_volume_id_and_state(db_session, queued):
     assert row.response["volumeId"] == "fq-v7"
     db_session.expire_all()
     assert db_session.get(FisquaStatus, queued.col.id).status == "registered"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answered", ["another-manifest-id", None])
+def test_a_2xx_for_another_manifest_id_is_retried_and_logged(db_session, queued, caplog, answered):
+    body = {"state": "received", "volumeId": "fq-v1"}
+    if answered is not None:
+        body["manifestId"] = answered
+    with caplog.at_level(logging.WARNING):
+        _send(db_session, Server(httpx.Response(200, json=body)))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "failed"
+    assert "manifestId" in row.last_error
+    assert row.manifest_id in caplog.text
+
+
+@pytest.mark.unit
+def test_a_2xx_for_the_manifest_sent_is_delivered(db_session, queued):
+    server = Server(lambda req: httpx.Response(200, json={
+        "state": "received", "volumeId": "fq-v1", "manifestId": json.loads(req.content)["id"]}))
+    _send(db_session, server)
+    assert _rows(db_session, queued.col)[0].state == "delivered"
 
 
 @pytest.mark.unit
@@ -464,7 +490,8 @@ def test_the_token_echoed_by_fisqua_never_reaches_rows_logs_or_the_api(client, d
     _send(db_session, server, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
     queued.record(status="captured")
     _handover(client, queued.col)
-    _send(db_session, Server(httpx.Response(200, json={"volumeId": f"v-{TOKEN}", "state": TOKEN, **echo})))
+    _send(db_session, Server(lambda req: httpx.Response(200, json={
+        "volumeId": f"v-{TOKEN}", "state": TOKEN, "manifestId": json.loads(req.content)["id"], **echo})))
     mid = _rows(db_session, queued.col)[-1].manifest_id
     _poll(db_session, Server(httpx.Response(200, json=[{"ref": queued.col.external_id, "manifestId": mid,
                                                         "state": f"s {TOKEN}", "problems": [{"m": TOKEN}]}])))

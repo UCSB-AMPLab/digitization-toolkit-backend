@@ -5,9 +5,19 @@ which HTTP answers mean what. Fisqua has answered the open points; the text
 is final once Juan signs it, so a rename there should be an edit here and
 nowhere else.
 
-The unit's token is 64 lowercase hex characters, opaque to the unit: it is
-sent as it is and never parsed.
+The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
+that shape it is opaque to the unit, sent as it is and never parsed.
+
+Contract 1.2 is approved (archiving 5e480b7, §9).
 """
+
+import re
+
+TOKEN_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# At most this many calls a minute per token; the unit sends at most this
+# many manifests per pass, and a pass runs at most every few minutes.
+CALLS_PER_MINUTE = 60
+MAX_SENDS_PER_PASS = CALLS_PER_MINUTE
 
 CONTRACT_VERSION = "1.2"
 
@@ -43,6 +53,7 @@ F_VOLUMES = "volumes"
 # 400 or 409 with problems is a refusal whatever the rule.
 RULE_ID_REUSED = "id-reused"
 RULE_REFERENCE_CODE = "reference-code"  # 422: the manifest's volume has no reference code
+RULE_RUN_STARTED = "run-started"  # 409: a newer manifest for a volume a run has started on
 # Not Fisqua's: the problem the unit records for a 413 with no problems in it.
 RULE_TOO_LARGE = "payload-too-large"
 

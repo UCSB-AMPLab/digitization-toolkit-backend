@@ -93,6 +93,20 @@ NO_REFERENCE_CODE_PROBLEM = {
     "record_ids": [],
     "image_ids": [],
 }
+
+
+def reference_code_differs_problem(stem: str, reference_code: str) -> dict:
+    """The problem for a volume whose reference code is not its file name stem (contract 1.2 §8)."""
+    return {
+        "rule": "reference_code_differs",
+        "message": (f"The volume's Fisqua reference code ({reference_code}) is not its file name stem "
+                    f"({stem}). Fisqua takes a volume's file name stem as its reference code, unchanged, "
+                    "so the volume is not sent to Fisqua while the two differ."),
+        "record_ids": [],
+        "image_ids": [],
+    }
+
+
 LAST_ERROR_LIMIT = 2000
 OUTBOX_LISTED = 20
 
@@ -124,9 +138,41 @@ def _tenant() -> Optional[str]:
     return configured_tenant_or_none()
 
 
+def token_invalid() -> bool:
+    """True when a token is set but is not 64 lowercase hex characters (contract 1.2)."""
+    token = _token()
+    return bool(token) and fc.TOKEN_PATTERN.match(token) is None
+
+
 def fisqua_configured() -> bool:
-    """True when the environment, this unit's token and a valid offsite tenant are all set."""
-    return fisqua_environment() is not None and bool(_token()) and _tenant() is not None
+    """True when the environment, a well-formed token and a valid offsite tenant are all set."""
+    token = _token()
+    return (fisqua_environment() is not None and bool(token) and fc.TOKEN_PATTERN.match(token) is not None
+            and _tenant() is not None)
+
+
+_LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
+_warned_overrides: set = set()
+
+
+def _usable_override(value: str) -> Optional[str]:
+    """DTK_FISQUA_BASE_URL when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
+    from urllib.parse import urlsplit
+
+    try:
+        parts = urlsplit(value)
+        host = parts.hostname
+    except ValueError:
+        parts, host = None, None
+    if parts is not None and host and parts.scheme == "https":
+        return value.rstrip("/")
+    if parts is not None and parts.scheme == "http" and host in _LOOPBACK_HOSTS:
+        return value.rstrip("/")
+    if value not in _warned_overrides:
+        _warned_overrides.add(value)
+        logger.warning("DTK_FISQUA_BASE_URL %r is ignored: it must be https://, or http:// to 127.0.0.1, "
+                       "localhost or [::1] for tests; the environment's host is used", value)
+    return None
 
 
 def base_url() -> Optional[str]:
@@ -135,7 +181,9 @@ def base_url() -> Optional[str]:
         return None
     override = config.settings.FISQUA_BASE_URL.strip()
     if override:
-        return override.rstrip("/")
+        usable = _usable_override(override)
+        if usable is not None:
+            return usable
     return fc.ENVIRONMENTS[fisqua_environment()].format(tenant=_tenant())
 
 
@@ -336,6 +384,14 @@ def enqueue_handover(db: Session, collection):
         # how to fix it.
         row.state, row.refusal, row.problems = "refused", "not_exportable", [NO_REFERENCE_CODE_PROBLEM]
         row.last_error = NO_REFERENCE_CODE_PROBLEM["message"]
+    elif collection.filename_stem is not None and collection.external_id != collection.filename_stem:
+        # Contract 1.2 §8: the stem is the reference code, unchanged. Keys use
+        # the stem and status is polled by the reference code, so a volume
+        # whose two differ would be filed under one and asked for by the
+        # other. A volume with no stem is refused for that at promotion.
+        problem = reference_code_differs_problem(collection.filename_stem, collection.external_id)
+        row.state, row.refusal, row.problems = "refused", "not_exportable", [problem]
+        row.last_error = problem["message"]
     db.add(row)
     return row
 
@@ -555,7 +611,9 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             due = (db.query(FisquaOutbox)
                    .filter((FisquaOutbox.state == "ready")
                            | ((FisquaOutbox.state == "failed") & (FisquaOutbox.next_attempt_at <= now)))
-                   .order_by(FisquaOutbox.id).all())
+                   .order_by(FisquaOutbox.id).limit(fc.MAX_SENDS_PER_PASS).all())
+            # At most MAX_SENDS_PER_PASS (the contract's calls a minute); the
+            # rest are sent on the next pass.
             for row in due:
                 if stopping():
                     return result.as_dict()
@@ -790,6 +848,8 @@ def unit_fisqua_summary() -> dict:
     configured = fisqua_configured()
     return {
         "configured": configured,
+        # A token is set but is not of the contract's shape; its value is never shown.
+        "token_invalid": token_invalid(),
         "environment": fisqua_environment() if configured else None,
         "config_error": config_error() if configured else None,
         "last_send": image_upload_scheduler.last_fisqua_result,

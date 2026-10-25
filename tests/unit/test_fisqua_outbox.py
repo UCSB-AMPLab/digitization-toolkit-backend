@@ -205,6 +205,32 @@ def test_a_volume_with_no_reference_code_is_refused_at_handover_and_never_sent(
 
 
 @pytest.mark.unit
+def test_a_volume_whose_reference_code_differs_from_its_stem_is_refused_at_handover(
+        client, db_session, override_projects_root, fisqua):
+    """Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code, unchanged."""
+    v = Volume(db_session, override_projects_root, stem="xx-test-001", external_id="xx-other-009")
+    v.record(status="captured")
+    _handover(client, v.col)
+    [row] = _rows(db_session, v.col)
+    assert row.state == "refused" and row.refusal == "not_exportable"
+    [problem] = row.problems
+    assert problem["rule"] == "reference_code_differs"
+    assert "xx-test-001" in problem["message"] and "xx-other-009" in problem["message"]
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    _poll(db_session, transport)
+    assert transport.sent == [] and transport.polled == []
+
+
+@pytest.mark.unit
+def test_a_volume_whose_reference_code_is_its_stem_is_queued(client, db_session, vol, fisqua):
+    assert vol.col.external_id == vol.col.filename_stem
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
+
+
+@pytest.mark.unit
 def test_once_the_reference_code_is_set_a_new_handover_queues_a_manifest(
         client, db_session, override_projects_root, fisqua):
     v = Volume(db_session, override_projects_root, external_id=None)
@@ -531,6 +557,25 @@ def test_delivered_at_is_when_the_answer_came(client, db_session, vol, fisqua):
 
 
 @pytest.mark.unit
+def test_at_most_60_manifests_are_sent_per_pass(client, db_session, override_projects_root, fisqua):
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    vols = [Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}") for n in range(1, 71)]
+    for v in vols:
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=str(uuid.uuid4()), stem=v.stem,
+                                    state="ready", attempts=0, manifest={"id": "m"}, created_at=_now()))
+    db_session.commit()
+    transport = FakeTransport(sends=[_delivered() for _ in range(70)])
+    _run(db_session, transport)
+    assert len(transport.sent) == 60
+    _run(db_session, transport)
+    assert len(transport.sent) == 70
+    db_session.expire_all()
+    assert db_session.query(FisquaOutbox).filter(FisquaOutbox.state == "delivered").count() == 70
+
+
+@pytest.mark.unit
 def test_the_retry_delay_doubles_and_is_capped(monkeypatch):
     from app.core import config
     from app.core.fisqua_outbox import retry_delay
@@ -574,6 +619,68 @@ def test_the_null_transport_leaves_ready_rows_ready(client, db_session, vol, fis
     assert row.state == "ready" and row.attempts == 0
     assert row.manifest is not None
     assert result["status"] == "no_transport"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bad", [TOKEN.upper(), TOKEN[:-1], TOKEN + "0", "fisqua-secret-token", "g" * 64,
+                                 f" {TOKEN[:-1]}x"])
+def test_a_malformed_token_leaves_fisqua_unconfigured_and_is_reported(client, db_session, vol, fisqua,
+                                                                       monkeypatch, bad):
+    from pydantic import SecretStr
+
+    from app.core import config
+    from app.core.fisqua_outbox import fisqua_configured
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(bad))
+    assert fisqua_configured() is False
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    assert _rows(db_session, vol.col) == []
+    resp = _as(client, "admin").get("/system/catalogue-backup")
+    fq = resp.json()["fisqua"]
+    assert fq["configured"] is False and fq["token_invalid"] is True
+    assert bad.strip() not in resp.text
+
+
+@pytest.mark.unit
+def test_a_well_formed_token_is_not_reported_invalid(client, fisqua):
+    fq = _as(client, "admin").get("/system/catalogue-backup").json()["fisqua"]
+    assert fq["configured"] is True and fq["token_invalid"] is False
+
+
+@pytest.mark.unit
+def test_no_token_is_not_reported_invalid(client, fisqua, monkeypatch):
+    from pydantic import SecretStr
+
+    from app.core import config
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(""))
+    fq = _as(client, "admin").get("/system/catalogue-backup").json()["fisqua"]
+    assert fq["configured"] is False and fq["token_invalid"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("override,expected", [
+    ("https://fisqua.dev.test/", "https://fisqua.dev.test"),
+    ("http://127.0.0.1:8787", "http://127.0.0.1:8787"),
+    ("http://localhost:8787/", "http://localhost:8787"),
+    ("http://[::1]:8787", "http://[::1]:8787"),
+    ("http://[::1]", "http://[::1]"),
+    ("http://localhost.evil.test", None),
+    ("http://fisqua.dev.test", None),
+    ("http://127.0.0.1.evil.test", None),
+    ("ftp://fisqua.dev.test", None),
+    ("fisqua.dev.test", None),
+])
+def test_the_base_url_override_must_be_https_or_loopback_http(fisqua, monkeypatch, caplog, override, expected):
+    from app.core import config
+    from app.core.fisqua_outbox import base_url
+    monkeypatch.setattr(config.settings, "FISQUA_BASE_URL", override)
+    with caplog.at_level(logging.WARNING, logger="app.core.fisqua_outbox"):
+        got = base_url()
+    if expected is None:
+        assert got == f"https://{TENANT}.staging.fisqua.org"
+        assert "DTK_FISQUA_BASE_URL" in caplog.text
+    else:
+        assert got == expected
 
 
 @pytest.mark.unit
