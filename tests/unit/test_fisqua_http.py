@@ -1030,3 +1030,56 @@ def test_a_retest_refused_for_its_content_clears_the_stop(db_session, queued, ca
     retest = _rows(db_session, queued.col)[-1].manifest_id
     assert (f"Fisqua version stop retest: manifest {retest} refused for its content, not its version; "
             "the stop is cleared and sending resumes") in caplog.text
+
+
+@pytest.mark.unit
+def test_a_retest_failed_in_transit_waits_for_a_retry_after_longer_than_the_interval(db_session, queued):
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    wait = 4 * _interval()
+    _send(db_session, Server(httpx.Response(503, headers={"Retry-After": str(int(wait.total_seconds()))})),
+          now=first)
+    server = Server(_ok())
+    _send(db_session, server, now=first + wait - timedelta(seconds=1))
+    assert server.requests == []
+    _send(db_session, server, now=first + wait)
+    assert len(server.requests) == 1
+    assert config_error() is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", ["accepted", "content"])
+def test_a_retest_answered_before_the_stop_was_removed_clears_it_with_no_call(
+        db_session, queued, monkeypatch, answer):
+    """The process ended after the answer was kept on the row and before the stop file was removed."""
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    real, interrupted = fisqua_outbox._clear_version_stop, [True]
+    monkeypatch.setattr(fisqua_outbox, "_clear_version_stop",
+                        lambda fingerprint: False if interrupted[0] else real(fingerprint))
+    reply = _ok() if answer == "accepted" else httpx.Response(422, json={"problems": [{"rule": "pages",
+                                                                                      "message": "x"}]})
+    _send(db_session, Server(reply), now=T0 + _interval())
+    assert config_error()["reason"] == "version"
+    interrupted[0] = False
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval() + timedelta(minutes=10))
+    assert server.requests == []
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_shutdown_makes_no_retest(db_session, queued):
+    import threading
+
+    from app.core.fisqua_outbox import run_fisqua_outbox
+    _stopped(db_session, queued)
+    shutdown = threading.Event()
+    shutdown.set()
+    server = Server(_ok())
+    result = run_fisqua_outbox(db_session, transport=_transport(server), now=T0 + _interval(), stop=shutdown)
+    assert result["status"] == "stopped"
+    assert server.requests == []
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]

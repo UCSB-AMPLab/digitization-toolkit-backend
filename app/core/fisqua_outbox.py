@@ -357,7 +357,7 @@ def record_config_error(status_code: Optional[int], reason: Optional[str], now: 
         logger.error("Fisqua answered HTTP %s (%s) for this unit's manifests (fingerprint %s); sending and "
                      "polling stop until the software is updated, or until a retest every %s s finds that "
                      "Fisqua reads its manifests", status_code, reason, entry["config_fingerprint"],
-                     _retest_interval().total_seconds())
+                     int(_retest_interval().total_seconds()))
         return
     logger.error("Fisqua answered HTTP %s (%s) for this unit's configuration (fingerprint %s); sending and "
                  "polling stop until DTK_FISQUA_ENV, DTK_FISQUA_BASE_URL or DTK_FISQUA_TOKEN is changed",
@@ -857,7 +857,27 @@ def _retest_candidates(db: Session, retest_row: Optional[int]) -> list:
     return first + sorted(rest, key=lambda item: item[1])
 
 
-def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], result: "_Run") -> bool:
+def _retest_read(state: Optional[str], problems: Any) -> bool:
+    """Whether a retest row's outcome shows Fisqua read its manifest: accepted, or refused for something else."""
+    return state == "delivered" or (state == "refused" and not _version_refusal(problems))
+
+
+def _retest_cleared(fingerprint: str, manifest_id: str, state: str, result: "_Run") -> bool:
+    """Remove the version stop after a retest Fisqua read, and say so in the journal. False if it was not removed."""
+    if not _clear_version_stop(fingerprint):
+        return False
+    if state == "delivered":
+        logger.info("Fisqua version stop retest: manifest %s accepted; the stop is cleared and sending "
+                    "resumes", manifest_id)
+    else:
+        logger.info("Fisqua version stop retest: manifest %s refused for its content, not its version; "
+                    "the stop is cleared and sending resumes", manifest_id)
+    result.status = "done"
+    return True
+
+
+def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], result: "_Run",
+                         stopping: Callable[[], bool]) -> bool:
     """Send one manifest while a version stop holds, once every _retest_interval. True when the stop cleared.
 
     Due DTK_FISQUA_RETRY_MAX seconds after the stop was recorded or last
@@ -876,8 +896,13 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
     * a configuration error (token, not_found, redirect): _send records it
       in place of the version stop, as for any send.
 
-    With nothing to send, or no call left in the budget, nothing is sent
-    and the time of the last retest is left as it was.
+    A retest whose answer was recorded on its row but whose stop was not
+    then removed (the process ended between the two) is settled from the
+    row first, with no call. A row that failed in transit waits for its own
+    next_attempt_at too, so a Retry-After longer than the interval holds.
+    With nothing to send, no call left in the budget, or a shutdown under
+    way (`stopping`), nothing is sent and the time of the last retest is
+    left as it was.
     """
     from app.models.fisqua import FisquaOutbox
 
@@ -885,14 +910,28 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
     if stop is None or stop.get("reason") != fc.VERSION_REASON or isinstance(transport, NullTransport):
         return False
     now = _naive(clock())
+    fingerprint = stop["config_fingerprint"]
+    retest_row = stop.get("retest_row")
+    last = None
+    if retest_row is not None:
+        last = (db.query(FisquaOutbox.manifest_id, FisquaOutbox.state, FisquaOutbox.problems,
+                         FisquaOutbox.next_attempt_at)
+                .filter(FisquaOutbox.id == retest_row).first())
+        db.rollback()
+        if last is not None and _retest_read(last.state, last.problems):
+            return _retest_cleared(fingerprint, last.manifest_id, last.state, result)
     since = [t for t in (_parse_stop_time(stop.get("at")), _parse_stop_time(stop.get("retest_at")))
              if t is not None]
     if since and now < max(since) + _retest_interval():
         return False
-    fingerprint = stop["config_fingerprint"]
+    if last is not None and last.state == "failed" and last.next_attempt_at is not None \
+            and _naive(last.next_attempt_at) > now:
+        return False
+    if stopping():
+        return False
 
     row = None
-    for kind, row_id, collection in _retest_candidates(db, stop.get("retest_row")):
+    for kind, row_id, collection in _retest_candidates(db, retest_row):
         if kind == "hand_over":
             new = enqueue_handover(db, collection)
             db.commit()
@@ -911,7 +950,8 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
             row = candidate
             break
         db.rollback()
-    if row is None:
+    if row is None or stopping():
+        db.rollback()
         return False
     if not call_budget.take():
         db.rollback()
@@ -931,16 +971,8 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
         logger.info("Fisqua version stop retest: manifest %s was answered with a configuration error (%s); "
                     "that stop replaces the version stop", manifest_id, after.get("reason"))
         return False
-    if state == "delivered" or (state == "refused" and not _version_refusal(problems)):
-        _clear_version_stop(fingerprint)
-        if state == "delivered":
-            logger.info("Fisqua version stop retest: manifest %s accepted; the stop is cleared and sending "
-                        "resumes", manifest_id)
-        else:
-            logger.info("Fisqua version stop retest: manifest %s refused for its content, not its version; "
-                        "the stop is cleared and sending resumes", manifest_id)
-        result.status = "done"
-        return True
+    if _retest_read(state, problems):
+        return _retest_cleared(fingerprint, manifest_id, state, result)
     if state == "refused":
         logger.info("Fisqua version stop retest: manifest %s refused again for version; the stop holds and "
                     "the next retest is in %s s", manifest_id, wait)
@@ -1068,8 +1100,9 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             if unit_stop is not None and unit_stop.get("reason") == fc.VERSION_REASON:
                 # Nothing is built under the software Fisqua could not read,
                 # but the one manifest of a retest, once an interval.
-                if not _retest_version_stop(db, transport, clock, result):
-                    result.status = "config_error"
+                if not _retest_version_stop(db, transport, clock, result, stopping):
+                    if result.status != "stopped":
+                        result.status = "config_error"
                     return result.as_dict()
                 unit_stop = None
             if unit_stop is None:
