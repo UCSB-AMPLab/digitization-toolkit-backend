@@ -74,6 +74,26 @@ class CameraConfig:
         return f"CameraConfig(cam{self.camera_index}, {self.img_size[0]}x{self.img_size[1]}, awb={self.awb})"
 
 
+# The rotations a body can be given (CameraRegistry.VALID_ORIENTATIONS).
+_VALID_ROTATIONS = (0, 90, 180, 270)
+
+
+def recorded_rotation(camera_config) -> Optional[int]:
+    """The clockwise rotation, in degrees, recorded beside an image this config captured.
+
+    One of 0, 90, 180, 270, the unit CameraConfig.rotate_deg and the
+    registry's per-body `orientation` hold, or None for any other value,
+    which capture.service._apply_rotation does not apply either. Recorded in the capture
+    record's `files` entries, on RecordImage, and in an export's
+    metadata.json, because a RAW master does not carry it in its own EXIF.
+    """
+    deg = getattr(camera_config, "rotate_deg", 0) or 0
+    if type(deg) is not int:
+        return None
+    deg %= 360
+    return deg if deg in _VALID_ROTATIONS else None
+
+
 # Helper functions for saving/loading camera configs
 def save_camera_configs(filepath: str, configs: dict):
     """

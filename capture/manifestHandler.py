@@ -14,6 +14,7 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
+from .camera import recorded_rotation
 from .utils import compute_sha256, setup_rotating_logger
 
 from app.core.config import settings
@@ -66,6 +67,11 @@ class CaptureFile:
     bytes: int
     mimetype: str = "image/jpeg"
     sha256: Optional[str] = None
+    # Clockwise rotation in degrees (0, 90, 180, 270) that displays the image
+    # upright: the capturing body's rotate_deg (capture.camera.recorded_rotation).
+    # A JPEG also carries it as its EXIF Orientation; a RAW master does not,
+    # since it is never rewritten. Records written before it lack the key.
+    rotate_deg: Optional[int] = None
 
 
 @dataclass
@@ -132,7 +138,8 @@ def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[P
             pass
     return str(Path("images/main") / p.name)
 
-def _preview_file(master: Union[str, Path], role: str, project_root: Optional[Path]) -> Optional["CaptureFile"]:
+def _preview_file(master: Union[str, Path], role: str, project_root: Optional[Path],
+                  rotate_deg: Optional[int] = None) -> Optional["CaptureFile"]:
     """The `<role>_preview` entry for a RAW master's `_preview.jpg` sidecar, or None when it has none.
 
     The RAW backend extracts the sidecar inside capture_image, and the
@@ -154,6 +161,7 @@ def _preview_file(master: Union[str, Path], role: str, project_root: Optional[Pa
         bytes=os.path.getsize(sidecar),
         mimetype="image/jpeg",
         sha256=compute_sha256(sidecar),
+        rotate_deg=rotate_deg,
     )
 
 
@@ -221,6 +229,7 @@ def generate_manifest_record(
     # Handle both single paths and multi-format (JPEG+raw) tuples
     files = []
     for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
+        rotate_deg = recorded_rotation(config)
         # Check if path is a tuple (multi-format: JPEG + raw buffer)
         if isinstance(path, tuple):
             jpeg_path, raw_path = path
@@ -231,7 +240,8 @@ def generate_manifest_record(
                 relative_path=_relative_capture_path(jpeg_path, project_root),
                 bytes=os.path.getsize(jpeg_path),
                 mimetype=f"image/{config.encoding}",
-                sha256=compute_sha256(jpeg_path)
+                sha256=compute_sha256(jpeg_path),
+                rotate_deg=rotate_deg,
             ))
 
             # Add raw sensor data file
@@ -242,9 +252,10 @@ def generate_manifest_record(
                 relative_path=_relative_capture_path(raw_path, project_root),
                 bytes=os.path.getsize(raw_path),
                 mimetype="application/octet-stream",  # Binary raw sensor data
-                sha256=compute_sha256(raw_path)
+                sha256=compute_sha256(raw_path),
+                rotate_deg=rotate_deg,
             ))
-            preview = _preview_file(raw_path, role, project_root)
+            preview = _preview_file(raw_path, role, project_root, rotate_deg)
             if preview is not None:
                 files.append(preview)
         else:
@@ -254,12 +265,13 @@ def generate_manifest_record(
                 relative_path=_relative_capture_path(path, project_root),
                 bytes=os.path.getsize(path),
                 mimetype=f"image/{config.encoding}",
-                sha256=compute_sha256(path)
+                sha256=compute_sha256(path),
+                rotate_deg=rotate_deg,
             ))
             # A RAW master's preview is the image Fisqua's pipeline reads
             # (exchange contract 1.1, section 4), so its digest is recorded
             # here, with the master's, rather than in a record of its own.
-            preview = _preview_file(path, role, project_root)
+            preview = _preview_file(path, role, project_root, rotate_deg)
             if preview is not None:
                 files.append(preview)
     
