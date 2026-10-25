@@ -100,14 +100,19 @@ def run_migrations_online() -> None:
         poolclass=pool.NullPool,
     )
 
+    from app.core.db import sqlite_foreign_keys_off
+
     with connectable.connect() as connection:
         context.configure(
             connection=connection, 
             target_metadata=target_metadata
         )
 
-        with context.begin_transaction():
-            context.run_migrations()
+        # On SQLite, batch rebuilds of a referenced table must not fire the
+        # referencing tables' ON DELETE actions (app.core.db.sqlite_foreign_keys_off).
+        with sqlite_foreign_keys_off(connection):
+            with context.begin_transaction():
+                context.run_migrations()
 
 
 if context.is_offline_mode():

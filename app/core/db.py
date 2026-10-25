@@ -1,3 +1,4 @@
+from contextlib import contextmanager
 from typing import Generator
 
 from sqlalchemy import create_engine
@@ -68,3 +69,29 @@ def init_db() -> None:
 	# Note: Tables are created via Alembic migrations, not create_all()
 	# Run: alembic upgrade head
 
+
+
+@contextmanager
+def sqlite_foreign_keys_off(connection):
+	"""Turn SQLite's foreign key enforcement off around migrations, and back on after if it was on.
+
+	Alembic's batch mode rebuilds a SQLite table (create a copy, copy the
+	rows, DROP the original, rename), and with enforcement on the DROP fires
+	every ON DELETE action of the tables that reference it: offsite_objects
+	links to record_images would be set NULL and camera_settings and
+	exif_data rows deleted. The pragma cannot change inside a transaction,
+	so this runs before alembic/env.py begins one, as Alembic's batch
+	documentation describes. A no-op on any other dialect.
+	"""
+	if connection.dialect.name != "sqlite":
+		yield
+		return
+	was_on = connection.exec_driver_sql("PRAGMA foreign_keys").scalar()
+	connection.exec_driver_sql("PRAGMA foreign_keys=OFF")
+	connection.commit()
+	try:
+		yield
+	finally:
+		if was_on:
+			connection.exec_driver_sql("PRAGMA foreign_keys=ON")
+			connection.commit()

@@ -18,7 +18,10 @@ applies it (app.core.fisqua_decisions).
   entry offered, which keeps a final volume polled until it is read.
 
 Nothing is backfilled. Written with batch_alter_table so it also runs on
-SQLite. Downgrade drops the eight columns, and with them the corrections and
+SQLite, where it rebuilds record_images: alembic/env.py runs it with foreign
+keys off so the rebuild fires no ON DELETE action of the tables that
+reference record_images, and the migration refuses to run on SQLite with
+them on. Downgrade drops the eight columns, and with them the corrections and
 the record of which set was applied; the statuses and rejections the sets
 wrote stay.
 """
@@ -35,7 +38,26 @@ branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 
 
+def _refuse_rebuild_with_foreign_keys_on() -> None:
+    """On SQLite, refuse to rebuild record_images while foreign keys are enforced.
+
+    batch_alter_table rebuilds the table there, and the DROP of the original
+    would set offsite_objects.record_image_id to NULL and delete the
+    camera_settings and exif_data rows. alembic/env.py turns enforcement off
+    before it begins the transaction (app.core.db.sqlite_foreign_keys_off);
+    a caller that has not is stopped here rather than losing those rows.
+    PostgreSQL alters the table in place and is not affected.
+    """
+    bind = op.get_bind()
+    if bind.dialect.name == 'sqlite' and bind.exec_driver_sql('PRAGMA foreign_keys').scalar():
+        raise RuntimeError(
+            "record_images cannot be rebuilt on SQLite with foreign keys enforced: the rebuild would "
+            "fire the ON DELETE actions of offsite_objects, camera_settings and exif_data. Run the "
+            "migration through alembic/env.py, which turns foreign keys off outside the transaction.")
+
+
 def upgrade() -> None:
+    _refuse_rebuild_with_foreign_keys_on()
     with op.batch_alter_table('record_images') as batch:
         batch.add_column(sa.Column('rotation_correction_quarter_turns', sa.Integer(), nullable=True))
         batch.create_check_constraint(
@@ -52,6 +74,7 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
+    _refuse_rebuild_with_foreign_keys_on()
     with op.batch_alter_table('fisqua_status') as batch:
         for name in ('decisions_offered_id', 'decisions_stale_id', 'decisions_report', 'decisions_manifest_id',
                      'decisions_applied_at', 'decisions_decided_at', 'decisions_id'):

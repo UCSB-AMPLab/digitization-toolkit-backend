@@ -147,3 +147,100 @@ def test_the_migration_upgrades_and_downgrades_on_postgresql(backend_root):
         with admin.begin() as conn:
             conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
         admin.dispose()
+
+
+# ---------------------------------------------------------------------------
+# SQLite with foreign keys enforced: the batch rebuild of record_images
+# ---------------------------------------------------------------------------
+
+def _fk_engine(path):
+    engine = sa.create_engine(f"sqlite:///{path}")
+
+    @sa.event.listens_for(engine, "connect")
+    def _on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+    return engine
+
+
+def _referenced(engine):
+    """record_images with rows that offsite_objects, camera_settings and exif_data reference."""
+    md = sa.MetaData()
+    sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
+    sa.Table("fisqua_status", md, sa.Column("collection_id", sa.Integer, primary_key=True),
+             sa.Column("status_checked_at", sa.DateTime, nullable=False))
+    sa.Table("offsite_objects", md, sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("record_image_id", sa.Integer, sa.ForeignKey("record_images.id", ondelete="SET NULL")))
+    for name in ("camera_settings", "exif_data"):
+        sa.Table(name, md, sa.Column("id", sa.Integer, primary_key=True),
+                 sa.Column("record_image_id", sa.Integer,
+                           sa.ForeignKey("record_images.id", ondelete="CASCADE"), nullable=False))
+    md.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO record_images (id) VALUES (1), (2)"))
+        conn.execute(sa.text("INSERT INTO offsite_objects (id, record_image_id) VALUES (1, 1), (2, 2)"))
+        conn.execute(sa.text("INSERT INTO camera_settings (id, record_image_id) VALUES (1, 1)"))
+        conn.execute(sa.text("INSERT INTO exif_data (id, record_image_id) VALUES (1, 2)"))
+
+
+def _references(engine):
+    with engine.begin() as conn:
+        return (conn.execute(sa.text("SELECT id, record_image_id FROM offsite_objects ORDER BY id")).all(),
+                conn.execute(sa.text("SELECT count(*) FROM camera_settings")).scalar(),
+                conn.execute(sa.text("SELECT count(*) FROM exif_data")).scalar())
+
+
+def _run_as_env(engine, fn):
+    """As alembic/env.py runs a migration: foreign keys off on SQLite, outside the transaction."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.core.db import sqlite_foreign_keys_off
+
+    with engine.connect() as conn:
+        with sqlite_foreign_keys_off(conn):
+            with conn.begin():
+                with Operations.context(MigrationContext.configure(conn)):
+                    fn()
+
+
+@pytest.mark.unit
+def test_the_rebuild_keeps_every_referencing_row_when_run_as_env_runs_it(backend_root, tmp_path):
+    engine = _fk_engine(tmp_path / "fk.db")
+    try:
+        _referenced(engine)
+        before = _references(engine)
+        mod = _load(backend_root)
+        _run_as_env(engine, mod.upgrade)
+        assert _references(engine) == before == ([(1, 1), (2, 2)], 1, 1)
+        _run_as_env(engine, mod.downgrade)
+        assert _references(engine) == before
+        with engine.connect() as conn:  # enforcement is back on afterwards
+            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.unit
+def test_the_migration_refuses_to_rebuild_with_foreign_keys_enforced(backend_root, tmp_path):
+    """Run inside a transaction with enforcement on, it stops rather than let the DROP fire FK actions."""
+    engine = _fk_engine(tmp_path / "fk.db")
+    try:
+        _referenced(engine)
+        before = _references(engine)
+        with pytest.raises(RuntimeError, match="foreign keys"):
+            _run(engine, _load(backend_root).upgrade)
+        assert _references(engine) == before
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.unit
+def test_sqlite_foreign_keys_off_leaves_other_dialects_alone():
+    from unittest import mock
+
+    from app.core.db import sqlite_foreign_keys_off
+    conn = mock.MagicMock()
+    conn.dialect.name = "postgresql"
+    with sqlite_foreign_keys_off(conn):
+        pass
+    conn.exec_driver_sql.assert_not_called()
