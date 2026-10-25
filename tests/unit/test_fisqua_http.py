@@ -17,7 +17,7 @@ import httpx
 import pytest
 
 from tests.unit.test_capture_manifest_export import TENANT, _as, tenant, vol  # noqa: F401
-from tests.unit.test_fisqua_outbox import TOKEN, _handover, _rows, fisqua  # noqa: F401
+from tests.unit.test_fisqua_outbox import OTHER_TOKEN, TOKEN, _handover, _rows, fisqua  # noqa: F401
 
 BASE = "https://fisqua.test"
 
@@ -142,16 +142,44 @@ def test_409_id_reused_is_refused(db_session, queued):
 
 
 @pytest.mark.unit
-def test_409_with_a_bare_rule_is_refused(db_session, queued):
-    _send(db_session, Server(httpx.Response(409, json={"rule": "id-reused"})))
+def test_409_with_any_problems_is_refused(db_session, queued):
+    """The supersede refusal once a run has started on the older manifest comes as a 409 with problems."""
+    problems = [{"rule": "run-started", "message": "A run has started on the volume's manifest."}]
+    _send(db_session, Server(httpx.Response(409, json={"problems": problems})))
     row = _rows(db_session, queued.col)[0]
-    assert row.state == "refused" and row.problems == [{"rule": "id-reused", "message": "Fisqua has this manifest id already."}]
+    assert row.state == "refused" and row.refusal == "fisqua" and row.problems == problems
 
 
 @pytest.mark.unit
-def test_another_409_is_retried(db_session, queued):
-    _send(db_session, Server(httpx.Response(409, json={"rule": "something-else"})))
+@pytest.mark.parametrize("body", [{"rule": "id-reused"}, {"problems": []}, None])
+def test_409_without_problems_is_retried(db_session, queued, body):
+    answer = httpx.Response(409, json=body) if body is not None else httpx.Response(409)
+    _send(db_session, Server(answer))
     assert _rows(db_session, queued.col)[0].state == "failed"
+
+
+@pytest.mark.unit
+def test_400_with_problems_is_refused(db_session, queued):
+    problems = [{"rule": "malformed", "message": "volumes[0].records is not a list"}]
+    _send(db_session, Server(httpx.Response(400, json={"problems": problems})))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.problems == problems
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [{"error": "bad"}, {"problems": []}, None])
+def test_400_without_problems_is_retried(db_session, queued, body):
+    answer = httpx.Response(400, json=body) if body is not None else httpx.Response(400)
+    _send(db_session, Server(answer))
+    assert _rows(db_session, queued.col)[0].state == "failed"
+
+
+@pytest.mark.unit
+def test_422_reference_code_is_refused(db_session, queued):
+    problems = [{"rule": "reference-code", "message": "The volume has no reference code."}]
+    _send(db_session, Server(httpx.Response(422, json={"problems": problems})))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.problems[0]["rule"] == "reference-code"
 
 
 @pytest.mark.unit
@@ -164,8 +192,7 @@ def test_413_is_refused(db_session, queued):
 @pytest.mark.unit
 @pytest.mark.parametrize("answer", [
     httpx.Response(429), httpx.Response(500), httpx.Response(502), httpx.Response(503),
-    httpx.ConnectError("refused"), httpx.ReadTimeout("slow"), httpx.Response(404),
-    httpx.Response(302, headers={"Location": "https://elsewhere.test/"}),
+    httpx.ConnectError("refused"), httpx.ReadTimeout("slow"), httpx.Response(418),
 ])
 def test_transient_answers_are_retried_with_backoff(db_session, queued, monkeypatch, answer):
     from app.core import config
@@ -178,10 +205,14 @@ def test_transient_answers_are_retried_with_backoff(db_session, queued, monkeypa
 
 
 @pytest.mark.unit
-def test_a_redirect_is_not_followed(db_session, queued):
-    server = Server(httpx.Response(307, headers={"Location": "https://elsewhere.test/x"}))
-    _send(db_session, server)
+@pytest.mark.parametrize("code", [301, 302, 307, 308])
+def test_a_redirect_is_not_followed_and_stops_the_unit(db_session, queued, code):
+    from app.core.fisqua_outbox import config_error
+    server = Server(httpx.Response(code, headers={"Location": "https://elsewhere.test/x"}))
+    assert _send(db_session, server)["status"] == "config_error"
     assert len(server.requests) == 1
+    assert config_error()["status_code"] == code
+    assert _rows(db_session, queued.col)[0].state == "ready"
 
 
 @pytest.mark.unit
@@ -232,54 +263,88 @@ def test_a_repeated_id_after_a_crash_is_sent_again_and_takes_the_original_answer
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-@pytest.mark.parametrize("code", [401, 403])
-def test_an_auth_refusal_stops_the_unit_until_the_token_changes(client, db_session, queued, monkeypatch, code, caplog):
+@pytest.mark.parametrize("code", [401, 403, 404, 302])
+def test_a_configuration_error_stops_the_unit_until_the_token_changes(client, db_session, queued, monkeypatch, code, caplog):
     from pydantic import SecretStr
 
     from app.core import config
-    from app.core.fisqua_outbox import auth_error
+    from app.core.fisqua_outbox import config_error
     caplog.set_level(logging.DEBUG)
     server = Server(httpx.Response(code, json={"error": "bad token"}))
     result = _send(db_session, server)
-    assert result["status"] == "auth_error"
+    assert result["status"] == "config_error"
     row = _rows(db_session, queued.col)[0]
     assert row.state == "ready" and row.attempts == 0
-    stop = auth_error()
+    stop = config_error()
     assert stop["status_code"] == code and stop["at"] is not None
-    assert len(stop["token_fingerprint"]) == 8
+    assert len(stop["config_fingerprint"]) == 8
+    assert stop["reason"]
 
     # Nothing is sent or polled while the token is the one refused, across a restart too.
     server = Server(_ok())
-    assert _send(db_session, server)["status"] == "auth_error"
-    assert _poll(db_session, server)["status"] == "auth_error"
+    assert _send(db_session, server)["status"] == "config_error"
+    assert _poll(db_session, server)["status"] == "config_error"
     assert server.requests == []
 
     # The volume page and the system panel show it.
     body = _as(client, "reviewer").get(f"/collections/{queued.col.id}/offsite").json()
-    assert body["fisqua"]["auth_error"]["status_code"] == code
+    assert body["fisqua"]["config_error"]["status_code"] == code
     system = _as(client, "reviewer").get("/system/catalogue-backup").json()
-    assert system["fisqua"]["auth_error"]["status_code"] == code
+    assert system["fisqua"]["config_error"]["status_code"] == code
     assert system["fisqua"]["configured"] is True
 
     # A new token resumes sending.
-    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr("a-new-token-0000"))
-    assert auth_error() is None
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(OTHER_TOKEN))
+    assert config_error() is None
     server = Server(_ok())
     _send(db_session, server)
     assert _rows(db_session, queued.col)[0].state == "delivered"
-    assert server.requests[0].headers["Authorization"] == "Bearer a-new-token-0000"
+    assert server.requests[0].headers["Authorization"] == f"Bearer {OTHER_TOKEN}"
 
     import hashlib
     full_hash = hashlib.sha256(TOKEN.encode()).hexdigest()
+    assert TOKEN not in str(stop) and full_hash not in str(stop)
     assert TOKEN not in caplog.text and full_hash not in caplog.text
 
 
 @pytest.mark.unit
-def test_a_401_on_the_poll_also_stops_the_unit(db_session, queued):
-    from app.core.fisqua_outbox import auth_error
+@pytest.mark.parametrize("code", [401, 403, 404, 307])
+def test_a_configuration_error_on_the_poll_also_stops_the_unit(db_session, queued, code):
+    from app.core.fisqua_outbox import config_error
     _send(db_session, Server(_ok()))
-    assert _poll(db_session, Server(httpx.Response(401)))["status"] == "auth_error"
-    assert auth_error()["status_code"] == 401
+    assert _poll(db_session, Server(httpx.Response(code)))["status"] == "config_error"
+    assert config_error()["status_code"] == code
+    server = Server(_ok())
+    assert _send(db_session, server)["status"] == "config_error"
+    assert server.requests == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("setting,value", [("FISQUA_ENV", "production"),
+                                           ("FISQUA_BASE_URL", "https://fisqua.dev.test")])
+def test_a_configuration_error_clears_when_the_environment_or_base_url_changes(
+        db_session, queued, monkeypatch, setting, value):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _send(db_session, Server(httpx.Response(404)))
+    assert config_error() is not None
+    monkeypatch.setattr(config.settings, setting, value)
+    assert config_error() is None
+    _send(db_session, Server(_ok()))
+    assert _rows(db_session, queued.col)[0].state == "delivered"
+
+
+@pytest.mark.unit
+def test_the_fingerprint_is_of_env_base_url_and_token_together(fisqua, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_fingerprint
+    first = config_fingerprint()
+    monkeypatch.setattr(config.settings, "FISQUA_BASE_URL", "https://x.test")
+    second = config_fingerprint()
+    monkeypatch.setattr(config.settings, "FISQUA_ENV", "production")
+    third = config_fingerprint()
+    assert len({first, second, third}) == 3
+    assert all(len(f) == 8 for f in (first, second, third))
 
 
 @pytest.mark.unit
@@ -287,9 +352,9 @@ def test_the_auth_file_holds_no_token_or_full_hash(db_session, queued):
     import hashlib
 
     from app.core import config
-    from app.core.fisqua_outbox import AUTH_ERROR_FILE
+    from app.core.fisqua_outbox import CONFIG_ERROR_FILE
     _send(db_session, Server(httpx.Response(401)))
-    text = (config.settings.data_dir / AUTH_ERROR_FILE).read_text()
+    text = (config.settings.data_dir / CONFIG_ERROR_FILE).read_text()
     assert TOKEN not in text and hashlib.sha256(TOKEN.encode()).hexdigest() not in text
 
 
@@ -327,6 +392,25 @@ def test_status_also_reads_an_object_holding_the_volumes(db_session, queued):
         {"ref": queued.col.external_id, "manifestId": row.manifest_id, "state": "published", "problems": []}]})))
     db_session.expire_all()
     assert db_session.get(FisquaStatus, queued.col.id).status == "published"
+
+
+@pytest.mark.unit
+def test_unknown_is_not_final_and_is_shown(client, db_session, queued):
+    from app.models.fisqua import FisquaStatus
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, queued.col)[0]
+    ref = queued.col.external_id
+    unknown = httpx.Response(200, json={"volumes": [{"ref": ref, "state": "unknown", "problems": []}]})
+    server = Server(unknown, unknown)
+    _poll(db_session, server)
+    _poll(db_session, server)
+    assert len(server.requests) == 2  # polled again
+    db_session.expire_all()
+    assert db_session.get(FisquaStatus, queued.col.id).status == "unknown"
+    body = _as(client, "reviewer").get(f"/collections/{queued.col.id}/offsite").json()
+    assert body["fisqua"]["status"]["status"] == "unknown"
+    assert row.manifest_id  # the row's manifest is untouched by an unknown answer
+    assert _rows(db_session, queued.col)[0].state == "delivered"
 
 
 @pytest.mark.unit

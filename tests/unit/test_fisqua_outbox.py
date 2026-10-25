@@ -18,8 +18,10 @@ import pytest
 
 from tests.unit.test_capture_manifest_export import TENANT, Volume, _as, tenant, vol  # noqa: F401
 
-TOKEN = "fisqua-secret-token-8c1f2e"
+# The shape of a Fisqua unit token: 64 lowercase hex characters, opaque to the unit.
+TOKEN = "5e0c9a7b1d3f42e8a6b0c4d2e9f1a3b5c7d9e0f2a4b6c8d0e1f3a5b7c9d1e3f5"
 ENV = "staging"
+OTHER_TOKEN = "a1b2c3d4e5f60718293a4b5c6d7e8f90a1b2c3d4e5f60718293a4b5c6d7e8f90"
 
 
 @pytest.fixture
@@ -109,6 +111,13 @@ def _status(*entries):
 # ---------------------------------------------------------------------------
 # Enqueue at handover
 # ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_test_token_has_the_shape_of_a_fisqua_token():
+    import re
+    assert re.fullmatch(r"[0-9a-f]{64}", TOKEN)
+    assert re.fullmatch(r"[0-9a-f]{64}", OTHER_TOKEN)
+
 
 @pytest.mark.unit
 def test_a_handover_enqueues_a_row_waiting_for_upload(client, db_session, vol, fisqua):
@@ -882,7 +891,7 @@ def test_offsite_state_carries_the_outbox_and_the_status(client, db_session, vol
                           "last_attempt_at", "last_error", "refusal", "problems", "response",
                           "external_id", "delivered_at"}
     assert fq["status"]["status"] == "registered"
-    assert fq["environment"] == ENV and fq["auth_error"] is None
+    assert fq["environment"] == ENV and fq["config_error"] is None
     assert set(fq["status"]) == {"status", "status_at", "status_checked_at", "problems", "manifest_id"}
 
 

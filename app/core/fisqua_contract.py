@@ -1,10 +1,12 @@
 """Every name the unit uses on Fisqua's side of the exchange (contract 1.2), in one place.
 
-Hosts, paths, query parameters, answer fields, rule ids and status names.
-Fisqua's proposal for 1.2 is firm but its final text is still to come, so a
-rename there should be an edit here and nowhere else. Juan ruled the token,
-the supersede rule, the states and the polling cadence; the rest is
-Fisqua's proposal.
+Hosts, paths, query parameters, answer fields, rule ids, status names, and
+which HTTP answers mean what. Fisqua has answered the open points; the text
+is final once Juan signs it, so a rename there should be an edit here and
+nowhere else.
+
+The unit's token is 64 lowercase hex characters, opaque to the unit: it is
+sent as it is and never parsed.
 """
 
 CONTRACT_VERSION = "1.2"
@@ -33,14 +35,36 @@ F_PROBLEMS = "problems"
 F_RULE = "rule"
 F_REF = "ref"
 F_ENTERED_AT = "enteredAt"
-# The status answer is a list of volumes, or an object holding it under this key.
+# The status answer is an object holding the volumes under this key (a bare
+# list is still accepted).
 F_VOLUMES = "volumes"
 
+# Rules Fisqua names in problems. The unit acts on none of them by name: a
+# 400 or 409 with problems is a refusal whatever the rule.
 RULE_ID_REUSED = "id-reused"
+RULE_REFERENCE_CODE = "reference-code"  # 422: the manifest's volume has no reference code
 # Not Fisqua's: the problem the unit records for a 413 with no problems in it.
 RULE_TOO_LARGE = "payload-too-large"
 
+# How the unit reads an HTTP status from Fisqua (app.core.fisqua_http).
+# Refused, final, for that manifest id.
+REFUSED_ALWAYS = (413, 422)
+# Refused, final, when the body holds a non-empty `problems` array (400: a
+# malformed body; 409: the id reused, or a newer manifest for a volume a run
+# has started on). Without problems: retried.
+REFUSED_WITH_PROBLEMS = (400, 409)
+# A configuration error: sending and polling stop for the whole unit until
+# the environment, the base URL or the token changes. Fisqua sends no
+# redirect, and following one would carry the token elsewhere, so every 3xx
+# counts here too.
+CONFIG_ERROR = (401, 403, 404)
+CONFIG_ERROR_REASONS = {401: "token", 403: "token", 404: "not_found"}
+REDIRECT_REASON = "redirect"
+
 STATES = ("received", "registered", "queued", "running", "review_pending",
-          "published", "refused", "superseded", "failed")
+          "published", "refused", "superseded", "failed", "unknown")
 # A volume in one of these is not polled again for the same manifest.
+# `unknown` (Fisqua does not know the volume; usually the manifest was not
+# received) is not final: it is shown and polled again.
 FINAL_STATES = ("published", "refused", "superseded")
+STATE_UNKNOWN = "unknown"

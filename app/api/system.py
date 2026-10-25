@@ -146,8 +146,8 @@ def get_catalogue_backup_state(
         **hold_state(),
         # Per-volume counts are on GET /collections/{id}/offsite.
         "images":           unit_upload_summary(db),
-        # Delivery to Fisqua: configured, environment, the unit-level auth
-        # error while Fisqua refuses the token, the last send and poll.
+        # Delivery to Fisqua: configured, environment, the unit-level configuration
+        # error while Fisqua refuses the configuration, the last send and poll.
         "fisqua":           unit_fisqua_summary(),
     }
 

@@ -5,19 +5,19 @@ to whatever host a redirect named), explicit timeouts. The token goes in
 the Authorization header only and is never part of a URL, an error text or
 a result. The names come from app.core.fisqua_contract.
 
-Answers to POST of a manifest:
+Answers to POST of a manifest (the codes are in fisqua_contract):
 
     2xx with a volumeId          delivered (Fisqua's state kept)
-    401, 403                     auth_error: the unit stops sending
-    422                          refused, with Fisqua's problems
-    409 with rule id-reused      refused
-    413                          refused
+    401, 403, 404, any 3xx       config_error: the unit stops sending and polling
+    422, 413                     refused, final, with Fisqua's problems
+    400, 409 with problems       refused, final, with Fisqua's problems
+    400, 409 without problems    error, retried
     429, 5xx                     error, retried; Retry-After is a floor
     anything else                error, retried
     timeout, connection error    error, retried
 
-Answers to GET of the status: 2xx with the volumes, 401/403 auth_error, the
-rest error.
+Answers to GET of the status: 2xx with the volumes, the same configuration
+errors, the rest error.
 """
 
 from datetime import datetime, timezone
@@ -62,26 +62,26 @@ def _json(response: httpx.Response) -> Any:
         return None
 
 
-def _rules(body: Any) -> set:
-    rules = set()
-    if isinstance(body, dict):
-        if isinstance(body.get(fc.F_RULE), str):
-            rules.add(body[fc.F_RULE])
-        for problem in body.get(fc.F_PROBLEMS) or []:
-            if isinstance(problem, dict) and isinstance(problem.get(fc.F_RULE), str):
-                rules.add(problem[fc.F_RULE])
-    return rules
-
-
 def _problems(body: Any) -> Optional[list]:
-    if isinstance(body, dict) and isinstance(body.get(fc.F_PROBLEMS), list):
+    """The body's `problems` array when it is a non-empty list, else None."""
+    if isinstance(body, dict) and isinstance(body.get(fc.F_PROBLEMS), list) and body[fc.F_PROBLEMS]:
         return body[fc.F_PROBLEMS]
     return None
 
 
-def _auth(code: int, body: Any) -> TransportResult:
-    return TransportResult(outcome="auth_error", response=body, status_code=code,
-                           error=f"Fisqua refused this unit's token (HTTP {code})")
+def _config_error(code: int, body: Any) -> Optional[TransportResult]:
+    """A configuration error for 401, 403, 404 and every 3xx; None for any other code."""
+    if code in fc.CONFIG_ERROR:
+        reason = fc.CONFIG_ERROR_REASONS[code]
+    elif 300 <= code < 400:
+        reason = fc.REDIRECT_REASON
+    else:
+        return None
+    text = {"token": "Fisqua refused this unit's token",
+            "not_found": "Fisqua has no such endpoint for this unit",
+            fc.REDIRECT_REASON: "Fisqua answered with a redirect, which is not followed"}[reason]
+    return TransportResult(outcome="config_error", response=body, status_code=code,
+                           reason=reason, error=f"{text} (HTTP {code})")
 
 
 def _transient(response: httpx.Response, body: Any) -> TransportResult:
@@ -102,18 +102,17 @@ def read_send_answer(response: httpx.Response) -> TransportResult:
         return TransportResult(outcome="delivered", response=body, status_code=code,
                                external_id=str(volume_id),
                                status=state if isinstance(state, str) else None)
-    if code in (401, 403):
-        return _auth(code, body)
-    if code == 422:
-        return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body))
-    if code == 409 and fc.RULE_ID_REUSED in _rules(body):
-        return TransportResult(outcome="refused", response=body, status_code=code,
-                               problems=_problems(body) or [{fc.F_RULE: fc.RULE_ID_REUSED,
-                                                             "message": "Fisqua has this manifest id already."}])
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
     if code == 413:
         return TransportResult(outcome="refused", response=body, status_code=code,
                                problems=_problems(body) or [{fc.F_RULE: fc.RULE_TOO_LARGE,
                                                              "message": "Fisqua refused the manifest as too large."}])
+    if code in fc.REFUSED_ALWAYS:
+        return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body))
+    if code in fc.REFUSED_WITH_PROBLEMS and _problems(body) is not None:
+        return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body))
     return _transient(response, body)
 
 
@@ -127,8 +126,9 @@ def read_status_answer(response: httpx.Response) -> TransportResult:
                                    error=f"Fisqua answered HTTP {code} without a list of volumes")
         return TransportResult(outcome="status", response=body, status_code=code,
                                volumes=[v for v in volumes if isinstance(v, dict)])
-    if code in (401, 403):
-        return _auth(code, body)
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
     return _transient(response, body)
 
 
