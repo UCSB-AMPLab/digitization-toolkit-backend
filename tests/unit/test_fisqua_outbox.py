@@ -1115,3 +1115,100 @@ def test_the_token_never_reaches_logs_rows_or_responses(client, db_session, vol,
     texts += [repr(config.settings), str(config.settings.model_dump())]
     for text in texts:
         assert TOKEN not in text
+
+
+# ---------------------------------------------------------------------------
+# A row taken back or superseded while it is being sent
+# ---------------------------------------------------------------------------
+
+class _DuringSend(FakeTransport):
+    """Runs `during` while the manifest is being sent, then answers as scripted."""
+
+    def __init__(self, during, **kw):
+        super().__init__(**kw)
+        self.during = during
+
+    def send_manifest(self, manifest):
+        self.during()
+        return super().send_manifest(manifest)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", ["error", "raise", "config_error"])
+def test_a_take_back_while_sending_withdraws_the_row_instead_of_retrying(client, db_session, vol, fisqua, answer):
+    from app.core.fisqua_outbox import TransportResult
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    sends = {"error": [TransportResult(outcome="error", error="timeout")],
+             "raise": [TimeoutError("read timed out")],
+             "config_error": [TransportResult(outcome="config_error", status_code=401, reason="token")]}[answer]
+    transport = _DuringSend(lambda: _take_back(client, vol.col), sends=sends)
+    _run(db_session, transport)
+    [row] = _rows(db_session, vol.col)
+    assert row.state == "withdrawn" and row.next_attempt_at is None
+    later = FakeTransport(sends=[_delivered()])
+    _run(db_session, later, now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=2))
+    assert later.sent == []
+
+
+@pytest.mark.unit
+def test_a_newer_handover_while_sending_supersedes_the_row(client, db_session, vol, fisqua):
+    from app.core.fisqua_outbox import TransportResult
+
+    def new_handover():
+        vol.record(status="captured")
+        _handover(client, vol.col)
+
+    _handover_first = vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, _DuringSend(new_handover, sends=[TransportResult(outcome="error", error="timeout")]))
+    rows = _rows(db_session, vol.col)
+    assert [r.state for r in rows] == ["superseded", "waiting_for_upload"]
+    assert _handover_first
+
+
+@pytest.mark.unit
+def test_a_row_delivered_while_a_take_back_came_stays_delivered(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, _DuringSend(lambda: _take_back(client, vol.col), sends=[_delivered()]))
+    [row] = _rows(db_session, vol.col)
+    assert row.state == "delivered" and row.cancel_requested is None
+
+
+@pytest.mark.unit
+def test_a_row_refused_while_a_take_back_came_stays_refused(client, db_session, vol, fisqua):
+    from app.core.fisqua_outbox import TransportResult
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, _DuringSend(lambda: _take_back(client, vol.col),
+                                 sends=[TransportResult(outcome="refused", problems=[{"rule": "x"}])]))
+    assert _rows(db_session, vol.col)[0].state == "refused"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("cancel", ["withdrawn", "superseded"])
+def test_a_row_left_sending_by_a_crash_after_a_cancel_takes_the_cancel(client, db_session, vol, fisqua, cancel):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport())
+    row = _rows(db_session, vol.col)[0]
+    row.state, row.cancel_requested = "sending", cancel
+    db_session.commit()
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    assert _rows(db_session, vol.col)[0].state == cancel
+    assert transport.sent == []
+
+
+@pytest.mark.unit
+def test_a_take_back_marks_a_sending_row_for_cancellation(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport())
+    row = _rows(db_session, vol.col)[0]
+    row.state = "sending"
+    db_session.commit()
+    _take_back(client, vol.col)
+    row = _rows(db_session, vol.col)[0]
+    assert (row.state, row.cancel_requested) == ("sending", "withdrawn")

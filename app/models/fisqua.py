@@ -76,6 +76,11 @@ class FisquaOutbox(Base):
     response = Column(JSON, nullable=True)
     external_id = Column(String(255), nullable=True)
     delivered_at = Column(DateTime, nullable=True)
+    # Set by a take-back (`withdrawn`) or a newer handover (`superseded`)
+    # while the row is `sending`, which they cannot change under the worker.
+    # The worker takes it as the row's state when the send ends in anything
+    # but delivered or refused, rather than scheduling a retry.
+    cancel_requested = Column(String(20), nullable=True)
 
     __table_args__ = (
         UniqueConstraint("manifest_id", name="fisqua_outbox_manifest_id_key"),
@@ -83,6 +88,8 @@ class FisquaOutbox(Base):
         CheckConstraint(REFUSAL_CHECK, name="check_fisqua_outbox_refusal"),
         CheckConstraint(DELIVERED_CHECK, name="check_fisqua_outbox_delivered"),
         CheckConstraint(ATTEMPTS_CHECK, name="check_fisqua_outbox_attempts"),
+        CheckConstraint("cancel_requested IS NULL OR cancel_requested IN ('withdrawn', 'superseded')",
+                        name="check_fisqua_outbox_cancel_requested"),
     )
 
 
@@ -110,3 +117,7 @@ class FisquaStatus(Base):
     decisions_manifest_id = Column(String(36), nullable=True)
     decisions_report = Column(JSON, nullable=True)
     decisions_stale_id = Column(String(255), nullable=True)
+    # The last decisionsId a status entry offered. While it is neither
+    # applied nor stale, the volume is polled even in a final state, so a
+    # set offered with the final status is not lost to a failed fetch.
+    decisions_offered_id = Column(String(255), nullable=True)

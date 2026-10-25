@@ -56,6 +56,7 @@ def upgrade() -> None:
         sa.Column('response', sa.JSON(), nullable=True),
         sa.Column('external_id', sa.String(length=255), nullable=True),
         sa.Column('delivered_at', sa.DateTime(), nullable=True),
+        sa.Column('cancel_requested', sa.String(length=20), nullable=True),
         sa.ForeignKeyConstraint(['collection_id'], ['collections.id'], ondelete='CASCADE'),
         sa.PrimaryKeyConstraint('id'),
         sa.UniqueConstraint('manifest_id', name='fisqua_outbox_manifest_id_key'),
@@ -69,6 +70,8 @@ def upgrade() -> None:
             "(state <> 'delivered' AND delivered_at IS NULL)",
             name='check_fisqua_outbox_delivered'),
         sa.CheckConstraint('attempts >= 0', name='check_fisqua_outbox_attempts'),
+        sa.CheckConstraint("cancel_requested IS NULL OR cancel_requested IN ('withdrawn', 'superseded')",
+                           name='check_fisqua_outbox_cancel_requested'),
     )
     op.create_index('ix_fisqua_outbox_id', 'fisqua_outbox', ['id'], unique=False)
     op.create_index('ix_fisqua_outbox_collection_id', 'fisqua_outbox', ['collection_id'], unique=False)

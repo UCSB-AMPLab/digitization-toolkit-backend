@@ -377,6 +377,7 @@ def enqueue_handover(db: Session, collection):
         .values(state="superseded", next_attempt_at=None)
         .execution_options(synchronize_session=False)
     )
+    _cancel_sending(db, collection.id, "superseded")
     if not fisqua_configured():
         return None
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
@@ -410,6 +411,57 @@ def withdraw_unsent(db: Session, collection_id: int) -> None:
         .values(state="withdrawn", next_attempt_at=None)
         .execution_options(synchronize_session=False)
     )
+    _cancel_sending(db, collection_id, "withdrawn")
+
+
+def _cancel_sending(db: Session, collection_id: int, state: str) -> None:
+    """Mark the volume's row being sent, if any, to become `state` unless the send delivers it. Does not commit.
+
+    The worker owns a `sending` row until the send ends, so the request asks
+    rather than writes the state: delivered or refused stand (Fisqua's
+    supersede rule handles a later manifest), anything else takes `state`
+    instead of a retry.
+    """
+    from app.models.fisqua import FisquaOutbox
+
+    db.execute(
+        update(FisquaOutbox)
+        .where(FisquaOutbox.collection_id == collection_id, FisquaOutbox.state == "sending")
+        .values(cancel_requested=state)
+        .execution_options(synchronize_session=False)
+    )
+
+
+def _end_send(db: Session, row_id: int, **values) -> Optional[str]:
+    """End a `sending` row that was not delivered or refused: `values`, or the state a cancel asked for.
+
+    Commits. Returns the state the row took (None if it was no longer
+    sending). One conditional UPDATE each way, so a cancel committed while
+    the answer was being read is not lost.
+    """
+    from app.models.fisqua import FisquaOutbox
+
+    done = db.execute(
+        update(FisquaOutbox)
+        .where(FisquaOutbox.id == row_id, FisquaOutbox.state == "sending",
+               FisquaOutbox.cancel_requested.is_(None))
+        .values(**values)
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    if done:
+        db.commit()
+        return values.get("state")
+    cancelled = db.execute(
+        update(FisquaOutbox)
+        .where(FisquaOutbox.id == row_id, FisquaOutbox.state == "sending",
+               FisquaOutbox.cancel_requested.isnot(None))
+        .values(state=FisquaOutbox.cancel_requested, next_attempt_at=None,
+                last_error=values.get("last_error"))
+        .execution_options(synchronize_session=False)
+    ).rowcount
+    state = db.query(FisquaOutbox.state).filter(FisquaOutbox.id == row_id).scalar() if cancelled else None
+    db.commit()
+    return state
 
 
 # ---------------------------------------------------------------------------
@@ -529,20 +581,21 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
 
     if answer.outcome == "delivered":
         if _move(db, row.id, "sending", state="delivered", delivered_at=now, response=answer.response,
-                 external_id=answer.external_id, last_error=None):
+                 external_id=answer.external_id, last_error=None, cancel_requested=None):
             _keep_status(db, row.collection_id, row.manifest_id, answer.status, None, None, now)
         result.delivered += 1
     elif answer.outcome == "config_error":
         # Not this manifest's fault: it goes back to ready, to be sent as it
         # is once the configuration is changed.
-        _move(db, row.id, "sending", state="ready", attempts=attempts - 1,
-              last_error=scrub(answer.error or "Fisqua refused this unit's configuration"))
+        _end_send(db, row.id, state="ready", attempts=attempts - 1,
+                  last_error=scrub(answer.error or "Fisqua refused this unit's configuration"))
         record_config_error(answer.status_code, answer.reason, now)
         result.status = "config_error"
         return False
     elif answer.outcome == "refused":
         _move(db, row.id, "sending", state="refused", refusal="fisqua", response=answer.response,
-              problems=answer.problems, last_error=scrub(answer.error) if answer.error else None)
+              problems=answer.problems, last_error=scrub(answer.error) if answer.error else None,
+              cancel_requested=None)
         result.refused += 1
         logger.warning("Fisqua refused manifest %s of volume %s", row.manifest_id, row.collection_id)
     else:
@@ -550,11 +603,15 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
         wait = retry_delay(attempts)
         if answer.retry_after is not None:
             wait = max(wait, timedelta(seconds=answer.retry_after))
-        _move(db, row.id, "sending", state="failed", last_error=error, response=answer.response,
-              next_attempt_at=now + wait)
-        result.failed += 1
-        logger.warning("Sending manifest %s of volume %s to Fisqua failed (attempt %s): %s",
-                       row.manifest_id, row.collection_id, attempts, error)
+        ended = _end_send(db, row.id, state="failed", last_error=error, response=answer.response,
+                          next_attempt_at=now + wait)
+        if ended == "failed":
+            result.failed += 1
+            logger.warning("Sending manifest %s of volume %s to Fisqua failed (attempt %s): %s",
+                           row.manifest_id, row.collection_id, attempts, error)
+        else:
+            logger.info("Sending manifest %s of volume %s to Fisqua failed after it was %s; not retried",
+                        row.manifest_id, row.collection_id, ended)
     return True
 
 
@@ -598,8 +655,8 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             # may not have it; it is sent again with the same manifest id,
             # and Fisqua answers a repeated id with its original answer.
             for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
-                _move(db, row_id, "sending", state="failed", next_attempt_at=now,
-                      last_error="interrupted while sending")
+                _end_send(db, row_id, state="failed", next_attempt_at=now,
+                          last_error="interrupted while sending")
 
             for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
                         .order_by(FisquaOutbox.id).all()):
@@ -670,8 +727,15 @@ def volumes_to_poll(db: Session) -> dict:
               .subquery())
     # COALESCE, so a status row with no state or no manifest id reads as not
     # final rather than as NULL, which NOT would also drop.
+    # A set offered and neither applied nor seen stale keeps the volume
+    # polled whatever its state, so a fetch that failed is tried again.
+    offered = FisquaStatus.decisions_offered_id
+    unread = and_(offered.isnot(None),
+                  offered != func.coalesce(FisquaStatus.decisions_id, ""),
+                  offered != func.coalesce(FisquaStatus.decisions_stale_id, ""))
     final = and_(func.coalesce(FisquaStatus.status, "").in_(fc.FINAL_STATES),
-                 func.coalesce(FisquaStatus.manifest_id, "") == FisquaOutbox.manifest_id)
+                 func.coalesce(FisquaStatus.manifest_id, "") == FisquaOutbox.manifest_id,
+                 not_(unread))
     # The reference code as capture_manifest.reference_code gives it: the
     # recorded external_id, else the stem.
     ref = func.coalesce(func.nullif(func.trim(Collection.external_id), ""), Collection.filename_stem)
@@ -747,6 +811,7 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                     decisions_id = entry.get(fc.F_DECISIONS_ID)
                     if isinstance(decisions_id, str) and decisions_id:
                         offered[cid] = (ref, decisions_id)
+                        _keep_offered(db, cid, decisions_id[:255])
                     if manifest_id is not None:
                         lost = (db.query(FisquaOutbox.id)
                                 .filter(FisquaOutbox.collection_id == cid,
@@ -767,6 +832,15 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             logger.exception("The Fisqua status poll raised")
             result["status"] = "error"
     return result
+
+
+def _keep_offered(db: Session, collection_id: int, decisions_id: str) -> None:
+    from app.models.fisqua import FisquaStatus
+
+    status = db.get(FisquaStatus, collection_id)
+    if status is not None and status.decisions_offered_id != decisions_id:
+        status.decisions_offered_id = decisions_id
+        db.commit()
 
 
 def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, result: dict) -> bool:

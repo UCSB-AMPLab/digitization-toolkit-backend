@@ -488,3 +488,102 @@ def test_the_token_never_reaches_the_applied_report(client, db_session, handed, 
     assert TOKEN not in text and TOKEN not in caplog.text
     from app.models.record import RecordRejection
     assert all(TOKEN not in (r.comment or "") for r in db_session.query(RecordRejection).all())
+
+
+# ---------------------------------------------------------------------------
+# A set applies only to the handover it was made for
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_set_waits_while_a_newer_handover_is_not_yet_delivered(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a)])
+    # A new folio and a new handover: its manifest waits for upload.
+    vol.record(status="captured", upload=False)
+    _handover(client, vol.col)
+    assert _rows(db_session, vol.col)[-1].state == "waiting_for_upload"
+    result = _poll(db_session, fake)
+    assert result["decisions_applied"] == 0
+    assert _refresh(db_session, a).status == "in_review"
+    state = _decisions_state(client, vol.col)
+    assert state is None or state["decisions_id"] is None
+    # Not marked stale: read again next tick, while the newer handover is pending.
+    _poll(db_session, fake)
+    assert len(fake.decision_calls()) == 2
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("newer_state", ["ready", "sending", "failed"])
+def test_a_set_waits_for_any_pending_newer_row(client, db_session, handed, newer_state):
+    import uuid as _uuid
+
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    vol, (a, b), row, fake = handed
+    db_session.add(FisquaOutbox(collection_id=vol.col.id, manifest_id=str(_uuid.uuid4()), stem=vol.stem,
+                                state=newer_state, attempts=1 if newer_state == "failed" else 0,
+                                manifest={"id": "x"}, created_at=_now()))
+    db_session.commit()
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+
+
+@pytest.mark.unit
+def test_a_record_whose_images_changed_since_the_manifest_is_skipped(client, db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    # a is retaken after the manifest was delivered: its current images are new captures.
+    rec = _refresh(db_session, a)
+    vol.supersede(rec)
+    vol.capture(rec, ("left", "right"))
+    _decide(fake, row, [_reject(a), _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).count() == 0
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
+
+
+@pytest.mark.unit
+def test_the_images_compared_are_those_of_the_decided_manifest(db_session, handed):
+    vol, (a, b), row, fake = handed
+    listed = {i["captureId"] for r in row.manifest["volumes"][0]["records"] if r["captuaRecordId"] == a.id
+              for i in r["images"]}
+    current = {i.capture_id for i in _refresh(db_session, a).images if i.is_current}
+    assert listed == current and listed
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"
+
+
+# ---------------------------------------------------------------------------
+# A final state does not lose an offered set
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_final_volume_stays_polled_until_its_offered_set_is_read(client, db_session, handed):
+    from app.core.fisqua_outbox import volumes_to_poll
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a), _approve(b)])
+    fake.status["state"] = "published"
+    fake.decisions_answer = httpx.Response(503)
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert vol.stem in volumes_to_poll(db_session)
+
+    fake.decisions_answer = None
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"
+    assert vol.stem not in volumes_to_poll(db_session)
+
+
+@pytest.mark.unit
+def test_a_final_volume_whose_offered_set_is_stale_is_not_polled_again(client, db_session, handed):
+    from app.core.fisqua_outbox import volumes_to_poll
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a)])
+    fake.decisions["manifestId"] = "an-earlier-manifest"
+    fake.status["state"] = "published"
+    _poll(db_session, fake)
+    assert vol.stem not in volumes_to_poll(db_session)

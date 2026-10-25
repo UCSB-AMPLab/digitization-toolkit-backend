@@ -18,7 +18,7 @@ REVISION = "9b7087bd0bc5"
 MIGRATION_FILE = f"{REVISION}_add_fisqua_outbox.py"
 OUTBOX_COLUMNS = {"id", "collection_id", "manifest_id", "stem", "created_at", "state", "attempts",
                   "next_attempt_at", "last_attempt_at", "last_error", "refusal", "problems", "manifest",
-                  "response", "external_id", "delivered_at"}
+                  "response", "external_id", "delivered_at", "cancel_requested"}
 STATUS_COLUMNS = {"collection_id", "manifest_id", "status", "status_at", "status_checked_at", "problems"}
 
 
@@ -58,7 +58,8 @@ def _exercise(engine, mod):
     assert "fisqua_outbox_manifest_id_key" in {u["name"] for u in insp.get_unique_constraints("fisqua_outbox")}
     checks = {c["name"] for c in insp.get_check_constraints("fisqua_outbox")}
     assert {"check_fisqua_outbox_state", "check_fisqua_outbox_refusal",
-            "check_fisqua_outbox_delivered", "check_fisqua_outbox_attempts"} <= checks
+            "check_fisqua_outbox_delivered", "check_fisqua_outbox_attempts",
+            "check_fisqua_outbox_cancel_requested"} <= checks
 
     insert = sa.text(
         "INSERT INTO fisqua_outbox (collection_id, manifest_id, stem, created_at, state, attempts, refusal, delivered_at) "

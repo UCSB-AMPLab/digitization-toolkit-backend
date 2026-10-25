@@ -32,9 +32,16 @@ Per record, in one transaction, with the records' rows locked in id order
   the set gives it by captureId and role, in quarter-turns clockwise (1-3),
   or none when the set lists none for it. No file is touched.
 
+A set also waits, unapplied and not stale, while a newer handover of the
+volume is still on its way (an outbox row after the current one in
+waiting_for_upload, ready, sending or failed): the records may already be
+what that handover sends.
+
 Skipped and reported, with nothing changed for that record: a record not in
 the volume (or an id that is not one), a record that is `captured` (its
-volume taken back, or it was retaken), a decision that is neither approved
+volume taken back, or it was retaken), a record whose current images are not
+exactly those the decided manifest listed for it (`images_changed`: retaken
+since), a decision that is neither approved
 nor rejected, and a rejection that POST /records/{id}/reject would refuse
 (checked with the same RecordRejectRequest): a reason not in
 app.schemas.record.PREDEFINED_REJECTION_REASONS, or `other` with no note.
@@ -92,15 +99,46 @@ def _shown_id(value: Any):
     return parsed if parsed is not None else str(value)[:_ID_LIMIT]
 
 
+PENDING = ("waiting_for_upload", "ready", "sending", "failed")
+
+
 def current_manifest_id(db: Session, collection_id: int) -> Optional[str]:
     """The manifest id of the volume's newest delivered outbox row: its current handover."""
+    row = _current_row(db, collection_id)
+    return row[1] if row is not None else None
+
+
+def _current_row(db: Session, collection_id: int):
+    """(id, manifest id) of the volume's newest delivered outbox row, or None."""
     from app.models.fisqua import FisquaOutbox
 
-    return (db.query(FisquaOutbox.manifest_id)
+    return (db.query(FisquaOutbox.id, FisquaOutbox.manifest_id)
             .filter(FisquaOutbox.collection_id == collection_id, FisquaOutbox.state == "delivered")
             .order_by(FisquaOutbox.id.desc())
-            .limit(1)
-            .scalar())
+            .first())
+
+
+def _newer_pending(db: Session, collection_id: int, row_id: int) -> bool:
+    """Whether a handover after the current one is still on its way: a newer row not yet delivered or ended."""
+    from app.models.fisqua import FisquaOutbox
+
+    return db.query(FisquaOutbox.id).filter(
+        FisquaOutbox.collection_id == collection_id, FisquaOutbox.id > row_id,
+        FisquaOutbox.state.in_(PENDING)).first() is not None
+
+
+def _listed_captures(db: Session, row_id: int) -> dict:
+    """{record id: the capture ids the manifest listed for it}, from the manifest stored on the row."""
+    from app.models.fisqua import FisquaOutbox
+
+    manifest = db.query(FisquaOutbox.manifest).filter(FisquaOutbox.id == row_id).scalar() or {}
+    listed = {}
+    for volume in manifest.get("volumes") or []:
+        for record in volume.get("records") or []:
+            rid = _record_id(record.get("captuaRecordId"))
+            if rid is not None:
+                listed[rid] = {i.get("captureId") for i in record.get("images") or [] if isinstance(i, dict)}
+    return listed
 
 
 def _why_not(decision: dict) -> Optional[str]:
@@ -224,7 +262,17 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
 
     collection = db.get(Collection, collection_id)
     stem = collection.filename_stem if collection is not None else None
-    current = current_manifest_id(db, collection_id)
+    current_row = _current_row(db, collection_id)
+    current = current_row[1] if current_row is not None else None
+    if current is not None and body.get(fc.F_MANIFEST_ID) == current \
+            and _newer_pending(db, collection_id, current_row[0]):
+        # A later handover is on its way: the records may already be what
+        # it sends, not what this set decided. Not stale, since that
+        # handover may yet be withdrawn or refused; read again next tick.
+        db.rollback()
+        logger.info("Fisqua decisions %s for volume %s wait: a newer handover is not yet delivered",
+                    decisions_id, collection_id)
+        return {"status": "pending_handover", "decisions_id": decisions_id}
     if current is None or body.get(fc.F_MANIFEST_ID) != current:
         status.decisions_stale_id = decisions_id
         db.commit()
@@ -235,6 +283,7 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
         return {"status": "stale", "decisions_id": decisions_id}
 
     report = _empty_report()
+    listed = _listed_captures(db, current_row[0])
     decisions = [d for d in body[fc.F_RECORDS] if isinstance(d, dict)]
     ids = sorted({i for i in (_record_id(d.get(fc.F_CAPTUA_RECORD_ID)) for d in decisions) if i is not None})
     try:
@@ -265,6 +314,12 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
                 continue
             if rec.status == "captured":
                 skip("captured")
+                continue
+            # The decision is about the images Fisqua was sent. A record
+            # retaken since has others, and the decision is not theirs.
+            current_captures = {img.capture_id for img in rec.images if img.is_current}
+            if rec.id not in listed or current_captures != listed[rec.id]:
+                skip("images_changed")
                 continue
             # Every transition _apply_one takes is in STATUS_TRANSITIONS for a
             # reviewer, from the statuses checked above, so none is refused

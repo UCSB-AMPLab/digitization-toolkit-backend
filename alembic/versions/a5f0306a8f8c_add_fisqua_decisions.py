@@ -13,11 +13,12 @@ applies it (app.core.fisqua_decisions).
   for display. NULL when Fisqua has made none. No file is changed.
 - On `fisqua_status`: `decisions_id`, `decisions_decided_at`,
   `decisions_applied_at`, `decisions_manifest_id` and `decisions_report` for
-  the last set applied, and `decisions_stale_id` for the last set seen for
-  another manifest.
+  the last set applied, `decisions_stale_id` for the last set seen for
+  another manifest, and `decisions_offered_id` for the last set a status
+  entry offered, which keeps a final volume polled until it is read.
 
 Nothing is backfilled. Written with batch_alter_table so it also runs on
-SQLite. Downgrade drops the seven columns, and with them the corrections and
+SQLite. Downgrade drops the eight columns, and with them the corrections and
 the record of which set was applied; the statuses and rejections the sets
 wrote stay.
 """
@@ -47,11 +48,12 @@ def upgrade() -> None:
         batch.add_column(sa.Column('decisions_manifest_id', sa.String(length=36), nullable=True))
         batch.add_column(sa.Column('decisions_report', sa.JSON(), nullable=True))
         batch.add_column(sa.Column('decisions_stale_id', sa.String(length=255), nullable=True))
+        batch.add_column(sa.Column('decisions_offered_id', sa.String(length=255), nullable=True))
 
 
 def downgrade() -> None:
     with op.batch_alter_table('fisqua_status') as batch:
-        for name in ('decisions_stale_id', 'decisions_report', 'decisions_manifest_id',
+        for name in ('decisions_offered_id', 'decisions_stale_id', 'decisions_report', 'decisions_manifest_id',
                      'decisions_applied_at', 'decisions_decided_at', 'decisions_id'):
             batch.drop_column(name)
     with op.batch_alter_table('record_images') as batch:

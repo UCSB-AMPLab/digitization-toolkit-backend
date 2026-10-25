@@ -14,7 +14,7 @@ from sqlalchemy.exc import IntegrityError
 REVISION = "a5f0306a8f8c"
 MIGRATION_FILE = f"{REVISION}_add_fisqua_decisions.py"
 STATUS_COLUMNS = {"decisions_id", "decisions_decided_at", "decisions_applied_at", "decisions_manifest_id",
-                  "decisions_report", "decisions_stale_id"}
+                  "decisions_report", "decisions_stale_id", "decisions_offered_id"}
 
 
 def _load(backend_root):
