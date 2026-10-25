@@ -1306,3 +1306,47 @@ def test_a_pass_that_runs_out_of_budget_leaves_the_rest_ready(client, db_session
     assert transport.sent == [] and result["status"] == "rate_limited"
     row = _rows(db_session, vol.col)[0]
     assert row.state == "ready" and row.attempts == 0
+
+
+# ---------------------------------------------------------------------------
+# The reference code is checked again when the manifest is built
+# ---------------------------------------------------------------------------
+
+def _upload_all(vol, rec):
+    for img in rec.images:
+        vol.offsite(img, "capture", f"{TENANT}/{vol.stem}/captures/{img.filename}", f"{img.filename} bytes".encode())
+
+
+@pytest.mark.unit
+def test_a_reference_code_set_differently_while_uploads_wait_is_refused_at_build(
+        client, db_session, override_projects_root, fisqua):
+    v = Volume(db_session, override_projects_root, external_id=None)
+    rec = v.record(status="captured", upload=False)
+    _handover(client, v.col)
+    assert _rows(db_session, v.col)[0].state == "waiting_for_upload"
+    resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-other-777"})
+    assert resp.status_code == 200, resp.text
+    _upload_all(v, rec)
+
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    [row] = _rows(db_session, v.col)
+    assert row.state == "refused" and row.refusal == "not_exportable"
+    [problem] = row.problems
+    assert problem["rule"] == "reference_code_differs"
+    assert v.stem in problem["message"] and "xx-other-777" in problem["message"]
+    assert row.manifest is None and transport.sent == []
+
+
+@pytest.mark.unit
+def test_a_reference_code_set_to_the_stem_while_uploads_wait_is_sent(
+        client, db_session, override_projects_root, fisqua):
+    v = Volume(db_session, override_projects_root, external_id=None)
+    rec = v.record(status="captured", upload=False)
+    _handover(client, v.col)
+    _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": v.stem})
+    _upload_all(v, rec)
+    transport = FakeTransport(sends=[_delivered()])
+    _run(db_session, transport)
+    row = _rows(db_session, v.col)[0]
+    assert row.state == "delivered" and row.reference_code == v.stem

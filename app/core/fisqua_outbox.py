@@ -441,18 +441,29 @@ def enqueue_handover(db: Session, collection):
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
-    recorded = (collection.external_id or "").strip()
-    if collection.filename_stem is not None and recorded and recorded != collection.filename_stem:
-        # Contract 1.2 §8: the stem is the reference code, unchanged. Keys use
-        # the stem and status is polled by the reference code, so a volume
-        # whose recorded code differs would be filed under one and asked for
-        # by the other. With no code recorded the stem is the code; a volume
-        # with no stem is refused for that at promotion.
-        problem = reference_code_differs_problem(collection.filename_stem, collection.external_id)
+    problem = _reference_problem(collection)
+    if problem is not None:
         row.state, row.refusal, row.problems = "refused", "not_exportable", [problem]
         row.last_error = problem["message"]
     db.add(row)
     return row
+
+
+def _reference_problem(collection) -> Optional[dict]:
+    """The reference_code_differs problem when the volume's recorded code is not its stem; else None.
+
+    Contract 1.2 §8: the stem is the reference code, unchanged. Keys use the
+    stem and status is polled by the reference code, so a volume whose
+    recorded code differs would be filed under one and asked for by the
+    other. With no code recorded the stem is the code; a volume with no stem
+    is refused for that when its manifest is built. Checked at handover and
+    again when the manifest is built, since a first external_id can be set
+    while the uploads are pending.
+    """
+    recorded = (collection.external_id or "").strip()
+    if collection.filename_stem is not None and recorded and recorded != collection.filename_stem:
+        return reference_code_differs_problem(collection.filename_stem, collection.external_id)
+    return None
 
 
 def withdraw_unsent(db: Session, collection_id: int) -> None:
@@ -568,6 +579,15 @@ def _promote(db: Session, row, result: _Run) -> None:
     state = volume_upload_state(db, collection)
     if state["uploadable"] and not state["received"]:
         result.waiting += 1
+        return
+    problem = _reference_problem(collection)
+    if problem is not None:
+        db.rollback()
+        if _move(db, row.id, "waiting_for_upload", state="refused", refusal="not_exportable",
+                 problems=[problem], last_error=problem["message"]):
+            result.not_exportable += 1
+            logger.warning("Fisqua manifest %s for volume %s is not exportable: reference_code_differs",
+                           row.manifest_id, collection.id)
         return
     manifest_uuid = uuid.UUID(row.manifest_id)
     try:
