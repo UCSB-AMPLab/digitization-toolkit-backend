@@ -103,6 +103,10 @@ ADOPT_ACTION = "image_upload_adopted"
 # A tenant prefix is a single path segment of the stem alphabet: lowercase
 # letters and digits, joined by single hyphens ("sbmal", "ahr", "captua-test").
 TENANT_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# The tenant is also the capture manifest's generatedBy.instance, which
+# Fisqua caps at 256 characters, and a host label in Fisqua's
+# <tenant>.fisqua.org, which DNS caps at 63.
+TENANT_MAX_LENGTH = 63
 
 # Under the projects root, so that a hard link to an image is on the image's
 # file system in the usual case. Removed after each object and swept at start.
@@ -129,7 +133,8 @@ def configured_tenant() -> Optional[str]:
     """The tenant prefix, or None when image upload is disabled.
 
     Raises ImageUploadMisconfigured for a value that is not one path segment
-    of the stem alphabet, so a mistyped prefix never becomes a key.
+    of the stem alphabet, or is longer than TENANT_MAX_LENGTH, so a mistyped
+    prefix never becomes a key.
     """
     value = config.settings.OFFSITE_TENANT.strip().strip("/")
     if not value:
@@ -138,6 +143,11 @@ def configured_tenant() -> Optional[str]:
         raise ImageUploadMisconfigured(
             f"DTK_OFFSITE_TENANT={value!r} is not a tenant prefix "
             "(lowercase letters and digits joined by single hyphens)"
+        )
+    if len(value) > TENANT_MAX_LENGTH:
+        raise ImageUploadMisconfigured(
+            f"DTK_OFFSITE_TENANT is {len(value)} characters long; a tenant prefix is at most "
+            f"{TENANT_MAX_LENGTH}"
         )
     return value
 

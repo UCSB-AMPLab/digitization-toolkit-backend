@@ -213,6 +213,26 @@ def test_a_tenant_that_is_not_a_prefix_is_refused(db_session, monkeypatch, bad):
 
 
 @pytest.mark.unit
+def test_a_tenant_longer_than_63_characters_is_refused(db_session, monkeypatch):
+    """The tenant becomes the manifest's generatedBy.instance; it is capped well inside Fisqua's 256."""
+    import pytest as _pytest
+
+    from app.core import config
+    from app.core.image_upload import ImageUploadMisconfigured, configured_tenant, run_image_upload
+
+    longest = "a" * 30 + "-" + "b" * 32
+    assert len(longest) == 63
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", longest)
+    assert configured_tenant() == longest
+
+    monkeypatch.setattr(config.settings, "OFFSITE_TENANT", longest + "c")
+    with _pytest.raises(ImageUploadMisconfigured, match="63"):
+        configured_tenant()
+    monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "/nonexistent")
+    assert run_image_upload(db_session)["status"] == "misconfigured"
+
+
+@pytest.mark.unit
 def test_an_empty_tenant_disables_the_upload(remote, db_session, override_projects_root, monkeypatch):
     from app.core import config
     from app.core.image_upload import image_upload_scheduler, is_enabled
