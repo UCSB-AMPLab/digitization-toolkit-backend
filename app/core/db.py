@@ -62,6 +62,7 @@ def init_db() -> None:
 	import app.models.user           # noqa: F401
 	import app.models.system_log     # noqa: F401
 	import app.models.project_member # noqa: F401
+	import app.models.offsite_object # noqa: F401
 
 	# Note: Tables are created via Alembic migrations, not create_all()
 	# Run: alembic upgrade head
