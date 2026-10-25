@@ -641,10 +641,12 @@ def _redacted(answer: TransportResult) -> TransportResult:
 
 
 def _keep_status(db: Session, collection_id: int, manifest_id: Optional[str], state: Optional[str],
-                 entered_at: Optional[datetime], problems: Any, now: datetime) -> None:
+                 entered_at: Optional[datetime], problems: Any, now: datetime) -> bool:
+    """Keep Fisqua's latest word on a volume. Commits. True when its manifest, state or problems changed."""
     from app.models.fisqua import FisquaStatus
 
     status = db.get(FisquaStatus, collection_id)
+    changed = status is None or (status.manifest_id, status.status, status.problems) != (manifest_id, state, problems)
     if status is None:
         status = FisquaStatus(collection_id=collection_id, status_checked_at=now)
         db.add(status)
@@ -654,6 +656,7 @@ def _keep_status(db: Session, collection_id: int, manifest_id: Optional[str], st
     status.status_checked_at = now
     status.problems = problems
     db.commit()
+    return changed
 
 
 OBJECT_MISSING_ACTION = "fisqua_object_missing"
@@ -758,6 +761,8 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
         if _move(db, row.id, "sending", state="delivered", delivered_at=now, response=answer.response,
                  external_id=answer.external_id, last_error=None, cancel_requested=None):
             _keep_status(db, row.collection_id, row.manifest_id, answer.status, None, None, now)
+            logger.info("Fisqua accepted manifest %s of volume %s: %s",
+                        row.manifest_id, row.collection_id, answer.status or "no state given")
         result.delivered += 1
     elif answer.outcome == "config_error":
         # Not this manifest's fault: it goes back to ready, to be sent as it
@@ -884,7 +889,19 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             db.rollback()
             logger.exception("The Fisqua outbox step raised")
             result.status = "error"
+    _log_pass(result)
     return result.as_dict()
+
+
+def _log_pass(result: "_Run") -> None:
+    """One line for the journal for a send pass that built, refused, sent or failed anything."""
+    if not (result.promoted or result.not_exportable or result.delivered or result.refused or result.failed):
+        return
+    quiet = result.status in ("done", "stopped", "rate_limited") and not (result.refused or result.failed)
+    logger.log(logging.INFO if quiet else logging.WARNING,
+               "Fisqua outbox pass %s: promoted=%s not_exportable=%s delivered=%s refused=%s failed=%s waiting=%s",
+               result.status, result.promoted, result.not_exportable, result.delivered, result.refused,
+               result.failed, result.waiting)
 
 
 # ---------------------------------------------------------------------------
@@ -969,7 +986,7 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
     if isinstance(transport, NullTransport):
         return {"status": "no_transport"}
     now = _naive(now) or _now()
-    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "recovered": 0,
+    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "changed": 0, "recovered": 0,
               "decisions_fetched": 0, "decisions_applied": 0, "decisions_stale": 0}
     with _step_lock:
         try:
@@ -1022,9 +1039,10 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                     manifest_id = manifest_id if isinstance(manifest_id, str) else None
                     state = entry.get(fc.F_STATE)
                     problems = entry.get(fc.F_PROBLEMS)
-                    _keep_status(db, cid, manifest_id, state if isinstance(state, str) else None,
-                                 _parse_time(entry.get(fc.F_ENTERED_AT)),
-                                 problems if problems else None, now)
+                    if _keep_status(db, cid, manifest_id, state if isinstance(state, str) else None,
+                                    _parse_time(entry.get(fc.F_ENTERED_AT)),
+                                    problems if problems else None, now):
+                        result["changed"] += 1
                     result["answered"] += 1
                     decisions_id = entry.get(fc.F_DECISIONS_ID)
                     if isinstance(decisions_id, str) and decisions_id:
@@ -1054,7 +1072,20 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             db.rollback()
             logger.exception("The Fisqua status poll raised")
             result["status"] = "error"
+    _log_poll(result)
     return result
+
+
+def _log_poll(result: dict) -> None:
+    """One line for the journal for a poll that asked Fisqua anything."""
+    if not result.get("calls"):
+        return
+    logger.log(logging.INFO if result["status"] in ("done", "rate_limited") else logging.WARNING,
+               "Fisqua status poll %s: asked=%s calls=%s answered=%s changed=%s recovered=%s "
+               "decisions_fetched=%s decisions_applied=%s decisions_stale=%s",
+               result["status"], result["asked"], result["calls"], result["answered"], result["changed"],
+               result["recovered"], result["decisions_fetched"], result["decisions_applied"],
+               result["decisions_stale"])
 
 
 def _keep_offered(db: Session, collection_id: int, decisions_id: str) -> None:

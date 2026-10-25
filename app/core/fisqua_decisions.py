@@ -401,6 +401,9 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
         return {"status": "error", "decisions_id": decisions_id}
 
     c = report["counts"]
+    logger.info("Fisqua decisions %s applied to volume %s: approved=%s rejected=%s unchanged=%s skipped=%s "
+                "rotations=%s rotations_skipped=%s", decisions_id, collection_id, c["approved"], c["rejected"],
+                c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"])
     audit.log_event(db, level="INFO", category="activity", action=APPLIED_ACTION, subject=stem,
                     detail=(f"volume {collection_id} decisions={decisions_id} approved={c['approved']} "
                             f"rejected={c['rejected']} unchanged={c['unchanged']} skipped={c['skipped']} "

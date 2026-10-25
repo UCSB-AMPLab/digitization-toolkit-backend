@@ -858,11 +858,14 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
               or result.refused or result.conflicts or result.error)
     if worked:
         level = "INFO" if result.status in ("done", "stopped", "held") and not result.refused else "WARN"
+        counts = (f"uploaded={result.uploaded} already_present={result.already_present} "
+                  f"unverified={result.unverified} refused={len(result.refused)} "
+                  f"conflicts={len(result.conflicts)} skipped={len(result.skipped)}")
         _log(db, action=RUN_ACTION, level=level, subject=result.status,
-             detail=(f"uploaded={result.uploaded} already_present={result.already_present} "
-                     f"unverified={result.unverified} refused={len(result.refused)} "
-                     f"conflicts={len(result.conflicts)} skipped={len(result.skipped)}"
-                     + (f" error: {result.error}" if result.error else "")))
+             detail=counts + (f" error: {result.error}" if result.error else ""))
+        # The same summary for the journal; the failure itself was logged where it happened.
+        logger.log(logging.INFO if level == "INFO" else logging.WARNING,
+                   "Image upload run %s: %s", result.status, counts)
     return result.as_dict()
 
 
