@@ -639,3 +639,32 @@ def test_a_retake_committed_while_the_locks_were_awaited_is_caught(client, db_se
     _poll(db_session, fake)
     assert _refresh(db_session, a).status == "in_review"
     assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
+
+
+# ---------------------------------------------------------------------------
+# The reference a manifest was sent under
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_status_and_decisions_are_asked_for_by_the_reference_sent(client, db_session, override_projects_root, fisqua):
+    """A volume sent under its stem (no external_id) and given an external_id afterwards."""
+    v = Volume(db_session, override_projects_root, external_id=None)
+    rec = v.record(status="captured")
+    _handover(client, v.col)
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, v.col)[0]
+    assert row.state == "delivered"
+    assert row.reference_code == v.stem == row.manifest["volumes"][0]["externalId"]
+
+    resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-other-777"})
+    assert resp.status_code == 200, resp.text
+
+    fake = Fisqua(v.stem)
+    fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}
+    _decide(fake, row, [_approve(rec)])
+    _poll(db_session, fake)
+    status_call = next(r for r in fake.requests if r.url.path == STATUS_PATH)
+    assert status_call.url.params["refs"] == v.stem
+    assert [r.url.path for r in fake.decision_calls()] == [f"/api/capture/v1/volumes/{v.stem}/decisions"]
+    assert _refresh(db_session, rec).status == "approved"
+

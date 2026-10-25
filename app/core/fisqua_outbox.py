@@ -46,7 +46,8 @@ app.core.fisqua_contract. Here:
   (FisquaStatusScheduler). Every volume with a manifest that has reached
   Fisqua, or may have, is asked for by its reference code
   (the recorded external_id, else the stem: the manifest's `externalId`), in batches of at
-  most MAX_REFS_PER_CALL, until Fisqua reports a final state for the
+  most MAX_REFS_PER_CALL (by the reference the manifest was sent under,
+  fisqua_outbox.reference_code), until Fisqua reports a final state for the
   volume's latest manifest. The answer is kept in fisqua_status. `unknown`
   (Fisqua does not know the volume; usually its manifest was not received)
   is kept and shown, and is not final. An answer naming the manifest id of
@@ -574,7 +575,9 @@ def _promote(db: Session, row, result: _Run) -> None:
                            row.manifest_id, collection.id, ", ".join(p.rule for p in exc.problems))
         return
     db.rollback()  # end the build's read transaction
-    if _move(db, row.id, "waiting_for_upload", state="ready", manifest=doc):
+    sent_ref = (doc.get("volumes") or [{}])[0].get("externalId")
+    if _move(db, row.id, "waiting_for_upload", state="ready", manifest=doc,
+             reference_code=sent_ref[:255] if isinstance(sent_ref, str) and sent_ref else None):
         result.promoted += 1
 
 
@@ -804,9 +807,13 @@ def volumes_to_poll(db: Session) -> dict:
     final = and_(func.coalesce(FisquaStatus.status, "").in_(fc.FINAL_STATES),
                  func.coalesce(FisquaStatus.manifest_id, "") == FisquaOutbox.manifest_id,
                  not_(unread))
-    # The reference code as capture_manifest.reference_code gives it: the
-    # recorded external_id, else the stem.
-    ref = func.coalesce(func.nullif(func.trim(Collection.external_id), ""), Collection.filename_stem)
+    # The reference the newest sent manifest carried (fisqua_outbox.reference_code),
+    # not the volume's code now: a first external_id set after the manifest
+    # was sent under the stem would ask Fisqua for a volume it does not
+    # know. A row without one falls back to the code as
+    # capture_manifest.reference_code gives it.
+    ref = func.coalesce(FisquaOutbox.reference_code,
+                        func.nullif(func.trim(Collection.external_id), ""), Collection.filename_stem)
     rows = (db.query(ref, Collection.id, FisquaOutbox.manifest_id)
             .select_from(newest)
             .join(FisquaOutbox, FisquaOutbox.id == newest.c.row_id)

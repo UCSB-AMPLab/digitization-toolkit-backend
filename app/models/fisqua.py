@@ -76,6 +76,11 @@ class FisquaOutbox(Base):
     response = Column(JSON, nullable=True)
     external_id = Column(String(255), nullable=True)
     delivered_at = Column(DateTime, nullable=True)
+    # The reference code the manifest was sent under (its
+    # volumes[0].externalId), written when the manifest is built. Status
+    # and decisions are asked for by it, not by the volume's code as it is
+    # now, which a first external_id set afterwards would change.
+    reference_code = Column(String(255), nullable=True)
     # Set by a take-back (`withdrawn`) or a newer handover (`superseded`)
     # while the row is `sending`, which they cannot change under the worker.
     # The worker takes it as the row's state when the send ends in anything
