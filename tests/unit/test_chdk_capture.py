@@ -142,7 +142,7 @@ def test_a_body_that_never_delivers_raises_the_shared_timeout(monkeypatch, tmp_p
 
 @pytest.mark.unit
 def test_a_ptp_failure_names_its_code_and_drops_the_body(monkeypatch, tmp_path):
-    """0x2002 from remote capture is this row's load-bearing risk (NEH-231)."""
+    """Remote capture can fail with PTP 0x2002 (NEH-231): the error names the code and the body is dropped."""
     body = Body(
         serial="AAA111", card=EVEN_CARD, shoot_error=PTPError(0x2002),
     )

@@ -2,7 +2,8 @@
 
 The file is named as a single capture is, `<stem>-img_<nnnn>_c0.<ext>`
 (contract 1.1, section 3); test_capture_contract_naming.py covers the rules.
-Any other upload is refused before anything is written (step 2).
+Any other upload is refused with 409, on the same terms as a capture, before
+anything is written.
 """
 
 import io
@@ -78,7 +79,7 @@ def test_an_upload_into_a_stemmed_volume_goes_into_its_captures(client, db_sessi
 @pytest.mark.unit
 def test_an_upload_into_a_project_level_record_is_refused_and_writes_nothing(client, db_session, capture_settings,
                                                                            data_dir, override_projects_root):
-    """Step 2 refuses an upload outside a stemmed volume before anything is written."""
+    """An upload outside a stemmed volume is refused before anything is written."""
     from app.models.project import Project
     from app.models.record import RecordImage
 

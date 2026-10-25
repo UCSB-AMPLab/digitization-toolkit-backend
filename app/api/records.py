@@ -80,8 +80,8 @@ def _image_files_to_unlink(
 
 	Nothing is unlinked here. The delete handlers call this while they hold the
 	record's row lock, commit the row deletion, and only then pass the list to
-	`_unlink_after_commit` (NEH-262). Unlinking first meant a commit that failed
-	left rows pointing at masters that were already gone.
+	`_unlink_after_commit` (NEH-262). Unlinking first would leave, after a failed
+	commit, rows pointing at masters that are already gone.
 
 	A RAW capture occupies two files on the card: the master the row points at,
 	and a JPEG preview the RAW backend writes as `<stem>_preview.jpg`, beside it
@@ -142,8 +142,8 @@ def _unlink_after_commit(paths: Iterable[Path]) -> List[str]:
 	logged at WARNING with its path and the next one is tried; the request still
 	succeeds, because the rows are gone and cannot be brought back from here.
 	That leaves a file on the card with no row, which can be found and removed
-	later. The opposite order left a row pointing at a master that no longer
-	existed, which cannot be repaired. A file already missing is not an error.
+	later. The opposite order would leave a row pointing at a master that no
+	longer exists, which cannot be repaired. A file already missing is not an error.
 
 	Returns the names of the files that could not be unlinked, in order, so the
 	handler can report them to the client (NEH-263); empty when every file went.
@@ -238,7 +238,6 @@ def list_records(
 	"""List all records with optional filtering."""
 	query = db.query(Record).options(joinedload(Record.images))
 	
-	# Apply filters if provided
 	if project_id is not None:
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
@@ -325,10 +324,11 @@ def update_record(
 	# Moving a record between collections is a withdrawal once it has been
 	# handed over, and the handover is a per-collection act by ruling
 	# (NEH-260): take the collection back, move what you like, promote it
-	# again. Without this check the whole-collection rule was reachable one
-	# record at a time — move it out, take the collection it landed in back,
-	# move it home — and it came back as the operator's while its siblings
-	# stayed in the queue. No race needed, three ordinary calls.
+	# again. Without this check the whole-collection rule would be reachable
+	# one record at a time — move it out, take the collection it landed in
+	# back, move it home — and the record would come back as the operator's
+	# while its siblings stay in the queue, in three ordinary calls with no
+	# race.
 	#
 	# Only a move is refused. Retitling or redating a record under review is
 	# ordinary cataloguing work and stays open to whoever may edit it.
@@ -453,9 +453,10 @@ async def add_image_to_record(
 	"""
 	# Lock order, the same on every path that takes both: the record's row,
 	# then its volume's. The record is locked here, and the stem check below
-	# locks the volume. Read unlocked, the record was still locked later, by
-	# the image insert's foreign-key check (FOR KEY SHARE), after the volume:
-	# the opposite order to a retake, and the two deadlocked on PostgreSQL.
+	# locks the volume. Read unlocked, the record would still be locked later,
+	# by the image insert's foreign-key check (FOR KEY SHARE), after the
+	# volume: the opposite order to a retake, and the two deadlock on
+	# PostgreSQL.
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
@@ -466,7 +467,6 @@ async def add_image_to_record(
 	if volume_lacks_stem(db, rec.collection_id):
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
 
-	# Validate file type
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
 		raise HTTPException(
@@ -523,7 +523,6 @@ async def add_image_to_record(
 
 	file_format = file_path.suffix.lstrip(".")
 	
-	# Try to get image dimensions
 	resolution_width = None
 	resolution_height = None
 	try:
@@ -533,14 +532,12 @@ async def add_image_to_record(
 	except Exception:
 		pass  # PIL not available or invalid image
 	
-	# Generate thumbnail
 	thumbnail_path = None
 	try:
 		thumbnail_path = generate_thumbnail(file_path, thumbnails_dir)
 	except Exception as e:
 		logger.warning(f"Failed to generate thumbnail for {file.filename}: {e}")
 	
-	# Create RecordImage
 	img = RecordImage(
 		record_id=rec_id,
 		filename=stored_filename,
@@ -601,7 +598,6 @@ def list_record_images(
 	db: Session = Depends(get_db_dependency)
 ):
 	"""Get all images for a specific record, ordered by sequence. Superseded (rejected-and-replaced) images are excluded by default."""
-	# Verify record exists
 	rec = db.query(Record).filter(Record.id == rec_id).first()
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
@@ -669,10 +665,11 @@ def delete_image(
 	# invariant also insists on at least one current image.
 	#
 	# The row is locked, not just read. Unlinking a master is not something a
-	# transaction can take back, and against the unlocked version a concurrent
-	# promotion and approval between this check and the unlink was reproduced:
-	# the file of an approved record was removed on the strength of a status
-	# that had already changed. The lock also stops this delete emptying a
+	# transaction can take back. Without the lock, a promotion and approval
+	# can commit between this check and the unlink, and the unlink then
+	# removes the file of an approved record on the strength of a status that
+	# has already changed (reproduced). The lock also stops this delete
+	# emptying a
 	# record that another request is promoting (see _apply_status_change).
 	# The files are chosen under this lock and unlinked only once the commit
 	# that removes the row has succeeded (NEH-262).
@@ -719,10 +716,9 @@ def delete_image(
 
 		# An emptied approved record goes back to the queue, in the same
 		# transaction and under the same row lock as the delete that emptied it.
-		# It used to be a second read-and-write after the commit, which is the
-		# pattern this whole guard exists to remove: the status it read could
-		# already have moved. Counting the siblings rather than reading
-		# rec.images keeps the answer independent of when the delete is flushed.
+		# A second read-and-write after the commit could act on a status that
+		# had already moved, which this guard exists to prevent. Counting the
+		# siblings rather than reading rec.images keeps the answer independent of when the delete is flushed.
 		remaining_current = (
 			db.query(RecordImage)
 			.filter(
@@ -1083,10 +1079,10 @@ def assert_movable(rec: Record) -> None:
 
 	Four routes change an existing record's parent: PATCH /records/{id},
 	POST /collections/{id}/move-records, and the two project attach/detach
-	routes. They all call this. The first version of this guard covered only
-	the two that were being edited at the time, and an adversarial round
-	defeated the rule through the project routes in two calls — so the
-	enumeration matters more than the check does.
+	routes. The other three call this; move-records checks `is_movable` on
+	every record first, so it can refuse all of them at once. A
+	parent-changing route without the check would let the rule be bypassed in
+	two calls, so every new one has to apply it too.
 	"""
 	if not is_movable(rec):
 		raise HTTPException(
@@ -1153,10 +1149,10 @@ def _apply_status_change(
 	Callers must have the record's images loaded AND must hold the record row
 	under SELECT ... FOR UPDATE. Validating a snapshot is not enough: the
 	check and the write have to be one atomic step, or a second request can
-	change what was checked in between. Two sequences were reproduced against
-	the unlocked version — a concurrent reject landing a rejected image back
-	on a record this call then promoted, and a concurrent delete emptying a
-	record this call then promoted. Locking the record row serialises both,
+	change what was checked in between. Without the lock, two sequences break
+	the invariant (both reproduced): a concurrent reject lands a rejected
+	image back on a record this call then promotes, and a concurrent delete
+	empties a record this call then promotes. Locking the record row serialises both,
 	because every path that moves a record's status or changes which of its
 	images are current takes the same lock first.
 	"""

@@ -44,18 +44,17 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
 
     One definition with two callers, deliberately: the request-time gate in
     app/api/collections.py and _do_export below. They are separated by however
-    long the export queue is, and the worker reloads the records, so checking
-    only at request time let a collection taken back in the gap export anyway —
-    the bag's metadata then described the work as `captured` (NEH-260,
-    reproduced). The approval half of that gap predates the handover gate.
+    long the export queue is, and the worker reloads the records, so a check
+    at request time alone would let a collection taken back in the gap export
+    anyway, with the bag's metadata describing the work as `captured` (NEH-260).
 
     Handover is reported before approval because they are different things to
     tell an operator: a collection she has not handed over is work in progress,
     not work that failed review.
 
-    An empty collection is reported here too. It used to be checked only at the
-    request, so the worker would bag a collection whose last record had been
-    deleted in between and write `"records": []` into the metadata.
+    An empty collection is reported here too, so the worker does not bag a
+    collection whose last record was deleted after the request and write
+    `"records": []` into the metadata.
     """
     if not records:
         return ("Collection has no records to export.", [])
@@ -90,9 +89,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
 
     # Statuses and images are read in one statement, so the gate below and the
     # payload built further down see the same instant. Loading the images lazily
-    # per record afterwards let a retake land in between: the record's cached
-    # status still said `approved` while its image query returned the
-    # replacement, and the bag then labelled a new unreviewed image as approved.
+    # per record afterwards would let a retake land in between: the record's
+    # cached status would still say `approved` while its image query returned
+    # the replacement, and the bag would label a new unreviewed image as approved.
     records = (
         db.query(Record)
         .options(joinedload(Record.images))
@@ -251,7 +250,7 @@ def _fixity_gate(images) -> None:
     "checksum_unresolved" when a captured image (its capture id has a
     capture record in some manifest) has no checksum that can be resolved,
     naming each such image's id, capture id and stored path. Images with no
-    capture record (uploads) pass unchecked, as they always have.
+    capture record (uploads) pass unchecked.
     """
     found = verify_images_against_manifest(images)
     mismatches = [m for m in found if m["reason"] == "mismatch"]
@@ -313,10 +312,9 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
             {
                 "id": r.id, "sequence": r.sequence, "title": r.title, "description": r.description,
                 "author": r.author, "date": r.date, "status": r.status,
-                # NEH-259: object_typology and material are gone. capture_mode
-                # takes their place here because it is the only record of
-                # whether an item was shot as one image or as an L+R pair, and
-                # a receiving institution needs that to read the images.
+                # capture_mode is the only record of whether an item was shot
+                # as one image or as an L+R pair, and a receiving institution
+                # needs that to read the images (NEH-259).
                 "capture_mode": r.capture_mode, "created_by": r.created_by,
                 "created_at": r.created_at.isoformat() if r.created_at else None,
                 "images": [

@@ -7,9 +7,9 @@ def authed_client(client, db_session):
     """TestClient authenticated as a real contributor via a get_current_user override.
 
     The capture endpoints sit behind allow_contributor, which resolves the caller
-    through get_current_user; verify_access_token rejects the literal
-    "Bearer test_token" these tests used to send, giving a 401 before the endpoint
-    ran. Overriding the dependency is the pattern used in
+    through get_current_user; verify_access_token rejects a literal token such as
+    "Bearer test_token", so a request carrying one gets a 401 before the endpoint
+    runs. Overriding the dependency is the pattern used in
     tests/unit/test_delete_user_guards.py. The `client` fixture clears
     dependency_overrides on teardown.
     """

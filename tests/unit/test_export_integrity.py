@@ -153,11 +153,9 @@ def test_prune_exports_keeps_newest(tmp_path):
     _prune_exports(tmp_path, 7, keep=3)
     remaining = sorted(p.name for p in tmp_path.glob("collection_7_*.zip"))
     assert len(remaining) == 3
-    # newest kept
     assert remaining == ["collection_7_20260102T000000Z.zip",
                          "collection_7_20260103T000000Z.zip",
                          "collection_7_20260104T000000Z.zip"]
-    # stale .part cleaned
     assert list(tmp_path.glob("*.part")) == []
 
 
@@ -165,9 +163,9 @@ def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
     export_client, db_session, override_projects_root, monkeypatch, tmp_path
 ):
     """NEH-259: the bag's metadata.json is what a receiving institution reads,
-    so dropping object_typology must not take single-vs-dual with it. The
-    schema version is how a bag written before this change is told from one
-    written after; bags already exported are not rewritten."""
+    so it carries capture_mode (single or dual) and no object_typology. The
+    schema version tells a bag of this shape from one of an earlier shape;
+    bags already exported are not rewritten."""
     import hashlib, zipfile
     from app.core import config
 

@@ -8,9 +8,6 @@ appended again by the next run, so every record ends up present and parseable
 once. The copy is not written whole and renamed: on exFAT or vfat a rename
 over an existing file is not shown to be crash-atomic, and the manifest may
 be a volume's only one.
-
-The torn-write tests are the verifier's (round 4), the second adjusted in
-round 5 to the append.
 """
 
 import json

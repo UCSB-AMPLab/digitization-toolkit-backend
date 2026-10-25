@@ -1,10 +1,10 @@
 """The backend's own INFO lines reach stderr, and so the systemd journal.
 
 uvicorn's logging config covers only the `uvicorn`, `uvicorn.error` and
-`uvicorn.access` loggers. Before app.core.logging_setup, a logger under `app.`
-or `capture.` had no handler and the root logger's WARNING level, so its INFO
-lines (the startup `Volume layout:` report among them) were dropped, and its
-warnings came out through Python's last-resort handler with no level or name.
+`uvicorn.access` loggers. Without app.core.logging_setup, a logger under `app.`
+or `capture.` has no handler and the root logger's WARNING level, so its INFO
+lines (the startup `Volume layout:` report among them) are dropped, and its
+warnings come out through Python's last-resort handler with no level or name.
 """
 
 import logging

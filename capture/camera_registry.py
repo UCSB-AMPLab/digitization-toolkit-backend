@@ -185,7 +185,7 @@ class CameraRegistry:
         except Exception:
             pass
 
-        # --- picamera2 path (original logic) ---
+        # --- picamera2 path ---
         if not _PICAMERA2_AVAILABLE:
             return None, {"error": "Picamera2 not available and not using gphoto2 backend"}
         try:
@@ -209,10 +209,8 @@ class CameraRegistry:
                     identifier = i2c_part[0].replace('i2c@', '')
                     hw_id = f"{model}_{identifier}"
                 else:
-                    # Fallback to last part of Id
                     hw_id = f"{model}_{id_parts[-1]}"
             else:
-                # Ultimate fallback
                 hw_id = f"{model}_idx{camera_index}"
             
             return hw_id, {
@@ -329,17 +327,15 @@ class CameraRegistry:
         register_camera resolves camera_index to a hardware id itself and
         delegates here. Callers that have already resolved and checked the
         identity (the orientation route, guarding against a rescan mid-
-        request per R30-4) must write under that exact identity rather than
+        request) must write under that exact identity rather than
         letting a second resolution pick a different body.
         """
         def change(cameras: Dict) -> None:
             now = datetime.now(timezone.utc).isoformat()
             if hardware_id in cameras["cameras"] and not force:
-                # Update last_seen info
                 cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
                 cameras["cameras"][hardware_id]["last_seen_at"] = now
             else:
-                # New registration
                 cameras["cameras"][hardware_id] = {
                     "model": info.get("model"),
                     "serial": info.get("serial"),
@@ -497,10 +493,8 @@ def initialize_camera_system(run_calibration: bool = True) -> Dict:
         print(f"Camera {idx}: {info['model']}")
         print(f"  Hardware ID: {hw_id}")
         
-        # Register camera
         registered_id = registry.register_camera(idx)
         
-        # Run calibration if requested
         if run_calibration:
             print(f"  Running calibration...")
             cal = CameraCalibration(idx)

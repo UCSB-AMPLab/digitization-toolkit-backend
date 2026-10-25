@@ -3,7 +3,6 @@ from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
 
-# initialize DB tables
 from app.core.db import init_db
 from app.core.schema import assert_schema_at_head
 from app.core.config import settings
@@ -12,7 +11,6 @@ from app.core.logging_setup import configure_logging
 # Before the routers are imported, so their import-time lines are kept too.
 configure_logging()
 
-# routers
 from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router
 from app.api.projects import router as projects_router
@@ -22,7 +20,6 @@ from app.api.system import router as system_router
 from app.api.activity import router as activity_router
 from app.api.imports import router as imports_router
 
-# Define lifespan event to initialize the database
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -78,7 +75,6 @@ async def lifespan(app: FastAPI):
 
     shutdown_backend()
 
-# Create FastAPI app with lifespan
 app = FastAPI(lifespan=lifespan)
 
 # Allow Svelte frontend API access. Origins use a deployment allowlist. On an

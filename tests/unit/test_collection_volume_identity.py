@@ -1186,7 +1186,7 @@ def test_a_blank_external_id_on_the_orm_is_a_named_409_through_the_handler(db_se
 
 
 # ---------------------------------------------------------------------------
-# The stem is optional on create for now
+# The stem is required on create
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1240,7 +1240,7 @@ def _admin_client(client):
 
 @pytest.mark.unit
 def test_an_emptied_volume_with_a_stem_and_captures_cannot_be_deleted(client, db_session):
-    """The verifier's case: records moved out, delete, then reissue the stem."""
+    """Records moved out, the volume deleted, then the stem reissued."""
     from app.models.collection import Collection
     from app.models.record import Record
 
@@ -1413,10 +1413,9 @@ def test_stem_reserved_is_not_accepted_on_requests():
 #
 # Collection.records has no cascade, so in the flush that deletes a volume
 # the ORM first sets records.collection_id to NULL on its records. A check
-# made during the flush (before_delete) then finds no images. The Postgres
-# rehearsal showed a volume with a stem, images and a counter of 0 deleted
-# that way. The refusal is decided in before_flush, while the records still
-# point at the volume.
+# made during the flush (before_delete) then finds no images, so a volume
+# with a stem, images and a counter of 0 would be deleted. The refusal is
+# decided in before_flush, while the records still point at the volume.
 
 def _reserved_by_images_only(db_session, p, *, parent=None):
     """A volume with a stem and an image, and a counter of 0."""

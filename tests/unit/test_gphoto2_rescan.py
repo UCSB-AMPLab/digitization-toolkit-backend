@@ -1,13 +1,13 @@
 """rescan() must republish the port map and drop sessions that stop matching it.
 
 A DSLR body that drops off USB mid-session (NEH-229) leaves the backend holding
-a PTP session pointed at a port that is gone. Detection already tracks reality -
-autodetect runs on every is_camera_connected() call - but nothing rebuilds the
-port map and closes the stale sessions, so the operator's only lever is a
-reboot.
+a PTP session pointed at a port that is gone. Detection tracks the bus -
+autodetect runs on every is_camera_connected() call - but detection alone
+neither rebuilds the port map nor closes the stale sessions, and without both
+the operator can recover only by rebooting.
 
-rescan() closes that gap: it rebuilds the map, publishes it, and then reconciles
-every cached session against it under that session's own per-camera lock. The
+rescan() rebuilds the map, publishes it, and then reconciles every cached
+session against it under that session's own per-camera lock. The
 fakes here model the two windows that make this delicate:
 
   - a session that is still being opened when the map is republished (its
@@ -35,7 +35,7 @@ import capture.backends.gphoto2_backend as gb
 def isolated_projects_root(monkeypatch, tmp_path):
     """Keep this file's backends off any real projects root.
 
-    GPhoto2Backend now persists its index -> body bindings to
+    GPhoto2Backend persists its index -> body bindings to
     <projects_dir>/camera-bindings.json and seeds them at construction, so
     without a per-test root one test's rig would seed the next test's backend.
     """
@@ -657,7 +657,7 @@ def test_rescan_reconcile_honours_a_refresh_that_lands_before_it_runs(monkeypatc
     monkeypatch.setattr(backend, "_get_camera_lock", pausing_get_camera_lock)
 
     # Rescan's own snapshot detects the body on a different port - as far as
-    # its build_port_map() is concerned, PORT_0 is stale.
+    # its _build_port_map() is concerned, PORT_0 is stale.
     detector.results = [(MODEL, PORT_0_NEW)]
 
     rescan_result = {}

@@ -3,9 +3,9 @@
 Copies are written with ensure_ascii=False, so a power cut can cut a line
 inside an accented character. Every reader decodes a manifest line by line:
 a line that does not decode, like one that does not parse, is skipped and
-logged, and the lines around it are read. Before, the whole-file decode
-raised UnicodeDecodeError, and with a journal pending every startup refused
-to serve.
+logged, and the lines around it are read. A whole-file decode would raise
+UnicodeDecodeError, and with a journal pending every startup would refuse to
+serve.
 """
 
 import json
@@ -50,7 +50,7 @@ def test_a_startup_after_a_copy_torn_inside_a_character_serves_and_repairs(db_se
     own = legacy["root"] / STEMS["a1"] / "metadata" / "manifest.jsonl"
     _write(own, TORN)  # the only line, cut inside "á", no newline
 
-    vl.migrate_volume_layout_at_startup(db_session)  # raised UnicodeDecodeError before
+    vl.migrate_volume_layout_at_startup(db_session)  # a whole-file decode would raise UnicodeDecodeError here
 
     raw = own.read_bytes().split(b"\n")
     assert raw[0] == TORN

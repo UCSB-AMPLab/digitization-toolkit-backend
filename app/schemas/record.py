@@ -10,12 +10,11 @@ from datetime import date as dt_date
 # still the operator's, and leaves it when she promotes the collection she has
 # finished (NEH-260).
 #
-# NEH-208 removed that state on the reading that a record enters the review
-# queue the instant it is taken. Three things followed: a fresh capture became
-# indistinguishable from work handed over for review, the operator could
-# neither redo nor delete her own frame until a reviewer formally rejected it,
-# and the state machine stopped matching the one the Fisqua exchange contract
-# describes, which is captured -> in_review -> approved | rejected.
+# Without that state, a fresh capture is indistinguishable from work handed
+# over for review, the operator can neither redo nor delete her own frame
+# until a reviewer formally rejects it, and the state machine does not match
+# the one the Fisqua exchange contract describes, which is
+# captured -> in_review -> approved | rejected.
 #
 # A reviewer can undo a mistaken approve or reject back to "in_review" (see
 # STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
@@ -62,10 +61,10 @@ STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
 }
 
 # The predefined rejection reasons. The first six mirror the list the
-# annotation feature's "Marcar error" uses client-side; the last three were
-# added later: framing (a page cut off or badly framed), obstruction (a
-# finger, weight or object in the shot) and other (anything else, which
-# must be described in the comment — see RecordRejectRequest). The table
+# annotation feature's "Marcar error" uses client-side; the last three are
+# framing (a page cut off or badly framed), obstruction (a finger, weight or
+# object in the shot) and other (anything else, which must be described in
+# the comment — see RecordRejectRequest). The table
 # holds the same list in check_record_rejection_reason; change both together,
 # with a migration.
 PREDEFINED_REJECTION_REASONS = (
@@ -388,7 +387,6 @@ class RecordAnnotationRead(BaseModel):
 
 
 # ==============================================================================
-# Legacy compatibility type alias (for gradual migration)
+# Type alias
 # ==============================================================================
-# These can help during API transition
 RecordWithImages = RecordRead  # Explicit name for record with images loaded

@@ -18,7 +18,7 @@ import pytest
 from tests.unit.test_preview_digests import STEM, TENANT, _append, _lines, _sha1, _sha256, _write
 
 class Vol:
-    """A stemmed volume with RAW captures recorded as before this change: no preview digests."""
+    """A stemmed volume with RAW captures recorded without preview digests."""
 
     def __init__(self, db, root: Path, stem=STEM):
         from app.models.collection import Collection

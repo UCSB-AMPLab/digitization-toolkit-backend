@@ -287,7 +287,7 @@ def test_integrity_scans_every_raw_suffix_for_orphans(db_session, override_proje
 
 
 # ---------------------------------------------------------------------------
-# Review follow-ups
+# Deleted masters, reported sidecars and rename clashes
 # ---------------------------------------------------------------------------
 
 import hashlib

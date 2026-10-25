@@ -1,14 +1,14 @@
 """A DSLR capture must be bounded: trigger, then wait for the file event.
 
-The old capture path issued a single blocking gp.Camera.capture() call under
-the per-camera lock. A body that stalls (AF hunting, a wedged PTP transaction)
-never returns from it, so previews and captures on that camera freeze with no
-error and the retry loop re-issues the same blocking call.
+A single blocking gp.Camera.capture() call under the per-camera lock never
+returns for a body that stalls (AF hunting, a wedged PTP transaction), so
+previews and captures on that camera would freeze with no error and the retry
+loop would re-issue the same blocking call.
 
 The fakes here model the split libgphoto2 offers instead: trigger_capture()
 returns immediately and wait_for_event(timeout_ms) delivers the file event in
 bounded steps, so a deadline can be checked between calls. The fake Camera
-deliberately has no capture() method - the old code path cannot pass.
+deliberately has no capture() method, so a blocking capture path cannot pass.
 """
 
 import logging
@@ -280,7 +280,7 @@ def test_capture_returns_the_file_delivered_by_the_event_loop(monkeypatch, tmp_p
 def test_trigger_is_retried_only_after_the_capture_deadline_is_empty(
     monkeypatch, tmp_path
 ):
-    # The post-trigger-error poll now waits out the full capture deadline
+    # The post-trigger-error poll waits out the full capture deadline
     # (the same one _wait_for_file_added uses), not a fixed settle delay -
     # a busy error can follow a successful exposure whose file may take as
     # long as the deadline to land. Drive it with a fake clock: a run of
@@ -397,7 +397,7 @@ def test_trigger_retry_raises_after_repeated_empty_deadlines(monkeypatch, tmp_pa
     deadline = gb._capture_deadline_s(gb._parse_exposure_seconds("1/125"))
     # Two full deadline windows are waited out (after attempts 1 and 2)
     # before attempt 3 raises without polling again - each retry is spaced
-    # by roughly a full capture deadline, not the old fixed settle delay.
+    # by roughly a full capture deadline, not a short fixed settle delay.
     assert len(script.trigger_times) == 3
     assert script.trigger_times[1] - script.trigger_times[0] >= deadline
     assert script.trigger_times[2] - script.trigger_times[1] >= deadline

@@ -745,9 +745,9 @@ class ChdkBackend(CameraBackend):
         under the body's own lock. What that buys is bounded and worth
         stating exactly. A capture is admitted by _row_error, which reads the
         body's hardware id, and that id is the card's when pyusb reads no USB
-        serial; publishing outside the lock let a rescan clear it between the
-        check and the shutter, and a page was written for a body that by then
-        had no identity to record it under. Under the lock a capture sees the
+        serial; publishing outside the lock would let a rescan clear it between
+        the check and the shutter, and a page would be written for a body that
+        by then had no identity to record it under. Under the lock a capture sees the
         card state whole: all three fields as they were before the read, or
         all three as they are after it.
 
@@ -836,10 +836,10 @@ class ChdkBackend(CameraBackend):
         barrier covers the ones that do not.
 
         Moving a body that holds an uncontested parity is the failure this
-        replaced: a layout that fell back to USB order for everything put a
-        healthy ODD body on index 0, where it carried no refusal of its own
-        and shot odd pages the service filed as even ones - no failure, no
-        log line, the pages simply in the wrong place.
+        rule prevents: a layout that fell back to USB order for everything
+        would put a healthy ODD body on index 0, where it would carry no
+        refusal of its own and shoot odd pages the service filed as even
+        ones - no failure, no log line, the pages simply in the wrong place.
         """
         self._mark_identity_clashes(bodies)
 
@@ -1448,13 +1448,12 @@ class ChdkBackend(CameraBackend):
         which is exactly why it has to be confirmed. pychdk 0.1.3's
         switch_mode polls get_mode itself and raises once its retries run
         out, so a switch that never arrived reaches this method as an
-        exception. 0.1.2, which this backend ran until the pin moved, did
-        not: its loop ran out and reported that the same way it reported
-        success, by returning nothing, which left every later capture and
-        live view running from playback with the flag set here suppressing
-        any further attempt. The second read below is what caught that, and
-        it stays - not against a camera, but against a library that returns
-        without the camera having arrived.
+        exception. pychdk 0.1.2 does not: its loop runs out and reports that
+        the same way it reports success, by returning nothing, which leaves
+        every later capture and live view running from playback with the
+        flag set here suppressing any further attempt. The second read below
+        guards against a library that returns without the camera having
+        arrived.
 
         So the camera is asked directly. The question is Lua, not uBASIC, and
         the two read opposite ways round: CHDK's Lua get_mode() returns three

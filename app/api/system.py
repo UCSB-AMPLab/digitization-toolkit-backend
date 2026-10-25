@@ -124,9 +124,8 @@ def get_catalogue_backup_state(
     Read-only, and deliberately visible to every role that can see the rest of
     the system panel: a backup whose state nobody can see is a backup nobody
     knows has stopped. `last_verified_at` is null on a unit that has never
-    completed a verified dump, which is the condition worth noticing — it is
-    what was true of the Rionegro unit for the six weeks before its card
-    filled.
+    completed a verified dump. The Rionegro unit was in that state for the
+    six weeks before its card filled.
 
     `held` is true while the offsite upload hold file exists
     (app.core.offsite_hold): no dump is taken and no image is uploaded until

@@ -101,7 +101,6 @@ def override_projects_root(tmp_path, monkeypatch):
     test_projects_dir = tmp_path / "test_projects"
     test_projects_dir.mkdir(parents=True, exist_ok=True)
     
-    # Patch the environment variable
     monkeypatch.setenv("PROJECTS_ROOT", str(test_projects_dir))
     
     # Reload settings to pick up the new value
@@ -119,14 +118,14 @@ def _is_camera_backend_unavailable(exc):
     not being connected).
 
     Matches the four sources of this RuntimeError:
-      - capture/backends/picamera2_backend.py:66 raises "Picamera2Backend
-        requires Linux ..." when Picamera2 failed to import off Linux
-        (matched by the class name; "requires Linux" alone would also match
-        the unrelated "Transform requires Linux" at :334).
-      - capture/backends/picamera2_backend.py:70 raises "picamera2 failed to
-        import: ..." when Picamera2 failed to import on Linux for a concrete
-        reason.
-      - capture/backends/__init__.py:23 substitutes a stub Picamera2Backend
+      - `Picamera2Backend.__init__` (capture/backends/picamera2_backend.py)
+        raises "Picamera2Backend requires Linux ..." when Picamera2 failed to
+        import off Linux (matched by the class name; "requires Linux" alone
+        would also match the unrelated "Transform requires Linux" in
+        `_still_config_args`).
+      - `Picamera2Backend.__init__` raises "picamera2 failed to import: ..."
+        when Picamera2 failed to import on Linux for a concrete reason.
+      - capture/backends/__init__.py substitutes a stub Picamera2Backend
         whose constructor raises "picamera2 is not available on this
         system ..." when the real backend module itself fails to import
         (ImportError/ValueError from a numpy ABI mismatch).
@@ -217,7 +216,6 @@ def set_camera_backend(monkeypatch, camera_backend_type):
     """
     monkeypatch.setenv("CAMERA_BACKEND", camera_backend_type)
     
-    # Reload settings
     from app.core import config
     import importlib
     importlib.reload(config)
@@ -255,7 +253,6 @@ def pytest_collection_modifyitems(config, items):
     (HARDWARE_TEST_FILES there), not here.
     """
     for item in items:
-        # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
 
@@ -267,7 +264,7 @@ def db_session(override_projects_root):
     """
     Create a test database session with fresh schema.
     
-    Each test gets its own in-memory SQLite database.
+    Each test gets its own SQLite database in a temporary file.
     """
     import tempfile
     from app.core.db import Base, engine, SessionLocal
@@ -279,17 +276,14 @@ def db_session(override_projects_root):
         offsite_object, fisqua,
     )
     
-    # Use temporary file-based SQLite for testing
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()  # release the handle; SQLite reopens the file by name
     test_db_url = f"sqlite:///{temp_db.name}"
     
     test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
     
-    # Create tables
     Base.metadata.create_all(test_engine)
     
-    # Create session
     SessionLocal.configure(bind=test_engine)
     session = SessionLocal()
     

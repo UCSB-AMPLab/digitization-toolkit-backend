@@ -24,7 +24,7 @@ import capture.backends.gphoto2_backend as gb
 def isolated_projects_root(monkeypatch, tmp_path):
     """Keep this file's backends off any real projects root.
 
-    GPhoto2Backend now persists its index -> body bindings to
+    GPhoto2Backend persists its index -> body bindings to
     <projects_dir>/camera-bindings.json and seeds them at construction, so
     without a per-test root one test's rig would seed the next test's backend.
     """

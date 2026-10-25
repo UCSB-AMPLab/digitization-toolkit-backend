@@ -110,7 +110,7 @@ def ensure_volume_dirs(stem: str, root: Optional[Path] = None) -> Path:
 def collection_capture_root(project_name: str, collection_name: str, root: Optional[Path] = None) -> Path:
     """On-disk root of a volume without a stem: `<project dir>/<secure collection name>`.
 
-    The name-based layout every volume had before stems. Two volumes of one
+    The name-based layout, for a volume without a stem. Two volumes of one
     name share the directory, and a nested volume's directory sits beside its
     parent's. A volume keeps it until it is given a stem and the startup
     migration (app.core.volume_layout) moves its files.
@@ -141,7 +141,7 @@ def capture_manifest_root(project_name: str, stem: Optional[str] = None, root: O
     """The directory whose `metadata/manifest.jsonl` takes a capture's record.
 
     The volume's root for a volume with a stem, so each such volume has its
-    own manifest; the project's directory otherwise, as before stems. The
+    own manifest; the project's directory otherwise. The
     capture record's paths are relative to it.
     """
     if stem:
@@ -193,10 +193,8 @@ def default_camera_config_from_registry(
     if registry is None:
         registry = CameraRegistry()
     
-    # Get hardware ID and calibration for current camera
     hw_id, camera_data = registry.get_camera_by_index(camera_index)
     
-    # Base configuration
     config = {
         "camera_index": camera_index,
         "img_size": IMG_SIZES.get(resolution, IMG_SIZES["high"]),
@@ -214,7 +212,6 @@ def default_camera_config_from_registry(
         "raw": False
     }
     
-    # Apply calibration if available
     if camera_data and camera_data.get("calibration", {}).get("focus", {}).get("success"):
         lens_position = camera_data["calibration"]["focus"]["lens_position"]
         config["autofocus_on_capture"] = False
@@ -232,8 +229,8 @@ def default_camera_config_from_registry(
 
     # Apply the saved rotation for this body, if one was ever set (NEH-71).
     # None (never set) leaves rotate_deg out of the dict entirely, so
-    # CameraConfig's own default (0) and _apply_rotation's `if rotate_deg:`
-    # behave exactly as before this key existed.
+    # CameraConfig's own default (0) applies and _apply_rotation's
+    # `if rotate_deg:` skips the rotation.
     # Only the four supported angles count; anything else in the file (a
     # hand edit, a bool, 45) is treated as unset rather than handed to the
     # capture path, where it would be rejected on every request.
@@ -274,10 +271,8 @@ def project_init(
     
     subprocess_logger.info(f"Created project directory structure: {project_path}")
     
-    # Get camera configurations from registry
     registry = CameraRegistry()
     
-    # Ensure cameras are detected and registered
     detected = registry.detect_cameras()
     for idx, (hw_id, info) in detected.items():
         if hw_id not in registry.cameras["cameras"]:
@@ -286,11 +281,9 @@ def project_init(
     cam0_config, cam0_hw_id = default_camera_config_from_registry(0, default_resolution, registry)
     cam1_config, cam1_hw_id = default_camera_config_from_registry(1, default_resolution, registry)
     
-    # Get camera hardware info
     cam0_info = registry.get_camera_by_id(cam0_hw_id) if cam0_hw_id else None
     cam1_info = registry.get_camera_by_id(cam1_hw_id) if cam1_hw_id else None
     
-    # Generate and save project manifest
     project_info = generate_manifest_project(
         project_name=project_name,
         paths={

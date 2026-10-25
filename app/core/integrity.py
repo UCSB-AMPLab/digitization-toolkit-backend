@@ -583,8 +583,9 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "orphan_records": len(orphan_records),
     }
     # "ok" reflects hard divergences (data loss or corruption). Missing thumbnails
-    # are regenerable and a missing manifest entry is often benign (uploads have no
-    # capture_id), so they are reported but do not by themselves fail the check.
+    # are regenerable and a missing manifest entry is often benign (an image
+    # uploaded before uploads were written to the manifest has none), so they
+    # are reported but do not by themselves fail the check.
     summary["ok"] = (
         summary["missing_files"] == 0
         and summary["orphan_files"] == 0

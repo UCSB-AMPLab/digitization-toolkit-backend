@@ -5,11 +5,11 @@ projects root at call time so a runtime storage-drive switch (POST
 /system/storage/activate, which flips the storage override consulted by
 Settings.projects_dir) takes effect immediately for new captures.
 
-Before the fix, capture/project_manager.py captured
-``PROJECTS_ROOT = settings.projects_dir`` as a module-level constant at import
-time, so after an operator activated an external drive new captures kept
-writing to the OLD root while the registry/delete/export/storage-panel readers
-followed the NEW root - splitting a project across two disks.
+If capture/project_manager.py held ``PROJECTS_ROOT = settings.projects_dir``
+as a module-level constant set at import time, then after an operator
+activated an external drive new captures would keep writing to the OLD root
+while the registry/delete/export/storage-panel readers followed the NEW root -
+splitting a project across two disks.
 
 Run with: python -m pytest tests/unit/test_projects_root_live.py
 """

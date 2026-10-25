@@ -27,5 +27,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Remove zsl column from camera_settings table
     op.drop_column('camera_settings', 'zsl')

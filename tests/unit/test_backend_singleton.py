@@ -6,7 +6,7 @@ the kiosk fires a device list plus two previews on boot, so two first callers
 could each pass the `if _backend is None:` check before either one assigned -
 each would construct its own backend, and the loser's PTP sessions and locks
 would never be seen by the winner holding the module global. `_backend_lock`
-now covers the whole check-and-construct; these tests hold it to that.
+covers the whole check-and-construct; these tests hold it to that.
 
 The fake constructor below models exactly that window: it counts entries,
 records (and signals) each entry into the constructor body, and then blocks
@@ -119,8 +119,8 @@ def test_overlapping_first_callers_share_one_backend(monkeypatch):
         # constructor: construction can only be underway right now if
         # _backend_lock is held. This is the mechanism assertion; the
         # timed second-entry observation below is the behavioural check
-        # layered on top of it (a reviewer showed the timing alone can pass
-        # against unfixed code if thread B happens to be scheduled late).
+        # layered on top of it (the timing alone can pass without the lock
+        # if thread B happens to be scheduled late).
         lock = getattr(capture_service, "_backend_lock", None)
         assert lock is not None, "get_backend() has no construction lock"
         acquired = lock.acquire(blocking=False)
@@ -131,10 +131,10 @@ def test_overlapping_first_callers_share_one_backend(monkeypatch):
         thread_b.start()
         started.append(thread_b)
 
-        # On unfixed code, B's None-check is not held back by anything before it
+        # Without the lock, B's None-check is not held back by anything before it
         # reaches the constructor, so a second entry fires almost immediately.
-        # On fixed code, B blocks on _backend_lock before the check, and no
-        # second entry appears within the wait.
+        # With it, B blocks on _backend_lock before the check, and no second
+        # entry appears within the wait.
         second_entry_seen = fake_constructor.wait_for_entries(2, timeout=1.0)
     finally:
         # Unbounded joins: a worker can only be inside the fake constructor

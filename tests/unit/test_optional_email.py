@@ -1,12 +1,12 @@
 """NEH-162: email is optional on account creation.
 
 The appliance runs offline and nothing verifies an address, so the email
-stays as a field on users but stops being required. Covers the
+is a field on users but is not required. Covers the
 registration API (app/schemas/user.py, app/api/auth.py), the model
 column (app/models/user.py), and the project-member listing/add
 endpoints that flatten a user's email onto each row
 (app/schemas/project_member.py, app/api/projects.py) — an email-less
-admin or collaborator must not break either of those (R46-1).
+admin or collaborator must not break either of those.
 """
 
 import pytest
@@ -38,9 +38,7 @@ def _admin_auth_header(client, admin_username, admin_password="pass1234"):
 
 def test_register_without_email_returns_200_with_null_email(client):
     # /auth/register has no status_code=201 on its route decorator, so it
-    # returns FastAPI's default 200 (pre-existing behavior, unrelated to
-    # NEH-162; the brief for this test named 201, verified against the
-    # running code to be 200).
+    # returns FastAPI's default 200.
     resp = _register(client, "u_no_email")
     assert resp.status_code == 200, resp.text
     assert resp.json()["email"] is None
@@ -105,7 +103,7 @@ def test_user_email_column_is_nullable():
 
 
 # ---------------------------------------------------------------------------
-# Project members (R46-1) — ProjectMemberRead.email must tolerate None
+# Project members: ProjectMemberRead.email must tolerate None
 # ---------------------------------------------------------------------------
 
 def _make_user(db_session, username, role, email=None, is_active=True):
@@ -172,7 +170,7 @@ def test_add_emailless_collaborator_returns_200_and_lists(emailless_admin_client
 
 @pytest.mark.parametrize("bad", [123, ["a@b.co"], {"address": "a@b.co"}, True])
 def test_a_non_string_email_is_a_422_not_a_server_error(client, bad):
-    """R47-1: a "before" validator sees the raw payload value, so a number,
+    """A "before" validator sees the raw payload value, so a number,
     a list, an object or a boolean must be refused as a format error rather
     than crash on .strip()."""
     resp = client.post("/auth/register", json={"username": "u_bad_email", "email": bad, "password": "Passw0rd!x"})

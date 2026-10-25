@@ -90,7 +90,6 @@ def test_token_generation():
         assert payload is not None, "Token verification failed"
         assert payload.get("sub") == "user_123", "Subject mismatch"
         
-        # Test expired token
         expired_token = create_access_token(subject="user_123", expires_seconds=0)
         time.sleep(1)
         expired_payload = verify_access_token(expired_token)
@@ -111,15 +110,12 @@ def test_schemas():
         from app.schemas.project import ProjectCreate
         from app.schemas.record import RecordCreate, RecordUpdate
         
-        # Test user creation
         user = UserCreate(username="testuser", email="test@example.com", password="pwd123")
         assert user.username == "testuser"
         
-        # Test project creation
         project = ProjectCreate(name="Test Project", description="A test project")
         assert project.name == "Test Project"
         
-        # Test record creation (object_typology and material dropped in NEH-259)
         doc = RecordCreate(
             title="Test Record",
             description="A test record",
@@ -130,7 +126,6 @@ def test_schemas():
         assert doc.author == "John Doe"
         assert doc.capture_mode == "single"
         
-        # Test record update
         doc_update = RecordUpdate(
             title="Updated Title",
             custom_attributes='{"custom": "value"}'
@@ -159,25 +154,21 @@ def test_routes():
         # _IncludedRouter objects with no .path attribute).
         routes = set(app.openapi()["paths"].keys())
 
-        # Check auth routes
         assert "/auth/register" in routes, "Auth register route missing"
         assert "/auth/login" in routes, "Auth login route missing"
         assert "/auth/refresh" in routes, "Auth refresh route missing"
         assert "/auth/password-reset" in routes, "Auth password reset route missing"
         
-        # Check records routes
         assert "/records/" in routes, "Records list route missing"
         assert "/records/{rec_id}" in routes, "Records get route missing"
         assert "/records/{rec_id}/images" in routes, "Record images route missing"
         assert "/records/images/{img_id}/file" in routes, "Record image file download route missing"
         
-        # Check projects routes
         assert "/projects/" in routes, "Projects list route missing"
         assert "/projects/{project_id}" in routes, "Projects get route missing"
         assert "/projects/{project_id}/initialize" in routes, "Projects initialize route missing"
         assert "/projects/{project_id}/records" in routes, "Projects records route missing"
         
-        # Check cameras routes
         assert "/cameras/" in routes, "Cameras list route missing"
         assert "/cameras/devices" in routes, "Cameras devices route missing"
         assert "/cameras/capture" in routes, "Cameras capture route missing"
@@ -186,7 +177,6 @@ def test_routes():
         assert "/cameras/calibrate/white-balance" in routes, "Cameras WB calibrate route missing"
         assert "/cameras/settings/{id}" in routes, "Cameras settings CRUD routes missing"
         
-        # Check health route
         assert "/health" in routes, "Health check route missing"
         
         print(" [OK] All required routes are registered")
@@ -212,7 +202,6 @@ def test_models():
         from app.models.record import Record, RecordImage
         from app.models.camera import CameraSettings
         
-        # Check that models are registered with Base
         table_names = {table.name for table in Base.metadata.tables.values()}
         
         assert "users" in table_names, "Users table not registered"
@@ -230,16 +219,14 @@ def test_models():
 
 
 def test_new_endpoints():
-    """Test newly added endpoint schemas and models."""
+    """Test the camera and project update schemas."""
     print("\nTesting new endpoint schemas...")
     try:
-        # Test camera schemas
         from app.schemas.camera import CameraSettingsUpdate
         cam_update = CameraSettingsUpdate(iso=400, white_balance="daylight")
         assert cam_update.iso == 400
         assert cam_update.white_balance == "daylight"
         
-        # Test project schemas
         from app.schemas.project import ProjectUpdate
         proj_update = ProjectUpdate(name="Updated Name", description="New description")
         assert proj_update.name == "Updated Name"

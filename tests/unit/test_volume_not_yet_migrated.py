@@ -7,9 +7,6 @@ moves them to its name-based directory there. Captures it made since in
 `<stem>/` stay where they are. Whether a volume's files are still in the old
 layout is decided by storage_ops.collections_in_old_layout: it has no stem,
 or it has an image under the projects root outside `<stem>/`.
-
-The first two tests are the verifier's (round 4), the first rewritten to
-expect the rows to follow the files.
 """
 
 from pathlib import Path

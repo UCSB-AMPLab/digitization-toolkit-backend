@@ -14,7 +14,6 @@ Run with: python -m pytest tests/integration/test_camera_capture_recapture_hardw
 import pytest
 import sys
 
-# Skip on non-Linux platforms
 if sys.platform != 'linux':
     pytest.skip("Integration tests require Linux/Raspberry Pi environment", allow_module_level=True)
 

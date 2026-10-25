@@ -5,7 +5,7 @@ The per-body rotation (NEH-71) is held in degrees clockwise (0, 90, 180,
 JPEG, master or a RAW master's preview, carries it as the EXIF Orientation
 tag, written losslessly. A RAW master (`.cr2`) is a preservation master and
 is never rewritten: piexif can only insert into a JPEG, and on a CR2 it
-raised and logged an empty warning on every capture. The rotation is
+raises. The rotation is
 recorded, for every captured image, as `rotate_deg`:
 
 * in each `files` entry of the capture record in the volume's manifest

@@ -2,23 +2,19 @@
 """
 Tests for the CAMERA_BACKEND guard (NEH-268).
 
-An unrecognised value used to log "Unknown backend '<value>', defaulting to
-subprocess" and return RpicamBackend -- a third backend that is neither the one
-configured nor the one intended. On a DSLR rig that yields no cameras and
-presents as a hardware fault, so a typo in one line of .env was
-indistinguishable from a dead camera.
+An unrecognised value is refused, never mapped to a fallback. A fallback to
+RpicamBackend is a third backend, neither the one configured nor the one
+intended: on a DSLR rig it yields no cameras and presents as a hardware fault,
+so a typo in one line of .env would be indistinguishable from a dead camera.
 
-Two things have to hold, and the second is the one that was easy to miss: the
-value is refused, AND it is refused at startup. The backend is built lazily on
-the first capture, so a guard that lived only in the dispatch would let the
-service start, answer /health, and fail at the moment someone tried to
-photograph something.
+Two things have to hold: the value is refused, AND it is refused at startup.
+The backend is built lazily on the first capture, so a guard that lived only in
+the dispatch would let the service start, answer /health, and fail at the
+moment someone tried to photograph something.
 
-This file is deliberately not named for the subsystem it tests. Until
-2026-10-23 tests/conftest.py added @pytest.mark.camera to any test whose node
-id contained "camera", and CI runs `pytest -m "not camera"`, so a file or a
-test named for the camera backend was silently deselected. It now marks only
-the hardware files in HARDWARE_TEST_FILES (the backend's root conftest.py).
+CI runs `pytest -m "not camera"`. The backend's root conftest.py adds
+@pytest.mark.camera only to the hardware files in HARDWARE_TEST_FILES, so
+these tests run in CI whatever their names say.
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 """
@@ -28,21 +24,20 @@ import pytest
 from capture import service as capture_service
 
 # The settings instance is patched through `capture_service.settings` rather
-# than through `app.core.capture_service.settings`, and the difference is not cosmetic.
+# than through `app.core.config.settings`, and the difference is not cosmetic.
 # conftest.py's `set_camera_backend` fixture calls `importlib.reload(config)`,
-# which rebinds `app.core.capture_service.settings` to a NEW Settings object while every
+# which rebinds `app.core.config.settings` to a NEW Settings object while every
 # module that did `from app.core.config import settings` -- capture.service
 # among them -- goes on holding the old one. Patching the name in config then
-# changes an object nobody reads. The first version of this file did exactly
-# that and all fourteen cases failed by reading the default.
+# changes an object nobody reads, and every case here would read the default.
 
 
 @pytest.mark.unit
 def test_the_registry_is_the_only_list_of_names():
     """The dispatch and the published tuple cannot disagree, by construction.
 
-    The silent fallback survived because the names were enumerated in one place
-    and "everything else" was handled in another. One mapping now feeds both.
+    Names enumerated in one place and "everything else" handled in another
+    leave room for a silent fallback. One mapping feeds both.
     """
     assert capture_service.KNOWN_CAMERA_BACKENDS == tuple(
         sorted(capture_service._BACKEND_CONSTRUCTORS)
@@ -51,7 +46,7 @@ def test_the_registry_is_the_only_list_of_names():
         "picamera2", "subprocess", "gphoto2", "chdk"
     }
     # Four distinct classes: a mapping that pointed two names at one backend
-    # would reintroduce the defect while passing a membership check.
+    # would be a silent fallback that passes a membership check.
     assert len(set(capture_service._BACKEND_CONSTRUCTORS.values())) == 4
 
 
@@ -59,10 +54,6 @@ def test_the_registry_is_the_only_list_of_names():
 @pytest.mark.parametrize(
     "value",
     ["picamera2", "subprocess", "gphoto2", "chdk"],
-    # Explicit ids because the VALUES go into the node id, and "picamera2"
-    # contains "camera" -- which conftest.py auto-marks and CI deselects. The
-    # first version of this file lost exactly this case that way: 17 cases were
-    # written, 16 ran, and only the deselected count showed it.
     ids=["pi_still_port", "subprocess", "gphoto2", "chdk"],
 )
 def test_every_known_value_is_accepted(monkeypatch, value):
@@ -110,10 +101,10 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "rpicam")
     built = []
     # Both the registry values AND the names in the module namespace. Patching
-    # only the registry left a hole: a construction written directly above the
-    # dispatch -- RpicamBackend(subprocess_logger) -- never touches the mapping,
-    # so the recorder stayed empty and this test passed with the forbidden
-    # fallback being built.
+    # only the registry leaves a hole: a construction written directly above the
+    # dispatch, such as `RpicamBackend(subprocess_logger)`, never touches the
+    # mapping, so the recorder would stay empty and this test would pass with
+    # the forbidden fallback being built.
     for name in list(capture_service._BACKEND_CONSTRUCTORS):
         monkeypatch.setitem(
             capture_service._BACKEND_CONSTRUCTORS,
@@ -121,18 +112,15 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
             lambda *a, _n=name, **k: built.append(_n),
         )
     # Instrument the CLASS OBJECTS, not the names that point at them. Patching
-    # namespaces became whack-a-mole: the registry mapping and capture.service
-    # missed a local import from a defining module, adding those missed
-    # capture/__init__.py's re-export, and nothing said that was the last
-    # alias. Replacing __init__ on a class records a construction reached
-    # through any name bound to it.
+    # names cannot be shown to cover every alias: the registry mapping and
+    # capture.service miss a local import from a defining module, and those
+    # together miss capture/__init__.py's re-export. Replacing __init__ on a
+    # class records a construction reached through any name bound to it.
     #
     # Collected from every source rather than assumed to be one object:
     # capture/backends/__init__.py does NOT always re-export the defining
     # module's class -- it can supply a stand-in that raises when the optional
-    # dependency is absent, which is how picamera2 behaves off a Pi. An earlier
-    # version of this test asserted the registry's value WAS the module's class
-    # and failed for exactly that reason.
+    # dependency is absent, which is how picamera2 behaves off a Pi.
     import importlib
 
     candidates = list(capture_service._BACKEND_CONSTRUCTORS.values())
@@ -192,8 +180,8 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
 
     # Entered through the app's REGISTERED lifespan, not by calling the
     # function. Calling app_main.lifespan directly passes even if the
-    # registration is dropped -- a mutation to `FastAPI()` with no lifespan=
-    # left all 17 cases in this file green while the protection was gone.
+    # registration is dropped: with `FastAPI()` given no lifespan=, every
+    # other case in this file stays green while the protection is gone.
     async def serve():
         async with app_main.app.router.lifespan_context(app_main.app):
             served.append(1)
@@ -249,10 +237,10 @@ class _FakeBackend:
 
 
 # The real device-row shape, which the registry reads by key:
-# `device["hardware_id"]` and `device.get("port")`. A row missing either raised
+# `device["hardware_id"]` and `device.get("port")`. A row missing either raises
 # into _hardware_id_from_backend's `except Exception`, which returns
-# (None, {"error": ...}) -- so the first version of these tests failed even on
-# an unpadded "gphoto2" and looked like a normalisation bug.
+# (None, {"error": ...}) -- so a fake without them fails even on an unpadded
+# "gphoto2" and looks like a normalisation bug.
 _FAKE_DEVICE = {
     "index": 0,
     "model": "Canon EOS Rebel T7",
@@ -274,17 +262,14 @@ _FAKE_DEVICE = {
 def test_the_registry_dispatches_on_the_normalised_value(monkeypatch, value):
     """A value the guard accepts must route to the same backend downstream.
 
-    Accepting surrounding whitespace in the guard while camera_registry.py
-    normalised differently meant `" gphoto2 "` passed startup and then selected
-    the picamera2 path, so a DSLR rig produced no hardware id and detected
-    nothing.
+    If the guard accepts surrounding whitespace and camera_registry.py
+    normalises differently, `" gphoto2 "` passes startup and then selects the
+    picamera2 path, so a DSLR rig produces no hardware id and detects nothing.
 
     This goes through the registry's real dispatch rather than asserting on its
-    source. An earlier version of this test read the source instead, on the
-    grounds that both registry sites lead into hardware detection -- a review
-    pointed out that the suite already enumerates a fake backend this way, and
-    that a source assertion passes a mutation which adds a raw-value equality
-    check beside the normalised one.
+    source: the suite already enumerates a fake backend this way, and a source
+    assertion passes a mutation which adds a raw-value equality check beside
+    the normalised one.
     """
     from app.core.config import settings
     from capture.camera_registry import CameraRegistry

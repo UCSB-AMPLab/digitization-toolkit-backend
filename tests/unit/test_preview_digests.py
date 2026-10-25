@@ -455,7 +455,7 @@ def test_a_jpeg_masters_relocation_gives_no_preview(override_projects_root):
 
 
 def _stemmed_raw(db, root, stem, name="IMG_0001.cr2", capture_id="cap-r1"):
-    """A volume with one RAW image whose capture record lists its preview, as capture now writes it."""
+    """A volume with one RAW image whose capture record lists its preview, as capture writes it."""
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record, RecordImage
@@ -528,7 +528,7 @@ def test_a_preview_renamed_by_the_layout_migration_keeps_its_digest(db_session, 
     from app.models.record import RecordImage
 
     _capture_records(db_session, legacy)
-    # The RAW capture's record lists its preview, as capture now writes it.
+    # The RAW capture's record lists its preview, as capture writes it.
     manifest = legacy["root"] / "proj" / "metadata" / "manifest.jsonl"
     preview = legacy["root"] / "proj" / "fondo_a" / "images" / "main" / "IMG_0001_preview.jpg"
     records = _lines(manifest)

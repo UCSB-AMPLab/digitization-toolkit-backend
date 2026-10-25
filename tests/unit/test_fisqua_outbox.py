@@ -225,7 +225,7 @@ def test_a_refused_handover_enqueues_nothing(client, db_session, vol, fisqua):
 @pytest.mark.unit
 def test_a_volume_with_no_recorded_reference_code_is_sent_and_polled_under_its_stem(
         client, db_session, override_projects_root, fisqua):
-    """Ruled: the stem is the reference code (contract 1.2 §8) when external_id is not recorded."""
+    """The stem is the reference code (contract 1.2 §8) when external_id is not recorded."""
     v = Volume(db_session, override_projects_root, external_id=None)
     v.record(status="captured")
     assert _handover(client, v.col)["promoted"] == 1
@@ -290,8 +290,8 @@ def test_a_volume_whose_reference_code_differs_from_its_stem_is_refused_at_hando
         client, db_session, override_projects_root, fisqua):
     """Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code, unchanged.
 
-    The model refuses such a pair now (ReferenceCodeDiffersFromStemError);
-    this is a row written before the rule, which the outbox still refuses.
+    The model refuses such a pair (`ReferenceCodeDiffersFromStemError`);
+    this is a row written around the rule, which the outbox still refuses.
     """
     v = Volume(db_session, override_projects_root, stem="xx-test-001", external_id=None)
     _reference_before_the_rule(db_session, v.col, "xx-other-009")
@@ -1340,7 +1340,7 @@ def test_a_reference_code_set_differently_while_uploads_wait_is_refused_at_build
     rec = v.record(status="captured", upload=False)
     _handover(client, v.col)
     assert _rows(db_session, v.col)[0].state == "waiting_for_upload"
-    # The API refuses the change now (backend #140); a row changed around it
+    # The API refuses the change (backend #140); a row changed around it
     # is still refused when its manifest is built.
     resp = _as(client, "admin").patch(f"/collections/{v.col.id}", json={"external_id": "xx-other-777"})
     assert resp.status_code == 409, resp.text

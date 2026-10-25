@@ -289,7 +289,9 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
     """Apply one decisions set to a volume (module header). Commits. Returns what it did.
 
     Statuses: "applied", "already_applied", "stale" (for another manifest),
-    "invalid" (no decisionsId or no records list), "error" (rolled back).
+    "pending_handover" (a newer handover of the volume is not yet
+    delivered; nothing applied, read again next tick), "invalid" (no
+    decisionsId or no records list), "error" (rolled back).
     """
     from app.core import audit
     from app.models.collection import Collection

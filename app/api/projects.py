@@ -38,7 +38,6 @@ from app.core.db_errors import integrity_conflict
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
-# Role checkers
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
@@ -114,9 +113,9 @@ def add_record_to_project(
         raise HTTPException(status_code=404, detail="Project not found")
     # Locked and guarded for the same reason the other move routes are: this
     # changes a record's parent, and doing that to a handed-over record
-    # withdraws it from review one record at a time (NEH-260). An adversarial
-    # round reached the rule through here in two calls while the other two
-    # routes were guarded.
+    # withdraws it from review one record at a time (NEH-260). Unguarded, this
+    # route would let two calls move a record the other two routes refuse to
+    # move.
     r = _locked_record(db, rec_id, with_images=False)
     if not r:
         raise HTTPException(status_code=404, detail="Record not found")
@@ -193,7 +192,6 @@ def update_project(
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
 
-    # Check for name conflicts if name is being changed
     old_name = p.name
     name_changed = bool(payload.name) and payload.name != old_name
     if name_changed:
@@ -593,7 +591,6 @@ def add_project_member(
         ProjectMember.user_id    == payload.user_id,
     ).first()
     if existing:
-        # Update role if already a member
         existing.role = payload.role
         db.commit()
         db.refresh(existing)

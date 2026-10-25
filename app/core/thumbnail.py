@@ -12,15 +12,12 @@ import uuid
 
 logger = logging.getLogger(__name__)
 
-# Default thumbnail dimensions
-#
 # 600px covers the largest grid-view cell size in the frontend (GridView's
 # column-count slider goes down to 2 columns, which can render cells ~500-
-# 540px wide) with a bit of margin. At 200px, `object-fit: cover` was
-# upscaling the thumbnail to fill much larger cells, producing visibly
-# blurry grids — this only affects the display size, not the stored master
-# image, so the storage/bandwidth cost stays a small fraction of the
-# full-resolution capture either way.
+# 540px wide) with a bit of margin. A smaller thumbnail is upscaled by
+# `object-fit: cover` to fill those cells, which blurs the grid. The size
+# applies to the thumbnail only, not the stored master image, so its storage
+# and bandwidth cost stays a small fraction of the full-resolution capture.
 DEFAULT_THUMBNAIL_WIDTH = 600
 DEFAULT_THUMBNAIL_HEIGHT = 600
 DEFAULT_THUMBNAIL_FORMAT = "JPEG"
@@ -56,13 +53,11 @@ def generate_thumbnail(
     dest_dir.mkdir(parents=True, exist_ok=True)
     
     try:
-        # Open the image
         with Image.open(source_path) as img:
             # Honour EXIF Orientation so a rotated master thumbnails upright
             img = ImageOps.exif_transpose(img)
             # Convert RGBA/P to RGB for JPEG compatibility
             if img.mode in ("RGBA", "P", "LA"):
-                # Create white background
                 rgb_img = Image.new("RGB", img.size, (255, 255, 255))
                 rgb_img.paste(img, mask=img.split()[-1] if img.mode in ("RGBA", "LA") else None)
                 img = rgb_img
@@ -70,11 +65,9 @@ def generate_thumbnail(
             # Calculate thumbnail size maintaining aspect ratio
             img.thumbnail((max_width, max_height), Image.Resampling.LANCZOS)
             
-            # Generate unique filename for thumbnail
             thumb_filename = f"{uuid.uuid4().hex}_thumb.jpg"
             thumb_path = dest_dir / thumb_filename
             
-            # Save thumbnail
             img.save(thumb_path, format=DEFAULT_THUMBNAIL_FORMAT, quality=quality, optimize=True)
             
             logger.info(f"Generated thumbnail: {thumb_path}")
@@ -131,8 +124,6 @@ def regenerate_thumbnail(
         OSError: if the old thumbnail exists and cannot be unlinked; no new
             thumbnail is generated in that case
     """
-    # Delete old thumbnail
     delete_thumbnail(old_thumbnail_path)
     
-    # Generate new thumbnail
     return generate_thumbnail(source_path, dest_dir, max_width, max_height, quality)

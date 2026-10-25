@@ -134,8 +134,8 @@ def test_a_frame_with_a_huge_margin_leaves_the_backend_still_serving(monkeypatch
     """The property is that the poll fails and the process carries on.
 
     A margin near INT_MAX sizes the canvas encode_viewport_jpeg allocates, so
-    before it was bounded this frame raised MemoryError - or, one order of
-    magnitude down, quietly asked for gigabytes. Neither is a ValueError, so
+    without the bound this frame would raise MemoryError - or, one order of
+    magnitude down, ask for gigabytes. Neither is a ValueError, so
     neither reaches the operator as the failed poll it is, and the backend
     runs natively on the appliance with nothing around it to absorb the
     difference. The next poll on a well-formed frame still has to work.

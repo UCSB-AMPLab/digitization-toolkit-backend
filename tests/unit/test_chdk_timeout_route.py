@@ -3,7 +3,7 @@
 The test-capture route answers 504 for a stalled capture and 500 for
 everything else, and it tells them apart by class: _is_capture_timeout walks
 the exception chain looking for CaptureTimeoutError, which it imports from
-the gphoto2 backend. That import is now a re-export of the shared class, so
+the gphoto2 backend. That import is a re-export of the shared class, so
 this is the test that the CHDK backend's own timeout comes out the same door
 - if the two ever became separate classes, a stalled compact would read as a
 crashed one and the operator would be told the wrong thing.

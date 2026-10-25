@@ -1,6 +1,6 @@
-"""The verifier's round-5 checks (f6e0875): one projects root per capture, uploads already in uploads/.
+"""One projects root per capture, and uploads already in uploads/.
 
-The occupied-directory and rescan checks of that round are in
+The occupied-directory and rescan checks are in
 test_stem_directory_occupied and test_volume_manifest_repair.
 """
 

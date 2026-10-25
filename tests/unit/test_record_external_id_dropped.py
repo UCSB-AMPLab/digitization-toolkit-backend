@@ -1,4 +1,4 @@
-"""`records.external_id` is gone; the reference code lives on the volume.
+"""`records` has no `external_id`; the reference code lives on the volume.
 
 Exchange contract 1.1 maps each Fisqua item onto a volume, so Fisqua's
 `referenceCode` is `collections.external_id` and a record carries none. The

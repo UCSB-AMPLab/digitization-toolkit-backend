@@ -176,7 +176,7 @@ class CaptureRequest(BaseModel):
 	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
 	# None (the default) leaves the registry's saved orientation from
 	# default_camera_config_from_registry in place; an explicit value,
-	# including 0, overrides it (NEH-71 - the one behaviour change of the ticket).
+	# including 0, overrides it (NEH-71).
 	rotate_deg: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
@@ -302,7 +302,6 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 		hw_id = dev["hardware_id"]
 		idx = dev["index"]
 
-		# Enrich with registry calibration data
 		camera_data = registry.get_camera_by_id(hw_id) if registry else None
 		calibrated = False
 		machine_id = None
@@ -689,7 +688,7 @@ def apply_camera_settings(
 def _is_capture_timeout(exc: BaseException) -> bool:
 	"""True if exc, or something it was raised from, is a CaptureTimeoutError.
 
-	capture/backends/gphoto2_backend.py:1418 wraps a CaptureTimeoutError in a
+	capture/backends/gphoto2_backend.py wraps a CaptureTimeoutError in a
 	plain RuntimeError ("DSLR capture failed: ...") so a stalled DSLR body
 	can travel the same failure path as any other capture error, keeping the
 	original timeout as __cause__. Catching RuntimeError (or CaptureTimeoutError
@@ -808,7 +807,6 @@ def trigger_capture(
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
-	# Validate camera is connected
 	if not is_camera_connected(request.camera_index):
 		return CaptureResponse(
 			success=False, 
@@ -823,7 +821,7 @@ def trigger_capture(
 		)
 		# NEH-71: omitted (None) leaves the registry's saved orientation from
 		# default_camera_config_from_registry in place; an explicit value,
-		# including 0, overrides it. This is the one behaviour change of the ticket.
+		# including 0, overrides it.
 		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
 		camera_config = CameraConfig(**config_dict)
@@ -884,9 +882,10 @@ def trigger_capture(
 		if retake_record is not None:
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
-			# Retake (NEH-208; widened to 'captured' in NEH-260, so an operator
-			# can redo a frame she can see is bad instead of waiting for a
-			# reviewer to reject it and pick one of six image faults). A record
+			# Retake (NEH-208, NEH-260). A captured record can be retaken as well
+			# as a rejected one, so an operator can redo a frame she can see is
+			# bad instead of waiting for a reviewer to reject it and pick one of
+			# six image faults. A record
 			# in review or approved was refused at the top: approved is the only
 			# state meaning something may already have left the appliance, so
 			# the path is reviewer undoes, reviewer rejects, operator retakes.
@@ -896,7 +895,6 @@ def trigger_capture(
 			from app.api.records import _supersede_current_images
 			_supersede_current_images(record)
 		else:
-			# Create new record for this capture
 			record = Record(
 				title=request.record_title or f"{project_name} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
@@ -925,7 +923,6 @@ def trigger_capture(
 
 		file_format = file_path.suffix.lower().lstrip(".")
 
-		# Create RecordImage with capture linkage
 		img = RecordImage(
 			record_id=record.id,
 			filename=file_path.name,
@@ -945,7 +942,6 @@ def trigger_capture(
 		db.add(img)
 		db.flush()  # Get the ID
 		
-		# Save camera settings
 		cs = CameraSettings(
 			record_image_id=img.id,
 			camera_model=camera_config.__class__.__name__,
@@ -956,7 +952,6 @@ def trigger_capture(
 		)
 		db.add(cs)
 		
-		# Save EXIF data
 		if exif_dict:
 			ex = ExifData(
 				record_image_id=img.id,
@@ -1039,7 +1034,6 @@ def trigger_dual_capture(
 	except ImportError as e:
 		return CaptureResponse(success=False, error=f"Capture system not available: {e}")
 	
-	# Validate both cameras are connected
 	for idx in [0, 1]:
 		if not is_camera_connected(idx):
 			return CaptureResponse(
@@ -1104,14 +1098,13 @@ def trigger_dual_capture(
 			# Loaded and locked before the camera was touched; see the top.
 			record = retake_record
 			# Retake, on the same terms as the single-capture endpoint above
-			# (NEH-208, widened to 'captured' in NEH-260). A dual pair can only
+			# (NEH-208, NEH-260). A dual pair can only
 			# be redone as a pair, and can't turn a single-mode record into two
 			# images; status and mode were checked before the camera was touched.
 			is_recapture = True
 			from app.api.records import _supersede_current_images
 			_supersede_current_images(record)
 		else:
-			# Create new record for this dual capture
 			record = Record(
 				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
@@ -1124,12 +1117,10 @@ def trigger_dual_capture(
 			db.add(record)
 			db.flush()  # Get the ID
 		
-		# Helper to process captured image
 		def create_image_record(file_path_str: str, camera_idx: int, role: str, camera_config):
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
-			# Extract image info
 			resolution_width = None
 			resolution_height = None
 			exif_dict = {}
@@ -1164,7 +1155,6 @@ def trigger_dual_capture(
 
 			file_format = file_path.suffix.lower().lstrip(".")
 
-			# Create RecordImage with capture linkage
 			img = RecordImage(
 				record_id=record.id,
 				filename=file_path.name,
@@ -1185,7 +1175,6 @@ def trigger_dual_capture(
 			db.add(img)
 			db.flush()
 			
-			# Camera settings
 			cam_config = cam0_config if camera_idx == 0 else cam1_config
 			cs = CameraSettings(
 				record_image_id=img.id,
@@ -1197,7 +1186,6 @@ def trigger_dual_capture(
 			)
 			db.add(cs)
 			
-			# EXIF data
 			if exif_dict:
 				ex = ExifData(
 					record_image_id=img.id,
@@ -1207,7 +1195,6 @@ def trigger_dual_capture(
 			
 			return img
 		
-		# Create RecordImages for both captures with the roles computed above
 		img0 = create_image_record(str(path0), 0, role0, cam0_config)
 		img1 = create_image_record(str(path1), 1, role1, cam1_config)
 
@@ -1267,8 +1254,8 @@ def calibrate_camera(
 		img_size = IMG_SIZES.get(request.resolution, IMG_SIZES["high"])
 
 		# Route the AF cycle through the backend's own Picamera2 instance.
-		# The old approach (CameraCalibration / calibration.py) opened a brand-new
-		# Picamera2(camera_index) independently of the service cache.  Two concurrent
+		# CameraCalibration (capture/calibration.py) opens a separate
+		# Picamera2(camera_index) outside the service cache. Two concurrent
 		# libcamera handles on the same hardware corrupt both, leaving the service
 		# instance in a broken state so the next capture hangs indefinitely.
 		#
@@ -1278,7 +1265,6 @@ def calibrate_camera(
 		result = backend.run_autofocus_calibration(request.camera_index, img_size)
 
 		if result["success"]:
-			# Save calibration to registry
 			registry = CameraRegistry()
 			hw_id, _ = registry.get_camera_hardware_id(request.camera_index)
 
@@ -1474,7 +1460,6 @@ def apply_dslr_settings(
 			status_code=501,
 			detail="Active camera backend does not support DSLR settings.",
 		)
-	# Validate image_format if provided
 	if request.image_format is not None and request.image_format not in ("JPEG", "RAW", "RAW+JPEG"):
 		raise HTTPException(
 			status_code=422,
@@ -1517,7 +1502,7 @@ def set_camera_orientation(
 	index. A rescan can put a different body on the same index between that
 	read and this write; if the index's current identity does not match the
 	one in the request, this returns 409 instead of silently saving the new
-	value under someone else's body (R30-4). The client should reload the
+	value under someone else's body. The client should reload the
 	device list and try again.
 	"""
 	try:

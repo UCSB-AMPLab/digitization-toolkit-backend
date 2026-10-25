@@ -2,9 +2,8 @@
 
 The CHDK and DSLR backends hold PTP claims on the bodies for the life of the
 process, and their cleanup is what waits for whatever is running and releases
-them. Nothing in production called it: the lifespan had startup work and a
-bare yield, so on a restart the sessions were dropped rather than closed, and
-the lifecycle the backend documents was a promise nothing kept.
+them. The application lifespan calls it on the way out; without that call, a
+restart would drop the sessions rather than close them.
 """
 
 import pytest
@@ -111,9 +110,9 @@ def test_the_application_lifespan_closes_the_backend_on_the_way_out(monkeypatch)
 def test_no_backend_is_built_while_the_old_one_is_closing(monkeypatch):
     """Closing takes time, and the cameras are not free until it is done.
 
-    Clearing the global before the cleanup let a request arriving in that
-    window build a fresh backend, which then claimed the same bodies while
-    the old one was still closing them - a camera that cannot be opened by
+    Clearing the global before the cleanup would let a request arriving in
+    that window build a fresh backend, which would then claim the same bodies
+    while the old one was still closing them - a camera that cannot be opened by
     the thing that just opened it. The documented lifecycle says a process
     may carry on after a shutdown or switch backends, so it is reachable.
     """

@@ -1,8 +1,8 @@
 """
 Camera backend abstraction layer.
 
-This module provides a unified interface for different camera backends
-(subprocess/rpicam-still and picamera2), allowing seamless switching
+This module provides a unified interface for the camera backends
+(subprocess/rpicam-still, picamera2, gphoto2 and CHDK), allowing switching
 between implementations.
 """
 

@@ -263,7 +263,7 @@ def test_daily_tz_across_the_march_change_in_los_angeles(client, db_session, mon
     assert by_zone["2026-03-07"] == 1
     assert by_zone["2026-03-08"] == 1
     assert by_zone["2026-03-09"] == 1
-    # The fixed-offset fallback still counts with one offset, as it always has.
+    # The fixed-offset fallback counts with one offset for the whole window.
     by_offset = _captured(api, days=5, tz_offset_minutes=420)
     assert by_offset["2026-03-07"] == 0
     assert by_offset["2026-03-08"] == 2

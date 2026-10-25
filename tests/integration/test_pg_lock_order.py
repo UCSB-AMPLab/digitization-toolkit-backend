@@ -2,9 +2,9 @@
 
 Every path that takes both locks takes the record's row first and then its
 volume's (app/core/volume_stem.py). An upload that read its record unlocked
-locked the volume at the stem check and then inserted the image, whose
+would lock the volume at the stem check and then insert the image, whose
 foreign-key check takes FOR KEY SHARE on the record: volume, then record. A
-retake locks the record, then the volume, and the two deadlocked
+retake locks the record, then the volume, and the two deadlock
 ("deadlock detected ... while locking tuple ... in relation records").
 tests/unit/test_capture_requires_stem.py checks the order in the source, but
 SQLite takes no row locks, so only a real PostgreSQL shows the deadlock.
@@ -17,7 +17,7 @@ that database is read or changed. The test needs the right to create a schema.
 Each request runs in its own thread with its own TestClient and its own
 session. The upload sleeps after taking its locks, while saving the file, so
 the second request arrives while they are held. TestClient runs endpoints on
-threads of its own, so the stand-in for the old unlocked read decides by the
+threads of its own, so the stand-in for an unlocked read decides by the
 function calling it, never by thread name.
 
 Run with, for example:
@@ -204,7 +204,7 @@ def test_two_uploads_on_one_record_both_land(pg):
 
 @pytest.mark.integration
 def test_the_old_unlocked_read_deadlocks_so_this_test_can_see_it(pg, monkeypatch):
-    """Control: with the upload reading its record unlocked again, the pair fails."""
+    """Control: with the upload reading its record unlocked, the pair fails."""
     import app.api.records as records_api
     from app.models.record import Record
 

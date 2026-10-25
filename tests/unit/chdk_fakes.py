@@ -161,8 +161,8 @@ class Body:
         # back the first RET message, so is_record is what a caller reads,
         # and mode_value stands for it here.
         #
-        # Do not carry uBASIC's convention across: it is the reason this fake
-        # once returned 0 for record, which made the polarity untestable.
+        # Do not carry uBASIC's convention across: a fake that returns 0 for
+        # record leaves the polarity untestable.
         #
         # The two ways a switch can fail are separate knobs, because the
         # pinned library produces only one of them. stuck_in_play is a body

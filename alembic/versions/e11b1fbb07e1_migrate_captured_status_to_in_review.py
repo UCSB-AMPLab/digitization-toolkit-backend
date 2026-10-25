@@ -45,6 +45,6 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Deliberately empty. There is nothing to undo, and the wider constraint
-    # this used to restore on the way down is what 2525f43a4661 creates.
+    # Deliberately empty. There is nothing to undo, and the four-value
+    # constraint is the one 2525f43a4661 creates.
     pass

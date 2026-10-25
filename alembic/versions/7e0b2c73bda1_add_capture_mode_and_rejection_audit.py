@@ -19,14 +19,12 @@ Part 1 of the NEH-208 review-workflow redesign. This migration:
    (cameras.py), so any record with such images is 'dual'; everything else
    (including records with zero images) is 'single'.
 4. Drops `records.rejection_note` — superseded by
-   record_rejections.predefined_reason/comment, which now carries this
-   information instead. Downgrade restores it empty (nullable); the text
+   record_rejections.predefined_reason/comment. Downgrade restores it empty (nullable); the text
    itself is not recoverable, same as this repo's other lossy downgrades.
 
-The second half of the redesign (captured -> in_review data migration and
-narrowing the status CHECK constraint) is a separate migration
-(b2a1f9c4d3e6) chained after this one, so the judgment-call backfill here
-stays isolated from that mechanical rewrite.
+The status side of the redesign is a separate migration, e11b1fbb07e1,
+chained after this one; under NEH-260 it is empty and 'captured' stays a
+record status.
 """
 from typing import Sequence, Union
 

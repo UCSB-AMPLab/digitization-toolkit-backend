@@ -1,8 +1,7 @@
 """Every name the unit uses on Fisqua's side of the exchange (contract 1.2), in one place.
 
 Hosts, paths, query parameters, answer fields, rule ids, status names, and
-which HTTP answers mean what. Fisqua has answered the open points; the text
-is final once Juan signs it, so a rename there should be an edit here and
+which HTTP answers mean what. A rename in the contract is an edit here and
 nowhere else.
 
 The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
@@ -49,7 +48,7 @@ F_RULE = "rule"
 F_REF = "ref"
 F_ENTERED_AT = "enteredAt"
 # The status answer is an object holding the volumes under this key (a bare
-# list is still accepted).
+# list is also accepted).
 F_VOLUMES = "volumes"
 
 # Rules Fisqua names in problems. The unit acts on none of them by name: a

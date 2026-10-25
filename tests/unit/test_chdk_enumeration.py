@@ -502,8 +502,8 @@ def test_the_error_names_the_body_a_card_write_can_actually_repair(monkeypatch):
     """A clash can run between one body's serial and another's card id.
 
     Only the body whose identity comes off its card can be repaired by
-    writing one. Naming the other would send the operator round in circles,
-    rewriting a card that was never the problem.
+    writing one. Naming the other would have the operator rewrite a card
+    that was never the problem.
     """
     from_serial = Body(bus=1, address=4, serial="cccccccccccc",
                        card=b"EVEN\nid=aaaaaaaaaaaa\n")

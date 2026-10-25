@@ -26,7 +26,7 @@ def _b64u_decode(data: str) -> bytes:
 # login upgrades weaker hashes when the plaintext is available.
 _ALGO = "pbkdf2_sha256"
 PBKDF2_ITERATIONS = 600_000
-_LEGACY_ITERATIONS = 100_000  # original hashes were stored bare as "salt$hash"
+_LEGACY_ITERATIONS = 100_000  # the iteration count of legacy hashes, stored bare as "salt$hash"
 
 
 def _pbkdf2(password: str, salt: str, iterations: int) -> str:
@@ -45,7 +45,7 @@ def verify_password(password: str, hashed: str) -> bool:
             _, iters, salt, digest = parts
             return hmac.compare_digest(_pbkdf2(password, salt, int(iters)), digest)
         if len(parts) == 2:
-            # Legacy format: "salt$hash" at the original fixed iteration count.
+            # Legacy format: "salt$hash" at `_LEGACY_ITERATIONS`.
             salt, digest = parts
             return hmac.compare_digest(_pbkdf2(password, salt, _LEGACY_ITERATIONS), digest)
     except Exception:

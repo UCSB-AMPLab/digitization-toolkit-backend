@@ -20,9 +20,7 @@ class Record(Base):
 	title = Column(String(255), nullable=False)
 	description = Column(Text, nullable=True)
 	
-	# Archival/descriptive metadata. object_typology and material were dropped
-	# in NEH-259: the first was hard-coded by the capture path and duplicated
-	# capture_mode, the second never had a writer or a UI.
+	# Archival/descriptive metadata.
 	author = Column(String(255), nullable=True)
 	date = Column(String(50), nullable=True)
 	custom_attributes = Column(Text, nullable=True)  # JSON string for custom fields
@@ -47,9 +45,8 @@ class Record(Base):
 	# two columns of one row, which is what a CHECK does, so it holds against
 	# a bulk UPDATE and raw SQL as well.
 	#
-	# Nothing writes them yet. Absent from every request schema, exposed
-	# read-only on RecordRead; the importer that will fill them is blocked on
-	# the exchange contract.
+	# Nothing writes them yet: they are absent from every request schema and
+	# exposed read-only on RecordRead.
 	date_start = Column(Date, nullable=True)
 	date_end = Column(Date, nullable=True)
 
@@ -269,8 +266,7 @@ class RecordStatusChange(Base):
 	and when.
 
 	records.status holds only where a record is now, and modified_at moves
-	with any edit, so before this table nothing said when a record was
-	approved. A row is written by
+	with any edit, so neither says when a record was approved. A row is written by
 	app.core.record_status.change_record_status, which every writer of
 	records.status goes through; take-back writes its rows in bulk beside its
 	single UPDATE. Rows are not corrected: undoing an approval is a second

@@ -149,7 +149,7 @@ def test_a_preview_refuses_a_body_that_moved_while_it_waited(monkeypatch):
 
 @pytest.mark.unit
 def test_a_preview_still_runs_when_the_body_stayed_where_it_was(monkeypatch):
-    """The revalidation must not refuse the ordinary case it was added for."""
+    """The revalidation must not refuse the ordinary case of a body that stayed."""
     one = Body(bus=1, address=4, serial="AAA111", card=EVEN_CARD,
                frame=viewport_frame())
     two = Body(bus=1, address=7, serial="BBB222", card=ODD_CARD,
@@ -235,9 +235,9 @@ def test_a_capture_cannot_run_inside_half_a_card_read(monkeypatch, tmp_path):
 
     A capture is admitted by _row_error, which reads the body's hardware id,
     and that id comes off the card when pyusb reads no USB serial. A capture
-    that started between the download and the publish was therefore admitted
-    against the card the rescan was replacing, and went on to write a page
-    for whatever the card said afterwards. Here the rewritten card has lost
+    that starts between the download and the publish would be admitted
+    against the card the rescan is replacing, and would go on to write a page
+    for whatever the card says afterwards. Here the rewritten card has lost
     its id line, so the body has no identity to record and may not capture at
     all: the outcome to assert is that no page is written, not that some
     check ran.

@@ -112,7 +112,8 @@ class _FakeBackendRaw:
 class _FakeBackendTupleRotated:
     """Multi-format capture like _FakeBackendTuple, but returns a metadata
     dict (not None) as the picamera2 backend does for raw captures
-    (capture/backends/picamera2_backend.py:709 returns (jpeg, raw) paths)."""
+    (capture/backends/picamera2_backend.py:709 builds the (jpeg, raw) pair it
+    returns)."""
 
     def __init__(self, recorded):
         self.recorded = recorded

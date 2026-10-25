@@ -3,7 +3,7 @@
 gphoto2 CLI tuning & diagnostics script for DSLR cameras (e.g. Canon EOS 1500D).
 
 Usage examples:
-  # Auto-detect cameras and show their settings
+  # Auto-detect connected cameras
   python3 gphoto2_test.py detect
 
   # Capture from a single camera

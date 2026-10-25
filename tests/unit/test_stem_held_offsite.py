@@ -231,7 +231,7 @@ def test_a_stem_released_around_the_model_is_not_given_to_another_volume(admin, 
 
 @pytest.mark.unit
 def test_a_volume_takes_back_a_stem_whose_keys_are_all_its_own(admin, db_session):
-    """A volume whose stem was cleared before this guard can have it set again."""
+    """A volume whose stem was cleared around the guard can have it set again."""
     import sqlalchemy as sa
 
     p = _project(db_session)
