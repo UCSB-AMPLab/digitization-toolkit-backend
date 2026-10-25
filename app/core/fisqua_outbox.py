@@ -941,7 +941,12 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                     if isinstance(decisions_id, str) and decisions_id:
                         offered[cid] = (ref, decisions_id)
                         _keep_offered(db, cid, decisions_id[:255])
-                    if manifest_id is not None:
+                    # Recover a lost answer only when Fisqua accepted the
+                    # manifest. One it refused is left failed and sent again
+                    # with the same id: Fisqua replays its stored answer, and
+                    # the refusal takes the one path every refusal takes
+                    # (_send), object-missing incident included.
+                    if manifest_id is not None and state != fc.STATE_REFUSED:
                         lost = (db.query(FisquaOutbox.id)
                                 .filter(FisquaOutbox.collection_id == cid,
                                         FisquaOutbox.manifest_id == manifest_id,

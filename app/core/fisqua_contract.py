@@ -97,6 +97,7 @@ STATES = ("received", "registered", "preparing_review", "in_capture_qc", "retake
 # received) is not final: it is shown and polled again.
 FINAL_STATES = ("published", "refused", "superseded")
 STATE_UNKNOWN = "unknown"
+STATE_REFUSED = "refused"
 
 # ---------------------------------------------------------------------------
 # QC decisions (§9.5)

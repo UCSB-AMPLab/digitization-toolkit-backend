@@ -709,3 +709,41 @@ def test_the_cooldown_does_not_hold_back_sends(db_session, queued, monkeypatch):
     server = Server(_ok())
     _send(db_session, server)
     assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+def test_a_lost_answer_that_was_a_refusal_is_resent_and_refused_on_the_one_path(db_session, queued):
+    """A status entry naming a failed row's manifest as refused does not mark it delivered.
+
+    The row is sent again with the same id, Fisqua replays its stored 422,
+    and the refusal takes the normal path, object-missing incident included.
+    """
+    from app.models.system_log import SystemLog
+    _send(db_session, Server(httpx.ConnectError("answer lost")))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "failed"
+    problems = [{"rule": "object-missing", "message": "not in the masters bucket",
+                 "objectKey": f"{queued.stem}/captures/{queued.stem}-img_0001_c0.jpg",
+                 "captureId": "c-1", "role": "left", "kind": "capture"}]
+    status = httpx.Response(200, json={"volumes": [{
+        "ref": queued.stem, "manifestId": row.manifest_id, "state": "refused", "problems": problems}]})
+    result = _poll(db_session, Server(status))
+    assert result["recovered"] == 0
+    assert _rows(db_session, queued.col)[0].state == "failed"
+
+    _send(db_session, Server(httpx.Response(422, json={"problems": problems})),
+          now=datetime.now(timezone.utc).replace(tzinfo=None) + timedelta(days=1))
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.refusal == "fisqua" and row.problems == problems
+    assert db_session.query(SystemLog).filter(SystemLog.action == "fisqua_object_missing").count() == 1
+
+
+@pytest.mark.unit
+def test_a_lost_answer_that_was_accepted_is_still_recovered(db_session, queued):
+    _send(db_session, Server(httpx.ConnectError("answer lost")))
+    row = _rows(db_session, queued.col)[0]
+    status = httpx.Response(200, json={"volumes": [{
+        "ref": queued.stem, "manifestId": row.manifest_id, "volumeId": "fq-1", "state": "registered",
+        "problems": []}]})
+    assert _poll(db_session, Server(status))["recovered"] == 1
+    assert _rows(db_session, queued.col)[0].state == "delivered"
