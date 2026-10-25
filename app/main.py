@@ -103,7 +103,11 @@ app.include_router(imports_router, prefix="/imports", tags=["imports"])
 
 
 from app.core.storage_override import StorageUnavailableError
-from app.models.collection import StemDirectoryCollisionError, StemHeldOffsiteError
+from app.models.collection import (
+    ReferenceCodeDiffersFromStemError,
+    StemDirectoryCollisionError,
+    StemHeldOffsiteError,
+)
 
 
 @app.exception_handler(StorageUnavailableError)
@@ -122,6 +126,15 @@ async def stem_directory_taken(request: Request, exc: StemDirectoryCollisionErro
 async def stem_held_offsite(request: Request, exc: StemHeldOffsiteError):
     """A stem with offsite objects keyed under it, refused at a flush."""
     return JSONResponse(status_code=409, content={"detail": {"message": str(exc)}})
+
+
+@app.exception_handler(ReferenceCodeDiffersFromStemError)
+async def reference_code_differs_from_stem(request: Request, exc: ReferenceCodeDiffersFromStemError):
+    """A volume's reference code and stem set to different values, refused at a flush."""
+    return JSONResponse(status_code=409, content={"detail": {
+        "message": str(exc), "reason": exc.reason,
+        "external_id": exc.external_id, "filename_stem": exc.filename_stem,
+    }})
 
 
 @app.get("/health")

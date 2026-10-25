@@ -67,6 +67,7 @@ from app.models.collection import (
     FILENAME_STEM_MAX_LENGTH,
     FILENAME_STEM_PATTERN,
     Collection,
+    ReferenceCodeDiffersFromStemError,
     StemDirectoryCollisionError,
     StemDirectoryOccupiedError,
     StemHeldOffsiteError,
@@ -653,6 +654,12 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             # this item only is rolled back and reported.
             db.rollback()
             rejects.append(_reject(position, code, "filename_stem_held_offsite"))
+            continue
+        except ReferenceCodeDiffersFromStemError:
+            # _check_item refuses this first; the model's flush listener is
+            # the rule for every writer, so its refusal is reported the same.
+            db.rollback()
+            rejects.append(_reject(position, code, "filename_stem_differs_from_reference_code"))
             continue
         except SQLAlchemyError:
             # Any other database failure on this item (a lost connection, a
