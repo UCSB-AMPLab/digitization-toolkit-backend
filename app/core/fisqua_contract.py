@@ -87,7 +87,8 @@ CONFIG_ERROR_REASONS = {401: "token", 403: "token", 404: "not_found"}
 REDIRECT_REASON = "redirect"
 # 400 rules (§9.2) that mean the unit's software and Fisqua disagree about
 # the manifest itself, not that one volume is wrong: the refusal is final for
-# its manifest, and the unit stops sending until its software changes.
+# its manifest, and the unit stops sending until its software changes or a
+# retest finds that Fisqua reads its manifests (fisqua_outbox._retest_version_stop).
 VERSION_RULES = ("version", "envelope", "shape")
 VERSION_REASON = "version"
 
