@@ -230,6 +230,20 @@ def _apply_rotations(rec, decision: dict, report: dict) -> None:
     report["counts"]["rotations"] += len(wanted)
 
 
+def _lock_records(db: Session, ids: list) -> dict:
+    """{id: record} for the records with these ids, with images and rejections, their rows locked in id order."""
+    from app.models.record import Record
+
+    if not ids:
+        return {}
+    return {rec.id: rec for rec in (db.query(Record)
+                                     .options(joinedload(Record.images), joinedload(Record.rejections))
+                                     .filter(Record.id.in_(ids))
+                                     .order_by(Record.id)
+                                     .with_for_update(of=Record)
+                                     .all())}
+
+
 def _empty_report() -> dict:
     return {"counts": {"approved": 0, "rejected": 0, "unchanged": 0, "skipped": 0,
                        "rotations": 0, "rotations_skipped": 0},
@@ -287,15 +301,20 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
     decisions = [d for d in body[fc.F_RECORDS] if isinstance(d, dict)]
     ids = sorted({i for i in (_record_id(d.get(fc.F_CAPTUA_RECORD_ID)) for d in decisions) if i is not None})
     try:
-        records = {}
-        if ids:
-            for rec in (db.query(Record)
-                        .options(joinedload(Record.images), joinedload(Record.rejections))
-                        .filter(Record.id.in_(ids))
-                        .order_by(Record.id)
-                        .with_for_update(of=Record)
-                        .all()):
-                records[rec.id] = rec
+        records = _lock_records(db, ids)
+        # Again, under the locks: a promotion may have committed while the
+        # locks were awaited. A promotion locks only the volume's captured
+        # records, not these, so one can still commit after this check; what
+        # it cannot do is change these records' images, since a retake takes
+        # the record lock (app.api.cameras, through records._locked_record). The images
+        # check below reads the records as locked, so a decision is never
+        # applied to images other than those it decided.
+        relocked = _current_row(db, collection_id)
+        if relocked is None or relocked[0] != current_row[0] or _newer_pending(db, collection_id, current_row[0]):
+            db.rollback()
+            logger.info("Fisqua decisions %s for volume %s wait: a newer handover came while the "
+                        "records were being locked", decisions_id, collection_id)
+            return {"status": "pending_handover", "decisions_id": decisions_id}
 
         for decision in decisions:
             raw = decision.get(fc.F_CAPTUA_RECORD_ID)

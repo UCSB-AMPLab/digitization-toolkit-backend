@@ -587,3 +587,55 @@ def test_a_final_volume_whose_offered_set_is_stale_is_not_polled_again(client, d
     fake.status["state"] = "published"
     _poll(db_session, fake)
     assert vol.stem not in volumes_to_poll(db_session)
+
+
+
+@pytest.mark.unit
+def test_a_promotion_committed_while_the_locks_were_awaited_makes_the_set_wait(client, db_session, handed, monkeypatch):
+    """The newer-handover guard is checked again under the record locks."""
+    import uuid as _uuid
+
+    from app.core import fisqua_decisions
+    from app.core.db import SessionLocal
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    vol, (a, b), row, fake = handed
+    real = fisqua_decisions._lock_records
+
+    def promotion_lands_first(db, ids):
+        other = SessionLocal()
+        try:
+            other.add(FisquaOutbox(collection_id=vol.col.id, manifest_id=str(_uuid.uuid4()), stem=vol.stem,
+                                   state="waiting_for_upload", attempts=0, created_at=_now()))
+            other.commit()
+        finally:
+            other.close()
+        return real(db, ids)
+
+    monkeypatch.setattr(fisqua_decisions, "_lock_records", promotion_lands_first)
+    _decide(fake, row, [_approve(a)])
+    result = _poll(db_session, fake)
+    assert result["decisions_applied"] == 0
+    assert _refresh(db_session, a).status == "in_review"
+    state = _decisions_state(client, vol.col)
+    assert state is None or (state["decisions_id"] is None and state["stale"] is False)
+
+
+@pytest.mark.unit
+def test_a_retake_committed_while_the_locks_were_awaited_is_caught(client, db_session, handed, monkeypatch):
+    """The images check reads the records as locked, not as first read."""
+    from app.core import fisqua_decisions
+    vol, (a, b), row, fake = handed
+    real = fisqua_decisions._lock_records
+
+    def retake_lands_first(db, ids):
+        rec = _refresh(db_session, a)
+        vol.supersede(rec)
+        vol.capture(rec, ("left", "right"))
+        return real(db, ids)
+
+    monkeypatch.setattr(fisqua_decisions, "_lock_records", retake_lands_first)
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
