@@ -1369,3 +1369,40 @@ def test_a_reference_code_set_to_the_stem_while_uploads_wait_is_sent(
     _run(db_session, transport)
     row = _rows(db_session, v.col)[0]
     assert row.state == "delivered" and row.reference_code == v.stem
+
+
+# ---------------------------------------------------------------------------
+# The shutdown event and the configuration error are two things
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_shutdown_stops_a_pass_with_waiting_manifests(client, db_session, vol, fisqua):
+    import threading
+
+    from app.core.fisqua_outbox import run_fisqua_outbox
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    shutdown = threading.Event()
+    shutdown.set()
+    transport = FakeTransport(sends=[_delivered()])
+    result = run_fisqua_outbox(db_session, transport=transport, stop=shutdown)
+    assert result["status"] == "stopped"
+    assert transport.sent == []
+    assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
+
+
+@pytest.mark.unit
+def test_a_non_version_configuration_error_with_a_waiting_manifest_takes_the_configuration_path(
+        client, db_session, vol, fisqua):
+    import threading
+
+    from app.core.fisqua_outbox import record_config_error, run_fisqua_outbox, _now
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    record_config_error(401, "token", _now())
+    transport = FakeTransport(sends=[_delivered()])
+    result = run_fisqua_outbox(db_session, transport=transport, stop=threading.Event())
+    assert result["status"] == "config_error"
+    assert transport.sent == []
+    # Not a version stop: the manifest is built, and waits for the configuration to change.
+    assert _rows(db_session, vol.col)[0].state == "ready"

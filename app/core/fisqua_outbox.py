@@ -840,12 +840,13 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                 _end_send(db, row_id, state="failed", next_attempt_at=now,
                           last_error="interrupted while sending")
 
-            stop = config_error()
-            if stop is not None and stop.get("reason") == fc.VERSION_REASON:
+            # Not `stop`: that is the caller's shutdown event, which stopping() reads.
+            unit_stop = config_error()
+            if unit_stop is not None and unit_stop.get("reason") == fc.VERSION_REASON:
                 # Nothing is built under the software Fisqua could not read.
                 result.status = "config_error"
                 return result.as_dict()
-            if stop is None:
+            if unit_stop is None:
                 _resend_version_refusals(db)
 
             for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
