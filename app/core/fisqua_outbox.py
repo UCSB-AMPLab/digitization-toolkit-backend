@@ -49,7 +49,8 @@ app.core.fisqua_contract. Here:
   the stop is removed; refused again for version, the stop holds for
   another interval. Once an update or a retest clears the stop, each volume
   whose newest manifest was refused for version is handed over again under
-  a new id.
+  a new id, and a retest manifest still unanswered when an update cleared
+  the stop is built again under a new id (_rebuild_stale_retest).
 * **The offsite upload hold** (app.core.offsite_hold). While its file exists
   a send pass and a poll tick each answer "held" at their start, with no
   call to Fisqua and nothing promoted; removing it resumes the next pass.
@@ -352,6 +353,15 @@ def record_config_error(status_code: Optional[int], reason: Optional[str], now: 
     entry = {"at": now.isoformat(), "status_code": status_code, "reason": reason,
              "config_fingerprint": config_fingerprint()}
     with _config_lock:
+        old = _read_stop_file()
+        entry.update({key: old[key] for key in PENDING_KEYS if key in old})
+        if old.get("reason") == fc.VERSION_REASON and reason != fc.VERSION_REASON:
+            # A configuration stop in place of a version stop: what the
+            # retests built is still the refused code's, to be built again
+            # once this stop goes (_current_stop, _rebuild_stale_retest).
+            entry[REBUILD_UNSENT_KEY] = True
+            if isinstance(old.get("retest_row"), int):
+                entry[REBUILD_KEY] = old["retest_row"]
         _write_stop(entry)
     if reason == fc.VERSION_REASON:
         logger.error("Fisqua answered HTTP %s (%s) for this unit's manifests (fingerprint %s); sending and "
@@ -371,10 +381,33 @@ def _parse_stop_time(value: Any) -> Optional[datetime]:
         return None
 
 
+# Keys, in the stop file, of work left by a version stop an update cleared
+# (_rebuild_stale_retest): the retest row to build again, and whether the
+# manifests built but never sent are to be built again.
+REBUILD_KEY = "rebuild_retest_row"
+REBUILD_UNSENT_KEY = "rebuild_unsent"
+PENDING_KEYS = (REBUILD_KEY, REBUILD_UNSENT_KEY)
+
+
+def _read_stop_file() -> dict:
+    """The stop file's content as a dict ({} when absent or unreadable). The caller holds _config_lock."""
+    try:
+        entry = json.loads(_config_error_path().read_text(encoding="utf-8"))
+    except (OSError, ValueError):
+        return {}
+    return entry if isinstance(entry, dict) else {}
+
+
 def _current_stop() -> Optional[dict]:
     """The stop file's entry, while the configuration is still the one that failed; None otherwise.
 
-    A record for another configuration is removed: it was changed, so sending resumes.
+    A record for another configuration is removed: it was changed, so sending
+    resumes. When that record is a version stop (or carries work one left),
+    the file keeps only that work (PENDING_KEYS): the last retest row, and
+    the manifests built but never sent, for the next send pass to build
+    again under the new code (_rebuild_stale_retest). They were built by
+    the code Fisqua refused. No database work is done here, under
+    _config_lock.
     """
     path = _config_error_path()
     with _config_lock:
@@ -384,15 +417,69 @@ def _current_stop() -> Optional[dict]:
             return None
         except (OSError, ValueError):
             entry = None
-        if isinstance(entry, dict) and entry.get("config_fingerprint") == config_fingerprint():
+        if not isinstance(entry, dict):
+            entry = None if entry is None else {}
+        if entry is not None and entry.get("config_fingerprint") == config_fingerprint():
             return entry
+        if entry and set(entry) <= set(PENDING_KEYS):
+            return None  # only work left by a cleared version stop: no stop
+        pending = {key: entry[key] for key in PENDING_KEYS if key in entry} if entry else {}
+        if entry and entry.get("reason") == fc.VERSION_REASON:
+            pending[REBUILD_UNSENT_KEY] = True
+            if isinstance(entry.get("retest_row"), int):
+                pending[REBUILD_KEY] = entry["retest_row"]
         try:
-            path.unlink()
+            if pending:
+                _write_stop(pending)
+            else:
+                path.unlink()
         except OSError:
             pass
         if entry is not None:
             logger.info("The Fisqua configuration was changed since Fisqua refused it; sending resumes")
         return None
+
+
+def _rebuild_stale_retest(db: Session) -> None:
+    """Build again what a version stop's retests built, once an update cleared the stop. Commits.
+
+    Those manifests were built by the code Fisqua refused; sent as they are,
+    they would be refused again and stop the unit under the new code. Built
+    and never sent (a retest that found no call left in the budget, or a
+    shutdown): _rebuild_unsent, as after any version refusal. The last
+    retest row, still `ready` or `failed` (its answer lost or a transient
+    failure), goes back to `waiting_for_upload` the same way, under a new
+    manifest id (Fisqua may hold the old one) and with no attempt. Run at
+    the start of a send pass, under _step_lock and outside _config_lock,
+    once the file holds only these keys; they are then removed from it.
+    """
+    with _config_lock:
+        entry = _read_stop_file()
+        row_id, unsent = entry.get(REBUILD_KEY), entry.get(REBUILD_UNSENT_KEY)
+    # Only once no stop holds: under a stop that carries them (a
+    # configuration stop that replaced a version stop) the code may still
+    # be the refused one.
+    if "config_fingerprint" in entry or (not isinstance(row_id, int) and not unsent):
+        return
+    if unsent:
+        _rebuild_unsent(db)
+    if isinstance(row_id, int) and _move(
+            db, row_id, ("ready", "failed"), state="waiting_for_upload", manifest=None, reference_code=None,
+            manifest_id=str(uuid.uuid4()), attempts=0, next_attempt_at=None, last_error=None, response=None):
+        logger.info("Fisqua retest manifest of outbox row %s is built again under the updated software", row_id)
+    with _config_lock:
+        entry = _read_stop_file()
+        if (entry.get(REBUILD_KEY), entry.get(REBUILD_UNSENT_KEY)) != (row_id, unsent):
+            return
+        for key in PENDING_KEYS:
+            entry.pop(key, None)
+        try:
+            if entry:
+                _write_stop(entry)
+            else:
+                _config_error_path().unlink()
+        except OSError:
+            pass
 
 
 def config_error() -> Optional[dict]:
@@ -1094,6 +1181,11 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
                 _end_send(db, row_id, state="failed", next_attempt_at=now,
                           last_error="interrupted while sending")
+
+            # Read the stop first: an update that cleared a version stop
+            # leaves its retest row to be built again.
+            config_error()
+            _rebuild_stale_retest(db)
 
             # Not `stop`: that is the caller's shutdown event, which stopping() reads.
             unit_stop = config_error()

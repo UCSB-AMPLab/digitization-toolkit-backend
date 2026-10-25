@@ -1083,3 +1083,104 @@ def test_a_shutdown_makes_no_retest(db_session, queued):
     assert result["status"] == "stopped"
     assert server.requests == []
     assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("panel_first", [False, True])
+def test_an_update_after_a_retest_failed_in_transit_sends_the_new_codes_manifest(
+        db_session, queued, monkeypatch, panel_first):
+    """The retest row was built by the code Fisqua refused; after the update it is built again, not resent."""
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    failed = Server(httpx.Response(503))
+    _send(db_session, failed, now=first)
+    old_id = json.loads(failed.requests[0].content)["id"]
+    [_refused, retest] = _rows(db_session, queued.col)
+    assert retest.state == "failed" and retest.manifest_id == old_id
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    if panel_first:
+        # The system panel reads the stop before the next pass does.
+        assert config_error() is None
+    server = Server(_ok())
+    result = _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    sent = json.loads(request.content)
+    assert sent["id"] != old_id
+    assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert result["status"] == "done"
+    assert config_error() is None
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "delivered"]
+    assert rows[1].id == retest.id and rows[1].manifest_id == sent["id"]
+    # Nothing is left to rebuild or resend.
+    later = Server(_ok())
+    _send(db_session, later, now=first + timedelta(hours=2))
+    assert later.requests == []
+
+
+@pytest.mark.unit
+def test_a_pending_rebuild_survives_a_new_configuration_stop(db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error, record_config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    failed = Server(httpx.Response(503))
+    _send(db_session, failed, now=first)
+    old_id = json.loads(failed.requests[0].content)["id"]
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    assert config_error() is None
+    # The poll meets a token error before the next send pass.
+    record_config_error(401, "token", first + timedelta(minutes=5))
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", __import__("pydantic").SecretStr(OTHER_TOKEN))
+    server = Server(_ok())
+    _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    assert json.loads(request.content)["id"] != old_id
+
+
+@pytest.mark.unit
+def test_a_retest_manifest_built_but_not_sent_is_built_again_after_an_update(db_session, queued, monkeypatch):
+    """The budget ran out after the retest built its manifest; the update must not send that manifest."""
+    from app.core import config, fisqua_outbox
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    full = fisqua_outbox.call_budget
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(limit=0))
+    _send(db_session, Server(_ok()), now=T0 + _interval())
+    built = _rows(db_session, queued.col)[-1]
+    assert built.state == "ready" and built.attempts == 0
+    monkeypatch.setattr(fisqua_outbox, "call_budget", full)
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    assert config_error() is None
+    server = Server(_ok())
+    _send(db_session, server, now=T0 + _interval() + timedelta(hours=1))
+    [request] = server.requests
+    assert json.loads(request.content)["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_retest_answered_with_a_token_error_is_built_again_after_an_update(db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _stopped(db_session, queued)
+    first = T0 + _interval()
+    _send(db_session, Server(httpx.Response(401)), now=first)
+    assert config_error()["reason"] == "token"
+    # The token stop holds: the retest row is not rebuilt yet, under the code Fisqua refused.
+    _send(db_session, Server(_ok()), now=first + timedelta(minutes=10))
+    retest = _rows(db_session, queued.col)[-1]
+    assert retest.state == "ready"
+    old_id = retest.manifest_id
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server, now=first + timedelta(hours=1))
+    [request] = server.requests
+    sent = json.loads(request.content)
+    assert sent["id"] != old_id
+    assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert config_error() is None
