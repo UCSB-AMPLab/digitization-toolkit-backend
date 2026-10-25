@@ -38,7 +38,12 @@ app.core.fisqua_contract. Here:
   offline for days. A configuration error (401, 403, 404 or any redirect)
   stops sending and polling for the whole unit (record_config_error) until
   the environment, the base URL or the token changes: the row goes back to
-  `ready`.
+  `ready`. A 400 for `version`, `envelope` or `shape` (Fisqua cannot read
+  what this software writes) refuses its manifest for good and stops the
+  unit with reason `version` until the software changes; nothing is built
+  meanwhile, manifests built but never sent are built again under new ids,
+  and once an update clears the stop each volume whose newest manifest was
+  refused for it is handed over again under a new id.
 * **The offsite upload hold** (app.core.offsite_hold). While its file exists
   a send pass and a poll tick each answer "held" at their start, with no
   call to Fisqua and nothing promoted; removing it resumes the next pass.
@@ -191,14 +196,16 @@ def base_url() -> Optional[str]:
 
 
 def config_fingerprint() -> str:
-    """8 hex digits of the sha256 of (environment, base URL, token): enough to tell two configurations apart.
+    """8 hex digits of the sha256 of (environment, base URL, token, software version).
 
-    The base URL is the one calls go to, so a change of DTK_FISQUA_BASE_URL
-    or of the tenant changes it too. Neither the token nor a full hash of it
-    is kept anywhere.
+    Enough to tell two configurations apart. The base URL is the one calls
+    go to, so a change of DTK_FISQUA_BASE_URL or of the tenant changes it
+    too; the software version (settings.app_version) is there so that an
+    update clears a stop for a manifest Fisqua could not read (reason
+    `version`). Neither the token nor a full hash of it is kept anywhere.
     """
-    triple = [fisqua_environment() or "", base_url() or "", _token()]
-    return hashlib.sha256(json.dumps(triple).encode()).hexdigest()[:8]
+    parts = [fisqua_environment() or "", base_url() or "", _token(), config.settings.app_version]
+    return hashlib.sha256(json.dumps(parts).encode()).hexdigest()[:8]
 
 
 def scrub(text: Any) -> str:
@@ -662,6 +669,66 @@ def _log_object_missing(db: Session, row, problems: Any) -> None:
                     detail=scrub(f"manifest {row.manifest_id} missing={len(missing)} keys: " + ", ".join(keys)))
 
 
+def _version_refusal(problems: Any) -> bool:
+    """Whether a refusal's problems include a rule meaning Fisqua cannot read this software's manifests."""
+    return any(isinstance(p, dict) and p.get(fc.F_RULE) in fc.VERSION_RULES for p in problems or [])
+
+
+def _rebuild_unsent(db: Session) -> None:
+    """Put manifests built but never sent back to be built again, under new ids. Commits.
+
+    After a version refusal, a `ready` row with no attempt was built by the
+    software Fisqua refused. Fisqua has never seen its id, so a new one is
+    safe; the manifest is built again, by the updated software, once the
+    stop clears.
+    """
+    from app.models.fisqua import FisquaOutbox
+
+    for (row_id,) in (db.query(FisquaOutbox.id)
+                      .filter(FisquaOutbox.state == "ready", FisquaOutbox.attempts == 0).all()):
+        _move(db, row_id, "ready", state="waiting_for_upload", manifest=None, reference_code=None,
+              manifest_id=str(uuid.uuid4()))
+
+
+def _resend_version_refusals(db: Session) -> int:
+    """Hand over again, under a new manifest id, each volume whose newest manifest was refused for version.
+
+    Run only while no stop is recorded, so after the update that cleared it.
+    Fisqua replays a stored refusal for the same id, hence the new one. Only
+    a volume whose newest outbox row is that refusal, and which has no
+    captured record, is handed over again: a newer row means a later
+    handover already stands for it, and a captured record means it was taken
+    back or is being captured, and its next handover will be sent. Returns
+    how many were handed over again.
+    """
+    from sqlalchemy import func
+
+    from app.models.collection import Collection
+    from app.models.fisqua import FisquaOutbox
+    from app.models.record import Record
+
+    newest = (db.query(FisquaOutbox.collection_id, func.max(FisquaOutbox.id))
+              .group_by(FisquaOutbox.collection_id).subquery())
+    rows = (db.query(FisquaOutbox)
+            .join(newest, FisquaOutbox.id == newest.c[1])
+            .filter(FisquaOutbox.state == "refused", FisquaOutbox.refusal == "fisqua").all())
+    again = 0
+    for row in rows:
+        if not _version_refusal(row.problems):
+            continue
+        captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
+                                              Record.status == "captured").first()
+        collection = db.get(Collection, row.collection_id)
+        if captured is not None or collection is None:
+            continue
+        enqueue_handover(db, collection)
+        db.commit()
+        again += 1
+        logger.info("Volume %s handed to Fisqua again under a new manifest id after a version refusal",
+                    row.collection_id)
+    return again
+
+
 def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _Run) -> bool:
     """Send one row. False when Fisqua refused the token, and sending is to stop.
 
@@ -703,6 +770,15 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
         result.refused += 1
         logger.warning("Fisqua refused manifest %s of volume %s", row.manifest_id, row.collection_id)
         _log_object_missing(db, row, answer.problems)
+        if answer.status_code == 400 and _version_refusal(answer.problems):
+            # Fisqua cannot read what this software writes: final for this
+            # manifest, as the contract has it, and a stop for the unit, so
+            # later handovers wait for an update instead of each being sent
+            # and refused (_rebuild_unsent rebuilds those already built).
+            record_config_error(400, fc.VERSION_REASON, now)
+            _rebuild_unsent(db)
+            result.status = "config_error"
+            return False
     else:
         error = scrub(answer.error or f"unexpected outcome {answer.outcome!r}")
         wait = retry_delay(attempts)
@@ -763,6 +839,14 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
             for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
                 _end_send(db, row_id, state="failed", next_attempt_at=now,
                           last_error="interrupted while sending")
+
+            stop = config_error()
+            if stop is not None and stop.get("reason") == fc.VERSION_REASON:
+                # Nothing is built under the software Fisqua could not read.
+                result.status = "config_error"
+                return result.as_dict()
+            if stop is None:
+                _resend_version_refusals(db)
 
             for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
                         .order_by(FisquaOutbox.id).all()):

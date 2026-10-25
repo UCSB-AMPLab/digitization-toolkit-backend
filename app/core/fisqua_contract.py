@@ -85,6 +85,11 @@ REFUSED_WITH_PROBLEMS = (409,)
 CONFIG_ERROR = (401, 403, 404)
 CONFIG_ERROR_REASONS = {401: "token", 403: "token", 404: "not_found"}
 REDIRECT_REASON = "redirect"
+# 400 rules (§9.2) that mean the unit's software and Fisqua disagree about
+# the manifest itself, not that one volume is wrong: the refusal is final for
+# its manifest, and the unit stops sending until its software changes.
+VERSION_RULES = ("version", "envelope", "shape")
+VERSION_REASON = "version"
 
 # Fisqua's states for a volume (§9.3, as amended). These are not Captua's
 # record statuses: Fisqua's `approved` is a whole volume through its capture

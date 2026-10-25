@@ -747,3 +747,91 @@ def test_a_lost_answer_that_was_accepted_is_still_recovered(db_session, queued):
         "problems": []}]})
     assert _poll(db_session, Server(status))["recovered"] == 1
     assert _rows(db_session, queued.col)[0].state == "delivered"
+
+
+# ---------------------------------------------------------------------------
+# A refusal for version, envelope or shape stops the unit until its software changes
+# ---------------------------------------------------------------------------
+
+def _version_refusal(rule="version"):
+    return httpx.Response(400, json={"problems": [{"rule": rule, "message": "not a version Fisqua reads",
+                                                   "path": "version"}]})
+
+
+def _second_volume(client, db_session, override_projects_root, stem="xx-test-002"):
+    from tests.unit.test_capture_manifest_export import Volume
+    v = Volume(db_session, override_projects_root, stem=stem, name="Otro", external_id=stem)
+    v.record(status="captured")
+    _handover(client, v.col)
+    return v
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rule", ["version", "envelope", "shape"])
+def test_a_version_refusal_is_final_and_stops_the_unit(client, db_session, queued, override_projects_root, rule):
+    from app.core.fisqua_outbox import config_error
+    server = Server(_version_refusal(rule))
+    assert _send(db_session, server)["status"] == "config_error"
+    row = _rows(db_session, queued.col)[0]
+    assert row.state == "refused" and row.refusal == "fisqua"
+    stop = config_error()
+    assert stop["reason"] == "version" and stop["status_code"] == 400
+
+    # A later handover is not built under the software Fisqua refused, nor sent.
+    other = _second_volume(client, db_session, override_projects_root)
+    server = Server(_ok())
+    assert _send(db_session, server)["status"] == "config_error"
+    assert server.requests == []
+    assert _rows(db_session, other.col)[0].state == "waiting_for_upload"
+
+
+@pytest.mark.unit
+def test_another_400_does_not_stop_the_unit(db_session, queued):
+    from app.core.fisqua_outbox import config_error
+    _send(db_session, Server(httpx.Response(400, json={"problems": [{"rule": "pages", "message": "x"}]})))
+    assert _rows(db_session, queued.col)[0].state == "refused"
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_an_unsent_ready_manifest_is_rebuilt_after_a_version_refusal(client, db_session, queued, override_projects_root):
+    other = _second_volume(client, db_session, override_projects_root)
+    # Both built in one pass; the first is refused for version, the second not yet sent.
+    _send(db_session, Server(_version_refusal()))
+    [row] = _rows(db_session, other.col)
+    assert row.state == "waiting_for_upload" and row.manifest is None and row.attempts == 0
+
+
+@pytest.mark.unit
+def test_a_software_update_clears_the_stop_and_resends_under_a_new_id(
+        client, db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    _send(db_session, Server(_version_refusal()))
+    refused = _rows(db_session, queued.col)[0]
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    assert config_error() is None
+    server = Server(_ok())
+    _send(db_session, server)
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "delivered"]
+    assert rows[1].manifest_id != refused.manifest_id
+    assert json.loads(server.requests[0].content)["id"] == rows[1].manifest_id
+    assert json.loads(server.requests[0].content)["generatedBy"]["systemVersion"] == "0.1.1"
+    # Once only: the refused row is no longer the volume's newest.
+    _send(db_session, Server(_ok()))
+    assert len(_rows(db_session, queued.col)) == 2
+
+
+@pytest.mark.unit
+def test_a_version_refused_volume_taken_back_is_not_resent(client, db_session, queued, monkeypatch):
+    from app.core import config
+    from tests.unit.test_fisqua_outbox import _take_back
+    _send(db_session, Server(_version_refusal()))
+    _take_back(client, queued.col)
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server)
+    assert server.requests == []
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
