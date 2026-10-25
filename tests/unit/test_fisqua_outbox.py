@@ -38,6 +38,7 @@ def fisqua(monkeypatch, tenant, tmp_path):
     # The call budget is process-wide; each test starts with a full one.
     from app.core import fisqua_outbox
     monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget())
+    monkeypatch.setattr(fisqua_outbox, "_status_cursor", None)
     return ENV
 
 

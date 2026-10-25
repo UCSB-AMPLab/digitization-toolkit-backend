@@ -46,7 +46,9 @@ app.core.fisqua_contract. Here:
   (FisquaStatusScheduler). Every volume with a manifest that has reached
   Fisqua, or may have, is asked for by its reference code
   (the recorded external_id, else the stem: the manifest's `externalId`), in batches of at
-  most MAX_REFS_PER_CALL (by the reference the manifest was sent under,
+  most MAX_REFS_PER_CALL, leaving DECISIONS_RESERVED_CALLS of the shared
+  call budget for decisions reads and starting each tick after the last
+  reference asked for, so no batch is starved (by the reference the manifest was sent under,
   fisqua_outbox.reference_code), until Fisqua reports a final state for the
   volume's latest manifest. The answer is kept in fisqua_status. `unknown`
   (Fisqua does not know the volume; usually its manifest was not received)
@@ -387,19 +389,28 @@ class CallBudget:
         with self._lock:
             return self._clock() < getattr(self, "_cool_until", float("-inf"))
 
-    def take(self) -> bool:
-        """Count one call and return True, or return False when the window is full."""
+    def take(self, reserve: int = 0) -> bool:
+        """Count one call and return True, or return False when the window is full.
+
+        With `reserve`, False already when only that many calls are left:
+        status batches keep DECISIONS_RESERVED_CALLS for decisions reads.
+        """
         with self._lock:
             now = self._clock()
             while self._calls and self._calls[0] <= now - self._window:
                 self._calls.popleft()
-            if len(self._calls) >= self._limit:
+            if len(self._calls) >= self._limit - max(0, reserve):
                 return False
             self._calls.append(now)
             return True
 
 
 call_budget = CallBudget()
+
+# The last reference a status batch asked for. The next poll starts after
+# it, so when the budget cannot cover every batch in one tick the later
+# references are asked for at the next tick instead of never.
+_status_cursor: Optional[str] = None
 
 
 # ---------------------------------------------------------------------------
@@ -854,16 +865,22 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                 return {**result, "status": "cooling_down"}
             wanted = volumes_to_poll(db)
             db.rollback()
+            global _status_cursor
             refs = sorted(wanted)
+            if _status_cursor is not None:
+                from bisect import bisect_right
+                at = bisect_right(refs, _status_cursor)
+                refs = refs[at:] + refs[:at]
             result["asked"] = len(refs)
             # {collection id: (ref, decisionsId)} for each entry offering a set.
             offered = {}
             for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
                 chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
-                if not call_budget.take():
+                if not call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                     result["status"] = "rate_limited"
                     break
                 result["calls"] += 1
+                _status_cursor = chunk[-1]
                 try:
                     answer = transport.get_status(chunk)
                 except Exception as exc:

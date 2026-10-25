@@ -668,3 +668,80 @@ def test_status_and_decisions_are_asked_for_by_the_reference_sent(client, db_ses
     assert [r.url.path for r in fake.decision_calls()] == [f"/api/capture/v1/volumes/{v.stem}/decisions"]
     assert _refresh(db_session, rec).status == "approved"
 
+
+# ---------------------------------------------------------------------------
+# Status batches do not starve decisions, nor later references
+# ---------------------------------------------------------------------------
+
+class ManyVolumes:
+    """A fake Fisqua for several volumes, each offering a decisions set for its manifest."""
+
+    def __init__(self, manifests):
+        self.manifests = manifests  # {ref: manifest id}
+        self.requests = []
+
+    def __call__(self, request):
+        self.requests.append(request)
+        if request.url.path == STATUS_PATH:
+            refs = request.url.params["refs"].split(",")
+            return httpx.Response(200, json={"volumes": [
+                {"ref": r, "manifestId": self.manifests[r], "state": "review_pending", "problems": [],
+                 "decisionsId": f"d-{r}", "decidedAt": "2026-10-25T10:00:00Z"} for r in refs]})
+        ref = request.url.path.split("/")[-2]
+        return httpx.Response(200, json={"decisionsId": f"d-{ref}", "decidedAt": "2026-10-25T10:00:00Z",
+                                         "manifestId": self.manifests[ref], "records": []})
+
+    def status_refs(self):
+        return [r.url.params["refs"] for r in self.requests if r.url.path == STATUS_PATH]
+
+    def decision_refs(self):
+        return [r.url.path.split("/")[-2] for r in self.requests if r.url.path.endswith("/decisions")]
+
+
+@pytest.mark.unit
+def test_status_batches_leave_calls_for_decisions_and_rotate_through_every_reference(
+        db_session, override_projects_root, fisqua, monkeypatch):
+    import uuid as _uuid
+
+    from app.core import fisqua_contract as fc
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import _now
+    from app.models.fisqua import FisquaOutbox
+    from tests.unit.test_fisqua_outbox import FakeClock
+    clock = FakeClock()
+    monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget(limit=4, clock=clock))
+    monkeypatch.setattr(fc, "MAX_REFS_PER_CALL", 1)
+    monkeypatch.setattr(fc, "DECISIONS_RESERVED_CALLS", 2)
+    manifests = {}
+    for n in range(1, 6):
+        v = Volume(db_session, override_projects_root, stem=f"xx-test-{n:03d}", name=f"T{n}",
+                   external_id=f"xx-test-{n:03d}")
+        mid = str(_uuid.uuid4())
+        db_session.add(FisquaOutbox(collection_id=v.col.id, manifest_id=mid, stem=v.stem,
+                                    reference_code=v.stem, state="delivered", attempts=1,
+                                    delivered_at=_now(), created_at=_now()))
+        manifests[v.stem] = mid
+    db_session.commit()
+    fake = ManyVolumes(manifests)
+
+    _poll(db_session, fake)
+    # Two calls for status (4 less the 2 kept), two for the decisions they offered.
+    assert fake.status_refs() == ["xx-test-001", "xx-test-002"]
+    assert fake.decision_refs() == ["xx-test-001", "xx-test-002"]
+
+    clock.t += 61
+    _poll(db_session, fake)
+    assert fake.status_refs()[2:] == ["xx-test-003", "xx-test-004"]
+    clock.t += 61
+    _poll(db_session, fake)
+    assert fake.status_refs()[4:] == ["xx-test-005", "xx-test-001"]
+    assert sorted(set(fake.decision_refs())) == sorted(manifests)
+
+
+@pytest.mark.unit
+def test_a_reserved_call_is_not_taken_by_status(monkeypatch):
+    from app.core.fisqua_outbox import CallBudget
+    from tests.unit.test_fisqua_outbox import FakeClock
+    budget = CallBudget(limit=3, clock=FakeClock())
+    assert [budget.take(reserve=1) for _ in range(3)] == [True, True, False]
+    assert budget.take() is True and budget.take() is False

@@ -18,6 +18,9 @@ TOKEN_PATTERN = re.compile(r"^[0-9a-f]{64}$")
 # many manifests per pass, and a pass runs at most every few minutes.
 CALLS_PER_MINUTE = 60
 MAX_SENDS_PER_PASS = CALLS_PER_MINUTE
+# Of those, status batches leave this many for reading QC decisions, so a
+# unit with many volumes still reads the decisions its status calls find.
+DECISIONS_RESERVED_CALLS = 10
 
 CONTRACT_VERSION = "1.2"
 
