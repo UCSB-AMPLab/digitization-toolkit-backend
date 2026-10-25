@@ -2,9 +2,10 @@
 """
 Tests for POST /records/{id}/reject and GET /records/{id}/rejections (NEH-208).
 
-Rejection requires a mandatory predefined_reason from a fixed 6-value list,
-plus an optional free-text comment; it's only valid from 'in_review'; and
-only reviewer/admin may perform it.
+Rejection requires a mandatory predefined_reason from a fixed list (blur,
+glare, shadow, focus, exposure, dirt, framing, obstruction, other), plus a
+free-text comment that is optional for every reason except 'other'; it's
+only valid from 'in_review'; and only reviewer/admin may perform it.
 Run with: python -m pytest tests/unit/test_record_reject_endpoint.py
 """
 
@@ -106,6 +107,106 @@ def test_rejection_appears_in_rejections_history_and_image_drops_from_images_lis
     resp = api.get(f"/records/{rec.id}/images")
     assert resp.status_code == 200, resp.text
     assert [i["id"] for i in resp.json()] == [img.id]
+
+
+OLD_REASONS = ["blur", "glare", "shadow", "focus", "exposure", "dirt"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reason", ["framing", "obstruction"])
+def test_new_reasons_are_accepted_without_a_comment(client, db_session, reason):
+    from app.models.record import RecordRejection
+
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+
+    resp = api.post(f"/records/{rec.id}/reject", json={"predefined_reason": reason})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "rejected"
+    [row] = db_session.query(RecordRejection).filter_by(record_id=rec.id).all()
+    assert row.predefined_reason == reason and row.comment is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("payload", [
+    {"predefined_reason": "other"},
+    {"predefined_reason": "other", "comment": None},
+    {"predefined_reason": "other", "comment": ""},
+    {"predefined_reason": "other", "comment": "   \n\t "},
+])
+def test_other_without_a_comment_is_refused(client, db_session, payload):
+    from app.models.record import RecordRejection
+
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+
+    resp = api.post(f"/records/{rec.id}/reject", json=payload)
+    assert resp.status_code == 422, resp.text
+    assert "other" in resp.text and "comment" in resp.text
+    db_session.expire_all()
+    assert db_session.query(RecordRejection).filter_by(record_id=rec.id).count() == 0
+    assert db_session.get(type(rec), rec.id).status == "in_review"
+
+
+@pytest.mark.unit
+def test_other_with_a_comment_is_accepted(client, db_session):
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+
+    resp = api.post(f"/records/{rec.id}/reject",
+                    json={"predefined_reason": "other", "comment": "page out of order"})
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["status"] == "rejected"
+
+    [rej] = api.get(f"/records/{rec.id}/rejections").json()
+    assert rej["predefined_reason"] == "other"
+    assert rej["comment"] == "page out of order"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reason", OLD_REASONS)
+@pytest.mark.parametrize("comment", [None, "", "  ", "a note"])
+def test_old_reasons_keep_the_comment_optional(client, db_session, reason, comment):
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+
+    payload = {"predefined_reason": reason}
+    if comment is not None:
+        payload["comment"] = comment
+    resp = api.post(f"/records/{rec.id}/reject", json=payload)
+    assert resp.status_code == 200, resp.text
+
+
+@pytest.mark.unit
+def test_the_reason_list_is_the_ruled_nine():
+    from app.schemas.record import PREDEFINED_REJECTION_REASONS
+
+    assert PREDEFINED_REJECTION_REASONS == (
+        "blur", "glare", "shadow", "focus", "exposure", "dirt",
+        "framing", "obstruction", "other",
+    )
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reason", ["framing", "obstruction", "other"])
+def test_the_table_accepts_the_new_reasons(db_session, reason):
+    from app.models.record import RecordRejection
+
+    rec = _make_record(db_session)
+    db_session.add(RecordRejection(record_id=rec.id, predefined_reason=reason, comment="x"))
+    db_session.commit()
+
+
+@pytest.mark.unit
+def test_the_table_still_refuses_an_unknown_reason(db_session):
+    from sqlalchemy.exc import IntegrityError
+    from app.models.record import RecordRejection
+
+    rec = _make_record(db_session)
+    db_session.add(RecordRejection(record_id=rec.id, predefined_reason="bogus"))
+    with pytest.raises(IntegrityError):
+        db_session.commit()
+    db_session.rollback()
 
 
 if __name__ == "__main__":

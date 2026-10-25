@@ -223,9 +223,9 @@ class RecordRejection(Base):
 	"""
 	Audit record of a single rejection event on a Record (NEH-208).
 
-	Created once per rejection with a mandatory predefined reason (the same
-	list the annotation feature's "Marcar error" uses) plus an optional
-	free-text comment. Links to every RecordImage that was current at the
+	Created once per rejection with a mandatory predefined reason
+	(PREDEFINED_REJECTION_REASONS) plus a free-text comment, optional except
+	for the reason 'other', where the API requires it. Links to every RecordImage that was current at the
 	time of rejection via RecordImage.rejection_id — those images are never
 	deleted; a later recapture supersedes them (is_current=False) without
 	touching this row, so the rejected file(s) + reason + timestamp + user
@@ -236,7 +236,7 @@ class RecordRejection(Base):
 	id = Column(Integer, primary_key=True, index=True)
 	record_id = Column(Integer, ForeignKey("records.id", ondelete="CASCADE"), nullable=False, index=True)
 
-	predefined_reason = Column(String(20), nullable=False)  # blur, glare, shadow, focus, exposure, dirt
+	predefined_reason = Column(String(20), nullable=False)  # one of PREDEFINED_REJECTION_REASONS (app/schemas/record.py)
 	comment = Column(Text, nullable=True)
 
 	rejected_by = Column(String(255), nullable=True)
@@ -247,7 +247,8 @@ class RecordRejection(Base):
 
 	__table_args__ = (
 		CheckConstraint(
-			"predefined_reason IN ('blur','glare','shadow','focus','exposure','dirt')",
+			"predefined_reason IN ('blur','glare','shadow','focus','exposure','dirt',"
+			"'framing','obstruction','other')",
 			name='check_record_rejection_reason'
 		),
 	)
