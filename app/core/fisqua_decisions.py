@@ -44,7 +44,8 @@ exactly those the decided manifest listed for it (`images_changed`: retaken
 since), a decision that is neither approved
 nor rejected, and a rejection that POST /records/{id}/reject would refuse
 (checked with the same RecordRejectRequest): a reason not in
-app.schemas.record.PREDEFINED_REJECTION_REASONS, or `other` with no note.
+app.schemas.record.PREDEFINED_REJECTION_REASONS, `other` with no note, or a
+note longer than REJECTION_COMMENT_MAX_LENGTH (`note_too_long`).
 An unusable rotation is skipped on its own.
 
 What applying did is kept on fisqua_status (decisions_report) for the
@@ -150,7 +151,9 @@ def _why_not(decision: dict) -> Optional[str]:
     """
     from pydantic import ValidationError
 
-    from app.schemas.record import PREDEFINED_REJECTION_REASONS, RecordRejectRequest
+    from app.schemas.record import (
+        PREDEFINED_REJECTION_REASONS, REJECTION_COMMENT_MAX_LENGTH, RecordRejectRequest,
+    )
 
     kind = decision.get(fc.F_DECISION)
     if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED):
@@ -160,6 +163,8 @@ def _why_not(decision: dict) -> Optional[str]:
         if reason not in PREDEFINED_REJECTION_REASONS:
             return "invalid_reason"
         note = decision.get(fc.F_NOTE)
+        if isinstance(note, str) and len(note) > REJECTION_COMMENT_MAX_LENGTH:
+            return "note_too_long"
         try:
             RecordRejectRequest(predefined_reason=reason, comment=note if isinstance(note, str) else None)
         except ValidationError:

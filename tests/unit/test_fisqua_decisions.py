@@ -789,3 +789,12 @@ def test_decisions_reads_rotate_so_failing_front_volumes_starve_none(
     db_session.expire_all()
     applied = {ref for ref, cid in cids.items() if db_session.get(FisquaStatus, cid).decisions_id}
     assert applied == {"xx-test-003", "xx-test-004", "xx-test-005"}
+
+
+@pytest.mark.unit
+def test_a_note_over_2000_characters_is_skipped_not_cut(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_reject(a, note="n" * 2001)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "note_too_long"}]
