@@ -13,6 +13,10 @@ class Settings(BaseSettings):
     DATABASE_NAME: str = "digitization_toolkit"
     DTK_DATA_DIR: str = "/var/lib/dtk"
     DTK_LOG_DIR: str = "/var/log/dtk"
+    # Level for the backend's own loggers (`app.*`, `capture.*`) on stderr,
+    # which the journal records on the appliance (app.core.logging_setup).
+    # DTK_LOG_DIR above is something else: the rotating capture logs' folder.
+    LOG_LEVEL: str = Field(default="INFO", validation_alias="DTK_LOG_LEVEL")
     
     PROJECTS_ROOT: str = ""
     CAMERA_BACKEND: str = "picamera2"

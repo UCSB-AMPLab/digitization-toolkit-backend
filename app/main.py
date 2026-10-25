@@ -7,6 +7,10 @@ from contextlib import asynccontextmanager
 from app.core.db import init_db
 from app.core.schema import assert_schema_at_head
 from app.core.config import settings
+from app.core.logging_setup import configure_logging
+
+# Before the routers are imported, so their import-time lines are kept too.
+configure_logging()
 
 # routers
 from app.api.records import router as records_router
