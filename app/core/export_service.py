@@ -31,7 +31,12 @@ FREE_SPACE_MARGIN = 100 * 1024 * 1024
 # a bag holds. Bags already exported are never rewritten: a bag with no
 # schema_version at all predates NEH-259, when the field was introduced
 # alongside the removal of object_typology and material.
-METADATA_SCHEMA_VERSION = 1
+#
+# 2: each image carries rotate_deg, the clockwise degrees (0, 90, 180, 270)
+#    that display it upright, or null for an upload or an image captured
+#    before the rotation was recorded. A RAW master is bagged as the camera
+#    wrote it, so this is where its rotation is.
+METADATA_SCHEMA_VERSION = 2
 
 
 def workflow_blockers(records) -> tuple[str, list[int]] | None:
@@ -319,6 +324,7 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
                         "id": img.id, "filename": img.filename, "role": img.role, "sequence": img.sequence,
                         "format": img.format, "resolution_width": img.resolution_width,
                         "resolution_height": img.resolution_height, "file_size": img.file_size,
+                        "rotate_deg": img.rotate_deg,
                     }
                     for img in r.images if img.is_current
                 ],

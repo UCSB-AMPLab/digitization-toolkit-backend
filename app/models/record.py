@@ -144,6 +144,13 @@ class RecordImage(Base):
 	# Image technical properties
 	resolution_width = Column(Integer, nullable=True)
 	resolution_height = Column(Integer, nullable=True)
+
+	# Clockwise rotation in degrees (0, 90, 180, 270) that displays the image
+	# upright, as the capturing body was set (NEH-71). A JPEG master also
+	# carries it as its EXIF Orientation; a RAW master is never rewritten, so
+	# this and the capture record's `files` entry are where its rotation is
+	# kept. NULL for an upload and for an image captured before it was recorded.
+	rotate_deg = Column(Integer, nullable=True)
 	
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -170,6 +177,10 @@ class RecordImage(Base):
 	preview_freed_bytes = Column(BigInteger, nullable=True)
 
 	__table_args__ = (
+		CheckConstraint(
+			"rotate_deg IS NULL OR rotate_deg IN (0, 90, 180, 270)",
+			name="check_record_image_rotate_deg",
+		),
 		CheckConstraint(
 			"(master_freed_at IS NULL AND master_freed_bytes IS NULL) OR "
 			"(master_freed_at IS NOT NULL AND master_freed_bytes IS NOT NULL AND master_freed_bytes >= 0)",

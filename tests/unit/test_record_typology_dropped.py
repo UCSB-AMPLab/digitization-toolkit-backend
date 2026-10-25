@@ -203,7 +203,7 @@ def test_metadata_payload_carries_capture_mode_and_a_schema_version(db_session):
     # same constant the serializer reads passes for any value the constant holds.
     # `type(...) is int` rather than isinstance, because True == 1 is also True.
     assert type(payload["schema_version"]) is int
-    assert payload["schema_version"] == 1
+    assert payload["schema_version"] == 2
     assert [r["capture_mode"] for r in payload["records"]] == ["single", "dual"]
     for r in payload["records"]:
         for field in DROPPED:

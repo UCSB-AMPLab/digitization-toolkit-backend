@@ -175,6 +175,9 @@ class RecordImageRead(RecordImageBase):
 	# The master, and a RAW master's preview, each on its own.
 	master_freed_at: Optional[datetime] = None
 	preview_freed_at: Optional[datetime] = None
+	# Clockwise degrees that display the image upright, recorded at capture;
+	# None for an upload or an image captured before it was recorded.
+	rotate_deg: Optional[int] = None
 
 	class Config:
 		from_attributes = True

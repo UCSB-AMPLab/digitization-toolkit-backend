@@ -142,7 +142,7 @@ def test_a_dual_raw_capture_records_each_preview_beside_its_master(
         entry = by_path[f"previews/{preview.name}"]
         assert entry == {"role": f"{role}_preview", "relative_path": f"previews/{preview.name}",
                          "bytes": preview.stat().st_size, "mimetype": "image/jpeg",
-                         "sha256": _sha256(preview.read_bytes())}
+                         "sha256": _sha256(preview.read_bytes()), "rotate_deg": 0}
 
 
 @pytest.mark.unit
