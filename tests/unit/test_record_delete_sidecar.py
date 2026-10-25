@@ -2,11 +2,11 @@
 
 A RAW capture lands on the card as two files: the master (`IMG_0001.CR2`) and a
 JPEG sidecar the RAW backend writes beside it (`IMG_0001_preview.jpg`), which is
-what the review UI and the thumbnail generator can actually read. Both deletion
-endpoints unlink the master and the thumbnail and leave the sidecar, so every
-deleted capture costs about 2.3 MB on the card for good. On the Rionegro unit
-that comes to 2,403 orphaned previews and 5.5 GB on a 115 GB card, which reached
-100% on 14 October and stopped capture.
+what the review UI and the thumbnail generator can actually read. A deletion
+endpoint that unlinks the master and the thumbnail and leaves the sidecar costs
+about 2.3 MB on the card for every deleted capture, for good. On the Rionegro
+unit that came to 2,403 orphaned previews and 5.5 GB on a 115 GB card, which
+reached 100% on 14 October and stopped capture.
 
 The orphans are also unreadable as evidence: a preview with no master and no
 database row looks, on the filesystem, exactly like a master that was lost.
@@ -200,7 +200,7 @@ def test_deleting_a_record_removes_a_superseded_images_sidecar(client, db_sessio
 
 @pytest.mark.unit
 def test_deleting_a_record_still_removes_the_master_and_the_thumbnail(client, db_session, capture_dir, thumbs_dir):
-    """Already true before NEH-257; asserted so the sidecar fix cannot cost it."""
+    """The master and the thumbnail go too; removing the sidecar must not cost either."""
     master, preview, thumb = _capture(capture_dir, thumbs_dir, "IMG_0004")
     _must_be_inside_storage(master, preview, thumb)
     rec = _record(db_session)
@@ -234,7 +234,7 @@ def test_deleting_an_image_removes_the_preview_sidecar(client, db_session, captu
 
 @pytest.mark.unit
 def test_deleting_an_image_still_removes_the_master_and_the_thumbnail(client, db_session, capture_dir, thumbs_dir):
-    """Already true before NEH-257; asserted so the sidecar fix cannot cost it."""
+    """The master and the thumbnail go too; removing the sidecar must not cost either."""
     master, preview, thumb = _capture(capture_dir, thumbs_dir, "IMG_0006")
     _must_be_inside_storage(master, preview, thumb)
     rec = _record(db_session)
@@ -252,7 +252,7 @@ def test_deleting_an_image_still_removes_the_master_and_the_thumbnail(client, db
 def test_deleting_one_image_leaves_a_siblings_sidecar_under_a_distinct_stem(client, db_session, capture_dir, thumbs_dir):
     """The sidecar that goes is the deleted master's own, not the directory's.
 
-    Guards against a fix that globs `*_preview.jpg` beside the master: the
+    Guards against an implementation that globs `*_preview.jpg` beside the master: the
     second half of a dual pair lives in the same directory, carries its own
     stem and its own sidecar, and is still referenced.
 
@@ -381,7 +381,7 @@ def test_deleting_the_last_master_of_a_shared_stem_removes_the_sidecar(client, d
 def test_deleting_a_record_removes_a_sidecar_two_of_its_masters_share(client, db_session, capture_dir, thumbs_dir):
     """The record delete takes every image, so the shared sidecar has no survivor.
 
-    Asserted because the single-image delete now protects a sidecar a sibling
+    Asserted because the single-image delete protects a sidecar a sibling
     still needs, and the record delete must not inherit that protection: there
     is nothing left to protect it for.
     """
@@ -445,7 +445,7 @@ def test_an_image_whose_path_escapes_storage_loses_no_sidecar(client, db_session
 
     `resolve_within_storage` is what stops a stored path from reaching the
     filesystem. The sidecar has to be derived from the resolved path, not from
-    the raw database string, or the fix would hand the delete endpoints a way
+    the raw database string, or the sidecar unlink would hand the delete endpoints a way
     out of the storage roots that the master unlink does not have.
     """
     from app.core.paths import resolve_within_storage

@@ -1,10 +1,10 @@
 """Send the backend's own log lines to stderr, where systemd's journal reads them.
 
 uvicorn configures only its own loggers (`uvicorn`, `uvicorn.error`,
-`uvicorn.access`). Everything under `app.` and `capture.` was left with no
-handler and the root logger's WARNING level, so INFO lines such as the startup
-`Volume layout:` report never reached the journal, and warnings came out
-through Python's last-resort handler with no level or logger name.
+`uvicorn.access`). Without a handler of their own, the loggers under `app.`
+and `capture.` take the root logger's WARNING level, so INFO lines such as the
+startup `Volume layout:` report do not reach the journal, and warnings come
+out through Python's last-resort handler with no level or logger name.
 
 The handler goes on the `app` and `capture` package loggers rather than on
 root. On root it would also carry third-party libraries' INFO lines (picamera2's

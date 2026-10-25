@@ -8,14 +8,12 @@ from sqlalchemy.pool import QueuePool
 from app.core.config import settings
 
 
-# Build DATABASE_URL from individual components
 DATABASE_URL = (
 	f"postgresql+psycopg://{settings.DATABASE_USER}:{settings.DATABASE_PASSWORD}"
 	f"@{settings.DATABASE_HOST}:{settings.DATABASE_PORT}/{settings.DATABASE_NAME}"
 )
 
 
-# Create engine
 # This is an unattended, offline-first appliance (Raspberry Pi): Postgres runs in a
 # Docker container that can restart under the backend (manual `docker restart`, or the
 # container restart policy), which leaves pooled connections stale. Without
@@ -30,10 +28,8 @@ engine = create_engine(
 	pool_recycle=1800,
 )
 
-# Session factory
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 
-# Base for models
 Base = declarative_base()
 
 

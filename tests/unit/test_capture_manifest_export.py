@@ -91,7 +91,7 @@ class Volume:
         For a RAW `ext`, each image gets a `_preview.jpg` sidecar and a
         preview object. `preview_digest_recorded` lists that preview, with
         its sha256, in the capture record's `files` (see the note on
-        test_today_raw_previews_have_no_recorded_digest).
+        test_refused_with_a_preview_that_has_no_recorded_digest).
         """
         from app.models.record import Record, RecordImage, RecordRejection
 
@@ -295,8 +295,7 @@ def test_each_export_is_logged_with_volume_id_and_counts(client, vol, db_session
 @pytest.mark.unit
 def test_a_volume_with_no_recorded_reference_code_travels_with_its_stem(client, db_session, override_projects_root, tenant):
     # Contract 1.2 §8: a volume's filenameStem is its Fisqua reference code,
-    # unchanged; ruled that the stem stands in when external_id is not
-    # recorded (it superseded 1.1 §4's null, surfaced as unmatched).
+    # unchanged, so the stem stands in when external_id is not recorded.
     v = Volume(db_session, override_projects_root, external_id=None)
     v.record()
     resp = _export(client, v.col)
@@ -306,7 +305,7 @@ def test_a_volume_with_no_recorded_reference_code_travels_with_its_stem(client, 
 
 @pytest.mark.unit
 def test_a_recorded_reference_code_travels_as_it_is(client, db_session, override_projects_root, tenant):
-    """The model refuses a code other than the stem now (backend #140); a row from before still travels as recorded."""
+    """The model refuses a code other than the stem (backend #140); a row that already holds one travels as recorded."""
     import sqlalchemy as sa
     v = Volume(db_session, override_projects_root, external_id=None)
     db_session.execute(sa.text("UPDATE collections SET external_id = 'xx-other-009' WHERE id = :id"), {"id": v.col.id})

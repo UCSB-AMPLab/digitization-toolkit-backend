@@ -1,4 +1,4 @@
-"""Follow-ups to the volume layout migration: old journals, pending sidecars, adoption, fixity after renames.
+"""The volume layout migration: version-1 journals, pending sidecars, adoption, fixity after renames.
 
 Uses the fixtures of test_volume_layout_by_stem: the name-based `legacy`
 layout under the per-test projects root, and a writable data directory.
@@ -14,12 +14,12 @@ from tests.unit.test_volume_layout_by_stem import STEMS, capture_settings, data_
 
 
 # ---------------------------------------------------------------------------
-# A journal written by the first version of the migration
+# A version-1 journal
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_v1_journal_left_by_the_earlier_commits_is_completed(db_session, legacy, data_dir):
-    """2d1116b wrote version-1 entries, with no "adopt" and no "capture_id". The crash came after the first move."""
+    """Version-1 entries have no "adopt" and no "capture_id". The crash came after the first move."""
     from app.core.volume_layout import JOURNAL_NAME, migrate_volume_layout_at_startup
     from app.models.record import RecordImage
 

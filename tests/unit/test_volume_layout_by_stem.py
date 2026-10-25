@@ -434,7 +434,7 @@ def test_a_change_that_moves_no_file_of_a_stemmed_volume_is_not_refused_by_its_e
 @pytest.mark.unit
 def test_a_rename_of_a_volume_without_a_stem_is_still_refused_by_its_export(client, db_session, placed,
                                                                            running_export):
-    """Its name-based directory moves with the name, as before stems."""
+    """Its name-based directory moves with the name, so its running export refuses the rename."""
     running_export(placed["b"].id)
     resp = _as_admin(client).patch(f"/collections/{placed['b'].id}", json={"name": "B renamed"})
     assert resp.status_code == 409, resp.text
@@ -586,7 +586,7 @@ STEMS = {"a1": "xx-test-a1", "a2": "xx-test-a2", "tomo": "xx-test-tomo1"}
 
 @pytest.fixture
 def legacy(db_session, capture_settings, data_dir, override_projects_root):
-    """The name-based layout, written as the code before stems wrote it.
+    """The name-based layout that the layout migration moves files out of.
 
     Project "Proj" (directory `proj`). Two top-level volumes both named
     "Fondo A" share `proj/fondo_a`; a volume "Tomo 1" nested in the first has

@@ -23,11 +23,9 @@ def calibrate_dual_cameras(save_dir: str = "."):
     save_dir = Path(save_dir)
     save_dir.mkdir(parents=True, exist_ok=True)
     
-    # Calibrate camera 0
     print("\n>>> CAMERA 0 <<<")
     cal0 = calibrate_camera_interactive(0, str(save_dir / "calibration_camera0.json"))
     
-    # Calibrate camera 1
     print("\n>>> CAMERA 1 <<<")
     cal1 = calibrate_camera_interactive(1, str(save_dir / "calibration_camera1.json"))
     
@@ -52,19 +50,16 @@ def show_usage():
 
 if __name__ == "__main__":
     if len(sys.argv) == 1:
-        # Default: calibrate camera 0
         calibrate_camera_interactive(0)
     
     elif sys.argv[1] in ["-h", "--help", "help"]:
         show_usage()
     
     elif sys.argv[1] == "dual":
-        # Calibrate both cameras
         save_dir = sys.argv[2] if len(sys.argv) > 2 else "."
         calibrate_dual_cameras(save_dir)
     
     else:
-        # Calibrate specific camera
         try:
             camera_index = int(sys.argv[1])
             save_path = sys.argv[2] if len(sys.argv) > 2 else None

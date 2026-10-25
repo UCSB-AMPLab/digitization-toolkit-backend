@@ -65,16 +65,13 @@ if not _picamera2_logger.handlers:
         _picamera2_logger.setLevel(_logging.DEBUG)
         _picamera2_logger.addHandler(_rfh)
 
-# Initialize camera backend based on configuration
 class UnknownCameraBackend(RuntimeError):
     """CAMERA_BACKEND names a backend this build cannot serve."""
 
 
 # The backends this build has, and the ONE place the list exists. Both the
 # dispatch and the startup assertion read this mapping, so a backend cannot be
-# added to a list and forgotten in a conditional -- which is how the silent
-# fallback below survived: the names were enumerated in one place and the
-# fallback handled "everything else" in another.
+# added to one list and forgotten in a conditional elsewhere.
 _BACKEND_CONSTRUCTORS = {
     "picamera2": Picamera2Backend,
     "subprocess": RpicamBackend,
@@ -87,11 +84,11 @@ KNOWN_CAMERA_BACKENDS = tuple(sorted(_BACKEND_CONSTRUCTORS))
 def canonical_backend_name(value: str) -> str:
     """The one definition of how a CAMERA_BACKEND value is read.
 
-    What is shared here is the RULE, not the source. Tolerating surrounding
-    whitespace in the startup assertion while camera_registry.py did a bare
-    `.lower()` meant `" gphoto2 "` passed startup and then selected the
-    picamera2 path, so a DSLR rig detected no cameras -- a worse failure than
-    the one the tolerance was added to prevent.
+    What is shared here is the RULE, not the source. If the startup assertion
+    tolerated surrounding whitespace while camera_registry.py did a bare
+    `.lower()`, `" gphoto2 "` would pass startup and then select the
+    picamera2 path, so a DSLR rig would detect no cameras -- a worse failure
+    than the one the tolerance prevents.
 
     It deliberately does NOT read `settings` itself. There are two live
     settings objects in a test run: conftest.py's set_camera_backend fixture
@@ -100,8 +97,8 @@ def canonical_backend_name(value: str) -> str:
     settings` keeps the one it imported. Existing tests patch both --
     test_chdk_wiring.py patches this module's, the registry's tests patch
     config's -- so a function that picked one of them would silently move
-    which object a caller consults. Each site keeps reading the object it
-    always read, and they agree because they normalise the same way.
+    which object a caller consults. Each site reads its own object, and they
+    agree because they normalise the same way.
     """
     return value.strip().lower()
 
@@ -109,11 +106,11 @@ def canonical_backend_name(value: str) -> str:
 def assert_camera_backend_configured() -> str:
     """Return the configured backend's canonical name, or refuse.
 
-    This used to log "Unknown backend '<value>', defaulting to subprocess" and
-    return RpicamBackend -- a third backend that is neither the one configured
-    nor the one intended. On a DSLR rig that yields no cameras and presents as
-    a hardware fault, on the machine furthest from help, so a typo in one line
-    of .env was indistinguishable from a dead camera (NEH-268).
+    There is no fallback. Defaulting to another backend (RpicamBackend, say)
+    gives a backend that is neither the one configured nor the one intended.
+    On a DSLR rig that yields no cameras and presents as a hardware fault, on
+    the machine furthest from help, so a typo in one line of .env would be
+    indistinguishable from a dead camera (NEH-268).
 
     Called from the application's lifespan as well as from the dispatch below.
     The dispatch alone is not enough: the backend is constructed lazily on the
@@ -123,9 +120,9 @@ def assert_camera_backend_configured() -> str:
     """
     configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
-        # The RAW value, from THE SAME object the check above read. Quoting it
-        # from a freshly imported `settings` reported the other live instance's
-        # value -- so the message named a backend nobody had configured.
+        # The RAW value, from THE SAME object the check above read. A freshly
+        # imported `settings` can be the other live instance, whose value
+        # would name a backend nobody configured.
         raise UnknownCameraBackend(
             f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
             f"a backend this build has. Valid values: "
@@ -209,7 +206,7 @@ def shutdown_backend() -> None:
 
 def is_camera_connected(camera_index: int = 0) -> bool:
     """
-    Check if the camera is connected using --list-cameras (fast, no initialization).
+    Check if the camera is connected, through the configured backend.
     
     Args:
         camera_index (int): The index of the camera to check (default is 0).
@@ -311,7 +308,7 @@ def capture_image(
         stem: Optional[str] = None,
         root: Optional[Path] = None) -> str:
     """
-    Capture an image using the rpicam-still command.
+    Capture an image with the configured camera backend.
     
     Args:
         project_name (str): The name of the project to save the image in.
@@ -325,7 +322,9 @@ def capture_image(
         root (Path): The projects root, read once by the caller for the whole
             capture; read here when not given.
     Returns:
-        str: The path to the captured image file.
+        tuple: (path, metadata). path is the captured file's path, or a tuple
+        of paths for a multi-format capture; metadata is None when the
+        backend returns a bare path.
     """
     
     if check_camera and not is_camera_connected(camera_config.camera_index):
@@ -351,15 +350,13 @@ def capture_image(
     if capture_name_taken(project_path, output_path.stem):
         raise FileExistsError(f"A file named {output_path.stem} already exists in {project_path}")
 
-    # Use backend for actual capture
     backend = get_backend()
     result = backend.capture_image(output_path, camera_config, capture_output)
     
-    # Handle different return types
-    # Result is always (path_or_paths, metadata)
-    # path_or_paths can be:
+    # Result is (path_or_paths, metadata), or a bare path from the subprocess
+    # backend. path_or_paths can be:
     #   - single path string for JPEG/PNG only
-    #   - tuple (jpeg_path, dng_path) for multi-format
+    #   - tuple (jpeg_path, raw_path) for multi-format (picamera2 with raw)
     if isinstance(result, tuple) and len(result) == 2:
         actual_path, metadata = result
     else:
@@ -492,8 +489,8 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     Raises:
         RuntimeError: if the camera is not connected (mirrors capture_image),
             if the backend raises during capture (including a DSLR timeout -
-            see capture/backends/gphoto2_backend.py:1418, which wraps
-            CaptureTimeoutError in a plain RuntimeError), or if a RAW capture
+            see GPhoto2Backend.capture_image, which wraps CaptureTimeoutError
+            in a plain RuntimeError), or if a RAW capture
             has no JPEG preview sidecar to return.
     """
     if not is_camera_connected(camera_index):
@@ -512,8 +509,9 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
         result = get_backend().capture_image(output_path, camera_config)
         elapsed_time = time.perf_counter() - start_time
 
-        # Result is a (path_or_paths, metadata) pair from the picamera2 and
-        # gphoto2 backends, or a bare path from the subprocess backend; same
+        # Result is a (path_or_paths, metadata) pair from the picamera2,
+        # gphoto2 and CHDK backends, or a bare path from the subprocess
+        # backend; same
         # two shapes capture_image (above) accepts.
         if isinstance(result, tuple) and len(result) == 2:
             actual_path, _metadata = result
@@ -521,8 +519,8 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
             actual_path, _metadata = result, None
 
         # actual_path may be a single path or, for a multi-format capture
-        # (e.g. picamera2_backend.py:709 returns (jpeg_path, raw_path) for
-        # raw captures), a tuple/list of paths - never stringify the tuple
+        # (Picamera2Backend returns (jpeg_path, raw_path) for raw captures),
+        # a tuple/list of paths - never stringify the tuple
         # itself, or _apply_rotation gets handed a nonexistent path built
         # from Python's tuple repr.
         paths = (
@@ -778,7 +776,7 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
     lock = _get_preview_lock(camera_index)
 
     # Fallback for backends with neither a native preview nor a lores stream
-    # (rpicam subprocess): a small standalone capture, as before.
+    # (rpicam subprocess): a small standalone capture.
     preview_config = CameraConfig(
         camera_index=camera_index,
         img_size=(1280, 720),
@@ -956,7 +954,6 @@ def main():
     Main entry point for testing the camera connectivity.
     """
     try:
-        # Check if cameras are connected
         cam0_connected = is_camera_connected(0)
         cam1_connected = is_camera_connected(1)
         

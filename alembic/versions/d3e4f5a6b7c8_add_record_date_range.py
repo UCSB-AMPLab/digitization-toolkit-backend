@@ -34,8 +34,7 @@ The constraint is written `date_start IS NULL OR date_end IS NULL OR
 date_end >= date_start`. The two NULL clauses are for a reader and not for the
 database: a bare `date_end >= date_start` evaluates to NULL when either end is
 NULL, and a CHECK accepts NULL, so the two forms behave identically and no test
-can tell them apart -- which was confirmed by mutating the model to the bare
-form and watching the suite stay green. `>=` rather than `>` is a real
+can tell them apart. `>=` rather than `>` is a real
 difference, because a single-day document has a start equal to its end.
 
 On upgrade there is nothing to back-fill and nothing to lose: every existing

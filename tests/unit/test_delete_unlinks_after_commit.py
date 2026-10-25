@@ -1,10 +1,9 @@
 """Record and image deletes unlink files only after the commit that removes the rows (NEH-262).
 
-Both delete endpoints used to unlink the master, its `_preview.jpg` sidecar and
-the thumbnail before `db.commit()`. A commit that failed then left rows
-pointing at masters that were already gone from the card, which nothing can
-repair. The handlers now collect the paths under the record's row lock, commit,
-and unlink afterwards. A file that cannot be unlinked after a successful commit
+Unlinking the master, its `_preview.jpg` sidecar and the thumbnail before
+`db.commit()` would, on a failed commit, leave rows pointing at masters already
+gone from the card, which nothing can repair. So the handlers collect the paths
+under the record's row lock, commit, and unlink afterwards. A file that cannot be unlinked after a successful commit
 is logged at WARNING, left on disk and named in the response's `not_removed`
 list (NEH-263): the row is gone, so what remains is an extra file, which can be
 found and removed later. A response with nothing left behind has no
@@ -300,7 +299,7 @@ def test_image_delete_unlinks_after_the_commit(client, db_session, monkeypatch, 
 
 @pytest.mark.unit
 def test_image_delete_that_empties_an_approved_record_still_moves_it_back(client, db_session, monkeypatch, capture_root, capture_dir, thumbs_dir):
-    """The fallback and its history row survive the reordering, and the files still go after the commit."""
+    """The fallback and its history row are kept, and the files still go after the commit."""
     from app.models.record import Record, RecordStatusChange
 
     master, preview, thumb = _capture(capture_dir, thumbs_dir, "IMG_1006")

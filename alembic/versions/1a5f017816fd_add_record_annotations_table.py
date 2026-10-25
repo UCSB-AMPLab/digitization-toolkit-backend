@@ -5,8 +5,7 @@ Revises: ff2f751fadbb
 Create Date: 2026-07-22 15:15:20.499432
 
 Adds record_annotations: persists the QA "Anotaciones" tab (flagged error
-typologies + free-text notes), which previously only lived in local
-component state and was lost on navigation/refresh.
+typologies + free-text notes) so they survive navigation and refresh.
 
 Note: autogenerate also proposed dropping collections.export_version,
 last_exported_at and last_export_hash — those columns exist in the DB

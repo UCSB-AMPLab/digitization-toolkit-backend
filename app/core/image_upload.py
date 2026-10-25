@@ -242,8 +242,8 @@ def listed_object(key: str) -> Listed:
     issues a HEAD on /file/<bucket>/<key>). That needs readFiles, which the
     appliance key withholds, and when the lookup fails rclone treats the
     path as a directory and lists under it, where the object is not: a
-    refused lookup then reads as an absent object, the failure decision 2
-    is built against. (Read from rclone's source, not tried against B2.)
+    refused lookup then reads as an absent object, which would let an upload
+    overwrite it. (Read from rclone's source, not tried against B2.)
 
     Raises VerificationUnavailable when a listing does not answer.
     """
@@ -352,7 +352,7 @@ def upload_file(local: Path, key: str) -> None:
     """`rclone copyto` one file to `key`. Copy only; nothing here can remove.
 
     --no-check-dest because the appliance key cannot read, so rclone's
-    destination check answers 401 (decision 2). The listing check before the
+    destination check answers 401. The listing check before the
     upload is what keeps this from overwriting.
     """
     argv = _rclone_argv(
@@ -917,7 +917,7 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
               "key_already_held": [], "changed": [], "unmatched": 0, "unreadable": [],
               "applied": apply}
 
-    candidates = {}  # key -> list of (image_id, kind, path, sha1)
+    candidates = {}  # key -> list of (image_id, kind, path, sha1, state)
     for item in pending_work(db):
         if _row_for(db, item.image_id, item.kind) is not None:
             continue  # has a key already: an upload in progress, or refused

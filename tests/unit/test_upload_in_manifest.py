@@ -172,7 +172,7 @@ def test_an_upload_with_a_capture_id_is_verified_against_its_record(client, db_s
 @pytest.mark.unit
 def test_an_upload_sent_without_a_capture_id_gets_its_own_and_is_verified(
         client, db_session, capture_settings, override_projects_root, volume):
-    """Step 7's capture manifest needs a sha256 for every image, so every upload is under the fixity index."""
+    """The capture manifest for Fisqua (app.core.capture_manifest) needs a sha256 for every image, so every upload is under the fixity index."""
     import uuid
     from app.core.integrity import build_fixity_index, verify_images_against_manifest
     from app.models.record import RecordImage
@@ -216,7 +216,7 @@ def test_the_export_bag_carries_the_upload_record_of_its_capture_id(client, db_s
 @pytest.mark.unit
 def test_the_startup_repair_finds_an_uploads_record_in_its_volumes_manifest(client, db_session, capture_settings,
                                                                             override_projects_root, volume):
-    """Without the record, an upload's capture id was reported at every startup as having none."""
+    """Without the record, the startup repair would report an upload's capture id as having none at every startup."""
     from app.core.volume_layout import migrate_volume_layout
 
     api = _as_admin(client)
@@ -237,7 +237,7 @@ def test_the_startup_repair_finds_an_uploads_record_in_its_volumes_manifest(clie
 @pytest.mark.unit
 def test_a_failed_commit_still_reserves_the_uploads_number(client, db_session, capture_settings,
                                                           override_projects_root, volume, monkeypatch):
-    """The file and its thumbnail are removed as before; the manifest line stays, so the number is not reused."""
+    """The file and its thumbnail are removed; the manifest line stays, so the number is not reused."""
     api = _as_admin(client)
     rec = _record(db_session, volume)
     real_commit = db_session.commit

@@ -123,11 +123,11 @@ def test_dispatch_uses_gphoto2_helper_when_backend_is_gphoto2(fake_backend, monk
 def test_detect_enumerates_a_reserved_hole_at_its_pinned_index(monkeypatch, tmp_path):
     """A map with a reserved hole must enumerate its one body at index 1.
 
-    detect_cameras() used to count gp.Camera.autodetect() and then walk
-    range(count), which puts a single surviving body at index 0 no matter
-    which index the backend pinned it to. It now builds its result from one
-    backend enumeration, so the index the backend published is the index the
-    registry records - and only one enumeration is run, not one per index.
+    detect_cameras() builds its result from one backend enumeration, so the
+    index the backend published is the index the registry records, and one
+    enumeration runs, not one per index. Counting gp.Camera.autodetect() and
+    walking range(count) would put a single surviving body at index 0 no
+    matter which index the backend pinned it to.
     """
     from app.core.config import settings
 

@@ -1,9 +1,9 @@
 """Backfill the sha256 of RAW previews captured before capture recorded it.
 
-Capture now lists a RAW master's `_preview.jpg` in its capture record
-(capture.manifestHandler._preview_file). Previews captured earlier have no
-digest anywhere, and Fisqua's pipeline reads the preview and checks its
-sha256 at pull (exchange contract 1.1, §4), so a volume of them cannot be
+Capture lists a RAW master's `_preview.jpg` in its capture record
+(capture.manifestHandler._preview_file). A preview whose capture record does
+not list it has no digest anywhere, and Fisqua's pipeline reads the preview
+and checks its sha256 at pull (exchange contract 1.1, §4), so a volume of them cannot be
 exported. This computes each one from the local file and appends it to the
 volume's own `metadata/manifest.jsonl` as a `preview_digest` record:
 

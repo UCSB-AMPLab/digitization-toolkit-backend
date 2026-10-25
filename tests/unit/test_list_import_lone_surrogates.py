@@ -1,9 +1,9 @@
 """A list holding an escaped lone surrogate (`\\ud800`) is refused whole, before anything is written.
 
 json.loads accepts the escape and returns a string no UTF-8 encoder will
-write, so the item it sat in was rejected, echoed into the report, and the
-report's storage (ensure_ascii=False) raised: a 500 with no report after
-other items were committed. The file is now refused with 400 when any key or
+write. An item holding one, rejected and echoed into the report, would make
+the report's storage (ensure_ascii=False) raise: a 500 with no report after
+other items were committed. So the file is refused with 400 when any key or
 string in it holds a lone surrogate. A surrogate pair is one character and
 is accepted. Report storage escapes what it cannot encode, so it cannot
 fail this way.

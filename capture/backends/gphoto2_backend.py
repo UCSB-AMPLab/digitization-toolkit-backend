@@ -24,10 +24,9 @@ Key design decisions:
 
 Tested with: Canon EOS 1500D x 2, USB 2.0, Raspberry Pi.
 
-Future hooks (wire up when DSLRCameraConfig is introduced):
-  - ISO control via `iso` PTP widget
-  - Shutter speed control via `shutterspeed` PTP widget
-  - Aperture control via `aperture` PTP widget
+ISO, shutter speed, aperture and image format are applied from CameraConfig
+before each capture, through the `iso`, `shutterspeed`, `aperture` and
+`imageformat` PTP widgets (_PTPSession.apply_dslr_config).
 """
 
 import json
@@ -647,8 +646,8 @@ class GPhoto2Backend(CameraBackend):
         Only the pins are restored - the port cache starts empty, because a usb
         devnum from a previous boot means nothing - so both indices begin
         reserved and the bodies land on provisional indices until the first
-        identification puts them back where they belong. That is the path this
-        backend already takes after a power-cycle; nothing here is new.
+        identification puts them back where they belong, the same path this
+        backend takes after a power-cycle.
 
         A missing file is the normal first-run case. A file that cannot be read
         or does not hold the expected shape is reported and ignored: bad
@@ -783,7 +782,7 @@ class GPhoto2Backend(CameraBackend):
         where they land.
 
         Two guards. Only complete knowledge counts: one port whose serial could
-        not be read means nothing is dropped (R23-4), because an unreadable
+        not be read means nothing is dropped, because an unreadable
         body is not an absent one. And one surviving seeded body is enough to
         keep every pin, so the camera that is still there keeps its side and
         the newcomer waits at a provisional index for the operator's rescan -
@@ -844,8 +843,7 @@ class GPhoto2Backend(CameraBackend):
         build nor reserved by a pin. An index pinned to a body that is not
         present therefore stays empty rather than being handed to whichever
         body happened to enumerate first. With no pins and an empty cache the
-        result is exactly the positional map this backend published before
-        identities were tracked.
+        result is the positional map, in autodetect order.
 
         Ports the given detection does not report are dropped from the serial
         cache: a usb devnum is not reused until the bus counter wraps, so a
@@ -926,7 +924,7 @@ class GPhoto2Backend(CameraBackend):
         A pin is written on the *first* serial read at an index, not after some
         later confirmation: an index that has been used but left unpinned is an
         index a different body can silently be published on, which is exactly
-        the substitution this work exists to prevent. The pin is refused only
+        the substitution the pins exist to prevent. The pin is refused only
         when it would overwrite one - the index is already pinned, or the
         serial is already pinned elsewhere - and in that case the cache entry
         is still written, since it is a true observation either way.
@@ -1212,8 +1210,7 @@ class GPhoto2Backend(CameraBackend):
                     serial = getattr(session, "serial", "") or ""
                     read_port = session.port
                     if not serial:
-                        # The read at session open failed, or this session
-                        # predates serials being read at all. Ask the body
+                        # The read at session open failed. Ask the body
                         # again through the session that already holds it -
                         # still no second claim.
                         try:
@@ -1400,12 +1397,12 @@ class GPhoto2Backend(CameraBackend):
         camera_config,
         capture_output: bool = False,
     ) -> str:
-        """Capture one image to output_path. Returns path as str.
+        """Capture one image to output_path. Returns (path as str, None).
 
         Most CameraConfig fields (awb, vflip, lens_position, etc.) are
-        picamera2-specific and are silently ignored here. DSLR-specific
-        controls (ISO, shutter speed, aperture) will be wired up once a
-        dedicated DSLRCameraConfig is introduced.
+        picamera2-specific and are silently ignored here. The DSLR fields
+        (iso, shutter_speed, aperture, image_format) are applied through
+        _PTPSession.apply_dslr_config before the shutter fires.
 
         Args:
             output_path: Destination path for the captured JPEG.
@@ -1413,10 +1410,11 @@ class GPhoto2Backend(CameraBackend):
             capture_output: Unused - kept for interface compatibility.
 
         Returns:
-            Absolute path string to the saved image file.
+            (path, None): the saved image file's path as a string (`.cr2`
+            when the body shoots RAW), and no metadata.
 
         Raises:
-            RuntimeError: If the capture fails.
+            RuntimeError: If the capture fails, a timeout included.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
         lock = self._get_camera_lock(camera_index)
@@ -1552,9 +1550,10 @@ class GPhoto2Backend(CameraBackend):
                         # session open has no pin, and reporting a serial
                         # without learning it leaves the index unpinned and
                         # free for a later arrival to take. There is nothing
-                        # to release first: the ordering rule (R23-2) is about
-                        # a claim that is about to be dropped, and this
-                        # session's claim lives on either way.
+                        # to release first: the rule that a serial is published
+                        # only once its claim is released is about a claim that
+                        # is about to be dropped, and this session's claim
+                        # lives on either way.
                         session.serial = serial
                         learned = self._learn_serial(
                             idx, session.port, serial
@@ -1608,7 +1607,7 @@ class GPhoto2Backend(CameraBackend):
                             except Exception:
                                 pass
                         self._release_port(idx, port)
-                    # R23-2: the claim is gone, so what it read may now be
+                    # The claim is gone, so what it read may now be
                     # published.
                     if serial:
                         learned = self._learn_serial(idx, port, serial) or learned
@@ -1814,7 +1813,6 @@ class GPhoto2Backend(CameraBackend):
                         settings["image_format"], _IMAGE_FORMAT_DEFAULT
                     )
                     session._set_config("imageformat", ptp_fmt)
-                # Return updated state
                 raw = session.get_info()
                 return {
                     "iso": raw.get("iso"),

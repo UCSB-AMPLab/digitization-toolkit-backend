@@ -4,7 +4,7 @@ Orientation lives beside calibration in cameras.json, keyed by hardware id
 so it survives reopening the app and rebooting the Pi, rather than being
 sent fresh (and lost) with every capture request.
 
-Also covers R30-1: two CameraRegistry instances are constructed per request
+Also covers concurrent saves: two CameraRegistry instances are constructed per request
 (app/api/cameras.py's _get_camera_registry), and each holds its own snapshot
 of the file. Without a reload-modify-save discipline under a shared lock, an
 instance that saves after another would silently clobber the other's change.
@@ -59,7 +59,7 @@ def test_update_orientation_on_an_unknown_hardware_id_raises_key_error(tmp_path)
 
 @pytest.mark.unit
 def test_two_instances_writing_different_bodies_both_land(tmp_path):
-    """R30-1: instance1 and instance2 are both constructed before either
+    """instance1 and instance2 are both constructed before either
     writes, then each mutates a different body. A third instance reading
     the file afterwards must see both changes, not just the last save."""
     registry_path = tmp_path / "cameras.json"
@@ -82,7 +82,7 @@ def test_two_instances_writing_different_bodies_both_land(tmp_path):
 
 @pytest.mark.unit
 def test_second_writer_reloads_the_first_writers_save_before_applying_its_own(tmp_path):
-    """R30-1 concurrency: the writer that loses the race for the lock must
+    """The writer that loses the race for the lock must
     reload after the winner's save completes, not before - otherwise it
     would overwrite the winner's change with a stale copy."""
     registry_path = tmp_path / "cameras.json"

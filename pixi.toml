@@ -9,9 +9,9 @@ platforms = ["linux-aarch64", "linux-64"]
 python = "~=3.11.0"
 # Web framework — kept in sync with requirements.txt (NEH-161/108):
 # any dependency change must update BOTH manifests in the same PR and re-run
-# `pixi lock`. Note: CORSMiddleware's allow_private_network kwarg (currently
-# commented out in app/main.py) requires starlette >=0.51.0 — the ==1.3.1 pin
-# satisfies that if it is ever re-enabled.
+# `pixi lock`. CORSMiddleware's `allow_private_network` kwarg, which
+# app/main.py does not pass, requires starlette >=0.51.0; the ==1.3.1 pin
+# satisfies that.
 fastapi = "==0.139.0"
 uvicorn = "==0.35.0"
 python-multipart = "==0.0.20"
@@ -45,8 +45,8 @@ numpy = "<2"
 pip = ">=26.1.2,<27"
 
 # Camera support - these require system packages
-# Note: picamera2 and rpicam need to be accessed via system packages
-# We'll handle this in the tasks
+# picamera2 and rpicam come from the system packages; the
+# `setup-camera-link` task puts them on the environment's path.
 
 [tasks]
 # Development server
@@ -63,9 +63,9 @@ db-history = "alembic history"
 # Schema drift guard (NEH-105): fails if the ORM models and a
 # migrated database disagree, i.e. if `db-migrate` would emit a
 # non-empty migration. Run it against a database already at head —
-# `pixi run db-upgrade` first. Drift is how collections acquired three
-# columns no model declared (dda9bc1bc608), and how project_members was
-# once dropped by an unreviewed autogenerate.
+# `pixi run db-upgrade` first. Undetected drift lets a table carry columns
+# no model declares (see dda9bc1bc608), and lets an unreviewed autogenerate
+# drop a table the models still use (see ff2f751fadbb).
 db-check-drift = { cmd = "alembic check", depends-on = ["db-upgrade"] }
 
 # Offsite image upload (NEH-227): record objects an earlier script put in the

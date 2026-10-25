@@ -235,7 +235,6 @@ class RoleChecker:
         return user
 
 
-# Role checkers
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])

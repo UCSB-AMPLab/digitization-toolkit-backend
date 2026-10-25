@@ -1,11 +1,11 @@
 """`/images/{id}/file` serves the master; `/images/{id}/preview` serves something a browser can show.
 
 A RAW capture lands on the card as the master (`IMG_0001.CR2`) and a JPEG
-sidecar the RAW backend writes beside it (`IMG_0001_preview.jpg`). The file
-endpoint used to swap the sidecar in for a RAW master while still naming the
-download after the master, so the download button and the collection ZIP
-handed out a JPEG called `IMG_0001.CR2`. With no sidecar, the same URL sent
-RAW bytes to an `<img>` tag.
+sidecar the RAW backend writes beside it (`IMG_0001_preview.jpg`). A file
+endpoint that swaps the sidecar in for a RAW master while still naming the
+download after the master makes the download button and the collection ZIP
+hand out a JPEG called `IMG_0001.CR2`, and with no sidecar it sends RAW bytes
+to an `<img>` tag.
 
 These tests pin the split: `/file` always sends the master's own bytes under
 its own filename; `/preview` sends the master for a browser-displayable

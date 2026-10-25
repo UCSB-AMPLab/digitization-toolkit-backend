@@ -1,7 +1,7 @@
 # `-m "not camera"` deselects camera-marked tests; the remaining hardware fixtures
 # skip because the default picamera2 backend cannot be built on the runner
 # (the subprocess backend would raise FileNotFoundError for rpicam-still instead).
-# DATABASE_URL is set because alembic/env.py:50 (get_url) reads DATABASE_URL from
+# DATABASE_URL is set because `get_url` in alembic/env.py reads DATABASE_URL from
 # the environment before falling back to app settings, and `db-check-drift` needs
 # it to reach the postgres service below.
 name: CI

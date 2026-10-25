@@ -5,8 +5,7 @@ root filesystem, is kept as the projects root (falling back to the internal
 card would split projects across two disks). Nothing may then create the
 projects tree there: with no drive mounted, `/var/lib/dtk/mounts/<x>/` is an
 ordinary directory on the SD card, and `mkdir(parents=True)` under it would put
-the project on the card while the operator believes it is on the drive (bench
-D3, section 5c).
+the project on the card while the operator believes it is on the drive.
 
 `writable_projects_dir()` is the check for writers that build a path into the
 tree; they all do it through `capture.project_manager._projects_root()`:
@@ -437,8 +436,8 @@ def test_bindings_saved_after_the_drive_returns_keep_the_pins_on_disk(
 
 @pytest.mark.unit
 def test_bindings_saved_by_a_backend_that_read_the_file_are_not_merged(override, on_a_drive, tmp_path):
-    """Behaviour is unchanged for a backend that seeded from the file: its pins
-    are written as they stand, so a pin it dropped stays dropped."""
+    """A backend that seeded from the file writes its pins as they stand, so a
+    pin it dropped stays dropped."""
     import json
     root = tmp_path / "dtk-projects"
     root.mkdir()

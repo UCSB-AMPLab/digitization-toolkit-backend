@@ -1,15 +1,12 @@
-"""NEH-259: `records.object_typology` and `records.material` are gone.
+"""NEH-259: records carry neither `object_typology` nor `material`.
 
-`object_typology` was never set by an operator — the capture path hard-coded
-"document" for single captures and "book" for dual ones, so it duplicated
-`capture_mode` and was sometimes wrong (a loose bifolium shot as a pair came
-out as "book"). `material` had no writer and no UI at all. The loose/bound
-distinction lives in `capture_mode`, under its own name.
+The loose/bound distinction lives in `capture_mode`, under its own name. An
+`object_typology` derived from the capture mode would duplicate it and be
+wrong for a loose bifolium shot as a pair; `material` has no writer and no UI.
 
-Dropping `object_typology` would otherwise take the only trace of single vs
-dual out of an exported bag, so the export payload gains `capture_mode` in
-its place, plus a schema version that tells a bag written before this change
-from one written after.
+The export payload carries `capture_mode`, so a bag still records single vs
+dual, and a schema version that tells a bag carrying `object_typology` from
+one carrying `capture_mode`.
 """
 
 import json

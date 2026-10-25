@@ -143,12 +143,12 @@ def test_an_enumeration_waits_for_a_capture_on_a_body_that_has_left(
 def test_cleanup_leaves_nothing_open_when_a_body_arrives_as_it_runs(monkeypatch):
     """A body opened after cleanup was asked for still has to be closed.
 
-    Cleanup used to take one snapshot of the map and close what was in it, so
-    an enumeration that opened a newly arrived body in the meantime left that
-    body mapped with a live claim while cleanup reported every camera closed.
-    Cleanup now runs under the same lock as an enumeration and drains the map
-    rather than a copy of it, so the two cannot overlap and nothing can be
-    open when it returns.
+    A cleanup that took one snapshot of the map and closed what was in it
+    would let an enumeration open a newly arrived body in the meantime and
+    leave that body mapped with a live claim while cleanup reported every
+    camera closed. Cleanup runs under the same lock as an enumeration and
+    drains the map rather than a copy of it, so the two cannot overlap and
+    nothing can be open when it returns.
 
     The enumeration is paused inside the bus scan, where it holds that lock,
     so cleanup provably cannot be running alongside it rather than merely

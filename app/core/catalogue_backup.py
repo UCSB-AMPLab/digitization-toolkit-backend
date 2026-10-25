@@ -41,8 +41,8 @@ Three rules it is built around:
   with no read, so a single-object lookup answers 401 and an empty result from
   a refused call is indistinguishable from an absent object. A matching row
   that carries no checksum is the same kind of silence. A check that cannot
-  answer is not a negative answer. This is the rule ``free-masters.py`` is
-  built around, for the same key.
+  answer is not a negative answer. Freeing masters from the card
+  (``app.core.offsite_free``) follows the same rule.
 * **A dump never survives the run.** The failure being guarded against is
   precisely a card with no room, so cleanup is the point rather than tidiness.
   The dump is a copy of live data, so removing an unverified one loses nothing;
@@ -338,12 +338,10 @@ def _kill_dump(process: subprocess.Popen) -> None:
     The group is compared with this process's own before anything is signalled.
     A dump started without start_new_session=True shares the backend's group,
     and killing that group kills the backend: uvicorn, the API, the schedule.
-    Removing start_new_session=True from the Popen above and running the
-    stalled-wrapper test killed the test runner, which is how this guard came
-    to be written. The two settings are one mechanism, and
-    a future edit that separates them must not be able to take the backend
-    down, so the fallback kills only the child and lets the caller's existing
-    timeout path report the stall.
+    start_new_session=True on the Popen in write_dump and this comparison are
+    one mechanism, and an edit that separates them must not be able to take
+    the backend down, so the fallback kills only the child and lets the
+    caller's existing timeout path report the stall.
 
     Raises OSError if the group is already gone; callers guard it.
     """
@@ -483,7 +481,7 @@ def upload(local: Path) -> None:
     """Copy one file to the destination. Copy only: nothing here can remove.
 
     --no-check-dest because rclone's default destination HEAD needs readFiles
-    and answers 401 against this write+list key. It cost the first attempt.
+    and answers 401 against this write+list key.
 
     Refuses anything that is not age ciphertext, by name and by header, so a
     plaintext dump cannot reach the bucket through this function.

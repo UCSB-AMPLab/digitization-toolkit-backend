@@ -1,11 +1,11 @@
 #!/usr/bin/env python3
 """
-Unit tests for the NEH-69 refactor: storage mount/umount/activate now shell out
-through the single privileged helper /usr/local/bin/dtk-system-helper instead of
+Unit tests for storage mount/umount/activate (NEH-69): they shell out through
+the single privileged helper /usr/local/bin/dtk-system-helper, never through
 raw sudo mount/umount/mkdir/chown.
 
-These assert the exact argv passed to subprocess.run so a future regression that
-reintroduces raw sudo calls (or the hardcoded pi:pi chown) is caught. They also
+These assert the exact argv passed to subprocess.run, so a raw sudo call (or a
+hardcoded pi:pi chown) fails them. They also
 assert the backend never mkdirs/rmdirs under the mounts root - the root is
 root-owned and the helper is its only writer. Run with:
     python -m pytest tests/unit/test_system_storage_helper.py
@@ -82,7 +82,7 @@ def test_mount_uses_helper_and_does_not_mkdir(admin_client, monkeypatch, dir_op_
     assert cmd[3] == "/dev/sda1"
     assert "-o" not in cmd
 
-    # Creating the mountpoint directory is the helper's job now.
+    # Creating the mountpoint directory is the helper's job.
     assert dir_op_recorder == []
 
 
@@ -128,7 +128,7 @@ def test_unmount_uses_helper_and_does_not_rmdir(admin_client, monkeypatch, dir_o
     # Routed through the helper, not a bare `sudo umount`.
     assert cmd == ["sudo", system.HELPER, "umount", target]
 
-    # Removing the mountpoint directory after umount is the helper's job now.
+    # Removing the mountpoint directory after umount is the helper's job.
     assert dir_op_recorder == []
 
 

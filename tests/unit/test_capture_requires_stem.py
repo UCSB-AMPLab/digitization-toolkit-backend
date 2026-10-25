@@ -468,9 +468,9 @@ def test_every_stem_check_loads_the_volume_through_the_locked_loader():
 # ---------------------------------------------------------------------------
 #
 # A path that takes both locks takes the record's row first and the volume's
-# second. An upload that locked the volume and then inserted an image, whose
-# foreign-key check takes FOR KEY SHARE on the record, deadlocked on
-# PostgreSQL 16 against a retake that held the record and wanted the volume.
+# second. An upload that locks the volume and then inserts an image, whose
+# foreign-key check takes FOR KEY SHARE on the record, deadlocks on
+# PostgreSQL 16 against a retake that holds the record and wants the volume.
 # The locked loaders' SQL is checked above and in test_workflow_row_locking.py;
 # here, the order in each path's source.
 

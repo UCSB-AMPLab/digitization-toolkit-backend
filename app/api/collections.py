@@ -99,7 +99,6 @@ def create_collection(
     if payload.project_id is not None and payload.parent_collection_id is not None:
         raise HTTPException(status_code=400, detail="Cannot specify both project_id and parent_collection_id")
     
-    # Validate parent exists
     if payload.project_id is not None:
         project = db.query(Project).filter(Project.id == payload.project_id).first()
         if not project:
@@ -468,7 +467,6 @@ def update_collection(
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     
-    # Validate new parent if specified
     if payload.parent_collection_id is not None:
         # Prevent circular references
         if payload.parent_collection_id == collection_id:
@@ -983,9 +981,9 @@ def take_back_collection(
 
     One statement, so the predicate and the write are evaluated together by
     the database. Selecting the in_review records and then assigning to each
-    of them is not the same thing: an approval committed in between was
-    overwritten with 'captured', which undid a reviewer's ruling and handed
-    the work back to the operator (reproduced). A collection can hold 825
+    of them is not the same thing: an approval committed in between would be
+    overwritten with 'captured', undoing a reviewer's ruling and handing the
+    work back to the operator (reproduced). A collection can hold 825
     records, so that window is as long as the transaction.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()

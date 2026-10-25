@@ -2,10 +2,10 @@
 while that export runs, and an export does not start while such a route is
 moving files.
 
-On the bench unit, renaming a collection while its export ran moved the files
-out from under the export, which then failed with a raw FileNotFoundError that
-named an internal path (bench D3, section 6). The routes below now hold the
-collections they touch for the length of their file work
+Renaming a collection while its export runs would move the files out from
+under the export, which would then fail with a raw FileNotFoundError naming an
+internal path. The routes below hold the collections they touch for the length
+of their file work
 (`export_jobs.hold_for_file_changes`): the hold refuses with 409 when an export
 of any of them is queued or running, and `export_jobs.start` refuses an export
 of a held collection.

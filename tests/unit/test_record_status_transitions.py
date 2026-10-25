@@ -72,7 +72,7 @@ def test_in_review_to_approved_forbidden_for_operator(client, db_session):
 
 @pytest.mark.unit
 def test_approved_to_rejected_no_longer_allowed(client, db_session):
-    """approved is terminal (NEH-208) — the old 'flag for rework' walk-back is gone."""
+    """approved -> rejected is not in the table (NEH-208); the only way out of approved is the undo to in_review."""
     rec = _make_record(db_session, status="approved")
     api = _client_as(client, "rev", "reviewer")
 
@@ -134,7 +134,7 @@ def test_rejected_to_captured_forbidden_for_reviewer(client, db_session):
 def test_in_review_to_captured_is_not_in_the_table(client, db_session):
     """Taking a handover back is per collection, never per record (NEH-260).
 
-    The value validates — `captured` is a real status again — so the refusal
+    The value validates — `captured` is a real status — so the refusal
     has to come from the transition table rather than from the schema.
     """
     rec = _make_record(db_session, status="in_review")

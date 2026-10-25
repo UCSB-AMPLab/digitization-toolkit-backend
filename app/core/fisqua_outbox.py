@@ -108,8 +108,9 @@ logger = logging.getLogger(__name__)
 
 UNSENT = ("waiting_for_upload", "ready", "failed")
 
-# The problem recorded for a handover of a volume with no Fisqua reference
-# code (collections.external_id), in the shape of capture_manifest's problems.
+# The problem recorded for a handover of a volume whose recorded Fisqua
+# reference code (collections.external_id) is not its file name stem, in the
+# shape of capture_manifest's problems.
 def reference_code_differs_problem(stem: str, reference_code: str) -> dict:
     """The problem for a volume whose reference code is not its file name stem (contract 1.2 §8)."""
     return {
@@ -643,10 +644,11 @@ def _reference_problem(collection) -> Optional[dict]:
     other. With no code recorded the stem is the code; a volume with no stem
     is refused for that when its manifest is built.
 
-    The model now refuses such a pair for every ORM writer
+    The model refuses such a pair for every ORM writer
     (app.models.collection, ReferenceCodeDiffersFromStemError), so the API
-    cannot produce one. This stays, at handover and again when the manifest
-    is built, for rows written before that rule or around it (raw SQL).
+    cannot produce one. The check runs here, at handover and again when the
+    manifest is built, for rows written before the model had that rule or
+    around it (raw SQL).
     """
     recorded = (collection.external_id or "").strip()
     if collection.filename_stem is not None and recorded and recorded != collection.filename_stem:
@@ -1070,7 +1072,10 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
 
 
 def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _Run) -> bool:
-    """Send one row. False when Fisqua refused the token, and sending is to stop.
+    """Send one row. False when sending is to stop.
+
+    Sending stops when Fisqua refuses the unit's configuration, or refuses the
+    manifest for version.
 
     Times are read from `clock` when each thing happens: the attempt when the
     row is claimed, and every deadline from when the answer came, so a long

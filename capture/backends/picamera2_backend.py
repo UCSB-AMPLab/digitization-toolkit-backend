@@ -14,8 +14,8 @@ a centred 16:9 band and can never reach the full array. Preview, zoom and
 still therefore all reference that default rectangle: ``_ensure_configured``
 reads it from ``camera_controls["ScalerCrop"][2]`` and pins it explicitly on
 every (re)configure, ``apply_zoom`` crops inside it, and a still waits for a
-frame actually exposed at it. Bench item B14 confirms the band on the
-appliance.
+frame actually exposed at it. Bench testing on the appliance confirms the
+band.
 """
 
 import os
@@ -376,7 +376,9 @@ class Picamera2Backend(CameraBackend):
             capture_output (bool): Not used for picamera2 (kept for interface compatibility).
             
         Returns:
-            str: Path to the captured image file.
+            tuple: (path, metadata). path is the image path, or a
+            (jpeg_path, raw_path) tuple when a raw buffer is saved too;
+            metadata is the archival subset of the frame metadata.
             
         Raises:
             RuntimeError: If capture fails.
@@ -629,7 +631,6 @@ class Picamera2Backend(CameraBackend):
             use_yuv = self._uses_yuv(camera_config)
             needs_reconfigure = self._ensure_configured(picam2, camera_config)
 
-            # Apply controls
             controls = self._config_to_picamera2_controls(camera_config)
 
             # Apply controls after start
@@ -684,7 +685,6 @@ class Picamera2Backend(CameraBackend):
                 # next request as it comes.
                 request = picam2.capture_request()
             try:
-                # Extract metadata first
                 metadata = request.get_metadata()
                 
                 if camera_config.raw:

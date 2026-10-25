@@ -5,9 +5,9 @@ never change, so a move would leave the volume's objects naming a record
 that is elsewhere. Every path that changes records.collection_id answers
 409: PATCH /records/{id} with another parent, POST
 /collections/{id}/move-records, and POST /projects/{id}/add_record/{rec},
-which takes a record out of its volume. A record already outside every
-volume (one that left before these checks existed) is let back only into
-the volume its keys are under, `<tenant>/<stem>/`.
+which takes a record out of its volume. A record with images stored
+offsite that is already outside every volume is let back only into the
+volume its keys are under, `<tenant>/<stem>/`.
 """
 
 import pytest
@@ -115,7 +115,7 @@ def test_add_record_takes_a_record_with_nothing_stored_offsite_out_of_its_volume
 
 
 def _put_outside_every_volume(db, rec, project_id):
-    """The state the unguarded add_record left behind: offsite rows, no volume."""
+    """Put `rec` outside every volume while it keeps its offsite rows."""
     rec.collection_id = None
     rec.project_id = project_id
     db.add(rec)

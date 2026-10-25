@@ -4,7 +4,7 @@
 A record is born `captured` — it is the operator's until she promotes the
 volume. A retake supersedes the current images either way and leaves the
 record `captured`: a captured record stays where it is, and a rejected one
-returns to `captured` (decision 8, ruled 2026-10-24). It reaches review again
+returns to `captured`. It reaches review again
 only when the operator promotes the volume, as a new capture does.
 
 A record in review or approved is not retakeable, and the capture is refused

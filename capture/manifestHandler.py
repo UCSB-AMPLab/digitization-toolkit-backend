@@ -121,8 +121,6 @@ class CaptureRecord:
         return asdict(self)
 
 
-#### Helper functions ####
-
 def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[Path]) -> str:
     """Path of a captured file relative to the project root.
 
@@ -210,7 +208,7 @@ def generate_manifest_record(
         img_paths: List of captured image paths
         cam_configs: List of CameraConfig objects used
         times: List of capture times in seconds (optional)
-        pair_id: Shared ID for dual captures (optional, auto-generated)
+        pair_id: Shared ID for dual captures (optional; None for a single capture)
         stagger: Delay between camera starts in ms (optional)
         roles: List of role names (e.g., ["left", "right"] or ["single"])
                If None, auto-assigns based on number of captures
@@ -219,7 +217,6 @@ def generate_manifest_record(
     Returns:
         CaptureRecord object
     """
-    # Auto-assign roles if not provided
     if roles is None:
         if len(img_paths) == 1:
             roles = ["single"]
@@ -228,7 +225,6 @@ def generate_manifest_record(
         else:
             roles = [f"cam{i}" for i in range(len(img_paths))]
     
-    # Build files list
     # Handle both single paths and multi-format (JPEG+raw) tuples
     files = []
     for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
@@ -237,7 +233,6 @@ def generate_manifest_record(
         if isinstance(path, tuple):
             jpeg_path, raw_path = path
             
-            # Add JPEG file
             files.append(CaptureFile(
                 role=role,
                 relative_path=_relative_capture_path(jpeg_path, project_root),
@@ -247,7 +242,6 @@ def generate_manifest_record(
                 rotate_deg=rotate_deg,
             ))
 
-            # Add raw sensor data file
             # Note: Using .raw extension due to picamera2 DNG save bug
             # Contains compressed raw sensor data (Pi 5) or packed pixels (Pi 4)
             files.append(CaptureFile(
@@ -262,7 +256,6 @@ def generate_manifest_record(
             if preview is not None:
                 files.append(preview)
         else:
-            # Single format
             files.append(CaptureFile(
                 role=role,
                 relative_path=_relative_capture_path(path, project_root),
@@ -278,7 +271,6 @@ def generate_manifest_record(
             if preview is not None:
                 files.append(preview)
     
-    # Build cameras list with metadata
     cameras = []
     for config in cam_configs:
         # Key metadata by camera_index so an asymmetric-None result never misattributes it
@@ -289,7 +281,6 @@ def generate_manifest_record(
             camera_controls_metadata=metadata
         ))
     
-    # Build timing dict
     timing = {}
     if times:
         for i, t in enumerate(times):
@@ -449,8 +440,8 @@ def append_upload_record(volume_root: Path, *, capture_id: Optional[str], relati
         _append_line(metadata_dir / "manifest.jsonl", line)
 
 
-# Written whole and renamed over the manifest by an earlier version of
-# append_manifest_lines; a leftover is removed at startup (app.core.volume_layout).
+# The temp name of a whole-file manifest rewrite, which append_manifest_lines
+# does not perform; a leftover is removed at startup (app.core.volume_layout).
 MANIFEST_PART_NAME = "manifest.jsonl.part"
 
 

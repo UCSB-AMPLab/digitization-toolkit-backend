@@ -33,8 +33,8 @@ class CameraCalibration:
     
     Supports:
     - Autofocus position calibration
-    - White balance calibration (future)
-    - Exposure calibration (future)
+    - White balance calibration
+    - Exposure calibration (not implemented)
     """
     
     def __init__(self, camera_index: int = 0):
@@ -94,7 +94,6 @@ class CameraCalibration:
         if verbose:
             print("\n[INFO] Running autofocus...")
         
-        # Run autofocus cycle and time it
         af_start = time.time()
         success = picam2.autofocus_cycle()
         af_time = time.time() - af_start
@@ -107,7 +106,6 @@ class CameraCalibration:
         }
         
         if success:
-            # Get lens position from metadata
             metadata = picam2.capture_metadata()
             lens_position = metadata.get("LensPosition")
             
@@ -129,7 +127,6 @@ class CameraCalibration:
         picam2.stop()
         picam2.close()
         
-        # Store in calibration data
         self.calibration_data["focus"] = result
         self.calibration_data["calibrated_at"] = datetime.now(timezone.utc).isoformat()
         
@@ -214,7 +211,6 @@ class CameraCalibration:
                     if gains:
                         print(f"  Frame {i+1}/{stabilization_frames}: R={gains[0]:.3f}, B={gains[1]:.3f}")
             
-            # Get final converged values
             final_metadata = picam2.capture_metadata()
             final_gains = final_metadata.get("ColourGains")
             colour_temp = final_metadata.get("ColourTemperature")
@@ -258,7 +254,6 @@ class CameraCalibration:
             if verbose:
                 print(f"\n[ERROR] White balance calibration failed: {e}")
         
-        # Store in calibration data
         self.calibration_data["white_balance"] = result
         self.calibration_data["calibrated_at"] = datetime.now(timezone.utc).isoformat()
         
@@ -307,14 +302,12 @@ class CameraCalibration:
         """
         recommendations = {}
         
-        # Focus recommendations
         if self.calibration_data["focus"].get("success"):
             lens_pos = self.calibration_data["focus"]["lens_position"]
             recommendations["autofocus_on_capture"] = False
             recommendations["lens_position"] = lens_pos
             recommendations["_focus_note"] = f"Manual focus at {lens_pos:.2f} dioptres"
         
-        # White balance recommendations
         if self.calibration_data["white_balance"].get("success"):
             awb_gains = self.calibration_data["white_balance"]["awb_gains"]
             recommendations["awb"] = "custom"
@@ -342,13 +335,8 @@ def calibrate_camera_interactive(camera_index: int = 0, save_path: Optional[str]
     
     cal = CameraCalibration(camera_index)
     
-    # Focus calibration
     focus_result = cal.calibrate_focus()
     
-    # Future: Add more calibration types
-    # wb_result = cal.calibrate_white_balance()
-    
-    # Show recommendations
     print(f"\n{'='*70}")
     print("RECOMMENDED CONFIGURATION")
     print(f"{'='*70}")
@@ -358,11 +346,9 @@ def calibrate_camera_interactive(camera_index: int = 0, save_path: Optional[str]
         if not key.startswith('_'):
             print(f"  {key} = {value}")
     
-    # Save if path provided
     if save_path:
         cal.save_profile(save_path)
     else:
-        # Default save location
         default_path = f"calibration_camera{camera_index}.json"
         cal.save_profile(default_path)
     
@@ -372,7 +358,6 @@ def calibrate_camera_interactive(camera_index: int = 0, save_path: Optional[str]
 if __name__ == "__main__":
     import sys
     
-    # Parse camera index from command line
     camera_index = int(sys.argv[1]) if len(sys.argv) > 1 else 0
     save_path = sys.argv[2] if len(sys.argv) > 2 else None
     

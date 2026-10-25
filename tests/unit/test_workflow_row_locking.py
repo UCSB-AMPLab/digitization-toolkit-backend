@@ -1,8 +1,8 @@
 #!/usr/bin/env python3
 """NEH-260: the record row is the mutex for its own workflow state.
 
-Validating a snapshot and then writing is not a guard. An adversarial round
-reproduced three sequences against the unlocked version:
+Validating a snapshot and then writing is not a guard. Without the row lock,
+three sequences go wrong:
 
   - a promotion that loaded a clean `captured` record, a concurrent
     promote-reject-prepare landing a rejected image back on it, and the first
@@ -125,7 +125,7 @@ def test_promote_and_bulk_take_their_rows_in_id_order():
 
 @pytest.mark.unit
 def test_take_back_is_a_single_statement():
-    """A select-then-assign is what overwrote an approval."""
+    """A select-then-assign can overwrite an approval committed in between."""
     import inspect
 
     from app.api.collections import take_back_collection

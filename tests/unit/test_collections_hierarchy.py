@@ -3,8 +3,8 @@
 Smoke test for GET /collections/{id}/hierarchy.
 
 The endpoint returns a collection with its nested children and a per-collection
-record count. This guards against a regression where the count query filtered a
-column that does not exist, so the endpoint returned 500 on every call.
+record count. The count query must filter on a column that exists; one that
+does not makes the endpoint return 500 on every call.
 Run with: python -m pytest tests/unit/test_collections_hierarchy.py
 """
 

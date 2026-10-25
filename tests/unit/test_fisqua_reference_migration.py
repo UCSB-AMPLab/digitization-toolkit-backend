@@ -68,7 +68,7 @@ def test_the_migration_chains_onto_the_decisions_migration(backend_root):
 
 @pytest.mark.unit
 def test_alembic_has_a_single_head(backend_root):
-    """The newest revision pins the head (moved here from test_fisqua_decisions_migration.py)."""
+    """The newest revision pins the head."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 

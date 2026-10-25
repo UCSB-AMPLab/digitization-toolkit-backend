@@ -1,18 +1,15 @@
 #!/usr/bin/env python3
-"""NEH-260 follow-ups: the two ways round the handover rule.
+"""NEH-260: two ways round the handover rule. Neither needs a race.
 
-An adversarial round found both. Neither needs a race.
-
-  1. The ruling of 2026-10-17 is that taking a handover back applies to a whole
-     collection and never to one record, so a reviewer cannot have a single item
-     pulled out from under them. But moving a record between collections carried
-     no status check, so three ordinary calls did it: move R into collection B,
-     take B back, move R home. R returned as the operator's while its siblings
-     stayed in the queue.
-  2. Exporting is a request and then a worker. The request checked the workflow
-     state; the worker reloaded the records and did not. A collection taken back
-     in between still exported, and the bag's metadata described the work as
-     `captured`.
+  1. Taking a handover back applies to a whole collection and never to one
+     record, so a reviewer cannot have a single item pulled out from under
+     them. Moving a record between collections therefore checks its status:
+     without the check, three ordinary calls (move R into collection B, take B
+     back, move R home) return R to the operator while its siblings stay in
+     the queue.
+  2. Exporting is a request and then a worker. The worker reloads the records
+     and checks the workflow state again: a collection taken back in between
+     must not export with bag metadata that describes the work as `captured`.
 
 Run with: python -m pytest tests/unit/test_handover_boundaries.py
 """
@@ -99,7 +96,7 @@ def test_a_handed_over_record_cannot_be_moved(client, db_session, status):
 
 @pytest.mark.unit
 def test_the_three_call_sequence_no_longer_withdraws_one_record(client, db_session):
-    """The reproduction, end to end: it has to fail at the first step now."""
+    """The three-call sequence, end to end: it fails at the first step."""
     a, b = _collection(db_session, "A"), _collection(db_session, "B")
     r = _record(db_session, a, name="r.jpg")
     s = _record(db_session, a, name="s.jpg")
@@ -110,7 +107,7 @@ def test_the_three_call_sequence_no_longer_withdraws_one_record(client, db_sessi
     db_session.refresh(s)
     assert (r.status, s.status) == ("in_review", "in_review")
 
-    # Step one of the old sequence.
+    # Step one of the sequence.
     assert api.patch(f"/records/{r.id}", json={"collection_id": b.id}).status_code == 409
     db_session.refresh(r)
     db_session.refresh(s)
@@ -136,10 +133,9 @@ def test_resending_the_same_parent_is_not_a_move(client, db_session):
     """A PATCH that changes nothing about the parent must not be refused —
     and must also not change the parent.
 
-    The first version of this test asserted only the 200. A mutation that
-    detached the record after validation passed it, and passed every other case
-    in this file too, which is what an adversarial round demonstrated. A test
-    that constrains only the status code constrains almost nothing.
+    A check of the 200 alone would pass a mutation that detaches the record
+    after validation, as would every other case in this file, so the parent
+    and the status are checked as well.
     """
     a = _collection(db_session, "A")
     rec = _record(db_session, a, status="in_review")
@@ -154,15 +150,14 @@ def test_resending_the_same_parent_is_not_a_move(client, db_session):
 
 
 # ---------------------------------------------------------------------------
-# The project routes, which the first version of this guard did not cover
+# The project routes
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_attaching_a_queued_record_to_a_project_is_refused(client, db_session):
-    """An adversarial round reached the whole-collection rule through here.
-
-    POST /projects/{id}/add_record/{rec} sets project_id and nulls
-    collection_id, which is a move, and it carried no status check.
+    """POST /projects/{id}/add_record/{rec} sets project_id and nulls
+    collection_id, which is a move, so it is refused for a handed-over record
+    like any other move.
     """
     a = _collection(db_session, "A")
     rec = _record(db_session, a, status="in_review")
@@ -210,7 +205,7 @@ def test_detaching_a_queued_record_from_a_project_is_refused(client, db_session)
 
 @pytest.mark.unit
 def test_the_two_call_project_sequence_no_longer_withdraws_one_record(client, db_session):
-    """The round's reproduction: attach S to a project, then take A back."""
+    """Attach S to a project, then take A back: the handover comes back whole."""
     a = _collection(db_session, "A")
     r = _record(db_session, a, name="r.jpg")
     s_rec = _record(db_session, a, name="s.jpg")
@@ -230,12 +225,12 @@ def test_the_two_call_project_sequence_no_longer_withdraws_one_record(client, db
 
 
 # ---------------------------------------------------------------------------
-# The export worker's remaining gaps
+# The export worker: an emptied collection
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_an_emptied_collection_is_refused_by_the_worker(db_session):
-    """The request refuses an empty collection; the worker used not to."""
+    """The request refuses an empty collection, and so does the worker."""
     from app.core.export_jobs import ExportError, ExportJob
     from app.core.export_service import _do_export, workflow_blockers
 
@@ -293,8 +288,8 @@ def test_the_workflow_gate_reports_handover_before_approval():
 
 @pytest.mark.unit
 def test_the_worker_refuses_a_collection_taken_back_after_the_request(db_session, tmp_path):
-    """The gap the round exploited: request while approved, take back, let the
-    worker run. It used to build a bag whose metadata said `captured`."""
+    """Request while approved, take back, let the worker run: the worker
+    refuses rather than build a bag whose metadata says `captured`."""
     from app.core.export_jobs import ExportError, ExportJob
     from app.core.export_service import _do_export
 

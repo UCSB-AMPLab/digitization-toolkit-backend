@@ -38,7 +38,7 @@ PREVIEW_SIDECAR_SUFFIX = "_preview.jpg"
 # with each sidecar beside its master and thumbnails in `images/thumbnails/`.
 CAPTURES_DIR = "captures"      # masters: CR2, or JPEG/TIFF
 PREVIEWS_DIR = "previews"      # the `_preview.jpg` extracted from a RAW master
-THUMBNAILS_DIR = "thumbnails"  # thumbnails
+THUMBNAILS_DIR = "thumbnails"
 METADATA_DIR = "metadata"      # the volume's manifest.jsonl
 VOLUME_SUBDIRS = (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR)
 

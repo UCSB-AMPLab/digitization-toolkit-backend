@@ -1043,8 +1043,8 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "row_changed"})
             continue
 
-        # A version-1 journal (written before adoption existed) has no "adopt"
-        # and no "capture_id": its entries are all moves.
+        # A version-1 journal has no "adopt" and no "capture_id": its entries
+        # are all moves.
         if e.get("adopt", False):
             if not dst.is_file():
                 report["skipped"].append({"image_id": e["image_id"], "path": e["from"], "reason": "missing"})
@@ -1524,10 +1524,11 @@ def migrate_volume_layout(db: Session, dry_run: bool = False) -> dict:
 def _remove_stale_parts(db: Session, root: Path, report: dict, dry_run: bool) -> None:
     """Remove each stemmed volume's leftover `metadata/manifest.jsonl.part`; count them.
 
-    An earlier version of append_manifest_lines wrote a volume's manifest
-    whole to that name and renamed it over the manifest; nothing writes it
-    now, so a `.part` is what a crash of that version left, and the manifest
-    it would have replaced is intact. With dry_run it is counted and kept.
+    Nothing writes that name: append_manifest_lines appends to the manifest.
+    A `.part` there is left on a unit by a crash of an earlier
+    append_manifest_lines that wrote the manifest whole to that name and
+    renamed it over the manifest, and the manifest it would have replaced is
+    intact. With dry_run it is counted and kept.
     One query and one stat per stemmed volume.
     """
     from capture.manifestHandler import MANIFEST_PART_NAME

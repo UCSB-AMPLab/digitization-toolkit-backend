@@ -381,7 +381,7 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     that the stem equals the code, then the stem's duplicate in the list,
     then the title, dates and sequence.
     The checks against volumes already on the unit come after this, in
-    import_list, since they read the database.
+    _import_items, since they read the database.
     """
     if not isinstance(item, dict):
         return "item_not_an_object", {}
@@ -411,7 +411,7 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "filename_stem_differs_from_reference_code", {}
     # With the stem equal to the code, a stem repeated in the list has a
     # repeated code too, which is reported above; this check, and the
-    # stem-on-unit check in import_list, stay for a stem held without that code.
+    # stem-on-unit check in _import_items, cover a stem held without that code.
     if first_stem.get(stem) != position:
         return "filename_stem_duplicated_in_list", {}
 

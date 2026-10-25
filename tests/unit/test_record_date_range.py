@@ -91,8 +91,8 @@ def test_neither_date_range_column_carries_an_index():
 
     A DATE column is comparable without an index — that is what distinguishes
     it from the `Text` `custom_attributes` the range would otherwise sit in.
-    An index is what a *query path* needs, and no query path exists on this
-    branch; adding one later is a one-line migration. Asserted so that an
+    An index is what a *query path* needs, and no query path exists; adding
+    one later is a one-line migration. Asserted so that an
     index arriving by accident, without a matching migration, shows up as a
     failure rather than as schema drift.
     """
@@ -364,14 +364,14 @@ def test_a_half_open_range_cannot_violate_the_check(db_session):
 
     Asserted as a pair with the refusals above: a check that rejected a
     half-open range would make "after 1750" and "before 1800" unstorable, and
-    those are the dates this round exists to carry.
+    those are the dates the columns exist to carry.
 
     It does not pin the *form* of the check, and nothing can. Writing it as a
     bare `date_end >= date_start` behaves identically — the comparison
     evaluates to NULL when either end is NULL, and a CHECK accepts NULL — so
     the explicit `IS NULL OR` form is a legibility choice with no behaviour
     behind it. Replacing the explicit form with the bare one leaves this file
-    green, which was confirmed by mutation rather than assumed.
+    green.
     """
     from app.models.record import Record
 
@@ -388,14 +388,14 @@ def test_a_half_open_range_cannot_violate_the_check(db_session):
 
 
 # ---------------------------------------------------------------------------
-# The range is queryable, which is the point of the round
+# The range is queryable, which is the point of the columns
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_records_can_be_filtered_by_an_overlapping_range(db_session):
     """What `custom_attributes` could not answer.
 
-    Not an endpoint — no query filter is in scope on this branch — but the
+    Not an endpoint — no query filter exists — but the
     columns have to be able to carry one, and a `Text` column holding encoded
     JSON cannot.
     """

@@ -12,10 +12,6 @@ the records of captures deleted since, of records moved out, and of copies
 naming other volumes' directories; and a stray one merged into does no harm,
 because the index, the fixity gate and the bag select records by the capture
 ids of the volume's rows.
-
-The first test is the verifier's (round 4); the deleted-capture and
-moved-out tests are the verifier's (round 5); the two-hop and merged-manifest
-tests are the verifier's (round 6).
 """
 
 import hashlib
@@ -67,7 +63,7 @@ def test_a_single_foreign_file_stops_the_move(db_session, legacy, rel):
     assert not [m for m in report["moved"] if m["collection_id"] == legacy["a2"].id]
     foreign = {tuple(s["foreign"]) for s in report["skipped"] if s["reason"] == "stem_dir_occupied"}
     assert foreign == {(rel.split("/sub")[0] + "/sub",) if "/sub/" in rel else (rel,)}
-    # The other volumes migrate as before.
+    # The migration still moves the other volumes.
     assert [m for m in report["moved"] if m["collection_id"] == legacy["a1"].id]
 
 

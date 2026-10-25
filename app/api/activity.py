@@ -171,7 +171,7 @@ def daily_activity(
     that zone, with the zone's offset at t, so an event on either side of a
     daylight-saving change lands on its own local date. Without `tz`, it is
     the date of t - tz_offset_minutes minutes, one offset for the whole
-    window, as before `tz` existed.
+    window.
 
     Bucketing is done in Python, not SQL. Converting a timestamp to a named
     zone needs a time zone database, which Postgres has (AT TIME ZONE) and

@@ -6,7 +6,7 @@ field of view than the capture records, and every poll/capture pair
 reconfigures the body.
 
 These tests pin the contract: one still configuration carrying a "lores"
-stream, a capture_preview() that saves that stream, and - R39-1/R40-1 - a
+stream, a capture_preview() that saves that stream, and a
 still that skips the frames libcamera has already queued under the preview's
 zoom before accepting one taken at the configuration's own unzoomed crop.
 
@@ -343,7 +343,7 @@ def test_preview_bytes_come_from_lores_and_the_still_from_main(monkeypatch, tmp_
 
 
 def test_a_reconfigure_pins_the_configurations_default_crop_once(monkeypatch, tmp_path):
-    """R40-1: a 16:9 configuration off a 4:3 readout starts on a centred band.
+    """A 16:9 configuration off a 4:3 readout starts on a centred band.
 
     The backend pins that band explicitly on (re)configure so preview, zoom and
     still all reference the same rectangle, and the preview's own frames are
@@ -377,7 +377,7 @@ def test_preview_adds_no_crop_of_its_own_and_never_sleeps(monkeypatch, tmp_path)
 
 
 # --------------------------------------------------------------------------
-# R39-1: the still must not accept a frame queued under the preview's zoom
+# The still must not accept a frame queued under the preview's zoom
 # --------------------------------------------------------------------------
 
 def test_a_still_after_a_zoomed_preview_skips_the_queued_zoomed_frame(monkeypatch, tmp_path):
@@ -439,7 +439,7 @@ def test_a_crop_stuck_at_zoom_raises_after_eight_released_requests(monkeypatch, 
 
 
 def test_a_still_at_medium_captures_at_the_band_not_the_full_array(monkeypatch, tmp_path):
-    """R40-2: the target is the configuration's reachable crop.
+    """The target is the configuration's reachable crop.
 
     In a 16:9 configuration the full pixel array is unreachable, so waiting for
     it would burn every retry and fail; the band frame is accepted first time.
@@ -477,7 +477,7 @@ def test_waiting_for_the_full_array_in_a_banded_mode_gives_up(monkeypatch, tmp_p
 
 
 def test_a_frame_at_a_hair_of_zoom_is_released_not_accepted(monkeypatch, tmp_path):
-    """R40-3: apply_zoom permits 1.005x, whose crop is within 1% of the target
+    """`apply_zoom` permits 1.005x, whose crop is within 1% of the target
     in both dimensions; a per-value tolerance must still reject it."""
     backend, cls = _install(monkeypatch, queued_crops=[(12, 9, 4632, 3478)])
 
@@ -561,7 +561,7 @@ def test_apply_zoom_holds_the_per_body_lock(monkeypatch, tmp_path):
 
 
 # --------------------------------------------------------------------------
-# R42-1: a half-finished reconfigure must leave no cache behind
+# A half-finished reconfigure must leave no cache behind
 # --------------------------------------------------------------------------
 
 def test_a_failed_start_leaves_no_cached_configuration(monkeypatch, tmp_path):
@@ -759,8 +759,7 @@ def test_a_rectangle_object_crop_yields_all_four_values():
 def test_turning_raw_on_with_the_same_encoding_reconfigures(monkeypatch, tmp_path):
     """A PNG still with raw=False and one with raw=True share use_yuv (both
     RGB888), so without `raw` in the reconfigure key the second would reuse
-    the first configuration and have no raw stream to save a sidecar from
-    (Copilot, C91b-2)."""
+    the first configuration and have no raw stream to save a sidecar from."""
     backend, cls = _install(monkeypatch)
     backend.capture_image(tmp_path / "a.png", _still_config(resolution="high", encoding="png", raw=False))
     configures_before = len(cls.INSTANCES[0].configs)
@@ -772,7 +771,7 @@ def test_turning_raw_on_with_the_same_encoding_reconfigures(monkeypatch, tmp_pat
 def test_without_the_control_the_fallback_is_the_modes_maximum_crop(monkeypatch, tmp_path):
     """A build that does not expose camera_controls["ScalerCrop"] must not
     fall back to the pixel array in a banded mode: ScalerCropMaximum is the
-    reachable rectangle there (Copilot, second review)."""
+    reachable rectangle there."""
     backend, cls = _install(monkeypatch)
     cam_cls = cls
     backend.capture_preview(0, img_size=IMG_SIZES["medium"], tmp_path=tmp_path / "p.jpg")

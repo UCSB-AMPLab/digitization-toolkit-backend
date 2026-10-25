@@ -26,7 +26,6 @@ if ! grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
     fi
 fi
 
-# Function to check if package is installed
 check_installed() {
     dpkg -l "$1" &> /dev/null
     return $?
@@ -39,7 +38,7 @@ echo ""
 echo "Step 2: Installing system dependencies..."
 echo "----------------------------------------"
 
-# Required for both backends
+# Required for the subprocess and picamera2 backends
 COMMON_PACKAGES=(
     "python3-dev"          # Python development headers
     "libcap-dev"           # libcap development headers (for picamera2)
@@ -105,11 +104,9 @@ echo "----------------------------------------"
 
 source "$VENV_DIR/bin/activate"
 
-# Upgrade pip
 echo -e "${YELLOW}->${NC} Upgrading pip..."
 pip install --upgrade pip -q
 
-# Install requirements
 if [ -f "$BACKEND_DIR/requirements.txt" ]; then
     echo -e "${YELLOW}->${NC} Installing from requirements.txt..."
     pip install -r "$BACKEND_DIR/requirements.txt"

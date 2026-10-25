@@ -336,7 +336,7 @@ def test_no_failure_path_leaves_a_dump_on_the_card(offsite, db_session, monkeypa
 
 @pytest.mark.unit
 def test_an_empty_dump_is_refused_before_it_is_uploaded(offsite, db_session, monkeypatch):
-    """A failed pg_dumpall still gzips to a valid ~20-byte stream (update.sh:445)."""
+    """A failed pg_dumpall still gzips to a valid ~20-byte stream (the same guard as scripts/update.sh's database dump)."""
     cb = offsite.module
     monkeypatch.setenv("STUB_DUMP_EMPTY", "1")
 
@@ -404,8 +404,8 @@ def test_a_verified_dump_from_an_earlier_day_does_not_satisfy_today(offsite, db_
     [
         pytest.param(1, id="a-second-apart"),
         # The collision the one-second stamp actually permits: two ticks inside
-        # the same second. Excluding this case was what let the old name scheme
-        # pass its own no-overwrite test.
+        # the same second. Without this case, a name made from the stamp alone
+        # passes the no-overwrite test.
         pytest.param(0, id="same-second"),
     ],
 )
@@ -466,7 +466,7 @@ def test_nothing_in_a_run_removes_or_replaces_an_object_already_in_the_bucket(
 
 @pytest.mark.unit
 def test_the_default_dump_goes_through_the_database_container(monkeypatch):
-    """No postgres client in pixi.toml; update.sh:438 is the precedent."""
+    """No postgres client in pixi.toml; scripts/update.sh's database dump is the precedent."""
     from app.core.config import settings
     import app.core.catalogue_backup as cb
 
@@ -566,7 +566,7 @@ def test_the_scheduler_does_not_start_without_a_configured_remote(offsite, monke
 @pytest.mark.unit
 def test_last_verified_backup_reports_the_most_recent_verified_run(offsite, db_session):
     """Two verified rows, so "most recent" is a claim the test can check. With
-    one row the assertion held whichever way the ordering ran."""
+    one row the assertion would hold whichever way the ordering ran."""
     from datetime import datetime, timezone
 
     from app.models.system_log import SystemLog
@@ -867,7 +867,7 @@ def test_a_dump_command_whose_binary_is_missing_is_a_plain_failure(tmp_path, mon
 
 
 # ---------------------------------------------------------------------------
-# A listing row with no checksum is not an absent object (R1)
+# A listing row with no checksum is not an absent object
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -911,13 +911,13 @@ def test_a_genuinely_absent_object_is_still_a_plain_failure(
 
 
 # ---------------------------------------------------------------------------
-# Cleanup is idempotent, not one finally (R2, R10)
+# Cleanup is idempotent, not one finally
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_stale_dump_is_swept_before_the_up_to_date_check(offsite, db_session):
     """An unlink that failed, or a process that exited mid-run, leaves a dump on
-    the card. The next tick returns up-to-date without ever reaching the old
+    the card. The next tick returns up-to-date without reaching a run's own
     cleanup, so the sweep has to come first and has to run on every tick."""
     cb = offsite.module
     assert cb.run_catalogue_backup(db_session)["status"] == "verified"
@@ -955,7 +955,7 @@ def test_the_scheduler_sweeps_an_abandoned_dump_at_startup(offsite, monkeypatch)
 
 
 # ---------------------------------------------------------------------------
-# The object name is collision-proof (R3)
+# The object name is collision-proof
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -987,7 +987,7 @@ def test_two_runs_in_the_same_second_do_not_share_an_object_name(
 
 
 # ---------------------------------------------------------------------------
-# The override may not quietly ship role passwords (R4)
+# The override may not quietly ship role passwords
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1062,14 +1062,14 @@ def test_a_run_with_an_unsafe_override_uploads_nothing(
 
 
 # ---------------------------------------------------------------------------
-# The dump timeout actually bounds the dump (R5)
+# The dump timeout actually bounds the dump
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_stalled_dump_is_killed_and_reported(offsite, tmp_path, monkeypatch):
     """A blocking read has no timeout, and process.wait is only reached once the
-    read loop ends, so a child that neither writes nor exits held the scheduler
-    thread for ever. The deadline has to kill the child."""
+    read loop ends, so a child that neither writes nor exits would hold the
+    scheduler thread for ever. The deadline has to kill the child."""
     from app.core.config import settings
 
     cb = offsite.module
@@ -1096,7 +1096,7 @@ def test_a_stalled_dump_is_killed_and_reported(offsite, tmp_path, monkeypatch):
 
 
 # ---------------------------------------------------------------------------
-# verified_at is the verification time, not the transaction's (R6)
+# verified_at is the verification time, not the transaction's
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1138,9 +1138,8 @@ def test_the_recorded_time_is_when_verification_succeeded(
 def test_an_audit_call_without_a_timestamp_still_takes_the_database_default(
     db_session,
 ):
-    """The timestamp parameter is additive: every existing caller must behave
-    exactly as it did, which means the column's own default still fills it in
-    and fills it in with the time of the call."""
+    """The timestamp parameter is optional: a call without one gets the
+    column's own default, filled in with the time of the call."""
     from datetime import datetime, timedelta, timezone
 
     from app.core import audit
@@ -1166,7 +1165,7 @@ def test_an_audit_call_without_a_timestamp_still_takes_the_database_default(
 
 
 # ---------------------------------------------------------------------------
-# A swallowed commit does not read as verified (R7)
+# A swallowed commit does not read as verified
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1199,7 +1198,7 @@ def test_a_lost_verified_record_is_not_reported_as_verified(
 
 
 # ---------------------------------------------------------------------------
-# What the single-process assumption rests on (R8)
+# What the single-process assumption rests on
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1212,7 +1211,7 @@ def test_the_single_process_assumption_names_the_worker_count_variable(offsite):
 
 
 # ---------------------------------------------------------------------------
-# Name the configured destination, do not claim a bucket (R9)
+# Name the configured destination, do not claim a bucket
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1241,7 +1240,7 @@ def test_a_verified_run_names_the_configured_destination(
 
 
 # ---------------------------------------------------------------------------
-# A timeout becomes the right error (R12)
+# A timeout becomes the right error
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1285,7 +1284,7 @@ def test_a_transport_timeout_does_not_escape_the_run(
 
 
 # ---------------------------------------------------------------------------
-# The daily boundary is the appliance's local day (R13)
+# The daily boundary is the appliance's local day
 # ---------------------------------------------------------------------------
 
 @pytest.fixture
@@ -1356,7 +1355,7 @@ def test_a_naive_timestamp_is_still_read_as_utc(offsite, local_zone_utc_minus_5)
 
 
 # ---------------------------------------------------------------------------
-# The deadline bounds the read, not only the direct child (R14)
+# The deadline bounds the read, not only the direct child
 # ---------------------------------------------------------------------------
 
 # A wrapper script, which PG_DUMP_COMMAND may name: it starts a child that
@@ -1404,7 +1403,7 @@ def test_a_stalled_wrapper_with_a_child_is_killed_and_reported(
 
 
 # ---------------------------------------------------------------------------
-# The dump is not readable by other local users (R15)
+# The dump is not readable by other local users
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1442,7 +1441,7 @@ def test_the_dump_directory_is_created_owner_only(db_session, tmp_path, monkeypa
 
 
 # ---------------------------------------------------------------------------
-# A filesystem error during the dump is a failed status (R16)
+# A filesystem error during the dump is a failed status
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
@@ -1476,7 +1475,7 @@ def test_a_full_card_during_the_dump_is_a_recorded_failure(
 
 
 # ---------------------------------------------------------------------------
-# The stale sweep does not sit behind the enabled check (R17)
+# The stale sweep does not sit behind the enabled check
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit

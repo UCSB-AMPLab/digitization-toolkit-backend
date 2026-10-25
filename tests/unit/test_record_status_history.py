@@ -1,9 +1,9 @@
 #!/usr/bin/env python3
 """record_status_changes: every change of a record's status is dated.
 
-records.status says only where a record is now, so the time of an approval
-was not stored anywhere. Each writer of the status now adds a row naming the
-old status, the new one, who changed it and when. These tests go through the
+records.status says only where a record is now, so it cannot give the time
+of an approval. Each writer of the status adds a row naming the old status,
+the new one, who changed it and when. These tests go through the
 endpoints, one per writer, and check the row each one leaves.
 
 Run with: python -m pytest tests/unit/test_record_status_history.py

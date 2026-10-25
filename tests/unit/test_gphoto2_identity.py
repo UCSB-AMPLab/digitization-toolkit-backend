@@ -781,7 +781,8 @@ def test_an_unreadable_serial_never_drops_a_pin(monkeypatch, caplog):
     `bodies.unreadable`, which covers the identification pass and the
     enumeration rescan() runs for its return value. Failing only the first
     read per port would let that trailing enumeration repair the map inside
-    the same rescan, which is not the state R23-4 is about.
+    the same rescan, which is not the state under test: a rescan that cannot
+    identify either body.
     """
     backend, _claims, detector, bodies, _cls = _backend_with(
         monkeypatch, [(MODEL, PORT_A), (MODEL, PORT_B)]
@@ -1017,12 +1018,13 @@ def test_identification_never_opens_a_port_another_index_still_holds(monkeypatch
         started.append(prober)
 
         # The pass takes index 0 first, under lock 0, and everything it may do
-        # there - closing S1's stale session, the ownership decision, and the
-        # brief open the unfixed code makes - happens before it releases that
+        # there - closing S1's stale session, the ownership decision, and any
+        # brief open that would break the rule - happens before it releases that
         # lock; it then blocks on lock 1 (C's provisional index), which this
         # thread holds. So the deterministic marker is "lock 0 was taken and
         # released again": only then is index 0's whole block over, and an
-        # assertion taken earlier could pass by schedule on the unfixed code.
+        # assertion taken earlier could pass by schedule even if the pass
+        # opened the port.
         lock_0 = backend._get_camera_lock(0)
         deadline = time.monotonic() + 10
         index_0_done = False
@@ -1063,7 +1065,7 @@ def test_identification_never_opens_a_port_another_index_still_holds(monkeypatch
 
 
 # ----------------------------------------------------------------------
-# (o, p, q) R25-1: a claim that no scan of self._sessions can see
+# (o, p, q) a claim that no scan of self._sessions can see
 # ----------------------------------------------------------------------
 
 def _repacked_to_zero(backend):
@@ -1195,8 +1197,8 @@ def test_a_session_still_closing_holds_its_port(monkeypatch):
 def test_a_brief_read_in_flight_holds_its_port(monkeypatch):
     """autodetect: [B, C]; the enumeration's brief read on C pauses in exit().
 
-    A brief read never appears in self._sessions at all, so its claim was
-    invisible to every ownership check.
+    A brief read never appears in self._sessions at all, so an ownership check
+    that scans only self._sessions cannot see its claim.
     """
     backend, claims, _detector, bodies, _cls = _parked_c_backend(monkeypatch)
 
@@ -1237,7 +1239,7 @@ def test_a_brief_read_in_flight_holds_its_port(monkeypatch):
 
 
 # ----------------------------------------------------------------------
-# (r) R25-2: a re-pack may not move a body off its side
+# (r) a re-pack may not move a body off its side
 # ----------------------------------------------------------------------
 
 def test_rescan_never_moves_a_surviving_body_off_its_side(monkeypatch, bindings_dir):
@@ -1286,7 +1288,7 @@ def test_rescan_repacks_a_newcomer_into_the_freed_side(monkeypatch, bindings_dir
 
 
 # ----------------------------------------------------------------------
-# (s) R25-3: two saves must not land out of order
+# (s) two saves must not land out of order
 # ----------------------------------------------------------------------
 
 def test_two_saves_leave_the_newest_pins_on_disk(monkeypatch, bindings_dir):
@@ -1364,7 +1366,7 @@ def test_two_saves_leave_the_newest_pins_on_disk(monkeypatch, bindings_dir):
 
 
 # ----------------------------------------------------------------------
-# (t) R25-4: the seeded-drop rule must not depend on who asks first
+# (t) the seeded-drop rule must not depend on who asks first
 # ----------------------------------------------------------------------
 
 def test_an_enumeration_first_still_drops_the_seeded_pins(monkeypatch, bindings_dir):
@@ -1387,7 +1389,7 @@ def test_an_enumeration_first_still_drops_the_seeded_pins(monkeypatch, bindings_
 
 
 # ----------------------------------------------------------------------
-# (u) R25-5: a serial read late, from a session that is already open
+# (u) a serial read late, from a session that is already open
 # ----------------------------------------------------------------------
 
 def test_a_serial_read_from_an_open_session_is_learned(monkeypatch):

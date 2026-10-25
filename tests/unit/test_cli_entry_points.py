@@ -4,9 +4,9 @@
 app.core.volume_layout` run in an interpreter that has not imported
 app.main, and app/models/__init__.py imports nothing. Without registering
 the models first, the first query fails while SQLAlchemy configures the
-mappers: relationship("Project") on Record cannot find Project. The suite
-did not see it because tests/conftest.py imports every model, so each
-command runs here in a fresh interpreter (cli_session_worker.py) against
+mappers: relationship("Project") on Record cannot find Project.
+tests/conftest.py imports every model, which hides that failure in-process, so
+each command runs here in a fresh interpreter (cli_session_worker.py) against
 the SQLite file the db_session fixture has created.
 """
 import json

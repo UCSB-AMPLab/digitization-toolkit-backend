@@ -326,9 +326,9 @@ def test_a_new_body_whose_card_would_not_read_is_tried_again(monkeypatch):
 
     A body already in the map is marked as dropped when something goes wrong
     with it, which is what makes the next connection check look at the bus
-    again. A body failing its very first card read was closed without that
-    mark, so the scan finished, the index stayed empty, and nothing retried:
-    the camera was unavailable until someone rescanned by hand.
+    again. A body that fails its very first card read needs the same mark:
+    closed without it, the scan finishes, the index stays empty, and nothing
+    retries, so the camera stays unavailable until someone rescans by hand.
     """
     from .chdk_fakes import PTPError
 

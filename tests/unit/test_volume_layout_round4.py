@@ -1,4 +1,4 @@
-"""The verifier's round-4 tests of the stem layout that are not elsewhere.
+"""Tests of the stem layout that are not elsewhere.
 
 The not-yet-migrated rename tests are in test_volume_not_yet_migrated, the
 stray-directory test in test_stem_directory_occupied, and the torn-write tests
@@ -260,7 +260,7 @@ def test_every_read_path_on_a_mixed_layout_unit(client, db_session, legacy):
     assert sorted(Path(p).name for p in result["orphan_files"]) == ["stray.jpg"]
 
 
-# --- scale (round 1/2 tests, now with a stem) --------------------------------------
+# --- scale, with a stem ----------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_rionegro_sized_stemmed_volume(db_session, capture_settings, data_dir, override_projects_root):

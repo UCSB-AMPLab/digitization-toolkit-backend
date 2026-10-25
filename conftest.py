@@ -100,7 +100,6 @@ def override_projects_root(tmp_path, monkeypatch):
     test_projects_dir = tmp_path / "test_projects"
     test_projects_dir.mkdir(parents=True, exist_ok=True)
     
-    # Patch the environment variable
     monkeypatch.setenv("PROJECTS_ROOT", str(test_projects_dir))
     
     # Reload settings to pick up the new value
@@ -220,11 +219,9 @@ def pytest_collection_modifyitems(config, items):
     - Tests with "backend" in the node id get @pytest.mark.backend
     """
     for item in items:
-        # Auto-mark hardware tests
         if item.nodeid.split("::", 1)[0] in HARDWARE_TEST_FILES:
             item.add_marker(pytest.mark.camera)
         
-        # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
 
@@ -236,7 +233,7 @@ def db_session(override_projects_root):
     """
     Create a test database session with fresh schema.
     
-    Each test gets its own in-memory SQLite database.
+    Each test gets its own temporary file-based SQLite database.
     """
     import tempfile
     from app.core.db import Base, engine, SessionLocal
@@ -248,10 +245,8 @@ def db_session(override_projects_root):
     
     test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
     
-    # Create tables
     Base.metadata.create_all(test_engine)
     
-    # Create session
     SessionLocal.configure(bind=test_engine)
     session = SessionLocal()
     

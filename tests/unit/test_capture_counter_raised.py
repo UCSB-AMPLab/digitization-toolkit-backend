@@ -273,13 +273,13 @@ def test_an_upload_whose_commit_fails_raises_nothing(client, db_session, test_pr
 
 
 # ---------------------------------------------------------------------------
-# The verifier's flows, now refused
+# Flows that would free a captured stem are refused
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
 def test_a_captured_stem_stays_fixed_after_the_record_is_deleted(client, db_session, test_project,
                                                                  monkeypatch, tmp_path):
-    """Verifier 1a: a real capture, then the record deleted, then a stem change."""
+    """A real capture, then the record deleted, then a stem change."""
     from app.models.collection import Collection
     from app.models.record import ImmutableFieldError, Record
 
@@ -302,7 +302,7 @@ def test_a_captured_stem_stays_fixed_after_the_record_is_deleted(client, db_sess
 @pytest.mark.unit
 def test_move_records_then_delete_is_refused_after_a_real_capture(client, db_session, test_project,
                                                                   monkeypatch, tmp_path):
-    """Verifier r10: capture into A, move its records to B, delete A."""
+    """Capture into A, move its records to B, delete A."""
     from app.models.collection import Collection
 
     _install_capture_fakes(monkeypatch, tmp_path)

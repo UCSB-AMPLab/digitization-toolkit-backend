@@ -110,8 +110,8 @@ class CollectionRead(CollectionBase):
     # Whether the volume keeps its row to keep its stem: it has a stem and
     # has captured, so DELETE refuses it even once its records are moved
     # out. Lets the interface warn before "move the records, then delete".
-    # Read-only. Costs one image query per volume that has a stem and a
-    # counter of 0.
+    # Read-only. Costs an image query, and an offsite-object query when that
+    # finds no image, per volume that has a stem and a counter of 0.
     stem_reserved: bool = False
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None

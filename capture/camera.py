@@ -94,7 +94,6 @@ def recorded_rotation(camera_config) -> Optional[int]:
     return deg if deg in _VALID_ROTATIONS else None
 
 
-# Helper functions for saving/loading camera configs
 def save_camera_configs(filepath: str, configs: dict):
     """
     Save camera configurations to a JSON file.
@@ -129,10 +128,11 @@ def load_camera_configs(filepath: str) -> dict:
         
     Example:
         configs = load_camera_configs("camera_setup.json")
-        path1, path2, _ = dual_capture_image(
+        path1, path2, capture_id, pair_id = dual_capture_image(
             "myproject",
             cam1_config=configs["left_camera"],
-            cam2_config=configs["right_camera"]
+            cam2_config=configs["right_camera"],
+            filename_index="co-ahr-con-t055-img_0001",
         )
     """
     import json

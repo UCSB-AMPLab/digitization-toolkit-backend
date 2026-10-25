@@ -9,7 +9,6 @@ import pytest
 import sys
 from pathlib import Path
 
-# Skip on non-Linux platforms
 if sys.platform != 'linux':
     pytest.skip("Integration tests require Linux/Raspberry Pi environment", allow_module_level=True)
 
@@ -24,10 +23,8 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
     """
     Test that /cameras/capture creates a RecordImage record in database.
     """
-    # Ensure project exists
     project_name = test_project.name
 
-    # Call capture endpoint
     response = authed_client.post(
         "/cameras/capture",
         json={
@@ -39,13 +36,11 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
         },
     )
 
-    # Check response
     assert response.status_code == 200
     data = response.json()
     assert data["success"] is True
     assert data["file_path"] is not None
 
-    # Verify database record was created
     doc = db_session.query(RecordImage).filter(
         RecordImage.file_path == data["file_path"]
     ).first()
@@ -54,14 +49,12 @@ def test_single_capture_creates_database_record(authed_client, db_session, test_
     assert doc.format == "jpg"
     assert doc.resolution_width is not None
     assert doc.resolution_height is not None
-    # Check that the record is linked to the volume
     record = db_session.query(Record).filter(Record.id == doc.record_id).first()
     assert record is not None
     assert record.collection_id == capture_volume.id
     assert record.status == "captured"
     assert record.capture_mode == "single"
 
-    # Verify camera settings were saved
     cs = db_session.query(CameraSettings).filter(
         CameraSettings.record_image_id == doc.id
     ).first()
@@ -76,7 +69,6 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
     """
     project_name = test_project.name
 
-    # Call dual capture endpoint
     response = authed_client.post(
         "/cameras/capture/dual",
         json={
@@ -88,13 +80,11 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
         },
     )
 
-    # Check response
     assert response.status_code == 200
     data = response.json()
     assert data["success"] is True
     assert len(data["file_paths"]) == 2
 
-    # Verify both database records were created
     # RecordImage has no collection_id — images belong to a Record, which
     # belongs to the volume.
     docs = db_session.query(RecordImage).join(Record).filter(
@@ -107,7 +97,6 @@ def test_dual_capture_creates_two_database_records(authed_client, db_session, te
     assert dual_record.status == "captured"
     assert dual_record.capture_mode == "dual"
 
-    # Check both have camera settings
     for doc in docs[-2:]:
         cs = db_session.query(CameraSettings).filter(
             CameraSettings.record_image_id == doc.id
@@ -122,7 +111,6 @@ def test_captured_images_stored_locally(authed_client, test_project, capture_vol
     """
     project_name = test_project.name
 
-    # Call capture endpoint
     response = authed_client.post(
         "/cameras/capture",
         json={
@@ -136,7 +124,6 @@ def test_captured_images_stored_locally(authed_client, test_project, capture_vol
     data = response.json()
     file_path = Path(data["file_path"])
 
-    # Verify file exists
     assert file_path.exists()
     assert file_path.stat().st_size > 0
     assert file_path.suffix.lower() in [".jpg", ".jpeg"]
@@ -162,14 +149,12 @@ def test_exif_data_extracted_and_saved(authed_client, db_session, test_project, 
     assert response.status_code == 200
     data = response.json()
 
-    # Get database record
     doc = db_session.query(RecordImage).filter(
         RecordImage.file_path == data["file_path"]
     ).first()
 
     assert doc is not None
 
-    # Check if EXIF data was created
     exif = db_session.query(ExifData).filter(
         ExifData.record_image_id == doc.id
     ).first()

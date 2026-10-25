@@ -4,7 +4,6 @@ from pathlib import Path
 from typing import Optional
 
 class Settings(BaseSettings):
-    # Deployment environment
     # Anything outside _DEV_ENVIRONMENTS requires a real SECRET_KEY
     APP_ENV: str = "development"
     DATABASE_USER: str = "user"
