@@ -316,17 +316,33 @@ def test_an_invalid_decision_is_skipped(client, db_session, handed, decision, wh
 
 @pytest.mark.unit
 @pytest.mark.parametrize("reason", ["framing", "obstruction", "other"])
-def test_a_contract_reason_the_unit_cannot_store_yet_is_skipped(client, db_session, handed, reason):
-    """Until backend/rejection-reasons widens record_rejections, these three are reported, not stored."""
-    from app.schemas.record import PREDEFINED_REJECTION_REASONS
-    if reason in PREDEFINED_REJECTION_REASONS:
-        pytest.skip("the unit stores this reason now")
+def test_the_three_reasons_added_in_1_2_are_stored(db_session, handed, reason):
+    from app.models.record import RecordRejection
     vol, (a, b), row, fake = handed
-    _decide(fake, row, [_reject(a, reason=reason, note="a note")])
+    _decide(fake, row, [_reject(a, reason=reason, note="the reason, in words")])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "rejected"
+    [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
+    assert (rej.predefined_reason, rej.comment) == (reason, "the reason, in words")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("note", ["", "   ", None])
+def test_other_without_a_note_is_skipped_as_the_reject_endpoint_refuses_it(client, db_session, handed, note):
+    vol, (a, b), row, fake = handed
+    resp = _as(client, "reviewer").post(f"/records/{a.id}/reject",
+                                        json={"predefined_reason": "other", "comment": note})
+    assert resp.status_code == 422  # the endpoint's own check
+    _decide(fake, row, [_reject(a, reason="other", note=note)])
     _poll(db_session, fake)
     assert _refresh(db_session, a).status == "in_review"
-    assert _decisions_state(client, vol.col)["skipped"] == [
-        {"captua_record_id": a.id, "reason": "reason_not_supported_on_unit"}]
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "other_without_note"}]
+
+
+@pytest.mark.unit
+def test_the_decisions_path_uses_the_units_reason_list():
+    import app.core.fisqua_contract as fc
+    assert not hasattr(fc, "REJECTION_REASONS")
 
 
 @pytest.mark.unit

@@ -76,8 +76,12 @@ CONFIG_ERROR = (401, 403, 404)
 CONFIG_ERROR_REASONS = {401: "token", 403: "token", 404: "not_found"}
 REDIRECT_REASON = "redirect"
 
-STATES = ("received", "registered", "queued", "running", "review_pending",
-          "retakes_requested", "published", "refused", "superseded", "failed", "unknown")
+# Fisqua's states for a volume (§9.3, as amended). These are not Captua's
+# record statuses: Fisqua's `approved` is a whole volume through its capture
+# QC, and is not app.schemas.record's `approved` for one record.
+STATES = ("received", "registered", "preparing_review", "in_capture_qc", "retakes_requested",
+          "approved", "queued", "running", "review_pending", "published", "refused",
+          "superseded", "failed", "unknown")
 # A volume in one of these is not polled again for the same manifest.
 # `unknown` (Fisqua does not know the volume; usually the manifest was not
 # received) is not final: it is shown and polled again.
@@ -112,10 +116,7 @@ DECISION_REJECTED = "rejected"
 ROTATION_ROLES = ("single", "left", "right")
 QUARTER_TURNS = (1, 2, 3)
 
-# The rejection reasons of contract 1.2 (§8, §9.5). A local copy: Captua's
-# own list (app.schemas.record.PREDEFINED_REJECTION_REASONS, and the CHECK on
-# record_rejections.predefined_reason) still has only the first six until
-# backend/rejection-reasons adds framing, obstruction and other. Whichever of
-# that branch and this one lands second makes the two one list.
-REJECTION_REASONS = ("blur", "glare", "shadow", "focus", "exposure", "dirt", "framing", "obstruction", "other")
-REASON_NEEDS_NOTE = ("other",)
+# The rejection reasons are Captua's own list,
+# app.schemas.record.PREDEFINED_REJECTION_REASONS, the nine of §8; a
+# decision is checked with RecordRejectRequest, as POST /records/{id}/reject
+# checks a reviewer's (app.core.fisqua_decisions).

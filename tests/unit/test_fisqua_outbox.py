@@ -113,6 +113,29 @@ def _status(*entries):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
+def test_the_amended_volume_states_are_known_and_not_final():
+    """Contract 1.2 §9.3 as amended: Fisqua's volume states, not Captua's record statuses."""
+    from app.core import fisqua_contract as fc
+    assert fc.STATES == ("received", "registered", "preparing_review", "in_capture_qc", "retakes_requested",
+                         "approved", "queued", "running", "review_pending", "published", "refused",
+                         "superseded", "failed", "unknown")
+    assert fc.FINAL_STATES == ("published", "refused", "superseded")
+    for state in ("preparing_review", "in_capture_qc", "approved", "retakes_requested"):
+        assert state in fc.STATES and state not in fc.FINAL_STATES
+
+
+@pytest.mark.unit
+def test_a_volume_fisqua_reports_approved_is_polled_again(client, db_session, vol, fisqua):
+    from app.core.fisqua_outbox import volumes_to_poll
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _run(db_session, FakeTransport(sends=[_delivered()]))
+    mid = _rows(db_session, vol.col)[0].manifest_id
+    _poll(db_session, FakeTransport(statuses=[_status(_entry(vol.col.external_id, mid, state="approved"))]))
+    assert vol.col.external_id in volumes_to_poll(db_session)
+
+
+@pytest.mark.unit
 def test_the_test_token_has_the_shape_of_a_fisqua_token():
     import re
     assert re.fullmatch(r"[0-9a-f]{64}", TOKEN)

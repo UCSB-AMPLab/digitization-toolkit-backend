@@ -35,12 +35,10 @@ Per record, in one transaction, with the records' rows locked in id order
 Skipped and reported, with nothing changed for that record: a record not in
 the volume (or an id that is not one), a record that is `captured` (its
 volume taken back, or it was retaken), a decision that is neither approved
-nor rejected, a rejection whose reason is not one of the contract's, an
-`other` with no note, and a reason the unit cannot store yet
-(`reason_not_supported_on_unit`: record_rejections accepts only
-app.schemas.record.PREDEFINED_REJECTION_REASONS, which lacks framing,
-obstruction and other until backend/rejection-reasons lands). An unusable
-rotation is skipped on its own.
+nor rejected, and a rejection that POST /records/{id}/reject would refuse
+(checked with the same RecordRejectRequest): a reason not in
+app.schemas.record.PREDEFINED_REJECTION_REASONS, or `other` with no note.
+An unusable rotation is skipped on its own.
 
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
@@ -106,21 +104,28 @@ def current_manifest_id(db: Session, collection_id: int) -> Optional[str]:
 
 
 def _why_not(decision: dict) -> Optional[str]:
-    """Why a decision cannot be applied, from its content alone; None when it can."""
-    from app.schemas.record import PREDEFINED_REJECTION_REASONS
+    """Why a decision cannot be applied, from its content alone; None when it can.
+
+    A rejection is checked by RecordRejectRequest, the request
+    POST /records/{id}/reject validates a reviewer's rejection with: the
+    reason one of PREDEFINED_REJECTION_REASONS, and `other` with a comment.
+    """
+    from pydantic import ValidationError
+
+    from app.schemas.record import PREDEFINED_REJECTION_REASONS, RecordRejectRequest
 
     kind = decision.get(fc.F_DECISION)
     if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED):
         return "invalid_decision"
     if kind == fc.DECISION_REJECTED:
         reason = decision.get(fc.F_REASON)
-        if reason not in fc.REJECTION_REASONS:
+        if reason not in PREDEFINED_REJECTION_REASONS:
             return "invalid_reason"
         note = decision.get(fc.F_NOTE)
-        if reason in fc.REASON_NEEDS_NOTE and not (isinstance(note, str) and note.strip()):
-            return "other_without_note"
-        if reason not in PREDEFINED_REJECTION_REASONS:
-            return "reason_not_supported_on_unit"
+        try:
+            RecordRejectRequest(predefined_reason=reason, comment=note if isinstance(note, str) else None)
+        except ValidationError:
+            return "other_without_note" if reason == "other" else "invalid_reason"
     return None
 
 
