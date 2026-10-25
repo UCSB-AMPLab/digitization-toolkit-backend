@@ -151,6 +151,11 @@ class RecordImage(Base):
 	# this and the capture record's `files` entry are where its rotation is
 	# kept. NULL for an upload and for an image captured before it was recorded.
 	rotate_deg = Column(Integer, nullable=True)
+	# Fisqua's correction of the image's rotation (contract 1.2 §9.5), in
+	# quarter-turns clockwise, 1 to 3, on top of the displayed orientation.
+	# For display only: no file is changed, and Fisqua applies it in
+	# processing. NULL when Fisqua has made none (app.core.fisqua_decisions).
+	rotation_correction_quarter_turns = Column(Integer, nullable=True)
 	
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -180,6 +185,10 @@ class RecordImage(Base):
 		CheckConstraint(
 			"rotate_deg IS NULL OR rotate_deg IN (0, 90, 180, 270)",
 			name="check_record_image_rotate_deg",
+		),
+		CheckConstraint(
+			"rotation_correction_quarter_turns IS NULL OR rotation_correction_quarter_turns IN (1, 2, 3)",
+			name="check_record_image_rotation_correction",
 		),
 		CheckConstraint(
 			"(master_freed_at IS NULL AND master_freed_bytes IS NULL) OR "

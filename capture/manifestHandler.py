@@ -178,13 +178,16 @@ def generate_manifest_project(
         project_name: Name of the project
         default_camera_config: Optional default CameraConfig.to_dict()
     """
+    from app.core.version import system_version
+
     return ProjectInfo(
         project_name=project_name,
         created_by=created_by or socket.gethostname(),
         paths=paths or {},
         software={
             "tool": "digitization-toolkit",
-            "version": settings.app_version,
+            # The release and revision (app.core.version), as the Fisqua manifest's systemVersion.
+            "version": system_version(),
         },
         default_camera_config=default_camera_config
     )

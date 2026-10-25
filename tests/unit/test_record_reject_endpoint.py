@@ -211,3 +211,32 @@ def test_the_table_still_refuses_an_unknown_reason(db_session):
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+COMMENT_LIMIT_MESSAGE = "A rejection comment can be at most 2,000 characters long."
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("reason", ["blur", "other"])
+def test_a_comment_over_2000_characters_is_refused_not_cut(client, db_session, reason):
+    """Fisqua keeps only the first 2,000 characters of a note, so the unit refuses a longer one."""
+    from app.models.record import RecordRejection
+
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+    resp = api.post(f"/records/{rec.id}/reject", json={"predefined_reason": reason, "comment": "x" * 2001})
+    assert resp.status_code == 422, resp.text
+    [error] = resp.json()["detail"]
+    assert error["msg"] == f"Value error, {COMMENT_LIMIT_MESSAGE}"
+    db_session.expire_all()
+    assert db_session.query(RecordRejection).filter_by(record_id=rec.id).count() == 0
+
+
+@pytest.mark.unit
+def test_a_comment_of_2000_characters_is_kept_whole(client, db_session):
+    rec = _make_record(db_session)
+    api = _client_as(client, "rev", "reviewer")
+    resp = api.post(f"/records/{rec.id}/reject", json={"predefined_reason": "blur", "comment": "y" * 2000})
+    assert resp.status_code == 200, resp.text
+    [rej] = api.get(f"/records/{rec.id}/rejections").json()
+    assert rej["comment"] == "y" * 2000

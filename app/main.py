@@ -61,7 +61,13 @@ async def lifespan(app: FastAPI):
     from app.core.image_upload import image_upload_scheduler
 
     image_upload_scheduler.start()
+    # Poll Fisqua for the status of sent volumes, every ten minutes
+    # (app.core.fisqua_outbox). A no-op on a unit with Fisqua not configured.
+    from app.core.fisqua_outbox import fisqua_status_scheduler
+
+    fisqua_status_scheduler.start()
     yield
+    fisqua_status_scheduler.stop()
     image_upload_scheduler.stop()
     catalogue_backup_scheduler.stop()
     # The camera backends hold a PTP claim on each body for the life of the

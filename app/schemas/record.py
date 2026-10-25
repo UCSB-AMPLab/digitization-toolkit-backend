@@ -187,6 +187,9 @@ class RecordImageRead(RecordImageBase):
 	# Clockwise degrees that display the image upright, recorded at capture;
 	# None for an upload or an image captured before it was recorded.
 	rotate_deg: Optional[int] = None
+	# Fisqua's rotation correction, quarter-turns clockwise (1-3), for
+	# display; None when Fisqua has made none (contract 1.2 §9.5).
+	rotation_correction_quarter_turns: Optional[int] = None
 
 	class Config:
 		from_attributes = True
@@ -279,9 +282,23 @@ class BulkStatusUpdate(BaseModel):
 # Rejection schemas (NEH-208)
 # ==============================================================================
 
+# Fisqua keeps the first 2,000 characters of a rejection's note (contract
+# 1.2, its MAX_NOTE_CHARS), so a longer comment is refused here, where the
+# reviewer can shorten it, rather than cut there without anyone knowing.
+REJECTION_COMMENT_MAX_LENGTH = 2000
+REJECTION_COMMENT_TOO_LONG = "A rejection comment can be at most 2,000 characters long."
+
+
 class RecordRejectRequest(BaseModel):
 	predefined_reason: PredefinedRejectionReason
 	comment: Optional[str] = None
+
+	@field_validator("comment")
+	@classmethod
+	def _comment_fits_fisqua(cls, v: Optional[str]) -> Optional[str]:
+		if v is not None and len(v) > REJECTION_COMMENT_MAX_LENGTH:
+			raise ValueError(REJECTION_COMMENT_TOO_LONG)
+		return v
 
 	@model_validator(mode="after")
 	def _other_needs_a_comment(self) -> "RecordRejectRequest":

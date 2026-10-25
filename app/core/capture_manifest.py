@@ -20,12 +20,18 @@ whose files are still on disk.
   the export.
 * A current RAW image must have a preview: Fisqua's runner reads pages with
   Pillow and cannot decode a RAW, so one without a preview row or file
-  refuses the export.
+  refuses the export. An image is RAW when its file on disk or the name in
+  its capture key has one of app.core.paths.RAW_SUFFIXES, Fisqua's list.
 * Only current images are listed. A superseded image stays in the bucket and
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
   2026-10-17: the manifest carries every record's status).
+* `externalId` is the volume's recorded reference code (collections.external_id)
+  or, when none is recorded, its stem: contract 1.2 §8 makes a volume's
+  filenameStem its Fisqua reference code, unchanged, and the unit's
+  interface has no field for external_id (ruled). The download and the
+  manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
 
 The export is refused, with every problem named, when Fisqua's registration
 (fisqua-dev scripts/lib/capture-registration.ts) would refuse the file or
@@ -164,6 +170,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     from app.core.image_upload import ImageUploadMisconfigured, configured_tenant
     from app.core.integrity import build_fixity_index
     from app.core.storage_ops import resolve_project
+    from app.core.version import system_version
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record
 
@@ -280,20 +287,26 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         "id": str(new_id()),
         "generatedAt": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
         "generatedBy": {"system": "captua", "instance": tenant,
-                        "systemVersion": config.settings.app_version},
+                        "systemVersion": system_version()},
         # The unit does not record which digitisation list a volume came
         # from, so there is no list id to reply to.
         "inReplyTo": None,
         "project": {"captuaProjectId": project.id, "name": project.name},
         "transfer": {"channel": "upload", "root": f"{tenant}/"},
         "volumes": [{
-            "externalId": collection.external_id,
+            "externalId": reference_code(collection),
             "captuaCollectionId": collection.id,
             "stem": stem,
             "title": collection.name,
             "records": out_records,
         }],
     }
+
+
+def reference_code(collection) -> Optional[str]:
+    """The volume's Fisqua reference code: its recorded external_id, else its stem (module header)."""
+    recorded = (collection.external_id or "").strip()
+    return recorded or collection.filename_stem
 
 
 def _object_state(row) -> str:
@@ -345,7 +358,11 @@ def _image_entry(img, rec, rows, index, tenant, capture_prefix, preview_prefix, 
 
     preview_key = None
     preview_path = None
-    if is_raw_suffix(Path(img.file_path)):
+    # RAW when the file on disk is, or when the name its offsite key carries
+    # is: an adopted object is matched by SHA1, so its key can name a RAW
+    # while the file on disk does not, and Fisqua decides from the key's name.
+    raw_key = cap is not None and is_raw_suffix(Path(_key_name(cap.object_key)))
+    if is_raw_suffix(Path(img.file_path)) or raw_key:
         preview_path = preview_sidecar_of(_resolved(img.file_path))
         prow = rows.get((img.id, "preview"))
         pstate = _object_state(prow)

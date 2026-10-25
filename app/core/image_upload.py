@@ -100,9 +100,16 @@ REFUSED_ACTION = "image_upload_refused"
 RUN_ACTION = "image_upload_run"
 ADOPT_ACTION = "image_upload_adopted"
 
-# A tenant prefix is a single path segment of the stem alphabet: lowercase
-# letters and digits, joined by single hyphens ("sbmal", "ahr", "captua-test").
-TENANT_PATTERN = re.compile(r"^[a-z0-9]+(-[a-z0-9]+)*$")
+# A tenant prefix is Fisqua's tenant slug: 1 to 63 lowercase letters, digits
+# and single hyphens, starting with a letter and not ending with a hyphen
+# ("sbmal", "ahr", "captua-test"), and none of TENANT_RESERVED. The same rule
+# as valid_tenant in the superproject's scripts/provision-rclone.sh.
+TENANT_PATTERN = re.compile(r"^[a-z][a-z0-9]*(-[a-z0-9]+)*$")
+TENANT_RESERVED = frozenset({"platform", "www", "api", "admin", "app"})
+# The tenant is also the capture manifest's generatedBy.instance, which
+# Fisqua caps at 256 characters, and a host label in Fisqua's
+# <tenant>.fisqua.org, which DNS caps at 63.
+TENANT_MAX_LENGTH = 63
 
 # Under the projects root, so that a hard link to an image is on the image's
 # file system in the usual case. Removed after each object and swept at start.
@@ -128,8 +135,9 @@ class UploadFailed(BackupError):
 def configured_tenant() -> Optional[str]:
     """The tenant prefix, or None when image upload is disabled.
 
-    Raises ImageUploadMisconfigured for a value that is not one path segment
-    of the stem alphabet, so a mistyped prefix never becomes a key.
+    Raises ImageUploadMisconfigured for a value that is not Fisqua's tenant
+    slug (TENANT_PATTERN, at most TENANT_MAX_LENGTH, none of TENANT_RESERVED),
+    so a mistyped prefix never becomes a key.
     """
     value = config.settings.OFFSITE_TENANT.strip().strip("/")
     if not value:
@@ -137,7 +145,16 @@ def configured_tenant() -> Optional[str]:
     if not TENANT_PATTERN.match(value):
         raise ImageUploadMisconfigured(
             f"DTK_OFFSITE_TENANT={value!r} is not a tenant prefix "
-            "(lowercase letters and digits joined by single hyphens)"
+            "(lowercase letters, digits and single hyphens, starting with a letter)"
+        )
+    if value in TENANT_RESERVED:
+        raise ImageUploadMisconfigured(
+            f"DTK_OFFSITE_TENANT={value!r} is reserved by Fisqua and cannot be a tenant prefix"
+        )
+    if len(value) > TENANT_MAX_LENGTH:
+        raise ImageUploadMisconfigured(
+            f"DTK_OFFSITE_TENANT is {len(value)} characters long; a tenant prefix is at most "
+            f"{TENANT_MAX_LENGTH}"
         )
     return value
 
@@ -841,11 +858,14 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
               or result.refused or result.conflicts or result.error)
     if worked:
         level = "INFO" if result.status in ("done", "stopped", "held") and not result.refused else "WARN"
+        counts = (f"uploaded={result.uploaded} already_present={result.already_present} "
+                  f"unverified={result.unverified} refused={len(result.refused)} "
+                  f"conflicts={len(result.conflicts)} skipped={len(result.skipped)}")
         _log(db, action=RUN_ACTION, level=level, subject=result.status,
-             detail=(f"uploaded={result.uploaded} already_present={result.already_present} "
-                     f"unverified={result.unverified} refused={len(result.refused)} "
-                     f"conflicts={len(result.conflicts)} skipped={len(result.skipped)}"
-                     + (f" error: {result.error}" if result.error else "")))
+             detail=counts + (f" error: {result.error}" if result.error else ""))
+        # The same summary for the journal; the failure itself was logged where it happened.
+        logger.log(logging.INFO if level == "INFO" else logging.WARNING,
+                   "Image upload run %s: %s", result.status, counts)
     return result.as_dict()
 
 
@@ -1525,12 +1545,23 @@ class ImageUploadScheduler:
     is created and removed without a restart. stop() is checked between
     objects; an upload in progress when the process exits is finished by
     nobody, and the next run's listing decides what it left.
+
+    wake() starts a run now instead of at the end of the wait: a handover
+    calls it, so a volume handed over is uploaded, verified and sent to
+    Fisqua (the tick's send pass) without waiting out the interval. The loop
+    waits on one Event that wake() and stop() both set, and clears it before
+    each run, so a wake during a run queues one more run, however many wakes
+    come, and no second run ever starts beside the first. The hold, the
+    Fisqua call budget and its cooldowns apply to a woken run as to any.
     """
 
     def __init__(self) -> None:
         self._stop = threading.Event()
+        # Set by wake() and by stop(): ends the loop's wait early.
+        self._wake = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[dict] = None
+        self.last_fisqua_result: Optional[dict] = None
 
     def start(self) -> bool:
         sweep_staging()
@@ -1540,12 +1571,14 @@ class ImageUploadScheduler:
         if self._thread is not None and self._thread.is_alive():
             return True
         self._stop.clear()
+        self._wake.clear()
         self._thread = threading.Thread(target=self._loop, name="image-upload", daemon=True)
         self._thread.start()
         return True
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
+        self._wake.set()
         thread, self._thread = self._thread, None
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
@@ -1553,12 +1586,26 @@ class ImageUploadScheduler:
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
+    def wake(self) -> None:
+        """Start a run now rather than at the end of the wait; one more after a run in progress.
+
+        Does nothing when no schedule is running (offsite not configured).
+        """
+        if self.is_running():
+            self._wake.set()
+
+    def _wait(self, seconds: float) -> bool:
+        """Wait `seconds` or until woken; clear the wake. True when stopping."""
+        self._wake.wait(seconds)
+        self._wake.clear()
+        return self._stop.is_set()
+
     def _loop(self) -> None:
-        if self._stop.wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
+        if self._wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
             return
         while True:
             self.tick()
-            if self._stop.wait(config.settings.OFFSITE_BACKUP_INTERVAL_SECONDS):
+            if self._wait(config.settings.OFFSITE_BACKUP_INTERVAL_SECONDS):
                 return
 
     def tick(self) -> Optional[dict]:
@@ -1566,11 +1613,22 @@ class ImageUploadScheduler:
 
         db = SessionLocal()
         try:
-            self.last_result = run_image_upload(db, stop=self._stop)
+            try:
+                self.last_result = run_image_upload(db, stop=self._stop)
+            except Exception:
+                logger.exception("Scheduled image upload raised")
+                self.last_result = None
+            # After the upload, in this thread: a manifest waits for its
+            # volume's objects to be verified, which only this run does, so
+            # a volume received in this run is sent in this tick, and its
+            # manifest is never built while this run is changing what it
+            # reads (app.core.fisqua_outbox).
+            if not self._stop.is_set():
+                from app.core.fisqua_outbox import run_fisqua_outbox
+
+                db.rollback()
+                self.last_fisqua_result = run_fisqua_outbox(db, stop=self._stop)
             return self.last_result
-        except Exception:
-            logger.exception("Scheduled image upload raised")
-            return None
         finally:
             db.close()
 
