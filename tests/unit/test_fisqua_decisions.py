@@ -802,3 +802,71 @@ def test_a_note_over_2000_characters_is_skipped_not_cut(client, db_session, hand
     _poll(db_session, fake)
     assert _refresh(db_session, a).status == "in_review"
     assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "note_too_long"}]
+
+
+# ---------------------------------------------------------------------------
+# Images compared one by one, not by capture id alone
+# ---------------------------------------------------------------------------
+
+def _image(db, rec, role):
+    db.expire_all()
+    return next(i for i in _refresh(db, rec).images if i.is_current and i.role == role)
+
+
+@pytest.mark.unit
+def test_one_image_of_a_pair_removed_is_images_changed(client, db_session, handed):
+    """Both images of a dual capture share a capture id; removing one must still count as a change."""
+    from app.models.record import RecordImage
+    vol, (a, b), row, fake = handed
+    right = _image(db_session, a, "right")
+    db_session.query(RecordImage).filter(RecordImage.id == right.id).delete()
+    db_session.commit()
+    _decide(fake, row, [_approve(a), _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
+
+
+@pytest.mark.unit
+def test_one_image_of_a_pair_replaced_is_images_changed(client, db_session, handed):
+    from datetime import datetime, timezone
+
+    from app.models.record import RecordImage
+    vol, (a, b), row, fake = handed
+    right = _image(db_session, a, "right")
+    right.is_current = False
+    right.superseded_at = datetime.now(timezone.utc)
+    name = f"{vol.stem}-img_0099_c1.jpg"
+    path = vol.root / "captures" / name
+    path.write_bytes(b"another right page")
+    new = RecordImage(record_id=a.id, capture_id=right.capture_id, pair_id=right.pair_id, role="right",
+                      filename=name, file_path=str(path), format="jpg", is_current=True)
+    db_session.add(new)
+    db_session.commit()
+    vol.offsite(new, "capture", f"{TENANT}/{vol.stem}/captures/{name}", b"another right page")
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
+
+
+@pytest.mark.unit
+def test_a_pair_whose_roles_were_swapped_is_images_changed(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    left, right = _image(db_session, a, "left"), _image(db_session, a, "right")
+    left.role, right.role = "right", "left"
+    db_session.commit()
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "images_changed"}]
+
+
+@pytest.mark.unit
+def test_an_unchanged_pair_is_applied(db_session, handed):
+    vol, (a, b), row, fake = handed
+    assert {i.role for i in _refresh(db_session, a).images if i.is_current} == {"left", "right"}
+    _decide(fake, row, [_approve(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"

@@ -40,8 +40,9 @@ what that handover sends.
 Skipped and reported, with nothing changed for that record: a record not in
 the volume (or an id that is not one), a record that is `captured` (its
 volume taken back, or it was retaken), a record whose current images are not
-exactly those the decided manifest listed for it (`images_changed`: retaken
-since), a decision that is neither approved
+exactly those the decided manifest listed for it, compared image by image as
+capture id, role and object key (`images_changed`: retaken since, or an
+image of a pair removed, replaced or given the other role), a decision that is neither approved
 nor rejected, and a rejection that POST /records/{id}/reject would refuse
 (checked with the same RecordRejectRequest): a reason not in
 app.schemas.record.PREDEFINED_REJECTION_REASONS, `other` with no note, or a
@@ -129,7 +130,12 @@ def _newer_pending(db: Session, collection_id: int, row_id: int) -> bool:
 
 
 def _listed_captures(db: Session, row_id: int) -> dict:
-    """{record id: the capture ids the manifest listed for it}, from the manifest stored on the row."""
+    """{record id: the images the manifest listed for it}, from the manifest stored on the row.
+
+    Each image as (captureId, role, objectKey). Both images of a dual
+    capture share one captureId, so the capture id alone cannot tell a pair
+    from what is left of it; the role and the image's own object key can.
+    """
     from app.models.fisqua import FisquaOutbox
 
     manifest = db.query(FisquaOutbox.manifest).filter(FisquaOutbox.id == row_id).scalar() or {}
@@ -138,8 +144,32 @@ def _listed_captures(db: Session, row_id: int) -> dict:
         for record in volume.get("records") or []:
             rid = _record_id(record.get("captuaRecordId"))
             if rid is not None:
-                listed[rid] = {i.get("captureId") for i in record.get("images") or [] if isinstance(i, dict)}
+                listed[rid] = {(i.get("captureId"), i.get("role"), i.get("objectKey"))
+                               for i in record.get("images") or [] if isinstance(i, dict)}
     return listed
+
+
+def _current_images(db: Session, records) -> dict:
+    """{record id: its current images as (capture id, role, capture key without the tenant)}.
+
+    The key is the image's offsite capture object's, relative to the tenant
+    prefix as the manifest's objectKey is; an image with no offsite object
+    has None, which no manifest entry matches.
+    """
+    from app.models.offsite_object import OffsiteObject
+
+    images = [img for rec in records for img in rec.images if img.is_current]
+    keys = {}
+    ids = [img.id for img in images]
+    for start in range(0, len(ids), 500):
+        for image_id, key in (db.query(OffsiteObject.record_image_id, OffsiteObject.object_key)
+                              .filter(OffsiteObject.record_image_id.in_(ids[start:start + 500]),
+                                      OffsiteObject.kind == "capture")):
+            keys[image_id] = key.split("/", 1)[1] if "/" in key else key
+    out = {rec.id: set() for rec in records}
+    for img in images:
+        out[img.record_id].add((img.capture_id, img.role, keys.get(img.id)))
+    return out
 
 
 def _why_not(decision: dict) -> Optional[str]:
@@ -320,6 +350,7 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             logger.info("Fisqua decisions %s for volume %s wait: a newer handover came while the "
                         "records were being locked", decisions_id, collection_id)
             return {"status": "pending_handover", "decisions_id": decisions_id}
+        current_images = _current_images(db, records.values())
 
         for decision in decisions:
             raw = decision.get(fc.F_CAPTUA_RECORD_ID)
@@ -339,10 +370,11 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             if rec.status == "captured":
                 skip("captured")
                 continue
-            # The decision is about the images Fisqua was sent. A record
-            # retaken since has others, and the decision is not theirs.
-            current_captures = {img.capture_id for img in rec.images if img.is_current}
-            if rec.id not in listed or current_captures != listed[rec.id]:
+            # The decision is about the images Fisqua was sent, image by
+            # image. A record retaken since, or one that lost, gained or
+            # swapped an image of its pair, has others, and the decision is
+            # not theirs.
+            if rec.id not in listed or current_images[rec.id] != listed[rec.id]:
                 skip("images_changed")
                 continue
             # Every transition _apply_one takes is in STATUS_TRANSITIONS for a
