@@ -187,6 +187,9 @@ class RecordImageRead(RecordImageBase):
 	# Clockwise degrees that display the image upright, recorded at capture;
 	# None for an upload or an image captured before it was recorded.
 	rotate_deg: Optional[int] = None
+	# Fisqua's rotation correction, quarter-turns clockwise (1-3), for
+	# display; None when Fisqua has made none (contract 1.2 §9.5).
+	rotation_correction_quarter_turns: Optional[int] = None
 
 	class Config:
 		from_attributes = True

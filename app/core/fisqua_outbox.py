@@ -51,7 +51,10 @@ app.core.fisqua_contract. Here:
   (Fisqua does not know the volume; usually its manifest was not received)
   is kept and shown, and is not final. An answer naming the manifest id of
   a row whose send failed marks that row delivered, so a lost answer to a
-  POST is recovered.
+  POST is recovered. An entry whose `decisionsId` is neither the set last
+  applied nor one already seen stale has its QC decisions read and applied
+  (§9.5, app.core.fisqua_decisions), within the same tick, the same
+  transport rules and the same hold.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
@@ -233,8 +236,9 @@ class TransportResult:
     """What one call to Fisqua came to.
 
     `outcome` is `delivered` or `refused` for send_manifest, `status` for
-    get_status, and `error` for either when Fisqua could not be reached or
-    gave no usable answer (retried). `response` is Fisqua's answer as it
+    get_status, `decisions` for get_decisions, `config_error` for any of them
+    when Fisqua refuses the unit's configuration, and `error` when Fisqua
+    could not be reached or gave no usable answer (retried). `response` is Fisqua's answer as it
     returned it, when there is one.
     """
 
@@ -260,6 +264,8 @@ class FisquaTransport(Protocol):
 
     def get_status(self, refs: list) -> TransportResult: ...
 
+    def get_decisions(self, ref: str) -> TransportResult: ...
+
 
 class NullTransport:
     """Sends nothing, for a unit with Fisqua not configured. The worker leaves `ready` rows as they are."""
@@ -268,6 +274,9 @@ class NullTransport:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
     def get_status(self, refs: list) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def get_decisions(self, ref: str) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
@@ -694,7 +703,8 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
     if isinstance(transport, NullTransport):
         return {"status": "no_transport"}
     now = _naive(now) or _now()
-    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "recovered": 0}
+    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "recovered": 0,
+              "decisions_fetched": 0, "decisions_applied": 0, "decisions_stale": 0}
     with _step_lock:
         try:
             if config_error() is not None:
@@ -703,6 +713,8 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             db.rollback()
             refs = sorted(wanted)
             result["asked"] = len(refs)
+            # {collection id: (ref, decisionsId)} for each entry offering a set.
+            offered = {}
             for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
                 chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
                 result["calls"] += 1
@@ -732,6 +744,9 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                                  _parse_time(entry.get(fc.F_ENTERED_AT)),
                                  problems if problems else None, now)
                     result["answered"] += 1
+                    decisions_id = entry.get(fc.F_DECISIONS_ID)
+                    if isinstance(decisions_id, str) and decisions_id:
+                        offered[cid] = (ref, decisions_id)
                     if manifest_id is not None:
                         lost = (db.query(FisquaOutbox.id)
                                 .filter(FisquaOutbox.collection_id == cid,
@@ -745,11 +760,55 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                                 response=entry, last_error=None, next_attempt_at=None,
                                 external_id=str(volume_id) if volume_id not in (None, "") else None):
                             result["recovered"] += 1
+            if _fetch_decisions(db, transport, offered, now, result) is False:
+                return {**result, "status": "config_error"}
         except Exception:
             db.rollback()
             logger.exception("The Fisqua status poll raised")
             result["status"] = "error"
     return result
+
+
+def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, result: dict) -> bool:
+    """Read and apply each offered decisions set not applied or seen stale already (§9.5).
+
+    At most the contract's calls a minute, less the status calls this tick
+    made; the rest are read at the next tick. False when Fisqua refused the
+    unit's configuration, and the poll is to stop.
+    """
+    from app.core.fisqua_decisions import apply_decisions
+    from app.models.fisqua import FisquaStatus
+
+    budget = max(0, fc.CALLS_PER_MINUTE - result["calls"])
+    for cid, (ref, decisions_id) in sorted(offered.items()):
+        status = db.get(FisquaStatus, cid)
+        seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
+        db.rollback()
+        if decisions_id in seen:
+            continue
+        if budget <= 0:
+            break
+        budget -= 1
+        result["decisions_fetched"] += 1
+        try:
+            answer = transport.get_decisions(ref)
+        except Exception as exc:
+            answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+        answer = _redacted(answer)
+        if answer.outcome == "config_error":
+            record_config_error(answer.status_code, answer.reason, now)
+            return False
+        if answer.outcome != "decisions":
+            logger.warning("Reading Fisqua's decisions for volume %s failed: %s",
+                           cid, scrub(answer.error or answer.outcome))
+            result["status"] = "error"
+            continue
+        applied = apply_decisions(db, cid, answer.response, now)
+        if applied["status"] == "applied":
+            result["decisions_applied"] += 1
+        elif applied["status"] == "stale":
+            result["decisions_stale"] += 1
+    return True
 
 
 class FisquaStatusScheduler:
@@ -837,6 +896,8 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
         return None
     rows = (db.query(FisquaOutbox).filter(FisquaOutbox.collection_id == collection_id)
             .order_by(FisquaOutbox.id.desc()).limit(OUTBOX_LISTED).all())
+    from app.core.fisqua_decisions import decisions_state
+
     status = db.get(FisquaStatus, collection_id)
     return {
         "environment": fisqua_environment(),
@@ -848,6 +909,8 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
             "status_checked_at": status.status_checked_at, "problems": status.problems,
             "manifest_id": status.manifest_id,
         },
+        # Fisqua's QC decisions, as last applied (app.core.fisqua_decisions), or None.
+        "decisions": decisions_state(status),
     }
 
 

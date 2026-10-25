@@ -99,3 +99,14 @@ class FisquaStatus(Base):
     # When the unit last had an answer.
     status_checked_at = Column(DateTime, nullable=False)
     problems = Column(JSON, nullable=True)
+    # QC decisions (contract 1.2 §9.5, app.core.fisqua_decisions): the last
+    # set applied, when Fisqua decided it and the unit applied it, for which
+    # manifest, and what applying it did (counts, and each record or
+    # rotation skipped with why). `decisions_stale_id` is the last set seen
+    # for another manifest, kept so it is not fetched again.
+    decisions_id = Column(String(255), nullable=True)
+    decisions_decided_at = Column(DateTime, nullable=True)
+    decisions_applied_at = Column(DateTime, nullable=True)
+    decisions_manifest_id = Column(String(36), nullable=True)
+    decisions_report = Column(JSON, nullable=True)
+    decisions_stale_id = Column(String(255), nullable=True)

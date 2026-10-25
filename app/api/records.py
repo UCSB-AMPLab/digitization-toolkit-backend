@@ -1277,6 +1277,33 @@ def bulk_update_status(
 # Rejection endpoints (NEH-208)
 # ==============================================================================
 
+def reject_locked_record(db: Session, rec: Record, reason: str, comment: Optional[str], actor: Optional[str]) -> RecordRejection:
+	"""Reject an in_review record: a RecordRejection, its id on every current image, and the status change.
+
+	The one place a rejection is written, for POST /{rec_id}/reject and for
+	Fisqua's decisions (app.core.fisqua_decisions). The caller holds the
+	record row lock with its images loaded, has checked that the record is
+	in_review and the reason is one of PREDEFINED_REJECTION_REASONS, and
+	commits.
+	"""
+	current_images = [img for img in rec.images if img.is_current]
+
+	rejection = RecordRejection(
+		record_id=rec.id,
+		predefined_reason=reason,
+		comment=comment,
+		rejected_by=actor,
+	)
+	db.add(rejection)
+	db.flush()  # assign rejection.id before linking images
+
+	for img in current_images:
+		img.rejection_id = rejection.id
+
+	change_record_status(db, rec, "rejected", actor)
+	return rejection
+
+
 @router.post("/{rec_id}/reject", response_model=RecordRead)
 def reject_record(
 	rec_id: int,
@@ -1306,21 +1333,7 @@ def reject_record(
 			detail=f"Cannot reject a record with status '{rec.status}'. Only 'in_review' records can be rejected."
 		)
 
-	current_images = [img for img in rec.images if img.is_current]
-
-	rejection = RecordRejection(
-		record_id=rec.id,
-		predefined_reason=payload.predefined_reason,
-		comment=payload.comment,
-		rejected_by=current_user.username,
-	)
-	db.add(rejection)
-	db.flush()  # assign rejection.id before linking images
-
-	for img in current_images:
-		img.rejection_id = rejection.id
-
-	change_record_status(db, rec, "rejected", current_user.username)
+	reject_locked_record(db, rec, payload.predefined_reason, payload.comment, current_user.username)
 
 	db.commit()
 	db.refresh(rec)

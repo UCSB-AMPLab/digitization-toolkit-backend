@@ -107,17 +107,6 @@ def test_the_migration_chains_onto_the_single_previous_head(backend_root):
 
 
 @pytest.mark.unit
-def test_alembic_has_a_single_head(backend_root):
-    """The newest revision pins the head (moved here from test_rejection_reasons_migration.py)."""
-    from alembic.config import Config
-    from alembic.script import ScriptDirectory
-
-    cfg = Config(str(backend_root / "alembic.ini"))
-    cfg.set_main_option("script_location", str(backend_root / "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == [REVISION]
-
-
-@pytest.mark.unit
 def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, tmp_path):
     engine = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
 
@@ -147,10 +136,14 @@ def test_the_model_matches_the_migration(backend_root, tmp_path):
         _neighbours(b)
         _run(b, _load(backend_root).upgrade)
 
+        # Columns a later revision adds (a5f0306a8f8c, the QC decisions) are
+        # left out; that revision's own test compares them.
         def shape(engine, table):
             insp = sa.inspect(engine)
+            created = STATUS_COLUMNS if table == "fisqua_status" else OUTBOX_COLUMNS
             return (
-                sorted((c["name"], str(c["type"]), c["nullable"]) for c in insp.get_columns(table)),
+                sorted((c["name"], str(c["type"]), c["nullable"]) for c in insp.get_columns(table)
+                       if c["name"] in created),
                 sorted(u["name"] for u in insp.get_unique_constraints(table)),
                 sorted(c["name"] for c in insp.get_check_constraints(table)),
                 sorted(i["name"] for i in insp.get_indexes(table)),

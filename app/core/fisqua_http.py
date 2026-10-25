@@ -19,7 +19,8 @@ Answers to POST of a manifest (the codes are in fisqua_contract):
     timeout, connection error    error, retried
 
 Answers to GET of the status: 2xx with the volumes, the same configuration
-errors, the rest error.
+errors, the rest error. Answers to GET of a volume's QC decisions (§9.5):
+2xx with an object, the same configuration errors, the rest error.
 """
 
 from datetime import datetime, timezone
@@ -154,6 +155,20 @@ def read_status_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def read_decisions_answer(response: httpx.Response) -> TransportResult:
+    code = response.status_code
+    body = _json(response)
+    if 200 <= code < 300:
+        if not isinstance(body, dict):
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=f"Fisqua answered HTTP {code} without a decisions object")
+        return TransportResult(outcome="decisions", response=body, status_code=code)
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
+    return _transient(response, body)
+
+
 def _failed(exc: Exception) -> TransportResult:
     kind = "timeout" if isinstance(exc, httpx.TimeoutException) else type(exc).__name__
     return TransportResult(outcome="error", error=f"Fisqua could not be reached: {kind}: {exc}")
@@ -191,6 +206,16 @@ class HttpFisquaTransport:
         except httpx.HTTPError as exc:
             return _failed(exc)
         return read_status_answer(response)
+
+    def get_decisions(self, ref: str) -> TransportResult:
+        from urllib.parse import quote
+
+        path = fc.DECISIONS_PATH.format(ref=quote(ref, safe=""))
+        try:
+            response = self._client.get(self._base + path, headers=self._headers())
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_decisions_answer(response)
 
     def close(self) -> None:
         self._client.close()
