@@ -136,7 +136,7 @@ def dump_recipient():
     value = config.settings.OFFSITE_DUMP_RECIPIENT.strip()
     if not value:
         raise RecipientMisconfigured(
-            "DTK_OFFSITE_DUMP_RECIPIENT is not set; no catalogue dump is "
+            "CAPTUA_OFFSITE_DUMP_RECIPIENT is not set; no catalogue dump is "
             "uploaded unencrypted"
         )
     try:
@@ -147,7 +147,7 @@ def dump_recipient():
         return pyrage.x25519.Recipient.from_str(value)
     except pyrage.RecipientError as exc:
         raise RecipientMisconfigured(
-            f"DTK_OFFSITE_DUMP_RECIPIENT is not an age X25519 public key (age1...): {exc}"
+            f"CAPTUA_OFFSITE_DUMP_RECIPIENT is not an age X25519 public key (age1...): {exc}"
         ) from exc
 
 
@@ -258,7 +258,7 @@ def remote_dir() -> str:
     """
     tenant = _tenant()
     if tenant is None:
-        raise BackupError("no tenant prefix is configured (DTK_OFFSITE_TENANT)")
+        raise BackupError("no tenant prefix is configured (CAPTUA_OFFSITE_TENANT)")
     prefix = config.settings.OFFSITE_DB_PREFIX.strip("/")
     remote = config.settings.OFFSITE_REMOTE.rstrip("/")
     return f"{remote}/{tenant}/{prefix}" if prefix else f"{remote}/{tenant}"

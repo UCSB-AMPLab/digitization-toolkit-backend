@@ -477,7 +477,7 @@ def test_refused_with_no_tenant(client, vol, monkeypatch):
     monkeypatch.setattr(config.settings, "OFFSITE_TENANT", "  ")
     problems = _refusal(_export(client, vol.col))
     assert "tenant_missing" in problems
-    assert "DTK_OFFSITE_TENANT" in problems["tenant_missing"]["message"]
+    assert "CAPTUA_OFFSITE_TENANT" in problems["tenant_missing"]["message"]
 
 
 @pytest.mark.unit

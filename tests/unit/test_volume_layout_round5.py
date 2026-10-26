@@ -87,7 +87,7 @@ def test_an_image_already_under_uploads_in_a_stemmed_volume_is_served_scanned_ga
     from app.core.volume_layout import migrate_volume_layout
     from app.models.record import Record, RecordImage
 
-    monkeypatch.setattr(records.settings, "DTK_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(records.settings, "DATA_DIR", str(data_dir))
     up = data_dir / "uploads"
     up.mkdir()
     f = up / "0123abcd.jpg"

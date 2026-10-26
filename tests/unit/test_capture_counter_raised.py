@@ -94,7 +94,7 @@ def upload_dir(monkeypatch, tmp_path):
     different instance by the time a test runs.
     """
     import app.api.records as records_api
-    monkeypatch.setattr(records_api.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(records_api.settings, "DATA_DIR", str(tmp_path / "data"))
     return tmp_path / "data"
 
 

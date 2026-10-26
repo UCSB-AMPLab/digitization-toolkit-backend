@@ -353,7 +353,7 @@ def test_restore_without_a_read_remote_is_refused(remote, db_session, override_p
 
     refused = _refusal(lambda: _restore(db_session, vol))
 
-    assert refused.status_code == 409 and "DTK_OFFSITE_READ_REMOTE" in refused.message
+    assert refused.status_code == 409 and "CAPTUA_OFFSITE_READ_REMOTE" in refused.message
 
 
 @pytest.mark.unit

@@ -7,7 +7,7 @@ copy, drop the checksums from a listing, or refuse listings once a copy has
 succeeded. No bucket and no key is used; rclone is given an empty config file
 so that it reads no configuration of this machine's.
 
-Skipped when no rclone binary is found (DTK_TEST_RCLONE, else PATH), except
+Skipped when no rclone binary is found (CAPTUA_TEST_RCLONE, else PATH), except
 under CI (the CI environment variable set), where a missing rclone fails the
 test: .github/workflows/ci.yml installs a pinned one for these tests.
 
@@ -25,7 +25,7 @@ from pathlib import Path
 
 import pytest
 
-REAL_RCLONE = os.environ.get("DTK_TEST_RCLONE") or shutil.which("rclone")
+REAL_RCLONE = os.environ.get("CAPTUA_TEST_RCLONE") or shutil.which("rclone")
 
 STEM = "xx-test-001"
 TENANT = "captua-test"
@@ -97,7 +97,7 @@ class Remote:
 def remote(db_session, tmp_path, monkeypatch):
     """A local directory remote behind the wrapper, with OFFSITE_* pointing at it."""
     if not REAL_RCLONE or not os.access(REAL_RCLONE, os.X_OK):
-        message = "no rclone binary (set DTK_TEST_RCLONE or put rclone on PATH)"
+        message = "no rclone binary (set CAPTUA_TEST_RCLONE or put rclone on PATH)"
         if os.environ.get("CI"):
             pytest.fail(message)
         pytest.skip(message)
@@ -123,7 +123,7 @@ def remote(db_session, tmp_path, monkeypatch):
     monkeypatch.setattr(s, "OFFSITE_BWLIMIT", "0")
     monkeypatch.setattr(s, "RCLONE_BIN", str(wrapper))
     monkeypatch.setattr(s, "RCLONE_CONFIG", str(empty_config))
-    monkeypatch.setattr(s, "DTK_DATA_DIR", str(data))
+    monkeypatch.setattr(s, "DATA_DIR", str(data))
     return Remote(root, ctl)
 
 

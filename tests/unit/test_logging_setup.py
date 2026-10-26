@@ -80,7 +80,7 @@ def test_unknown_level_falls_back_to_info_and_says_so(restore_loggers, capsys):
     logging.getLogger("app.core.schema").info("still here")
 
     err = capsys.readouterr().err
-    assert "DTK_LOG_LEVEL" in err and "CHATTY" in err
+    assert "CAPTUA_LOG_LEVEL" in err and "CHATTY" in err
     assert "INFO app.core.schema: still here" in err
 
 

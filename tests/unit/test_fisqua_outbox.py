@@ -34,7 +34,7 @@ def fisqua(monkeypatch, tenant, tmp_path):
     monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(TOKEN))
     monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "b2unit:bucket")
     # The unit-level auth error is a file in the data directory.
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "data"))
     # The call budget is process-wide; each test starts with a full one.
     from app.core import fisqua_outbox
     monkeypatch.setattr(fisqua_outbox, "call_budget", fisqua_outbox.CallBudget())
@@ -757,7 +757,7 @@ def test_the_base_url_override_must_be_https_or_loopback_http(fisqua, monkeypatc
         got = base_url()
     if expected is None:
         assert got == f"https://{TENANT}.staging.fisqua.org"
-        assert "DTK_FISQUA_BASE_URL" in caplog.text
+        assert "CAPTUA_FISQUA_BASE_URL" in caplog.text
     else:
         assert got == expected
 

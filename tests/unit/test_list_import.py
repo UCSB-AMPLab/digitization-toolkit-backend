@@ -24,7 +24,7 @@ def reports_root(tmp_path, monkeypatch):
     from app.core import config
 
     root = tmp_path / "data"
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(root))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(root))
     return root / "imports"
 
 
@@ -1332,7 +1332,7 @@ def test_two_processes_racing_the_first_hash_create_once(tmp_path, mode):
     import sys
 
     worker = str(Path(__file__).resolve().parent / "list_import_race_worker.py")
-    env = {**os.environ, "DTK_DATA_DIR": str(tmp_path)}
+    env = {**os.environ, "CAPTUA_DATA_DIR": str(tmp_path)}
     procs = [subprocess.Popen([sys.executable, worker, mode, str(tmp_path / f"{t}.db"), t * 64],
                               env=env, cwd=os.getcwd(), stdout=subprocess.PIPE,
                               stderr=subprocess.STDOUT, text=True)

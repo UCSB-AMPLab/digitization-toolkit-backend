@@ -144,16 +144,16 @@ def configured_tenant() -> Optional[str]:
         return None
     if not TENANT_PATTERN.match(value):
         raise ImageUploadMisconfigured(
-            f"DTK_OFFSITE_TENANT={value!r} is not a tenant prefix "
+            f"CAPTUA_OFFSITE_TENANT={value!r} is not a tenant prefix "
             "(lowercase letters, digits and single hyphens, starting with a letter)"
         )
     if value in TENANT_RESERVED:
         raise ImageUploadMisconfigured(
-            f"DTK_OFFSITE_TENANT={value!r} is reserved by Fisqua and cannot be a tenant prefix"
+            f"CAPTUA_OFFSITE_TENANT={value!r} is reserved by Fisqua and cannot be a tenant prefix"
         )
     if len(value) > TENANT_MAX_LENGTH:
         raise ImageUploadMisconfigured(
-            f"DTK_OFFSITE_TENANT is {len(value)} characters long; a tenant prefix is at most "
+            f"CAPTUA_OFFSITE_TENANT is {len(value)} characters long; a tenant prefix is at most "
             f"{TENANT_MAX_LENGTH}"
         )
     return value
@@ -895,7 +895,7 @@ def adopt_objects(db: Session, prefix: str, *, apply: bool = False) -> dict:
     if not prefix:
         raise ValueError("a prefix is required")
     if not config.settings.OFFSITE_REMOTE.strip():
-        raise ValueError("DTK_OFFSITE_REMOTE is not configured")
+        raise ValueError("CAPTUA_OFFSITE_REMOTE is not configured")
 
     listed = lsjson_rows(remote_path(prefix) + "/", recursive=True)
     by_sha1: dict = {}
@@ -1001,7 +1001,7 @@ _LAYOUT_DIR = {"capture": CAPTURES_DIR, "preview": PREVIEWS_DIR}
 
 
 def _remote_bucket() -> str:
-    """The bucket DTK_OFFSITE_REMOTE addresses, which must be the whole of its path.
+    """The bucket CAPTUA_OFFSITE_REMOTE addresses, which must be the whole of its path.
 
     A remote of the form `<name>:<bucket>`: keys recorded relative to it are
     then the bucket's own keys, which is what a rename map gives. A remote
@@ -1011,12 +1011,12 @@ def _remote_bucket() -> str:
     """
     remote = config.settings.OFFSITE_REMOTE.strip()
     if not remote:
-        raise ValueError("DTK_OFFSITE_REMOTE is not configured")
+        raise ValueError("CAPTUA_OFFSITE_REMOTE is not configured")
     name, colon, path = remote.rpartition(":")
     bucket = path.strip("/")
     if not colon or not name or not bucket or "/" in bucket:
         raise ValueError(
-            f"DTK_OFFSITE_REMOTE={remote!r} does not name a bucket as <remote>:<bucket>, "
+            f"CAPTUA_OFFSITE_REMOTE={remote!r} does not name a bucket as <remote>:<bucket>, "
             "so the map's bucket keys cannot be checked against it"
         )
     return bucket
@@ -1077,7 +1077,7 @@ def _read_rename_map_header(db: Session, rename_map) -> tuple:
     bucket = _remote_bucket()
     if destination.get("bucket") != bucket:
         raise ValueError(
-            f"the map's destination bucket is {destination.get('bucket')!r}, but DTK_OFFSITE_REMOTE "
+            f"the map's destination bucket is {destination.get('bucket')!r}, but CAPTUA_OFFSITE_REMOTE "
             f"addresses the bucket {bucket!r}; nothing is listed or recorded"
         )
     raw_root = destination.get("root")
@@ -1090,7 +1090,7 @@ def _read_rename_map_header(db: Session, rename_map) -> tuple:
     except ImageUploadMisconfigured as exc:
         raise ValueError(str(exc)) from exc
     if tenant is None:
-        raise ValueError("DTK_OFFSITE_TENANT is not configured, so nothing can be listed")
+        raise ValueError("CAPTUA_OFFSITE_TENANT is not configured, so nothing can be listed")
     map_tenant = root.split("/", 1)[0]
     if map_tenant != tenant:
         # The appliance key lists only under its tenant's prefix, and so do
@@ -1112,7 +1112,7 @@ def adopt_rename_map(db: Session, rename_map: dict, *, apply: bool = False) -> d
 
     The map is refused whole (ValueError, nothing listed or written) when its
     header is not contract 1.1's rename map, when its volume is not one on
-    this unit with that id and stem, when DTK_OFFSITE_REMOTE does not address
+    this unit with that id and stem, when CAPTUA_OFFSITE_REMOTE does not address
     exactly the map's destination bucket, or when the destination root is
     not under this unit's tenant.
 
@@ -1365,13 +1365,13 @@ def stranded_offsite_message(db: Session, record_id: int) -> str:
     volume. A key under any other prefix (an adopted key, or one under an
     earlier tenant) or without a stem segment names no volume, and nor can
     any key be matched while no valid tenant is configured; the detail then
-    says so, in the second case naming DTK_OFFSITE_TENANT.
+    says so, in the second case naming CAPTUA_OFFSITE_TENANT.
     """
     tenant = configured_tenant_or_none()
     if tenant is None:
-        return ("This record's files are stored offsite, and no valid DTK_OFFSITE_TENANT is set, "
+        return ("This record's files are stored offsite, and no valid CAPTUA_OFFSITE_TENANT is set, "
                 "so their keys cannot be matched to any volume of this unit. It can be put into a "
-                "volume only once DTK_OFFSITE_TENANT is set, and then only into the volume its keys are under.")
+                "volume only once CAPTUA_OFFSITE_TENANT is set, and then only into the volume its keys are under.")
     stems = [_key_stem(k, tenant) for k in _offsite_keys(db, record_id)]
     if not stems or None in stems:
         return ("This record's files are stored offsite under keys that name no volume of this unit, "
@@ -1650,7 +1650,7 @@ def main(argv: Optional[list] = None) -> int:
         "adopt",
         help="record objects already under a prefix as the keys of matching local images",
     )
-    adopt.add_argument("prefix", help="remote prefix, relative to DTK_OFFSITE_REMOTE")
+    adopt.add_argument("prefix", help="remote prefix, relative to CAPTUA_OFFSITE_REMOTE")
     adopt.add_argument("--apply", action="store_true",
                        help="write the rows; without it, only report what would be recorded")
     adopt_map = sub.add_parser(

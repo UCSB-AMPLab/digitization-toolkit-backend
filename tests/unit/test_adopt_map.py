@@ -2,7 +2,7 @@
 
 The bucket is a real rclone remote, as in tests/unit/test_image_upload.py:
 the same wrapper in front of the real binary, here behind an alias remote so
-that DTK_OFFSITE_REMOTE names a bucket (`tb2:<bucket>`) as it does on a unit.
+that CAPTUA_OFFSITE_REMOTE names a bucket (`tb2:<bucket>`) as it does on a unit.
 The maps are synthetic.
 
     python -m pytest tests/unit/test_adopt_map.py
@@ -26,7 +26,7 @@ def _sha1(data: bytes) -> str:
 
 @pytest.fixture
 def masters(remote, tmp_path, monkeypatch):
-    """DTK_OFFSITE_REMOTE as `tb2:<BUCKET>`, an alias remote over a local directory."""
+    """CAPTUA_OFFSITE_REMOTE as `tb2:<BUCKET>`, an alias remote over a local directory."""
     from app.core import config
 
     buckets = tmp_path / "buckets"
@@ -266,7 +266,7 @@ def test_a_remote_that_names_no_bucket_or_a_path_inside_one_refuses_the_map(
 
     vol, img, entries = _raw_volume(db_session, override_projects_root, masters)
     monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", remote_value)
-    with pytest.raises(ValueError, match="DTK_OFFSITE_REMOTE"):
+    with pytest.raises(ValueError, match="CAPTUA_OFFSITE_REMOTE"):
         _adopt(db_session, _map(vol, entries), apply=True)
     assert _rows(db_session) == {}
 

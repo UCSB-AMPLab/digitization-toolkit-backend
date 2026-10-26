@@ -5,8 +5,9 @@ Alembic head silently uses a stale schema until some endpoint 500s in the field,
 with no operator around to diagnose it. This asserts at startup that the database
 is stamped at head, turning a late, obscure 500 into a clear, immediate failure.
 
-Set DTK_SKIP_SCHEMA_CHECK=1 to bypass (e.g. tooling that manages the schema out
-of band). If Alembic or the config cannot be loaded the check is skipped with a
+Set CAPTUA_SKIP_SCHEMA_CHECK=1 to bypass (e.g. tooling that manages the schema out
+of band); DTK_SKIP_SCHEMA_CHECK, the other name every setting has, is read
+when CAPTUA_SKIP_SCHEMA_CHECK is unset. If Alembic or the config cannot be loaded the check is skipped with a
 warning; only a genuine revision mismatch aborts startup.
 """
 
@@ -25,14 +26,16 @@ class SchemaOutOfDateError(RuntimeError):
 
 
 def _skip_requested() -> bool:
-    val = os.environ.get("DTK_SKIP_SCHEMA_CHECK", "")
+    val = os.environ.get("CAPTUA_SKIP_SCHEMA_CHECK")
+    if val is None:
+        val = os.environ.get("DTK_SKIP_SCHEMA_CHECK", "")
     return val.strip().lower() not in ("", "0", "false", "no")
 
 
 def assert_schema_at_head() -> None:
     """Abort startup unless the database is migrated to the Alembic head revision."""
     if _skip_requested():
-        logger.warning("[INFO] Schema head check skipped (DTK_SKIP_SCHEMA_CHECK set)")
+        logger.warning("[INFO] Schema head check skipped (CAPTUA_SKIP_SCHEMA_CHECK set)")
         return
 
     try:

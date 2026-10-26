@@ -123,7 +123,7 @@ LISTING_MESSAGE = (
 )
 NO_READ_REMOTE_MESSAGE = (
     "Restore is not set up on this unit: it needs read access to the offsite bucket "
-    "(DTK_OFFSITE_READ_REMOTE), and none is configured."
+    "(CAPTUA_OFFSITE_READ_REMOTE), and none is configured."
 )
 NOT_IN_OWN_FOLDER_MESSAGE = (
     "Some of this volume's files have not yet been moved into the volume's own folder, "

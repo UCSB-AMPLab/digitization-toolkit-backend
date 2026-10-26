@@ -152,7 +152,7 @@ def offsite(tmp_path, monkeypatch, db_session):
     """
     from app.core.config import settings
 
-    dump_tmp = tmp_path / "dtk" / "tmp"
+    dump_tmp = tmp_path / "captua" / "tmp"
     dump_tmp.mkdir(parents=True)
 
     pg_dump = _install(tmp_path, "pg-dump-stub", _PG_DUMP_STUB)
@@ -471,7 +471,7 @@ def test_the_default_dump_goes_through_the_database_container(monkeypatch):
     import app.core.catalogue_backup as cb
 
     monkeypatch.setattr(settings, "PG_DUMP_COMMAND", "", raising=False)
-    monkeypatch.setattr(settings, "DATABASE_USER", "dtkuser")
+    monkeypatch.setattr(settings, "DATABASE_USER", "captuauser")
 
     argv = cb.dump_argv()
 
@@ -479,7 +479,7 @@ def test_the_default_dump_goes_through_the_database_container(monkeypatch):
     assert "exec" in argv and "-T" in argv
     assert argv[argv.index("-T") + 1] == "db"
     assert "pg_dumpall" in argv
-    assert argv[argv.index("-U") + 1] == "dtkuser"
+    assert argv[argv.index("-U") + 1] == "captuauser"
 
 
 @pytest.mark.unit
@@ -507,11 +507,11 @@ def test_an_explicit_dump_command_overrides_the_default(monkeypatch):
     import app.core.catalogue_backup as cb
 
     monkeypatch.setattr(
-        settings, "PG_DUMP_COMMAND", "/opt/dtk/bin/dump-catalogue --stdout",
+        settings, "PG_DUMP_COMMAND", "/opt/captua/bin/dump-catalogue --stdout",
         raising=False,
     )
 
-    assert cb.dump_argv() == ["/opt/dtk/bin/dump-catalogue", "--stdout"]
+    assert cb.dump_argv() == ["/opt/captua/bin/dump-catalogue", "--stdout"]
 
 
 # ---------------------------------------------------------------------------
@@ -727,12 +727,12 @@ def test_no_dump_is_uploaded_without_a_valid_recipient(offsite, db_session, monk
         result = cb.run_catalogue_backup(db_session)
 
     assert result["status"] == "misconfigured", result
-    assert "DTK_OFFSITE_DUMP_RECIPIENT" in result["error"]
+    assert "CAPTUA_OFFSITE_DUMP_RECIPIENT" in result["error"]
     assert offsite.upload_calls() == []
     assert offsite.leftovers() == [], "no dump is written either"
-    assert "DTK_OFFSITE_DUMP_RECIPIENT" in caplog.text
+    assert "CAPTUA_OFFSITE_DUMP_RECIPIENT" in caplog.text
     logged = db_session.query(SystemLog).filter(SystemLog.action == cb.FAILED_ACTION).all()
-    assert logged and "DTK_OFFSITE_DUMP_RECIPIENT" in logged[-1].detail
+    assert logged and "CAPTUA_OFFSITE_DUMP_RECIPIENT" in logged[-1].detail
 
 
 @pytest.mark.unit
@@ -1430,7 +1430,7 @@ def test_the_dump_directory_is_created_owner_only(db_session, tmp_path, monkeypa
     from app.core import config
     import app.core.catalogue_backup as cb
 
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "data"))
     old_umask = os.umask(0o022)
     try:
         created = cb._dump_dir()

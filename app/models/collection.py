@@ -87,7 +87,7 @@ def offsite_keys_under_stem(session, stem, collection=None) -> bool:
 
     A key holds the stem when its second path segment is the stem and
     something follows it: `<tenant>/<stem>/<rest>`. The tenant is not
-    compared with DTK_OFFSITE_TENANT, because keys under an earlier tenant,
+    compared with CAPTUA_OFFSITE_TENANT, because keys under an earlier tenant,
     or kept while upload is disabled, name objects issued under the stem
     all the same. With `collection` given, a key whose image belongs to a
     record in that volume is not counted. A key whose image was deleted

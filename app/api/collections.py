@@ -335,7 +335,7 @@ def restore_collection(
     """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
 
     Refused with 409 when the volume has no stem, when no read remote is
-    configured (DTK_OFFSITE_READ_REMOTE), and while an export of it is
+    configured (CAPTUA_OFFSITE_READ_REMOTE), and while an export of it is
     queued or running or its files are being read for upload.
     """
     from app.core.offsite_free import FreeRefused, start_restore

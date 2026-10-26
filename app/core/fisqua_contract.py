@@ -23,7 +23,7 @@ DECISIONS_RESERVED_CALLS = 10
 
 CONTRACT_VERSION = "1.2"
 
-# DTK_FISQUA_ENV -> base URL, with the unit's offsite tenant as `tenant`.
+# CAPTUA_FISQUA_ENV -> base URL, with the unit's offsite tenant as `tenant`.
 ENVIRONMENTS = {
     "production": "https://{tenant}.fisqua.org",
     "staging": "https://{tenant}.staging.fisqua.org",

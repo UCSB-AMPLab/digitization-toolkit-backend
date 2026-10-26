@@ -27,7 +27,7 @@ def _records_data_dir(data_dir, monkeypatch):
     """app.api.records binds settings at its import; point its data directory at this test's too."""
     from app.api import records
 
-    monkeypatch.setattr(records.settings, "DTK_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(records.settings, "DATA_DIR", str(data_dir))
 
 
 def _uploads_dir() -> Path:

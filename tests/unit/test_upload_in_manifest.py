@@ -40,7 +40,7 @@ def _jpeg(colour="white") -> bytes:
 def _records_data_dir(data_dir, monkeypatch):
     from app.api import records
 
-    monkeypatch.setattr(records.settings, "DTK_DATA_DIR", str(data_dir))
+    monkeypatch.setattr(records.settings, "DATA_DIR", str(data_dir))
 
 
 @pytest.fixture
