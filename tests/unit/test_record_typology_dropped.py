@@ -7,6 +7,8 @@ wrong for a loose bifolium shot as a pair; `material` has no writer and no UI.
 The export payload carries `capture_mode`, so a bag still records single vs
 dual, and a schema version that tells a bag carrying `object_typology` from
 one carrying `capture_mode`.
+
+Version: 0.1.0-beta
 """
 
 import json

@@ -12,6 +12,8 @@ The camera test (POST /cameras/test-capture/{i}) takes no volume and stores
 nothing (NEH-166), so it is not refused.
 
 The hardware is stood in for as test_capture_counter_raised.py does.
+
+Version: 0.1.0-beta
 """
 
 import inspect

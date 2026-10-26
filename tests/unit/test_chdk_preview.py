@@ -9,6 +9,8 @@ conversations on one USB endpoint.
 The instrumentation here is for the bench, which is the only session with
 hardware: the frame geometry once per body, and the frame rate every hundred
 frames, so nobody has to stand over the rig with a stopwatch.
+
+Version: 0.1.0-beta
 """
 
 import pytest

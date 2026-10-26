@@ -32,6 +32,8 @@ latest delivered manifest. A table of its own rather than columns on
 collections: the poll writes it without touching the volume's row, which
 PATCH, the stem guards and the handover paths lock, and the Fisqua fields
 stay out of CollectionRead and the volume listings.
+
+Version: 0.1.0-beta
 """
 
 from datetime import datetime, timezone

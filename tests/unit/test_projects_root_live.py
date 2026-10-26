@@ -12,6 +12,8 @@ while the registry/delete/export/storage-panel readers followed the NEW root -
 splitting a project across two disks.
 
 Run with: python -m pytest tests/unit/test_projects_root_live.py
+
+Version: 0.1.0-beta
 """
 
 import tempfile

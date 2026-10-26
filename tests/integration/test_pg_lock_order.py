@@ -23,6 +23,8 @@ function calling it, never by thread name.
 Run with, for example:
   DATABASE_HOST=localhost DATABASE_PORT=5432 DATABASE_USER=... DATABASE_PASSWORD=... \
   DATABASE_NAME=... python -m pytest tests/integration/test_pg_lock_order.py
+
+Version: 0.1.0-beta
 """
 import io
 import os

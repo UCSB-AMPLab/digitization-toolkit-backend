@@ -9,6 +9,8 @@ instead of finding a card reader.
 It rewrites a body's identity, so it is an admin's to do. It also mints an id
 for a body that has none, which is what lifts that body out of provisional
 and lets it capture.
+
+Version: 0.1.0-beta
 """
 
 import threading

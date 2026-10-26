@@ -19,6 +19,8 @@ crash. Volumes without a stem are left where they are.
 
 Files are real, under the per-test projects root from `override_projects_root`.
 The stems are test values in the `xx-test-` form.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

@@ -4,6 +4,8 @@ The file is no row's, so it is listed in `left_unreferenced` (files no row
 references, left where they are) and logged at WARNING with the image id it
 displaced. Otherwise the next run finds it foreign and skips the volume as
 `stem_dir_occupied` with no earlier word about it.
+
+Version: 0.1.0-beta
 """
 
 import pytest

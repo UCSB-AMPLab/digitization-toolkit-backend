@@ -32,6 +32,8 @@ one-time commands do not read it: they are what runs during it.
 The path is CAPTUA_OFFSITE_HOLD_FILE, by default `offsite-hold` in CAPTUA_DATA_DIR
 (/var/lib/dtk/offsite-hold on a unit). Only the file's existence counts;
 its contents are not read.
+
+Version: 0.1.0-beta
 """
 
 import logging

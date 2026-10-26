@@ -20,6 +20,8 @@ Usage examples:
 
   # Apply a known-good speed preset to a camera
   python3 gphoto2_test.py preset --port usb:003,005 [--port usb:001,005 ...]
+
+Version: 0.1.0-beta
 """
 
 import argparse

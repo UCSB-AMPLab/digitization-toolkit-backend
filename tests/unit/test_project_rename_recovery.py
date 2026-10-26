@@ -5,6 +5,8 @@ Power loss is this appliance's defining failure mode, so a rename that moves the
 on-disk tree and then commits new paths must survive a crash between the two
 steps without leaving records dangling. reconcile_pending_rename replays or
 discards the intent journal at startup; these tests cover its three branches.
+
+Version: 0.1.0-beta
 """
 import pytest
 

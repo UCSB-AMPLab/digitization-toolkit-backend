@@ -51,6 +51,8 @@ An unusable rotation is skipped on its own.
 
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
+
+Version: 0.1.0-beta
 """
 
 import logging

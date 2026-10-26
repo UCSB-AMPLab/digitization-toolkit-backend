@@ -2,6 +2,8 @@
 Thumbnail generation utilities for record images.
 
 This module provides functions for generating and managing thumbnails of record images.
+
+Version: 0.1.0-beta
 """
 
 import logging

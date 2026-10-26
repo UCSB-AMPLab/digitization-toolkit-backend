@@ -19,6 +19,8 @@ fakes here model the two windows that make this delicate:
 
 Both are counted in PTP claims: at no point may two claims on one body be live
 at once.
+
+Version: 0.1.0-beta
 """
 
 import logging

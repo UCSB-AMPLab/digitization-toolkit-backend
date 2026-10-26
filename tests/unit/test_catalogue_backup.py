@@ -22,6 +22,8 @@ built. Everything else — the gzip stream, the SHA1, the subprocess, the unlink
 is the production path.
 
     python -m pytest tests/unit/test_catalogue_backup.py
+
+Version: 0.1.0-beta
 """
 
 import errno

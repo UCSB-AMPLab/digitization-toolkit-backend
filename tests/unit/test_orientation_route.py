@@ -5,6 +5,8 @@ POST /cameras/capture that let a saved orientation survive an omitted field.
 Modelled on test_rescan_route.py: a fake backend stands in for the process
 singleton; the registry itself is a real CameraRegistry pointed at a fresh
 file through the client fixture's projects-root override.
+
+Version: 0.1.0-beta
 """
 
 import capture.service as capture_service

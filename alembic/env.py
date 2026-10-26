@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from logging.config import fileConfig
 import os
 import sys

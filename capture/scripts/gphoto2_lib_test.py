@@ -20,6 +20,8 @@ Usage:
   pixi run python capture/scripts/gphoto2_lib_test.py capture --port usb:003,002 --out /tmp/test.jpg
   pixi run python capture/scripts/gphoto2_lib_test.py dual   --left usb:003,002 --right usb:001,002 --outdir /tmp/caps
   pixi run python capture/scripts/gphoto2_lib_test.py bench  --left usb:003,002 --right usb:001,002 --count 6 --settle 3
+
+Version: 0.1.0-beta
 """
 
 import argparse

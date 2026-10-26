@@ -1,6 +1,8 @@
 """The QC decisions migration (a5f0306a8f8c), on SQLite and, opt-in, on PostgreSQL.
 
     python -m pytest tests/unit/test_fisqua_decisions_migration.py
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

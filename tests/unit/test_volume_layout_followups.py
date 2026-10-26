@@ -2,6 +2,8 @@
 
 Uses the fixtures of test_volume_layout_by_stem: the name-based `legacy`
 layout under the per-test projects root, and a writable data directory.
+
+Version: 0.1.0-beta
 """
 
 import json

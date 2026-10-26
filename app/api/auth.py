@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 import hmac
 
 from fastapi import APIRouter, Depends, HTTPException, Security, Query, Header, Request

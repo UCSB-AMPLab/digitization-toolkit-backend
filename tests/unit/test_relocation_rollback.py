@@ -8,6 +8,8 @@ rows keep their old paths; the files already moved are moved back to match
 them, RAW preview sidecars included.
 
 Files are real, under the per-test projects root from `override_projects_root`.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

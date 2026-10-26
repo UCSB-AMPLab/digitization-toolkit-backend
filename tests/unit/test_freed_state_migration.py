@@ -5,6 +5,8 @@ a server, in a schema of its own, created and dropped by the test, as in
 tests/unit/test_offsite_objects_migration.py.
 
     python -m pytest tests/unit/test_freed_state_migration.py
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

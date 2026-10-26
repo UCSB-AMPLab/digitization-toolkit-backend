@@ -6,6 +6,8 @@ directory or, as on a unit, a file pointing into the superproject's
 .git/modules.
 
     python -m pytest tests/unit/test_version.py
+
+Version: 0.1.0-beta
 """
 
 import zlib

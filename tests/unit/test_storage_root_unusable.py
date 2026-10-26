@@ -24,6 +24,8 @@ The root filesystem's device number comes from `_internal_device()`, patched
 here because a test's tmp_path may or may not share a device with `/`.
 
 Run with: python -m pytest tests/unit/test_storage_root_unusable.py
+
+Version: 0.1.0-beta
 """
 
 import os

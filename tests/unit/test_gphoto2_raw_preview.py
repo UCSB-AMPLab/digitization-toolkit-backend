@@ -6,6 +6,8 @@ array encoded through Pillow), the rawpy-missing warning path, an
 extract_thumb() exception, and an unrecognized thumbnail format - none of
 which may raise, since the preview extraction runs after the master file
 has already been saved and deleted from the camera.
+
+Version: 0.1.0-beta
 """
 
 import logging

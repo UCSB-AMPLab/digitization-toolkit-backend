@@ -3,6 +3,8 @@
 The not-yet-migrated rename tests are in test_volume_not_yet_migrated, the
 stray-directory test in test_stem_directory_occupied, and the torn-write tests
 in test_manifest_torn_appends.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

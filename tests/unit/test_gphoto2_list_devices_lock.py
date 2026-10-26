@@ -9,6 +9,8 @@ preview thread is already opening.
 The fakes here model exactly that window: the session constructor claims the
 camera and then blocks, so a concurrent list_devices() runs while the claim is
 held but before the session is visible in self._sessions.
+
+Version: 0.1.0-beta
 """
 
 import logging

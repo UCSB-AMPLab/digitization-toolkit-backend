@@ -5,6 +5,8 @@ shutter, autofocus and the file path exactly like POST /capture - but returns it
 inline as JPEG bytes and never stores it: no file under the projects root, no
 manifest record. Modelled on test_orientation_route.py (client/monkeypatch
 pattern) and test_gphoto2_rescan.py (the autouse projects-root fixture).
+
+Version: 0.1.0-beta
 """
 
 from pathlib import Path

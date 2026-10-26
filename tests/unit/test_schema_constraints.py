@@ -10,6 +10,8 @@ UNIQUE constraints, so those are covered directly here. FK ondelete
 CASCADE is a Postgres-side behavior and is not tested here.
 
 Run with: python -m pytest tests/unit/test_schema_constraints.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

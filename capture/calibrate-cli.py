@@ -7,6 +7,8 @@ Usage:
     python calibrate-cli.py 1                  # Calibrate camera 1
     python calibrate-cli.py 0 my_profile.json  # Save to custom path
     python calibrate-cli.py dual               # Calibrate both cameras
+
+Version: 0.1.0-beta
 """
 import sys
 from pathlib import Path

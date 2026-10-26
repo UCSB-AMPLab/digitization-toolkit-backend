@@ -1,5 +1,7 @@
 """
 Subprocess-based camera backend using rpicam-still.
+
+Version: 0.1.0-beta
 """
 
 import subprocess

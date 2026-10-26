@@ -9,6 +9,8 @@ lockouts, it never grants access.
 Keys are opaque strings; the caller throttles per account and per client IP by
 passing both keys, so brute force is bounded whether it targets one account from
 many IPs or many accounts from one IP.
+
+Version: 0.1.0-beta
 """
 
 import math

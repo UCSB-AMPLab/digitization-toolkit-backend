@@ -14,6 +14,8 @@ take_filename_index is the one place a capture or an upload takes its
 number. The callers turn its CaptureNameRefused into a 409 carrying the
 exception's fixed text, after rolling back, so a refused event consumes no
 number.
+
+Version: 0.1.0-beta
 """
 import logging
 import os

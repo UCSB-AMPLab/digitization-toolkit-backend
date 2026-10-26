@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from typing import Iterable, List, Optional

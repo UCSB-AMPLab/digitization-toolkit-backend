@@ -6,6 +6,8 @@ that CAPTUA_OFFSITE_REMOTE names a bucket (`tb2:<bucket>`) as it does on a unit.
 The maps are synthetic.
 
     python -m pytest tests/unit/test_adopt_map.py
+
+Version: 0.1.0-beta
 """
 
 import copy

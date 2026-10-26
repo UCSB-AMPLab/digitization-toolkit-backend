@@ -12,6 +12,8 @@
      must not export with bag metadata that describes the work as `captured`.
 
 Run with: python -m pytest tests/unit/test_handover_boundaries.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -7,6 +7,8 @@ rather than stored: a collection has been handed over when none of its records
 is `captured`.
 
 Run with: python -m pytest tests/unit/test_collection_handover.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

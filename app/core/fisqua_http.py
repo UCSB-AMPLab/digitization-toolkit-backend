@@ -23,6 +23,8 @@ errors, the rest error. Answers to GET of a volume's QC decisions (§9.5):
 2xx with an object, 404 with rule no-decisions as nothing to apply yet
 (read again at the next poll), the same configuration errors otherwise,
 the rest error.
+
+Version: 0.1.0-beta
 """
 
 from datetime import datetime, timezone

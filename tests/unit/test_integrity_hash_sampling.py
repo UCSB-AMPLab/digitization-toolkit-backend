@@ -5,6 +5,8 @@ A full sweep re-hashes every stored image, which is I/O-punishing on a unit
 holding tens of thousands of captures. run_integrity_check must hash only a
 bounded (random) sample when max_hash_checks is set, and everything eligible
 only when it is None (the explicit full-sweep opt-in).
+
+Version: 0.1.0-beta
 """
 import hashlib
 import json

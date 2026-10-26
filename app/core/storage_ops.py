@@ -4,6 +4,8 @@ Filesystem operations tied to project/collection/record moves and deletes.
 These helpers keep the image files on disk consistent with the database when
 records are re-parented (move) or their container is removed (delete), and
 provide the guard that stops a delete from erasing files still referenced by surviving records.
+
+Version: 0.1.0-beta
 """
 
 import glob

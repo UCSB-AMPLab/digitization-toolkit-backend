@@ -6,6 +6,8 @@ an exclusive lock on `<imports>/.project-create.lock`: the import that takes
 it second looks again under it and finds the first one's project. An import
 that cannot take that lock and would have to create a project is refused,
 with nothing written, rather than risk a second project.
+
+Version: 0.1.0-beta
 """
 
 import threading

@@ -1,4 +1,7 @@
-"""PBKDF2 hashing: new-format + legacy verify, and rehash-on-upgrade detection."""
+"""PBKDF2 hashing: new-format + legacy verify, and rehash-on-upgrade detection.
+
+Version: 0.1.0-beta
+"""
 
 from app.core.security import (
     hash_password, verify_password, needs_rehash, _pbkdf2, _LEGACY_ITERATIONS,

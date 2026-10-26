@@ -11,6 +11,8 @@ This validates:
 6. All necessary imports are available
 
 Usage: python tests/validate_system.py
+
+Version: 0.1.0-beta
 """
 
 import sys

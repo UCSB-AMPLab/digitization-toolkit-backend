@@ -7,6 +7,8 @@ the rows pointing at the new names, and a relocation record in the capture
 manifest for each renamed master with a capture id. Renumbering rewrites
 records' `sequence` only and writes none of this, but the migration and the
 integrity index still read it. This helper produces that state.
+
+Version: 0.1.0-beta
 """
 
 import os

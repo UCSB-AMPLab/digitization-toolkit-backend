@@ -6,6 +6,8 @@ has no project_id; nesting a volume clears its project link). DELETE /collection
 POST /projects/{id}/move-collections logs `collection_moved` for each volume it
 moves, beside its existing `collections_moved` summary. A request that is
 refused or changes nothing logs nothing.
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -6,6 +6,8 @@ the local-midnight cases do not depend on when the suite runs. Timestamps are
 written directly as naive UTC, the form they are stored in.
 
 Run with: python -m pytest tests/unit/test_activity.py
+
+Version: 0.1.0-beta
 """
 from datetime import date, datetime, timedelta
 

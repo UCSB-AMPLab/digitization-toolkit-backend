@@ -11,6 +11,8 @@ never a moment in which its port looks free while its device is still open.
 
 These tests stop one thread inside a call and run another past it, so they
 are about the windows, not the happy path.
+
+Version: 0.1.0-beta
 """
 
 import threading

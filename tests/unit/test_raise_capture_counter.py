@@ -8,6 +8,8 @@ n + 1. A dry run unless `--apply`; it never lowers the counter, an equal
 value changes nothing, and n stays within MAX_CAPTURE_NUMBER.
 
     python -m pytest tests/unit/test_raise_capture_counter.py
+
+Version: 0.1.0-beta
 """
 
 import json

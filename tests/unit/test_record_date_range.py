@@ -23,6 +23,8 @@ database, because a CHECK can compare two columns of one row.
 Nothing writes these columns yet. They are absent from every request schema
 and exposed read-only on the response; the importer that will fill them is
 blocked on the exchange contract.
+
+Version: 0.1.0-beta
 """
 
 from datetime import date

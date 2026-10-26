@@ -30,6 +30,8 @@ Every file these tests create lives under the per-test temporary projects root
 from the `override_projects_root` fixture. `_must_be_inside_storage` asserts that
 before any delete runs, so a misconfigured root fails the test rather than
 pointing a delete at a real capture tree.
+
+Version: 0.1.0-beta
 """
 
 import pytest

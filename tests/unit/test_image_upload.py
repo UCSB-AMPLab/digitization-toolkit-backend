@@ -12,6 +12,8 @@ under CI (the CI environment variable set), where a missing rclone fails the
 test: .github/workflows/ci.yml installs a pinned one for these tests.
 
     python -m pytest tests/unit/test_image_upload.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

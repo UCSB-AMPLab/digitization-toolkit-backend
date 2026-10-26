@@ -69,6 +69,8 @@ the hold, the listing) and run the rest as a background job.
 `mark-freed` (python -m app.core.image_upload mark-freed <stem>) records
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
+
+Version: 0.1.0-beta
 """
 
 import json

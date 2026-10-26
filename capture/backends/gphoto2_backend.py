@@ -27,6 +27,8 @@ Tested with: Canon EOS 1500D x 2, USB 2.0, Raspberry Pi.
 ISO, shutter speed, aperture and image format are applied from CameraConfig
 before each capture, through the `iso`, `shutterspeed`, `aperture` and
 `imageformat` PTP widgets (_PTPSession.apply_dslr_config).
+
+Version: 0.1.0-beta
 """
 
 import json

@@ -16,6 +16,8 @@ and a volume stays undeletable once it has captured, even after its records
 are deleted or moved out.
 
 The hardware is stood in for as test_capture_birth_and_retake.py does.
+
+Version: 0.1.0-beta
 """
 
 import capture.service as capture_service

@@ -6,6 +6,8 @@ narrows it back to six, and refuses while any rejection uses one of the three
 new reasons, because rewriting an audit row's reason would falsify it.
 
 Run with: python -m pytest tests/unit/test_rejection_reasons_migration.py
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

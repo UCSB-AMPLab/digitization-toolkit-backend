@@ -4,6 +4,8 @@ As tests/unit/test_offsite_objects_migration.py: SQLite always; PostgreSQL
 only when DATABASE_HOST is set, in a schema created and dropped by the test.
 
     python -m pytest tests/unit/test_fisqua_outbox_migration.py
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

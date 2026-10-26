@@ -9,6 +9,8 @@ hardcoded pi:pi chown) fails them. They also
 assert the backend never mkdirs/rmdirs under the mounts root - the root is
 root-owned and the helper is its only writer. Run with:
     python -m pytest tests/unit/test_system_storage_helper.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

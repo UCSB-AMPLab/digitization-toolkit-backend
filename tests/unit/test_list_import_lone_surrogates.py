@@ -7,6 +7,8 @@ other items were committed. So the file is refused with 400 when any key or
 string in it holds a lone surrogate. A surrogate pair is one character and
 is accepted. Report storage escapes what it cannot encode, so it cannot
 fail this way.
+
+Version: 0.1.0-beta
 """
 
 import json

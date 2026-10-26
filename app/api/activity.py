@@ -4,6 +4,8 @@ and how much was captured and reviewed on each recent day.
 Both endpoints count in the database or over a bounded set of timestamp
 columns. Neither loads ORM objects, because a unit holds thousands of records
 and the dashboard calls them on every visit.
+
+Version: 0.1.0-beta
 """
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone

@@ -7,6 +7,8 @@ app.models.collection, so every writer reaches it: the API routes answer
 409, and any other writer (the list import) gets StemDirectoryCollisionError.
 The project routes check before they move a tree. The startup migration
 refuses to move a volume into a directory that is a live project tree.
+
+Version: 0.1.0-beta
 """
 
 from pathlib import Path

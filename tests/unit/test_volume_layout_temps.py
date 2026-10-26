@@ -12,6 +12,8 @@
   may still hold one) and the migration's own
   cross-filesystem _move (`.<name>.part`, all three). Any other file no row
   owns is foreign and the volume is skipped.
+
+Version: 0.1.0-beta
 """
 
 import pytest

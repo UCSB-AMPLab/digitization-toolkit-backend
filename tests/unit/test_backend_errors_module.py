@@ -7,6 +7,8 @@ capture/backends/errors.py, where any backend can raise it, and
 gphoto2_backend re-exports the same object rather than defining a second
 class: two classes with one name would make the 504 depend on which backend
 was running.
+
+Version: 0.1.0-beta
 """
 
 import pytest

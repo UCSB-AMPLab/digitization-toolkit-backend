@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from datetime import datetime, timezone
 from sqlalchemy import event, inspect as sa_inspect, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
 from sqlalchemy.orm import Session, relationship, validates, object_session

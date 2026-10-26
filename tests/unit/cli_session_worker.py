@@ -7,6 +7,8 @@ tests/conftest.py does. The worker only points app.core.db.SessionLocal at
 the SQLite file (the settings build a Postgres URL) and then calls the
 module's main() with the remaining arguments, as `python -m <module>` would.
 It imports no model itself.
+
+Version: 0.1.0-beta
 """
 import importlib
 import os

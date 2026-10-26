@@ -11,6 +11,8 @@ the same event to the operator.
 
 Backends may re-export from here for the sake of existing imports, but must
 not define their own copy.
+
+Version: 0.1.0-beta
 """
 
 

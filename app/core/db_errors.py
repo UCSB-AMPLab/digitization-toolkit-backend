@@ -4,6 +4,8 @@ The appliance is LAN-exposed on port 80, so constraint-violation responses must
 never echo the offending SQL statement or its bound parameters. This module
 turns an IntegrityError into a 409 carrying only the violated constraint name
 and a human-readable message.
+
+Version: 0.1.0-beta
 """
 from typing import Optional
 from fastapi import HTTPException

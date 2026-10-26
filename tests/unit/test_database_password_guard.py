@@ -1,4 +1,7 @@
-"""Guard against booting outside dev with a placeholder DATABASE_PASSWORD"""
+"""Guard against booting outside dev with a placeholder DATABASE_PASSWORD
+
+Version: 0.1.0-beta
+"""
 
 from types import SimpleNamespace
 

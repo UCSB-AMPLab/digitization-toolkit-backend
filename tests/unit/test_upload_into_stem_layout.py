@@ -4,6 +4,8 @@ The file is named as a single capture is, `<stem>-img_<nnnn>_c0.<ext>`
 (contract 1.1, section 3); test_capture_contract_naming.py covers the rules.
 Any other upload is refused with 409, on the same terms as a capture, before
 anything is written.
+
+Version: 0.1.0-beta
 """
 
 import io

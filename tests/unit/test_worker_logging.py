@@ -8,6 +8,8 @@ something writes one INFO line with its counts; a failure a WARNING or an
 ERROR. No line carries the token or a key's credentials.
 
     python -m pytest tests/unit/test_worker_logging.py
+
+Version: 0.1.0-beta
 """
 
 import logging

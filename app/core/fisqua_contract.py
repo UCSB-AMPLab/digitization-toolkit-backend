@@ -8,6 +8,8 @@ The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
 that shape it is opaque to the unit, sent as it is and never parsed.
 
 Contract 1.2 is approved (archiving 5e480b7, §9).
+
+Version: 0.1.0-beta
 """
 
 import re

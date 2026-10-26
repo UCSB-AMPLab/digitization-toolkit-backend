@@ -15,6 +15,8 @@ gone). Falling back to internal storage then would put new work on the SD card
 while the rest of the project is on the drive. Instead, everything that writes
 into the projects tree gets its root from writable_projects_dir, which raises
 StorageUnavailableError for such a root.
+
+Version: 0.1.0-beta
 """
 import json
 import logging

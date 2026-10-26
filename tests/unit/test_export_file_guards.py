@@ -19,6 +19,8 @@ The export used here is a registry job whose work waits on an event, so it
 stays running for as long as the test needs.
 
 Run with: python -m pytest tests/unit/test_export_file_guards.py
+
+Version: 0.1.0-beta
 """
 
 import threading

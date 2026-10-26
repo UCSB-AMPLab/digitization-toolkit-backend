@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from datetime import datetime, timezone
 from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
 from sqlalchemy.orm import relationship

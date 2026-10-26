@@ -8,6 +8,8 @@ naming and collision rules, and that name stays reserved. The volume is then
 wholly in its own folder, so a restore writes the bytes there.
 
     python -m pytest tests/unit/test_offsite_free_layout.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

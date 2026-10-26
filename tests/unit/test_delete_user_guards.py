@@ -1,5 +1,8 @@
 """Critical NEH-57 guards on DELETE /auth/users/{id}: no self-delete, no
-last-active-admin delete (both would strand a headless unit), and an audit trail."""
+last-active-admin delete (both would strand a headless unit), and an audit trail.
+
+Version: 0.1.0-beta
+"""
 
 import pytest
 

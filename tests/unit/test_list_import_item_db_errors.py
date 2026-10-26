@@ -4,6 +4,8 @@ The lookups for a volume already holding the item's reference code or stem
 run inside the same rollback-and-reject handling as the insert, so a lost
 connection there is reported as `refused_by_database` for that item, the
 other items are still created, and the report is stored.
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -4,6 +4,8 @@ escape projects_dir.
 `project_capture_root` derives the manifest root through
 `secure_project_filename` (NEH-45); a raw path join would let these names
 escape.
+
+Version: 0.1.0-beta
 """
 import pytest
 

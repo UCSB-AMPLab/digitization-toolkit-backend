@@ -7,6 +7,8 @@ column (app/models/user.py), and the project-member listing/add
 endpoints that flatten a user's email onto each row
 (app/schemas/project_member.py, app/api/projects.py) — an email-less
 admin or collaborator must not break either of those.
+
+Version: 0.1.0-beta
 """
 
 import pytest

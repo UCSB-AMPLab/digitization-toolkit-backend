@@ -28,6 +28,8 @@ PostgreSQL refuses FOR UPDATE on the nullable side of a LEFT JOIN, so a lock
 written without `of` would fail on the appliance and pass here.
 
 Run with: python -m pytest tests/unit/test_workflow_row_locking.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

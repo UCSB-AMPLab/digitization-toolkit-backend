@@ -8,6 +8,8 @@ Also covers concurrent saves: two CameraRegistry instances are constructed per r
 (app/api/cameras.py's _get_camera_registry), and each holds its own snapshot
 of the file. Without a reload-modify-save discipline under a shared lock, an
 instance that saves after another would silently clobber the other's change.
+
+Version: 0.1.0-beta
 """
 
 import threading

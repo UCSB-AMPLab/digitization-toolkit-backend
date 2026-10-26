@@ -18,6 +18,8 @@ additions the identity work needs:
     between a serial being read and the claim that read it being released.
 
 Every test states the sequence of autodetect results it scripts.
+
+Version: 0.1.0-beta
 """
 
 import json

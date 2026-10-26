@@ -10,6 +10,8 @@ No bucket and no rclone: offsite_objects rows are written directly, as the
 uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

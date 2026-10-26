@@ -12,6 +12,8 @@ in them, and the backend relies on the library's rules - an id comes back
 lowercased, a malformed file parses as nothing rather than raising. A second
 implementation with rules of its own would let these tests agree with
 themselves while disagreeing with the library.
+
+Version: 0.1.0-beta
 """
 
 import re

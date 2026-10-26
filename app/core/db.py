@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from contextlib import contextmanager
 from typing import Generator
 

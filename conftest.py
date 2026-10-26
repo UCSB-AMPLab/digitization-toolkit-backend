@@ -1,5 +1,7 @@
 """
 Pytest configuration and fixtures for the Captua backend tests.
+
+Version: 0.1.0-beta
 """
 
 import os

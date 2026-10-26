@@ -1,5 +1,7 @@
 """The work a background export job runs: validate, check disk, stream the bag,
 prune old zips. Runs in a worker thread with its own DB session.
+
+Version: 0.1.0-beta
 """
 
 import json

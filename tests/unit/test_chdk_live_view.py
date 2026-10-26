@@ -15,6 +15,8 @@ The viewport's pixels are not square. chdkptp sizes its canvas as the
 screen's width (margins included) over the LCD's aspect ratio and stretches
 the frame into it (gui_live.lua update_canvas_size); a preview that skipped
 that step would hand the operator a squashed page.
+
+Version: 0.1.0-beta
 """
 
 import struct
