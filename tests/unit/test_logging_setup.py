@@ -95,3 +95,95 @@ def test_uvicorn_and_root_loggers_are_left_alone(restore_loggers):
     assert logging.getLogger().level == root_level
     for n, handlers in uvicorn_handlers.items():
         assert logging.getLogger(n).handlers == handlers
+
+
+# Placeholder JWT-shaped strings; no real token appears in these tests.
+FAKE_TOKEN = "abc.def.ghi"
+
+
+@pytest.fixture
+def uvicorn_access_capture():
+    """A StringIO handler on uvicorn.access with uvicorn's own AccessFormatter,
+    so the assertions read the line as the journal receives it."""
+    import io
+
+    from uvicorn.logging import AccessFormatter
+
+    saved = {n: list(logging.getLogger(n).filters) for n in logging_setup.UVICORN_LOGGERS}
+    access = logging.getLogger("uvicorn.access")
+    saved_level = access.level
+    stream = io.StringIO()
+    handler = logging.StreamHandler(stream)
+    handler.setFormatter(AccessFormatter('%(client_addr)s - "%(request_line)s" %(status_code)s', use_colors=False))
+    access.addHandler(handler)
+    access.setLevel(logging.INFO)
+    yield stream
+    access.removeHandler(handler)
+    access.setLevel(saved_level)
+    for name, filters in saved.items():
+        logging.getLogger(name).filters[:] = filters
+
+
+def _access(target: str) -> None:
+    # The same call shape as uvicorn's h11 and httptools protocols.
+    logging.getLogger("uvicorn.access").info(
+        '%s - "%s %s HTTP/%s" %d', "172.30.0.4:53480", "GET", target, "1.1", 200
+    )
+
+
+def test_access_line_masks_the_token_and_keeps_other_params(restore_loggers, uvicorn_access_capture):
+    configure_logging("INFO")
+
+    _access(f"/records/images/5/thumbnail?token={FAKE_TOKEN}&size=s")
+
+    line = uvicorn_access_capture.getvalue()
+    assert FAKE_TOKEN not in line
+    assert '"GET /records/images/5/thumbnail?token=***&size=s HTTP/1.1" 200 OK' in line
+
+
+def test_access_line_without_a_token_is_unchanged(restore_loggers, uvicorn_access_capture):
+    configure_logging("INFO")
+
+    _access("/records/images/5/thumbnail?size=s&page=2")
+    _access("/cameras")
+
+    lines = uvicorn_access_capture.getvalue().splitlines()
+    assert lines == [
+        '172.30.0.4:53480 - "GET /records/images/5/thumbnail?size=s&page=2 HTTP/1.1" 200 OK',
+        '172.30.0.4:53480 - "GET /cameras HTTP/1.1" 200 OK',
+    ]
+
+
+@pytest.mark.parametrize(
+    "target, expected",
+    [
+        (f"/x?access_token={FAKE_TOKEN}", "/x?access_token=***"),
+        (f"/x?size=s&TOKEN={FAKE_TOKEN}", "/x?size=s&TOKEN=***"),
+        (f"/x?%74oken={FAKE_TOKEN}&a=1", "/x?%74oken=***&a=1"),
+        (f"/x?token={FAKE_TOKEN}&token={FAKE_TOKEN}", "/x?token=***&token=***"),
+        (f"/x?mytoken={FAKE_TOKEN}", f"/x?mytoken={FAKE_TOKEN}"),
+        ("/x?token=", "/x?token="),
+        ("/token=abc", "/token=abc"),
+    ],
+)
+def test_redact_query_secrets(target, expected):
+    assert logging_setup.redact_query_secrets(target) == expected
+
+
+def test_preformatted_message_is_masked_too(restore_loggers, caplog):
+    configure_logging("INFO")
+
+    with caplog.at_level(logging.INFO, logger="uvicorn.error"):
+        logging.getLogger("uvicorn.error").info(f'1.2.3.4:5 - "WebSocket /ws?token={FAKE_TOKEN}" 403')
+
+    assert FAKE_TOKEN not in caplog.text
+    assert '"WebSocket /ws?token=***" 403' in caplog.text
+
+
+def test_filter_is_added_once(restore_loggers, uvicorn_access_capture):
+    configure_logging("INFO")
+    configure_logging("INFO")
+
+    for name in logging_setup.UVICORN_LOGGERS:
+        filters = [f for f in logging.getLogger(name).filters if isinstance(f, logging_setup.RedactQuerySecretsFilter)]
+        assert len(filters) == 1, name
