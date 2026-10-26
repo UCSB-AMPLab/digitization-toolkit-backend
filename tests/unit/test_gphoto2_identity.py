@@ -1421,3 +1421,131 @@ def test_a_serial_read_from_an_open_session_is_learned(monkeypatch):
     assert backend._get_port_map() == {0: (MODEL, PORT_A), 1: (MODEL, PORT_B)}
     assert backend._get_or_open_session(0) is session_a
     assert session_a.close_calls == 0
+
+
+# ----------------------------------------------------------------------
+# (v) a body that cannot answer a serial right now keeps its known identity
+# ----------------------------------------------------------------------
+
+PLACEHOLDER_0 = "canoneosrebelt7_idx0"
+
+
+def test_an_open_session_supplies_the_serial_when_a_read_fails(monkeypatch):
+    """autodetect: [A]; a session holds A, then A stops answering config reads.
+
+    A live preview holds the body's session; a config read through it can
+    fail while the body is busy. The serial read at session open still names
+    the body, and the row must carry it rather than the placeholder, or the
+    registry lookup misses and the camera loses its orientation and
+    calibration.
+    """
+    backend, claims, _detector, bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_A)]
+    )
+    session_a = backend._get_or_open_session(0)
+    assert session_a.serial == SERIAL_A
+    init_calls = claims.init_calls
+
+    bodies.unreadable.add(PORT_A)
+    devices = backend.list_devices()
+
+    assert [(d["index"], d["hardware_id"], d["serial"]) for d in devices] == [
+        (0, HW_A, SERIAL_A)
+    ]
+    assert claims.init_calls == init_calls, "the enumeration made a second claim"
+    assert backend._get_or_open_session(0) is session_a
+
+
+def test_a_pin_confirmed_by_the_port_supplies_the_serial(monkeypatch):
+    """autodetect: [A, B]; no session, and A's brief read fails on the second listing."""
+    backend, _claims, _detector, bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_A), (MODEL, PORT_B)]
+    )
+    backend.list_devices()
+    assert backend._pins == {0: SERIAL_A, 1: SERIAL_B}
+    assert backend._sessions == {}
+
+    bodies.unreadable.add(PORT_A)
+    devices = backend.list_devices()
+
+    assert [(d["index"], d["hardware_id"], d["serial"]) for d in devices] == [
+        (0, HW_A, SERIAL_A), (1, HW_B, SERIAL_B)
+    ]
+
+
+def test_with_no_session_and_no_confirmed_pin_the_placeholder_stands(
+    monkeypatch, bindings_dir
+):
+    """autodetect: [S1], a body that answers no serial, then [A] unreadable after a restart.
+
+    With nothing to go on the row keeps the placeholder. After a restart the
+    pins are seeded but the port cache is empty, so a pin alone does not say
+    which body an unreadable port holds and it must not be used.
+    """
+    backend, _claims, _detector, _bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_S1)]
+    )
+    devices = backend.list_devices()
+    assert [(d["index"], d["hardware_id"], d["serial"]) for d in devices] == [
+        (0, PLACEHOLDER_0, None)
+    ]
+
+    _write_bindings(bindings_dir, {"0": SERIAL_A})
+    restarted, _claims, _detector, bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_A)]
+    )
+    assert restarted._pins == {0: SERIAL_A}
+    bodies.unreadable.add(PORT_A)
+
+    devices = restarted.list_devices()
+
+    assert [(d["index"], d["hardware_id"], d["serial"]) for d in devices] == [
+        (1, "canoneosrebelt7_idx1", None)
+    ]
+    assert restarted._pins == {0: SERIAL_A}
+
+
+def test_a_pin_the_port_contradicts_is_not_used(monkeypatch):
+    """autodetect: [C], published at index 0 by a map older than the pin there.
+
+    Index 0 is pinned to A, but the serial last read on the port at index 0
+    is C's. The pin does not name the body on that port, so the row keeps the
+    placeholder instead of being reported as A.
+    """
+    backend, _claims, _detector, bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_C)]
+    )
+    with backend._map_lock:
+        backend._pins = {0: SERIAL_A}
+        backend._serial_by_port = {PORT_C: SERIAL_C}
+        backend._port_map = {0: (MODEL, PORT_C)}
+    bodies.unreadable.add(PORT_C)
+
+    devices = backend.list_devices()
+
+    assert [(d["index"], d["hardware_id"], d["serial"]) for d in devices] == [
+        (0, PLACEHOLDER_0, None)
+    ]
+
+
+def test_a_session_serial_that_contradicts_the_pins_leaves_the_row_out(
+    monkeypatch, caplog
+):
+    """autodetect: [A]; the session at index 0 holds C's serial while 0 is pinned to A.
+
+    The session's serial goes through the same pin check a fresh read does,
+    so it is never reported at an index pinned to another body.
+    """
+    backend, _claims, _detector, bodies, _cls = _backend_with(
+        monkeypatch, [(MODEL, PORT_A)]
+    )
+    session_a = backend._get_or_open_session(0)
+    assert backend._pins == {0: SERIAL_A}
+    session_a.serial = SERIAL_C
+    bodies.unreadable.add(PORT_A)
+
+    with caplog.at_level(logging.WARNING):
+        devices = backend.list_devices()
+
+    assert "contradicts the pins" in caplog.text
+    assert (0, HW_C) not in [(d["index"], d["hardware_id"]) for d in devices]
