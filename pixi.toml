@@ -1,7 +1,7 @@
 [workspace]
 name = "digitization-toolkit-backend"
 version = "0.1.0"
-description = "Backend for digitization toolkit - native camera support"
+description = "Backend for Captua - native camera support"
 channels = ["conda-forge"]
 platforms = ["linux-aarch64", "linux-64"]
 

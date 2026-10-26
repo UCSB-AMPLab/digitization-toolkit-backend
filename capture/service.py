@@ -11,7 +11,10 @@ from typing import Optional
 # Using stable names rather than mkstemp prevents unbounded accumulation when
 # the process is killed before the finally-block cleanup runs.
 _PREVIEW_TMP_DIR = Path("/tmp")
-_PREVIEW_PREFIX = "dtk_preview_c"
+_PREVIEW_PREFIX = "captua_preview_c"
+# The earlier name of these files. A unit updated from an earlier release can
+# still have such files in /tmp, so the flush removes them too.
+_OLD_PREVIEW_PREFIX = "dtk_preview_c"
 
 # Per-camera locks so concurrent polling requests serialise writes to the
 # shared fixed-path temp file.
@@ -522,7 +525,7 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     config_dict, _hw_id = default_camera_config_from_registry(camera_index, resolution)
     camera_config = CameraConfig(**config_dict)
 
-    tmpdir = tempfile.mkdtemp(prefix="dtk_testcap_")
+    tmpdir = tempfile.mkdtemp(prefix="captua_testcap_")
     try:
         output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
 
@@ -826,14 +829,20 @@ def flush_preview_tmp() -> int:
     Delete all stale preview temp files from /tmp.
 
     Useful when the server was previously killed without running cleanup,
-    leaving behind dtk_preview_c*.jpg files.  Safe to call at any time;
+    leaving behind captua_preview_c*.jpg or dtk_preview_c*.jpg files.  Safe
+    to call at any time;
     files in active use are simply recreated on the next polling cycle.
 
     Returns:
         Number of files deleted.
     """
     count = 0
-    for f in _PREVIEW_TMP_DIR.glob(f"{_PREVIEW_PREFIX}*.jpg"):
+    stale = [
+        f
+        for prefix in (_PREVIEW_PREFIX, _OLD_PREVIEW_PREFIX)
+        for f in _PREVIEW_TMP_DIR.glob(f"{prefix}*.jpg")
+    ]
+    for f in stale:
         try:
             f.unlink(missing_ok=True)
             subprocess_logger.info(f"Flushed stale preview temp file: {f}")

@@ -183,7 +183,7 @@ def generate_manifest_project(
         created_by=created_by or socket.gethostname(),
         paths=paths or {},
         software={
-            "tool": "digitization-toolkit",
+            "tool": "captua",
             # The release and revision (app.core.version), as the Fisqua manifest's systemVersion.
             "version": system_version(),
         },

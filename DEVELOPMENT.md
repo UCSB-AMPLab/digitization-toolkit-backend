@@ -106,7 +106,7 @@ docker compose exec backend python test_api.py
 
 ## Context for AI Assistants
 
-**Project Type:** Digitization toolkit for standalone Raspberry Pi deployment  
+**Project Type:** Captua, a digitization appliance for standalone Raspberry Pi deployment  
 **Environment:** Offline-capable, single-instance  
 **Database:** PostgreSQL with psycopg3  
 **Migrations:** Alembic (strict - no auto table creation)  

@@ -1,11 +1,11 @@
 #!/bin/bash
-# Setup script for DTK capture service dependencies
+# Setup script for the Captua capture service dependencies
 # This installs system packages required for camera backends
 
 set -e  # Exit on error
 
 echo "=================================================="
-echo "DTK Capture Service - Dependency Setup"
+echo "Captua capture service - dependency setup"
 echo "=================================================="
 echo ""
 

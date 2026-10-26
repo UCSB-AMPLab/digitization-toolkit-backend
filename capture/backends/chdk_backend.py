@@ -1593,7 +1593,7 @@ class ChdkBackend(CameraBackend):
                 camera_index, "side assignment", refuse_unusable=False
             ) as body:
                 handle, temp_path = tempfile.mkstemp(
-                    prefix="dtk_own_", suffix=".txt"
+                    prefix="captua_own_", suffix=".txt"
                 )
                 try:
                     with os.fdopen(handle, "wb") as scratch:

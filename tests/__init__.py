@@ -1,1 +1,1 @@
-"""Test suite for DTK Backend."""
+"""Test suite for the Captua backend."""
