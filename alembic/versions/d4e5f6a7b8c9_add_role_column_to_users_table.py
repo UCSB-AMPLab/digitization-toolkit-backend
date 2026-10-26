@@ -19,7 +19,6 @@ depends_on: Union[str, Sequence[str], None] = None
 
 
 def upgrade() -> None:
-    # Add role column to users table
     # server_default fills existing rows; nullable=False is safe with it present
     op.add_column(
         'users',
@@ -28,5 +27,4 @@ def upgrade() -> None:
 
 
 def downgrade() -> None:
-    # Remove role column from users table
     op.drop_column('users', 'role')

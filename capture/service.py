@@ -1,8 +1,11 @@
+# Version: 0.1.0-beta
+
 import sys
 from pathlib import Path
 import time
 import threading
-from datetime import datetime, timezone
+import tempfile
+import shutil
 import concurrent.futures
 from typing import Optional
 
@@ -10,7 +13,10 @@ from typing import Optional
 # Using stable names rather than mkstemp prevents unbounded accumulation when
 # the process is killed before the finally-block cleanup runs.
 _PREVIEW_TMP_DIR = Path("/tmp")
-_PREVIEW_PREFIX = "dtk_preview_c"
+_PREVIEW_PREFIX = "captua_preview_c"
+# The earlier name of these files. A unit updated from an earlier release can
+# still have such files in /tmp, so the flush removes them too.
+_OLD_PREVIEW_PREFIX = "dtk_preview_c"
 
 # Per-camera locks so concurrent polling requests serialise writes to the
 # shared fixed-path temp file.
@@ -29,12 +35,20 @@ if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
 from .utils import setup_rotating_logger, atomic_write
-from .camera import CameraConfig
+from .camera import CameraConfig, IMG_SIZES
 from .manifestHandler import generate_manifest_record, append_manifest_record
-from .backends import CameraBackend, RpicamBackend, Picamera2Backend, GPhoto2Backend
-from .project_manager import project_capture_root, image_output_dir
+from .backends import (
+    CameraBackend,
+    ChdkBackend,
+    GPhoto2Backend,
+    Picamera2Backend,
+    RpicamBackend,
+)
+from .project_manager import capture_manifest_root, ensure_volume_dirs, image_output_dir, projects_root
 
 from app.core.config import settings
+from app.core.capture_naming import capture_filename_index, capture_name_taken, files_carrying  # noqa: F401 (re-exported)
+from app.core.paths import is_raw_suffix, preview_sidecar_of
 
 LOG_FILE = settings.log_dir / "capture_service.log"
 LOG_FILE.parent.mkdir(parents=True, exist_ok=True)
@@ -56,7 +70,74 @@ if not _picamera2_logger.handlers:
         _picamera2_logger.setLevel(_logging.DEBUG)
         _picamera2_logger.addHandler(_rfh)
 
-# Initialize camera backend based on configuration
+class UnknownCameraBackend(RuntimeError):
+    """CAMERA_BACKEND names a backend this build cannot serve."""
+
+
+# The backends this build has, and the ONE place the list exists. Both the
+# dispatch and the startup assertion read this mapping, so a backend cannot be
+# added to one list and forgotten in a conditional elsewhere.
+_BACKEND_CONSTRUCTORS = {
+    "picamera2": Picamera2Backend,
+    "subprocess": RpicamBackend,
+    "gphoto2": GPhoto2Backend,
+    "chdk": ChdkBackend,
+}
+KNOWN_CAMERA_BACKENDS = tuple(sorted(_BACKEND_CONSTRUCTORS))
+
+
+def canonical_backend_name(value: str) -> str:
+    """The one definition of how a CAMERA_BACKEND value is read.
+
+    What is shared here is the RULE, not the source. If the startup assertion
+    tolerated surrounding whitespace while camera_registry.py did a bare
+    `.lower()`, `" gphoto2 "` would pass startup and then select the
+    picamera2 path, so a DSLR rig would detect no cameras -- a worse failure
+    than the one the tolerance prevents.
+
+    It deliberately does NOT read `settings` itself. There are two live
+    settings objects in a test run: conftest.py's set_camera_backend fixture
+    calls importlib.reload(app.core.config), which rebinds that module's
+    `settings` while every module holding `from app.core.config import
+    settings` keeps the one it imported. Existing tests patch both --
+    test_chdk_wiring.py patches this module's, the registry's tests patch
+    config's -- so a function that picked one of them would silently move
+    which object a caller consults. Each site reads its own object, and they
+    agree because they normalise the same way.
+    """
+    return value.strip().lower()
+
+
+def assert_camera_backend_configured() -> str:
+    """Return the configured backend's canonical name, or refuse.
+
+    There is no fallback. Defaulting to another backend (RpicamBackend, say)
+    gives a backend that is neither the one configured nor the one intended.
+    On a DSLR rig that yields no cameras and presents as a hardware fault, on
+    the machine furthest from help, so a typo in one line of .env would be
+    indistinguishable from a dead camera (NEH-268).
+
+    Called from the application's lifespan as well as from the dispatch below.
+    The dispatch alone is not enough: the backend is constructed lazily on the
+    first capture, so a check that lived only here would let the service start,
+    answer /health, and fail at the moment someone tried to photograph
+    something.
+    """
+    configured = canonical_backend_name(settings.CAMERA_BACKEND)
+    if configured not in _BACKEND_CONSTRUCTORS:
+        # The RAW value, from THE SAME object the check above read. A freshly
+        # imported `settings` can be the other live instance, whose value
+        # would name a backend nobody configured.
+        raise UnknownCameraBackend(
+            f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
+            f"a backend this build has. Valid values: "
+            f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env and restart. "
+            f"The service refuses to start rather than fall back, because a "
+            f"fallback to another backend presents as a dead camera."
+        )
+    return configured
+
+
 def get_camera_backend() -> CameraBackend:
     """
     Get the configured camera backend instance.
@@ -64,33 +145,73 @@ def get_camera_backend() -> CameraBackend:
     Returns:
         CameraBackend: The active camera backend implementation.
     """
-    backend_type = settings.CAMERA_BACKEND.lower()
-    
-    if backend_type == "picamera2":
-        return Picamera2Backend(subprocess_logger)
-    elif backend_type == "subprocess":
-        return RpicamBackend(subprocess_logger)
-    elif backend_type == "gphoto2":
-        return GPhoto2Backend(subprocess_logger)
-    else:
-        subprocess_logger.warning(f"Unknown backend '{backend_type}', defaulting to subprocess.")
-        return RpicamBackend(subprocess_logger)
+    return _BACKEND_CONSTRUCTORS[assert_camera_backend_configured()](subprocess_logger)
 
 # Global backend instance (lazy initialization)
 _backend: Optional[CameraBackend] = None
+_backend_lock = threading.Lock()
 
 def get_backend() -> CameraBackend:
-    """Get or initialize the global camera backend."""
+    """Get or initialize the global camera backend.
+
+    The lock covers the whole check-and-construct so two first callers on the
+    thread pool cannot each build their own instance. Stays lazy: nothing is
+    constructed until the first call, and a failed construction leaves the
+    global unset so the next call retries.
+    """
     global _backend
-    if _backend is None:
-        _backend = get_camera_backend()
-        subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
-    return _backend
+    with _backend_lock:
+        if _backend is None:
+            _backend = get_camera_backend()
+            subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+        return _backend
+
+
+def shutdown_backend() -> None:
+    """Close the camera backend, if one was ever built.
+
+    The DSLR and CHDK backends hold their bodies for the life of the process:
+    a PTP claim per camera, opened on first use and kept. cleanup() is what
+    waits for whatever is running on them and releases them, so it has to be
+    called when the application stops - see app/main.py's lifespan, which is
+    the only caller in production.
+
+    Never builds a backend: opening the cameras in order to close them would
+    be absurd, and on a machine with none attached it would fail the
+    shutdown. Never raises either - a backend that cannot be closed cleanly
+    is logged and let go, because the process is leaving anyway and a
+    shutdown that fails is worse than a session the kernel reclaims.
+
+    The global is cleared, so a process that keeps running after this (a test,
+    or a backend switch) builds a fresh one on the next call rather than
+    handing out the closed one - but only once the close has finished. The
+    lock is held across the cleanup for that reason: a camera is not free
+    until the close that releases it returns, and clearing the global first
+    would let a request arriving in that window build a backend that claimed
+    the same bodies while the old one was still closing them. So get_backend
+    waits here, which is the cost of never handing out a camera twice.
+    """
+    global _backend
+    with _backend_lock:
+        backend = _backend
+        if backend is None:
+            return
+        try:
+            backend.cleanup()
+            subprocess_logger.info(
+                f"Closed camera backend: {backend.get_backend_name()}"
+            )
+        except Exception as exc:
+            subprocess_logger.warning(
+                f"Error while closing the camera backend: {exc!r}"
+            )
+        finally:
+            _backend = None
 
 
 def is_camera_connected(camera_index: int = 0) -> bool:
     """
-    Check if the camera is connected using --list-cameras (fast, no initialization).
+    Check if the camera is connected, through the configured backend.
     
     Args:
         camera_index (int): The index of the camera to check (default is 0).
@@ -102,24 +223,27 @@ def is_camera_connected(camera_index: int = 0) -> bool:
 
 
 # EXIF Orientation tag values for clockwise rotations.
-# The image/sensor data is never modified; viewers that honour EXIF display the page upright, so the preservation master keeps full fidelity.
+# The pixel data is never modified; viewers that honour EXIF display the page upright.
 _EXIF_ORIENTATION_FOR_DEG = {
     90: 6,    # 90 deg CW  > EXIF "rotated 90 CW"
     180: 3,   # 180 deg    > EXIF "rotated 180"
     270: 8,   # 270 deg CW > EXIF "rotated 90 CCW"
 }
 
-# Offset of the EXIF Orientation tag within a CR2/JPEG EXIF block.
-# Tag ID 0x0112 = 274 decimal.
+# The EXIF Orientation tag, 0x0112 = 274 decimal.
 _EXIF_ORIENTATION_TAG = 0x0112
 
 
 def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
-    """Record a clockwise rotation losslessly via the EXIF Orientation tag.
+    """Record a clockwise rotation losslessly in a JPEG's EXIF Orientation tag.
 
-    Applies to JPEG and CR2 masters: the pixel/sensor data is never re-encoded,
-    only the orientation metadata is set, so the preservation master keeps full
-    fidelity. Skips 0 deg and unsupported file types.
+    Applies to a JPEG master and to a RAW master's `_preview.jpg`: the pixel
+    data is never re-encoded, only the orientation tag is set. A RAW master
+    (`.cr2`, `.dng`, `.raw`) is a preservation master and is left as the
+    camera wrote it; piexif can insert only into a JPEG in any case. Its
+    rotation is recorded beside it instead
+    (capture.camera.recorded_rotation). Skips 0 deg
+    and every file that is not a JPEG, silently.
     """
     deg = rotate_deg % 360
     if deg == 0:
@@ -128,7 +252,7 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
     exif_val = _EXIF_ORIENTATION_FOR_DEG.get(deg)
     if exif_val is None:
         return
-    if file_path.suffix.lower() not in (".jpg", ".jpeg", ".cr2"):
+    if file_path.suffix.lower() not in (".jpg", ".jpeg"):
         return
 
     try:
@@ -136,46 +260,75 @@ def _apply_rotation(file_path: Path, rotate_deg: int) -> None:
         exif_dict = piexif.load(str(file_path))
         exif_dict["0th"][_EXIF_ORIENTATION_TAG] = exif_val
         exif_bytes = piexif.dump(exif_dict)
-        # Durable: write the tag into a temp copy, then atomically replace the master
+        # Durable: write the tag into a temp copy, then atomically replace the file
         atomic_write(file_path, lambda tmp: piexif.insert(exif_bytes, str(file_path), tmp))
     except Exception as e:
-        subprocess_logger.warning(f"Could not set EXIF orientation on {file_path.name}: {e}")
+        # piexif raises some errors with no message (InvalidImageDataError), so name the type.
+        subprocess_logger.warning(
+            f"Could not set EXIF orientation on {file_path.name}: {type(e).__name__}: {e}")
+
+
+def _capture_paths(actual_path) -> list[Path]:
+    """Every file a backend reports for one capture, as Paths.
+
+    A multi-format capture (Picamera2Backend with raw) reports a
+    (jpeg_path, raw_path) tuple; each element is a file, and the tuple's
+    string form names none.
+    """
+    if isinstance(actual_path, (tuple, list)):
+        return [Path(str(p)) for p in actual_path]
+    return [Path(str(actual_path))]
+
+
+def _rotate_capture_files(paths: list[Path], rotate_deg: int) -> None:
+    """Record rotate_deg on every JPEG of a capture.
+
+    Each JPEG master gets the tag, and so does the `_preview.jpg` extracted
+    from a RAW master. The RAW master itself is passed to _apply_rotation
+    too, which leaves it as the camera wrote it.
+    """
+    if not rotate_deg:
+        return
+    for p in paths:
+        _apply_rotation(p, rotate_deg)
+        preview = preview_sidecar_of(p)
+        if is_raw_suffix(p) and preview.exists():
+            _apply_rotation(preview, rotate_deg)
 
 
 def image_filename(
-    camera_index: int, 
-    index: str = None,
+    camera_index: int,
+    index: str,
     img_size: tuple = None,
     image_encoding: str = "jpg") -> str:
     """
-    Generate a compact image filename with timestamp and camera index.
-    
+    The file name of one camera's image of a capture event.
+
     Examples:
-        - 20260104_035632_123_c1.jpg  (with milliseconds for uniqueness)
-        - 20260104_035632_123_c1_4624x3472.jpg  (with resolution)
-        - 0001_c1.jpg  (with custom index like "0001")
-    
+        - co-ahr-con-t055-img_0001_c1.jpg  (index "co-ahr-con-t055-img_0001")
+        - co-ahr-con-t055-img_0001_c1_4624x3472.jpg  (with resolution)
+
     Args:
-        camera_index (int): The camera index.
-        index (str): Custom index/counter. If None, uses UTC timestamp with ms.
-        include_resolution (bool): Whether to include resolution in filename.
-        img_size (tuple): The image size as (width, height), required if include_resolution=True.
+        camera_index (int): The camera index, appended as `_c<n>` on every capture.
+        index (str): The event's filename index (capture_filename_index). Required:
+            there is no timestamp fallback (exchange contract 1.1, section 3).
+        img_size (tuple): The image size as (width, height), appended when given.
+        image_encoding (str): The file suffix requested from the backend.
     Returns:
         str: The generated image filename.
     """
     if not index:
-        now = datetime.now(timezone.utc)
-        index = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
-    
+        raise ValueError("A capture's file name needs a filename index")
+
     filename = f"{index}_c{camera_index}"
-    
+
     if img_size:
         width, height = img_size
         filename += f"_{width}x{height}"
-    
+
     filename += image_encoding if image_encoding.startswith('.') else f".{image_encoding}"
     return filename
-    
+
 
 def capture_image(
         project_name: str,
@@ -184,67 +337,66 @@ def capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         capture_output: bool = False,
-        collection_name: Optional[str] = None) -> str:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None,
+        root: Optional[Path] = None) -> str:
     """
-    Capture an image using the rpicam-still command.
+    Capture an image with the configured camera backend.
     
     Args:
         project_name (str): The name of the project to save the image in.
         camera_config (CameraConfig): Camera configuration object with all capture settings.
-        output_filename (str): The name of the output image file (optional, auto-generated if None).
+        output_filename (str): The name of the output image file (image_filename). Required.
         check_camera (bool): Whether to check camera availability before capture (default is True).
-        include_resolution (bool): Include resolution in auto-generated filename (default is False).
+        include_resolution (bool): Unused; the caller puts any resolution in output_filename.
         capture_output (bool): Capture stderr/stdout for debugging (default is False for performance).
+        collection_name (str): The volume's name, for a volume without a stem (name-based layout).
+        stem (str): The volume's file name stem; the image goes to `<stem>/captures/`.
+        root (Path): The projects root, read once by the caller for the whole
+            capture; read here when not given.
     Returns:
-        str: The path to the captured image file.
+        tuple: (path, metadata). path is the captured file's path, or a tuple
+        of paths for a multi-format capture; metadata is None when the
+        backend returns a bare path.
     """
     
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
-    project_path = image_output_dir(project_name, collection_name)
+    if root is None:
+        root = projects_root()
+    if stem:
+        # All four, so the RAW backend finds `previews/` for the sidecar.
+        ensure_volume_dirs(stem, root)
+    project_path = image_output_dir(project_name, collection_name, stem, root)
     project_path.mkdir(parents=True, exist_ok=True)
     
     if not output_filename:
-        output_filename = image_filename(
-            camera_index=camera_config.camera_index,
-            img_size=camera_config.img_size if include_resolution else None,
-            image_encoding=camera_config.encoding
-        )
-    
+        raise ValueError("capture_image needs output_filename; there is no timestamp fallback")
+
     output_path = Path(project_path, output_filename)
 
-    # Never overwrite an existing master if a repeated timestamp collides
-    if output_path.exists():
-        stem, suffix = output_path.stem, output_path.suffix
-        counter = 1
-        while output_path.exists():
-            output_path = project_path / f"{stem}_{counter}{suffix}"
-            counter += 1
+    # Never overwrite a master or its sidecar. The caller takes a capture
+    # number no file carries (capture_name_taken), so this refuses only a
+    # name that was taken after that check, under any suffix, since the
+    # backend may change the suffix (gphoto2 writes `.cr2`).
+    if capture_name_taken(project_path, output_path.stem):
+        raise FileExistsError(f"A file named {output_path.stem} already exists in {project_path}")
 
-    # Use backend for actual capture
     backend = get_backend()
     result = backend.capture_image(output_path, camera_config, capture_output)
     
-    # Handle different return types
-    # Result is always (path_or_paths, metadata)
-    # path_or_paths can be:
+    # Result is (path_or_paths, metadata), or a bare path from the subprocess
+    # backend. path_or_paths can be:
     #   - single path string for JPEG/PNG only
-    #   - tuple (jpeg_path, dng_path) for multi-format
+    #   - tuple (jpeg_path, raw_path) for multi-format (picamera2 with raw)
     if isinstance(result, tuple) and len(result) == 2:
         actual_path, metadata = result
     else:
         actual_path, metadata = result, None
 
     # Apply clockwise rotation if requested (e.g. for portrait manuscripts)
-    rotate_deg = getattr(camera_config, "rotate_deg", 0)
-    if rotate_deg:
-        _apply_rotation(Path(str(actual_path)), rotate_deg)
-        # Also rotate the _preview.jpg extracted from CR2 if present
-        preview = Path(str(actual_path)).with_suffix("")
-        preview = preview.parent / (preview.name + "_preview.jpg")
-        if preview.exists():
-            _apply_rotation(preview, rotate_deg)
+    _rotate_capture_files(_capture_paths(actual_path), getattr(camera_config, "rotate_deg", 0))
 
     return actual_path, metadata
     
@@ -254,7 +406,10 @@ def single_capture_image(
         camera_config: CameraConfig,
         check_camera: bool = True,
         include_resolution: bool = False,
-        collection_name: Optional[str] = None) -> tuple:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None,
+        filename_index: Optional[str] = None,
+        root: Optional[Path] = None) -> tuple:
     """
     Capture an image from a single camera.
     
@@ -262,27 +417,47 @@ def single_capture_image(
         project_name (str): The name of the project to save the image in.
         camera_config (CameraConfig): Configuration for the camera.
         check_camera (bool): Whether to check camera availability before capture.
-        include_resolution (bool): Include resolution in auto-generated filename.
+        include_resolution (bool): Append the resolution to the file name.
+        filename_index (str): The event's `<stem>-img_<nnnn>` (capture_filename_index).
+            Required; the image is named `<filename_index>_c<camera index>.<ext>`.
+        root (Path): The projects root, read once by the caller; read here when not given.
     Returns:
         tuple: (output_path, capture_id, pair_id) - path to image and manifest IDs.
+            pair_id is None: a single capture has no pair.
     """
-    
+    if not filename_index:
+        raise ValueError("single_capture_image needs a filename_index; there is no timestamp fallback")
+
     if check_camera and not is_camera_connected(camera_config.camera_index):
         raise RuntimeError(f"Camera {camera_config.camera_index} is not connected.")
     
     start_time = time.time()
-    
+
+    # Read once: the image and its manifest record go under the same root
+    # even if an admin activates another drive while the shutter is open.
+    if root is None:
+        root = projects_root()
+
     output_path, metadata = capture_image(
         project_name=project_name,
         camera_config=camera_config,
+        output_filename=image_filename(
+            camera_index=camera_config.camera_index,
+            index=filename_index,
+            img_size=camera_config.img_size if include_resolution else None,
+            image_encoding=camera_config.encoding,
+        ),
         check_camera=False,  # Already checked
         include_resolution=include_resolution,
-        collection_name=collection_name
+        collection_name=collection_name,
+        stem=stem,
+        root=root
     )
     
     elapsed_time = time.time() - start_time
 
-    project_root = project_capture_root(project_name)
+    # The volume's own manifest for a volume with a stem, the project's otherwise
+    project_root = capture_manifest_root(project_name, stem, root)
 
     record = generate_manifest_record(
         project_name=project_name,
@@ -310,11 +485,89 @@ def _unlink_capture_output(path) -> None:
     parts = path if isinstance(path, (tuple, list)) else (path,)
     for p in parts:
         fp = Path(str(p))
-        for target in (fp, fp.with_name(fp.stem + "_preview.jpg")):
+        for target in (fp, preview_sidecar_of(fp)):
             try:
                 target.unlink(missing_ok=True)
             except OSError:
                 pass
+
+
+def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
+    """Take a real still for the dashboard's "Probar camaras" button and return it inline.
+
+    Exercises the same shutter/autofocus/backend path as POST /capture -
+    same registry-driven CameraConfig (default_camera_config_from_registry,
+    so a saved orientation still applies) and the same
+    get_backend().capture_image() call - but the file never lands under the
+    projects root: it is written to a throwaway temp directory that is
+    always removed before returning, and no manifest record is ever
+    generated or appended. This is a one-off test capture, not a document
+    capture, so it must never appear in a project's capture history.
+
+    Args:
+        camera_index: The index of the camera to test.
+        resolution: Resolution preset (see capture.camera.IMG_SIZES).
+
+    Returns:
+        tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
+            backend capture call, not config lookup or file cleanup.
+
+    Raises:
+        RuntimeError: if the camera is not connected (mirrors capture_image),
+            if the backend raises during capture (including a DSLR timeout -
+            see GPhoto2Backend.capture_image, which wraps CaptureTimeoutError
+            in a plain RuntimeError), or if a RAW capture
+            has no JPEG preview sidecar to return.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected.")
+
+    from .project_manager import default_camera_config_from_registry
+
+    config_dict, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+    camera_config = CameraConfig(**config_dict)
+
+    tmpdir = tempfile.mkdtemp(prefix="captua_testcap_")
+    try:
+        output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
+
+        start_time = time.perf_counter()
+        result = get_backend().capture_image(output_path, camera_config)
+        elapsed_time = time.perf_counter() - start_time
+
+        # Result is a (path_or_paths, metadata) pair from the picamera2,
+        # gphoto2 and CHDK backends, or a bare path from the subprocess
+        # backend; same
+        # two shapes capture_image (above) accepts.
+        if isinstance(result, tuple) and len(result) == 2:
+            actual_path, _metadata = result
+        else:
+            actual_path, _metadata = result, None
+
+        # The same rotation capture_image applies, so the test still shows
+        # the page the way a real capture would store it.
+        paths = _capture_paths(actual_path)
+        _rotate_capture_files(paths, getattr(camera_config, "rotate_deg", 0))
+
+        # Pick the bytes to return.
+        if isinstance(actual_path, (tuple, list)):
+            # Multi-format capture: (jpeg_path, raw_path) - return the jpeg.
+            image_bytes = paths[0].read_bytes()
+        else:
+            single_path = paths[0]
+            if is_raw_suffix(single_path):
+                sidecar = preview_sidecar_of(single_path)
+                if not sidecar.exists():
+                    raise RuntimeError(
+                        f"No JPEG preview available for RAW capture {single_path.name}"
+                    )
+                image_bytes = sidecar.read_bytes()
+            else:
+                image_bytes = single_path.read_bytes()
+
+        return image_bytes, elapsed_time
+    finally:
+        shutil.rmtree(tmpdir, ignore_errors=True)
 
 
 def dual_capture_image(
@@ -324,7 +577,11 @@ def dual_capture_image(
         check_camera: bool = True,
         include_resolution: bool = False,
         stagger_ms: int = 20,
-        collection_name: Optional[str] = None) -> tuple:
+        collection_name: Optional[str] = None,
+        stem: Optional[str] = None,
+        filename_index: Optional[str] = None,
+        root: Optional[Path] = None,
+        roles: Optional[list] = None) -> tuple:
     """
     Capture images from two cameras in parallel with independent configurations.
     
@@ -333,42 +590,52 @@ def dual_capture_image(
         cam1_config (CameraConfig): Configuration for camera 1.
         cam2_config (CameraConfig): Configuration for camera 2.
         check_camera (bool): Whether to check camera availability before capture.
-        include_resolution (bool): Include resolution in auto-generated filenames.
+        include_resolution (bool): Append each camera's resolution to its file name.
         stagger_ms (int): Delay in ms between starting cameras (default is 20ms).
+        filename_index (str): The event's `<stem>-img_<nnnn>` (capture_filename_index).
+            Required. Both images carry it, `_c0` and `_c1` telling them apart,
+            and it is the pair id.
+        root (Path): The projects root, read once by the caller; read here when not given.
+        roles (list): The manifest roles of cam1's and cam2's images, in that order,
+            as the caller records them in the database. ["left", "right"] when not given.
     Returns:
         tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
         
     Example:
         cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
         cam2 = CameraConfig(camera_index=1, hflip=True, awb="indoor")
-        path1, path2, capture_id, pair_id = dual_capture_image("myproject", cam1, cam2)
+        path1, path2, capture_id, pair_id = dual_capture_image(
+            "myproject", cam1, cam2, stem="co-ahr-con-t055",
+            filename_index="co-ahr-con-t055-img_0001")
     """
-    
+    if not filename_index:
+        raise ValueError("dual_capture_image needs a filename_index; there is no timestamp fallback")
+
     if check_camera:
         if not is_camera_connected(cam1_config.camera_index):
             raise RuntimeError(f"Camera {cam1_config.camera_index} is not connected.")
         if not is_camera_connected(cam2_config.camera_index):
             raise RuntimeError(f"Camera {cam2_config.camera_index} is not connected.")
         
-    # Pre-generate filenames with same timestamp index for pairing
-    now = datetime.now(timezone.utc)
-    timestamp_index = now.strftime("%Y%m%d_%H%M%S") + f"_{now.microsecond // 1000:03d}"
-    
+    # One filename index for the pair; `_c<n>` tells the two images apart.
     filename1 = image_filename(
         camera_index=cam1_config.camera_index,
-        index=timestamp_index,
+        index=filename_index,
         img_size=cam1_config.img_size if include_resolution else None,
         image_encoding=cam1_config.encoding
     )
     filename2 = image_filename(
         camera_index=cam2_config.camera_index,
-        index=timestamp_index,
+        index=filename_index,
         img_size=cam2_config.img_size if include_resolution else None,
         image_encoding=cam2_config.encoding
     )
     
     timing = {}
-    
+    # Read once for both cameras and the manifest record (see single_capture_image).
+    if root is None:
+        root = projects_root()
+
     def capture_with_timing(config, fname):
         start = time.time()
         path, metadata = capture_image(
@@ -378,13 +645,19 @@ def dual_capture_image(
             check_camera=False,  # Already checked
             include_resolution=include_resolution,
             capture_output=False,  # Max performance
-            collection_name=collection_name
+            collection_name=collection_name,
+            stem=stem,
+            root=root
         )
         elapsed = time.time() - start
         return path, elapsed, metadata
     
     results = {}
     errors = {}
+    # Wall time for the pair, not the sum of the two captures: the comparison
+    # that matters to the bench is how long the operator waits between pages
+    # (NEH-173), and the two shutters overlap.
+    pair_started = time.time()
     with concurrent.futures.ThreadPoolExecutor(max_workers=2) as executor:
         future1 = executor.submit(capture_with_timing, cam1_config, filename1)
         # Stagger second camera start (like bash script)
@@ -399,11 +672,28 @@ def dual_capture_image(
             except Exception as e:
                 errors[cfg.camera_index] = e
 
+    pair_wall = time.time() - pair_started
+
     if errors:
         # Partial/failed pair: any file already written has no manifest entry, so
         # unlink it rather than leave a manifest-less orphan that looks like a page.
         for path, _elapsed, _meta in results.values():
             _unlink_capture_output(path)
+        # A camera that failed may have written its file (or its RAW sidecar)
+        # before failing, and returned no path. The event's name was free when
+        # it was taken (take_filename_index), so every file now carrying it was
+        # written by this capture; each camera's are removed, except for a
+        # camera refused because its name was already taken, whose file is
+        # not this capture's.
+        output_dir = image_output_dir(project_name, collection_name, stem, root)
+        for idx in (cam1_config.camera_index, cam2_config.camera_index):
+            if isinstance(errors.get(idx), FileExistsError):
+                continue
+            for target in files_carrying(output_dir, f"{filename_index}_c{idx}"):
+                try:
+                    target.unlink(missing_ok=True)
+                except OSError:
+                    subprocess_logger.warning(f"Could not remove {target} after a failed dual capture")
         raise RuntimeError(
             "Dual capture failed on camera(s) "
             + "; ".join(f"cam{i}: {e}" for i, e in sorted(errors.items()))
@@ -412,12 +702,13 @@ def dual_capture_image(
     img1_path, time1, metadata1 = results[cam1_config.camera_index]
     img2_path, time2, metadata2 = results[cam2_config.camera_index]
 
-    project_root = project_capture_root(project_name)
+    project_root = capture_manifest_root(project_name, stem, root)
 
     record = generate_manifest_record(
         project_name=project_name,
-        pair_id=timestamp_index,
+        pair_id=filename_index,
         img_paths=[img1_path, img2_path],
+        roles=roles,
         cam_configs=[cam1_config, cam2_config],
         times=[time1, time2],
         stagger=stagger_ms,
@@ -428,47 +719,63 @@ def dual_capture_image(
     
     subprocess_logger.info(
         f"Parallel capture: cam{cam1_config.camera_index}={time1:.3f}s, cam{cam2_config.camera_index}={time2:.3f}s, "
+        f"pair_wall={pair_wall:.3f}s, "
         f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     
     return img1_path, img2_path, record.capture_id, record.pair_id
     
-def capture_preview_frame(camera_index: int) -> bytes:
+def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
-    Capture a low-resolution preview frame and return JPEG bytes.
+    Capture a live preview frame and return JPEG bytes.
 
     Not saved to the project directory - intended for live preview polling
-    from the frontend. Uses a stable per-camera temp file that is overwritten
-    on every call (rather than mkstemp), so at most one file per camera ever
-    exists in /tmp even if the process is killed unexpectedly.
+    from the frontend. Uses a stable per-camera temp path (rather than
+    mkstemp) that is removed after each call, so at most one file per camera
+    can ever be left in /tmp, and only if the process dies mid-call.
 
-    The preview uses a lightweight configuration:
-      - 1280x720 (native fast mode, no cropping)
-      - No autofocus cycle (too slow for live preview)
-      - No AE stabilisation wait
-      - No temporal denoise warmup
-      - Reduced JPEG quality (75) for a smaller payload
+    On picamera2 the frame is the second ("lores") stream of the still's own
+    configuration at ``resolution``: same sensor mode, same ScalerCrop, so the
+    preview's field of view is the capture's and nothing is reconfigured
+    between a poll and a capture of the same size. No autofocus cycle, no AE
+    stabilisation wait, no denoise warmup, and JPEG quality 75 for a smaller
+    polling payload.
 
     Args:
         camera_index: Camera index (0 or 1).
+        resolution: Key into IMG_SIZES ("low", "medium", "high") naming the
+            still whose configuration the preview rides on. Backends with
+            their own native preview (gphoto2) pick their own size and ignore
+            this.
 
     Returns:
         JPEG bytes of the preview frame.
 
     Raises:
+        ValueError: If ``resolution`` is not a known IMG_SIZES key.
         RuntimeError: If the camera is not connected or capture fails.
     """
+    img_size = IMG_SIZES.get(resolution)
+    if img_size is None:
+        raise ValueError(
+            f"Unknown resolution '{resolution}'; expected one of {sorted(IMG_SIZES)}"
+        )
+
     if not is_camera_connected(camera_index):
         raise RuntimeError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
+    is_picamera2 = isinstance(backend, Picamera2Backend)
+
     # If the backend has a native preview implementation (e.g. gphoto2), use it
-    # directly instead of the picamera2-specific CameraConfig path below.
-    try:
-        return backend.capture_preview(camera_index)
-    except NotImplementedError:
-        pass  # fall through to picamera2 path
+    # directly. Its signature takes no size, so it is called as the base class
+    # declares it.
+    if not is_picamera2:
+        try:
+            return backend.capture_preview(camera_index)
+        except NotImplementedError:
+            pass  # fall through to the generic capture_image path
 
     # Fixed per-camera path - overwrites the same file each poll cycle.
     # A per-camera lock serialises concurrent requests so two tabs never
@@ -476,9 +783,11 @@ def capture_preview_frame(camera_index: int) -> bytes:
     tmp_path = _PREVIEW_TMP_DIR / f"{_PREVIEW_PREFIX}{camera_index}.jpg"
     lock = _get_preview_lock(camera_index)
 
+    # Fallback for backends with neither a native preview nor a lores stream
+    # (rpicam subprocess): a small standalone capture.
     preview_config = CameraConfig(
         camera_index=camera_index,
-        img_size=(1280, 720),        # Native 80 fps mode - fast, no crop
+        img_size=(1280, 720),
         autofocus_on_capture=False,  # Skip AF cycle for live preview
         timeout=0,                   # No AE stabilisation wait
         denoise_frames=0,            # No temporal denoise warmup
@@ -490,6 +799,10 @@ def capture_preview_frame(camera_index: int) -> bytes:
     with lock:
         for attempt in range(2):
             try:
+                if is_picamera2:
+                    return backend.capture_preview(
+                        camera_index, img_size=img_size, tmp_path=tmp_path
+                    )
                 backend.capture_image(tmp_path, preview_config)
                 data = tmp_path.read_bytes()
                 return data
@@ -518,14 +831,20 @@ def flush_preview_tmp() -> int:
     Delete all stale preview temp files from /tmp.
 
     Useful when the server was previously killed without running cleanup,
-    leaving behind dtk_preview_c*.jpg files.  Safe to call at any time;
+    leaving behind captua_preview_c*.jpg or dtk_preview_c*.jpg files.  Safe
+    to call at any time;
     files in active use are simply recreated on the next polling cycle.
 
     Returns:
         Number of files deleted.
     """
     count = 0
-    for f in _PREVIEW_TMP_DIR.glob(f"{_PREVIEW_PREFIX}*.jpg"):
+    stale = [
+        f
+        for prefix in (_PREVIEW_PREFIX, _OLD_PREVIEW_PREFIX)
+        for f in _PREVIEW_TMP_DIR.glob(f"{prefix}*.jpg")
+    ]
+    for f in stale:
         try:
             f.unlink(missing_ok=True)
             subprocess_logger.info(f"Flushed stale preview temp file: {f}")
@@ -649,7 +968,6 @@ def main():
     Main entry point for testing the camera connectivity.
     """
     try:
-        # Check if cameras are connected
         cam0_connected = is_camera_connected(0)
         cam1_connected = is_camera_connected(1)
         

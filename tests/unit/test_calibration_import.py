@@ -1,8 +1,10 @@
 """Regression test for NEH-113: capture/calibration.py must not hard-import
-picamera2 at module load time. On non-Linux dev machines (macOS) the bare
-`from picamera2 import Picamera2` blew up import of the whole module; it
-must now guard the import the same way capture/backends/picamera2_backend.py
-does, and raise a clear RuntimeError if calibration is attempted without it.
+picamera2 at module load time. On non-Linux dev machines (macOS) a bare
+`from picamera2 import Picamera2` would fail the import of the whole module,
+so it guards the import the same way capture/backends/picamera2_backend.py
+does, and raises a clear RuntimeError if calibration is attempted without it.
+
+Version: 0.1.0-beta
 """
 
 import pytest

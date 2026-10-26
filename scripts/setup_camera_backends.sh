@@ -1,11 +1,11 @@
 #!/bin/bash
-# Setup script for DTK capture service dependencies
+# Setup script for the Captua capture service dependencies
 # This installs system packages required for camera backends
 
 set -e  # Exit on error
 
 echo "=================================================="
-echo "DTK Capture Service - Dependency Setup"
+echo "Captua capture service - dependency setup"
 echo "=================================================="
 echo ""
 
@@ -26,7 +26,6 @@ if ! grep -q "Raspberry Pi" /proc/cpuinfo 2>/dev/null; then
     fi
 fi
 
-# Function to check if package is installed
 check_installed() {
     dpkg -l "$1" &> /dev/null
     return $?
@@ -39,7 +38,7 @@ echo ""
 echo "Step 2: Installing system dependencies..."
 echo "----------------------------------------"
 
-# Required for both backends
+# Required for the subprocess and picamera2 backends
 COMMON_PACKAGES=(
     "python3-dev"          # Python development headers
     "libcap-dev"           # libcap development headers (for picamera2)
@@ -77,7 +76,10 @@ echo ""
 echo "Step 3: Setting up Python virtual environment..."
 echo "-----------------------------------------------"
 
-BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")" && pwd)"
+# The script lives in scripts/, one level below the backend root where
+# requirements.txt is, so the root is derived from the script's own path and
+# does not depend on the current directory.
+BACKEND_DIR="$(cd "$(dirname "${BASH_SOURCE[0]}")/.." && pwd)"
 VENV_DIR="$BACKEND_DIR/.venv"
 
 if [ -d "$VENV_DIR" ]; then
@@ -105,11 +107,9 @@ echo "----------------------------------------"
 
 source "$VENV_DIR/bin/activate"
 
-# Upgrade pip
 echo -e "${YELLOW}->${NC} Upgrading pip..."
 pip install --upgrade pip -q
 
-# Install requirements
 if [ -f "$BACKEND_DIR/requirements.txt" ]; then
     echo -e "${YELLOW}->${NC} Installing from requirements.txt..."
     pip install -r "$BACKEND_DIR/requirements.txt"
@@ -155,12 +155,14 @@ echo "Next steps:"
 echo "  1. Activate virtual environment:"
 echo "     source $VENV_DIR/bin/activate"
 echo ""
-echo "  2. Choose camera backend (optional):"
-echo "     export CAMERA_BACKEND=subprocess  # (default)"
-echo "     export CAMERA_BACKEND=picamera2   # (recommended for better performance)"
+echo "  2. Choose camera backend (optional; the default is picamera2):"
+echo "     export CAMERA_BACKEND=picamera2   # (default)"
+echo "     export CAMERA_BACKEND=subprocess"
+echo "     export CAMERA_BACKEND=gphoto2"
+echo "     export CAMERA_BACKEND=chdk"
 echo ""
-echo "  3. Run tests:"
-echo "     python capture/test_phase2_picamera2.py"
+echo "  3. Run the camera tests (needs the cameras connected):"
+echo "     python -m pytest tests/test_cameras.py -m camera"
 echo ""
 echo "  4. Start the service:"
 echo "     python -m uvicorn app.main:app --reload"

@@ -6,6 +6,8 @@ These exercise the endpoint through the FastAPI TestClient with the auth and
 DB dependencies overridden, and the privileged helper / subprocess mocked so
 nothing is ever actually powered off. Run with:
     python -m pytest tests/unit/test_system_power.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

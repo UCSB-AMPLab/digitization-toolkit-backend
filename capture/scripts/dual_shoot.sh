@@ -21,7 +21,6 @@ fi
 ms_now() { date +%s%3N; }
 iso_now() { date -u +"%Y-%m-%dT%H:%M:%S.%3NZ"; }
 
-# Compute SHA256 of a file
 sha256_of() {
   if command -v sha256sum >/dev/null 2>&1; then
     sha256sum "$1" | awk '{print $1}'
@@ -76,7 +75,6 @@ try_capture() {
   local ts_iso="$(iso_now)"
   local opts_joined="${EXTRA_OPTS[*]}"
 
-  # Logs
   echo "$ts_iso,$run_id,$DISTANCE_CM,$W,$H,cam0,$f0,$b0,$s0,$t0_start,$t0_end,$e0_ms,$TIMEOUT_MS,$ec0,\"$opts_joined\",$delta_start_ms" >> "$LOG"
   echo "$ts_iso,$run_id,$DISTANCE_CM,$W,$H,cam1,$f1,$b1,$s1,$t1_start,$t1_end,$e1_ms,$TIMEOUT_MS,$ec1,\"$opts_joined\",$delta_start_ms" >> "$LOG"
 

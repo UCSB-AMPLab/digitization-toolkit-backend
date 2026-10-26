@@ -9,7 +9,7 @@
 1. Run the automated setup script:
 ```bash
 cd /home/pi/dtk/backend
-./setup_camera_backends.sh
+./scripts/setup_camera_backends.sh
 ```
 
 This will install:
@@ -79,17 +79,14 @@ Run camera backend tests:
 ```bash
 source .venv/bin/activate
 
-# Test both backends
-python capture/test_phase2_picamera2.py
-
-# Test service integration
-python capture/test_phase1_integration.py
+# Needs the cameras connected
+python -m pytest tests/test_cameras.py -m camera
 ```
 
 ## Troubleshooting
 
 **Issue: `ModuleNotFoundError: No module named 'libcamera'`**
-- Solution: Run `./setup_camera_backends.sh` or manually link system packages
+- Solution: Run `./scripts/setup_camera_backends.sh` or manually link system packages
 
 **Issue: Camera not detected**
 - Verify hardware connection: `rpicam-hello --list-cameras`

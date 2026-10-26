@@ -11,6 +11,8 @@ This validates:
 6. All necessary imports are available
 
 Usage: python tests/validate_system.py
+
+Version: 0.1.0-beta
 """
 
 import sys
@@ -112,7 +114,6 @@ def validate_models():
         from app.models.camera import CameraSettings
         from app.models.project import Project
 
-        # Verify models can be instantiated
         proj = Project(name="test", description="test")
         doc = RecordImage(record_id=1, filename="test.jpg", file_path="/test", format="jpg")
         cs = CameraSettings(record_image_id=1, white_balance="auto")
@@ -129,16 +130,14 @@ def validate_capture_service():
     try:
         from capture.camera import CameraConfig, IMG_SIZES
         
-        # Verify presets
         assert len(IMG_SIZES) == 3, f"Expected 3 IMG_SIZES, got {len(IMG_SIZES)}"
         assert "low" in IMG_SIZES, "IMG_SIZES missing 'low'"
         assert "medium" in IMG_SIZES, "IMG_SIZES missing 'medium'"
         assert "high" in IMG_SIZES, "IMG_SIZES missing 'high'"
         
-        # Note: picamera2 and camera_registry only available on Raspberry Pi
-        # They require picamera2 which is not available on non-Pi systems
-        # This is expected and OK - validation passes as long as core
-        # service functions are importable on actual Pi hardware
+        # Camera detection through picamera2 works only on a Raspberry Pi, so
+        # this check covers the size presets and does not exercise the camera
+        # registry.
         
         print("[OK] (camera registry requires Raspberry Pi)")
         return True
@@ -149,7 +148,7 @@ def validate_capture_service():
 
 def main():
     print("\n" + "="*70)
-    print("DIGITIZATION TOOLKIT - SYSTEM VALIDATION")
+    print("CAPTUA - SYSTEM VALIDATION")
     print("="*70 + "\n")
     
     tests = [

@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from sqlalchemy import Column, Integer, String, DateTime, CheckConstraint
 from sqlalchemy.sql import func
 

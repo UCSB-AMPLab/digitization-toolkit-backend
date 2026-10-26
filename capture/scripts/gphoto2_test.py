@@ -3,7 +3,7 @@
 gphoto2 CLI tuning & diagnostics script for DSLR cameras (e.g. Canon EOS 1500D).
 
 Usage examples:
-  # Auto-detect cameras and show their settings
+  # Auto-detect connected cameras
   python3 gphoto2_test.py detect
 
   # Capture from a single camera
@@ -20,6 +20,8 @@ Usage examples:
 
   # Apply a known-good speed preset to a camera
   python3 gphoto2_test.py preset --port usb:003,005 [--port usb:001,005 ...]
+
+Version: 0.1.0-beta
 """
 
 import argparse

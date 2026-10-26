@@ -2,6 +2,8 @@
 Abstract base class for camera backends.
 
 Defines the interface that all camera backend implementations must follow.
+
+Version: 0.1.0-beta
 """
 
 from abc import ABC, abstractmethod
@@ -118,6 +120,23 @@ class CameraBackend(ABC):
         override to provide accurate enumeration for their hardware type.
         """
         return []
+
+    def rescan(self) -> list:
+        """
+        Re-detect hardware and drop stale state, then enumerate.
+
+        Called when a body has been power-cycled, unplugged or moved between
+        USB ports mid-session and the backend's cached view of the hardware
+        has to be rebuilt without restarting the process.
+
+        Backends without persistent sessions have no stale state to drop, so
+        this just enumerates. Backends that hold open device sessions should
+        override to reconcile them against the fresh detection first.
+
+        Returns:
+            list: The same device dicts list_devices() returns.
+        """
+        return self.list_devices()
 
     def capture_preview(self, camera_index: int) -> bytes:
         """

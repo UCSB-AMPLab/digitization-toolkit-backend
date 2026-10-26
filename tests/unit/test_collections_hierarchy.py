@@ -3,9 +3,11 @@
 Smoke test for GET /collections/{id}/hierarchy.
 
 The endpoint returns a collection with its nested children and a per-collection
-record count. This guards against a regression where the count query filtered a
-column that does not exist, so the endpoint returned 500 on every call.
+record count. The count query must filter on a column that exists; one that
+does not makes the endpoint return 500 on every call.
 Run with: python -m pytest tests/unit/test_collections_hierarchy.py
+
+Version: 0.1.0-beta
 """
 
 import pytest
@@ -41,7 +43,7 @@ def test_hierarchy_returns_200_with_record_count(read_client, db_session):
     db_session.commit()
     db_session.add(Collection(name="child", parent_collection_id=col.id))
     for i in range(3):
-        db_session.add(Record(title=f"r{i}", collection_id=col.id))
+        db_session.add(Record(title=f"r{i}", collection_id=col.id, capture_mode="single"))
     db_session.commit()
 
     resp = read_client.get(f"/collections/{col.id}/hierarchy")

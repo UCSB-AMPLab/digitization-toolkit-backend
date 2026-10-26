@@ -1,8 +1,11 @@
-"""Regression test for NEH-128: a traversal-laden project_name must not let the
-manifest write escape projects_dir.
+"""NEH-128: a traversal-laden project_name must not let the manifest write
+escape projects_dir.
 
-The manifest root is derived through secure_project_filename (fixed in NEH-45);
-these tests guard against a regression that would reintroduce a raw path join.
+`project_capture_root` derives the manifest root through
+`secure_project_filename` (NEH-45); a raw path join would let these names
+escape.
+
+Version: 0.1.0-beta
 """
 import pytest
 

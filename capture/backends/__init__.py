@@ -1,14 +1,17 @@
 """
 Camera backend abstraction layer.
 
-This module provides a unified interface for different camera backends
-(subprocess/rpicam-still and picamera2), allowing seamless switching
+This module provides a unified interface for the camera backends
+(subprocess/rpicam-still, picamera2, gphoto2 and CHDK), allowing switching
 between implementations.
+
+Version: 0.1.0-beta
 """
 
 from .base import CameraBackend
 from .subprocess_backend import RpicamBackend
 from .gphoto2_backend import GPhoto2Backend
+from .chdk_backend import ChdkBackend
 
 # picamera2 depends on simplejpeg which can raise ValueError on numpy ABI
 # mismatch at import time (e.g. pixi env vs system numpy).  Guard the import
@@ -26,4 +29,7 @@ except (ImportError, ValueError):
                 "Set CAMERA_BACKEND=gphoto2 or CAMERA_BACKEND=subprocess."
             )
 
-__all__ = ['CameraBackend', 'RpicamBackend', 'Picamera2Backend', 'GPhoto2Backend']
+__all__ = [
+    'CameraBackend', 'RpicamBackend', 'Picamera2Backend', 'GPhoto2Backend',
+    'ChdkBackend',
+]

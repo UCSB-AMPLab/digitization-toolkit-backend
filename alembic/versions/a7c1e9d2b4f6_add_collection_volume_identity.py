@@ -1,0 +1,214 @@
+"""add a volume's identity to collections
+
+Exchange contract 1.1 maps each Fisqua item onto a Captua volume, which is a
+row of `collections`. This revision gives the volume the columns that mapping
+writes to, and nothing that uses them: no stem assignment, no capture naming,
+no layout change, no import and no export.
+
+- `filename_stem`: the slug the volume's image file names are built from,
+  `<stem>-img_<nnnn>_c<n>`. Nullable, because no existing volume has one and
+  nothing generates one: an operator assigns it. Unique, by
+  `collections_filename_stem_key`, so two volumes cannot produce the same file
+  names. Two CHECKs:
+  - `check_collection_filename_stem_length`: at most 27 characters. The
+    contract reuses `<stem>-img_<nnnn>` as the pair id, and
+    `record_images.pair_id` is String(36); 36 less the nine characters of
+    `-img_0000` is 27. The model derives the same number from the column
+    (app/models/collection.py, FILENAME_STEM_MAX_LENGTH); a migration is a
+    snapshot, so it is written out here. The column itself is String(255),
+    so that an overlong stem is refused by this named CHECK on both engines
+    rather than by Postgres's varchar limit as a different kind of error.
+  - `check_collection_filename_stem_pattern`: a lowercase slug,
+    `^[a-z0-9]+(-[a-z0-9]+)*$`. On Postgres a POSIX regex with `~`. SQLite
+    has no regex operator unless one is registered, so there the same rule
+    is spelled with GLOB: only `[a-z0-9-]`, alphanumeric at both ends, no
+    `--`. Any other engine gets no pattern CHECK.
+- `external_id`: Fisqua's `referenceCode`. Nullable, unique and indexed by
+  one unique index, `ix_collections_external_id`, as `records.external_id` is.
+  Written once; that rule is on the model, since no CHECK can compare a new
+  value with the stored one. `check_collection_external_id_trimmed` refuses
+  an empty value and one that begins or ends with whitespace: `[[:space:]]`
+  regexes on Postgres (space, tab, newline, vertical tab, form feed, carriage
+  return, and depending on the locale other Unicode spaces), `trim()` with
+  those six characters on SQLite, and nothing on any other engine.
+- `date`, `date_start`, `date_end`: the display date and its queryable range,
+  the same columns `records` has, with `check_collection_date_range` refusing
+  an end before its start in the form `check_record_date_range` uses.
+- `sequence` and `custom_attributes` (Text holding JSON), as on `records`.
+- `capture_counter`: Integer, NOT NULL, server default 0, and
+  `check_collection_capture_counter` refusing a negative value. It counts
+  every capture the volume has ever had, superseded ones included, and is the
+  source of `<nnnn>`, so a number is never reused. That it never decreases is
+  on the model.
+
+The counter is backfilled from what each volume holds. One capture event is
+one `record_images.capture_id`: the capture path writes one manifest record
+per event, whose `capture_id` is a fresh UUID (capture/manifestHandler.py,
+CaptureRecord), and a dual capture gives both of its images that same
+`capture_id` (app/api/cameras.py), so a spread counts once. `pair_id` cannot
+be the key, because a single capture leaves it NULL. So for each volume the
+count is the number of distinct non-empty `capture_id`s among the images of
+its own records, plus one for each image with a NULL or empty `capture_id`
+(an upload that came with none). Superseded images (`is_current` false) count
+like current ones. Images in a nested volume's records count for that volume,
+not for its parent. A volume with no images gets 0.
+
+The backfill can only count images that still exist. A capture whose record
+was deleted before this revision left no row, so it is not counted, and a
+volume whose records were moved out counts what it holds now.
+
+It also drops `records.external_id` and its unique index,
+`ix_records_external_id`, which `c2d3e4f5a6b7` added. Under contract 1.1 the
+reference code belongs to the volume, so a record carries none; the column
+had no writer, and the frontend never read it. The downgrade adds it back,
+nullable, with the same unique index, and empty: any value it held before the
+upgrade is lost.
+
+Every column applies to every row the same way, nested volumes
+(`parent_collection_id`) included.
+
+The stem's rule, that once set it is fixed when the volume has captured
+(`capture_counter > 0` or any image), is on the model, for the same reason as
+external_id's.
+
+Written with batch_alter_table so the revision also runs on SQLite, which
+cannot add a constraint to an existing table; on Postgres batch mode emits
+plain ALTER TABLE statements and copies nothing.
+
+On upgrade nothing is lost: every existing row gets NULL in every new column
+but `capture_counter`, which is backfilled as above. NULLs do not collide
+under a unique constraint or index, and every CHECK passes on NULL or on a
+count, which is never negative.
+
+Downgrade drops the constraints, the index and the columns, and with them any
+stem, reference code, date range or capture count a volume holds. The count
+can be backfilled again from the images that remain, but numbers given to
+captures since deleted are not recoverable from it. On a unit at this revision
+none is written until an operator or the importer writes one; from then on a
+dump taken before the upgrade is the rollback mechanism -- see
+docs/releases/0.1.0-beta/migration-rehearsal.md in the workspace.
+"""
+from typing import Sequence, Union
+
+from alembic import op
+import sqlalchemy as sa
+
+
+# revision identifiers, used by Alembic.
+revision: str = 'a7c1e9d2b4f6'
+down_revision: Union[str, None] = 'f5a6b7c8d9e0'
+branch_labels: Union[str, Sequence[str], None] = None
+depends_on: Union[str, Sequence[str], None] = None
+
+
+STEM_PATTERN_POSTGRES = "filename_stem IS NULL OR filename_stem ~ '^[a-z0-9]+(-[a-z0-9]+)*$'"
+STEM_PATTERN_SQLITE = (
+    "filename_stem IS NULL OR ("
+    "filename_stem GLOB '[a-z0-9]*' AND filename_stem GLOB '*[a-z0-9]' "
+    "AND filename_stem NOT GLOB '*[^a-z0-9-]*' AND filename_stem NOT GLOB '*--*')"
+)
+
+
+# Distinct capture events among the images of each volume's own records: one
+# per distinct non-empty capture_id, one per image without one. COALESCE
+# because SUM over no rows is NULL.
+BACKFILL_CAPTURE_COUNTER = """
+UPDATE collections SET capture_counter = COALESCE((
+    SELECT COUNT(DISTINCT NULLIF(ri.capture_id, ''))
+           + SUM(CASE WHEN NULLIF(ri.capture_id, '') IS NULL THEN 1 ELSE 0 END)
+    FROM record_images ri
+    JOIN records r ON r.id = ri.record_id
+    WHERE r.collection_id = collections.id
+), 0)
+"""
+
+
+EXTERNAL_ID_TRIMMED_POSTGRES = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id !~ '^[[:space:]]' AND external_id !~ '[[:space:]]$')"
+)
+EXTERNAL_ID_TRIMMED_SQLITE = (
+    "external_id IS NULL OR (external_id <> '' "
+    "AND external_id = trim(external_id, char(32, 9, 10, 11, 12, 13)))"
+)
+
+
+def _external_id_trimmed_check():
+    dialect = op.get_bind().dialect.name
+    if dialect == 'postgresql':
+        return EXTERNAL_ID_TRIMMED_POSTGRES
+    if dialect == 'sqlite':
+        return EXTERNAL_ID_TRIMMED_SQLITE
+    return None
+
+
+def _stem_pattern_check():
+    dialect = op.get_bind().dialect.name
+    if dialect == 'postgresql':
+        return STEM_PATTERN_POSTGRES
+    if dialect == 'sqlite':
+        return STEM_PATTERN_SQLITE
+    return None
+
+
+def upgrade() -> None:
+    pattern = _stem_pattern_check()
+    trimmed = _external_id_trimmed_check()
+    with op.batch_alter_table('collections') as batch:
+        batch.add_column(sa.Column('filename_stem', sa.String(length=255), nullable=True))
+        batch.add_column(sa.Column('external_id', sa.String(length=255), nullable=True))
+        batch.add_column(sa.Column('date', sa.String(length=50), nullable=True))
+        batch.add_column(sa.Column('date_start', sa.Date(), nullable=True))
+        batch.add_column(sa.Column('date_end', sa.Date(), nullable=True))
+        batch.add_column(sa.Column('sequence', sa.Integer(), nullable=True))
+        batch.add_column(sa.Column('custom_attributes', sa.Text(), nullable=True))
+        batch.add_column(sa.Column('capture_counter', sa.Integer(), nullable=False,
+                                   server_default=sa.text('0')))
+        batch.create_check_constraint('check_collection_capture_counter', 'capture_counter >= 0')
+        batch.create_unique_constraint('collections_filename_stem_key', ['filename_stem'])
+        batch.create_index('ix_collections_external_id', ['external_id'], unique=True)
+        batch.create_check_constraint(
+            'check_collection_date_range',
+            'date_start IS NULL OR date_end IS NULL OR date_end >= date_start',
+        )
+        batch.create_check_constraint(
+            'check_collection_filename_stem_length',
+            'filename_stem IS NULL OR length(filename_stem) <= 27',
+        )
+        if pattern is not None:
+            batch.create_check_constraint('check_collection_filename_stem_pattern', pattern)
+        if trimmed is not None:
+            batch.create_check_constraint('check_collection_external_id_trimmed', trimmed)
+
+    op.execute(BACKFILL_CAPTURE_COUNTER)
+
+    with op.batch_alter_table('records') as batch:
+        batch.drop_index('ix_records_external_id')
+        batch.drop_column('external_id')
+
+
+def downgrade() -> None:
+    with op.batch_alter_table('records') as batch:
+        batch.add_column(sa.Column('external_id', sa.String(length=255), nullable=True))
+        batch.create_index('ix_records_external_id', ['external_id'], unique=True)
+
+    pattern = _stem_pattern_check()
+    trimmed = _external_id_trimmed_check()
+    with op.batch_alter_table('collections') as batch:
+        if trimmed is not None:
+            batch.drop_constraint('check_collection_external_id_trimmed', type_='check')
+        if pattern is not None:
+            batch.drop_constraint('check_collection_filename_stem_pattern', type_='check')
+        batch.drop_constraint('check_collection_filename_stem_length', type_='check')
+        batch.drop_constraint('check_collection_date_range', type_='check')
+        batch.drop_constraint('check_collection_capture_counter', type_='check')
+        batch.drop_index('ix_collections_external_id')
+        batch.drop_constraint('collections_filename_stem_key', type_='unique')
+        batch.drop_column('capture_counter')
+        batch.drop_column('custom_attributes')
+        batch.drop_column('sequence')
+        batch.drop_column('date_end')
+        batch.drop_column('date_start')
+        batch.drop_column('date')
+        batch.drop_column('external_id')
+        batch.drop_column('filename_stem')

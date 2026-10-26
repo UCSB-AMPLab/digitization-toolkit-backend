@@ -26,8 +26,9 @@ def init_db() -> None:
 **When adding/modifying models:**
 1. Update the model in `app/models/`
 2. Generate migration: `docker compose exec backend alembic revision --autogenerate -m "description"`
-3. Review the generated migration file
+3. Review the generated migration file — **read every operation and delete anything you did not intend**. Autogenerate emits drops for any table or column the models don't declare, which is how `project_members` was once dropped (`dda9bc1bc608`, restored in `ff2f751fadbb`)
 4. Apply: `docker compose exec backend alembic upgrade head`
+5. Confirm no drift is left: `docker compose exec backend alembic check` — it must print `No new upgrade operations detected`
 
 ### [INFO] Authentication & Security
 
@@ -86,6 +87,13 @@ docker compose exec backend alembic upgrade head
 docker compose exec backend alembic revision --autogenerate -m "description"
 ```
 
+### Check for schema drift (models vs. migrated database)
+```bash
+docker compose exec backend alembic upgrade head
+docker compose exec backend alembic check
+```
+Natively on the Pi, `pixi run db-check-drift` runs both.
+
 ### Check database tables
 ```bash
 docker compose exec backend python -c "from app.core.db import engine; from sqlalchemy import inspect; print(inspect(engine).get_table_names())"
@@ -98,7 +106,7 @@ docker compose exec backend python test_api.py
 
 ## Context for AI Assistants
 
-**Project Type:** Digitization toolkit for standalone Raspberry Pi deployment  
+**Project Type:** Captua, a digitization appliance for standalone Raspberry Pi deployment  
 **Environment:** Offline-capable, single-instance  
 **Database:** PostgreSQL with psycopg3  
 **Migrations:** Alembic (strict - no auto table creation)  

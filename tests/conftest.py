@@ -1,5 +1,7 @@
 """
-Pytest configuration and fixtures for DTK Backend tests.
+Pytest configuration and fixtures for the Captua backend tests.
+
+Version: 0.1.0-beta
 """
 
 import os
@@ -101,7 +103,6 @@ def override_projects_root(tmp_path, monkeypatch):
     test_projects_dir = tmp_path / "test_projects"
     test_projects_dir.mkdir(parents=True, exist_ok=True)
     
-    # Patch the environment variable
     monkeypatch.setenv("PROJECTS_ROOT", str(test_projects_dir))
     
     # Reload settings to pick up the new value
@@ -112,39 +113,80 @@ def override_projects_root(tmp_path, monkeypatch):
     return test_projects_dir
 
 
+def _is_camera_backend_unavailable(exc):
+    """
+    Return True if the given RuntimeError indicates the camera backend
+    itself is unavailable on this platform (as opposed to a camera simply
+    not being connected).
+
+    Matches the four sources of this RuntimeError:
+      - `Picamera2Backend.__init__` (capture/backends/picamera2_backend.py)
+        raises "Picamera2Backend requires Linux ..." when Picamera2 failed to
+        import off Linux (matched by the class name; "requires Linux" alone
+        would also match the unrelated "Transform requires Linux" in
+        `_still_config_args`).
+      - `Picamera2Backend.__init__` raises "picamera2 failed to import: ..."
+        when Picamera2 failed to import on Linux for a concrete reason.
+      - capture/backends/__init__.py substitutes a stub Picamera2Backend
+        whose constructor raises "picamera2 is not available on this
+        system ..." when the real backend module itself fails to import
+        (ImportError/ValueError from a numpy ABI mismatch).
+      - capture/calibration.py raises "picamera2 is not available on this
+        system" when _PICAMERA2_AVAILABLE is False.
+    """
+    message = str(exc)
+    return (
+        "Picamera2Backend" in message
+        or "picamera2 failed to import" in message
+        or "picamera2 is not available" in message
+    )
+
+
 @pytest.fixture
 def skip_if_no_camera():
     """
     Skip test if no cameras are detected.
-    
+
+    Also skips when the camera backend itself cannot be initialised on this
+    platform (see _is_camera_backend_unavailable).
+
     Usage:
         def test_camera_function(skip_if_no_camera):
             # Test will be skipped if no cameras found
             ...
     """
     from capture import is_camera_connected
-    
-    if not is_camera_connected(0):
-        pytest.skip("No camera detected - skipping hardware test")
+
+    try:
+        if not is_camera_connected(0):
+            pytest.skip("No camera detected - skipping hardware test")
+    except RuntimeError as e:
+        if _is_camera_backend_unavailable(e):
+            pytest.skip("Camera backend not available on this platform - skipping test")
+        else:
+            raise
 
 
 @pytest.fixture
 def skip_if_single_camera():
     """
     Skip test if fewer than 2 cameras are detected.
-    
+
+    Also skips when the camera backend itself cannot be initialised on this
+    platform (see _is_camera_backend_unavailable).
+
     Usage:
         def test_dual_camera_function(skip_if_single_camera):
             # Test will be skipped if not enough cameras
             ...
     """
     from capture import is_camera_connected
-    
+
     try:
         if not (is_camera_connected(0) and is_camera_connected(1)):
             pytest.skip("Dual cameras not detected - skipping test")
     except RuntimeError as e:
-        if "requires Linux" in str(e) or "Picamera2Backend" in str(e):
+        if _is_camera_backend_unavailable(e):
             pytest.skip("Camera backend not available on this platform - skipping test")
         else:
             raise
@@ -176,7 +218,6 @@ def set_camera_backend(monkeypatch, camera_backend_type):
     """
     monkeypatch.setenv("CAMERA_BACKEND", camera_backend_type)
     
-    # Reload settings
     from app.core import config
     import importlib
     importlib.reload(config)
@@ -207,16 +248,13 @@ def pytest_configure(config):
 def pytest_collection_modifyitems(config, items):
     """
     Modify test collection to add markers automatically.
-    
-    - Tests with "camera" in the name get @pytest.mark.camera
-    - Tests with "slow" in the name get @pytest.mark.slow
+
+    - Tests with "backend" in the node id get @pytest.mark.backend
+
+    The camera marker is added in the backend's root conftest.py, by file
+    (HARDWARE_TEST_FILES there), not here.
     """
     for item in items:
-        # Auto-mark camera tests
-        if "camera" in item.nodeid.lower():
-            item.add_marker(pytest.mark.camera)
-        
-        # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
 
@@ -228,7 +266,7 @@ def db_session(override_projects_root):
     """
     Create a test database session with fresh schema.
     
-    Each test gets its own in-memory SQLite database.
+    Each test gets its own SQLite database in a temporary file.
     """
     import tempfile
     from app.core.db import Base, engine, SessionLocal
@@ -237,19 +275,17 @@ def db_session(override_projects_root):
     # Import all models so their tables are registered on Base.metadata
     from app.models import (  # noqa: F401
         user, project, project_member, collection, record, camera, system_log,
+        offsite_object, fisqua,
     )
     
-    # Use temporary file-based SQLite for testing
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()  # release the handle; SQLite reopens the file by name
     test_db_url = f"sqlite:///{temp_db.name}"
     
     test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
     
-    # Create tables
     Base.metadata.create_all(test_engine)
     
-    # Create session
     SessionLocal.configure(bind=test_engine)
     session = SessionLocal()
     

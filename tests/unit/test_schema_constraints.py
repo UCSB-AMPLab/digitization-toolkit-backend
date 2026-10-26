@@ -7,10 +7,11 @@ enum-like status/role/level/category columns.
 
 SQLite (via db_session's create_all) enforces model-declared CHECK and
 UNIQUE constraints, so those are covered directly here. FK ondelete
-CASCADE is a Postgres-side behavior verified separately against the
-scratch database, not here.
+CASCADE is a Postgres-side behavior and is not tested here.
 
 Run with: python -m pytest tests/unit/test_schema_constraints.py
+
+Version: 0.1.0-beta
 """
 
 import pytest
@@ -91,7 +92,7 @@ def test_second_exif_data_row_for_same_record_image_raises_integrity_error(db_se
     db_session.add(proj)
     db_session.commit()
 
-    rec = Record(title="r", project_id=proj.id)
+    rec = Record(title="r", project_id=proj.id, capture_mode="single")
     db_session.add(rec)
     db_session.commit()
 
@@ -134,13 +135,13 @@ def test_valid_rows_commit_fine(db_session):
 
     pm = ProjectMember(project_id=proj.id, user_id=user.id, role="operator")
     log = SystemLog(level="ERR", category="capture", action="capture_failed")
-    rec = Record(title="r", project_id=proj.id, status="approved")
+    rec = Record(title="r", project_id=proj.id, status="approved", capture_mode="single")
     db_session.add_all([pm, log, rec])
     db_session.commit()
 
 
 # ==============================================================================
-# (4) API-level: schema tighten on RecordBase.status
+# (4) API level: RecordBase.status is validated
 # ==============================================================================
 
 def _contributor():
@@ -163,7 +164,7 @@ def contributor_client(client, db_session):
 def test_create_record_with_bogus_status_returns_422(contributor_client, db_session):
     # RecordCreate ignores `status` on the create path (Record() is built
     # without it in create_record), so this guards an otherwise-unused
-    # field - belt and suspenders alongside the DB-level CHECK constraint.
+    # field, alongside the DB-level CHECK constraint.
     resp = contributor_client.post("/records/", json={"title": "r", "status": "bogus"})
     assert resp.status_code == 422, resp.text
 

@@ -1,0 +1,237 @@
+"""The QC decisions migration (a5f0306a8f8c), on SQLite and, opt-in, on PostgreSQL.
+
+    python -m pytest tests/unit/test_fisqua_decisions_migration.py
+
+Version: 0.1.0-beta
+"""
+
+import importlib.util
+import os
+import uuid
+
+import pytest
+import sqlalchemy as sa
+from sqlalchemy.exc import IntegrityError
+
+REVISION = "a5f0306a8f8c"
+MIGRATION_FILE = f"{REVISION}_add_fisqua_decisions.py"
+STATUS_COLUMNS = {"decisions_id", "decisions_decided_at", "decisions_applied_at", "decisions_manifest_id",
+                  "decisions_report", "decisions_stale_id", "decisions_offered_id"}
+
+
+def _load(backend_root):
+    path = backend_root / "alembic" / "versions" / MIGRATION_FILE
+    spec = importlib.util.spec_from_file_location("fisqua_decisions_migration", path)
+    mod = importlib.util.module_from_spec(spec)
+    spec.loader.exec_module(mod)
+    return mod
+
+
+def _neighbours(engine):
+    md = sa.MetaData()
+    sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
+    sa.Table("fisqua_status", md, sa.Column("collection_id", sa.Integer, primary_key=True),
+             sa.Column("status_checked_at", sa.DateTime, nullable=False))
+    md.create_all(engine)
+
+
+def _run(engine, fn):
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    with engine.begin() as conn:
+        with Operations.context(MigrationContext.configure(conn)):
+            fn()
+
+
+def _exercise(engine, mod):
+    _neighbours(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO record_images (id) VALUES (1)"))
+        conn.execute(sa.text("INSERT INTO fisqua_status (collection_id, status_checked_at) VALUES (1, CURRENT_TIMESTAMP)"))
+    _run(engine, mod.upgrade)
+
+    insp = sa.inspect(engine)
+    assert "rotation_correction_quarter_turns" in {c["name"] for c in insp.get_columns("record_images")}
+    assert STATUS_COLUMNS <= {c["name"] for c in insp.get_columns("fisqua_status")}
+    for good in (None, 1, 2, 3):
+        with engine.begin() as conn:
+            conn.execute(sa.text("UPDATE record_images SET rotation_correction_quarter_turns = :q WHERE id = 1"),
+                         {"q": good})
+    for bad in (0, 4, -1):
+        with pytest.raises(IntegrityError), engine.begin() as conn:
+            conn.execute(sa.text("UPDATE record_images SET rotation_correction_quarter_turns = :q WHERE id = 1"),
+                         {"q": bad})
+
+    _run(engine, mod.downgrade)
+    insp = sa.inspect(engine)
+    assert "rotation_correction_quarter_turns" not in {c["name"] for c in insp.get_columns("record_images")}
+    assert not STATUS_COLUMNS & {c["name"] for c in insp.get_columns("fisqua_status")}
+    with engine.begin() as conn:
+        assert conn.execute(sa.text("SELECT count(*) FROM fisqua_status")).scalar() == 1
+
+
+@pytest.mark.unit
+def test_the_migration_chains_onto_the_fisqua_outbox(backend_root):
+    mod = _load(backend_root)
+    assert mod.revision == REVISION and mod.down_revision == "9b7087bd0bc5"
+
+
+@pytest.mark.unit
+def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, tmp_path):
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
+    try:
+        _exercise(engine, _load(backend_root))
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.unit
+def test_the_models_match_the_migration(backend_root, tmp_path):
+    """The added columns and check agree between the ORM and the migrated tables."""
+    from app.core.db import Base
+    import app.models.fisqua  # noqa: F401
+    import app.models.record  # noqa: F401
+
+    b = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
+    try:
+        _neighbours(b)
+        _run(b, _load(backend_root).upgrade)
+        insp = sa.inspect(b)
+        migrated = {c["name"]: (str(c["type"]), c["nullable"]) for c in insp.get_columns("fisqua_status")}
+        for name in STATUS_COLUMNS:
+            col = Base.metadata.tables["fisqua_status"].c[name]
+            assert migrated[name] == (str(col.type.compile(b.dialect)), col.nullable), name
+        col = Base.metadata.tables["record_images"].c["rotation_correction_quarter_turns"]
+        got = {c["name"]: (str(c["type"]), c["nullable"]) for c in insp.get_columns("record_images")}
+        assert got["rotation_correction_quarter_turns"] == (str(col.type.compile(b.dialect)), True)
+        checks = {c["name"] for c in insp.get_check_constraints("record_images")}
+        assert "check_record_image_rotation_correction" in checks
+        orm_checks = {c.name for c in Base.metadata.tables["record_images"].constraints
+                      if isinstance(c, sa.CheckConstraint)}
+        assert "check_record_image_rotation_correction" in orm_checks
+    finally:
+        b.dispose()
+
+
+@pytest.mark.unit
+def test_the_migration_upgrades_and_downgrades_on_postgresql(backend_root):
+    if "DATABASE_HOST" not in os.environ:
+        pytest.skip("opt-in: set DATABASE_* to a PostgreSQL server")
+    from sqlalchemy.exc import OperationalError
+
+    from app.core.db import DATABASE_URL
+
+    schema = f"captua_migtest_{uuid.uuid4().hex[:12]}"
+    admin = sa.create_engine(DATABASE_URL)
+    try:
+        with admin.begin() as conn:
+            conn.execute(sa.text(f'CREATE SCHEMA "{schema}"'))
+    except OperationalError as exc:
+        admin.dispose()
+        pytest.skip(f"DATABASE_* does not reach a PostgreSQL server: {exc.orig}")
+    engine = sa.create_engine(DATABASE_URL, connect_args={"options": f"-csearch_path={schema}"})
+    try:
+        _exercise(engine, _load(backend_root))
+    finally:
+        engine.dispose()
+        with admin.begin() as conn:
+            conn.execute(sa.text(f'DROP SCHEMA "{schema}" CASCADE'))
+        admin.dispose()
+
+
+# ---------------------------------------------------------------------------
+# SQLite with foreign keys enforced: the batch rebuild of record_images
+# ---------------------------------------------------------------------------
+
+def _fk_engine(path):
+    engine = sa.create_engine(f"sqlite:///{path}")
+
+    @sa.event.listens_for(engine, "connect")
+    def _on(dbapi_conn, _record):
+        dbapi_conn.execute("PRAGMA foreign_keys=ON")
+    return engine
+
+
+def _referenced(engine):
+    """record_images with rows that offsite_objects, camera_settings and exif_data reference."""
+    md = sa.MetaData()
+    sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
+    sa.Table("fisqua_status", md, sa.Column("collection_id", sa.Integer, primary_key=True),
+             sa.Column("status_checked_at", sa.DateTime, nullable=False))
+    sa.Table("offsite_objects", md, sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("record_image_id", sa.Integer, sa.ForeignKey("record_images.id", ondelete="SET NULL")))
+    for name in ("camera_settings", "exif_data"):
+        sa.Table(name, md, sa.Column("id", sa.Integer, primary_key=True),
+                 sa.Column("record_image_id", sa.Integer,
+                           sa.ForeignKey("record_images.id", ondelete="CASCADE"), nullable=False))
+    md.create_all(engine)
+    with engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO record_images (id) VALUES (1), (2)"))
+        conn.execute(sa.text("INSERT INTO offsite_objects (id, record_image_id) VALUES (1, 1), (2, 2)"))
+        conn.execute(sa.text("INSERT INTO camera_settings (id, record_image_id) VALUES (1, 1)"))
+        conn.execute(sa.text("INSERT INTO exif_data (id, record_image_id) VALUES (1, 2)"))
+
+
+def _references(engine):
+    with engine.begin() as conn:
+        return (conn.execute(sa.text("SELECT id, record_image_id FROM offsite_objects ORDER BY id")).all(),
+                conn.execute(sa.text("SELECT count(*) FROM camera_settings")).scalar(),
+                conn.execute(sa.text("SELECT count(*) FROM exif_data")).scalar())
+
+
+def _run_as_env(engine, fn):
+    """As alembic/env.py runs a migration: foreign keys off on SQLite, outside the transaction."""
+    from alembic.migration import MigrationContext
+    from alembic.operations import Operations
+
+    from app.core.db import sqlite_foreign_keys_off
+
+    with engine.connect() as conn:
+        with sqlite_foreign_keys_off(conn):
+            with conn.begin():
+                with Operations.context(MigrationContext.configure(conn)):
+                    fn()
+
+
+@pytest.mark.unit
+def test_the_rebuild_keeps_every_referencing_row_when_run_as_env_runs_it(backend_root, tmp_path):
+    engine = _fk_engine(tmp_path / "fk.db")
+    try:
+        _referenced(engine)
+        before = _references(engine)
+        mod = _load(backend_root)
+        _run_as_env(engine, mod.upgrade)
+        assert _references(engine) == before == ([(1, 1), (2, 2)], 1, 1)
+        _run_as_env(engine, mod.downgrade)
+        assert _references(engine) == before
+        with engine.connect() as conn:  # enforcement is back on afterwards
+            assert conn.exec_driver_sql("PRAGMA foreign_keys").scalar() == 1
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.unit
+def test_the_migration_refuses_to_rebuild_with_foreign_keys_enforced(backend_root, tmp_path):
+    """Run inside a transaction with enforcement on, it stops rather than let the DROP fire FK actions."""
+    engine = _fk_engine(tmp_path / "fk.db")
+    try:
+        _referenced(engine)
+        before = _references(engine)
+        with pytest.raises(RuntimeError, match="foreign keys"):
+            _run(engine, _load(backend_root).upgrade)
+        assert _references(engine) == before
+    finally:
+        engine.dispose()
+
+
+@pytest.mark.unit
+def test_sqlite_foreign_keys_off_leaves_other_dialects_alone():
+    from unittest import mock
+
+    from app.core.db import sqlite_foreign_keys_off
+    conn = mock.MagicMock()
+    conn.dialect.name = "postgresql"
+    with sqlite_foreign_keys_off(conn):
+        pass
+    conn.exec_driver_sql.assert_not_called()

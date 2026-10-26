@@ -6,6 +6,8 @@ Operators/reviewers may only delete annotations they created; admins may
 delete any annotation. Legacy annotations with no created_by recorded can
 still be deleted by anyone, since ownership can't be enforced on them.
 Run with: python -m pytest tests/unit/test_annotation_delete_creator_check.py
+
+Version: 0.1.0-beta
 """
 
 import pytest
@@ -29,7 +31,7 @@ def _client_as(client, username, role):
 def _make_annotation(db_session, created_by):
     from app.models.record import Record, RecordAnnotation
 
-    rec = Record(title="r", created_by="someone")
+    rec = Record(title="r", created_by="someone", capture_mode="single")
     db_session.add(rec)
     db_session.commit()
 

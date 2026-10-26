@@ -53,7 +53,6 @@ def upgrade() -> None:
     # This preserves all existing descriptive metadata
     connection = op.get_bind()
     
-    # Get all existing record_images
     result = connection.execute(sa.text("""
         SELECT id, title, description, object_typology, author, material, date, 
                custom_attributes, project_id, collection_id, created_at, uploaded_by
@@ -83,11 +82,9 @@ def upgrade() -> None:
             'created_by': row.uploaded_by
         })
         
-        # Get the ID of the just-created record
         new_record_id_result = connection.execute(sa.text("SELECT lastval()"))
         new_record_id = new_record_id_result.scalar()
         
-        # Link the RecordImage to the new Record
         connection.execute(sa.text("""
             UPDATE record_images SET record_id = :record_id WHERE id = :image_id
         """), {'record_id': new_record_id, 'image_id': row.id})

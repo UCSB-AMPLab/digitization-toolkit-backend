@@ -5,9 +5,12 @@ Alembic head silently uses a stale schema until some endpoint 500s in the field,
 with no operator around to diagnose it. This asserts at startup that the database
 is stamped at head, turning a late, obscure 500 into a clear, immediate failure.
 
-Set DTK_SKIP_SCHEMA_CHECK=1 to bypass (e.g. tooling that manages the schema out
-of band). If Alembic or the config cannot be loaded the check is skipped with a
+Set CAPTUA_SKIP_SCHEMA_CHECK=1 to bypass (e.g. tooling that manages the schema out
+of band); DTK_SKIP_SCHEMA_CHECK, the other name every setting has, is read
+when CAPTUA_SKIP_SCHEMA_CHECK is unset. If Alembic or the config cannot be loaded the check is skipped with a
 warning; only a genuine revision mismatch aborts startup.
+
+Version: 0.1.0-beta
 """
 
 import logging
@@ -25,14 +28,16 @@ class SchemaOutOfDateError(RuntimeError):
 
 
 def _skip_requested() -> bool:
-    val = os.environ.get("DTK_SKIP_SCHEMA_CHECK", "")
+    val = os.environ.get("CAPTUA_SKIP_SCHEMA_CHECK")
+    if val is None:
+        val = os.environ.get("DTK_SKIP_SCHEMA_CHECK", "")
     return val.strip().lower() not in ("", "0", "false", "no")
 
 
 def assert_schema_at_head() -> None:
     """Abort startup unless the database is migrated to the Alembic head revision."""
     if _skip_requested():
-        logger.warning("[INFO] Schema head check skipped (DTK_SKIP_SCHEMA_CHECK set)")
+        logger.warning("[INFO] Schema head check skipped (CAPTUA_SKIP_SCHEMA_CHECK set)")
         return
 
     try:
@@ -57,13 +62,20 @@ def assert_schema_at_head() -> None:
             current = set(MigrationContext.configure(conn).get_current_heads())
     except Exception as e:
         # An unreachable database is a distinct failure; surface it rather than mask it.
-        raise SchemaOutOfDateError(f"Could not read the database schema revision: {e}") from e
+        msg = (
+            f"Cannot start: the database is unreachable, so its schema revision could not be read ({e}). "
+            "Check that the database service is running and DATABASE_* settings are correct, then restart the backend."
+        )
+        logger.error(f"[ERROR] {msg}")
+        raise SchemaOutOfDateError(msg) from e
 
     if current == heads:
         logger.info(f"[OK] Database schema at head ({', '.join(sorted(heads)) or 'none'})")
         return
 
-    raise SchemaOutOfDateError(
-        f"Database schema is out of date: database at {sorted(current) or 'no revision'}, "
+    msg = (
+        f"Cannot start: database schema is out of date - database at {sorted(current) or 'no revision'}, "
         f"code expects head {sorted(heads)}. Run 'alembic upgrade head' (or update.sh) before starting the backend."
     )
+    logger.error(f"[ERROR] {msg}")
+    raise SchemaOutOfDateError(msg)

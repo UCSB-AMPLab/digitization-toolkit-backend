@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
 import logging
@@ -47,7 +49,15 @@ class CameraConfig:
     # Post-capture rotation applied to the saved file (degrees, clockwise).
     # 0 = landscape (default), 90 = portrait CW, 180 = upside-down, 270 = portrait CCW.
     rotate_deg: int = 0
-    # DSLR-only fields (gphoto2 backend). Ignored by picamera2/subprocess backends.
+    # Exposure and format fields for the camera-controlled backends.
+    # gphoto2 uses all four; the CHDK backend reads iso and shutter_speed and
+    # ignores aperture and image_format; picamera2/subprocess ignore all four.
+    #
+    # iso is the number printed in the camera's own ISO menu, not a real
+    # sensitivity: gphoto2 writes it straight to the camera's iso PTP widget,
+    # and the CHDK backend passes it to pychdk's shoot(market_iso=...), which
+    # converts it to a real sv96 on the camera and requests a script exposure
+    # override. Do not convert it here.
     iso: Optional[int] = None            # e.g. 400; None = camera default
     shutter_speed: Optional[str] = None  # e.g. "1/250" (PTP shutterspeed string)
     aperture: Optional[str] = None       # e.g. "5.6" (PTP aperture string)
@@ -66,7 +76,26 @@ class CameraConfig:
         return f"CameraConfig(cam{self.camera_index}, {self.img_size[0]}x{self.img_size[1]}, awb={self.awb})"
 
 
-# Helper functions for saving/loading camera configs
+# The rotations a body can be given (CameraRegistry.VALID_ORIENTATIONS).
+_VALID_ROTATIONS = (0, 90, 180, 270)
+
+
+def recorded_rotation(camera_config) -> Optional[int]:
+    """The clockwise rotation, in degrees, recorded beside an image this config captured.
+
+    One of 0, 90, 180, 270, the unit CameraConfig.rotate_deg and the
+    registry's per-body `orientation` hold, or None for any other value,
+    which capture.service._apply_rotation does not apply either. Recorded in the capture
+    record's `files` entries, on RecordImage, and in an export's
+    metadata.json, because a RAW master does not carry it in its own EXIF.
+    """
+    deg = getattr(camera_config, "rotate_deg", 0) or 0
+    if type(deg) is not int:
+        return None
+    deg %= 360
+    return deg if deg in _VALID_ROTATIONS else None
+
+
 def save_camera_configs(filepath: str, configs: dict):
     """
     Save camera configurations to a JSON file.
@@ -101,10 +130,11 @@ def load_camera_configs(filepath: str) -> dict:
         
     Example:
         configs = load_camera_configs("camera_setup.json")
-        path1, path2, _ = dual_capture_image(
+        path1, path2, capture_id, pair_id = dual_capture_image(
             "myproject",
             cam1_config=configs["left_camera"],
-            cam2_config=configs["right_camera"]
+            cam2_config=configs["right_camera"],
+            filename_index="co-ahr-con-t055-img_0001",
         )
     """
     import json

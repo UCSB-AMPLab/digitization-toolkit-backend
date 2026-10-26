@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timezone
@@ -14,6 +16,7 @@ backend_dir = Path(__file__).parent.parent
 if str(backend_dir) not in sys.path:
     sys.path.insert(0, str(backend_dir))
 
+from .camera import recorded_rotation
 from .utils import compute_sha256, setup_rotating_logger
 
 from app.core.config import settings
@@ -66,6 +69,11 @@ class CaptureFile:
     bytes: int
     mimetype: str = "image/jpeg"
     sha256: Optional[str] = None
+    # Clockwise rotation in degrees (0, 90, 180, 270) that displays the image
+    # upright: the capturing body's rotate_deg (capture.camera.recorded_rotation).
+    # A JPEG also carries it as its EXIF Orientation; a RAW master does not,
+    # since it is never rewritten. Records written before it lack the key.
+    rotate_deg: Optional[int] = None
 
 
 @dataclass
@@ -115,8 +123,6 @@ class CaptureRecord:
         return asdict(self)
 
 
-#### Helper functions ####
-
 def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[Path]) -> str:
     """Path of a captured file relative to the project root.
 
@@ -132,6 +138,33 @@ def _relative_capture_path(file_path: Union[str, Path], project_root: Optional[P
             pass
     return str(Path("images/main") / p.name)
 
+def _preview_file(master: Union[str, Path], role: str, project_root: Optional[Path],
+                  rotate_deg: Optional[int] = None) -> Optional["CaptureFile"]:
+    """The `<role>_preview` entry for a RAW master's `_preview.jpg` sidecar, or None when it has none.
+
+    The RAW backend extracts the sidecar inside capture_image, and the
+    rotation there rewrites it, both before the capture record is generated,
+    so the digest is of the bytes as they will stay. A JPEG master has no
+    sidecar whatever is beside it.
+    """
+    from app.core.paths import is_raw_suffix, preview_sidecar_of
+
+    path = Path(master)
+    if not is_raw_suffix(path):
+        return None
+    sidecar = preview_sidecar_of(path)
+    if not sidecar.is_file():
+        return None
+    return CaptureFile(
+        role=f"{role}_preview",
+        relative_path=_relative_capture_path(sidecar, project_root),
+        bytes=os.path.getsize(sidecar),
+        mimetype="image/jpeg",
+        sha256=compute_sha256(sidecar),
+        rotate_deg=rotate_deg,
+    )
+
+
 def generate_manifest_project(
     project_name: str,
     paths: Dict[str, str] = None,
@@ -145,13 +178,16 @@ def generate_manifest_project(
         project_name: Name of the project
         default_camera_config: Optional default CameraConfig.to_dict()
     """
+    from app.core.version import system_version
+
     return ProjectInfo(
         project_name=project_name,
         created_by=created_by or socket.gethostname(),
         paths=paths or {},
         software={
-            "tool": "digitization-toolkit",
-            "version": settings.app_version,
+            "tool": "captua",
+            # The release and revision (app.core.version), as the Fisqua manifest's systemVersion.
+            "version": system_version(),
         },
         default_camera_config=default_camera_config
     )
@@ -174,7 +210,7 @@ def generate_manifest_record(
         img_paths: List of captured image paths
         cam_configs: List of CameraConfig objects used
         times: List of capture times in seconds (optional)
-        pair_id: Shared ID for dual captures (optional, auto-generated)
+        pair_id: Shared ID for dual captures (optional; None for a single capture)
         stagger: Delay between camera starts in ms (optional)
         roles: List of role names (e.g., ["left", "right"] or ["single"])
                If None, auto-assigns based on number of captures
@@ -183,7 +219,6 @@ def generate_manifest_record(
     Returns:
         CaptureRecord object
     """
-    # Auto-assign roles if not provided
     if roles is None:
         if len(img_paths) == 1:
             roles = ["single"]
@@ -192,24 +227,23 @@ def generate_manifest_record(
         else:
             roles = [f"cam{i}" for i in range(len(img_paths))]
     
-    # Build files list
     # Handle both single paths and multi-format (JPEG+raw) tuples
     files = []
     for i, (path, config, role) in enumerate(zip(img_paths, cam_configs, roles)):
+        rotate_deg = recorded_rotation(config)
         # Check if path is a tuple (multi-format: JPEG + raw buffer)
         if isinstance(path, tuple):
             jpeg_path, raw_path = path
             
-            # Add JPEG file
             files.append(CaptureFile(
                 role=role,
                 relative_path=_relative_capture_path(jpeg_path, project_root),
                 bytes=os.path.getsize(jpeg_path),
                 mimetype=f"image/{config.encoding}",
-                sha256=compute_sha256(jpeg_path)
+                sha256=compute_sha256(jpeg_path),
+                rotate_deg=rotate_deg,
             ))
 
-            # Add raw sensor data file
             # Note: Using .raw extension due to picamera2 DNG save bug
             # Contains compressed raw sensor data (Pi 5) or packed pixels (Pi 4)
             files.append(CaptureFile(
@@ -217,19 +251,28 @@ def generate_manifest_record(
                 relative_path=_relative_capture_path(raw_path, project_root),
                 bytes=os.path.getsize(raw_path),
                 mimetype="application/octet-stream",  # Binary raw sensor data
-                sha256=compute_sha256(raw_path)
+                sha256=compute_sha256(raw_path),
+                rotate_deg=rotate_deg,
             ))
+            preview = _preview_file(raw_path, role, project_root, rotate_deg)
+            if preview is not None:
+                files.append(preview)
         else:
-            # Single format
             files.append(CaptureFile(
                 role=role,
                 relative_path=_relative_capture_path(path, project_root),
                 bytes=os.path.getsize(path),
                 mimetype=f"image/{config.encoding}",
-                sha256=compute_sha256(path)
+                sha256=compute_sha256(path),
+                rotate_deg=rotate_deg,
             ))
+            # A RAW master's preview is the image Fisqua's pipeline reads
+            # (exchange contract 1.1, section 4), so its digest is recorded
+            # here, with the master's, rather than in a record of its own.
+            preview = _preview_file(path, role, project_root, rotate_deg)
+            if preview is not None:
+                files.append(preview)
     
-    # Build cameras list with metadata
     cameras = []
     for config in cam_configs:
         # Key metadata by camera_index so an asymmetric-None result never misattributes it
@@ -240,7 +283,6 @@ def generate_manifest_record(
             camera_controls_metadata=metadata
         ))
     
-    # Build timing dict
     timing = {}
     if times:
         for i, t in enumerate(times):
@@ -256,6 +298,27 @@ def generate_manifest_record(
         timing=timing,
     )
     
+
+def _append_line(manifest_path: Path, line: bytes) -> None:
+    """Append one encoded JSONL line to a manifest in one O_APPEND write, fsynced.
+
+    If the file does not end with a newline (a power cut tore its last
+    line), a newline is written first, in the same write, so the torn line
+    stays a line of its own, which the index skips and logs, and never
+    swallows this record. Called under _manifest_append_lock.
+    """
+    fd = os.open(manifest_path, os.O_RDWR | os.O_CREAT | os.O_APPEND, 0o644)
+    try:
+        size = os.fstat(fd).st_size
+        if size and os.pread(fd, 1, size - 1) != b"\n":
+            line = b"\n" + line
+        mv = memoryview(line)
+        while mv:  # one O_APPEND write keeps the JSONL line atomic
+            mv = mv[os.write(fd, mv):]
+        os.fsync(fd)
+    finally:
+        os.close(fd)
+
 
 def append_manifest_record(project_root: Path, record: Union[CaptureRecord, ProjectInfo], record_type: str = "capture"):
     """
@@ -278,17 +341,129 @@ def append_manifest_record(project_root: Path, record: Union[CaptureRecord, Proj
     
     line = (json.dumps(record.to_dict(), ensure_ascii=False) + "\n").encode("utf-8")
     with _manifest_append_lock:
-        fd = os.open(manifest_path, os.O_WRONLY | os.O_CREAT | os.O_APPEND, 0o644)
-        try:
-            mv = memoryview(line)
-            while mv:  # one O_APPEND write keeps the JSONL line atomic
-                mv = mv[os.write(fd, mv):]
-            os.fsync(fd)
-        finally:
-            os.close(fd)
+        _append_line(manifest_path, line)
 
     if record_type == "project":
         subprocess_logger.info(f"Appended project record for '{record.project_name}' to manifest.")
     else:
         subprocess_logger.info(f"Appended capture record {record.capture_id} to manifest.")
         
+
+RELOCATION_RECORD_TYPE = "relocation"
+
+# A RAW preview's sha256 computed after capture, by
+# `python -m app.core.image_upload backfill-preview-digests` for previews
+# captured before capture recorded them (app.core.preview_digests).
+PREVIEW_DIGEST_RECORD_TYPE = "preview_digest"
+
+# Records that carry a capture id but are not capture records: the fixity
+# index reads them, but the export bag, the startup repair of a volume's
+# manifest and the index's set of captured ids do not count them.
+NON_CAPTURE_RECORD_TYPES = frozenset({RELOCATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE})
+
+
+def is_capture_record(entry) -> bool:
+    """Whether a decoded manifest line is a capture record (an upload record is one)."""
+    return isinstance(entry, dict) and entry.get("record_type") not in NON_CAPTURE_RECORD_TYPES
+
+
+def append_relocation_record(project_root: Path, capture_id: str, from_rel: str, to_rel: str, *,
+                             image_id: int, sha256: str) -> None:
+    """Append to the project's capture manifest that a captured file now lives under another name.
+
+    The manifest is append-only, so a file that is moved and renamed after
+    capture keeps its capture-time sha256 through this record rather than by
+    rewriting its capture record: `{"record_type": "relocation", "capture_id",
+    "image_id", "sha256", "from", "to", "relocated_at"}`, both paths relative
+    to `project_root` as the capture record's `relative_path` is. `image_id`
+    is the RecordImage id and `sha256` the capture-time checksum the system
+    held for that image when it was renamed, so app.core.integrity resolves
+    the image's checksum from this one record, in any order and whatever
+    names later renames reuse. `relocated_at` is information only. The line
+    is written with one O_APPEND write and fsynced, as append_manifest_record
+    writes.
+    """
+    metadata_dir = project_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    manifest_path = metadata_dir / "manifest.jsonl"
+    payload = {
+        "record_type": RELOCATION_RECORD_TYPE,
+        "capture_id": capture_id,
+        "image_id": image_id,
+        "sha256": sha256,
+        "from": from_rel,
+        "to": to_rel,
+        "relocated_at": datetime.now(timezone.utc).isoformat(),
+    }
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(manifest_path, line)
+
+
+UPLOAD_RECORD_TYPE = "upload"
+
+
+def append_upload_record(volume_root: Path, *, capture_id: Optional[str], relative_path: str,
+                         size: int, mimetype: str, sha256: str) -> None:
+    """Append to a volume's capture manifest that an image was uploaded into it.
+
+    POST /records/{id}/images names the file `<stem>-img_<nnnn>_c0.<ext>`
+    with a number from the volume's counter, and this record is what keeps
+    that number from being given again once the image is deleted
+    (app.core.capture_naming.manifest_capture_numbers reads it). It has the
+    shape of a capture record, so every reader of the manifest treats it as
+    one: `{"record_type": "upload", "capture_id", "timestamp_utc", "files":
+    [{"role": "single", "relative_path", "bytes", "mimetype", "sha256"}]}`,
+    the path relative to `volume_root` as a capture record's is.
+    `capture_id` is the one the client sent with the upload, or the uuid4
+    the upload endpoint gives an upload sent without one, and is the image
+    row's too; the readers that key on it (the fixity index, the export bag,
+    the startup repair of a volume's manifest) read the record as a capture
+    record. The line is
+    written with one O_APPEND write and fsynced, a newline first if the last
+    line is torn, as append_manifest_record writes.
+    """
+    metadata_dir = volume_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    payload = {
+        "record_type": UPLOAD_RECORD_TYPE,
+        "capture_id": capture_id,
+        "timestamp_utc": datetime.now(timezone.utc).isoformat(),
+        "files": [{
+            "role": "single",
+            "relative_path": relative_path,
+            "bytes": size,
+            "mimetype": mimetype,
+            "sha256": sha256,
+        }],
+    }
+    line = (json.dumps(payload, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(metadata_dir / "manifest.jsonl", line)
+
+
+# The temp name of a whole-file manifest rewrite, which append_manifest_lines
+# does not perform; a leftover is removed at startup (app.core.volume_layout).
+MANIFEST_PART_NAME = "manifest.jsonl.part"
+
+
+def append_manifest_lines(root: Path, lines: list) -> None:
+    """Append already-encoded JSONL lines to `<root>/metadata/manifest.jsonl`, in one write, fsynced.
+
+    For records copied from another manifest (app.core.volume_layout). The
+    lines go through _append_line, as a capture record does: a newline
+    first if the last line is torn, then the lines in one O_APPEND write.
+    A power cut can tear the copy's last line; that line stays apart as
+    junk, which the index skips and logs, and the next startup's repair
+    finds the record missing and appends it again. The manifest is never
+    rewritten or renamed: on exFAT or vfat drives a rename over an existing
+    file is not shown to be crash-atomic, and this may be the volume's only
+    manifest. Each line is one JSON object without its newline.
+    """
+    if not lines:
+        return
+    metadata_dir = root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    data = "".join(line + "\n" for line in lines).encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(metadata_dir / "manifest.jsonl", data)

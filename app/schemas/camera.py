@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from typing import Optional
 from pydantic import BaseModel
 from datetime import datetime

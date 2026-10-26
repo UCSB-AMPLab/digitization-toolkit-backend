@@ -85,7 +85,7 @@ pip install -r requirements.txt
 Run the setup script to handle all dependencies:
 
 ```bash
-./setup_camera_backends.sh
+./scripts/setup_camera_backends.sh
 ```
 
 This script will:

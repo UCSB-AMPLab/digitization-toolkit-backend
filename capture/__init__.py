@@ -1,7 +1,9 @@
 """
-DTK Capture Module
+Captua capture module
 
 Provides camera capture services with multiple backend support.
+
+Version: 0.1.0-beta
 """
 
 from .camera import CameraConfig

@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 import hashlib
 import os
 import logging
@@ -54,8 +56,7 @@ def atomic_write(final_path, write_fn: Callable[[str], None]) -> str:
 def compute_sha256(file_path: str) -> str:
     """
     Compute SHA256 hash of a file.
-    
-    Reference: https://github.com/github-copilot/code_referencing?cursor=20401bb2b76e5586f3eb23414fa0a226
+
     Args:
         file_path: Path to the file.
     Returns:

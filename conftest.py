@@ -1,5 +1,7 @@
 """
-Pytest configuration and fixtures for DTK Backend tests.
+Pytest configuration and fixtures for the Captua backend tests.
+
+Version: 0.1.0-beta
 """
 
 import os
@@ -100,7 +102,6 @@ def override_projects_root(tmp_path, monkeypatch):
     test_projects_dir = tmp_path / "test_projects"
     test_projects_dir.mkdir(parents=True, exist_ok=True)
     
-    # Patch the environment variable
     monkeypatch.setenv("PROJECTS_ROOT", str(test_projects_dir))
     
     # Reload settings to pick up the new value
@@ -197,19 +198,32 @@ def pytest_configure(config):
     )
 
 
+# The files whose tests need camera hardware. Every test in them gets
+# @pytest.mark.camera, which CI deselects with -m "not camera". Marking by
+# file, not by the word "camera" in a test's node id, keeps tests that only
+# talk about cameras (fakes, refusals before any camera is touched) in CI.
+# The match is on the file part of the node id, which pytest gives relative
+# to the rootdir (this directory, where pytest.ini is), so these paths are
+# written from here. The only place the camera marker is added automatically
+# (tests/conftest.py does not repeat it).
+HARDWARE_TEST_FILES = (
+    "tests/test_cameras.py",
+    "tests/integration/test_camera_capture_recapture_hardware.py",
+    "tests/integration/test_capture_integration.py",
+)
+
+
 def pytest_collection_modifyitems(config, items):
     """
     Modify test collection to add markers automatically.
-    
-    - Tests with "camera" in the name get @pytest.mark.camera
-    - Tests with "slow" in the name get @pytest.mark.slow
+
+    - Tests in HARDWARE_TEST_FILES get @pytest.mark.camera
+    - Tests with "backend" in the node id get @pytest.mark.backend
     """
     for item in items:
-        # Auto-mark camera tests
-        if "camera" in item.nodeid.lower():
+        if item.nodeid.split("::", 1)[0] in HARDWARE_TEST_FILES:
             item.add_marker(pytest.mark.camera)
         
-        # Auto-mark backend tests
         if "backend" in item.nodeid.lower():
             item.add_marker(pytest.mark.backend)
 
@@ -221,7 +235,7 @@ def db_session(override_projects_root):
     """
     Create a test database session with fresh schema.
     
-    Each test gets its own in-memory SQLite database.
+    Each test gets its own temporary file-based SQLite database.
     """
     import tempfile
     from app.core.db import Base, engine, SessionLocal
@@ -233,10 +247,8 @@ def db_session(override_projects_root):
     
     test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
     
-    # Create tables
     Base.metadata.create_all(test_engine)
     
-    # Create session
     SessionLocal.configure(bind=test_engine)
     session = SessionLocal()
     
