@@ -67,7 +67,8 @@ def test_capture_performance(override_projects_root, skip_if_single_camera):
     Performance test to ensure capture times meet targets.
     
     Critical for production use where hundreds of pages are scanned daily.
-    Target: < 3.0 seconds per dual capture for good user experience.
+    Target: average under 5.0 seconds per dual capture; slower only warns,
+    and the test fails above 15 seconds.
     """
     project_name = "test_performance"
     
