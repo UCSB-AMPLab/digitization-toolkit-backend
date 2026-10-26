@@ -253,6 +253,8 @@ _INSECURE_SECRET_KEYS = {
     "",
     "dev-secret-change-me",
     "secret-key-here-change-in-production",
+    # Shipped in .env.example until 2026-07-25; units provisioned then may still carry it.
+    "your-secret-key-here-change-in-production",
 }
 
 # Environments exempt from the production guards; anything else must set real secrets
