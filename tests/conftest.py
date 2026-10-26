@@ -1,5 +1,5 @@
 """
-Pytest configuration and fixtures for DTK Backend tests.
+Pytest configuration and fixtures for the Captua backend tests.
 """
 
 import os

@@ -770,7 +770,7 @@ class Picamera2Backend(CameraBackend):
         own_tmp = tmp_path is None
         if own_tmp:
             handle, generated = tempfile.mkstemp(
-                prefix=f"dtk_preview_frame_c{camera_index}_", suffix=".jpg"
+                prefix=f"captua_preview_frame_c{camera_index}_", suffix=".jpg"
             )
             os.close(handle)
             tmp_path = Path(generated)

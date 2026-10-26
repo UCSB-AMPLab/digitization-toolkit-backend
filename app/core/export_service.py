@@ -39,6 +39,12 @@ FREE_SPACE_MARGIN = 100 * 1024 * 1024
 METADATA_SCHEMA_VERSION = 2
 
 
+def source_organization(project) -> str:
+    """The bag's Source-Organization: the project's name, or the software's
+    name for a collection with no project."""
+    return project.name if project else "Captua"
+
+
 def workflow_blockers(records) -> tuple[str, list[int]] | None:
     """Why a collection's workflow state forbids an export, or None.
 
@@ -210,7 +216,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
 
         payload_files = [(resolved, rel) for rel, resolved, _ in to_copy]
         bag_info = {
-            "Source-Organization": project.name if project else "Digitization Toolkit",
+            "Source-Organization": source_organization(project),
             "External-Description": collection.description or collection.name,
             "Bagging-Date": timestamp[:8],
             "External-Identifier": f"collection-{collection_id}",

@@ -14,7 +14,7 @@ package loggers keep propagating, so pytest's caplog and any root handler still
 see their records.
 
 The `capture_service` and `project_manager` loggers are outside both packages
-and keep writing only to their rotating files under DTK_LOG_DIR.
+and keep writing only to their rotating files under CAPTUA_LOG_DIR.
 """
 
 import logging
@@ -23,7 +23,7 @@ import sys
 from app.core.config import settings
 
 APP_LOGGERS = ("app", "capture")
-HANDLER_NAME = "dtk-stderr"
+HANDLER_NAME = "captua-stderr"
 FORMAT = "%(levelname)s %(name)s: %(message)s"
 
 
@@ -71,6 +71,6 @@ def configure_logging(level: str | None = None) -> logging.Handler:
 
     if not known:
         logging.getLogger("app.core.logging_setup").warning(
-            "DTK_LOG_LEVEL=%r is not a logging level; using INFO", requested
+            "CAPTUA_LOG_LEVEL=%r is not a logging level; using INFO", requested
         )
     return handler

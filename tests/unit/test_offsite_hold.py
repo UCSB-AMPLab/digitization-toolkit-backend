@@ -61,7 +61,7 @@ def test_the_hold_file_defaults_to_offsite_hold_in_the_data_dir(db_session, monk
     from app.core.offsite_hold import hold_file
 
     monkeypatch.setattr(config.settings, "OFFSITE_HOLD_FILE", "")
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", "/var/lib/dtk")
+    monkeypatch.setattr(config.settings, "DATA_DIR", "/var/lib/dtk")
     assert str(hold_file()) == "/var/lib/dtk/offsite-hold"
 
     monkeypatch.setattr(config.settings, "OFFSITE_HOLD_FILE", str(tmp_path / "elsewhere"))
@@ -72,7 +72,7 @@ def test_the_hold_file_defaults_to_offsite_hold_in_the_data_dir(db_session, monk
 def test_the_setting_is_read_from_its_environment_name(monkeypatch, tmp_path):
     from app.core.config import Settings
 
-    monkeypatch.setenv("DTK_OFFSITE_HOLD_FILE", str(tmp_path / "h"))
+    monkeypatch.setenv("CAPTUA_OFFSITE_HOLD_FILE", str(tmp_path / "h"))
     assert Settings(_env_file=None).OFFSITE_HOLD_FILE == str(tmp_path / "h")
 
 

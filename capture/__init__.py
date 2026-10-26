@@ -1,5 +1,5 @@
 """
-DTK Capture Module
+Captua capture module
 
 Provides camera capture services with multiple backend support.
 """

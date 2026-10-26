@@ -227,7 +227,7 @@ def test_an_upload_into_a_stemmed_volume_on_an_unusable_override_creates_nothing
     from app.api import records
     from app.models.record import Record
 
-    monkeypatch.setattr(records.settings, "DTK_DATA_DIR", str(tmp_path / "data2"))
+    monkeypatch.setattr(records.settings, "DATA_DIR", str(tmp_path / "data2"))
     gone = tmp_path / "unplugged" / "projects"
     monkeypatch.setattr(storage_override, "get_storage_override_or_fallback", lambda: (str(gone), False))
     rec = db_session.query(Record).filter(Record.collection_id == legacy["a1"].id).first()

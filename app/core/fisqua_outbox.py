@@ -1,7 +1,7 @@
 """Delivering each handed-over volume's capture manifest to Fisqua, and polling its status (contract 1.2).
 
 Every call is the unit's: HTTPS to `<tenant>.fisqua.org` (or the staging
-host) with this unit's token (DTK_FISQUA_ENV, DTK_FISQUA_TOKEN; see
+host) with this unit's token (CAPTUA_FISQUA_ENV, CAPTUA_FISQUA_TOKEN; see
 app.core.config). The HTTP calls and the reading of Fisqua's answers are in
 app.core.fisqua_http, and every name on Fisqua's side in
 app.core.fisqua_contract. Here:
@@ -43,7 +43,7 @@ app.core.fisqua_contract. Here:
   unit with reason `version` until the software changes or Fisqua reads
   its manifests again. Nothing is built meanwhile, and manifests built but
   never sent are built again under new ids, except for a retest: every
-  DTK_FISQUA_RETRY_MAX seconds (six hours) from the stop or the last
+  CAPTUA_FISQUA_RETRY_MAX seconds (six hours) from the stop or the last
   retest, one manifest, for the oldest volume handed over and received, is
   built and sent as any other (_retest_version_stop). If Fisqua accepts it
   the stop is removed; refused again for version, the stop holds for
@@ -143,7 +143,7 @@ def _token() -> str:
 
 
 def fisqua_environment() -> Optional[str]:
-    """`production` or `staging`, or None when DTK_FISQUA_ENV is empty or names neither."""
+    """`production` or `staging`, or None when CAPTUA_FISQUA_ENV is empty or names neither."""
     env = config.settings.FISQUA_ENV.strip().lower()
     return env if env in fc.ENVIRONMENTS else None
 
@@ -172,7 +172,7 @@ _warned_overrides: set = set()
 
 
 def _usable_override(value: str) -> Optional[str]:
-    """DTK_FISQUA_BASE_URL when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
+    """CAPTUA_FISQUA_BASE_URL when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
     from urllib.parse import urlsplit
 
     try:
@@ -186,13 +186,13 @@ def _usable_override(value: str) -> Optional[str]:
         return value.rstrip("/")
     if value not in _warned_overrides:
         _warned_overrides.add(value)
-        logger.warning("DTK_FISQUA_BASE_URL %r is ignored: it must be https://, or http:// to 127.0.0.1, "
+        logger.warning("CAPTUA_FISQUA_BASE_URL %r is ignored: it must be https://, or http:// to 127.0.0.1, "
                        "localhost or [::1] for tests; the environment's host is used", value)
     return None
 
 
 def base_url() -> Optional[str]:
-    """Fisqua's base URL for this unit: DTK_FISQUA_BASE_URL if set, else the environment's host for the tenant."""
+    """Fisqua's base URL for this unit: CAPTUA_FISQUA_BASE_URL if set, else the environment's host for the tenant."""
     if not fisqua_configured():
         return None
     override = config.settings.FISQUA_BASE_URL.strip()
@@ -207,7 +207,7 @@ def config_fingerprint() -> str:
     """8 hex digits of the sha256 of (environment, base URL, token, installed code).
 
     Enough to tell two configurations apart. The base URL is the one calls
-    go to, so a change of DTK_FISQUA_BASE_URL or of the tenant changes it
+    go to, so a change of CAPTUA_FISQUA_BASE_URL or of the tenant changes it
     too. The installed code is app.core.version.code_identity (the backend
     commit and the release, or the process start when no commit can be
     read), so that an update, or failing that a restart, clears a stop for
@@ -371,7 +371,7 @@ def record_config_error(status_code: Optional[int], reason: Optional[str], now: 
                      int(_retest_interval().total_seconds()))
         return
     logger.error("Fisqua answered HTTP %s (%s) for this unit's configuration (fingerprint %s); sending and "
-                 "polling stop until DTK_FISQUA_ENV, DTK_FISQUA_BASE_URL or DTK_FISQUA_TOKEN is changed",
+                 "polling stop until CAPTUA_FISQUA_ENV, CAPTUA_FISQUA_BASE_URL or CAPTUA_FISQUA_TOKEN is changed",
                  status_code, reason, entry["config_fingerprint"])
 
 
@@ -501,7 +501,7 @@ def config_error() -> Optional[dict]:
 
 
 def _retest_interval() -> timedelta:
-    """How long a version stop waits between retests: DTK_FISQUA_RETRY_MAX (six hours by default)."""
+    """How long a version stop waits between retests: CAPTUA_FISQUA_RETRY_MAX (six hours by default)."""
     return timedelta(seconds=max(1, config.settings.FISQUA_RETRY_MAX_SECONDS))
 
 
@@ -969,7 +969,7 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
                          stopping: Callable[[], bool]) -> bool:
     """Send one manifest while a version stop holds, once every _retest_interval. True when the stop cleared.
 
-    Due DTK_FISQUA_RETRY_MAX seconds after the stop was recorded or last
+    Due CAPTUA_FISQUA_RETRY_MAX seconds after the stop was recorded or last
     retested, whichever is later. The manifest is the one a normal send
     would make: the first of _retest_candidates that is, or can now be,
     built (_promote) is claimed and sent by _send, after a call from the

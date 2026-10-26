@@ -36,7 +36,7 @@ by a concurrent request between the check and the insert, or a CHECK) is
 reported as a reject, not raised.
 
 The report is returned and also written under
-`<DTK_DATA_DIR>/imports/<list-id>/`, one numbered file per run, so an
+`<DATA_DIR>/imports/<list-id>/`, one numbered file per run, so an
 operator can fetch it again (latest_report_path). Each report records the
 SHA-256 of the uploaded file, and a list id already imported from a file
 with a different hash is refused (ListIdReused).
@@ -1002,7 +1002,7 @@ def _next_run_number(directory: Path, list_id: str) -> int:
 
 
 def reports_dir() -> Path:
-    """Where import reports are kept: `<DTK_DATA_DIR>/imports`."""
+    """Where import reports are kept: `<DATA_DIR>/imports`."""
     return config.settings.data_dir / "imports"
 
 

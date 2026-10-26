@@ -4,7 +4,7 @@ While a unit is upgraded, provisioning writes the tenant to offsite.env
 before the one-time commands run (adopt-map, adopt, raise-capture-counter,
 mark-freed, backfill-preview-digests). The running backend read its settings
 at start and uploads nothing, but a crash, a reboot or a power cut restarts
-it with the tenant, and DTK_OFFSITE_BACKUP_DELAY later it would upload the
+it with the tenant, and CAPTUA_OFFSITE_BACKUP_DELAY later it would upload the
 images not yet adopted a second time, under their disk names, with a key that
 cannot delete them. The upgrade creates the hold file first and removes it
 once those commands have run.
@@ -29,7 +29,7 @@ schedulers start whether or not the file exists, so creating it takes effect
 at the next tick and removing it resumes the next tick, with no restart. The
 one-time commands do not read it: they are what runs during it.
 
-The path is DTK_OFFSITE_HOLD_FILE, by default `offsite-hold` in DTK_DATA_DIR
+The path is CAPTUA_OFFSITE_HOLD_FILE, by default `offsite-hold` in CAPTUA_DATA_DIR
 (/var/lib/dtk/offsite-hold on a unit). Only the file's existence counts;
 its contents are not read.
 """
@@ -44,7 +44,7 @@ logger = logging.getLogger(__name__)
 
 
 def hold_file() -> Path:
-    """The hold file's path (DTK_OFFSITE_HOLD_FILE, else offsite-hold in the data dir)."""
+    """The hold file's path (CAPTUA_OFFSITE_HOLD_FILE, else offsite-hold in the data dir)."""
     return config.settings.offsite_hold_file
 
 

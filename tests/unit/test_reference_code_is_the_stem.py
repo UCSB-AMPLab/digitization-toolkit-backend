@@ -303,7 +303,7 @@ def reports_root(tmp_path, monkeypatch):
     from app.core import config
 
     root = tmp_path / "data"
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(root))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(root))
     return root / "imports"
 
 

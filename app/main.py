@@ -5,11 +5,13 @@ from contextlib import asynccontextmanager
 
 from app.core.db import init_db
 from app.core.schema import assert_schema_at_head
-from app.core.config import settings
+from app.core.config import log_environment_names, settings
 from app.core.logging_setup import configure_logging
 
 # Before the routers are imported, so their import-time lines are kept too.
 configure_logging()
+# Which settings came under CAPTUA_ names and which under the older DTK_ names.
+log_environment_names()
 
 from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router

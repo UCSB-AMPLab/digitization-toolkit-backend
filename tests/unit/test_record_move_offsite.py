@@ -207,7 +207,7 @@ def test_the_way_back_is_refused_without_a_configured_tenant(admin, db_session, 
     _put_outside_every_volume(db_session, rec, a.project_id)
     response = admin.patch(f"/records/{rec.id}", json={"collection_id": a.id})
     assert response.status_code == 409, response.text
-    assert "once DTK_OFFSITE_TENANT is set" in response.json()["detail"]
+    assert "once CAPTUA_OFFSITE_TENANT is set" in response.json()["detail"]
 
 
 @pytest.mark.unit

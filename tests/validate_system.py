@@ -146,7 +146,7 @@ def validate_capture_service():
 
 def main():
     print("\n" + "="*70)
-    print("DIGITIZATION TOOLKIT - SYSTEM VALIDATION")
+    print("CAPTUA - SYSTEM VALIDATION")
     print("="*70 + "\n")
     
     tests = [

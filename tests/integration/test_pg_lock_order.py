@@ -118,7 +118,7 @@ def _install_app(monkeypatch, tmp_path, Session):
     app.dependency_overrides[get_current_user] = lambda: User(
         username="op", email="op@example.com", hashed_password="x", role="admin", is_active=True)
 
-    monkeypatch.setattr(records_api.settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(records_api.settings, "DATA_DIR", str(tmp_path / "data"))
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "single_capture_image",
                         lambda project_name, camera_config, check_camera=False,

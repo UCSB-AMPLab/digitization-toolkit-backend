@@ -23,8 +23,8 @@ from pathlib import Path
 # dir BEFORE the capture import so this test is hermetic.
 from app.core.config import settings
 
-_TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="dtk-test-logs-"))
-settings.DTK_LOG_DIR = str(_TEST_LOG_DIR)
+_TEST_LOG_DIR = Path(tempfile.mkdtemp(prefix="captua-test-logs-"))
+settings.LOG_DIR = str(_TEST_LOG_DIR)
 
 import capture.project_manager as pm  # noqa: E402
 import pytest  # noqa: E402

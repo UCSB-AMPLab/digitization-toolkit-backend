@@ -1,1 +1,1 @@
-"""Integration tests for DTK Backend."""
+"""Integration tests for the Captua backend."""

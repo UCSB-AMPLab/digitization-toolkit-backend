@@ -183,7 +183,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             problems.append(Problem(
                 "tenant_missing",
                 "No tenant is configured on this unit, so the manifest has no transfer root. "
-                "Set DTK_OFFSITE_TENANT to the tenant's prefix and restart the backend."))
+                "Set CAPTUA_OFFSITE_TENANT to the tenant's prefix and restart the backend."))
     except ImageUploadMisconfigured as exc:
         problems.append(Problem("tenant_invalid", f"{exc}. Correct it and restart the backend."))
 

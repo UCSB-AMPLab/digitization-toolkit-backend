@@ -164,7 +164,7 @@ _USABLE_FSTYPES = {"ext4", "ext3", "ext2", "vfat", "exfat", "ntfs", "btrfs", "xf
 # Strict allowlist for device paths accepted by mount/activate endpoints
 _DEVICE_RE = re.compile(r"^/dev/(sd[a-z][0-9]+|mmcblk[0-9]+p[0-9]+|nvme[0-9]+n[0-9]+p[0-9]+)$")
 
-# dtk-managed mount point base directory (pi user owns this)
+# Base directory of the mount points Captua manages (pi user owns this)
 _MOUNT_BASE = Path("/var/lib/dtk/mounts")
 
 
@@ -309,7 +309,7 @@ def mount_device(
     if dev_info.get("mountpoint"):
         return {"mountpoint": dev_info["mountpoint"], "message": "Device is already mounted."}
 
-    # Build a safe mount point name under the dtk data tree. The mounts root is
+    # Build a safe mount point name under the data directory (/var/lib/dtk). The mounts root is
     # root-owned; the helper creates the directory itself (and removes it if the
     # mount fails), so we don't mkdir here.
     label = dev_info.get("label") or dev_info["name"]
@@ -344,7 +344,7 @@ def unmount_device(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Safely unmount a partition that was mounted by DTK.
+    """Safely unmount a partition that Captua mounted.
 
     If the unmounted path is currently the active storage override, the override
     is cleared automatically so the backend falls back to its default path.
@@ -361,7 +361,7 @@ def unmount_device(
     try:
         target.resolve().relative_to(_MOUNT_BASE.resolve())
     except ValueError:
-        raise HTTPException(status_code=400, detail="Only DTK-managed paths can be unmounted.")
+        raise HTTPException(status_code=400, detail="Only paths Captua mounted can be unmounted.")
 
     # If this mountpoint (or a subpath) is the active storage override, clear it first, so the backend doesn't try to write to a stale path
     override_cleared = False

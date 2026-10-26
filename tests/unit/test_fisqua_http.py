@@ -838,7 +838,7 @@ def test_a_version_refused_volume_taken_back_is_not_resent(client, db_session, q
 
 
 # ---------------------------------------------------------------------------
-# While a version stop holds, one manifest is sent every DTK_FISQUA_RETRY_MAX seconds
+# While a version stop holds, one manifest is sent every CAPTUA_FISQUA_RETRY_MAX seconds
 # to learn whether Fisqua now reads what this software writes
 # ---------------------------------------------------------------------------
 

@@ -44,7 +44,7 @@ def data_dir(override_projects_root, tmp_path, monkeypatch):
 
     d = tmp_path / "data"
     d.mkdir()
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(d))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(d))
     return d
 
 

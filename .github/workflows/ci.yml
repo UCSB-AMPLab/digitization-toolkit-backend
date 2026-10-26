@@ -19,9 +19,9 @@ jobs:
       postgres:
         image: postgres:16
         env:
-          POSTGRES_USER: dtk
-          POSTGRES_PASSWORD: dtk
-          POSTGRES_DB: dtk
+          POSTGRES_USER: captua
+          POSTGRES_PASSWORD: captua
+          POSTGRES_DB: captua
         ports:
           - 5432
         options: >-
@@ -56,15 +56,15 @@ jobs:
       - name: Unit and integration tests
         run: pixi run -e dev pytest tests/ -m "not camera" -q
         env:
-          DTK_TEST_RCLONE: ${{ runner.temp }}/rclone-bin/rclone
-          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
-          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          CAPTUA_TEST_RCLONE: ${{ runner.temp }}/rclone-bin/rclone
+          CAPTUA_LOG_DIR: ${{ runner.temp }}/captua-logs
+          CAPTUA_DATA_DIR: ${{ runner.temp }}/captua-data
           APP_ENV: test
 
       - name: Schema drift guard
         run: pixi run -e dev db-check-drift
         env:
-          DATABASE_URL: postgresql+psycopg://dtk:dtk@localhost:${{ job.services.postgres.ports[5432] }}/dtk
-          DTK_LOG_DIR: ${{ runner.temp }}/dtk-logs
-          DTK_DATA_DIR: ${{ runner.temp }}/dtk-data
+          DATABASE_URL: postgresql+psycopg://captua:captua@localhost:${{ job.services.postgres.ports[5432] }}/captua
+          CAPTUA_LOG_DIR: ${{ runner.temp }}/captua-logs
+          CAPTUA_DATA_DIR: ${{ runner.temp }}/captua-data
           APP_ENV: test

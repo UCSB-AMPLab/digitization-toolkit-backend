@@ -1,7 +1,7 @@
 """Run by test_list_import.py in a subprocess: one import of a fixed list id, with or without flock.
 
 Usage: python list_import_race_worker.py <import|import_noflock> <sqlite file> <sha256>
-DTK_DATA_DIR comes from the environment. Prints one RESULT line.
+CAPTUA_DATA_DIR comes from the environment. Prints one RESULT line.
 """
 import os
 import sys

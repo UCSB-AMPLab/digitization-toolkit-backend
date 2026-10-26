@@ -1,1 +1,1 @@
-"""Unit tests for DTK Backend."""
+"""Unit tests for the Captua backend."""

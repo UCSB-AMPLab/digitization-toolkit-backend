@@ -547,7 +547,7 @@ def flush_preview_tmp_files(
 	"""
 	Delete stale preview temp files left in /tmp.
 
-	These files (dtk_preview_c*.jpg) are normally removed immediately after each
+	These files (captua_preview_c*.jpg, or dtk_preview_c*.jpg from an earlier release) are normally removed immediately after each
 	preview poll, but can be left behind if the backend process was killed
 	unexpectedly.  Call this from the admin settings page to reclaim disk space.
 

@@ -17,7 +17,7 @@ from app.models.record import Record, RecordImage
 def data_dir(tmp_path, monkeypatch):
     """Point the journal at a writable temp data dir (default /var/lib/dtk is not writable in tests)."""
     from app.core.config import settings
-    monkeypatch.setattr(settings, "DTK_DATA_DIR", str(tmp_path / "data"))
+    monkeypatch.setattr(settings, "DATA_DIR", str(tmp_path / "data"))
     return tmp_path
 
 

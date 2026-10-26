@@ -335,7 +335,7 @@ def test_thumbnail_of_a_file_outside_the_override_root_is_still_generated(
         client, db_session, pm, override, tmp_path, monkeypatch):
     from app.core import config
     c, img = _record_under(db_session, tmp_path / "elsewhere")
-    monkeypatch.setattr(config.settings, "DTK_DATA_DIR", str(tmp_path / "elsewhere"))
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(tmp_path / "elsewhere"))
     override(tmp_path / "mounts" / "usb" / "dtk-projects")
     resp = _admin_client(client).get(f"/records/images/{img.id}/thumbnail")
     assert resp.status_code == 200, resp.text
