@@ -958,6 +958,24 @@ class GPhoto2Backend(CameraBackend):
             self._save_pins()
         return changed
 
+    def _pinned_serial_confirmed_by_port(self, camera_index: int, port: str) -> str:
+        """The serial pinned at `camera_index`, if `port` is known to hold it; else "".
+
+        For a row whose body did not answer a serial just now. A pin on its
+        own does not say which body is on a port: the map never lays an
+        unidentified body on a pinned index, so a body found there without a
+        serial is there either because its port answered the pinned serial
+        before, or because the map predates the pin. Only the first is
+        evidence, so the pin is used only when the serial cached for this
+        same port is the pinned one. A usb devnum is not reused until the bus
+        counter wraps, so that earlier read still names the body on it.
+        """
+        with self._map_lock:
+            pinned = self._pins.get(camera_index)
+            if pinned and self._serial_by_port.get(port) == pinned:
+                return pinned
+        return ""
+
     def _contradicts_pins(self, camera_index: int, serial: str) -> bool:
         """True if `serial` at `camera_index` disagrees with the pins."""
         if not serial:
@@ -1459,9 +1477,13 @@ class GPhoto2Backend(CameraBackend):
         indices to look at, but every session match is against the map as
         currently published (see _session_matches_map), not this call's
         snapshot - a publish can land while this call is paused on a
-        per-camera lock. For each camera, re-uses an already-open PTP session
-        to read the serial number; if no session is open yet, opens a brief
-        one just for the read and closes it. A cached session is re-used only
+        per-camera lock. For each camera, takes the serial an already-open PTP
+        session read at open, asking the body through that session only if
+        that read failed; if no session is open yet, opens a brief one just
+        for the read and closes it. A body that answers no serial either way
+        is reported under its pinned serial when the serial cached for its
+        port is that one, and under the `<model>_idx<N>` placeholder
+        otherwise. A cached session is re-used only
         while the current map still puts the same model on the same port at
         that index - one that does not match is a claim on a body that has
         moved or gone, so it is closed and the temporary read path runs
@@ -1540,11 +1562,18 @@ class GPhoto2Backend(CameraBackend):
                     # snapshot row holds any more.
                     row_port = session.port
                     row_model = session.model
-                    try:
-                        cfg = session._cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-                    except Exception:
-                        pass
+                    # The body on a session's port cannot change while the
+                    # session holds it, so the serial read at open still
+                    # names it. Asking again only when that read failed keeps
+                    # a busy body (a live preview, say) from losing its
+                    # identity to a read it is too busy to answer.
+                    serial = getattr(session, "serial", "") or ""
+                    if not serial:
+                        try:
+                            cfg = session._cam.get_config()
+                            serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                        except Exception:
+                            serial = ""
                     if serial:
                         # Learn it here too. A body whose read failed at
                         # session open has no pin, and reporting a serial
@@ -1611,6 +1640,9 @@ class GPhoto2Backend(CameraBackend):
                     # published.
                     if serial:
                         learned = self._learn_serial(idx, port, serial) or learned
+
+            if not serial:
+                serial = self._pinned_serial_confirmed_by_port(idx, row_port)
 
             if self._contradicts_pins(idx, serial):
                 # This index is pinned to another body, or this body is pinned
