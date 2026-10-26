@@ -5,6 +5,8 @@ behind the same rclone wrapper, so every listing and copy is a real rclone
 call. Restore reads through OFFSITE_READ_REMOTE, here the same directory.
 
     python -m pytest tests/unit/test_offsite_free.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

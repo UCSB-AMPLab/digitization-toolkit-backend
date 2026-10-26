@@ -1,4 +1,7 @@
-"""Login throttle: lockout after repeated failures, reset on success, and that the /auth/login endpoint is actually wired to it."""
+"""Login throttle: lockout after repeated failures, reset on success, and that the /auth/login endpoint is actually wired to it.
+
+Version: 0.1.0-beta
+"""
 
 
 class FakeClock:

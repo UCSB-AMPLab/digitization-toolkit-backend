@@ -25,6 +25,8 @@
 A tag known only from an object inside a pack file, or from packed-refs
 without the fully-peeled trait, cannot be peeled without reading the pack;
 that checkout counts as untagged. A clone's packed-refs carries the trait.
+
+Version: 0.1.0-beta
 """
 
 import re

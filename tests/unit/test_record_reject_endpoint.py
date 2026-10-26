@@ -7,6 +7,8 @@ glare, shadow, focus, exposure, dirt, framing, obstruction, other), plus a
 free-text comment that is optional for every reason except 'other'; it's
 only valid from 'in_review'; and only reviewer/admin may perform it.
 Run with: python -m pytest tests/unit/test_record_reject_endpoint.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

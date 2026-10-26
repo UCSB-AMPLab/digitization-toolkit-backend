@@ -5,6 +5,8 @@ uvicorn's logging config covers only the `uvicorn`, `uvicorn.error` and
 or `capture.` has no handler and the root logger's WARNING level, so its INFO
 lines (the startup `Volume layout:` report among them) are dropped, and its
 warnings come out through Python's last-resort handler with no level or name.
+
+Version: 0.1.0-beta
 """
 
 import logging

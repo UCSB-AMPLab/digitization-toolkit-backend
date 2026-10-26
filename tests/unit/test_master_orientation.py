@@ -14,6 +14,8 @@ recorded, for every captured image, as `rotate_deg`:
 * in each image of the BagIt export's metadata.json (schema_version 2).
 
 Run with: python -m pytest tests/unit/test_master_orientation.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

@@ -9,6 +9,8 @@ allow_read_only: a reviewer may look at the device list but may not reset the
 hardware under someone else's capture run. A backend that raises is a 503 with
 the reason attached - unlike enumeration, an empty list would read as "no
 bodies attached" and hide the failure.
+
+Version: 0.1.0-beta
 """
 
 import pytest

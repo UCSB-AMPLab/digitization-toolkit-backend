@@ -17,6 +17,8 @@ digest has to be in the capture manifest as the master's is.
   does not keep the preview of a deleted master off the orphan list.
 
     python -m pytest tests/unit/test_preview_digests.py
+
+Version: 0.1.0-beta
 """
 
 import hashlib

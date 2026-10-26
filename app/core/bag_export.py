@@ -2,6 +2,8 @@
 
 The output validates as a BagIt 0.97 bag: unzip it and `bagit.Bag(dir).validate()`
 passes.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

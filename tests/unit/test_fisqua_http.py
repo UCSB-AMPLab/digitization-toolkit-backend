@@ -6,6 +6,8 @@ token changes; status is asked for in batches of at most 100 refs; and the
 token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
+
+Version: 0.1.0-beta
 """
 
 import json

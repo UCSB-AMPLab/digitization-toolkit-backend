@@ -21,6 +21,8 @@ documented API: global_camera_info(), create_still_configuration(**kw),
 configure(), start()/stop()/started, options, set_controls(), camera_controls,
 camera_properties and capture_request() -> CompletedRequest with
 get_metadata()/save()/release().
+
+Version: 0.1.0-beta
 """
 
 import logging

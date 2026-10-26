@@ -1,6 +1,9 @@
 """Export refuses to produce a misleading bag: a missing source file or a file
 whose bytes no longer match its capture-time checksum both fail the export. 
-The export runs as a background job, so these surface as a failed job with detail."""
+The export runs as a background job, so these surface as a failed job with detail.
+
+Version: 0.1.0-beta
+"""
 
 import json
 import time

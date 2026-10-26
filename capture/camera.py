@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
 import logging

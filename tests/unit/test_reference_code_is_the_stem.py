@@ -12,6 +12,8 @@ not be repaired either. The model refuses it at the flush, for every writer:
 
 The routes answer 409 with a detail that names both values. A refusal
 changes nothing in the database.
+
+Version: 0.1.0-beta
 """
 
 import json

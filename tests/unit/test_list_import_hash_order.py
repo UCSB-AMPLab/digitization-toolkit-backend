@@ -11,6 +11,8 @@ already have passed the check against that hash, so the hash stays (and is
 logged), and a different file under the id is refused as before. A corrected
 file under the same id then imports. A hash recorded by an earlier import is
 never removed; one that cannot be removed is logged with its path.
+
+Version: 0.1.0-beta
 """
 
 import pytest

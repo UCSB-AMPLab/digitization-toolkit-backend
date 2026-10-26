@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from typing import Generator
 
 from app.core.db import get_db

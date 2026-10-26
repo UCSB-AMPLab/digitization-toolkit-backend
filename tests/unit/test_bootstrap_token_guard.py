@@ -1,4 +1,7 @@
-"""Gate first-user admin bootstrap behind a local bootstrap token."""
+"""Gate first-user admin bootstrap behind a local bootstrap token.
+
+Version: 0.1.0-beta
+"""
 
 from types import SimpleNamespace
 

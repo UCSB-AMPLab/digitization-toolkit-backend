@@ -18,6 +18,8 @@ side deadlocks.
 Opt-in, as tests/integration/test_pg_offsite_reservation.py: skipped unless
 DATABASE_HOST is set and DATABASE_* reach a PostgreSQL server; the tables
 are created in a schema of their own, dropped afterwards.
+
+Version: 0.1.0-beta
 """
 import hashlib
 import os

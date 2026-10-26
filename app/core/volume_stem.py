@@ -11,6 +11,8 @@ its record's, carrying RETAKE_VOLUME_DETAIL, and a retake of a record that
 is neither captured nor rejected, carrying RETAKE_STATUS_DETAIL.
 They refuse before any camera is triggered or any file is written. The
 interface matches each 409 on its exact text, so the texts do not change.
+
+Version: 0.1.0-beta
 """
 from typing import Optional
 

@@ -9,6 +9,8 @@ image. Records taken back, gone from the volume, or with a decision the unit
 cannot apply are skipped and reported.
 
     python -m pytest tests/unit/test_fisqua_decisions.py
+
+Version: 0.1.0-beta
 """
 
 import json

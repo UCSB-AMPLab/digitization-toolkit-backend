@@ -12,6 +12,8 @@ cold start is also the likeliest thing to time out. That switch has to be
 inside the same handling as the capture itself, or the commonest
 first-contact failure there is reaches the operator as a generic 500 instead
 of a timeout.
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -1,6 +1,8 @@
 """Names the backend writes that carry the software's name.
 
     python -m pytest tests/unit/test_captua_names.py
+
+Version: 0.1.0-beta
 """
 
 from types import SimpleNamespace

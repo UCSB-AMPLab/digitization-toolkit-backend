@@ -1,4 +1,7 @@
-"""Shared fixtures for the hardware-gated capture integration tests."""
+"""Shared fixtures for the hardware-gated capture integration tests.
+
+Version: 0.1.0-beta
+"""
 import pytest
 
 

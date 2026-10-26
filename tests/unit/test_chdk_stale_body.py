@@ -18,6 +18,8 @@ body's card, long before it publishes, so the queued operation can wake and
 correctly succeed against a layout nothing has changed yet - a test built
 that way passes or fails on scheduling, which is the one thing a proof of a
 race must not do.
+
+Version: 0.1.0-beta
 """
 
 import time

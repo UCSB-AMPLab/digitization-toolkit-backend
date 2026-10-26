@@ -8,6 +8,8 @@ verified in the bucket, building the manifest then; and `ready` rows are
 handed to the transport, with backoff on errors.
 
     python -m pytest tests/unit/test_fisqua_outbox.py
+
+Version: 0.1.0-beta
 """
 
 import logging

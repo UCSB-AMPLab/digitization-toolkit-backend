@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from __future__ import annotations
 from typing import Optional, List, Literal
 from pydantic import BaseModel, field_validator, model_validator

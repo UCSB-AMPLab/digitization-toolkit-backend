@@ -3,6 +3,8 @@ picamera2 at module load time. On non-Linux dev machines (macOS) a bare
 `from picamera2 import Picamera2` would fail the import of the whole module,
 so it guards the import the same way capture/backends/picamera2_backend.py
 does, and raises a clear RuntimeError if calibration is attempted without it.
+
+Version: 0.1.0-beta
 """
 
 import pytest

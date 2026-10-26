@@ -16,6 +16,8 @@ sidecar, as capture does.
 
 Storage setup follows tests/unit/test_record_delete_sidecar.py: every file
 lives under the per-test projects root from `override_projects_root`.
+
+Version: 0.1.0-beta
 """
 
 import io

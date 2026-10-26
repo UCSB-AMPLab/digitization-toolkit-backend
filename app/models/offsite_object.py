@@ -30,6 +30,8 @@ and no `uploaded_at`: this unit's uploader never sent it.
 
 `object_key` is relative to OFFSITE_REMOTE. It is written when the row is
 created and never changed (OffsiteObject's before_update guard).
+
+Version: 0.1.0-beta
 """
 
 from datetime import datetime, timezone

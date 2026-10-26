@@ -3,6 +3,8 @@
 Tests for NEH-121: deterministic collection listing order, GET /collections/count,
 sequence-aware record ordering within a collection, and structured export 422 detail.
 Run with: python -m pytest tests/unit/test_collections_order_count_export_detail.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -8,6 +8,8 @@ appended again by the next run, so every record ends up present and parseable
 once. The copy is not written whole and renamed: on exFAT or vfat a rename
 over an existing file is not shown to be crash-atomic, and the manifest may
 be a volume's only one.
+
+Version: 0.1.0-beta
 """
 
 import json

@@ -16,6 +16,8 @@ reads it from ``camera_controls["ScalerCrop"][2]`` and pins it explicitly on
 every (re)configure, ``apply_zoom`` crops inside it, and a still waits for a
 frame actually exposed at it. Bench testing on the appliance confirms the
 band.
+
+Version: 0.1.0-beta
 """
 
 import os

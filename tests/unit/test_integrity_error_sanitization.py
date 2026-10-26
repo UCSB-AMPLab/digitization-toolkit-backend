@@ -3,6 +3,8 @@
 
 Guards the sanitized 409 helper and the schema-level single-parent rule that
 keeps a record's project/collection conflict from reaching the database at all.
+
+Version: 0.1.0-beta
 """
 import pytest
 from sqlalchemy.exc import IntegrityError

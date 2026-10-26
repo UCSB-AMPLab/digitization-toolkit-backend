@@ -23,6 +23,8 @@ Authorization header, so image, thumbnail and download URLs carry the JWT as
 journal, which anyone with a shell on the unit can read. The filter sits on the
 loggers rather than on uvicorn's handlers so it holds whatever handlers
 `--log-config` or uvicorn's defaults install.
+
+Version: 0.1.0-beta
 """
 
 import logging

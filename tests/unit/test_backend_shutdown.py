@@ -4,6 +4,8 @@ The CHDK and DSLR backends hold PTP claims on the bodies for the life of the
 process, and their cleanup is what waits for whatever is running and releases
 them. The application lifespan calls it on the way out; without that call, a
 restart would drop the sessions rather than close them.
+
+Version: 0.1.0-beta
 """
 
 import pytest

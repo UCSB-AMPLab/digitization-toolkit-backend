@@ -15,6 +15,8 @@ service asks (a `.cr2` and its sidecar for a RAW rig, as the gphoto2 backend
 does).
 
 Run with: python -m pytest tests/unit/test_capture_contract_naming.py
+
+Version: 0.1.0-beta
 """
 
 import json

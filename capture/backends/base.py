@@ -2,6 +2,8 @@
 Abstract base class for camera backends.
 
 Defines the interface that all camera backend implementations must follow.
+
+Version: 0.1.0-beta
 """
 
 from abc import ABC, abstractmethod

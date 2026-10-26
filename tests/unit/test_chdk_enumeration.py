@@ -12,6 +12,8 @@ has no identity to register: it is listed and previewable, but it may not
 capture until the side route gives it one.
 
 Everything here runs against the fake pychdk in chdk_fakes.py; no USB.
+
+Version: 0.1.0-beta
 """
 
 import pytest

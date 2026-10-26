@@ -5,6 +5,8 @@ For each volume with a stem whose images are all in place, its own
 each capture id of its images. A missing one (a copy that failed, or was
 torn) is copied from the other manifests as the migration copies, so the next
 start repairs it. Volumes still in the old layout are left to the migration.
+
+Version: 0.1.0-beta
 """
 
 import json

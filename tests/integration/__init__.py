@@ -1,1 +1,4 @@
-"""Integration tests for the Captua backend."""
+"""Integration tests for the Captua backend.
+
+Version: 0.1.0-beta
+"""

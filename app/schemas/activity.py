@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 import datetime as dt
 from datetime import datetime
 from typing import Optional

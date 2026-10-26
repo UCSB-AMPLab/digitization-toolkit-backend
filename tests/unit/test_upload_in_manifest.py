@@ -13,6 +13,8 @@ its row and in its record, so the consumers of the manifest read the record
 as they read a capture record: the fixity index (app.core.integrity), the
 export bag's capture records (capture_record_lines) and the startup repair
 of a volume's manifest (app.core.volume_layout).
+
+Version: 0.1.0-beta
 """
 
 import hashlib

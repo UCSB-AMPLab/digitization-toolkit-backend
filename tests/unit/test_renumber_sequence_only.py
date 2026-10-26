@@ -8,6 +8,8 @@ the order they were listed in, and every file under the projects root keeps
 its name, inode, mtime and bytes; no manifest line is written.
 
 Files are real, under the per-test projects root.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

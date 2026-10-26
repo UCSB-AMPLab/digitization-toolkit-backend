@@ -9,6 +9,8 @@ Two refusals happen before the shutter. A body with no identity may not
 capture, because nothing it produces could be attributed to a body; and
 neither may a body whose parity another body also claims, because one of the
 two would be filed as the wrong page.
+
+Version: 0.1.0-beta
 """
 
 import pytest

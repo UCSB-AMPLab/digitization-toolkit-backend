@@ -22,6 +22,8 @@ rely on, and the rules that keep it stable:
 The test database is SQLite (tests/conftest.py, `db_session`), so the
 database-level checks exercised here are the SQLite forms. The Postgres forms
 are exercised by CI's drift guard and the migration rehearsal, not by this file.
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

@@ -10,6 +10,8 @@ machine. This file verifies the part only the real endpoints can exercise: the
 capture-mode mismatch guard, and that a recapture leaves the original file on
 disk untouched.
 Run with: python -m pytest tests/integration/test_camera_capture_recapture_hardware.py
+
+Version: 0.1.0-beta
 """
 import pytest
 import sys

@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
 from sqlalchemy.orm import Session

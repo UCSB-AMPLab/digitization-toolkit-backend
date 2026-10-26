@@ -9,6 +9,8 @@ The fakes here model the split libgphoto2 offers instead: trigger_capture()
 returns immediately and wait_for_event(timeout_ms) delivers the file event in
 bounded steps, so a deadline can be checked between calls. The fake Camera
 deliberately has no capture() method, so a blocking capture path cannot pass.
+
+Version: 0.1.0-beta
 """
 
 import logging

@@ -8,6 +8,8 @@ that is elsewhere. Every path that changes records.collection_id answers
 which takes a record out of its volume. A record with images stored
 offsite that is already outside every volume is let back only into the
 volume its keys are under, `<tenant>/<stem>/`.
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -53,6 +53,8 @@ margins included - over the LCD's aspect ratio and stretches the frame into
 it (``gui_live.lua``, update_canvas_size and the put_to_cd_canvas call under
 it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
+
+Version: 0.1.0-beta
 """
 
 import contextlib

@@ -7,6 +7,8 @@ disagreeing, and nothing surfaces it until an export drops a page or a thumbnail
 files on disk, spot-checks file bytes against the capture-time manifest hashes,
 and reports parentless records. It is strictly read-only: it never moves,
 deletes, or rewrites anything.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from dataclasses import dataclass, field, asdict
 from typing import List, Dict, Optional, Union
 from datetime import datetime, timezone

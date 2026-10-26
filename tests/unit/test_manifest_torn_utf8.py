@@ -6,6 +6,8 @@ a line that does not decode, like one that does not parse, is skipped and
 logged, and the lines around it are read. A whole-file decode would raise
 UnicodeDecodeError, and with a journal pending every startup would refuse to
 serve.
+
+Version: 0.1.0-beta
 """
 
 import json

@@ -15,6 +15,8 @@ preserves the old image without recording that a bag was built from it.
 The hardware is stood in for as test_record_typology_dropped.py does.
 
 Run with: python -m pytest tests/unit/test_capture_birth_and_retake.py
+
+Version: 0.1.0-beta
 """
 
 import capture.service as capture_service

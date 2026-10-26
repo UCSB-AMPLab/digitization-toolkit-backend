@@ -7,6 +7,8 @@ preview has been uploaded. A dry run unless `--apply`; existing lines are
 never rewritten.
 
     python -m pytest tests/unit/test_preview_digest_backfill.py
+
+Version: 0.1.0-beta
 """
 
 import json

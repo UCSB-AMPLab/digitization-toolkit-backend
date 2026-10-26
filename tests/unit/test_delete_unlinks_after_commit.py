@@ -14,6 +14,8 @@ The files are real, under the per-test projects root from the
 ordering is asserted with a log of events: the session's commit and every
 `Path.unlink` on a file under the capture tree append to it, and every unlink
 has to come after the commit.
+
+Version: 0.1.0-beta
 """
 
 import logging

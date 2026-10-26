@@ -18,6 +18,8 @@ takes both a record's row and its volume's takes the record's first
 (app/core/volume_stem.py), and a path that locks several records takes
 them in id order. On SQLite, which the test suite runs on, no lock clause is
 emitted.
+
+Version: 0.1.0-beta
 """
 from typing import List, Optional, Tuple
 

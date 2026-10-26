@@ -7,6 +7,8 @@ the new one, who changed it and when. These tests go through the
 endpoints, one per writer, and check the row each one leaves.
 
 Run with: python -m pytest tests/unit/test_record_status_history.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

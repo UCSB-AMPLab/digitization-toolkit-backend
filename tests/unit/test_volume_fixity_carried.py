@@ -10,6 +10,8 @@ each, so nothing it answers changes; the bag takes one record per capture.
 `DELETE /projects/{id}` moves the project's `metadata/manifest.jsonl` to
 `<projects root>/.retired-manifests/<project dir>-<UTC timestamp>-manifest.jsonl`
 before it removes the tree, and the index keeps reading it there.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

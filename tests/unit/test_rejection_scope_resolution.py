@@ -4,6 +4,8 @@ Tests for NEH-208 rejection scope: a dual-mode record's rejection must flag
 BOTH images (a dual-camera pair can only ever be redone together), while a
 single-mode record's rejection flags exactly the one image.
 Run with: python -m pytest tests/unit/test_rejection_scope_resolution.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

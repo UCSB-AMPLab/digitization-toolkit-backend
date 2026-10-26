@@ -6,6 +6,8 @@ The endpoint returns a collection with its nested children and a per-collection
 record count. The count query must filter on a column that exists; one that
 does not makes the endpoint return 500 on every call.
 Run with: python -m pytest tests/unit/test_collections_hierarchy.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

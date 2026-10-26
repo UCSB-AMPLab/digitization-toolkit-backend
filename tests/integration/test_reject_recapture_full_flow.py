@@ -13,6 +13,8 @@ before adding the replacement image(s). The mode-mismatch guard and the
 actual capture-endpoint wiring are covered separately by the hardware-gated
 test_camera_capture_recapture_hardware.py.
 Run with: python -m pytest tests/integration/test_reject_recapture_full_flow.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

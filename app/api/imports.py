@@ -5,6 +5,8 @@ the form the contract delivers it in (a file moved by download, USB or LAN
 copy), so the interface can send the file the operator picked unchanged.
 GET /imports/digitisation-list/{list_id}/report returns the latest stored
 import report for a list. The import itself is app/core/list_import.py.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

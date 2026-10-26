@@ -6,6 +6,8 @@ The tick runs the upload and then the Fisqua send pass, so a volume whose
 last object the woken run verifies is promoted and sent in that tick.
 
     python -m pytest tests/unit/test_upload_wake.py
+
+Version: 0.1.0-beta
 """
 
 import threading

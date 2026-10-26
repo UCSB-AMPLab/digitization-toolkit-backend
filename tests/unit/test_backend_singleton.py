@@ -13,6 +13,8 @@ records (and signals) each entry into the constructor body, and then blocks
 on a shared release Event before returning a backend object. That lets a
 test hold a first caller inside the constructor and observe whether a second
 caller reaches the constructor body before the first one has returned.
+
+Version: 0.1.0-beta
 """
 
 import threading

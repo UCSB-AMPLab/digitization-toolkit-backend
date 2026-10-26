@@ -55,6 +55,8 @@ Three rules it is built around:
 
 Nothing here deletes or overwrites anything at the destination, and the B2 key
 is scoped so that it could not.
+
+Version: 0.1.0-beta
 """
 
 import gzip

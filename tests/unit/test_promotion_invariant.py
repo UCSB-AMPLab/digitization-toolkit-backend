@@ -15,6 +15,8 @@ refusal the same way: the bulk endpoint skips a record it cannot move and
 returns 200 without it, by design, while the other two refuse with a 422.
 
 Run with: python -m pytest tests/unit/test_promotion_invariant.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -5,6 +5,8 @@ capture the volume has ever had, superseded ones included, and never reuse a
 number. collections.capture_counter is that count, and next_capture_number
 is the one place a capture raises it. raise_capture_counter is the
 operator's way to raise it past numbers taken outside this unit.
+
+Version: 0.1.0-beta
 """
 from typing import Optional
 

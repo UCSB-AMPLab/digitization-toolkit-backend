@@ -1,4 +1,7 @@
-"""Guard against booting outside dev with a default/empty SECRET_KEY (NEH-54)."""
+"""Guard against booting outside dev with a default/empty SECRET_KEY (NEH-54).
+
+Version: 0.1.0-beta
+"""
 
 from types import SimpleNamespace
 

@@ -1,4 +1,7 @@
-"""In-process registry of background export jobs for the single-process appliance"""
+"""In-process registry of background export jobs for the single-process appliance
+
+Version: 0.1.0-beta
+"""
 
 import logging
 import threading

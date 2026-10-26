@@ -4,6 +4,8 @@ A symbolic link there (put by hand, or left by a drive mounted inside the
 tree) would take the masters off the storage, where every reader then
 refuses them (resolve_within_storage). The startup migration resolves each
 destination and skips the volume with reason `stem_dir_outside_projects_root`.
+
+Version: 0.1.0-beta
 """
 
 import pytest

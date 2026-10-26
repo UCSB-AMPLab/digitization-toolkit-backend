@@ -17,6 +17,8 @@ CI runs `pytest -m "not camera"`. The backend's root conftest.py adds
 these tests run in CI whatever their names say.
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime

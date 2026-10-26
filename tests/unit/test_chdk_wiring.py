@@ -11,6 +11,8 @@ The registry join carries one rule of its own. A body with no identity gets a
 provisional id so the API can list it, and that id must never be written to
 cameras.json: a calibration or an orientation saved under it would be
 attached to whichever body happened to be at that index.
+
+Version: 0.1.0-beta
 """
 
 import pytest

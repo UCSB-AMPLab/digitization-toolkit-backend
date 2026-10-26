@@ -4,6 +4,8 @@ Integration tests for capture API endpoints wired to database.
 Tests the full flow: capture image -> save to microSD -> create database record.
 These need camera hardware (Linux/Raspberry Pi); they skip on other platforms and when no camera is connected.
 Run with: python -m pytest tests/integration/test_capture_integration.py
+
+Version: 0.1.0-beta
 """
 import pytest
 import sys

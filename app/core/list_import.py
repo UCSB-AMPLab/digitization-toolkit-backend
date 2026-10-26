@@ -40,6 +40,8 @@ The report is returned and also written under
 operator can fetch it again (latest_report_path). Each report records the
 SHA-256 of the uploaded file, and a list id already imported from a file
 with a different hash is refused (ListIdReused).
+
+Version: 0.1.0-beta
 """
 
 from __future__ import annotations

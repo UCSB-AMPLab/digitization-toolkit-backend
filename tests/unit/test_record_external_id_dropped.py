@@ -5,6 +5,8 @@ Exchange contract 1.1 maps each Fisqua item onto a volume, so Fisqua's
 column `c2d3e4f5a6b7` added to `records` had no writer and the frontend never
 read it, so `a7c1e9d2b4f6` drops it with its unique index, and the write-once
 guard that protected it goes with it.
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

@@ -114,6 +114,8 @@ queries and a string comparison per image row, with no filesystem access per
 row. Run by hand, with the backend stopped, as
 `python -m app.core.volume_layout [--dry-run]`; a dry run reports what would
 be done and writes nothing.
+
+Version: 0.1.0-beta
 """
 
 import argparse

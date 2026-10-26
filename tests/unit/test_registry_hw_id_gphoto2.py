@@ -4,6 +4,8 @@ Opening a private PTP session from the registry is a second claim on a camera
 the live preview may already hold. The registry should ask the process-wide
 backend (capture.service.get_backend) to enumerate instead, and must never
 import gphoto2 itself.
+
+Version: 0.1.0-beta
 """
 
 import builtins

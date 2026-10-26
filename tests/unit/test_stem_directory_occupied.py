@@ -12,6 +12,8 @@ the records of captures deleted since, of records moved out, and of copies
 naming other volumes' directories; and a stray one merged into does no harm,
 because the index, the fixity gate and the bag select records by the capture
 ids of the volume's rows.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

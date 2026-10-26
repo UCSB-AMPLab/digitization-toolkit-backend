@@ -2,6 +2,8 @@
 
 The occupied-directory and rescan checks are in
 test_stem_directory_occupied and test_volume_manifest_repair.
+
+Version: 0.1.0-beta
 """
 
 import hashlib

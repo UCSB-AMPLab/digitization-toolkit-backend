@@ -11,6 +11,8 @@ leaving `captured` also has to satisfy the replacement-image invariant (see
 test_promotion_invariant.py).
 
 Run with: python -m pytest tests/unit/test_record_status_transitions.py
+
+Version: 0.1.0-beta
 """
 
 import pytest

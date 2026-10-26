@@ -6,6 +6,8 @@ CAPTUA_ name wins over its DTK_ name wherever either is set; within one family
 the process environment wins over the files, and offsite.env over ../.env.
 
     python -m pytest tests/unit/test_env_names.py
+
+Version: 0.1.0-beta
 """
 
 import logging

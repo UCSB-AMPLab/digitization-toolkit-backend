@@ -10,6 +10,8 @@ crashed one and the operator would be told the wrong thing.
 
 The whole path runs for real: the route, the capture service, the backend,
 and a scripted body whose remote capture never completes.
+
+Version: 0.1.0-beta
 """
 
 import pytest

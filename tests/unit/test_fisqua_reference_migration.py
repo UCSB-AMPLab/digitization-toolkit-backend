@@ -1,6 +1,8 @@
 """The sent-reference migration (6df85ec6309b), on SQLite and, opt-in, on PostgreSQL.
 
     python -m pytest tests/unit/test_fisqua_reference_migration.py
+
+Version: 0.1.0-beta
 """
 
 import importlib.util

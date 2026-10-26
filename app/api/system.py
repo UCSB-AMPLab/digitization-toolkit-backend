@@ -1,3 +1,5 @@
+# Version: 0.1.0-beta
+
 import json
 import logging
 import os

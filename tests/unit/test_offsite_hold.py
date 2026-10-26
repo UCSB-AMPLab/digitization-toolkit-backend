@@ -8,6 +8,8 @@ upgrade (adopt, adopt-map, raise-capture-counter, mark-freed,
 backfill-preview-digests) are not held.
 
     python -m pytest tests/unit/test_offsite_hold.py
+
+Version: 0.1.0-beta
 """
 
 import json

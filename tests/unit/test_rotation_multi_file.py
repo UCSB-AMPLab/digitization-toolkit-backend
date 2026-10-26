@@ -7,6 +7,8 @@ Orientation tag; the `.raw` buffer is a preservation master and stays byte
 for byte as the camera wrote it.
 
     python -m pytest tests/unit/test_rotation_multi_file.py
+
+Version: 0.1.0-beta
 """
 
 import io

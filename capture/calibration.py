@@ -3,6 +3,8 @@ Camera calibration module for finding optimal settings.
 
 This module provides calibration functions to determine optimal camera settings
 for specific setups. Calibration profiles can be saved and loaded for reuse.
+
+Version: 0.1.0-beta
 """
 import json
 import sys

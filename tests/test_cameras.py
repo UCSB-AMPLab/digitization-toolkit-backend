@@ -1,6 +1,8 @@
 """
 Tests for camera capture functionality.
 Run with: python -m pytest tests/test_cameras.py -m camera
+
+Version: 0.1.0-beta
 """
 
 import os

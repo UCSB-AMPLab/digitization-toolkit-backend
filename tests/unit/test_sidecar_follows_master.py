@@ -7,6 +7,8 @@ NEH-263: `delete_thumbnail` raises when the unlink fails. The integrity scan
 counts a sidecar as known only while its RAW master is known and on disk.
 
 Files are real, under the per-test projects root from `override_projects_root`.
+
+Version: 0.1.0-beta
 """
 
 import pathlib

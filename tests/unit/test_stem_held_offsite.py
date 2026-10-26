@@ -8,6 +8,8 @@ was. A volume whose stem has such keys under it is treated as having
 captured: its stem cannot be changed or cleared, and the volume cannot be
 deleted. A stem with such keys under it cannot be given to a volume, unless
 every one of them belongs to an image of a record in that volume.
+
+Version: 0.1.0-beta
 """
 
 import pytest
