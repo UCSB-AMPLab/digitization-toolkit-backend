@@ -751,6 +751,24 @@ def test_marking_takes_the_list_lock(client, imported, monkeypatch):
 
 
 @pytest.mark.unit
+def test_a_mark_is_refused_with_a_503_when_the_list_lock_cannot_be_taken(client, imported, monkeypatch):
+    # Without the lock, two marks on different items could each read the old
+    # file and the second write would drop the first, both reported as saved.
+    import fcntl
+
+    _as_role("rev", "reviewer")
+    _mark(client, 1)
+    before = (imported / "done.json").read_bytes()
+
+    def fail(fd, op):
+        raise OSError("locks not supported")
+
+    monkeypatch.setattr(fcntl, "flock", fail)
+    assert _mark(client, 2).status_code == 503
+    assert (imported / "done.json").read_bytes() == before
+
+
+@pytest.mark.unit
 def test_marking_and_unmarking_are_logged(client, db_session, imported):
     from app.models.system_log import SystemLog
 

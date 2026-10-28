@@ -1222,7 +1222,12 @@ def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str])
     directory = reports_dir() / list_id
     if not directory.is_dir():
         raise ListItemNotFound(list_id)
-    with _list_lock(list_id):
+    with _list_lock(list_id) as lock:
+        # Unlike the import, which creates its files exclusively, this is a
+        # read and a rewrite: without the lock two marks could each read the
+        # old file and the later write would drop the earlier mark.
+        if not lock.held:
+            raise OSError(f"could not lock list {list_id}")
         try:
             items = _list_items(parse_list_file((directory / LIST_FILE_NAME).read_bytes()), list_id)
         except (OSError, ListUnreadable):
