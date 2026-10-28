@@ -439,7 +439,7 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     stem = item.get("filenameStem")
     if stem is None or stem == "":
         return "missing_filename_stem", {}
-    if not isinstance(stem, str) or not _STEM_RE.match(stem):
+    if not isinstance(stem, str) or not _STEM_RE.fullmatch(stem):
         return "filename_stem_not_a_slug", {}
     if len(stem) > FILENAME_STEM_MAX_LENGTH:
         return "filename_stem_too_long", {}

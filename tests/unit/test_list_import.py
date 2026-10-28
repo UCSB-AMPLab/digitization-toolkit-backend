@@ -5,7 +5,7 @@ item, in a project named after the basket; items that cannot be created are
 reported as rejects and the rest are still created. The fixtures are the two
 synthetic lists in tests/fixtures/ (tenant captua-test, codes xx-test-...).
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import json
@@ -300,6 +300,7 @@ def _item(code="xx-test-901", stem="xx-test-901", **kw):
     (_item(stem=""), "missing_filename_stem"),
     (_item(stem="xx--test"), "filename_stem_not_a_slug"),
     (_item(stem=7), "filename_stem_not_a_slug"),
+    (_item(code="xx-test-951", stem="xx-test-951\n"), "filename_stem_not_a_slug"),
     (_item(title=None), "missing_title"),
     (_item(title="  "), "missing_title"),
     (_item(title="x" * 256), "invalid_title"),
