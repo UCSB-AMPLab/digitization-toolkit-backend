@@ -534,3 +534,233 @@ def test_a_list_with_its_file_and_no_report_is_listed_after_the_dated_ones(clien
     assert (undated["projectId"], undated["importedAt"]) == (None, None)
     assert undated["listFileMissing"] is False
     assert undated["items"]
+
+
+# ---------------------------------------------------------------------------
+# Each item's volume's project
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_each_item_carries_its_volumes_project(client, db_session, reports_root):
+    _as("op", "admin")
+    report = _post(client, _list_with([
+        _item(code="xx-test-901", stem="xx-test-901"),
+        _item(code="xx-test-901", stem="xx-test-901", sequence=2),  # a repeat: no volume
+    ])).json()
+    first, repeat = _one(client, VALID_ID)["items"]
+    assert first["projectId"] == report["projectId"]
+    assert repeat["projectId"] is None
+
+
+@pytest.mark.unit
+def test_an_item_with_no_volume_has_no_project(client, db_session, reports_root):
+    _as("op", "admin")
+    _post(client, _list_with([_item(code="xx-test-901", stem="xx-test-901")]))
+    db_session.delete(_volumes(db_session)["xx-test-901"])
+    db_session.commit()
+    (item,) = _one(client, VALID_ID)["items"]
+    assert (item["collectionId"], item["projectId"]) == (None, None)
+
+
+# ---------------------------------------------------------------------------
+# Marking an item done by hand
+# ---------------------------------------------------------------------------
+
+def _as_role(username, role):
+    """The real role checks, with get_current_user giving this user."""
+    from app.main import app
+    import app.api.imports as imports
+    from app.api.auth import get_current_user
+    from app.models.user import User
+
+    for dep in (imports.allow_contributor, imports.allow_read_only):
+        app.dependency_overrides.pop(dep, None)
+    user = User(username=username, email=f"{username}@example.com",
+                hashed_password="x", role=role, is_active=True)
+    app.dependency_overrides[get_current_user] = lambda: user
+
+
+def _mark(client, position, done=True, list_id=VALID_ID):
+    return client.put(f"/imports/digitisation-lists/{list_id}/items/{position}/done", json={"done": done})
+
+
+def _marks(client, list_id=VALID_ID):
+    return {i["position"]: i["doneMark"] for i in _one(client, list_id)["items"]}
+
+
+@pytest.fixture
+def imported(client, db_session, reports_root):
+    _as("op", "admin")
+    _post_fixture(client, VALID)
+    return reports_root / VALID_ID
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role, allowed", [("admin", True), ("reviewer", True), ("operator", False)])
+def test_marking_done_is_admin_or_reviewer(client, imported, role, allowed):
+    _as_role("u", role)
+    resp = _mark(client, 1)
+    assert resp.status_code == (200 if allowed else 403), resp.text
+    assert (imported / "done.json").exists() is allowed
+
+
+@pytest.mark.unit
+def test_marking_done_needs_authentication(client, db_session, reports_root):
+    assert _mark(client, 1).status_code == 401
+
+
+@pytest.mark.unit
+def test_a_mark_is_stored_and_shown_on_the_item(client, imported):
+    _as_role("rev", "reviewer")
+    resp = _mark(client, 2)
+    assert resp.status_code == 200, resp.text
+    body = resp.json()
+    assert body["listId"] == VALID_ID and body["position"] == 2
+    assert body["doneMark"]["by"] == "rev"
+    at = body["doneMark"]["at"]
+    assert at.endswith("Z")
+
+    stored = json.loads((imported / "done.json").read_text(encoding="utf-8"))
+    assert stored == {"2": {"done": True, "by": "rev", "at": at}}
+    assert not list(imported.glob(".tmp-*"))
+
+    marks = _marks(client)
+    assert marks[2] == {"by": "rev", "at": at}
+    assert marks[1] is None and marks[3] is None
+
+
+@pytest.mark.unit
+def test_unmarking_removes_the_entry(client, imported):
+    _as_role("rev", "reviewer")
+    _mark(client, 1)
+    _mark(client, 3)
+    resp = _mark(client, 1, done=False)
+    assert resp.status_code == 200
+    assert resp.json()["doneMark"] is None
+    stored = json.loads((imported / "done.json").read_text(encoding="utf-8"))
+    assert set(stored) == {"3"}
+    assert _marks(client)[1] is None and _marks(client)[3] is not None
+
+    # Unmarking an item that is not marked is not an error.
+    assert _mark(client, 2, done=False).status_code == 200
+
+
+@pytest.mark.unit
+def test_marking_again_keeps_one_entry(client, imported):
+    _as_role("adm", "admin")
+    _mark(client, 1)
+    _mark(client, 1)
+    assert set(json.loads((imported / "done.json").read_text(encoding="utf-8"))) == {"1"}
+
+
+@pytest.mark.unit
+def test_marking_an_unknown_list_or_position_is_404(client, imported):
+    _as_role("rev", "reviewer")
+    assert _mark(client, 1, list_id=REJECTS_ID).status_code == 404
+    assert _mark(client, 99).status_code == 404
+    assert _mark(client, 0).status_code == 404
+
+
+@pytest.mark.unit
+def test_a_position_that_is_not_an_item_is_404(client, db_session, reports_root):
+    """A position the stored file holds no item object at: not shown, so not markable."""
+    _as("op", "admin")
+    _post(client, _list_with([_item(), "not an object"]))
+    _as_role("rev", "reviewer")
+    assert _mark(client, 2).status_code == 404
+    assert _mark(client, 1).status_code == 200
+
+
+@pytest.mark.unit
+def test_marking_a_list_without_its_file_is_404(client, imported):
+    (imported / "list.json").unlink()
+    _as_role("rev", "reviewer")
+    assert _mark(client, 1).status_code == 404
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [{}, {"done": "yes"}, {"done": 1}, {"done": None}, ["done"]])
+def test_a_malformed_body_is_422(client, imported, body):
+    _as_role("rev", "reviewer")
+    resp = client.put(f"/imports/digitisation-lists/{VALID_ID}/items/1/done", json=body)
+    assert resp.status_code == 422
+    assert not (imported / "done.json").exists()
+
+
+@pytest.mark.unit
+def test_a_list_id_that_is_not_a_uuid_is_422(client, imported):
+    _as_role("rev", "reviewer")
+    assert _mark(client, 1, list_id="not-a-uuid").status_code == 422
+    assert client.put("/imports/digitisation-lists/not-a-uuid/items/x/done", json={"done": True}).status_code == 422
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("content", [
+    b"{damaged",
+    b"[1, 2]",
+    b'{"1": "yes", "x": {"done": true}, "2": {"done": false, "by": "a", "at": "b"}}',
+    b"\xff\xfe",
+])
+def test_a_damaged_done_file_reads_as_no_marks(client, imported, content):
+    (imported / "done.json").write_bytes(content)
+    _as("op", "admin")
+    assert all(mark is None for mark in _marks(client).values())
+
+
+@pytest.mark.unit
+def test_marking_over_a_damaged_done_file_starts_afresh(client, imported):
+    (imported / "done.json").write_bytes(b"{damaged")
+    _as_role("rev", "reviewer")
+    assert _mark(client, 1).status_code == 200
+    assert set(json.loads((imported / "done.json").read_text(encoding="utf-8"))) == {"1"}
+
+
+@pytest.mark.unit
+def test_a_done_file_that_cannot_be_written_is_a_503_and_changes_nothing(client, imported, monkeypatch):
+    import os
+
+    _as_role("rev", "reviewer")
+    _mark(client, 1)
+    before = (imported / "done.json").read_bytes()
+
+    def fail(src, dst):
+        raise OSError("read-only filesystem")
+
+    monkeypatch.setattr(os, "replace", fail)
+    assert _mark(client, 2).status_code == 503
+    assert (imported / "done.json").read_bytes() == before
+    assert not list(imported.glob(".tmp-*"))
+
+
+@pytest.mark.unit
+def test_marking_takes_the_list_lock(client, imported, monkeypatch):
+    import app.core.list_import as li
+
+    taken = []
+    real = li._list_lock
+
+    class spy(real):
+        def __enter__(self):
+            taken.append(self.path)
+            return super().__enter__()
+
+    monkeypatch.setattr(li, "_list_lock", spy)
+    _as_role("rev", "reviewer")
+    _mark(client, 1)
+    assert taken == [imported / ".lock"]
+
+
+@pytest.mark.unit
+def test_marking_and_unmarking_are_logged(client, db_session, imported):
+    from app.models.system_log import SystemLog
+
+    _as_role("rev", "reviewer")
+    _mark(client, 1)
+    _mark(client, 1, done=False)
+    rows = (db_session.query(SystemLog)
+            .filter(SystemLog.action.like("digitisation_list_item_%"))
+            .order_by(SystemLog.id).all())
+    assert [r.action for r in rows] == ["digitisation_list_item_marked_done", "digitisation_list_item_unmarked"]
+    assert all(r.actor == "rev" and r.category == "activity" for r in rows)
+    assert rows[0].subject == "Prueba válida"
+    assert "xx-test-001" in rows[0].detail

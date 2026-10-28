@@ -1077,19 +1077,7 @@ def store_list_file(list_id: str, raw: bytes) -> Path:
             return target
     except OSError:
         logger.warning("Could not read the kept file of list %s; replacing it", list_id)
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
-    try:
-        with os.fdopen(fd, "wb") as handle:
-            handle.write(raw)
-            handle.flush()
-            os.fsync(handle.fileno())
-        os.replace(tmp, target)
-    except BaseException:
-        try:
-            os.unlink(tmp)
-        except OSError:
-            pass
-        raise
+    _replace_file(target, raw)
     return target
 
 
@@ -1180,12 +1168,96 @@ def stored_lists() -> list[dict]:
             "projectId": report.get("projectId"),
             "importedAt": report.get("importedAt"),
             "listFileMissing": items is None,
+            "doneMarks": read_done_marks(list_id) if items else {},
             "items": items or [],
         })
     dated = sorted((e for e in lists if e["importedAt"] is not None),
                    key=lambda e: (str(e["importedAt"]), e["listId"]), reverse=True)
     undated = sorted((e for e in lists if e["importedAt"] is None), key=lambda e: e["listId"])
     return dated + undated
+
+
+DONE_FILE_NAME = "done.json"
+
+
+class ListItemNotFound(Exception):
+    """No stored list file of this id holds an item at this position."""
+
+
+def read_done_marks(list_id: str) -> dict[int, dict]:
+    """The items marked done by hand, as position -> {by, at}, from `<list-id>/done.json`.
+
+    The file holds {"<position>": {"done": true, "by": ..., "at": ...}}. A
+    file that is missing, unreadable or not such an object reads as no
+    marks, and an entry that is not one is skipped, so a damaged file never
+    stops the queue from being read.
+    """
+    path = reports_dir() / str(uuid.UUID(list_id)) / DONE_FILE_NAME
+    try:
+        data = json.loads(path.read_bytes().decode("utf-8"))
+    except (OSError, ValueError, RecursionError):
+        return {}
+    if not isinstance(data, dict):
+        return {}
+    marks = {}
+    for key, entry in data.items():
+        if not (isinstance(key, str) and key.isdigit() and isinstance(entry, dict) and entry.get("done") is True):
+            continue
+        marks[int(key)] = {"by": entry.get("by"), "at": entry.get("at")}
+    return marks
+
+
+def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str]) -> tuple[dict, Optional[dict]]:
+    """Mark the item at `position` done (or remove its mark), under the list lock.
+
+    Returns the item, as _list_items gives it, and its mark ({by, at}, or
+    None once removed). Raises ListItemNotFound when the list has no stored
+    file readable as that list, or the file holds no item object at that
+    position. done.json is rewritten whole, atomically (a temporary file,
+    fsynced, then os.replace); a damaged one is read as no marks and so
+    replaced. Raises OSError, with done.json unchanged, if it cannot be
+    written.
+    """
+    list_id = str(uuid.UUID(list_id))
+    directory = reports_dir() / list_id
+    if not directory.is_dir():
+        raise ListItemNotFound(list_id)
+    with _list_lock(list_id):
+        try:
+            items = _list_items(parse_list_file((directory / LIST_FILE_NAME).read_bytes()), list_id)
+        except (OSError, ListUnreadable):
+            items = None
+        item = next((i for i in items or [] if i["position"] == position), None)
+        if item is None:
+            raise ListItemNotFound(list_id)
+        marks = read_done_marks(list_id)
+        if done:
+            marks[position] = {
+                "by": actor,
+                "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
+            }
+        else:
+            marks.pop(position, None)
+        body = {str(p): {"done": True, **mark} for p, mark in sorted(marks.items())}
+        _replace_file(directory / DONE_FILE_NAME, json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8"))
+    return item, marks.get(position)
+
+
+def _replace_file(target: Path, data: bytes) -> None:
+    """Write `target` atomically: a temporary file beside it, fsynced, then os.replace. Raises OSError."""
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=target.suffix)
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(data)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
 
 
 def _next_run_number(directory: Path, list_id: str) -> int:
