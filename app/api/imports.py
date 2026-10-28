@@ -4,9 +4,11 @@ POST /imports/digitisation-list takes the list as a multipart file upload,
 the form the contract delivers it in (a file moved by download, USB or LAN
 copy), so the interface can send the file the operator picked unchanged.
 GET /imports/digitisation-list/{list_id}/report returns the latest stored
-import report for a list. The import itself is app/core/list_import.py.
+import report for a list, and GET /imports/digitisation-lists every imported
+list with its items and the volume each one names. The import itself is
+app/core/list_import.py.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import hashlib
@@ -16,6 +18,7 @@ from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
+from app.api.activity import status_counts
 from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core.audit import log_event
@@ -31,7 +34,10 @@ from app.core.list_import import (
     parse_list_file,
     latest_report,
     report_filename,
+    stem_is_well_formed,
+    stored_lists,
 )
+from app.models.collection import Collection
 from app.models.user import User
 
 router = APIRouter()
@@ -83,7 +89,8 @@ def import_digitisation_list(
     `created` and `skipped`, the volumes created, and the `rejects`, each
     with the item's position, referenceCode and reason. `reportStored` says
     whether the report was also kept on the unit for
-    GET /imports/digitisation-list/{list_id}/report.
+    GET /imports/digitisation-list/{list_id}/report, and `listStored`
+    whether the uploaded file was kept for GET /imports/digitisation-lists.
     """
     raw = _read_capped(file)
     try:
@@ -94,7 +101,7 @@ def import_digitisation_list(
     try:
         report = import_list(db, document, current_user.username,
                              may_create_project=current_user.role == "admin",
-                             file_sha256=hashlib.sha256(raw).hexdigest())
+                             file_sha256=hashlib.sha256(raw).hexdigest(), raw=raw)
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
@@ -114,6 +121,54 @@ def import_digitisation_list(
                 f"{report['skipped']} skipped" + ("" if stored else "; report not stored")),
     )
     return JSONResponse(content=report)
+
+
+@router.get("/digitisation-lists")
+def list_digitisation_lists(
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """Every imported list, newest import first, with its items in list order.
+
+    Each list has `listId`, `listName`, `projectId`, `importedAt`,
+    `listFileMissing` and `items`. Each item has `position`, `sequence`,
+    `referenceCode`, `filenameStem`, `title`, `notes` (as the file has
+    them) and `action` (null when absent), plus `collectionId`, the volume
+    on this unit whose filename_stem is the item's filenameStem, and
+    `status`, that volume's record counts by status as
+    GET /activity/collections gives them; both null when there is no such
+    volume, when the stem is not one the import accepts (it is then not
+    looked up), and for an item that repeats a stem an earlier item of the
+    same list, by position in the file, already gave. A list whose stored file is missing or unreadable, which is
+    every list imported before the file was kept, has `items: []` and
+    `listFileMissing: true`. Reads only.
+    """
+    lists = stored_lists()
+    # A stem the import would refuse is never bound: psycopg refuses a NUL
+    # in a parameter, which would fail the whole response.
+    stems = {item["filenameStem"] for entry in lists for item in entry["items"]
+             if stem_is_well_formed(item["filenameStem"])}
+    volume_of: dict[str, int] = {}
+    if stems:
+        volume_of = dict(
+            db.query(Collection.filename_stem, Collection.id)
+            .filter(Collection.filename_stem.in_(stems))
+            .all()
+        )
+    counts = status_counts(db, sorted(set(volume_of.values())))
+    for entry in lists:
+        first_position: dict[str, int] = {}
+        for item in entry["items"]:
+            stem = item["filenameStem"]
+            if stem_is_well_formed(stem):
+                first_position[stem] = min(first_position.get(stem, item["position"]), item["position"])
+        for item in entry["items"]:
+            stem = item["filenameStem"]
+            first = stem_is_well_formed(stem) and first_position[stem] == item["position"]
+            cid = volume_of.get(stem) if first else None
+            item["collectionId"] = cid
+            item["status"] = counts[cid].model_dump() if cid is not None else None
+    return JSONResponse(content=lists)
 
 
 @router.get("/digitisation-list/{list_id}/report")

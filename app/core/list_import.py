@@ -39,9 +39,11 @@ The report is returned and also written under
 `<DATA_DIR>/imports/<list-id>/`, one numbered file per run, so an
 operator can fetch it again (latest_report_path). Each report records the
 SHA-256 of the uploaded file, and a list id already imported from a file
-with a different hash is refused (ListIdReused).
+with a different hash is refused (ListIdReused). The uploaded file itself is
+kept beside the reports as `list.json` (store_list_file), and stored_lists
+reads every list back for the queue, item by item in list order.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 from __future__ import annotations
@@ -49,6 +51,7 @@ from __future__ import annotations
 import fcntl
 import json
 import logging
+import math
 import os
 import re
 import tempfile
@@ -170,6 +173,29 @@ def _refuse_constant(name: str):
     raise ListUnreadable(f"The file is not valid JSON: it contains {name}, which JSON does not allow.")
 
 
+NUMBER_TOO_LARGE_MESSAGE = "The file contains a number too large to read."
+
+
+def _finite_float(text: str) -> float:
+    # json reads 1e400 as inf, which json.dumps then writes as the bare word
+    # Infinity: not JSON, in custom_attributes or in any response.
+    value = float(text)
+    if not math.isfinite(value):
+        raise ListUnreadable(NUMBER_TOO_LARGE_MESSAGE)
+    return value
+
+
+def _float_sized_int(text: str) -> int:
+    # An integer beyond a float's range reads back as Infinity in a
+    # JavaScript consumer; one past the digit limit raises ValueError here.
+    value = int(text)
+    try:
+        float(value)
+    except OverflowError:
+        raise ListUnreadable(NUMBER_TOO_LARGE_MESSAGE)
+    return value
+
+
 def _refuse_duplicate_keys(pairs):
     # A key given twice in one object is read by json as its last value,
     # silently; a file whose first `version` was 2.0 would pass as 1.1.
@@ -212,8 +238,9 @@ def parse_list_file(raw: bytes) -> Any:
     and nesting deep enough to exhaust the recursion limit; NaN, Infinity
     and -Infinity; a key repeated within one object, at any depth; and a key
     or string holding a lone surrogate, which json accepts as an escape
-    (`\\ud800`) but no UTF-8 encoder writes. Nothing is written before
-    this returns.
+    (`\\ud800`) but no UTF-8 encoder writes; and a number whose value a
+    float cannot hold, such as 1e400. Nothing is written before this
+    returns.
     """
     try:
         text = raw.decode("utf-8-sig")
@@ -221,6 +248,7 @@ def parse_list_file(raw: bytes) -> Any:
         raise ListUnreadable("The file is not UTF-8 text.")
     try:
         document = json.loads(text, parse_constant=_refuse_constant,
+                              parse_float=_finite_float, parse_int=_float_sized_int,
                               object_pairs_hook=_refuse_duplicate_keys)
     except _DuplicateKey as exc:
         raise ListUnreadable(f"The file is not valid for import: the key {str(exc)!r} appears twice in one object.")
@@ -231,7 +259,7 @@ def parse_list_file(raw: bytes) -> Any:
     except ValueError:
         # The integer-conversion digit limit (sys.set_int_max_str_digits),
         # whose own text names interpreter settings an operator cannot use.
-        raise ListUnreadable("The file contains a number too large to read.")
+        raise ListUnreadable(NUMBER_TOO_LARGE_MESSAGE)
     if _holds_lone_surrogate(document):
         raise ListUnreadable(
             "The file is not valid for import: a string in it holds an escaped lone surrogate "
@@ -350,6 +378,15 @@ def _reference_code(item: dict) -> Any:
     if isinstance(code, str) and not code.strip():
         return None
     return code
+
+
+def stem_is_well_formed(stem: Any) -> bool:
+    """Whether `stem` passes the stem checks of _check_item: a slug of at most FILENAME_STEM_MAX_LENGTH.
+
+    Matched against the whole string, so a trailing newline, which `$`
+    accepts, does not pass.
+    """
+    return isinstance(stem, str) and len(stem) <= FILENAME_STEM_MAX_LENGTH and _STEM_RE.fullmatch(stem) is not None
 
 
 def _parse_date(value: Any) -> tuple[bool, Optional[date]]:
@@ -722,7 +759,7 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool,
-                file_sha256: Optional[str] = None) -> dict:
+                file_sha256: Optional[str] = None, raw: Optional[bytes] = None) -> dict:
     """Import a digitisation list, store its report, and return it.
 
     Raises, before writing anything to the database or a report:
@@ -744,9 +781,12 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     leaves no hash and its corrected version can be imported under the
     same id.
     Otherwise commits the project (if new) and then each volume on its own,
-    stores the report as the list's next run, and returns it with
-    `reportStored` saying whether that write succeeded (the stored file
-    does not carry that key).
+    keeps `raw`, the uploaded file, as the list's `list.json`
+    (store_list_file), stores the report as the list's next run, and
+    returns it with `reportStored` saying whether that write succeeded (the
+    stored file does not carry that key). `listStored` says whether the
+    list file is kept, and is stored with the report; it is False when
+    `raw` is not given. Neither failure undoes the import.
 
     Imports of the same list id are serialised by an exclusive lock on
     `<reports_dir>/<list-id>/.lock`, held from the hash check to the
@@ -790,6 +830,14 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
             raise
         report = _import_items(db, list_id, list_name, project, project_created, items, actor, notes=notes)
         report["fileSha256"] = file_sha256
+        list_stored = False
+        if raw is not None:
+            try:
+                store_list_file(list_id, raw)
+                list_stored = True
+            except OSError:
+                logger.exception("Could not keep the file of list %s", list_id)
+        report["listStored"] = list_stored
         try:
             store_report(report)
             stored = True
@@ -957,16 +1005,21 @@ def _write_hash_file(directory: Path, digest: str) -> None:
     """Create `<directory>/sha256` holding `digest`, or raise FileExistsError if it exists.
 
     Created exclusively, so that of two imports that both found no hash
-    file (possible when the list lock is unavailable) only one writes it:
-    the hash goes to a temporary file, which is hard-linked to the name
-    (failing if the name exists). Without hard links the name is created
-    with O_CREAT|O_EXCL and written in place, and removed if the write
-    fails.
+    file (possible when the list lock is unavailable) only one writes it.
     """
     directory.mkdir(parents=True, exist_ok=True)
-    target = directory / HASH_FILE_NAME
-    data = (digest + "\n").encode("ascii")
-    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".sha256")
+    _write_new_file(directory / HASH_FILE_NAME, (digest + "\n").encode("ascii"), ".sha256")
+
+
+def _write_new_file(target: Path, data: bytes, suffix: str) -> None:
+    """Create `target` holding `data`, or raise FileExistsError if it exists.
+
+    The data goes to a temporary file in the same directory, which is
+    hard-linked to the name (failing if the name exists), so a reader never
+    sees half a file. Without hard links the name is created with
+    O_CREAT|O_EXCL and written in place, and removed if the write fails.
+    """
+    fd, tmp = tempfile.mkstemp(dir=target.parent, prefix=".tmp-", suffix=suffix)
     try:
         with os.fdopen(fd, "wb") as handle:
             handle.write(data)
@@ -996,6 +1049,143 @@ def _write_hash_file(directory: Path, digest: str) -> None:
         except OSError:
             pass
         raise
+
+
+LIST_FILE_NAME = "list.json"
+
+
+def store_list_file(list_id: str, raw: bytes) -> Path:
+    """Keep the uploaded list, byte for byte, as `<reports_dir>/<list-id>/list.json`.
+
+    Written exclusively and atomically, as the hash file is
+    (_write_new_file). A list id is imported again only from a file with
+    the same SHA-256 (_check_hash), so an existing copy that holds these
+    bytes is kept as it is. One that does not (damaged, or unreadable) is
+    replaced atomically: a temporary file, fsynced, then os.replace. Raises
+    OSError if the file cannot be written or replaced.
+    """
+    directory = reports_dir() / str(uuid.UUID(list_id))
+    directory.mkdir(parents=True, exist_ok=True)
+    target = directory / LIST_FILE_NAME
+    try:
+        _write_new_file(target, raw, ".json")
+        return target
+    except FileExistsError:
+        pass
+    try:
+        if target.read_bytes() == raw:
+            return target
+    except OSError:
+        logger.warning("Could not read the kept file of list %s; replacing it", list_id)
+    fd, tmp = tempfile.mkstemp(dir=directory, prefix=".tmp-", suffix=".json")
+    try:
+        with os.fdopen(fd, "wb") as handle:
+            handle.write(raw)
+            handle.flush()
+            os.fsync(handle.fileno())
+        os.replace(tmp, target)
+    except BaseException:
+        try:
+            os.unlink(tmp)
+        except OSError:
+            pass
+        raise
+    return target
+
+
+def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
+    """The items of a stored list file, in list order; None if it is not this list's file.
+
+    List order is `sequence`, then position in the file; an item without
+    an integer sequence comes after those with one. An item that is not a
+    JSON object has no fields to show and is left out. `notes` is given as
+    the file has it when it is a string, and so is `action`, which the
+    contract does not name; any other value of either is None.
+    """
+    try:
+        found_id, _, items = check_envelope(document)
+    except ListRefused:
+        return None
+    if found_id != list_id:
+        return None
+
+    def text(item: dict, key: str) -> Optional[str]:
+        value = item.get(key)
+        return value if isinstance(value, str) else None
+
+    out = []
+    for position, item in enumerate(items, start=1):
+        if not isinstance(item, dict):
+            continue
+        sequence = item.get("sequence")
+        if isinstance(sequence, bool) or not isinstance(sequence, int):
+            sequence = None
+        out.append({
+            "position": position,
+            "sequence": sequence,
+            "referenceCode": text(item, "referenceCode"),
+            "filenameStem": text(item, "filenameStem"),
+            "title": text(item, "title"),
+            "notes": text(item, "notes"),
+            "action": text(item, "action"),
+        })
+    out.sort(key=lambda i: (i["sequence"] is None, i["sequence"] or 0, i["position"]))
+    return out
+
+
+def stored_lists() -> list[dict]:
+    """Every list imported on this unit, newest import first, with its items from its list.json.
+
+    A list is a directory under reports_dir() named by a UUID and holding
+    a report latest_report can read, a list.json readable as that list, or
+    both. `listName`, `projectId` and `importedAt` come from the latest
+    report; without one (its import could not store it), `listName` comes
+    from the file, the other two are None, and the list comes after every
+    dated one. `items` is in list order (_list_items); when list.json is
+    missing, cannot be read as a list, or is another list's file, `items`
+    is empty and `listFileMissing` is True. Reads only.
+    """
+    root = reports_dir()
+    try:
+        directories = [p for p in root.iterdir() if p.is_dir()]
+    except OSError:
+        return []
+    lists = []
+    for directory in directories:
+        try:
+            list_id = str(uuid.UUID(directory.name))
+        except ValueError:
+            continue
+        if list_id != directory.name:
+            continue
+        items = None
+        file_name = None
+        try:
+            document = parse_list_file((directory / LIST_FILE_NAME).read_bytes())
+            items = _list_items(document, list_id)
+            if items is not None:
+                file_name = document["list"]["name"]
+        except (OSError, ListUnreadable):
+            pass
+        found = latest_report(list_id)
+        if found is not None:
+            report = json.loads(found[1].decode("utf-8"))
+        elif items is not None:
+            report = {"listName": file_name}
+        else:
+            continue
+        lists.append({
+            "listId": list_id,
+            "listName": report.get("listName"),
+            "projectId": report.get("projectId"),
+            "importedAt": report.get("importedAt"),
+            "listFileMissing": items is None,
+            "items": items or [],
+        })
+    dated = sorted((e for e in lists if e["importedAt"] is not None),
+                   key=lambda e: (str(e["importedAt"]), e["listId"]), reverse=True)
+    undated = sorted((e for e in lists if e["importedAt"] is None), key=lambda e: e["listId"])
+    return dated + undated
 
 
 def _next_run_number(directory: Path, list_id: str) -> int:

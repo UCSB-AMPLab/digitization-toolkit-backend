@@ -3,9 +3,10 @@ and how much was captured and reviewed on each recent day.
 
 Both endpoints count in the database or over a bounded set of timestamp
 columns. Neither loads ORM objects, because a unit holds thousands of records
-and the dashboard calls them on every visit.
+and the dashboard calls them on every visit. status_counts is also what
+GET /imports/digitisation-lists shows for each item's volume.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -61,6 +62,24 @@ def _collections_in_scope(db: Session, project_id: Optional[int]) -> List[int]:
     return [cid for cid, _, _ in rows if cid in found]
 
 
+def status_counts(db: Session, ids: List[int]) -> dict[int, StatusCounts]:
+    """Each collection's records counted by status, in one grouped query.
+
+    Every id given is in the result, one with no records with zeros. A
+    record counts under its current collection.
+    """
+    counts: dict[int, dict[str, int]] = defaultdict(dict)
+    if ids:
+        for cid, status, n in (
+            db.query(Record.collection_id, Record.status, func.count(Record.id))
+            .filter(Record.collection_id.in_(ids))
+            .group_by(Record.collection_id, Record.status)
+            .all()
+        ):
+            counts[cid][status] = n
+    return {cid: StatusCounts(**counts.get(cid, {})) for cid in ids}
+
+
 @router.get("/collections", response_model=List[CollectionActivity])
 def collection_activity(
     project_id: Optional[int] = Query(None, description="Only this project's collections, at any depth"),
@@ -79,14 +98,7 @@ def collection_activity(
     if not ids:
         return []
 
-    counts: dict[int, dict[str, int]] = defaultdict(dict)
-    for cid, status, n in (
-        db.query(Record.collection_id, Record.status, func.count(Record.id))
-        .filter(Record.collection_id.in_(ids))
-        .group_by(Record.collection_id, Record.status)
-        .all()
-    ):
-        counts[cid][status] = n
+    counts = status_counts(db, ids)
 
     # The collection a change row belongs to: the record's current one while
     # the record exists, the stored snapshot once it has been deleted.
@@ -105,7 +117,7 @@ def collection_activity(
 
     results = []
     for cid in ids:
-        by_status = StatusCounts(**counts.get(cid, {}))
+        by_status = counts[cid]
         results.append(CollectionActivity(
             collection_id=cid,
             status_counts=by_status,
