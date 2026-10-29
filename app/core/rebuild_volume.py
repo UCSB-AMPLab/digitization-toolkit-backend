@@ -412,18 +412,80 @@ def _freed_keys(volume_dir: Path) -> set:
     return keys
 
 
-def _done(db: Session, collection_id: int, planned: List[Planned], keys: Dict[str, str],
-          paths: Dict[str, str]) -> tuple:
-    """({capture_id: done image facts}, [problems]): the volume's records, each matched to an earlier run's image.
+def _naive_utc(value: Optional[datetime]) -> Optional[datetime]:
+    """A DateTime as naive UTC: the column gives naive values back, holding UTC as written."""
+    if value is None or value.tzinfo is None:
+        return value
+    return value.astimezone(timezone.utc).replace(tzinfo=None)
 
-    A record is an earlier run's when it is single and captured, has one
-    image, and that image has a planned capture id, the planned sequence,
-    name and canonical path, a freed master, a thumbnail row in the volume's
-    `thumbnails/` (whose file, if an interruption or a hand lost it, the
-    applied run copies again from the bundle) and a verified row at the
-    planned key. Every other record is returned as a problem, with its
-    images' names and whether any of them carries a planned capture id, for
-    the caller to judge (_captures_since_raise).
+
+def _differences(p: Planned, rec, imgs: list, row, line: Optional[dict], key: str, path: str) -> List[str]:
+    """The fields in which an earlier run's record and image, offsite row and manifest line differ from the plan.
+
+    Empty when the image is whole and is what the plan and the bundle say it
+    is: an image is never skipped as done on its capture id alone.
+    """
+    out = []
+    if len(imgs) != 1:
+        return ["images"]
+    img = imgs[0]
+    checks = [
+        ("capture_mode", rec.capture_mode == "single"),
+        ("status", rec.status == "captured"),
+        ("sequence", rec.sequence == p.volume_order),
+        ("filename", img.filename == p.filename),
+        ("file_path", img.file_path == path),
+        ("rotate_deg", img.rotate_deg == p.rotate_deg),
+        ("created_at", _naive_utc(img.created_at) == _naive_utc(p.captured_at)),
+        ("file_size", img.file_size == p.size),
+        ("resolution_width", img.resolution_width == p.width),
+        ("resolution_height", img.resolution_height == p.height),
+        ("master_freed_at", img.master_freed_at is not None),
+        ("master_freed_bytes", img.master_freed_bytes == p.size),
+        ("thumbnail_path", bool(img.thumbnail_path)
+         and Path(img.thumbnail_path).parent == Path(path).parent.parent / THUMBNAILS_DIR),
+    ]
+    out.extend(name for name, ok in checks if not ok)
+    if row is None or row.verified_at is None:
+        out.append("offsite.verified")
+    else:
+        if row.object_key != key:
+            out.append("offsite.key")
+        if row.local_sha1 != p.sha1:
+            out.append("offsite.local_sha1")
+    out.extend(_line_differences(p, line))
+    return out
+
+
+def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
+    """The fields in which an image's capture line differs from the plan and the bundle."""
+    files = (line or {}).get("files") or []
+    if line is None:
+        return ["manifest.missing"]
+    if len(files) != 1 or not isinstance(files[0], dict):
+        return ["manifest.files"]
+    f = files[0]
+    checks = [
+        ("manifest.relative_path", f.get("relative_path") == f"{CAPTURES_DIR}/{p.filename}"),
+        ("manifest.sha256", f.get("sha256") == p.sha256),
+        ("manifest.bytes", f.get("bytes") == p.size),
+        ("manifest.rotate_deg", f.get("rotate_deg") == p.rotate_deg),
+    ]
+    return [name for name, ok in checks if not ok]
+
+
+def _done(db: Session, collection_id: int, planned: List[Planned], keys: Dict[str, str],
+          paths: Dict[str, str], in_manifest: Dict[str, dict]) -> tuple:
+    """({capture_id: done image facts}, [other records], [differing images]) for the volume's records.
+
+    A record whose image carries a planned capture id is an earlier run's,
+    and is done only when it is whole and agrees with the plan and the
+    bundle in every field _differences compares; otherwise it is listed,
+    naming the fields, for the caller to refuse. A missing thumbnail file is
+    not a difference: the applied run copies it again from the bundle. Every
+    record whose images carry no planned capture id is returned among the
+    others, with its images' names, for the caller to judge
+    (_captures_since_raise).
     """
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
@@ -436,33 +498,35 @@ def _done(db: Session, collection_id: int, planned: List[Planned], keys: Dict[st
     for img in images:
         by_record.setdefault(img.record_id, []).append(img)
     rows = {}
-    if images:
-        for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_([i.id for i in images])):
+    for start in range(0, len(images), 500):
+        chunk = [i.id for i in images[start:start + 500]]
+        for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
             rows[(row.record_image_id, row.kind)] = row
 
-    done, problems = {}, []
+    done, others, differ = {}, [], []
     for rec in records:
         imgs = by_record.get(rec.id, [])
-        img = imgs[0] if len(imgs) == 1 else None
-        p = by_id.get(img.capture_id) if img is not None else None
-        row = rows.get((img.id, "capture")) if img is not None else None
-        if (p is None or rec.capture_mode != "single" or rec.status != "captured"
-                or rec.sequence != p.volume_order or img.filename != p.filename
-                or img.file_path != paths[p.capture_id] or img.master_freed_at is None
-                or not img.thumbnail_path
-                or Path(img.thumbnail_path).parent != Path(paths[p.capture_id]).parent.parent / THUMBNAILS_DIR
-                or row is None or row.verified_at is None or row.object_key != keys[p.capture_id]
-                or p.capture_id in done):
-            problems.append({"record_id": rec.id, "reason": "not_this_bundles_work",
-                             "images": [i.id for i in imgs], "filenames": [i.filename for i in imgs],
-                             "planned": any(i.capture_id in by_id for i in imgs)})
+        mine = [i for i in imgs if i.capture_id in by_id]
+        if not mine:
+            others.append({"record_id": rec.id, "reason": "not_this_bundles_work",
+                           "images": [i.id for i in imgs], "filenames": [i.filename for i in imgs]})
+            continue
+        p = by_id[mine[0].capture_id]
+        img = mine[0]
+        fields = _differences(p, rec, imgs, rows.get((img.id, "capture")), in_manifest.get(p.capture_id),
+                              keys[p.capture_id], paths[p.capture_id])
+        if p.capture_id in done:
+            fields = ["capture_id_repeated"] + fields
+        if fields:
+            differ.append({"record_id": rec.id, "image_id": img.id, "capture_id": p.capture_id,
+                           "volumeOrder": p.volume_order, "reason": "differs_from_plan", "fields": fields})
             continue
         done[p.capture_id] = {"image_id": img.id, "record_id": rec.id, "file_path": img.file_path,
                               "freed_at": img.master_freed_at, "freed_bytes": img.master_freed_bytes,
                               "thumbnail_path": img.thumbnail_path,
                               "thumbnail_missing": not Path(img.thumbnail_path).is_file()}
     db.commit()
-    return done, problems
+    return done, others, differ
 
 
 def _capture_number(stem: str, name) -> Optional[int]:
@@ -481,7 +545,7 @@ def _captures_since_raise(stem: str, others: List[dict], counter_after: int, cou
     counterAfter + 1 and on, and a rerun leaves them where they are.
     """
     for o in others:
-        if o["planned"] or not o["filenames"]:
+        if not o["filenames"]:
             return False
         for name in o["filenames"]:
             n = _capture_number(stem, name)
@@ -765,7 +829,11 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
     # The counter is raised to counterAfter before the first image, so it is
     # 0 before any run, counterAfter after one, or above it by the captures
     # an operator has taken into the volume since.
-    done, others = _done(db, collection_id, planned, keys, paths)
+    in_manifest = _manifest_captures(volume_dir)
+    done, others, differ = _done(db, collection_id, planned, keys, paths, in_manifest)
+    if differ:
+        raise RebuildRefused(f"{len(differ)} image(s) an earlier run wrote differ from the plan and the bundle; "
+                             "an image is never skipped as done unless it agrees with them", differ)
     if counter_before == 0:
         if others or done:
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make",
@@ -808,7 +876,6 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
     if taken:
         raise RebuildRefused("a planned key or capture id is already recorded on this unit", taken)
 
-    in_manifest = _manifest_captures(volume_dir)
     by_id = {p.capture_id: p for p in planned}
     stray = []
     for cid, entry in in_manifest.items():
@@ -822,10 +889,10 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
             if (counter_before < counter_after or not numbers
                     or not all(n is not None and n > counter_after for n in numbers)):
                 stray.append({"capture_id": cid, "reason": "manifest_capture_not_planned"})
-        elif (len(files) != 1 or not isinstance(files[0], dict)
-              or files[0].get("relative_path") != f"{CAPTURES_DIR}/{p.filename}"
-              or files[0].get("sha256") != p.sha256):
-            stray.append({"capture_id": cid, "volumeOrder": p.volume_order, "reason": "manifest_line_differs"})
+        elif cid not in done and _line_differences(p, entry):
+            # A line a failed commit left: the append-only manifest keeps it, so it must be the plan's.
+            stray.append({"capture_id": cid, "volumeOrder": p.volume_order, "reason": "manifest_line_differs",
+                          "fields": _line_differences(p, entry)})
     if stray:
         raise RebuildRefused(f"the manifest of volume {stem!r} holds captures this bundle does not plan", stray)
 
@@ -879,7 +946,7 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         if d is not None and d["thumbnail_missing"]:
             _recopy_thumbnail(p.thumbnail, Path(d["thumbnail_path"]))
             report["thumbnails_recopied"].append(d["thumbnail_path"])
-    freed_manifest = _RunManifest(stem, "freed")
+    freed_manifest = _RunManifest(stem, "freed", directory=volume_dir / METADATA_DIR)
     already_freed = _freed_keys(volume_dir)
     for p in planned:
         d = done.get(p.capture_id)

@@ -881,3 +881,83 @@ def test_a_lock_file_a_killed_run_left_is_not_foreign_to_the_layout_pass(remote,
     (metadata / "other.lock").write_text("")
 
     assert _foreign_entries(db_session, override_projects_root / STEM, vol.id) == ["metadata/other.lock"]
+
+
+# ---------------------------------------------------------------------------
+# Codex follow-ups
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_rerun_refuses_a_done_image_the_corrected_plan_disagrees_with(remote, db_session, override_projects_root,
+                                                                        tmp_path):
+    """A done image is compared with the plan and the bundle, never skipped as done on its capture id alone."""
+    from app.models.record import RecordImage
+
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path / "first", remote), apply=True)
+    image_id = db_session.query(RecordImage.id).filter(RecordImage.capture_id == _capture_id(1)).scalar()
+
+    def turn(plan):
+        plan[0]["rotateDeg"] = 90
+
+    def turn_exif(images):
+        images[0]["exifOrientation"] = 6
+
+    corrected = _bundle(tmp_path / "second", remote, plan_over=[turn], image_over=[turn_exif])
+    refusal = _refused(db_session, corrected, override_projects_root, match="differ from the plan")
+
+    assert [(p["image_id"], p["volumeOrder"], p["fields"]) for p in refusal.problems] == [
+        (image_id, 1, ["rotate_deg", "manifest.rotate_deg"])]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("change,fields", [
+    (lambda img, row: setattr(img, "file_size", img.file_size + 1), ["file_size"]),
+    (lambda img, row: setattr(img, "resolution_height", 1), ["resolution_height"]),
+    (lambda img, row: setattr(img, "created_at", img.created_at.replace(year=2024)), ["created_at"]),
+    (lambda img, row: setattr(row, "local_sha1", "0" * 40), ["offsite.local_sha1"]),
+])
+def test_a_rerun_names_each_field_a_done_image_differs_in(remote, db_session, override_projects_root, tmp_path,
+                                                          change, fields):
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import RecordImage
+
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote)
+    _rebuild(db_session, bundle, apply=True)
+    img = db_session.query(RecordImage).filter(RecordImage.capture_id == _capture_id(2)).one()
+    row = db_session.query(OffsiteObject).filter(OffsiteObject.record_image_id == img.id).one()
+    change(img, row)
+    db_session.commit()
+
+    refusal = _refused(db_session, bundle, override_projects_root, match="differ from the plan")
+    assert [(p["volumeOrder"], p["fields"]) for p in refusal.problems] == [(2, fields)]
+
+
+@pytest.mark.unit
+def test_every_artifact_stays_under_the_root_read_at_the_start(remote, db_session, override_projects_root,
+                                                               tmp_path, monkeypatch):
+    """A storage switch during the run does not split the volume's files across two roots."""
+    from capture import project_manager
+
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote)
+    other = tmp_path / "other-drive"
+    other.mkdir()
+    real = project_manager._projects_root
+    calls = []
+
+    def switching():
+        calls.append(1)
+        return real() if len(calls) == 1 else other
+
+    monkeypatch.setattr(project_manager, "_projects_root", switching)
+    report = _rebuild(db_session, bundle, apply=True)
+
+    assert len(report["created"]) == 3
+    assert list(other.rglob("*")) == []
+    first = override_projects_root / STEM
+    assert len(list((first / "thumbnails").iterdir())) == 3
+    assert len(_manifest_lines(override_projects_root)) == 3
+    assert len(_freed_lines(override_projects_root)) == 3
+    assert report["manifest"].startswith(str(first))
