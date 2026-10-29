@@ -366,3 +366,125 @@ def test_a_volume_whose_retakes_are_done_can_be_promoted(client, db_session, tes
     resp = _client_as(client, "op", "operator").post(f"/collections/{a.id}/promote")
     assert resp.status_code == 200, resp.text
     assert resp.json()["promoted"] == 1
+
+
+# ---------------------------------------------------------------------------
+# A prepared record: rejected, then moved back to captured by PATCH status
+# ("prepare for retake"), with the rejected image still current. It is still
+# pending until a capture replaces the image.
+# ---------------------------------------------------------------------------
+
+def _prepared(client, db_session, volume, sequence):
+    """A record rejected through the API and then prepared for retake, its rejected image still current."""
+    rec = _record(db_session, volume, "in_review", sequence)
+    resp = _client_as(client, "rev", "reviewer").post(
+        f"/records/{rec.id}/reject", json={"predefined_reason": "blur"})
+    assert resp.status_code == 200, resp.text
+    resp = _client_as(client, "op", "operator").patch(
+        f"/records/{rec.id}/status", json={"status": "captured"})
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    db_session.refresh(rec)
+    assert rec.status == "captured"
+    return rec
+
+
+@pytest.mark.unit
+def test_a_prepared_record_is_still_pending(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _record(db_session, a, "captured", 1)
+    prepared = _prepared(client, db_session, a, 2)
+    api = _client_as(client, "op", "operator")
+
+    body = _summary(api)
+    assert body["pendingRecords"] == 1
+    assert body["volumes"] == [{
+        "collectionId": a.id, "projectId": test_project.id, "name": "Tomo A",
+        "filenameStem": "co-test-a", "pending": 1, "total": 1,
+        "firstPendingRecordId": prepared.id,
+    }]
+    assert body["turn"] == {"state": "recaptures", "unlockedBy": None}
+    assert _events(db_session, COMPLETED) == [], "a status change alone never completes a volume"
+
+
+@pytest.mark.unit
+def test_the_first_pending_record_counts_prepared_ones(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _rejected(db_session, a, 5)
+    prepared = _prepared(client, db_session, a, 2)
+    body = _summary(_client_as(client, "op", "operator"))
+    assert body["volumes"][0]["pending"] == 2
+    assert body["volumes"][0]["firstPendingRecordId"] == prepared.id
+
+
+@pytest.mark.unit
+def test_a_prepared_record_blocks_promotion(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _record(db_session, a, "captured", 1)
+    _prepared(client, db_session, a, 2)
+    resp = _client_as(client, "op", "operator").post(f"/collections/{a.id}/promote")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "recaptures_pending"
+    assert resp.json()["detail"]["pending"] == 1
+
+
+@pytest.mark.unit
+def test_a_prepared_record_keeps_a_new_volume_locked(client, db_session, test_project, fakes):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    empty = _volume(db_session, test_project, "Tomo N", "co-test-n")
+    _prepared(client, db_session, a, 1)
+    resp = _capture(_client_as(client, "op", "operator"), test_project, empty)
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "recapture_turn"
+
+
+@pytest.mark.unit
+def test_retaking_a_prepared_record_completes_the_volume_once(client, db_session, test_project, fakes):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    b = _volume(db_session, test_project, "Tomo B", "co-test-b")
+    prepared = _prepared(client, db_session, a, 1)
+    _rejected(db_session, b, 1)
+    api = _client_as(client, "op", "operator")
+
+    assert _capture(api, test_project, a, record_id=prepared.id).status_code == 200
+    assert len(_events(db_session, COMPLETED)) == 1
+    body = _summary(api)
+    assert body["turn"] == {"state": "new", "unlockedBy": {"collectionId": a.id, "name": "Tomo A"}}
+    assert [v["collectionId"] for v in body["volumes"]] == [b.id]
+
+    # The volume is at zero now: another retake of the same record writes no second event.
+    assert _capture(api, test_project, a, record_id=prepared.id).status_code == 200
+    assert len(_events(db_session, COMPLETED)) == 1
+    assert _client_as(client, "op", "operator").post(f"/collections/{a.id}/promote").status_code == 200
+
+
+# ---------------------------------------------------------------------------
+# The summary reads each volume's counts and first pending record together
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_summary_reads_the_volumes_in_one_statement(client, db_session, test_project):
+    """One statement gives every volume its counts and its first pending record,
+    so a volume whose pending records are retaken between two queries cannot
+    leave a listed volume without a first pending record. Counted as statements
+    that read the records table: the volume listing and the unit's total."""
+    from sqlalchemy import event as sa_event
+    for i in range(3):
+        v = _volume(db_session, test_project, f"Tomo {i}", f"co-test-{i}")
+        _rejected(db_session, v, 1)
+        _rejected(db_session, v, 2)
+    api = _client_as(client, "op", "operator")
+    engine = db_session.get_bind()
+    seen = []
+
+    def count(conn, cursor, statement, parameters, context, executemany):
+        if "FROM records" in statement and "system_logs" not in statement:
+            seen.append(statement)
+
+    sa_event.listen(engine, "before_cursor_execute", count)
+    try:
+        body = _summary(api)
+    finally:
+        sa_event.remove(engine, "before_cursor_execute", count)
+    assert len(body["volumes"]) == 3
+    assert len(seen) == 2, seen

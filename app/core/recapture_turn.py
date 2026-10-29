@@ -1,14 +1,21 @@
-"""The recapture turn: while records are rejected anywhere on the unit, new volumes alternate with finished recaptures.
+"""The recapture turn: while records are pending anywhere on the unit, new volumes alternate with finished recaptures.
 
 Finishing every recapture of one volume opens the turn for one new volume (a
 volume with no records); the first capture into a new volume returns the turn
 to recaptures. Turns do not accumulate, and the turn belongs to the unit, not
 to a user. Two system-log events carry the state, so no migration is needed:
 
-  recapture_volume_completed  a retake left its volume with no rejected record
+  recapture_volume_completed  a retake left its volume with no pending record
   new_volume_started          a capture created the first record of a volume
 
-The turn is "free" when no record is rejected; otherwise "new" when the
+A record is pending while its status is rejected, or while it is captured
+and a current image still carries a rejection_id: the state the
+prepare-for-retake transition (PATCH /records/{id}/status, rejected ->
+captured) leaves it in until a capture replaces the image. pending_clause and
+record_is_pending are that one definition, used by the summary, the turn,
+the completion test and the promotion refusal.
+
+The turn is "free" when no record is pending; otherwise "new" when the
 newest completion is newer than the newest start, else "recaptures". Newer
 means a higher system_logs id, not a later created_at: both events are
 inserted while lock_turn is held, so their ids are in the order the turn
@@ -19,7 +26,7 @@ would start a new volume during the recaptures turn; an admin's is let
 through. They take lock_turn before reading the turn or writing either event,
 after the record and volume row locks they already hold, so two operators
 cannot both start a new volume on one completion. Promotion of a volume with
-any rejected record is refused separately (app/api/collections.py).
+any pending record is refused separately (app/api/collections.py).
 
 Version: 0.2.0
 """
@@ -27,11 +34,11 @@ from datetime import datetime, timezone
 import re
 from typing import Optional
 
-from sqlalchemy import func, text
+from sqlalchemy import and_, exists, func, or_, text
 from sqlalchemy.orm import Session
 
 from app.models.collection import Collection
-from app.models.record import Record
+from app.models.record import Record, RecordImage
 from app.models.system_log import SystemLog
 
 
@@ -64,16 +71,34 @@ def lock_turn(db: Session) -> None:
 		db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _TURN_LOCK_KEY})
 
 
+def pending_clause(record=Record):
+	"""SQL for "this record is pending"; `record` may be an alias of Record."""
+	marked = exists().where(
+		RecordImage.record_id == record.id,
+		RecordImage.is_current.is_(True),
+		RecordImage.rejection_id.isnot(None),
+	)
+	return or_(record.status == "rejected", and_(record.status == "captured", marked))
+
+
+def record_is_pending(rec: Record) -> bool:
+	"""The same test as pending_clause, on a loaded record."""
+	if rec.status == "rejected":
+		return True
+	return rec.status == "captured" and any(
+		img.is_current and img.rejection_id is not None for img in rec.images)
+
+
 def pending_records(db: Session) -> int:
-	"""How many records are rejected on the unit, the count GET /records/to-retake/count gives."""
-	return db.query(func.count(Record.id)).filter(Record.status == "rejected").scalar() or 0
+	"""How many records are pending on the unit."""
+	return db.query(func.count(Record.id)).filter(pending_clause()).scalar() or 0
 
 
 def volume_pending(db: Session, collection_id: int) -> int:
-	"""How many records of the volume are rejected."""
+	"""How many records of the volume are pending."""
 	return (
 		db.query(func.count(Record.id))
-		.filter(Record.collection_id == collection_id, Record.status == "rejected")
+		.filter(Record.collection_id == collection_id, pending_clause())
 		.scalar() or 0
 	)
 

@@ -108,23 +108,24 @@ def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_rec
 	return True
 
 
-def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook_rejected: bool, user: User) -> None:
+def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook_pending: bool, user: User) -> None:
 	"""Add the turn's events to the capture's transaction, just before it commits.
 
 	new_volume_started for a capture that created its volume's first record
 	(the turn lock is already held, from _refuse_a_new_volume_out_of_turn);
-	recapture_volume_completed for a retake of a rejected record that leaves
-	its volume with none rejected. A retake takes the turn lock here, last of
+	recapture_volume_completed for a retake of a pending record that leaves
+	its volume with none pending (app.core.recapture_turn), so once for each
+	time the volume reaches zero, and never for a status change alone. A retake takes the turn lock here, last of
 	its locks, so its event and a new volume's start are written in turn.
 	"""
-	if not (starts_volume or retook_rejected):
+	if not (starts_volume or retook_pending):
 		return
 	volume = db.get(Collection, record.collection_id)
 	if starts_volume:
 		recapture_turn.record_event(db, recapture_turn.STARTED_ACTION, volume, user.username)
 		return
 	recapture_turn.lock_turn(db)
-	db.flush()  # the retaken record's new status, before the count
+	db.flush()  # the retaken record's new status and images, before the count
 	if recapture_turn.volume_pending(db, record.collection_id) == 0:
 		recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, user.username)
 
@@ -840,7 +841,7 @@ def trigger_capture(
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
 		)
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
-	retook_rejected = retake_record is not None and retake_record.status == "rejected"
+	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
@@ -1010,7 +1011,7 @@ def trigger_capture(
 			# prepare-for-retake transition, and reaches review again only
 			# when an operator promotes its volume; a captured one stays.
 			change_record_status(db, record, "captured", current_user.username)
-		_record_turn_events(db, record, starts_volume, retook_rejected, current_user)
+		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()
 		db.refresh(record)
@@ -1069,7 +1070,7 @@ def trigger_dual_capture(
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
 		)
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
-	retook_rejected = retake_record is not None and retake_record.status == "rejected"
+	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
@@ -1250,7 +1251,7 @@ def trigger_dual_capture(
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.
 			change_record_status(db, record, "captured", current_user.username)
-		_record_turn_events(db, record, starts_volume, retook_rejected, current_user)
+		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()
 		db.refresh(record)
