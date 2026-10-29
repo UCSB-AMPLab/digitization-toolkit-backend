@@ -115,7 +115,7 @@ row. Run by hand, with the backend stopped, as
 `python -m app.core.volume_layout [--dry-run]`; a dry run reports what would
 be done and writes nothing.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import argparse
@@ -566,14 +566,16 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
     - in `metadata/`, `manifest.jsonl`, always (see owned()), the
-      `manifest.jsonl.part` an earlier version's crashed copy left, and the
-      `offsite-freed-*.jsonl` / `offsite-restored-*.jsonl` run manifests.
+      `manifest.jsonl.part` an earlier version's crashed copy left, the
+      `offsite-freed-*.jsonl` / `offsite-restored-*.jsonl` run manifests, and
+      the `.rebuild.lock` a killed rebuild left (app.core.rebuild_volume).
     Anything else is foreign: another entry at the top, a directory inside
     one of the four, or any other file. A directory is listed, not walked.
     Nothing when `<stem>/` does not exist.
     """
     from app.core.offsite_free import RUN_MANIFEST_PATTERN
     from app.core.paths import CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+    from app.core.rebuild_volume import LOCK_NAME as REBUILD_LOCK_NAME
     from capture.manifestHandler import MANIFEST_PART_NAME
 
     if not volume_dir.is_dir():
@@ -607,6 +609,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
             return True  # left by an earlier version's copy; removed at the start of a run
         if sub == METADATA_DIR and RUN_MANIFEST_PATTERN.match(f.name):
             return True  # a free's or a restore's record (app.core.offsite_free)
+        if sub == METADATA_DIR and f.name == REBUILD_LOCK_NAME:
+            return True  # a rebuild's lock file; a killed run leaves it, and the next run removes it
         if sub == METADATA_DIR and f.name == "manifest.jsonl":
             # Never foreign: append-only, it keeps records of deleted captures,
             # of records moved out and of copies naming other volumes'
