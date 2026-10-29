@@ -1,9 +1,9 @@
-# Version: 0.1.0-beta
+# Version: 0.2.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from typing import Iterable, List, Optional
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, aliased, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import logging
@@ -13,6 +13,7 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from datetime import datetime, timezone
 
+from app.models.collection import Collection
 from app.models.record import Record, RecordImage, ExifData, RecordAnnotation, RecordRejection
 from app.models.camera import CameraSettings
 from app.models.user import User
@@ -21,7 +22,7 @@ from app.schemas.record import (
 	RecordImageCreate, RecordImageRead, RecordImageUpdate,
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
-	RecordRejectRequest, RecordRejectionRead,
+	RecordRejectRequest, RecordRejectionRead, RecordToRetake,
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
@@ -280,6 +281,75 @@ def count_records(
 	if collection_id is not None:
 		query = query.filter(Record.collection_id == collection_id)
 	return {"count": query.count()}
+
+
+def _to_retake_query(db: Session):
+	"""The rejected records, each with its volume and its latest rejection, in one query.
+
+	The latest rejection is the one with the newest rejected_at (the highest
+	id on a tie), found by a correlated subquery in the join, so the rows
+	come from one statement whatever their number. Both joins are outer: a
+	record in no volume, or rejected with no RecordRejection row, is still
+	waiting.
+	"""
+	other = aliased(RecordRejection)
+	latest = (
+		db.query(other.id)
+		.filter(other.record_id == Record.id)
+		.order_by(other.rejected_at.desc(), other.id.desc())
+		.limit(1)
+		.correlate(Record)
+		.scalar_subquery()
+	)
+	return (
+		db.query(Record, Collection, RecordRejection)
+		.outerjoin(Collection, Collection.id == Record.collection_id)
+		.outerjoin(RecordRejection, RecordRejection.id == latest)
+		.filter(Record.status == "rejected")
+	)
+
+
+@router.get("/to-retake", response_model=List[RecordToRetake])
+def list_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Every rejected record, across all volumes, oldest latest rejection first.
+
+	Each row has the record, its volume's project id, name and stem, and its latest
+	rejection's reason code, comment, author and time. A rejected record
+	with no rejection row comes last; ties go by record id.
+	"""
+	rows = (
+		_to_retake_query(db)
+		.order_by(RecordRejection.rejected_at.asc().nulls_last(), Record.id)
+		.all()
+	)
+	return [
+		RecordToRetake(
+			recordId=rec.id,
+			title=rec.title,
+			sequence=rec.sequence,
+			collectionId=rec.collection_id,
+			projectId=col.project_id if col else None,
+			name=col.name if col else None,
+			filenameStem=col.filename_stem if col else None,
+			reason=rej.predefined_reason if rej else None,
+			comment=rej.comment if rej else None,
+			rejectedBy=rej.rejected_by if rej else None,
+			rejectedAt=rej.rejected_at if rej else None,
+		)
+		for rec, col, rej in rows
+	]
+
+
+@router.get("/to-retake/count")
+def count_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""How many records GET /records/to-retake lists, for the side menu's badge."""
+	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
 
 
 @router.get("/{rec_id}", response_model=RecordRead)
@@ -1353,7 +1423,7 @@ def list_record_rejections(
 		db.query(RecordRejection)
 		.options(joinedload(RecordRejection.images))
 		.filter(RecordRejection.record_id == rec_id)
-		.order_by(RecordRejection.rejected_at.desc())
+		.order_by(RecordRejection.rejected_at.desc(), RecordRejection.id.desc())
 		.all()
 	)
 	return [RecordRejectionRead.model_validate(r) for r in rejections]
