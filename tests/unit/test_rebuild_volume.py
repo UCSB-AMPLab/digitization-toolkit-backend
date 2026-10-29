@@ -961,3 +961,75 @@ def test_every_artifact_stays_under_the_root_read_at_the_start(remote, db_sessio
     assert len(_manifest_lines(override_projects_root)) == 3
     assert len(_freed_lines(override_projects_root)) == 3
     assert report["manifest"].startswith(str(first))
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("change,fields", [
+    ({"capturedAt": "2023-03-01T16:00:00+00:00"}, ["created_at", "manifest.timestamp_utc"]),
+    ({"capturedAtSource": "sheet-calibrated"}, ["manifest.provenance.capturedAtSource"]),
+])
+def test_a_rerun_compares_a_done_pages_manifest_time_and_provenance(remote, db_session, override_projects_root,
+                                                                    tmp_path, change, fields):
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path / "first", remote), apply=True)
+
+    def edit(plan):
+        plan[0].update(change)
+
+    refusal = _refused(db_session, _bundle(tmp_path / "second", remote, plan_over=[edit]),
+                       override_projects_root, match="differ from the plan")
+    assert [(p["volumeOrder"], p["fields"]) for p in refusal.problems] == [(1, fields)]
+
+
+@pytest.mark.unit
+def test_a_rerun_compares_a_done_pages_source_key(remote, db_session, override_projects_root, tmp_path):
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path / "first", remote), apply=True)
+
+    def move(images):
+        images[0]["sourceKey"] = "rionegro/2023/tomo/IMG_0001b.JPG"
+
+    refusal = _refused(db_session, _bundle(tmp_path / "second", remote, image_over=[move]),
+                       override_projects_root, match="differ from the plan")
+    assert [(p["volumeOrder"], p["fields"]) for p in refusal.problems] == [(1, ["manifest.provenance.key"])]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("line_over,fields", [
+    ({"timestamp_utc": "2023-03-01T15:00:01+00:00"}, ["manifest.timestamp_utc"]),
+    ({"provenance": {"rebuiltFrom": {"bucket": "elsewhere", "key": "rionegro/2023/tomo/IMG_0001.JPG",
+                                     "capturedAtSource": "DateTimeOriginal"}}}, ["manifest.provenance.bucket"]),
+    ({"provenance": None}, ["manifest.provenance.bucket", "manifest.provenance.key",
+                            "manifest.provenance.capturedAtSource"]),
+])
+def test_a_leftover_line_whose_time_or_provenance_differs_is_refused(remote, db_session, override_projects_root,
+                                                                     tmp_path, line_over, fields):
+    """A line a failed commit left is reused, not appended again, so it must be the plan's in every field."""
+    from app.core.rebuild_volume import Planned, _capture_line, load_bundle
+    from capture.manifestHandler import append_manifest_lines
+
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote)
+    _, planned = load_bundle(str(bundle), STEM)
+    first: Planned = planned[0]
+    line = json.loads(_capture_line(first, "P"))
+    line.update(line_over)
+    append_manifest_lines(override_projects_root / STEM, [json.dumps(line)])
+
+    refusal = _refused(db_session, bundle, override_projects_root, match="manifest")
+    assert [(p["volumeOrder"], p["fields"]) for p in refusal.problems] == [(1, fields)]
+
+
+@pytest.mark.unit
+def test_a_leftover_line_that_is_the_plans_is_reused(remote, db_session, override_projects_root, tmp_path):
+    from app.core.rebuild_volume import _capture_line, load_bundle
+    from capture.manifestHandler import append_manifest_lines
+
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote)
+    _, planned = load_bundle(str(bundle), STEM)
+    append_manifest_lines(override_projects_root / STEM, [_capture_line(planned[0], "P")])
+
+    assert len(_rebuild(db_session, bundle, apply=True)["created"]) == 3
+    assert [line["capture_id"] for line in _manifest_lines(override_projects_root)] == [
+        _capture_id(n) for n in (1, 2, 3)]

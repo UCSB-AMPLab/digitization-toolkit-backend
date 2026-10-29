@@ -458,7 +458,12 @@ def _differences(p: Planned, rec, imgs: list, row, line: Optional[dict], key: st
 
 
 def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
-    """The fields in which an image's capture line differs from the plan and the bundle."""
+    """The fields in which an image's capture line differs from the plan and the bundle.
+
+    Its file entry (path, sha256, bytes, rotation), its timestamp_utc against
+    capturedAt in UTC, and its provenance (rebuiltFrom bucket, sourceKey and
+    capturedAtSource), each named on its own.
+    """
     files = (line or {}).get("files") or []
     if line is None:
         return ["manifest.missing"]
@@ -470,6 +475,18 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
         ("manifest.sha256", f.get("sha256") == p.sha256),
         ("manifest.bytes", f.get("bytes") == p.size),
         ("manifest.rotate_deg", f.get("rotate_deg") == p.rotate_deg),
+        # The line is reused, never appended again, so its time and its
+        # source must be the plan's and the bundle's too.
+        ("manifest.timestamp_utc", _captured_at(line.get("timestamp_utc")) == p.captured_at),
+    ]
+    provenance = line.get("provenance")
+    source = provenance.get("rebuiltFrom") if isinstance(provenance, dict) else None
+    source = source if isinstance(source, dict) else {}
+    checks += [
+        ("manifest.provenance.bucket", source.get("bucket") == SOURCE_BUCKET),
+        ("manifest.provenance.key", source.get("key") == p.source_key),
+        ("manifest.provenance.capturedAtSource",
+         "capturedAtSource" in source and source.get("capturedAtSource") == p.captured_at_source),
     ]
     return [name for name, ok in checks if not ok]
 
