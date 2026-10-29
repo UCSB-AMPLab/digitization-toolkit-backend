@@ -363,51 +363,53 @@ def summarise_records_to_retake(
 	retake with the rejected image still current. Each volume with a pending
 	record is listed, most pending first, then by name: `pending` is its
 	pending records, `total` its records with at least one rejection whatever
-	their state now, and firstPendingRecordId its pending record with the
-	lowest sequence (then the lowest id). The counts and the first pending
-	record come from one statement, so a retake committed while the summary is
-	read cannot list a volume without its first record. projectId is the
-	project that owns the volume, through its parents for a nested one.
+	their state now, pendingRecordIds every pending record of the volume by
+	sequence (a record with none last) then id, and firstPendingRecordId the
+	first of them. projectId is the project that owns the volume, through its
+	parents for a nested one.
+
+	The volumes come from one statement: every record in a volume that is
+	pending or was ever rejected, with its volume, in the order of the list.
+	Counts, list and first record are taken from the same rows, so a retake
+	committed while the summary is read cannot make them disagree, and a
+	volume left with no pending record is not listed. The same statement
+	runs on PostgreSQL and SQLite, with no array aggregate.
 	"""
-	from sqlalchemy import case, func
+	from sqlalchemy import or_
 	from app.core import recapture_turn
 	from app.core.storage_ops import resolve_project
 
-	is_pending = case((recapture_turn.pending_clause(), 1), else_=0)
-	ever_rejected = case((
-		db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists(), 1), else_=0)
-	other = aliased(Record)
-	first_pending = (
-		db.query(other.id)
-		.filter(other.collection_id == Collection.id, recapture_turn.pending_clause(other))
-		.order_by(other.sequence.asc().nulls_last(), other.id)
-		.limit(1)
-		.correlate(Collection)
-		.scalar_subquery()
-	)
+	is_pending = recapture_turn.pending_clause()
+	ever_rejected = db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
 	rows = (
-		db.query(
-			Collection.id, Collection.name, Collection.filename_stem,
-			func.sum(is_pending), func.sum(ever_rejected), first_pending,
-		)
+		db.query(Collection.id, Collection.name, Collection.filename_stem,
+		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"))
 		.join(Record, Record.collection_id == Collection.id)
-		.group_by(Collection.id, Collection.name, Collection.filename_stem)
-		.having(func.sum(is_pending) > 0)
+		.filter(or_(is_pending, ever_rejected))
+		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
 		.all()
 	)
+	by_volume: dict = {}
+	for collection_id, name, stem, record_id, pending, rejected in rows:
+		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0})
+		if pending:
+			vol["ids"].append(record_id)
+		if rejected:
+			vol["total"] += 1
 	volumes = []
-	for collection_id, name, stem, pending, total, first_id in rows:
-		if first_id is None:
+	for collection_id, vol in by_volume.items():
+		if not vol["ids"]:
 			continue
 		project = resolve_project(db, db.get(Collection, collection_id))
 		volumes.append({
 			"collectionId": collection_id,
 			"projectId": project.id if project else None,
-			"name": name,
-			"filenameStem": stem,
-			"pending": int(pending),
-			"total": int(total),
-			"firstPendingRecordId": first_id,
+			"name": vol["name"],
+			"filenameStem": vol["stem"],
+			"pending": len(vol["ids"]),
+			"total": vol["total"],
+			"firstPendingRecordId": vol["ids"][0],
+			"pendingRecordIds": vol["ids"],
 		})
 	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
 	pending_records = recapture_turn.pending_records(db)

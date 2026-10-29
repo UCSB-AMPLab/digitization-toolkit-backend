@@ -38,6 +38,7 @@ def _volume(db_session, test_project, name, stem):
 
 
 def _record(db_session, volume, status, sequence, capture_mode="single", rejections=0):
+    # sequence may be None: a record with no sequence sorts after every numbered one.
     from app.models.record import Record, RecordImage, RecordRejection
     rec = Record(title=f"folio {sequence}", status=status, capture_mode=capture_mode,
                  collection_id=volume.id, sequence=sequence)
@@ -121,9 +122,10 @@ def test_summary_shape_counts_and_order(client, db_session, test_project):
     _record(db_session, a, "captured", 1, rejections=2)   # retaken: counts in total only
     _record(db_session, a, "captured", 2)                 # never rejected
     # B: three pending, listed first.
+    # Created out of sequence order, so the list's order is the sequence's, not the id's.
+    b4 = _rejected(db_session, b, 4)
     first_b = _rejected(db_session, b, 1)
-    _rejected(db_session, b, 2)
-    _rejected(db_session, b, 4)
+    b2 = _rejected(db_session, b, 2)
     # C: nothing pending, so not listed.
     _record(db_session, c, "in_review", 1, rejections=1)
     # D: two pending, the same as A, and before it by name.
@@ -138,6 +140,7 @@ def test_summary_shape_counts_and_order(client, db_session, test_project):
         "collectionId": b.id, "projectId": test_project.id, "name": "Tomo B",
         "filenameStem": "co-test-b", "pending": 3, "total": 3,
         "firstPendingRecordId": first_b.id,
+        "pendingRecordIds": [first_b.id, b2.id, b4.id],
     }
     by_id = {v["collectionId"]: v for v in body["volumes"]}
     assert (by_id[a.id]["pending"], by_id[a.id]["total"]) == (2, 3)
@@ -402,6 +405,7 @@ def test_a_prepared_record_is_still_pending(client, db_session, test_project):
         "collectionId": a.id, "projectId": test_project.id, "name": "Tomo A",
         "filenameStem": "co-test-a", "pending": 1, "total": 1,
         "firstPendingRecordId": prepared.id,
+        "pendingRecordIds": [prepared.id],
     }]
     assert body["turn"] == {"state": "recaptures", "unlockedBy": None}
     assert _events(db_session, COMPLETED) == [], "a status change alone never completes a volume"
@@ -478,7 +482,7 @@ def test_the_summary_reads_the_volumes_in_one_statement(client, db_session, test
     seen = []
 
     def count(conn, cursor, statement, parameters, context, executemany):
-        if "FROM records" in statement and "system_logs" not in statement:
+        if ("FROM records" in statement or "JOIN records" in statement) and "system_logs" not in statement:
             seen.append(statement)
 
     sa_event.listen(engine, "before_cursor_execute", count)
@@ -488,3 +492,55 @@ def test_the_summary_reads_the_volumes_in_one_statement(client, db_session, test
         sa_event.remove(engine, "before_cursor_execute", count)
     assert len(body["volumes"]) == 3
     assert len(seen) == 2, seen
+
+
+# ---------------------------------------------------------------------------
+# pendingRecordIds: every pending record of the volume, by sequence then id
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_pending_ids_include_prepared_records_in_sequence_order(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    r7 = _rejected(db_session, a, 7)
+    prepared = _prepared(client, db_session, a, 3)
+    _record(db_session, a, "captured", 1, rejections=1)   # retaken: not pending
+    _record(db_session, a, "captured", 2)                 # never rejected
+    r5 = _rejected(db_session, a, 5)
+    tie_low = _rejected(db_session, a, 9)
+    tie_high = _rejected(db_session, a, 9)                # same sequence: by id
+    unsequenced = _rejected(db_session, a, None)          # no sequence: last
+
+    vol = _summary(_client_as(client, "op", "operator"))["volumes"][0]
+    assert vol["pendingRecordIds"] == [prepared.id, r5.id, r7.id, tie_low.id, tie_high.id, unsequenced.id]
+    assert vol["firstPendingRecordId"] == vol["pendingRecordIds"][0]
+    assert vol["pending"] == len(vol["pendingRecordIds"])
+
+
+@pytest.mark.unit
+def test_each_volume_lists_only_its_own_pending_ids(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    b = _volume(db_session, test_project, "Tomo B", "co-test-b")
+    a1 = _rejected(db_session, a, 1)
+    b1 = _rejected(db_session, b, 1)
+    b2 = _prepared(client, db_session, b, 2)
+    by_id = {v["collectionId"]: v for v in _summary(_client_as(client, "op", "operator"))["volumes"]}
+    assert by_id[a.id]["pendingRecordIds"] == [a1.id]
+    assert by_id[b.id]["pendingRecordIds"] == [b1.id, b2.id]
+
+
+@pytest.mark.unit
+def test_the_volume_and_its_ids_go_when_nothing_is_pending(client, db_session, test_project, fakes):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    b = _volume(db_session, test_project, "Tomo B", "co-test-b")
+    prepared = _prepared(client, db_session, a, 1)
+    r2 = _rejected(db_session, a, 2)
+    _rejected(db_session, b, 1)
+    api = _client_as(client, "op", "operator")
+
+    assert _capture(api, test_project, a, record_id=prepared.id).status_code == 200
+    by_id = {v["collectionId"]: v for v in _summary(api)["volumes"]}
+    assert by_id[a.id]["pendingRecordIds"] == [r2.id]
+    assert by_id[a.id]["firstPendingRecordId"] == r2.id
+
+    assert _capture(api, test_project, a, record_id=r2.id).status_code == 200
+    assert [v["collectionId"] for v in _summary(api)["volumes"]] == [b.id]
