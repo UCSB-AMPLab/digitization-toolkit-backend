@@ -835,7 +835,7 @@ def test_the_report_carries_the_uploaded_files_sha256(client, db_session, report
     _as("op", "admin")
     report = _post_fixture(client, VALID).json()
     assert report["fileSha256"] == hashlib.sha256(VALID.read_bytes()).hexdigest()
-    stored = json.loads(next((reports_root / VALID_ID).glob("*.json")).read_text(encoding="utf-8"))
+    stored = json.loads(next((reports_root / VALID_ID).glob("import-report_*.json")).read_text(encoding="utf-8"))
     assert stored["fileSha256"] == report["fileSha256"]
 
 
@@ -997,7 +997,7 @@ def test_a_reject_echoes_at_most_120_characters_of_the_code(client, db_session, 
     (reject,) = report["rejects"]
     assert reject["referenceCode"] == code[:120]
     assert reject["referenceCodeTruncated"] is truncated
-    stored = next((reports_root / VALID_ID).glob("*.json"))
+    stored = next((reports_root / VALID_ID).glob("import-report_*.json"))
     assert stored.stat().st_size < 10_000
 
 
