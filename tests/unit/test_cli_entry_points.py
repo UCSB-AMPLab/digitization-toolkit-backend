@@ -1,7 +1,7 @@
 """Every operator command registers every model before it opens a session.
 
-`python -m app.core.image_upload <command>` and `python -m
-app.core.volume_layout` run in an interpreter that has not imported
+`python -m app.core.image_upload <command>`, `python -m
+app.core.volume_layout` and `python -m app.core.rebuild_volume` run in an interpreter that has not imported
 app.main, and app/models/__init__.py imports nothing. Without registering
 the models first, the first query fails while SQLAlchemy configures the
 mappers: relationship("Project") on Record cannot find Project.
@@ -9,7 +9,7 @@ tests/conftest.py imports every model, which hides that failure in-process, so
 each command runs here in a fresh interpreter (cli_session_worker.py) against
 the SQLite file the db_session fixture has created.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 import json
 import os
@@ -55,6 +55,14 @@ def test_command_runs_in_a_fresh_interpreter(seeded, module, args):
     assert "failed to locate a name" not in result.stderr, result.stderr
     assert result.returncode == 0, result.stderr
     assert isinstance(json.loads(result.stdout), dict)
+
+
+def test_rebuild_volume_reaches_its_bundle_in_a_fresh_interpreter(seeded, tmp_path):
+    """The volume is looked up (the mappers configured) before the missing bundle is refused."""
+    result = _run("app.core.rebuild_volume", seeded, STEM, str(tmp_path / "no-bundle"))
+    assert "failed to locate a name" not in result.stderr, result.stderr
+    assert result.returncode == 2, result.stderr
+    assert result.stderr.startswith("error: ") and "is not a directory" in result.stderr
 
 
 def test_dry_run_raises_nothing(seeded, db_session):
