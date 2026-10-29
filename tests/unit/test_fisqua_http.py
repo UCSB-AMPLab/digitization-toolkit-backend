@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import json
@@ -392,6 +392,18 @@ def test_the_fingerprint_is_of_env_base_url_and_token_together(fisqua, monkeypat
     third = config_fingerprint()
     assert len({first, second, third}) == 3
     assert all(len(f) == 8 for f in (first, second, third))
+
+
+@pytest.mark.unit
+def test_the_fingerprint_changes_with_the_rotate_deg_setting(fisqua, monkeypatch):
+    """CAPTUA_FISQUA_ROTATE_DEG picks the contract version the manifests are written in."""
+    from app.core import config
+    from app.core.fisqua_outbox import config_fingerprint
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", False)
+    off = config_fingerprint()
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", True)
+    on = config_fingerprint()
+    assert off != on and len(on) == 8
 
 
 @pytest.mark.unit
@@ -824,6 +836,28 @@ def test_a_software_update_clears_the_stop_and_resends_under_a_new_id(
     # Once only: the refused row is no longer the volume's newest.
     _send(db_session, Server(_ok()))
     assert len(_rows(db_session, queued.col)) == 2
+
+
+@pytest.mark.unit
+def test_turning_rotate_deg_on_clears_the_stop_and_resends_under_a_new_id(
+        client, db_session, queued, monkeypatch):
+    from app.core import config
+    from app.core.fisqua_outbox import config_error
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", False)
+    _send(db_session, Server(_version_refusal()))
+    refused = _rows(db_session, queued.col)[0]
+    assert config_error()["reason"] == "version"
+
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", True)
+    assert config_error() is None
+    server = Server(_ok())
+    _send(db_session, server)
+    rows = _rows(db_session, queued.col)
+    assert [r.state for r in rows] == ["refused", "delivered"]
+    assert rows[1].manifest_id != refused.manifest_id
+    sent = json.loads(server.requests[0].content)
+    assert sent["id"] == rows[1].manifest_id
+    assert sent["version"] == "1.5"
 
 
 @pytest.mark.unit
