@@ -352,6 +352,66 @@ def count_records_to_retake(
 	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
 
 
+@router.get("/to-retake/summary")
+def summarise_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""The retakes by volume, and the unit's recapture turn (app.core.recapture_turn).
+
+	pendingRecords is the unit's rejected count, as /to-retake/count gives it.
+	Each volume with a rejected record is listed, most pending first, then by
+	name: `pending` is its rejected records, `total` its records with at least
+	one rejection whatever their status now, and firstPendingRecordId its
+	rejected record with the lowest sequence (then the lowest id). projectId
+	is the project that owns the volume, through its parents for a nested one.
+	"""
+	from sqlalchemy import case, func
+	from app.core import recapture_turn
+	from app.core.storage_ops import resolve_project
+
+	ever_rejected = (
+		db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
+	)
+	rows = (
+		db.query(
+			Record.collection_id,
+			func.sum(case((Record.status == "rejected", 1), else_=0)).label("pending"),
+			func.sum(case((ever_rejected, 1), else_=0)).label("total"),
+		)
+		.filter(Record.collection_id.isnot(None))
+		.group_by(Record.collection_id)
+		.having(func.sum(case((Record.status == "rejected", 1), else_=0)) > 0)
+		.all()
+	)
+	volumes = []
+	for collection_id, pending, total in rows:
+		col = db.get(Collection, collection_id)
+		first = (
+			db.query(Record.id)
+			.filter(Record.collection_id == collection_id, Record.status == "rejected")
+			.order_by(Record.sequence.asc().nulls_last(), Record.id)
+			.first()
+		)
+		project = resolve_project(db, col)
+		volumes.append({
+			"collectionId": collection_id,
+			"projectId": project.id if project else None,
+			"name": col.name,
+			"filenameStem": col.filename_stem,
+			"pending": int(pending),
+			"total": int(total),
+			"firstPendingRecordId": first[0],
+		})
+	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
+	pending_records = recapture_turn.pending_records(db)
+	return {
+		"pendingRecords": pending_records,
+		"volumes": volumes,
+		"turn": recapture_turn.turn(db, pending_records),
+	}
+
+
 @router.get("/{rec_id}", response_model=RecordRead)
 def get_record(
 	rec_id: int,
