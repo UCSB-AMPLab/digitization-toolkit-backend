@@ -352,6 +352,72 @@ def count_records_to_retake(
 	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
 
 
+@router.get("/to-retake/summary")
+def summarise_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""The retakes by volume, and the unit's recapture turn (app.core.recapture_turn).
+
+	pendingRecords is the unit's pending records: rejected, or prepared for
+	retake with the rejected image still current. Each volume with a pending
+	record is listed, most pending first, then by name: `pending` is its
+	pending records, `total` its records with at least one rejection whatever
+	their state now, and firstPendingRecordId its pending record with the
+	lowest sequence (then the lowest id). The counts and the first pending
+	record come from one statement, so a retake committed while the summary is
+	read cannot list a volume without its first record. projectId is the
+	project that owns the volume, through its parents for a nested one.
+	"""
+	from sqlalchemy import case, func
+	from app.core import recapture_turn
+	from app.core.storage_ops import resolve_project
+
+	is_pending = case((recapture_turn.pending_clause(), 1), else_=0)
+	ever_rejected = case((
+		db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists(), 1), else_=0)
+	other = aliased(Record)
+	first_pending = (
+		db.query(other.id)
+		.filter(other.collection_id == Collection.id, recapture_turn.pending_clause(other))
+		.order_by(other.sequence.asc().nulls_last(), other.id)
+		.limit(1)
+		.correlate(Collection)
+		.scalar_subquery()
+	)
+	rows = (
+		db.query(
+			Collection.id, Collection.name, Collection.filename_stem,
+			func.sum(is_pending), func.sum(ever_rejected), first_pending,
+		)
+		.join(Record, Record.collection_id == Collection.id)
+		.group_by(Collection.id, Collection.name, Collection.filename_stem)
+		.having(func.sum(is_pending) > 0)
+		.all()
+	)
+	volumes = []
+	for collection_id, name, stem, pending, total, first_id in rows:
+		if first_id is None:
+			continue
+		project = resolve_project(db, db.get(Collection, collection_id))
+		volumes.append({
+			"collectionId": collection_id,
+			"projectId": project.id if project else None,
+			"name": name,
+			"filenameStem": stem,
+			"pending": int(pending),
+			"total": int(total),
+			"firstPendingRecordId": first_id,
+		})
+	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
+	pending_records = recapture_turn.pending_records(db)
+	return {
+		"pendingRecords": pending_records,
+		"volumes": volumes,
+		"turn": recapture_turn.turn(db, pending_records),
+	}
+
+
 @router.get("/{rec_id}", response_model=RecordRead)
 def get_record(
 	rec_id: int,

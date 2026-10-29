@@ -13,10 +13,13 @@ It is checked in `_apply_status_change`, which all three promotion paths go
 through, so every test here runs against all three. The paths do not report a
 refusal the same way: the bulk endpoint skips a record it cannot move and
 returns 200 without it, by design, while the other two refuse with a 422.
+A volume whose record still has its rejected image current is a volume with
+a recapture pending, which the collection path refuses first, with a 409
+(app.core.recapture_turn; tests/unit/test_recapture_turn.py).
 
 Run with: python -m pytest tests/unit/test_promotion_invariant.py
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import pytest
@@ -107,11 +110,14 @@ def _assert_promoted(resp, path, db_session, rec):
     assert rec.status == "in_review"
 
 
-def _assert_refused(resp, path, db_session, rec):
+def _assert_refused(resp, path, db_session, rec, pending=False):
     if path == "bulk":
         # Documented behaviour: a record it cannot move is skipped, not an error.
         assert resp.status_code == 200, resp.text
         assert rec.id not in {r["id"] for r in resp.json()}, resp.text
+    elif path == "collection" and pending:
+        assert resp.status_code == 409, resp.text
+        assert resp.json()["detail"]["code"] == "recaptures_pending"
     else:
         assert resp.status_code == 422, resp.text
     db_session.refresh(rec)
@@ -151,7 +157,7 @@ def test_unretaken_record_cannot_be_handed_over(client, db_session, path):
     _image(db_session, rec, "old.jpg")
     op = _reject_then_prepare_for_retake(client, db_session, rec)
 
-    _assert_refused(_promote(op, path, rec, col), path, db_session, rec)
+    _assert_refused(_promote(op, path, rec, col), path, db_session, rec, pending=True)
 
 
 @pytest.mark.unit
@@ -188,7 +194,7 @@ def test_added_image_without_superseding_does_not_release_the_record(client, db_
 
     _image(db_session, rec, "extra.jpg")
 
-    _assert_refused(_promote(op, path, rec, col), path, db_session, rec)
+    _assert_refused(_promote(op, path, rec, col), path, db_session, rec, pending=True)
 
 
 # ---------------------------------------------------------------------------
