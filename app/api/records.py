@@ -618,6 +618,16 @@ async def add_image_to_record(
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# An excluded record (a Fisqua decision, contract 1.6) takes no image, as
+	# it takes no capture (app.api.cameras): the image would stay out of the
+	# export, and every later decision on the record would be skipped as
+	# images_changed. Refused for every role, before anything is written.
+	if rec.status == "excluded":
+		raise HTTPException(
+			status_code=409,
+			detail=("Cannot add an image to a record with status 'excluded': "
+			        "Fisqua excluded it from the volume."),
+		)
 	# An upload is a capture event for the record's volume, refused on the
 	# same terms as a capture, before anything is written.
 	if rec.collection_id is None:

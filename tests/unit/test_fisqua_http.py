@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.2.0
+Version: 0.2.1
 """
 
 import json
@@ -396,7 +396,7 @@ def test_the_fingerprint_is_of_env_base_url_and_token_together(fisqua, monkeypat
 
 @pytest.mark.unit
 def test_the_fingerprint_changes_with_the_rotate_deg_setting(fisqua, monkeypatch):
-    """CAPTUA_FISQUA_ROTATE_DEG picks the contract version the manifests are written in."""
+    """CAPTUA_FISQUA_ROTATE_DEG decides whether the manifests carry rotateDeg."""
     from app.core import config
     from app.core.fisqua_outbox import config_fingerprint
     monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", False)
@@ -857,7 +857,7 @@ def test_turning_rotate_deg_on_clears_the_stop_and_resends_under_a_new_id(
     assert rows[1].manifest_id != refused.manifest_id
     sent = json.loads(server.requests[0].content)
     assert sent["id"] == rows[1].manifest_id
-    assert sent["version"] == "1.5"
+    assert sent["version"] == "1.6"
 
 
 @pytest.mark.unit

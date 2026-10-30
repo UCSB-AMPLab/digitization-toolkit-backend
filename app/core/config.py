@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.2.1
 
 import logging
 import os
@@ -162,11 +162,11 @@ class Settings(BaseSettings):
     # Read and write timeout of each call; connecting has ten seconds.
     FISQUA_TIMEOUT_SECONDS: float = Field(default=60.0, validation_alias=_names("FISQUA_TIMEOUT"))
     # On: each image in a capture manifest carries `rotateDeg`, its recorded
-    # rotate_deg (clockwise from the stored pixels, EXIF ignored), and the
-    # manifest is contract 1.5 (app.core.capture_manifest). Off: contract 1.1,
-    # with no rotateDeg. Fisqua staging reads 1.5; production does not yet, and
-    # drops a key it does not know, so this stays off for production until
-    # Fisqua reads 1.5 there.
+    # rotate_deg (clockwise from the stored pixels, EXIF ignored). Off: no
+    # image carries it. The manifest declares contract 1.6 either way
+    # (app.core.capture_manifest). Fisqua staging reads rotateDeg; production
+    # does not yet, and drops a key it does not know, so this stays off for
+    # production until Fisqua reads it there.
     FISQUA_ROTATE_DEG: bool = Field(default=False, validation_alias=_names("FISQUA_ROTATE_DEG"))
 
     # APP_VERSION: overrides the release read from the superproject's VERSION

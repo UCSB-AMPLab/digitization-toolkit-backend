@@ -247,7 +247,7 @@ def test_envelope(client, vol):
     assert resp.status_code == 200, resp.text
     doc = resp.json()
     assert doc["contract"] == "fisqua-captua-exchange"
-    assert doc["version"] == "1.1"
+    assert doc["version"] == "1.6"
     assert doc["kind"] == "capture-manifest"
     assert UUID4.match(doc["id"])
     assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", doc["generatedAt"])
@@ -794,7 +794,7 @@ def fisqua_registration_problems(doc, slug):
     page_key_re = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
     if doc.get("contract") != "fisqua-captua-exchange":
         out.append("contract")
-    if doc.get("version") != "1.1":
+    if doc.get("version") != "1.6":
         out.append("version")
     if doc.get("kind") != "capture-manifest":
         out.append("kind")
@@ -1038,7 +1038,7 @@ def test_rotate_deg_is_off_by_default():
 
 
 @pytest.mark.unit
-def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_1_1(client, vol):
+def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_still_1_6(client, vol):
     rec = vol.record(layout=("left", "right"))
     left, right = sorted(rec.images, key=lambda i: i.role)
     _rotate(left, 90)
@@ -1046,14 +1046,14 @@ def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_1_1(client, 
     resp = _export(client, vol.col)
     assert resp.status_code == 200, resp.text
     doc = resp.json()
-    assert doc["version"] == "1.1"
+    assert doc["version"] == "1.6"
     assert "rotateDeg" not in resp.text
     assert all(set(i) == {"captureId", "pairId", "filename", "role", "objectKey", "sha256"}
                for i in _images(doc))
 
 
 @pytest.mark.unit
-def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_5(client, vol, rotate_deg):
+def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_6(client, vol, rotate_deg):
     rec = vol.record(layout=("left", "right"))
     left, right = sorted(rec.images, key=lambda i: i.role)
     _rotate(left, 90)
@@ -1064,7 +1064,7 @@ def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_5
     single = vol.record(layout=("single",)).images[0]
     _rotate(single, 270)
     doc = _export(client, vol.col).json()
-    assert doc["version"] == "1.5"
+    assert doc["version"] == "1.6"
     by_id = {i["captureId"] + i["role"]: i for i in _images(doc)}
     out_left = by_id[left.capture_id + "left"]
     out_right = by_id[right.capture_id + "right"]
@@ -1083,7 +1083,7 @@ def test_with_rotate_deg_on_an_image_with_no_rotation_has_no_key(client, vol, ro
     _rotate(left, 90)
     assert right.rotate_deg is None
     doc = _export(client, vol.col).json()
-    assert doc["version"] == "1.5"
+    assert doc["version"] == "1.6"
     out_left, out_right = doc["volumes"][0]["records"][0]["images"]
     assert out_left["rotateDeg"] == 90
     assert "rotateDeg" not in out_right
@@ -1151,3 +1151,14 @@ def test_a_volume_whose_records_are_all_excluded_has_no_pages(client, vol):
     vol.record(status="excluded", sequence=2)
     problems = _refusal(_export(client, vol.col))
     assert list(problems) == ["no_pages"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rotate", [False, True])
+def test_the_version_is_1_6_with_or_without_an_exclusion_and_rotate_deg(client, vol, monkeypatch, rotate):
+    from app.core import config
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", rotate)
+    vol.record(status="in_review", sequence=1)
+    assert _export(client, vol.col).json()["version"] == "1.6"
+    vol.record(status="excluded", sequence=2)
+    assert _export(client, vol.col).json()["version"] == "1.6"

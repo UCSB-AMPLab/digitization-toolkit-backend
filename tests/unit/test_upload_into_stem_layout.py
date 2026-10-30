@@ -5,7 +5,7 @@ The file is named as a single capture is, `<stem>-img_<nnnn>_c0.<ext>`
 Any other upload is refused with 409, on the same terms as a capture, before
 anything is written.
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import io
@@ -126,3 +126,72 @@ def test_the_projects_root_is_read_from_the_live_settings(client, db_session, ov
     db_session.expire_all()
     stored = Path(db_session.query(RecordImage).one().file_path)
     assert stored.parent == override_projects_root / "xx-test-live" / "captures"
+
+
+# ---------------------------------------------------------------------------
+# An excluded record (Fisqua contract 1.6) takes no upload, as it takes no
+# capture: an image added to it would leave the export and fail every later
+# Fisqua decision as images_changed.
+# ---------------------------------------------------------------------------
+
+def _as(client, role):
+    from app.main import app
+    from app.api.auth import get_current_user
+    from app.models.user import User
+
+    app.dependency_overrides[get_current_user] = lambda: User(
+        username=role, email=f"{role}@example.com", hashed_password="x", role=role, is_active=True)
+    return client
+
+
+def _stemmed_record(db, status):
+    from app.models.collection import Collection
+    from app.models.project import Project
+    from app.models.record import Record
+
+    p = Project(name="P")
+    db.add(p)
+    db.commit()
+    vol = Collection(name="Tomo", project_id=p.id, filename_stem="xx-test-001")
+    db.add(vol)
+    db.commit()
+    rec = Record(title="r", status=status, capture_mode="single", collection_id=vol.id)
+    db.add(rec)
+    db.commit()
+    return rec
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role", ["operator", "admin"])
+def test_an_upload_into_an_excluded_record_is_refused_and_writes_nothing(client, db_session, capture_settings,
+                                                                        data_dir, override_projects_root, role):
+    from app.models.record import Record, RecordImage
+
+    rec = _stemmed_record(db_session, "excluded")
+    resp = _as(client, role).post(f"/records/{rec.id}/images",
+                                  files={"file": ("page.jpg", _jpeg(), "image/jpeg")})
+
+    assert resp.status_code == 409, resp.text
+    assert "excluded" in resp.json()["detail"]
+    db_session.expire_all()
+    assert db_session.query(RecordImage).count() == 0
+    assert db_session.get(Record, rec.id).status == "excluded"
+    assert not _uploads_dir().exists() or list(_uploads_dir().iterdir()) == []
+    assert [p for p in override_projects_root.rglob("*") if p.is_file()] == []
+
+
+@pytest.mark.unit
+def test_an_upload_into_an_in_review_record_is_stored_as_before(client, db_session, capture_settings, data_dir,
+                                                                override_projects_root):
+    from app.models.record import Record, RecordImage
+
+    rec = _stemmed_record(db_session, "in_review")
+    resp = _as(client, "operator").post(f"/records/{rec.id}/images",
+                                        files={"file": ("page.jpg", _jpeg(), "image/jpeg")})
+
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    img = db_session.query(RecordImage).one()
+    assert Path(img.file_path) == override_projects_root / "xx-test-001" / "captures" / "xx-test-001-img_0001_c0.jpg"
+    assert Path(img.file_path).read_bytes() == _jpeg()
+    assert db_session.get(Record, rec.id).status == "in_review"

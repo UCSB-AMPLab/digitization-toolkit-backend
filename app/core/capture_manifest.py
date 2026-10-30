@@ -1,4 +1,4 @@
-"""A volume's capture manifest for Fisqua (exchange contract 1.1, §4, artefact 2).
+"""A volume's capture manifest for Fisqua (exchange contract 1.6; §4, artefact 2, as in 1.1).
 
 Built only from the catalogue (the volume, its records and their current
 images), the capture manifests (`metadata/manifest.jsonl`, read through
@@ -37,9 +37,10 @@ whose files are still on disk.
   filenameStem its Fisqua reference code, unchanged, and the unit's
   interface has no field for external_id (ruled). The download and the
   manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
+* The manifest always declares version 1.6, whatever its records and
+  whatever CAPTUA_FISQUA_ROTATE_DEG; Fisqua reads any 1.x.
 * `rotateDeg` (contract 1.5) is sent only when CAPTUA_FISQUA_ROTATE_DEG is
-  on, and then the manifest is version 1.5; off, it is version 1.1 with no
-  such key. It is the image's recorded rotate_deg: the clockwise degrees
+  on; off, no image carries the key. It is the image's recorded rotate_deg: the clockwise degrees
   that display it upright from its stored pixels, whatever EXIF Orientation
   the file carries (Captua never turns pixels; the rebuilt 2022-24 JPEGs of
   app.core.rebuild_volume carry wrong tags and the right rotate_deg). It
@@ -68,9 +69,9 @@ from app.core import config
 from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, is_raw_suffix, preview_sidecar_of
 
 CONTRACT = "fisqua-captua-exchange"
-VERSION = "1.1"
-# The version when images carry rotateDeg (config FISQUA_ROTATE_DEG).
-ROTATE_DEG_VERSION = "1.5"
+# One version for every manifest, with or without rotateDeg (config
+# FISQUA_ROTATE_DEG) or an excluded record.
+VERSION = "1.6"
 ROTATE_DEGREES = (0, 90, 180, 270)
 KIND = "capture-manifest"
 EXPORT_ACTION = "capture_manifest_exported"
@@ -302,7 +303,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     stamp = (now or _now()).astimezone(timezone.utc)
     return {
         "contract": CONTRACT,
-        "version": ROTATE_DEG_VERSION if config.settings.FISQUA_ROTATE_DEG else VERSION,
+        "version": VERSION,
         "kind": KIND,
         "id": str(new_id()),
         "generatedAt": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),

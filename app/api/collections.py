@@ -370,7 +370,7 @@ def export_capture_manifest(
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
-    """The volume's capture manifest for Fisqua (exchange contract 1.1, artefact 2; 1.2), as a JSON download.
+    """The volume's capture manifest for Fisqua (exchange contract 1.6, artefact 2), as a JSON download.
 
     A unit with a Fisqua token sends the manifest itself at handover
     (app.core.fisqua_outbox). This route stays for units without a token
