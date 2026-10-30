@@ -1327,6 +1327,10 @@ class ListItemIdDiffers(Exception):
     """The item at the position is not the queue entry the caller named."""
 
 
+class ListItemIdRequired(Exception):
+    """A done mark on the digitisation queue named no itemId; nothing has been written."""
+
+
 def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str],
                   item_id: Optional[str] = None) -> tuple[dict, Optional[dict]]:
     """Mark the item at `position` done (or remove its mark), under the list lock.
@@ -1336,15 +1340,20 @@ def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str],
     file readable as that list, the file holds no item object at that
     position, or (in the digitisation queue) that item has no itemId. The
     mark is keyed by done_key: a queue item's by its itemId, so it stays
-    with the entry when a later revision moves it. With `item_id`, an item
-    at that position whose itemId differs raises ListItemIdDiffers, so a
-    mark sent against an older revision is not put on another entry.
+    with the entry when a later revision moves it. For the queue `item_id`
+    is required (ListItemIdRequired without it), and an item at that
+    position whose itemId differs raises ListItemIdDiffers, so a mark sent
+    against an older revision is not put on another entry.
     done.json is rewritten whole, atomically (a temporary file,
     fsynced, then os.replace); a damaged one is read as no marks and so
     replaced. Raises OSError, with done.json unchanged, if it cannot be
     written.
     """
     list_id = str(uuid.UUID(list_id))
+    if list_id == QUEUE_LIST_ID and item_id is None:
+        # A position alone names whatever entry the latest revision put
+        # there, which may not be the one the caller saw.
+        raise ListItemIdRequired(list_id)
     directory = reports_dir() / list_id
     if not directory.is_dir():
         raise ListItemNotFound(list_id)

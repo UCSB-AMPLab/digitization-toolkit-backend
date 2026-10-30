@@ -47,7 +47,8 @@ offsite hold (app.core.fisqua_outbox).
   imports and queue revisions, as the band already picks them.
 * **Acknowledging**. POST /api/capture/v1/queue/ack with the revision and
   the applied and skipped items. The body is kept in `queue-state.json`
-  before it is posted; while it is not acknowledged each tick posts the
+  before it is posted, and is not posted when it cannot be kept (the
+  revision is then applied again at the next tick); while it is not acknowledged each tick posts the
   same body again and asks for nothing else. The revision is kept only once
   Fisqua has acknowledged it. itemIds the answer lists as `unknown` are
   logged once and left out of every later ack. An ack Fisqua refuses (400,
@@ -726,7 +727,13 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
             try:
                 _write_state({"revision": revision, "pendingAck": ack})
             except OSError:
-                logger.exception("Could not keep the queue ack before posting it")
+                # Posted without being kept, a lost answer could not be
+                # retried with the same body. Applying is idempotent: the
+                # next tick asks under the old revision, applies again and
+                # tries to keep the ack again.
+                logger.exception("Could not keep the ack of queue revision %s, so it is not posted; applied "
+                                 "again at the next tick", fisqua_outbox.scrub(new_revision))
+                return {"status": "ack_not_kept", "operators": operators["status"]}
             stopped = _settle_ack(transport, ack, now)
             if stopped is not None:
                 return {**stopped, "operators": operators["status"]}

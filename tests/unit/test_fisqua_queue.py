@@ -713,7 +713,7 @@ def test_a_queue_done_mark_follows_its_item_across_revisions(client, synced, db_
     a = _qitem("xx-test-901", item_id="00000000-0000-4000-8000-00000000000a", sequence=1)
     b = _qitem("xx-test-902", item_id="00000000-0000-4000-8000-00000000000b", sequence=2)
     _sync(db_session, QueueTransport(queues=[_queue([a, b], "r1")], acks=[_ok_ack()]))
-    resp = _mark(client, QUEUE_LIST_ID, 2)
+    resp = _mark(client, QUEUE_LIST_ID, 2, itemId=b["itemId"])
     assert resp.status_code == 200, resp.text
     assert resp.json()["itemId"] == b["itemId"] and resp.json()["doneMark"]["by"] == "rev"
     marks = json.loads((reports_root / QUEUE_LIST_ID / "done.json").read_text(encoding="utf-8"))
@@ -729,7 +729,7 @@ def test_a_queue_done_mark_follows_its_item_across_revisions(client, synced, db_
 
     # Taken off by the item's current position.
     position = by_code["xx-test-902"]["position"]
-    assert _mark(client, QUEUE_LIST_ID, position, done=False).json()["doneMark"] is None
+    assert _mark(client, QUEUE_LIST_ID, position, done=False, itemId=b["itemId"]).json()["doneMark"] is None
     assert _queue_list(client)["items"][0]["doneMark"] is None
 
 
@@ -957,3 +957,71 @@ def test_any_refused_ack_is_dropped_logged_and_the_queue_asked_afresh(synced, db
     _sync(db_session, transport)
     assert len(transport.acks_sent) == 1
     assert transport.queue_asked == [None, None]
+
+
+
+# ---------------------------------------------------------------------------
+# Review findings
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("withdrawn_first", [True, False])
+def test_the_live_entry_gets_the_volume_when_a_withdrawn_one_names_the_same_code(
+        client, synced, db_session, withdrawn_first):
+    live = _qitem("xx-test-901", item_id="00000000-0000-4000-8000-0000000000a1")
+    gone = _qitem("xx-test-901", item_id="00000000-0000-4000-8000-0000000000a2", withdrawn=True)
+    items = [gone, live] if withdrawn_first else [live, gone]
+    _sync(db_session, QueueTransport(queues=[_queue(items)], acks=[_ok_ack()]))
+    vol = _volumes(db_session)["xx-test-901"]
+    by_id = {i["itemId"]: i for i in _queue_list(client)["items"]}
+    assert by_id[live["itemId"]]["collectionId"] == vol.id
+    assert by_id[live["itemId"]]["projectId"] == vol.project_id
+    assert by_id[live["itemId"]]["status"] is not None
+    assert by_id[gone["itemId"]]["collectionId"] is None
+
+
+@pytest.mark.unit
+def test_a_withdrawn_entry_alone_keeps_the_binding(client, synced, db_session):
+    item = _qitem("xx-test-901")
+    _sync(db_session, QueueTransport(queues=[_queue([item], "r1")], acks=[_ok_ack()]))
+    _sync(db_session, QueueTransport(queues=[_queue([{**item, "withdrawn": True}], "r2")], acks=[_ok_ack()]))
+    [only] = _queue_list(client)["items"]
+    assert only["collectionId"] == _volumes(db_session)["xx-test-901"].id
+
+
+@pytest.mark.unit
+def test_a_queue_done_mark_without_item_id_is_a_422_and_changes_nothing(client, synced, db_session, reports_root):
+    from app.core.fisqua_queue import QUEUE_LIST_ID
+    _sync(db_session, QueueTransport(queues=[_queue([_qitem()])], acks=[_ok_ack()]))
+    resp = _mark(client, QUEUE_LIST_ID, 1)
+    assert resp.status_code == 422, resp.text
+    assert not (reports_root / QUEUE_LIST_ID / "done.json").exists()
+    assert _queue_list(client)["items"][0]["doneMark"] is None
+
+
+@pytest.mark.unit
+def test_an_ack_that_cannot_be_kept_is_not_posted_and_the_revision_is_applied_again(
+        synced, db_session, monkeypatch):
+    from app.core import fisqua_queue
+    real = fisqua_queue._write_state
+    calls = []
+
+    def fail_first(state):
+        calls.append(state)
+        if len(calls) == 1:
+            raise OSError("disk full")
+        return real(state)
+
+    monkeypatch.setattr(fisqua_queue, "_write_state", fail_first)
+    item = _qitem()
+    transport = QueueTransport(queues=[_queue([item], "r1"), _queue([item], "r1")], acks=[_ok_ack()])
+    assert _sync(db_session, transport)["status"] == "ack_not_kept"
+    assert transport.acks_sent == []
+    assert fisqua_queue._read_state() == {}
+
+    # The next tick asks again without a revision, applies again (nothing made twice) and acks.
+    assert _sync(db_session, transport)["status"] == "applied"
+    assert transport.queue_asked == [None, None]
+    assert len(transport.acks_sent) == 1
+    assert len(_volumes(db_session)) == 1
+    assert fisqua_queue._read_state()["revision"] == "r1"
