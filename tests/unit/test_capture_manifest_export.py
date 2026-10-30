@@ -11,7 +11,7 @@ uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
 
-Version: 0.2.1
+Version: 0.3.2
 """
 
 import hashlib
@@ -1162,3 +1162,80 @@ def test_the_version_is_1_6_with_or_without_an_exclusion_and_rotate_deg(client, 
     assert _export(client, vol.col).json()["version"] == "1.6"
     vol.record(status="excluded", sequence=2)
     assert _export(client, vol.col).json()["version"] == "1.6"
+
+
+# ---------------------------------------------------------------------------
+# An opening that misses a side (records.missing_side) stays on the unit
+# until it is recaptured, and is left out of the handover's manifest.
+# ---------------------------------------------------------------------------
+
+def _missing_side(vol, side="left"):
+    """A captured dual record with its one image, the page opposite `side`, as app.core.rebuild_volume writes one."""
+    rec = vol.record(status="captured", layout=("right",) if side == "left" else ("left",))
+    rec.missing_side = side
+    vol.db.commit()
+    vol.db.refresh(rec)
+    return rec
+
+
+def _listed(doc):
+    return [r["captuaRecordId"] for r in doc["volumes"][0]["records"]]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_record_missing_a_side_is_left_out_and_does_not_refuse(client, vol, side):
+    a = vol.record(status="in_review")
+    missing = _missing_side(vol, side)
+    b = vol.record(status="in_review")
+
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert _listed(doc) == [a.id, b.id]
+    assert missing.id not in _listed(doc)
+    assert {i["captureId"] for i in _images(doc)} == {img.capture_id for r in (a, b) for img in r.images}
+    # Its capture line stays in the volume's manifest.jsonl; only the export skips it.
+    lines = (vol.root / "metadata" / "manifest.jsonl").read_text().splitlines()
+    assert any(json.loads(line)["capture_id"] == missing.images[0].capture_id for line in lines)
+
+
+@pytest.mark.unit
+def test_once_recaptured_and_handed_over_it_is_in_the_next_manifest(client, vol, db_session):
+    from app.models.record import Record
+
+    a = vol.record(status="captured")
+    missing = _missing_side(vol)
+    api = _as(client, "operator")
+    assert api.post(f"/collections/{vol.col.id}/promote").json()["promoted"] == 1
+    assert _listed(_export(client, vol.col).json()) == [a.id]
+
+    # The retake: both pages, the lone image superseded, the side cleared, as trigger_dual_capture does.
+    vol.supersede(missing)
+    vol.capture(missing, ("left", "right"))
+    missing.missing_side = None
+    db_session.commit()
+    resp = api.post(f"/collections/{vol.col.id}/promote")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["promoted"] == 1
+
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert _listed(doc) == [a.id, missing.id]
+    db_session.expire_all()
+    current = [i for i in db_session.get(Record, missing.id).images if i.is_current]
+    [entry] = [r for r in doc["volumes"][0]["records"] if r["captuaRecordId"] == missing.id]
+    assert entry["status"] == "in_review"
+    assert sorted(i["role"] for i in entry["images"]) == ["left", "right"]
+    assert {i["captureId"] for i in entry["images"]} == {i.capture_id for i in current}
+
+
+@pytest.mark.unit
+def test_an_ordinary_captured_record_beside_one_missing_a_side_still_refuses(client, vol):
+    vol.record(status="in_review")
+    missing = _missing_side(vol)
+    c = vol.record(status="captured")
+    problems = _refusal(_export(client, vol.col))
+    assert problems["records_captured"]["record_ids"] == [c.id]
+    assert missing.id not in problems["records_captured"]["record_ids"]

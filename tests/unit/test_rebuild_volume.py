@@ -14,7 +14,7 @@ and 4 the second, and 5 has no partner. Each odd image is the right-hand page
 
     python -m pytest tests/unit/test_rebuild_volume.py
 
-Version: 0.3.1
+Version: 0.3.2
 """
 
 import hashlib
@@ -1206,3 +1206,111 @@ def test_a_rerun_compares_a_done_records_source_bucket(remote, db_session, overr
                        override_projects_root, match="differ from the plan")
     assert [(p["ordinal"], p["fields"]) for p in refusal.problems] == [
         (1, ["manifest.provenance.left.bucket", "manifest.provenance.right.bucket"])]
+
+
+# ---------------------------------------------------------------------------
+# An opening with a page never photographed: a dual record with `missingSide`
+# and its one image, on the other side.
+# ---------------------------------------------------------------------------
+
+# The second opening's images: 3 is its right-hand page (_c1), 4 its left (_c0).
+OTHER_SIDE = {"left": (3, "right"), "right": (4, "left")}
+
+
+def _missing_side_over(side):
+    """plan_over and image_over that leave the second opening with only the page opposite `side`."""
+    keep, _ = OTHER_SIDE[side]
+    drop = 4 if keep == 3 else 3
+
+    def plan(records):
+        records[1]["missingSide"] = side
+        records[1]["images"] = [i for i in records[1]["images"] if i["volumeOrder"] == keep]
+
+    def images(lines):
+        lines[:] = [line for line in lines if line["volumeOrder"] != drop]
+
+    return {"plan_over": [plan], "image_over": [images]}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_dual_record_missing_a_side_is_written_with_its_one_image(
+        remote, db_session, override_projects_root, tmp_path, side):
+    from app.models.record import Record
+
+    _volume(db_session)
+    keep, role = OTHER_SIDE[side]
+    name = _name(2, 1 if role == "right" else 0)
+    bundle = _bundle(tmp_path, remote, **_missing_side_over(side))
+
+    report = _rebuild(db_session, bundle, apply=True)
+
+    assert (report["records"], report["images"]) == (3, 4)
+    db_session.expire_all()
+    records = db_session.query(Record).order_by(Record.sequence).all()
+    assert [(r.capture_mode, r.missing_side) for r in records] == [("dual", None), ("dual", side), ("single", None)]
+    [img] = records[1].images
+    assert (img.filename, img.role, img.pair_id, img.capture_id, img.is_current) == (
+        name, role, _pair_id(2), _capture_id(2), True)
+    assert img.master_freed_bytes == len(_master(keep))
+
+    lines = {line["capture_id"]: line for line in _manifest_lines(override_projects_root)}
+    line = lines[_capture_id(2)]
+    assert line["pair_id"] == _pair_id(2)
+    assert [(f["role"], f["relative_path"]) for f in line["files"]] == [(role, f"captures/{name}")]
+    assert line["provenance"]["missingSide"] == side
+    assert [s["role"] for s in line["provenance"]["rebuiltFrom"]] == [role]
+    assert "missingSide" not in lines[_capture_id(1)]["provenance"]
+    assert "missingSide" not in lines[_capture_id(3)]["provenance"]
+
+    # A rerun finds it whole.
+    again = _rebuild(db_session, bundle, apply=True)
+    assert again["created"] == [] and len(again["skipped"]) == 3
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("edit,reason,ordinal", [
+    # both images kept
+    (lambda r: r[1].update(missingSide="left"), "missing_side_images_invalid", 2),
+    # no image
+    (lambda r: r[1].update(missingSide="left", images=[]), "missing_side_images_invalid", 2),
+    # the one image on the missing side
+    (lambda r: r[1].update(missingSide="left", images=[i for i in r[1]["images"] if i["role"] == "left"]),
+     "missing_side_images_invalid", 2),
+    (lambda r: r[1].update(missingSide="right", images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_images_invalid", 2),
+    # bad values
+    (lambda r: r[1].update(missingSide="both", images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_invalid", 2),
+    (lambda r: r[1].update(missingSide="", images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_invalid", 2),
+    (lambda r: r[1].update(missingSide=0, images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_invalid", 2),
+    # unhashable JSON values are refused, not raised
+    (lambda r: r[1].update(missingSide=[], images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_invalid", 2),
+    (lambda r: r[1].update(missingSide={}, images=[i for i in r[1]["images"] if i["role"] == "right"]),
+     "missing_side_invalid", 2),
+    # only a dual record can miss a side
+    (lambda r: r[2].update(missingSide="right"), "missing_side_invalid", 3),
+])
+def test_a_missing_side_record_that_is_not_one_image_on_the_other_side_is_refused(
+        remote, db_session, override_projects_root, tmp_path, edit, reason, ordinal):
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote, plan_over=_edit(edit))
+    _record_refusal(db_session, bundle, override_projects_root, reason, ordinal)
+
+
+@pytest.mark.unit
+def test_a_rerun_compares_a_done_records_missing_side(remote, db_session, override_projects_root, tmp_path):
+    from app.models.record import Record
+
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote, **_missing_side_over("left"))
+    _rebuild(db_session, bundle, apply=True)
+    rec = db_session.query(Record).filter(Record.sequence == 2).one()
+    rec.missing_side = None
+    db_session.commit()
+
+    refusal = _refused(db_session, bundle, override_projects_root, match="differ from the plan")
+    assert [(p["ordinal"], p["fields"]) for p in refusal.problems] == [(2, ["missing_side"])]

@@ -17,7 +17,7 @@ The hardware is stood in for as tests/unit/test_capture_birth_and_retake.py does
 
 Run with: python -m pytest tests/unit/test_recapture_turn.py
 
-Version: 0.3.1
+Version: 0.3.2
 """
 
 from datetime import datetime
@@ -147,6 +147,7 @@ def test_summary_shape_counts_and_order(client, db_session, test_project):
         "filenameStem": "co-test-b", "pending": 3, "total": 3, "excluded": 0,
         "firstPendingRecordId": first_b.id,
         "pendingRecordIds": [first_b.id, b2.id, b4.id],
+        "missingSideRecordIds": [],
     }
     by_id = {v["collectionId"]: v for v in body["volumes"]}
     assert (by_id[a.id]["pending"], by_id[a.id]["total"]) == (2, 3)
@@ -896,6 +897,7 @@ def test_a_prepared_record_is_still_pending(client, db_session, test_project):
         "filenameStem": "co-test-a", "pending": 1, "total": 1, "excluded": 0,
         "firstPendingRecordId": prepared.id,
         "pendingRecordIds": [prepared.id],
+        "missingSideRecordIds": [],
     }]
     assert body["turn"] == {"state": "recaptures", "unlockedBy": None}
     assert _events(db_session, COMPLETED) == [], "a status change alone never completes a volume"
@@ -1126,6 +1128,7 @@ def test_the_summary_counts_a_volumes_exclusions_and_leaves_them_out_of_total(cl
         "filenameStem": "co-test-a", "pending": 1, "total": 2, "excluded": 2,
         "firstPendingRecordId": waiting.id,
         "pendingRecordIds": [waiting.id],
+        "missingSideRecordIds": [],
     }]
 
 

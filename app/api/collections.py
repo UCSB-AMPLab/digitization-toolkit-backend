@@ -1,4 +1,4 @@
-# Version: 0.3.1
+# Version: 0.3.2
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -881,7 +881,8 @@ def promote_collection(
 ):
     """
     Hand a finished collection over for review: apply captured -> in_review to
-    every captured record in it.
+    every captured record in it but those that miss a side
+    (records.missing_side), which stay captured until they are recaptured.
 
     The act is per collection — an operator promotes a tomo when she has
     finished it — while the transition itself stays per record, which is what
@@ -891,7 +892,10 @@ def promote_collection(
     All or nothing. A collection reads as handed over when none of its records
     is captured, so promoting some of them would leave it unsubmitted while
     reporting success; the records that cannot go are named instead and
-    nothing changes.
+    nothing changes. The one exception is a record that misses a side: it
+    is pending, not unfinished work to refuse over, so the others go and it
+    stays, and the volume does not read as handed over until it is
+    recaptured and handed over too.
 
     Submitted state is derived, never stored. Capture another folio into a
     promoted collection and it is no longer submitted, which is the right
@@ -923,19 +927,23 @@ def promote_collection(
     records = (
         db.query(Record)
         .options(joinedload(Record.images))
-        .filter(Record.collection_id == collection_id, Record.status == "captured")
+        .filter(Record.collection_id == collection_id, Record.status == "captured",
+                Record.missing_side.is_(None))
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
-    # A volume with a pending record (rejected, or prepared for retake with
-    # its rejected image still current; app.core.recapture_turn) stays on the
-    # unit until its retakes are done, for every role: Fisqua would hold a
-    # delivery with a rejected record anyway. Counted after the locks, and
-    # before the idempotent return, so a volume whose only records left are
-    # rejected is refused too.
-    from app.core.recapture_turn import volume_pending
-    pending = volume_pending(db, collection_id)
+    # A volume with a record waiting for a retake (rejected, or prepared for
+    # retake with its rejected image still current; app.core.recapture_turn)
+    # stays on the unit until its retakes are done, for every role: Fisqua
+    # would hold a delivery with a rejected record anyway. Counted after the
+    # locks, and before the idempotent return, so a volume whose only records
+    # left are rejected is refused too. A record that misses a side is
+    # pending but does not hold the volume back: it is left out of the
+    # records above, stays captured, and goes with the next handover once a
+    # dual retake has written both pages.
+    from app.core.recapture_turn import volume_retakes_pending
+    pending = volume_retakes_pending(db, collection_id)
     if pending:
         raise HTTPException(
             status_code=409,

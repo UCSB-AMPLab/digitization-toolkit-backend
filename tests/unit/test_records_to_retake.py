@@ -1,13 +1,16 @@
 """GET /records/to-retake and GET /records/to-retake/count: the records waiting to be retaken.
 
-Every record whose status is `rejected`, across all volumes, with its volume
-and its latest RecordRejection, oldest latest rejection first. Rejections are
+Every pending record (app.core.recapture_turn: rejected, prepared for retake,
+or missing a side), across all volumes, with its volume, its latest
+RecordRejection and why it is pending, oldest latest rejection first. The
+prepared and missing-side rows are covered in test_recapture_turn.py and
+test_missing_side.py. Rejections are
 written directly with their rejected_at, so the order does not depend on the
 clock.
 
 Run with: python -m pytest tests/unit/test_records_to_retake.py
 
-Version: 0.2.0
+Version: 0.3.2
 """
 
 from datetime import datetime
@@ -119,6 +122,8 @@ def test_a_row_carries_the_record_its_volume_and_the_latest_rejection(client, db
         "comment": "falta el margen",
         "rejectedBy": "luis",
         "rejectedAt": "2026-10-03T15:30:00",
+        "pendingReason": "rejected",
+        "missingSide": None,
     }
 
 

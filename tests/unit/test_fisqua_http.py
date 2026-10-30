@@ -1220,3 +1220,22 @@ def test_a_retest_answered_with_a_token_error_is_built_again_after_an_update(db_
     assert sent["id"] != old_id
     assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
     assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_version_refused_volume_with_a_record_missing_a_side_is_resent(
+        client, db_session, queued, monkeypatch):
+    # A record missing a side stays captured on the unit until it is
+    # recaptured and is left out of the handover, so it must not hold back the
+    # resend after a version stop clears.
+    from app.core import config
+    _send(db_session, Server(_version_refusal()))
+    rec = queued.record(status="captured")
+    rec.capture_mode = "dual"
+    rec.missing_side = "left"
+    db_session.commit()
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server)
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused", "delivered"]

@@ -26,7 +26,13 @@ whose files are still on disk.
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
-  2026-10-17: the manifest carries every record's status).
+  2026-10-17: the manifest carries every record's status), but a captured
+  record that misses a side (records.missing_side, an opening only one
+  camera photographed): promotion leaves it captured on the unit, so the
+  manifest leaves it out, with its images, and it does not refuse the
+  export as a captured record does. Its capture line stays in the volume's
+  manifest.jsonl. Once a dual retake has cleared its missing side it is an
+  ordinary record, listed in the next handover.
 * Pages are the images of records `in_review` or `approved` (HANDED_OVER).
   A record `excluded` by a Fisqua decision (contract 1.6) is listed with
   that status and its current images, so Fisqua keeps its decision, but it
@@ -53,7 +59,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.2.1
+Version: 0.3.2
 """
 
 import re
@@ -184,6 +190,11 @@ def _rejection_note(record) -> Optional[str]:
     return comment or latest.predefined_reason
 
 
+def _left_on_the_unit(rec) -> bool:
+    """Whether the record is a captured opening that misses a side, which the handover leaves out."""
+    return rec.status == "captured" and rec.missing_side is not None
+
+
 def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] = None,
                            new_id: Callable[[], uuid.UUID] = uuid.uuid4) -> dict:
     """The capture manifest of one volume, or ManifestRefused naming every problem (module header)."""
@@ -227,6 +238,9 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
+    # A captured opening that misses a side stays on the unit until it is
+    # recaptured, as promotion leaves it (module header).
+    records = [rec for rec in records if not _left_on_the_unit(rec)]
     found = _Collector()
 
     by_sequence: Dict[int, List[int]] = {}

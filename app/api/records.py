@@ -1,4 +1,4 @@
-# Version: 0.3.1
+# Version: 0.3.2
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -284,14 +284,17 @@ def count_records(
 
 
 def _to_retake_query(db: Session):
-	"""The rejected records, each with its volume and its latest rejection, in one query.
+	"""The pending records, each with its volume, its latest rejection and why it is pending, in one query.
 
-	The latest rejection is the one with the newest rejected_at (the highest
-	id on a tie), found by a correlated subquery in the join, so the rows
-	come from one statement whatever their number. Both joins are outer: a
-	record in no volume, or rejected with no RecordRejection row, is still
-	waiting.
+	Pending is app.core.recapture_turn's one definition: rejected, prepared
+	for retake, or missing a side. The latest rejection is the one with the
+	newest rejected_at (the highest id on a tie), found by a correlated
+	subquery in the join, so the rows come from one statement whatever their
+	number. Both joins are outer: a record in no volume, or pending with no
+	RecordRejection row (a missing side has none), is still waiting.
 	"""
+	from app.core import recapture_turn
+
 	other = aliased(RecordRejection)
 	latest = (
 		db.query(other.id)
@@ -302,10 +305,10 @@ def _to_retake_query(db: Session):
 		.scalar_subquery()
 	)
 	return (
-		db.query(Record, Collection, RecordRejection)
+		db.query(Record, Collection, RecordRejection, recapture_turn.pending_reason_clause().label("pending_reason"))
 		.outerjoin(Collection, Collection.id == Record.collection_id)
 		.outerjoin(RecordRejection, RecordRejection.id == latest)
-		.filter(Record.status == "rejected")
+		.filter(recapture_turn.pending_clause())
 	)
 
 
@@ -314,11 +317,14 @@ def list_records_to_retake(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Every rejected record, across all volumes, oldest latest rejection first.
+	"""Every pending record, across all volumes, oldest latest rejection first.
 
-	Each row has the record, its volume's project id, name and stem, and its latest
-	rejection's reason code, comment, author and time. A rejected record
-	with no rejection row comes last; ties go by record id.
+	Pending as app.core.recapture_turn defines it: rejected, prepared for
+	retake, or missing a side. Each row has the record, its volume's project
+	id, name and stem, its latest rejection's reason code, comment, author
+	and time, why it is pending (pendingReason) and the side it misses
+	(missingSide). A record with no rejection row, as a missing side has
+	none, comes last; ties go by record id.
 	"""
 	rows = (
 		_to_retake_query(db)
@@ -338,8 +344,10 @@ def list_records_to_retake(
 			comment=rej.comment if rej else None,
 			rejectedBy=rej.rejected_by if rej else None,
 			rejectedAt=rej.rejected_at if rej else None,
+			pendingReason=reason,
+			missingSide=rec.missing_side,
 		)
-		for rec, col, rej in rows
+		for rec, col, rej, reason in rows
 	]
 
 
@@ -349,7 +357,8 @@ def count_records_to_retake(
 	db: Session = Depends(get_db_dependency)
 ):
 	"""How many records GET /records/to-retake lists, for the side menu's badge."""
-	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
+	from app.core import recapture_turn
+	return {"count": recapture_turn.pending_records(db)}
 
 
 @router.get("/to-retake/summary")
@@ -359,14 +368,16 @@ def summarise_records_to_retake(
 ):
 	"""The retakes by volume, and the unit's recapture turn (app.core.recapture_turn).
 
-	pendingRecords is the unit's pending records: rejected, or prepared for
-	retake with the rejected image still current. Each volume with a pending
+	pendingRecords is the unit's pending records: rejected, prepared for
+	retake with the rejected image still current, or missing a side. Each volume with a pending
 	record is listed, most pending first, then by name: `pending` is its
 	pending records, `total` its records with at least one rejection whatever
 	their state now except excluded, `excluded` its records now excluded by
 	a Fisqua decision (contract 1.6), which are never pending, pendingRecordIds every pending record of the volume by
-	sequence (a record with none last) then id, and firstPendingRecordId the
-	first of them. projectId is the project that owns the volume, through its
+	sequence (a record with none last) then id, firstPendingRecordId the
+	first of them, and missingSideRecordIds those of them that miss a side,
+	in the same order. A record that misses a side has no rejection, so it
+	counts in `pending` and not in `total`. projectId is the project that owns the volume, through its
 	parents for a nested one.
 
 	The volumes come from one statement: every record in a volume that is
@@ -386,17 +397,20 @@ def summarise_records_to_retake(
 	rows = (
 		db.query(Collection.id, Collection.name, Collection.filename_stem,
 		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"),
-		         Record.status)
+		         Record.status, recapture_turn.pending_reason_clause().label("pending_reason"))
 		.join(Record, Record.collection_id == Collection.id)
 		.filter(or_(is_pending, ever_rejected, Record.status == "excluded"))
 		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
 		.all()
 	)
 	by_volume: dict = {}
-	for collection_id, name, stem, record_id, pending, rejected, status in rows:
-		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0, "excluded": 0})
+	for collection_id, name, stem, record_id, pending, rejected, status, reason in rows:
+		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "missing": [],
+		                                           "total": 0, "excluded": 0})
 		if pending:
 			vol["ids"].append(record_id)
+			if reason == recapture_turn.MISSING_SIDE:
+				vol["missing"].append(record_id)
 		if status == "excluded":
 			vol["excluded"] += 1
 		elif rejected:
@@ -416,6 +430,7 @@ def summarise_records_to_retake(
 			"excluded": vol["excluded"],
 			"firstPendingRecordId": vol["ids"][0],
 			"pendingRecordIds": vol["ids"],
+			"missingSideRecordIds": vol["missing"],
 		})
 	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
 	pending_records = recapture_turn.pending_records(db)
@@ -1266,8 +1281,11 @@ def assert_movable(rec: Record) -> None:
 def _assert_promotable(rec: Record) -> None:
 	"""
 	Refuse to let a record leave 'captured' unless the work is there to hand
-	over: at least one current image, and no current image carrying a
-	rejection_id (NEH-260).
+	over: at least one current image, no current image carrying a
+	rejection_id (NEH-260), and no missing side. A record that misses a side
+	(app.core.rebuild_volume) stays captured on the unit until a dual retake
+	writes both pages: PATCH /{id}/status refuses it, and POST /bulk-status
+	and POST /collections/{id}/promote leave it out.
 
 	The second clause is the substantive test. rejection_id is written in
 	reject_record below, on the images current at the moment of rejection, and
@@ -1296,6 +1314,14 @@ def _assert_promotable(rec: Record) -> None:
 			detail=(
 				f"Record {rec.id} still carries the rejected image(s) {marked}. "
 				f"Retake it before handing it over."
+			)
+		)
+	if rec.missing_side is not None:
+		raise HTTPException(
+			status_code=422,
+			detail=(
+				f"Record {rec.id} misses its {rec.missing_side} page. "
+				f"Retake the opening before handing it over."
 			)
 		)
 

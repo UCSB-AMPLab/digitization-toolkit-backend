@@ -1,4 +1,4 @@
-# Version: 0.2.1
+# Version: 0.3.2
 
 from __future__ import annotations
 from typing import Optional, List, Literal
@@ -102,6 +102,11 @@ PredefinedRejectionReason = Literal[
 # Which camera setup produced a document: one image, or an L+R pair fired
 # together on a single shutter press. Set once at capture time.
 CaptureMode = Literal["single", "dual"]
+# The page of a dual opening never photographed (records.missing_side).
+MissingSide = Literal["left", "right"]
+# Why a record is pending (app.core.recapture_turn.pending_reason): rejected,
+# prepared for retake with its rejected image still current, or missing a side.
+PendingReason = Literal["rejected", "prepared", "missing_side"]
 
 
 # ==============================================================================
@@ -274,6 +279,10 @@ class RecordRead(RecordBase):
 	created_by: Optional[str] = None
 	created_at: Optional[datetime]
 	modified_at: Optional[datetime]
+	# The page of a dual opening never photographed, set only by
+	# app.core.rebuild_volume and cleared by a dual retake; None otherwise.
+	# The record's one current image is the other page.
+	missing_side: Optional[MissingSide] = None
 	images: List[RecordImageRead] = []
 
 	class Config:
@@ -347,10 +356,10 @@ class RecordRejectionRead(BaseModel):
 
 
 class RecordToRetake(BaseModel):
-	"""A rejected record waiting to be retaken, with its volume and its latest rejection.
+	"""A pending record waiting to be retaken, with its volume, its latest rejection and why it waits.
 
 	The volume's fields are None for a record in no volume; the rejection's,
-	for a rejected record with no RecordRejection row.
+	for a record with no RecordRejection row, as a missing side has none.
 	"""
 	recordId: int
 	title: str
@@ -366,6 +375,9 @@ class RecordToRetake(BaseModel):
 	comment: Optional[str] = None
 	rejectedBy: Optional[str] = None
 	rejectedAt: Optional[datetime] = None
+	# Why it is pending, and for "missing_side" which page is missing (None otherwise).
+	pendingReason: PendingReason
+	missingSide: Optional[MissingSide] = None
 
 
 class RecordStatusChangeRead(BaseModel):
