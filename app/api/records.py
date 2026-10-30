@@ -1,4 +1,4 @@
-# Version: 0.2.1
+# Version: 0.3.1
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -1385,12 +1385,20 @@ def update_record_status(
 	review again only when an operator promotes its volume. The undo transitions above are plain
 	status resets with no new image, no reason and no rejection record; the
 	change itself is dated in record_status_changes, like every other.
+
+	A change that leaves a full rescan with no captured record sends it to
+	review, as POST /collections/{id}/promote does, and opens the recapture
+	turn the first time (recapture_turn.award_rescan_turns, which takes the
+	volume's row and then the turn lock, after this record's lock).
 	"""
 	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id])
 	_apply_status_change(db, rec, payload.status, current_user)
+	award_rescan_turns(db, rescans, current_user.username)
 
 	db.commit()
 	db.refresh(rec)
@@ -1408,6 +1416,11 @@ def bulk_update_status(
 	Records where the transition is not valid are skipped and reported in the response.
 
 	Returns the updated records.
+
+	Each full rescan the call leaves with no captured record is sent to
+	review, as in PATCH /{rec_id}/status (recapture_turn.award_rescan_turns):
+	after every record lock, the rescans' volume rows in id order, then the
+	turn lock once.
 	"""
 	# Locked for the same reason the single-record path is, and ordered by id
 	# so two bulk calls over overlapping sets take the rows in the same order
@@ -1426,6 +1439,9 @@ def bulk_update_status(
 	skipped: list[int] = []
 	updated: list[Record] = []
 
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id for rec in records])
+
 	for rec in records:
 		try:
 			_apply_status_change(db, rec, payload.status, current_user)
@@ -1434,6 +1450,7 @@ def bulk_update_status(
 			continue
 		updated.append(rec)
 
+	award_rescan_turns(db, rescans, current_user.username)
 	db.commit()
 	for rec in updated:
 		db.refresh(rec)

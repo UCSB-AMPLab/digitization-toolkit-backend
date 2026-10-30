@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.3.1
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -97,10 +97,15 @@ def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_rec
 	after the record and volume locks, and held until the capture commits, so
 	the turn read here is still the turn when its new_volume_started event is
 	written and two operators cannot both start a volume on one completion
-	(app.core.recapture_turn). An admin may start one in any turn. Called
-	after the other refusals, before any number is taken or camera touched.
+	(app.core.recapture_turn). An admin may start one in any turn. A full
+	rescan is rework, not a new volume: its first capture is never refused,
+	takes no turn lock and returns False, so it writes no new_volume_started
+	and leaves the turn as it was. Called after the other refusals, before
+	any number is taken or camera touched.
 	"""
 	if retake_record is not None or not recapture_turn.volume_is_empty(db, collection_id):
+		return False
+	if recapture_turn.volume_is_full_rescan(db.get(Collection, collection_id)):
 		return False
 	recapture_turn.lock_turn(db)
 	if user.role != "admin" and recapture_turn.turn(db)["state"] == "recaptures":
@@ -117,6 +122,11 @@ def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook
 	its volume with none pending (app.core.recapture_turn), so once for each
 	time the volume reaches zero, and never for a status change alone. A retake takes the turn lock here, last of
 	its locks, so its event and a new volume's start are written in turn.
+
+	A full rescan not yet promoted writes no recapture_volume_completed: its
+	retakes are part of its capture, and its first promotion is what opens
+	a turn. Once it carries rescan_volume_completed, its retakes complete it
+	as any volume's do.
 	"""
 	if not (starts_volume or retook_pending):
 		return
@@ -126,7 +136,9 @@ def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook
 		return
 	recapture_turn.lock_turn(db)
 	db.flush()  # the retaken record's new status and images, before the count
-	if recapture_turn.volume_pending(db, record.collection_id) == 0:
+	if recapture_turn.volume_pending(db, record.collection_id) == 0 and not (
+			recapture_turn.volume_is_full_rescan(volume)
+			and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
 		recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, user.username)
 
 
