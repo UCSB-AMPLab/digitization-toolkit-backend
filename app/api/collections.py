@@ -970,11 +970,13 @@ def promote_collection(
             },
         )
 
+    # Records, then the volume's row, then the turn: the capture paths' order.
+    # The row is taken before the status changes write their history rows.
+    from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+    rescans = lock_rescan_volumes(db, [collection_id])
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
-    # Records, then the volume's row, then the turn: the capture paths' order.
-    from app.core.recapture_turn import award_rescan_turns
-    award_rescan_turns(db, [collection_id], current_user.username)
+    award_rescan_turns(db, rescans, current_user.username)
     # Queued in the handover's transaction, after the records' locks, so a
     # handover and its manifest are committed together or not at all
     # (app.core.fisqua_outbox). Nothing is queued when Fisqua is not configured.

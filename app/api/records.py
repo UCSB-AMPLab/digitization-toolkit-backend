@@ -1395,9 +1395,10 @@ def update_record_status(
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id])
 	_apply_status_change(db, rec, payload.status, current_user)
-	from app.core.recapture_turn import award_rescan_turns
-	award_rescan_turns(db, [rec.collection_id], current_user.username)
+	award_rescan_turns(db, rescans, current_user.username)
 
 	db.commit()
 	db.refresh(rec)
@@ -1438,6 +1439,9 @@ def bulk_update_status(
 	skipped: list[int] = []
 	updated: list[Record] = []
 
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id for rec in records])
+
 	for rec in records:
 		try:
 			_apply_status_change(db, rec, payload.status, current_user)
@@ -1446,8 +1450,7 @@ def bulk_update_status(
 			continue
 		updated.append(rec)
 
-	from app.core.recapture_turn import award_rescan_turns
-	award_rescan_turns(db, [rec.collection_id for rec in updated], current_user.username)
+	award_rescan_turns(db, rescans, current_user.username)
 	db.commit()
 	for rec in updated:
 		db.refresh(rec)

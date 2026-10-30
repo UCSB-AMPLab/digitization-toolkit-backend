@@ -1127,3 +1127,33 @@ def test_the_summary_counts_a_volumes_exclusions_and_leaves_them_out_of_total(cl
         "firstPendingRecordId": waiting.id,
         "pendingRecordIds": [waiting.id],
     }]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", ["patch", "bulk", "promote"])
+def test_a_rescans_row_is_locked_before_any_status_change(client, db_session, test_project, monkeypatch, route):
+    # Two requests over one rescan must queue on its row before either writes
+    # a history row (whose key share lock on the volume would otherwise have
+    # to be upgraded by both). PostgreSQL only; here the order is what can be tested.
+    from app.api import collections as collections_api, records as records_api
+    rescan = _volume(db_session, test_project, "Tomo R", "co-test-r", _with_action("full-rescan"))
+    recs = [_record(db_session, rescan, "captured", 1), _record(db_session, rescan, "captured", 2)]
+    api = _client_as(client, "op", "operator")
+    taken = _spy_lock_order(monkeypatch)
+    for module in (records_api, collections_api):
+        real = module._apply_status_change
+
+        def spy(db, rec, status, user, _real=real):
+            taken.append(("status", rec.id))
+            return _real(db, rec, status, user)
+
+        monkeypatch.setattr(module, "_apply_status_change", spy)
+    if route == "patch":
+        _patch(api, recs[0], "in_review")
+    elif route == "bulk":
+        _bulk(api, recs, "in_review")
+    else:
+        assert api.post(f"/collections/{rescan.id}/promote").status_code == 200
+    first_status = next(i for i, t in enumerate(taken) if isinstance(t, tuple) and t[0] == "status")
+    assert taken[0] == ("volume", rescan.id), taken
+    assert first_status > 0 and taken.index("turn") > first_status, taken

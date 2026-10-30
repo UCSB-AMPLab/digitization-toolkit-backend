@@ -165,38 +165,47 @@ def has_event(db: Session, action: str, collection_id: int) -> bool:
 	).first() is not None
 
 
-def award_rescan_turns(db: Session, collection_ids, actor: Optional[str]) -> None:
-	"""Write rescan_volume_completed for each full rescan among the volumes that is now sent to review.
+def lock_rescan_volumes(db: Session, collection_ids) -> list:
+	"""Lock the rows of the full rescans among the volumes, in id order; return their ids.
 
 	Called by the routes that move records out of captured, after their
-	status changes and before their commit, with the volumes those changes
-	touched. A volume is due when it is a full rescan, carries no such event
-	yet, has at least one record and none left captured.
-
-	The caller holds its record locks. Volumes that are not full rescans are
-	dropped before any lock, so they take none. Otherwise the caller's
-	status changes are flushed first, so the key share locks their history
-	rows take on every touched volume (rescan or not) are held; then the
-	rescan rows are taken in id order (volume_stem.locked_volume_query), and
-	only then the turn lock, once. A path that holds the turn lock never
-	waits for a volume row, so this cannot deadlock against a retake, which
-	holds its volume's row and then asks for the turn.
+	record locks and before any status change, with the volumes the changes
+	will touch; award_rescan_turns then takes the ids it returns. Volumes
+	that are not full rescans are dropped before any lock, so they take
+	none. Taking a rescan's row here, before the status changes write their
+	history rows (which take a key share lock on the volume), means two
+	requests over one rescan queue on its row instead of each holding a key
+	share lock and waiting for the other's to upgrade.
 	"""
 	from app.core import volume_stem
 
-	rescans = sorted({
-		cid for cid in collection_ids
-		if cid is not None and (volume := db.get(Collection, cid)) is not None
-		and volume_is_full_rescan(volume)
-	})
-	if not rescans:
-		return
-	# The caller's status changes go first: their history rows take a key
-	# share lock on every volume they touch, rescan or not, and those must
-	# be held before the turn lock, as the row locks below are.
-	db.flush()
+	with db.no_autoflush:
+		rescans = sorted({
+			cid for cid in collection_ids
+			if cid is not None and (volume := db.get(Collection, cid)) is not None
+			and volume_is_full_rescan(volume)
+		})
 	for cid in rescans:
 		volume_stem.locked_volume_query(db, cid).first()
+	return rescans
+
+
+def award_rescan_turns(db: Session, rescans: list, actor: Optional[str]) -> None:
+	"""Write rescan_volume_completed for each locked rescan that is now sent to review.
+
+	`rescans` is what lock_rescan_volumes returned before the caller's status
+	changes. A volume is due when it carries no such event yet, has at least
+	one record and none left captured. The caller's status changes are
+	flushed first, so every key share lock their history rows take on any
+	volume is held before the turn lock; then the turn lock, once. The order
+	on every path is records, then the rescans' rows in id order, then the
+	turn lock, and a path holding the turn lock never waits for a volume row,
+	so this cannot deadlock against a retake, which holds its volume's row
+	and then asks for the turn.
+	"""
+	if not rescans:
+		return
+	db.flush()
 	lock_turn(db)
 	for cid in rescans:
 		if has_event(db, RESCAN_COMPLETED_ACTION, cid):
