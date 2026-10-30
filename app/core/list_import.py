@@ -47,8 +47,11 @@ The digitisation queue synced with Fisqua (contract 1.7,
 app.core.fisqua_queue) is stored the same way, as a list of its own under
 a fixed list id: each applied revision is written as that list's
 `list.json`, in this format, and as one more numbered report run, whose
-`source` is `queue`. It checks and creates each new item's volume with
-check_item and create_volume, the steps an import takes for one item.
+`source` is `queue`; only its newest QUEUE_REPORTS_KEPT runs are kept.
+It checks and creates each new item's volume with check_item and
+create_volume, the steps an import takes for one item. Its done marks are
+keyed by each entry's itemId, since positions change between revisions;
+a file's list keeps them by position (done_key).
 
 Version: 0.3.0
 """
@@ -1116,7 +1119,9 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
     contract does not name; any other value of either is None. `assignee`
     (contract 1.7, a queue entry's unit username) is a string or None, and
     `withdrawn` is True only when the item says true; a file import's items
-    have neither, so None and False.
+    have neither, so None and False. `itemId` is the queue entry's id, or
+    None, and `retakes` the entry's list of retakes as the item gives it
+    (a spot recapture's), or [] when it has none.
     """
     try:
         found_id, _, items = check_envelope(document)
@@ -1146,6 +1151,8 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
             "action": text(item, "action"),
             "assignee": text(item, "assignee"),
             "withdrawn": item.get("withdrawn") is True,
+            "itemId": text(item, "itemId"),
+            "retakes": item["retakes"] if isinstance(item.get("retakes"), list) else [],
         })
     out.sort(key=lambda i: (i["sequence"] is None, i["sequence"] or 0, i["position"]))
     return out
@@ -1214,6 +1221,10 @@ DONE_FILE_NAME = "done.json"
 
 # The `source` of the digitisation queue's reports and of its entry in stored_lists.
 QUEUE_SOURCE = "queue"
+# The list id the digitisation queue is stored under, the same on every unit.
+QUEUE_LIST_ID = str(uuid.uuid5(uuid.NAMESPACE_OID, "captua.fisqua-digitisation-queue"))
+# How many of the queue's report runs are kept, newest first.
+QUEUE_REPORTS_KEPT = 20
 
 
 def project_for(db: Session, name: str, actor: Optional[str]) -> tuple[Project, bool]:
@@ -1251,19 +1262,47 @@ def store_queue_list(list_id: str, document: dict, report: dict) -> None:
         _replace_file(directory / LIST_FILE_NAME,
                       json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8"))
         store_report({**report, "listId": list_id, "source": QUEUE_SOURCE})
+        _prune_runs(directory, list_id, QUEUE_REPORTS_KEPT)
+
+
+def _prune_runs(directory: Path, list_id: str, keep: int) -> None:
+    """Remove all but the `keep` highest-numbered report runs of a list; a failure is logged.
+
+    For the digitisation queue only, which stores a run per applied
+    revision: a file import's runs are its import history and are kept.
+    """
+    runs = _run_files(directory, list_id)
+    for _, path in runs[:-keep] if keep > 0 else runs:
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning("Could not remove the old queue report %s", path)
 
 
 class ListItemNotFound(Exception):
     """No stored list file of this id holds an item at this position."""
 
 
-def read_done_marks(list_id: str) -> dict[int, dict]:
-    """The items marked done by hand, as position -> {by, at}, from `<list-id>/done.json`.
+def done_key(list_id: str, item: dict) -> Any:
+    """What an item's done mark is keyed by: its itemId in the digitisation queue, else its position.
 
-    The file holds {"<position>": {"done": true, "by": ..., "at": ...}}. A
-    file that is missing, unreadable or not such an object reads as no
-    marks, and an entry that is not one is skipped, so a damaged file never
-    stops the queue from being read.
+    Queue positions change from one revision to the next; an entry's itemId
+    does not. None for a queue item without an itemId, which cannot be marked.
+    """
+    if str(uuid.UUID(list_id)) == QUEUE_LIST_ID:
+        return item.get("itemId")
+    return item["position"]
+
+
+def read_done_marks(list_id: str) -> dict:
+    """The items marked done by hand, as key -> {by, at}, from `<list-id>/done.json`.
+
+    The key is done_key's: the position, an int, for a file's list, held in
+    the file as {"<position>": {"done": true, "by": ..., "at": ...}}; the
+    itemId for the digitisation queue, {"<itemId>": {...}}. A file that is
+    missing, unreadable or not such an object reads as no marks, and an
+    entry that is not one is skipped, so a damaged file never stops the
+    queue from being read.
     """
     path = reports_dir() / str(uuid.UUID(list_id)) / DONE_FILE_NAME
     try:
@@ -1272,21 +1311,35 @@ def read_done_marks(list_id: str) -> dict[int, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
+    by_item = str(uuid.UUID(list_id)) == QUEUE_LIST_ID
     marks = {}
     for key, entry in data.items():
-        if not (isinstance(key, str) and key.isdigit() and isinstance(entry, dict) and entry.get("done") is True):
+        if not (isinstance(key, str) and key and isinstance(entry, dict) and entry.get("done") is True):
             continue
-        marks[int(key)] = {"by": entry.get("by"), "at": entry.get("at")}
+        if by_item:
+            marks[key] = {"by": entry.get("by"), "at": entry.get("at")}
+        elif key.isdigit():
+            marks[int(key)] = {"by": entry.get("by"), "at": entry.get("at")}
     return marks
 
 
-def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str]) -> tuple[dict, Optional[dict]]:
+class ListItemIdDiffers(Exception):
+    """The item at the position is not the queue entry the caller named."""
+
+
+def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str],
+                  item_id: Optional[str] = None) -> tuple[dict, Optional[dict]]:
     """Mark the item at `position` done (or remove its mark), under the list lock.
 
     Returns the item, as _list_items gives it, and its mark ({by, at}, or
     None once removed). Raises ListItemNotFound when the list has no stored
-    file readable as that list, or the file holds no item object at that
-    position. done.json is rewritten whole, atomically (a temporary file,
+    file readable as that list, the file holds no item object at that
+    position, or (in the digitisation queue) that item has no itemId. The
+    mark is keyed by done_key: a queue item's by its itemId, so it stays
+    with the entry when a later revision moves it. With `item_id`, an item
+    at that position whose itemId differs raises ListItemIdDiffers, so a
+    mark sent against an older revision is not put on another entry.
+    done.json is rewritten whole, atomically (a temporary file,
     fsynced, then os.replace); a damaged one is read as no marks and so
     replaced. Raises OSError, with done.json unchanged, if it cannot be
     written.
@@ -1308,17 +1361,22 @@ def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str])
         item = next((i for i in items or [] if i["position"] == position), None)
         if item is None:
             raise ListItemNotFound(list_id)
+        if item_id is not None and item.get("itemId") != item_id:
+            raise ListItemIdDiffers(list_id)
+        key = done_key(list_id, item)
+        if key is None:
+            raise ListItemNotFound(list_id)
         marks = read_done_marks(list_id)
         if done:
-            marks[position] = {
+            marks[key] = {
                 "by": actor,
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             }
         else:
-            marks.pop(position, None)
-        body = {str(p): {"done": True, **mark} for p, mark in sorted(marks.items())}
+            marks.pop(key, None)
+        body = {str(k): {"done": True, **mark} for k, mark in sorted(marks.items())}
         _replace_file(directory / DONE_FILE_NAME, json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8"))
-    return item, marks.get(position)
+    return item, marks.get(key)
 
 
 def _replace_file(target: Path, data: bytes) -> None:

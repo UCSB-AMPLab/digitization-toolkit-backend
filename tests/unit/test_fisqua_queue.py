@@ -345,10 +345,12 @@ def test_a_queue_update_never_changes_a_record_status(synced, db_session):
     db_session.add(rec)
     db_session.commit()
     _sync(db_session, QueueTransport(queues=[_queue([_qitem(action="spot-recapture",
-                                                            unnamedRetakeField=[{"captuaRecordId": rec.id}])])],
+                                                            retakes=[{"captuaRecordId": rec.id, "pairId": "p1",
+                                                                       "side": "left"}])])],
                                      acks=[_ok_ack()]))
     db_session.expire_all()
     assert db_session.get(Record, rec.id).status == "approved"
+    assert _volumes(db_session)["xx-test-901"].assignee_username is None
 
 
 @pytest.mark.unit
@@ -559,7 +561,8 @@ def test_the_transport_paths_and_answers():
 
 @pytest.mark.unit
 @pytest.mark.parametrize("code,outcome", [(401, "config_error"), (403, "config_error"),
-                                          (404, "error"), (500, "error"), (422, "refused")])
+                                          (404, "unsupported"), (405, "unsupported"),
+                                          (500, "error"), (422, "refused")])
 def test_the_transport_reads_failures(code, outcome):
     t = _http(lambda request: httpx.Response(code, json={"problems": [{"rule": "x"}]}))
     assert t.put_operators({"operators": []}).outcome == outcome
@@ -623,3 +626,334 @@ def test_the_collection_read_schema_exposes_assignee_and_hidden():
     from app.schemas.collection import CollectionRead, CollectionUpdate
     assert {"assignee_username", "queue_hidden_at"} <= set(CollectionRead.model_fields)
     assert not {"assignee_username", "queue_hidden_at"} & set(CollectionUpdate.model_fields)
+
+
+# ---------------------------------------------------------------------------
+# Retakes (an agreed field of a spot-recapture entry)
+# ---------------------------------------------------------------------------
+
+RETAKES = [{"captuaRecordId": 12, "pairId": "xx-test-901-img_0003", "side": "left"},
+           {"captuaRecordId": 13, "pairId": "xx-test-901-img_0005", "side": "both"}]
+
+
+def _queue_list(client):
+    from app.core.fisqua_queue import QUEUE_LIST_ID
+    [queue] = [entry for entry in _lists(client) if entry["listId"] == QUEUE_LIST_ID]
+    return queue
+
+
+@pytest.mark.unit
+def test_retakes_are_exposed_on_queue_items_and_empty_when_absent(client, synced, db_session):
+    items = [_qitem("xx-test-901", action="spot-recapture", retakes=RETAKES), _qitem("xx-test-902")]
+    transport = QueueTransport(queues=[_queue(items)], acks=[_ok_ack()])
+    _sync(db_session, transport)
+    assert transport.acks_sent[0]["skipped"] == []
+    by_code = {i["referenceCode"]: i for i in _queue_list(client)["items"]}
+    assert by_code["xx-test-901"]["retakes"] == RETAKES
+    assert by_code["xx-test-902"]["retakes"] == []
+
+
+@pytest.mark.unit
+def test_a_file_list_item_has_empty_retakes(client, synced, db_session):
+    _as_importer("op", "admin")
+    assert _post(client, _list_with([_item()])).status_code == 200
+    [entry] = _lists(client)
+    assert entry["items"][0]["retakes"] == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("retakes", [
+    "p1",
+    [1],
+    [{"pairId": "p1", "side": "left"}],
+    [{"captuaRecordId": "12", "pairId": "p1", "side": "left"}],
+    [{"captuaRecordId": True, "pairId": "p1", "side": "left"}],
+    [{"captuaRecordId": 12, "pairId": "", "side": "left"}],
+    [{"captuaRecordId": 12, "pairId": 7, "side": "left"}],
+    [{"captuaRecordId": 12, "pairId": "p1", "side": "top"}],
+    [{"captuaRecordId": 12, "pairId": "p1"}],
+    None,
+])
+def test_malformed_retakes_skip_the_item(synced, db_session, retakes):
+    item = _qitem(action="spot-recapture", retakes=retakes)
+    transport = QueueTransport(queues=[_queue([item])], acks=[_ok_ack()])
+    _sync(db_session, transport)
+    assert transport.acks_sent[0]["skipped"] == [{"itemId": item["itemId"], "reason": "invalid_retakes"}]
+    assert _volumes(db_session) == {}
+
+
+@pytest.mark.unit
+def test_retakes_a_later_entry_drops_are_dropped_from_the_volume(synced, db_session):
+    item = _qitem(action="spot-recapture", retakes=RETAKES)
+    _sync(db_session, QueueTransport(queues=[_queue([item], "r1")], acks=[_ok_ack()]))
+    assert json.loads(_volumes(db_session)["xx-test-901"].custom_attributes)["fisqua"]["retakes"] == RETAKES
+    later = {k: v for k, v in item.items() if k != "retakes"}
+    _sync(db_session, QueueTransport(queues=[_queue([{**later, "action": "complete"}], "r2")], acks=[_ok_ack()]))
+    fisqua = json.loads(_volumes(db_session)["xx-test-901"].custom_attributes)["fisqua"]
+    assert "retakes" not in fisqua and fisqua["action"] == "complete"
+
+
+# ---------------------------------------------------------------------------
+# Done marks on the queue: keyed by itemId
+# ---------------------------------------------------------------------------
+
+def _mark(client, list_id, position, done=True, **extra):
+    from app.main import app
+    import app.api.imports as imports
+    from app.models.user import User
+    reviewer = User(username="rev", hashed_password="x", role="reviewer", is_active=True)
+    app.dependency_overrides[imports.allow_reviewer] = lambda: reviewer
+    return client.put(f"/imports/digitisation-lists/{list_id}/items/{position}/done",
+                      json={"done": done, **extra})
+
+
+@pytest.mark.unit
+def test_a_queue_done_mark_follows_its_item_across_revisions(client, synced, db_session, reports_root):
+    from app.core.fisqua_queue import QUEUE_LIST_ID
+    a = _qitem("xx-test-901", item_id="00000000-0000-4000-8000-00000000000a", sequence=1)
+    b = _qitem("xx-test-902", item_id="00000000-0000-4000-8000-00000000000b", sequence=2)
+    _sync(db_session, QueueTransport(queues=[_queue([a, b], "r1")], acks=[_ok_ack()]))
+    resp = _mark(client, QUEUE_LIST_ID, 2)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["itemId"] == b["itemId"] and resp.json()["doneMark"]["by"] == "rev"
+    marks = json.loads((reports_root / QUEUE_LIST_ID / "done.json").read_text(encoding="utf-8"))
+    assert list(marks) == [b["itemId"]]
+
+    # The next revision puts b first: the mark goes with it, not with position 2.
+    _sync(db_session, QueueTransport(queues=[_queue([{**b, "sequence": 1}, {**a, "sequence": 2}], "r2")],
+                                     acks=[_ok_ack()]))
+    by_code = {i["referenceCode"]: i for i in _queue_list(client)["items"]}
+    assert by_code["xx-test-902"]["doneMark"]["by"] == "rev"
+    assert by_code["xx-test-902"]["itemId"] == b["itemId"]
+    assert by_code["xx-test-901"]["doneMark"] is None
+
+    # Taken off by the item's current position.
+    position = by_code["xx-test-902"]["position"]
+    assert _mark(client, QUEUE_LIST_ID, position, done=False).json()["doneMark"] is None
+    assert _queue_list(client)["items"][0]["doneMark"] is None
+
+
+@pytest.mark.unit
+def test_a_queue_done_mark_with_another_item_id_is_refused(client, synced, db_session):
+    from app.core.fisqua_queue import QUEUE_LIST_ID
+    a = _qitem("xx-test-901", item_id="00000000-0000-4000-8000-00000000000a")
+    _sync(db_session, QueueTransport(queues=[_queue([a])], acks=[_ok_ack()]))
+    assert _mark(client, QUEUE_LIST_ID, 1, itemId="00000000-0000-4000-8000-0000000000ff").status_code == 409
+    assert _mark(client, QUEUE_LIST_ID, 1, itemId=a["itemId"]).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_file_list_done_mark_keeps_its_position_key(client, synced, db_session, reports_root):
+    _as_importer("op", "admin")
+    doc = _list_with([_item("xx-test-901", "xx-test-901"), _item("xx-test-902", "xx-test-902")])
+    assert _post(client, doc).status_code == 200
+    list_id = doc["id"]
+    resp = _mark(client, list_id, 2)
+    assert resp.status_code == 200 and resp.json()["itemId"] is None
+    marks = json.loads((reports_root / list_id / "done.json").read_text(encoding="utf-8"))
+    assert list(marks) == ["2"]
+
+
+# ---------------------------------------------------------------------------
+# A Fisqua without 1.7
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code", [404, 405])
+def test_a_fisqua_without_1_7_is_retried_quietly_and_logged_once(synced, db_session, monkeypatch, caplog, code):
+    import logging
+    from app.core import fisqua_outbox, fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_unsupported_logged", False)
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    seen = []
+
+    def server(request):
+        seen.append(request.url.path)
+        return httpx.Response(code, headers={"Retry-After": "3600"})
+
+    transport = _http(server)
+    with caplog.at_level(logging.INFO, logger="app.core.fisqua_queue"):
+        first = _sync(db_session, transport)
+        second = _sync(db_session, transport)
+    assert first["status"] == "unsupported" and second["status"] == "unsupported"
+    # Operators and the queue are both asked each cycle, and nothing waits on them.
+    assert seen.count("/api/capture/v1/queue") == 2
+    assert seen.count("/api/capture/v1/operators") == 2
+    assert not fisqua_outbox.call_budget.cooling()
+    assert fisqua_outbox.config_error() is None
+    lines = [r for r in caplog.records if "1.7" in r.getMessage()]
+    assert len(lines) == 1
+
+
+@pytest.mark.unit
+def test_an_ack_answered_405_is_kept_and_posted_again(synced, db_session):
+    transport = QueueTransport(queues=[_queue([_qitem()], "r1")],
+                               acks=[_result("unsupported", status_code=405)])
+    assert _sync(db_session, transport)["status"] == "ack_failed"
+    transport.ack_answers = [_ok_ack()]
+    transport.queue_answers = [_result("not_modified")]
+    _sync(db_session, transport)
+    assert len(transport.acks_sent) == 2 and transport.queue_asked == [None, "r1"]
+
+
+# ---------------------------------------------------------------------------
+# Pruning the queue's reports
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_the_queue_keeps_its_newest_20_reports(client, synced, db_session, reports_root):
+    from app.core.fisqua_queue import QUEUE_LIST_ID
+    for n in range(1, 26):
+        _sync(db_session, QueueTransport(queues=[_queue([_qitem(sequence=n)], f"r{n}")], acks=[_ok_ack()]))
+    runs = sorted(p.name for p in (reports_root / QUEUE_LIST_ID).glob("import-report_*_run*.json"))
+    assert len(runs) == 20
+    assert runs[0].endswith("run0006.json") and runs[-1].endswith("run0025.json")
+    assert json.loads((reports_root / QUEUE_LIST_ID / runs[-1]).read_text(encoding="utf-8"))["revision"] == "r25"
+    assert _queue_list(client)["items"][0]["sequence"] == 25
+
+
+@pytest.mark.unit
+def test_file_imports_are_not_pruned(client, synced, db_session, reports_root):
+    _as_importer("op", "admin")
+    doc = _list_with([_item()])
+    for _ in range(22):
+        assert _post(client, doc).status_code == 200
+    assert len(list((reports_root / doc["id"]).glob("import-report_*_run*.json"))) == 22
+
+
+# ---------------------------------------------------------------------------
+# Fisqua's built side of 1.7
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_retake_with_a_null_pair_id_is_accepted_and_its_null_assignee_kept(client, synced, db_session):
+    retakes = [{"captuaRecordId": 12, "pairId": None, "side": "both"}]
+    item = _qitem(action="spot-recapture", retakes=retakes, assignee=None)
+    transport = QueueTransport(queues=[_queue([item])], acks=[_ok_ack()])
+    _sync(db_session, transport)
+    assert transport.acks_sent[0]["skipped"] == []
+    assert _volumes(db_session)["xx-test-901"].assignee_username is None
+    assert _queue_list(client)["items"][0]["retakes"] == retakes
+
+
+def _refused(rule, status_code=422):
+    return _result("refused", status_code=status_code,
+                   problems=[{"rule": rule, "message": "m", "path": "/operators/0/role"}])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", [_refused("shape"), _refused("duplicate-username"),
+                                    _result("refused", status_code=413, error="too large")])
+def test_operators_refused_are_logged_and_not_sent_again_until_the_list_changes(
+        fisqua, reports_root, db_session, monkeypatch, caplog, answer):
+    import logging
+    from app.core import fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    clock = [1000.0]
+    monkeypatch.setattr(fisqua_queue, "_monotonic", lambda: clock[0])
+    _user(db_session, "ana", "operator")
+    transport = QueueTransport(operators=[answer, _result("delivered")],
+                               queues=[_result("not_modified")] * 4)
+    with caplog.at_level(logging.WARNING, logger="app.core.fisqua_queue"):
+        assert _sync(db_session, transport)["operators"] == "refused"
+    assert any("refused" in r.getMessage() for r in caplog.records)
+    if answer.problems:
+        assert any("/operators/0/role" in r.getMessage() for r in caplog.records)
+    clock[0] += 2 * 86400
+    _sync(db_session, transport)
+    assert len(transport.operators_sent) == 1
+    # The list changes: sent again.
+    _user(db_session, "beto", "operator")
+    _sync(db_session, transport)
+    assert len(transport.operators_sent) == 2
+
+
+@pytest.mark.unit
+def test_more_than_1000_operators_are_not_sent(fisqua, reports_root, db_session, monkeypatch):
+    from app.core import fisqua_queue
+    from app.models.user import User
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    db_session.add_all([User(username=f"u{n:04d}", hashed_password="x", role="operator", is_active=True)
+                        for n in range(1001)])
+    db_session.commit()
+    transport = QueueTransport(queues=[_result("not_modified")])
+    assert _sync(db_session, transport)["operators"] == "refused"
+    assert transport.operators_sent == []
+
+
+@pytest.mark.unit
+def test_a_rate_limited_operators_send_takes_the_link_backoff(fisqua, reports_root, db_session, monkeypatch):
+    from app.core import fisqua_outbox, fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    transport = QueueTransport(operators=[_result("error", status_code=429, retry_after=120.0)])
+    assert _sync(db_session, transport)["status"] == "cooling_down"
+    assert fisqua_outbox.call_budget.cooling()
+    assert transport.queue_asked == []
+
+
+@pytest.mark.unit
+def test_unknown_item_ids_in_the_ack_answer_are_logged_once_and_not_sent_again(
+        synced, db_session, monkeypatch, caplog):
+    import logging
+    from app.core import fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_unknown_item_ids", set())
+    a, b = _qitem("xx-test-901"), _qitem("xx-test-902")
+    transport = QueueTransport(
+        queues=[_queue([a, b], "r1"), _queue([a, b], "r2")],
+        acks=[_result("acknowledged", response={"recorded": 1, "unknown": [b["itemId"]]}),
+              _result("acknowledged", response={"recorded": 1, "unknown": []})])
+    with caplog.at_level(logging.WARNING, logger="app.core.fisqua_queue"):
+        _sync(db_session, transport)
+        _sync(db_session, transport)
+    assert [x["itemId"] for x in transport.acks_sent[0]["applied"]] == [a["itemId"], b["itemId"]]
+    assert [x["itemId"] for x in transport.acks_sent[1]["applied"]] == [a["itemId"]]
+    assert len([r for r in caplog.records if b["itemId"] in r.getMessage()]) == 1
+
+
+@pytest.mark.unit
+def test_an_ack_refused_for_its_revision_is_dropped_and_the_queue_asked_afresh(synced, db_session):
+    transport = QueueTransport(queues=[_queue([_qitem()], "r1"), _result("not_modified")],
+                               acks=[_refused("revision")])
+    assert _sync(db_session, transport)["status"] == "ack_dropped"
+    _sync(db_session, transport)
+    # Not posted again; the next GET carries no revision.
+    assert len(transport.acks_sent) == 1
+    assert transport.queue_asked == [None, None]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("code,outcome", [(413, "refused"), (429, "error")])
+def test_the_transport_reads_413_and_429_on_operators(code, outcome):
+    t = _http(lambda request: httpx.Response(code, headers={"Retry-After": "30"}))
+    answer = t.put_operators({"operators": []})
+    assert answer.outcome == outcome
+    if code == 429:
+        assert answer.retry_after == 30.0
+
+
+@pytest.mark.unit
+def test_the_transport_reads_the_ack_answer():
+    t = _http(lambda request: httpx.Response(200, json={"recorded": 2, "unknown": ["x"]}))
+    answer = t.post_queue_ack({"revision": "r", "applied": [], "skipped": []})
+    assert answer.outcome == "acknowledged" and answer.response == {"recorded": 2, "unknown": ["x"]}
+    t = _http(lambda request: httpx.Response(422, json={"problems": [{"rule": "revision", "message": "m"}]}))
+    answer = t.post_queue_ack({"revision": "r", "applied": [], "skipped": []})
+    assert answer.outcome == "refused" and answer.problems[0]["rule"] == "revision"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("answer", [_refused("shape"), _refused("malformed"),
+                                    _result("refused", status_code=413, error="too large"),
+                                    _result("refused", status_code=400, error="bad request")])
+def test_any_refused_ack_is_dropped_logged_and_the_queue_asked_afresh(synced, db_session, caplog, answer):
+    import logging
+    transport = QueueTransport(queues=[_queue([_qitem()], "r1"), _result("not_modified")], acks=[answer])
+    with caplog.at_level(logging.WARNING, logger="app.core.fisqua_queue"):
+        assert _sync(db_session, transport)["status"] == "ack_dropped"
+    lines = [r.getMessage() for r in caplog.records if "dropped" in r.getMessage()]
+    assert len(lines) == 1
+    if answer.problems:
+        assert "/operators/0/role" in lines[0]
+    _sync(db_session, transport)
+    assert len(transport.acks_sent) == 1
+    assert transport.queue_asked == [None, None]

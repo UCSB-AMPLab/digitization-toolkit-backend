@@ -13,7 +13,9 @@ offsite hold (app.core.fisqua_outbox).
   each user created, changed or deleted through the users routes
   (notify_operators_changed, run after the response), and at least once a
   day. A failed send is logged and leaves the list due, so the next poll
-  tick sends it; it never fails the route.
+  tick sends it; it never fails the route. A list Fisqua refuses (422,
+  logged with its problems, or 413), or one longer than MAX_OPERATORS, is
+  not sent again until the list itself is different.
 * **The queue** (sync_fisqua_queue), at each status poll tick. GET
   /api/capture/v1/queue with If-None-Match holding the last revision
   acknowledged; a 304 does nothing. A 200 is applied and acknowledged.
@@ -26,7 +28,11 @@ offsite hold (app.core.fisqua_outbox).
   code, title and dates are never changed. Otherwise the volume is created
   as an import creates one (list_import.create_volume), in the project named
   `listName`, which is created when there is none. An item the import would
-  reject, or whose assignee is not a username, is skipped with that reason.
+  reject, whose assignee is not a username, or whose `retakes` is not the
+  agreed shape (a spot recapture's [{captuaRecordId, pairId, side}]) is
+  skipped with that reason. The retakes are kept with the item for Cola;
+  they never change a record's status. The assignee is stored as sent: a
+  retake entry arrives unassigned (null), and none is made up for it.
   A withdrawn item whose volume has no records hides the volume from Cola
   (collections.queue_hidden_at; the row is kept); one whose volume has
   records changes nothing; both are acknowledged as applied. A withdrawn
@@ -43,8 +49,16 @@ offsite hold (app.core.fisqua_outbox).
   the applied and skipped items. The body is kept in `queue-state.json`
   before it is posted; while it is not acknowledged each tick posts the
   same body again and asks for nothing else. The revision is kept only once
-  Fisqua has acknowledged it. A revision that cannot be stored for Cola is
+  Fisqua has acknowledged it. itemIds the answer lists as `unknown` are
+  logged once and left out of every later ack. An ack Fisqua refuses (400,
+  413, or 422 with any rule, `revision` included) is logged with its
+  problems and dropped with the kept revision, so the next tick asks for
+  the queue afresh. A revision that cannot be stored for Cola is
   not acknowledged, and is applied again at the next tick.
+* **A Fisqua without 1.7.** A 404 or 405 on any of these paths is
+  `unsupported`: logged once per process, asked again at the next tick, and
+  never a configuration stop or a Retry-After wait, so handovers, status and
+  decisions go on. Any other error takes the link's usual handling.
 
 Version: 0.3.0
 """
@@ -55,7 +69,6 @@ import json
 import logging
 import threading
 import time
-import uuid
 from dataclasses import dataclass, field
 from datetime import datetime, timezone
 from typing import Any, Optional
@@ -70,7 +83,7 @@ from app.core.fisqua_outbox import NullTransport, TransportResult
 logger = logging.getLogger(__name__)
 
 # The list id the queue is stored under, the same on every unit.
-QUEUE_LIST_ID = str(uuid.uuid5(uuid.NAMESPACE_OID, "captua.fisqua-digitisation-queue"))
+QUEUE_LIST_ID = list_import.QUEUE_LIST_ID
 QUEUE_CONTRACT_VERSION = "1.7"
 STATE_FILE_NAME = "queue-state.json"
 # created_by of a volume or project the sync creates: no unit user did.
@@ -83,12 +96,32 @@ QUEUE_REASONS = {
     "invalid_assignee": f"The assignee is not null or a username of at most {ASSIGNEE_MAX_LENGTH} characters.",
     "withdrawn_not_on_unit": "The item was withdrawn and no volume on this unit has its referenceCode.",
     "list_name_refused": "The project named after listName cannot be created on this unit.",
+    "invalid_retakes": (
+        "The retakes are not a list of objects, each with an integer captuaRecordId, a pairId that is "
+        "a non-empty string or null, and a side of left, right or both."
+    ),
 }
+
+RETAKE_SIDES = ("left", "right", "both")
 
 # The item fields the queue keeps in columns or uses only to decide, left out of custom_attributes.fisqua.
 _NOT_KEPT_IN_ATTRIBUTES = (fc.F_ASSIGNEE, fc.F_WITHDRAWN)
 
 _monotonic = time.monotonic
+
+# Whether this process has logged that Fisqua has no contract 1.7 (a 404 or
+# 405 on a 1.7 path). Logged once; every tick still asks again.
+_unsupported_logged = False
+
+
+def _note_unsupported(answer: TransportResult) -> None:
+    global _unsupported_logged
+    if _unsupported_logged:
+        return
+    _unsupported_logged = True
+    logger.info("Fisqua answered HTTP %s on a contract 1.7 path: it has no digitisation queue for this unit yet. "
+                "Asked again at each status poll; not logged again until the backend restarts.",
+                answer.status_code)
 
 
 def get_transport():
@@ -106,6 +139,9 @@ class _OperatorsState:
 
     due: bool = True
     sent_at: Optional[float] = None
+    # The body Fisqua refused (422 or 413), or one over MAX_OPERATORS: not
+    # sent again, by a tick, a route or the daily send, until the list differs.
+    refused_body: Optional[dict] = None
     lock: threading.Lock = field(default_factory=threading.Lock)
 
     def is_due(self) -> bool:
@@ -156,7 +192,13 @@ def _call(transport, method: str, *args) -> TransportResult:
 
 def send_operators(db: Session, *, transport=None, now: Optional[datetime] = None,
                    only_if_due: bool = False) -> dict:
-    """PUT the unit's users to Fisqua. Never raises; a failure leaves them due for the next tick."""
+    """PUT the unit's users to Fisqua. Never raises.
+
+    A transient failure leaves them due for the next tick (a 429 or other
+    Retry-After also holds the link back, as for every call). A body Fisqua
+    refuses (422, logged with its problems, or 413), or one longer than
+    MAX_OPERATORS, is not sent again until the list it reads is different.
+    """
     gated = _gate()
     if gated is not None:
         return gated
@@ -165,7 +207,8 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
         return {"status": "no_transport"}
     now = fisqua_outbox._naive(now) or fisqua_outbox._now()
     with _operators.lock:
-        if only_if_due and not _operators.is_due():
+        refused = _operators.refused_body
+        if only_if_due and refused is None and not _operators.is_due():
             return {"status": "not_due"}
         try:
             if fisqua_outbox.config_error() is not None:
@@ -177,6 +220,16 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
             logger.exception("Reading the unit's users for Fisqua failed; sent at the next tick")
             _operators.due = True
             return {"status": "error"}
+        if refused is not None:
+            if body == refused:
+                return {"status": "refused"}
+            _operators.refused_body = None
+        if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
+            logger.warning("The unit has %d admins and operators, more than the %d Fisqua takes; the list is "
+                           "not sent until it changes", len(body[fc.F_OPERATORS]), fc.MAX_OPERATORS)
+            _operators.refused_body = body
+            _operators.due = False
+            return {"status": "refused"}
         if not fisqua_outbox.call_budget.take():
             _operators.due = True
             return {"status": "rate_limited"}
@@ -185,9 +238,23 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
             fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
             _operators.due = True
             return {"status": "config_error"}
+        if answer.outcome == "unsupported":
+            _note_unsupported(answer)
+            _operators.due = True
+            return {"status": "unsupported"}
+        if answer.outcome == "refused":
+            logger.warning("Fisqua refused the unit's users (HTTP %s): %s; not sent again until the list changes",
+                           answer.status_code,
+                           fisqua_outbox.scrub(json.dumps(answer.problems, ensure_ascii=False)
+                                               if answer.problems else (answer.error or "no problems given")))
+            _operators.refused_body = body
+            _operators.due = False
+            return {"status": "refused"}
         if answer.outcome != "delivered":
             logger.warning("Sending the unit's users to Fisqua failed (%s); sent again at the next tick",
                            fisqua_outbox.scrub(answer.error or answer.outcome))
+            if answer.retry_after is not None:
+                fisqua_outbox.call_budget.cool_down(answer.retry_after)
             _operators.due = True
             return {"status": "error"}
         _operators.due = False
@@ -258,6 +325,35 @@ def _valid_assignee(value: Any) -> bool:
                              and "\x00" not in value)
 
 
+def _valid_retakes(item: dict) -> bool:
+    """Whether the item's `retakes`, when it has the field, is the agreed shape.
+
+    Absent is valid (every item but a spot recapture). Present, it is a
+    list (possibly empty) of objects, each with captuaRecordId an integer
+    (not a boolean), pairId a non-empty string without NUL or null (a
+    single-image opening), and side one of
+    RETAKE_SIDES; other keys in an entry are ignored. null is not a list.
+    """
+    if fc.F_RETAKES not in item:
+        return True
+    retakes = item[fc.F_RETAKES]
+    if not isinstance(retakes, list):
+        return False
+    for entry in retakes:
+        if not isinstance(entry, dict):
+            return False
+        record_id = entry.get(fc.F_CAPTUA_RECORD_ID)
+        pair_id = entry.get(fc.F_PAIR_ID)
+        if isinstance(record_id, bool) or not isinstance(record_id, int):
+            return False
+        # null for a single-image opening.
+        if pair_id is not None and (not isinstance(pair_id, str) or not pair_id or "\x00" in pair_id):
+            return False
+        if entry.get(fc.F_SIDE) not in RETAKE_SIDES:
+            return False
+    return True
+
+
 def _merge_attributes(current: Optional[str], fisqua: dict) -> Optional[str]:
     """custom_attributes with `fisqua` merged into its `fisqua` object; None when `current` is not a JSON object."""
     if current is None or not current.strip():
@@ -271,6 +367,9 @@ def _merge_attributes(current: Optional[str], fisqua: dict) -> Optional[str]:
             return None
     kept = attrs.get("fisqua")
     kept = dict(kept) if isinstance(kept, dict) else {}
+    # The retakes are the entry's current ones: an entry without them drops
+    # the ones an earlier revision left.
+    kept.pop(fc.F_RETAKES, None)
     kept.update(fisqua)
     attrs["fisqua"] = kept
     return json.dumps(attrs, ensure_ascii=False)
@@ -358,6 +457,9 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
         assignee = item.get(fc.F_ASSIGNEE)
         if not _valid_assignee(assignee):
             skip(item_id, "invalid_assignee")
+            continue
+        if not _valid_retakes(item):
+            skip(item_id, "invalid_retakes")
             continue
         code = values["external_id"]
         live_codes.add(code)
@@ -461,14 +563,57 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
 _queue_lock = threading.Lock()
 
 
+# itemIds Fisqua answered an ack as not knowing: logged once, and left out
+# of every later ack this process sends.
+_unknown_item_ids: set = set()
+
+
+def _without_unknown(ack: dict) -> dict:
+    """The ack without the items Fisqua said it does not know."""
+    if not _unknown_item_ids:
+        return ack
+    return {**ack,
+            fc.F_APPLIED: [a for a in ack[fc.F_APPLIED] if a.get(fc.F_ITEM_ID) not in _unknown_item_ids],
+            fc.F_SKIPPED: [k for k in ack[fc.F_SKIPPED] if k.get(fc.F_ITEM_ID) not in _unknown_item_ids]}
+
+
+def _note_unknown(response: Any) -> None:
+    unknown = response.get(fc.F_UNKNOWN) if isinstance(response, dict) else None
+    if not isinstance(unknown, list):
+        return
+    new = [i for i in unknown if isinstance(i, str) and i not in _unknown_item_ids]
+    if new:
+        _unknown_item_ids.update(new)
+        logger.warning("Fisqua does not know %d acknowledged queue item(s): %s; not acknowledged again",
+                       len(new), fisqua_outbox.scrub(", ".join(new)))
+
+
+def _revision_refused(answer: TransportResult) -> bool:
+    return answer.outcome == "refused" and any(
+        isinstance(p, dict) and p.get(fc.F_RULE) == fc.RULE_REVISION for p in answer.problems or [])
+
+
 def _post_ack(transport, body: dict, now: datetime) -> str:
-    """`acknowledged`, `config_error` or `error`."""
+    """`acknowledged`, `dropped` (refused: 400, 413 or 422), `config_error` or `error`."""
     if not fisqua_outbox.call_budget.take():
         return "error"
     answer = _call(transport, "post_queue_ack", body)
     if answer.outcome == "config_error":
         fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
         return "config_error"
+    if answer.outcome == "refused":
+        # A body Fisqua refuses (400, 413, or 422 with any rule, `revision`
+        # included) is not made acceptable by being sent again.
+        logger.warning("Fisqua refused the ack of queue revision %s (HTTP %s%s): %s; the ack is dropped and "
+                       "the queue asked for afresh", fisqua_outbox.scrub(body.get(fc.F_REVISION)),
+                       answer.status_code,
+                       ", rule revision: malformed or later than Fisqua's" if _revision_refused(answer) else "",
+                       fisqua_outbox.scrub(json.dumps(answer.problems, ensure_ascii=False)
+                                           if answer.problems else (answer.error or "no problems given")))
+        return "dropped"
+    if answer.outcome == "unsupported":
+        _note_unsupported(answer)
+        return "error"
     if answer.outcome != "acknowledged":
         logger.warning("Acknowledging queue revision %s to Fisqua failed (%s); posted again at the next tick",
                        fisqua_outbox.scrub(body.get(fc.F_REVISION)),
@@ -476,6 +621,7 @@ def _post_ack(transport, body: dict, now: datetime) -> str:
         if answer.retry_after is not None:
             fisqua_outbox.call_budget.cool_down(answer.retry_after)
         return "error"
+    _note_unknown(answer.response)
     return "acknowledged"
 
 
@@ -484,6 +630,12 @@ def _settle_ack(transport, body: dict, now: datetime) -> Optional[dict]:
     outcome = _post_ack(transport, body, now)
     if outcome == "config_error":
         return {"status": "config_error"}
+    if outcome == "dropped":
+        try:
+            _write_state({"revision": None, "pendingAck": None})
+        except OSError:
+            logger.exception("Could not drop the refused queue ack; it is posted again at the next tick")
+        return {"status": "ack_dropped", "revision": body.get(fc.F_REVISION)}
     if outcome != "acknowledged":
         return {"status": "ack_failed", "revision": body.get(fc.F_REVISION)}
     try:
@@ -529,6 +681,9 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
                 return {"status": "config_error", "operators": operators["status"]}
             if answer.outcome == "not_modified":
                 return {"status": "unchanged", "revision": revision, "operators": operators["status"]}
+            if answer.outcome == "unsupported":
+                _note_unsupported(answer)
+                return {"status": "unsupported", "operators": operators["status"]}
             if answer.outcome != "queue":
                 logger.warning("Asking Fisqua for the digitisation queue failed: %s",
                                fisqua_outbox.scrub(answer.error or answer.outcome))
@@ -567,6 +722,7 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
                       actor=QUEUE_ACTOR, subject=report["listName"],
                       detail=(f"revision {new_revision}: {report['created']} created, {report['updated']} "
                               f"updated, {report['hidden']} hidden, {report['skipped']} skipped")[:2000])
+            ack = _without_unknown(ack)
             try:
                 _write_state({"revision": revision, "pendingAck": ack})
             except OSError:

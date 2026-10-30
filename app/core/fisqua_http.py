@@ -25,12 +25,14 @@ errors, the rest error. Answers to GET of a volume's QC decisions (§9.5):
 the rest error.
 
 Answers to the digitisation queue's calls (contract 1.7): PUT of the
-operators, 2xx delivered and 400 or 422 refused; GET of the queue, 304
-not_modified and 2xx with an object the queue; POST of its ack, 2xx
-acknowledged and 400 or 422 refused. 401, 403 and any 3xx are the same
-configuration errors as above. A 404 is an error, retried, and not a
-configuration error: a Fisqua without 1.7 answers these paths 404, and that
-must not stop the unit's handovers. The rest are errors, retried.
+operators, 2xx delivered and 400, 413 or 422 refused; GET of the queue,
+304 not_modified and 2xx with an object the queue; POST of its ack, 2xx
+acknowledged and 400, 413 or 422 refused. 429 is an error with its
+Retry-After, as on the other paths. 401, 403 and any 3xx are the same
+configuration errors as above. A 404 or 405 is `unsupported`: a Fisqua
+without 1.7, asked again at the next poll and never a configuration error,
+so it never stops the unit's handovers, status or decisions. The rest are
+errors, retried.
 
 Version: 0.3.0
 """
@@ -194,15 +196,20 @@ def read_decisions_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+# A 1.7 path answered with one of these: a Fisqua without contract 1.7.
+UNSUPPORTED_CODES = (404, 405)
+
+
 def _queue_config_error(code: int, body: Any) -> Optional[TransportResult]:
-    """_config_error for the 1.7 paths, where a 404 is retried rather than stopping the unit."""
-    if code == 404:
-        return None
+    """For the 1.7 paths: `unsupported` for 404 or 405, else _config_error."""
+    if code in UNSUPPORTED_CODES:
+        return TransportResult(outcome="unsupported", response=body, status_code=code,
+                               error=f"Fisqua has no contract 1.7 endpoint here (HTTP {code})")
     return _config_error(code, body)
 
 
 def _read_queue_call(response: httpx.Response, ok_outcome: str) -> TransportResult:
-    """The answer to PUT operators or POST queue/ack: `ok_outcome` on 2xx, refused on 400 or 422."""
+    """The answer to PUT operators or POST queue/ack: `ok_outcome` on 2xx, refused on 400, 413 or 422."""
     code = response.status_code
     body = _json(response)
     if 200 <= code < 300:
@@ -210,7 +217,7 @@ def _read_queue_call(response: httpx.Response, ok_outcome: str) -> TransportResu
     stop = _queue_config_error(code, body)
     if stop is not None:
         return stop
-    if code in (400, 422):
+    if code in (400, 413, 422):
         return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body),
                                error=f"Fisqua refused the call (HTTP {code})")
     return _transient(response, body)
