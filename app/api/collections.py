@@ -1,4 +1,4 @@
-# Version: 0.2.1
+# Version: 0.3.1
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -896,6 +896,20 @@ def promote_collection(
     Submitted state is derived, never stored. Capture another folio into a
     promoted collection and it is no longer submitted, which is the right
     answer: there is work in it nobody has looked at.
+
+    The first successful promotion of a full rescan opens the recapture turn
+    for one new volume, as finishing a volume's recaptures does: it writes
+    rescan_volume_completed under the turn lock, in the handover's
+    transaction. A volume already carrying that event writes none, so a
+    take-back and a second promotion open no second turn
+    (app.core.recapture_turn). A refused or empty promotion writes nothing.
+
+    Locks, in the order every path that takes the turn lock keeps: the
+    records, then the volume's row (locked_volume_query, as the capture
+    paths take it), then the turn. A retake holds its volume's row and then
+    asks for the turn; a promotion holding the turn and then needing the row
+    (its status-change rows reference the volume) would deadlock against it.
+    Other promotions take neither lock.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -956,6 +970,14 @@ def promote_collection(
             },
         )
 
+    # Records, then the volume's row, then the turn: the capture paths' order.
+    # Before the status changes, whose history rows reference the volume.
+    from app.core import recapture_turn, volume_stem
+    if recapture_turn.volume_is_full_rescan(collection):
+        volume_stem.locked_volume_query(db, collection_id).first()
+        recapture_turn.lock_turn(db)
+        if not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, collection_id):
+            recapture_turn.record_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, collection, current_user.username)
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
     # Queued in the handover's transaction, after the records' locks, so a
