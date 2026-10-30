@@ -6,9 +6,10 @@ copy), so the interface can send the file the operator picked unchanged.
 GET /imports/digitisation-list/{list_id}/report returns the latest stored
 import report for a list, and GET /imports/digitisation-lists every imported
 list with its items and the volume each one names. The import itself is
-app/core/list_import.py.
+app/core/list_import.py. The digitisation queue synced with Fisqua
+(app/core/fisqua_queue.py) is one more list there, with `source` `queue`.
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import hashlib
@@ -154,7 +155,15 @@ def list_digitisation_lists(
     otherwise null; a missing or damaged done.json reads as no marks. A
     list whose stored file is missing or unreadable, which is every list
     imported before the file was kept, has `items: []` and
-    `listFileMissing: true`. Reads only.
+    `listFileMissing: true`.
+
+    Each list also has `source`: `queue` for the digitisation queue synced
+    with Fisqua (contract 1.7), `file` for an imported file. Each item also
+    has `assignee` (the queue entry's unit username, or null; null for a
+    file's item), `withdrawn` (true for a queue entry Fisqua withdrew) and
+    `queueHidden`, true when the item's volume was taken off Cola by a
+    withdrawn entry (collections.queue_hidden_at), which a file's item for
+    the same volume shows too. Reads only.
     """
     lists = stored_lists()
     # A stem the import would refuse is never bound: psycopg refuses a NUL
@@ -162,13 +171,14 @@ def list_digitisation_lists(
     stems = {item["filenameStem"] for entry in lists for item in entry["items"]
              if stem_is_well_formed(item["filenameStem"])}
     volume_of: dict[str, tuple[int, int | None]] = {}
+    hidden: set[int] = set()
     if stems:
-        volume_of = {
-            stem: (cid, pid)
-            for stem, cid, pid in db.query(Collection.filename_stem, Collection.id, Collection.project_id)
-            .filter(Collection.filename_stem.in_(stems))
-            .all()
-        }
+        rows = (db.query(Collection.filename_stem, Collection.id, Collection.project_id,
+                         Collection.queue_hidden_at)
+                .filter(Collection.filename_stem.in_(stems))
+                .all())
+        volume_of = {stem: (cid, pid) for stem, cid, pid, _ in rows}
+        hidden = {cid for _, cid, _, hidden_at in rows if hidden_at is not None}
     counts = status_counts(db, sorted({cid for cid, _ in volume_of.values()}))
     for entry in lists:
         marks = entry.pop("doneMarks")
@@ -185,6 +195,7 @@ def list_digitisation_lists(
             item["projectId"] = pid
             item["status"] = counts[cid].model_dump() if cid is not None else None
             item["doneMark"] = marks.get(item["position"])
+            item["queueHidden"] = cid in hidden
     return JSONResponse(content=lists)
 
 

@@ -43,7 +43,14 @@ with a different hash is refused (ListIdReused). The uploaded file itself is
 kept beside the reports as `list.json` (store_list_file), and stored_lists
 reads every list back for the queue, item by item in list order.
 
-Version: 0.2.0
+The digitisation queue synced with Fisqua (contract 1.7,
+app.core.fisqua_queue) is stored the same way, as a list of its own under
+a fixed list id: each applied revision is written as that list's
+`list.json`, in this format, and as one more numbered report run, whose
+`source` is `queue`. It checks and creates each new item's volume with
+check_item and create_volume, the steps an import takes for one item.
+
+Version: 0.3.0
 """
 
 from __future__ import annotations
@@ -635,6 +642,70 @@ def _reject(position: int, code: Any, reason: str) -> dict:
     }
 
 
+def check_item(position: int, item: Any, first_code: dict, first_stem: dict) -> tuple[Optional[str], dict]:
+    """The reject reason for one item, or None and its volume's column values (see _check_item)."""
+    return _check_item(position, item, first_code, first_stem)
+
+
+def first_positions(items: list) -> tuple[dict, dict]:
+    """(first position of each referenceCode, first position of each filenameStem), as check_item takes them."""
+    return (_first_positions(items, _reference_code),
+            _first_positions(items, lambda item: item.get("filenameStem")))
+
+
+def create_volume(db: Session, list_id: str, position: int, project_id: int, actor: Optional[str],
+                  values: dict) -> tuple[Optional[int], Optional[str]]:
+    """Create one checked item's volume in `project_id` and commit it: (its id, None), or (None, a reject reason).
+
+    `values` are check_item's column values, to which a caller may add
+    other Collection columns. The volume is refused as reference_code_on_unit
+    or filename_stem_on_unit when a volume on the unit already has its code
+    or its stem; any failure at the database rolls back this volume only.
+    """
+    # The lookups and the insert are one step for the rollback-and-reject
+    # handling: a database failure at any of them costs this item only.
+    # The new id is taken at the flush, before the commit, so nothing is
+    # read back after it: with the session expiring on commit, reading
+    # the id afterwards is a query that can fail for a volume already
+    # committed, which a rollback could no longer remove.
+    try:
+        if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
+            return None, "reference_code_on_unit"
+        if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
+            return None, "filename_stem_on_unit"
+        volume = Collection(project_id=project_id, created_by=actor, **values)
+        db.add(volume)
+        db.flush()
+        volume_id = volume.id
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        return None, _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+    except StemDirectoryCollisionError as exc:
+        # The model's flush listener refused the stem's directory; this
+        # item only is rolled back and reported.
+        db.rollback()
+        return None, _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
+    except StemHeldOffsiteError:
+        # The model's flush listener found offsite keys under the stem;
+        # this item only is rolled back and reported.
+        db.rollback()
+        return None, "filename_stem_held_offsite"
+    except ReferenceCodeDiffersFromStemError:
+        # _check_item refuses this first; the model's flush listener is
+        # the rule for every writer, so its refusal is reported the same.
+        db.rollback()
+        return None, "filename_stem_differs_from_reference_code"
+    except SQLAlchemyError:
+        # Any other database failure on this item (a lost connection, a
+        # full disk, a value the driver cannot bind) costs this item
+        # only: it is rolled back and reported, and the import goes on.
+        logger.exception("Import of list %s: item %d refused by the database", list_id, position)
+        db.rollback()
+        return None, "refused_by_database"
+    return volume_id, None
+
+
 def _import_items(db: Session, list_id: str, list_name: str, project: Project, project_created: bool,
                   items: list, actor: Optional[str], notes: Any = None) -> dict:
     """Create each item's volume in `project` (found or created by _project_for); return the report."""
@@ -658,55 +729,9 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             rejects.append(_reject(position, code, reason))
             continue
 
-        # The lookups and the insert are one step for the rollback-and-reject
-        # handling: a database failure at any of them costs this item only.
-        # The new id is taken at the flush, before the commit, so nothing is
-        # read back after it: with the session expiring on commit, reading
-        # the id afterwards is a query that can fail for a volume already
-        # committed, which a rollback could no longer remove.
-        try:
-            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
-                rejects.append(_reject(position, code, "reference_code_on_unit"))
-                continue
-            if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
-                rejects.append(_reject(position, code, "filename_stem_on_unit"))
-                continue
-            volume = Collection(project_id=project_id, created_by=actor, **values)
-            db.add(volume)
-            db.flush()
-            volume_id = volume.id
-            db.commit()
-        except IntegrityError as exc:
-            db.rollback()
-            reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+        volume_id, reason = create_volume(db, list_id, position, project_id, actor, values)
+        if reason is not None:
             rejects.append(_reject(position, code, reason))
-            continue
-        except StemDirectoryCollisionError as exc:
-            # The model's flush listener refused the stem's directory; this
-            # item only is rolled back and reported.
-            db.rollback()
-            reason = _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
-            rejects.append(_reject(position, code, reason))
-            continue
-        except StemHeldOffsiteError:
-            # The model's flush listener found offsite keys under the stem;
-            # this item only is rolled back and reported.
-            db.rollback()
-            rejects.append(_reject(position, code, "filename_stem_held_offsite"))
-            continue
-        except ReferenceCodeDiffersFromStemError:
-            # _check_item refuses this first; the model's flush listener is
-            # the rule for every writer, so its refusal is reported the same.
-            db.rollback()
-            rejects.append(_reject(position, code, "filename_stem_differs_from_reference_code"))
-            continue
-        except SQLAlchemyError:
-            # Any other database failure on this item (a lost connection, a
-            # full disk, a value the driver cannot bind) costs this item
-            # only: it is rolled back and reported, and the import goes on.
-            logger.exception("Import of list %s: item %d refused by the database", list_id, position)
-            db.rollback()
-            rejects.append(_reject(position, code, "refused_by_database"))
             continue
         created.append({
             "position": position,
@@ -1088,7 +1113,10 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
     an integer sequence comes after those with one. An item that is not a
     JSON object has no fields to show and is left out. `notes` is given as
     the file has it when it is a string, and so is `action`, which the
-    contract does not name; any other value of either is None.
+    contract does not name; any other value of either is None. `assignee`
+    (contract 1.7, a queue entry's unit username) is a string or None, and
+    `withdrawn` is True only when the item says true; a file import's items
+    have neither, so None and False.
     """
     try:
         found_id, _, items = check_envelope(document)
@@ -1116,6 +1144,8 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
             "title": text(item, "title"),
             "notes": text(item, "notes"),
             "action": text(item, "action"),
+            "assignee": text(item, "assignee"),
+            "withdrawn": item.get("withdrawn") is True,
         })
     out.sort(key=lambda i: (i["sequence"] is None, i["sequence"] or 0, i["position"]))
     return out
@@ -1131,7 +1161,9 @@ def stored_lists() -> list[dict]:
     from the file, the other two are None, and the list comes after every
     dated one. `items` is in list order (_list_items); when list.json is
     missing, cannot be read as a list, or is another list's file, `items`
-    is empty and `listFileMissing` is True. Reads only.
+    is empty and `listFileMissing` is True. `source` is `queue` for the
+    digitisation queue synced with Fisqua (its report says so), else
+    `file`. Reads only.
     """
     root = reports_dir()
     try:
@@ -1164,6 +1196,7 @@ def stored_lists() -> list[dict]:
             continue
         lists.append({
             "listId": list_id,
+            "source": QUEUE_SOURCE if report.get("source") == QUEUE_SOURCE else "file",
             "listName": report.get("listName"),
             "projectId": report.get("projectId"),
             "importedAt": report.get("importedAt"),
@@ -1178,6 +1211,46 @@ def stored_lists() -> list[dict]:
 
 
 DONE_FILE_NAME = "done.json"
+
+# The `source` of the digitisation queue's reports and of its entry in stored_lists.
+QUEUE_SOURCE = "queue"
+
+
+def project_for(db: Session, name: str, actor: Optional[str]) -> tuple[Project, bool]:
+    """The project named `name` as an import finds it, created (by an admin's rights) if there is none.
+
+    For the queue sync, which may create its list's project. Raises what
+    _project_for raises: ProjectLockUnavailable, or ListRefused when the
+    project's directory would be a volume's stem.
+    """
+    return _project_for(db, name, actor, True)
+
+
+def find_project(db: Session, name: str) -> Optional[Project]:
+    """The project an import of a list named `name` would use, or None."""
+    return _find_project(db, name)
+
+
+def store_queue_list(list_id: str, document: dict, report: dict) -> None:
+    """Keep one applied queue revision as the list `list_id`: its list.json, then a report run.
+
+    `document` is a digitisation-list envelope whose id is `list_id`; it
+    replaces list.json whole and atomically, since each revision is the
+    whole queue. `report` is stored as the list's next run (store_report),
+    with `source` set to QUEUE_SOURCE, so stored_lists dates the list by
+    the revision's `importedAt`. No hash file is written: a revision is
+    never refused as ListIdReused, and a file upload under this id is
+    refused as ListUnverifiable, since its runs carry no fileSha256. Under
+    the list lock, which done marks also take. Raises OSError if either
+    write fails.
+    """
+    list_id = str(uuid.UUID(list_id))
+    directory = reports_dir() / list_id
+    directory.mkdir(parents=True, exist_ok=True)
+    with _list_lock(list_id):
+        _replace_file(directory / LIST_FILE_NAME,
+                      json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8"))
+        store_report({**report, "listId": list_id, "source": QUEUE_SOURCE})
 
 
 class ListItemNotFound(Exception):

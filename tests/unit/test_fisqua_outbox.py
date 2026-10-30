@@ -9,7 +9,7 @@ handed to the transport, with backoff on errors.
 
     python -m pytest tests/unit/test_fisqua_outbox.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
@@ -1028,6 +1028,12 @@ def test_the_status_scheduler_polls_on_its_own_interval(fisqua, monkeypatch):
     assert config.settings.FISQUA_POLL_INTERVAL_SECONDS == 600
     seen = []
     monkeypatch.setattr(fisqua_outbox, "poll_fisqua_status", lambda db: seen.append(1) or {"status": "done"})
+    # The queue sync and the users sent at start run in the same thread; no call leaves the test.
+    from app.core import fisqua_queue
+    queued = []
+    monkeypatch.setattr(fisqua_queue, "sync_fisqua_queue", lambda db: queued.append(1) or {"status": "unchanged"})
+    started = []
+    monkeypatch.setattr(fisqua_queue, "send_operators", lambda db: started.append(1) or {"status": "sent"})
     monkeypatch.setattr(config.settings, "OFFSITE_BACKUP_DELAY_SECONDS", 0)
     monkeypatch.setattr(config.settings, "FISQUA_POLL_INTERVAL_SECONDS", 0.05)
     import time
@@ -1036,6 +1042,8 @@ def test_the_status_scheduler_polls_on_its_own_interval(fisqua, monkeypatch):
     time.sleep(0.3)
     scheduler.stop()
     assert len(seen) >= 2
+    assert len(queued) >= 2
+    assert started == [1]
 
 
 @pytest.mark.unit

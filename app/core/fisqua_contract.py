@@ -7,9 +7,11 @@ nowhere else.
 The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
 that shape it is opaque to the unit, sent as it is and never parsed.
 
-Contract 1.2 is approved (archiving 5e480b7, §9).
+Contract 1.2 is approved (archiving 5e480b7, §9). The digitisation queue
+(contract 1.7) is at the end: the unit's users, the queue and its
+acknowledgement.
 
-Version: 0.2.1
+Version: 0.3.0
 """
 
 import re
@@ -151,3 +153,35 @@ QUARTER_TURNS = (1, 2, 3)
 # app.schemas.record.PREDEFINED_REJECTION_REASONS, the nine of §8; a
 # decision is checked with RecordRejectRequest, as POST /records/{id}/reject
 # checks a reviewer's (app.core.fisqua_decisions).
+
+
+# ---------------------------------------------------------------------------
+# The digitisation queue (contract 1.7)
+# ---------------------------------------------------------------------------
+
+# PUT, the unit's whole list of users who capture: {"operators": [...]}.
+OPERATORS_PATH = "/api/capture/v1/operators"
+F_OPERATORS = "operators"
+F_USERNAME = "username"
+F_DISPLAY_NAME = "displayName"
+F_OPERATOR_ROLE = "role"
+F_ACTIVE = "active"
+# The unit roles sent; reviewers cannot capture and are left out.
+OPERATOR_ROLES = ("admin", "operator")
+
+# GET, with If-None-Match: "<revision>"; 304 when nothing changed.
+QUEUE_PATH = "/api/capture/v1/queue"
+IF_NONE_MATCH_HEADER = "If-None-Match"
+ETAG_HEADER = "ETag"
+F_REVISION = "revision"
+F_LIST_NAME = "listName"
+F_ITEMS = "items"
+F_ITEM_ID = "itemId"
+F_ASSIGNEE = "assignee"
+F_WITHDRAWN = "withdrawn"
+
+# POST {"revision", "applied": [{"itemId", "collectionId"}], "skipped": [{"itemId", "reason"}]}.
+QUEUE_ACK_PATH = "/api/capture/v1/queue/ack"
+F_APPLIED = "applied"
+F_SKIPPED = "skipped"
+F_COLLECTION_ID = "collectionId"

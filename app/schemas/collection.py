@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -117,6 +117,11 @@ class CollectionRead(CollectionBase):
     stem_reserved: bool = False
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None
+    # Set only by the queue sync with Fisqua (app.core.fisqua_queue), and
+    # read-only here: the unit username the volume's queue entry is
+    # assigned to, and when a withdrawn entry hid it from Cola.
+    assignee_username: Optional[str] = None
+    queue_hidden_at: Optional[datetime] = None
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

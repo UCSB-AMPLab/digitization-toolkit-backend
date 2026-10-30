@@ -24,7 +24,15 @@ errors, the rest error. Answers to GET of a volume's QC decisions (§9.5):
 (read again at the next poll), the same configuration errors otherwise,
 the rest error.
 
-Version: 0.1.0-beta
+Answers to the digitisation queue's calls (contract 1.7): PUT of the
+operators, 2xx delivered and 400 or 422 refused; GET of the queue, 304
+not_modified and 2xx with an object the queue; POST of its ack, 2xx
+acknowledged and 400 or 422 refused. 401, 403 and any 3xx are the same
+configuration errors as above. A 404 is an error, retried, and not a
+configuration error: a Fisqua without 1.7 answers these paths 404, and that
+must not stop the unit's handovers. The rest are errors, retried.
+
+Version: 0.3.0
 """
 
 from datetime import datetime, timezone
@@ -186,6 +194,64 @@ def read_decisions_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def _queue_config_error(code: int, body: Any) -> Optional[TransportResult]:
+    """_config_error for the 1.7 paths, where a 404 is retried rather than stopping the unit."""
+    if code == 404:
+        return None
+    return _config_error(code, body)
+
+
+def _read_queue_call(response: httpx.Response, ok_outcome: str) -> TransportResult:
+    """The answer to PUT operators or POST queue/ack: `ok_outcome` on 2xx, refused on 400 or 422."""
+    code = response.status_code
+    body = _json(response)
+    if 200 <= code < 300:
+        return TransportResult(outcome=ok_outcome, response=body, status_code=code)
+    stop = _queue_config_error(code, body)
+    if stop is not None:
+        return stop
+    if code in (400, 422):
+        return TransportResult(outcome="refused", response=body, status_code=code, problems=_problems(body),
+                               error=f"Fisqua refused the call (HTTP {code})")
+    return _transient(response, body)
+
+
+def read_operators_answer(response: httpx.Response) -> TransportResult:
+    return _read_queue_call(response, "delivered")
+
+
+def read_queue_ack_answer(response: httpx.Response) -> TransportResult:
+    return _read_queue_call(response, "acknowledged")
+
+
+def _unquote_etag(value: Optional[str]) -> Optional[str]:
+    if value is None:
+        return None
+    value = value.strip()
+    if value.startswith("W/"):
+        value = value[2:]
+    if len(value) >= 2 and value[0] == value[-1] == '"':
+        value = value[1:-1]
+    return value or None
+
+
+def read_queue_answer(response: httpx.Response) -> TransportResult:
+    code = response.status_code
+    body = _json(response)
+    if code == 304:
+        return TransportResult(outcome="not_modified", status_code=code)
+    if 200 <= code < 300:
+        if not isinstance(body, dict):
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=f"Fisqua answered HTTP {code} without a queue object")
+        return TransportResult(outcome="queue", response=body, status_code=code,
+                               etag=_unquote_etag(response.headers.get(fc.ETAG_HEADER)))
+    stop = _queue_config_error(code, body)
+    if stop is not None:
+        return stop
+    return _transient(response, body)
+
+
 def _failed(exc: Exception) -> TransportResult:
     kind = "timeout" if isinstance(exc, httpx.TimeoutException) else type(exc).__name__
     return TransportResult(outcome="error", error=f"Fisqua could not be reached: {kind}: {exc}")
@@ -233,6 +299,30 @@ class HttpFisquaTransport:
         except httpx.HTTPError as exc:
             return _failed(exc)
         return read_decisions_answer(response)
+
+    def put_operators(self, body: dict) -> TransportResult:
+        try:
+            response = self._client.put(self._base + fc.OPERATORS_PATH, json=body, headers=self._headers())
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_operators_answer(response)
+
+    def get_queue(self, revision: Optional[str]) -> TransportResult:
+        headers = self._headers()
+        if revision:
+            headers[fc.IF_NONE_MATCH_HEADER] = f'"{revision}"'
+        try:
+            response = self._client.get(self._base + fc.QUEUE_PATH, headers=headers)
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_queue_answer(response)
+
+    def post_queue_ack(self, body: dict) -> TransportResult:
+        try:
+            response = self._client.post(self._base + fc.QUEUE_ACK_PATH, json=body, headers=self._headers())
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_queue_ack_answer(response)
 
     def close(self) -> None:
         self._client.close()

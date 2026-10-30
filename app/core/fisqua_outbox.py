@@ -70,6 +70,10 @@ app.core.fisqua_contract. Here:
   applied nor one already seen stale has its QC decisions read and applied
   (§9.5, app.core.fisqua_decisions), within the same tick, the same
   transport rules and the same hold.
+* **The digitisation queue** (contract 1.7, app.core.fisqua_queue): each
+  scheduler tick, after the status poll, sends the unit's users when due
+  and polls, applies and acknowledges the queue, through the same
+  transport, call budget, configuration stop and hold.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
@@ -85,7 +89,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.2.1
+Version: 0.3.0
 """
 
 import hashlib
@@ -288,6 +292,8 @@ class TransportResult:
     volumes: Optional[list] = None
     # config_error: `token`, `not_found` or `redirect`.
     reason: Optional[str] = None
+    # get_queue: the ETag of a 200, without its quotes.
+    etag: Optional[str] = None
 
 
 class FisquaTransport(Protocol):
@@ -296,6 +302,13 @@ class FisquaTransport(Protocol):
     def get_status(self, refs: list) -> TransportResult: ...
 
     def get_decisions(self, ref: str) -> TransportResult: ...
+
+    # Contract 1.7 (app.core.fisqua_queue).
+    def put_operators(self, body: dict) -> TransportResult: ...
+
+    def get_queue(self, revision: Optional[str]) -> TransportResult: ...
+
+    def post_queue_ack(self, body: dict) -> TransportResult: ...
 
 
 class NullTransport:
@@ -308,6 +321,15 @@ class NullTransport:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
     def get_decisions(self, ref: str) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def put_operators(self, body: dict) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def get_queue(self, revision: Optional[str]) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def post_queue_ack(self, body: dict) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
@@ -1512,14 +1534,17 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
 class FisquaStatusScheduler:
     """Polls Fisqua every FISQUA_POLL_INTERVAL_SECONDS (ten minutes), in a thread of its own.
 
-    A tick with no volume to ask for makes no call, so the poll runs only
-    while some sent volume is not final.
+    A tick's status poll with no volume to ask for makes no call, so it
+    asks only while some sent volume is not final. Each tick then runs the
+    digitisation queue's sync (app.core.fisqua_queue), which asks for the
+    queue every tick; the unit's users are sent when the thread starts.
     """
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[dict] = None
+        self.last_queue_result: Optional[dict] = None
 
     def start(self) -> bool:
         if not fisqua_configured():
@@ -1542,6 +1567,9 @@ class FisquaStatusScheduler:
         return self._thread is not None and self._thread.is_alive()
 
     def _loop(self) -> None:
+        # The unit's users go to Fisqua at start (contract 1.7), before the
+        # first poll; a failure is retried at the next tick.
+        self.send_operators_at_start()
         if self._stop.wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
             return
         while True:
@@ -1549,18 +1577,38 @@ class FisquaStatusScheduler:
             if self._stop.wait(config.settings.FISQUA_POLL_INTERVAL_SECONDS):
                 return
 
+    def send_operators_at_start(self) -> None:
+        from app.core.db import SessionLocal
+        from app.core.fisqua_queue import send_operators
+
+        db = SessionLocal()
+        try:
+            send_operators(db)
+        except Exception:
+            logger.exception("Sending the unit's users to Fisqua at start raised")
+        finally:
+            db.close()
+
     def tick(self) -> Optional[dict]:
         from app.core.db import SessionLocal
+        from app.core.fisqua_queue import sync_fisqua_queue
 
         db = SessionLocal()
         try:
             self.last_result = poll_fisqua_status(db)
-            return self.last_result
         except Exception:
             logger.exception("Scheduled Fisqua status poll raised")
-            return None
+            self.last_result = None
+        try:
+            # The digitisation queue, with the status poll (contract 1.7).
+            self.last_queue_result = sync_fisqua_queue(db)
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduled Fisqua queue sync raised")
+            self.last_queue_result = None
         finally:
             db.close()
+        return self.last_result
 
 
 fisqua_status_scheduler = FisquaStatusScheduler()
