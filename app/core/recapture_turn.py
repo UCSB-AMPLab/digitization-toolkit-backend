@@ -174,11 +174,13 @@ def award_rescan_turns(db: Session, collection_ids, actor: Optional[str]) -> Non
 	yet, has at least one record and none left captured.
 
 	The caller holds its record locks. Volumes that are not full rescans are
-	dropped before any lock, so they take none; the rest have their rows
-	taken in id order (volume_stem.locked_volume_query), and only then the
-	turn lock, once. A path that holds the turn lock never waits for a
-	volume row, so this cannot deadlock against a retake, which holds its
-	volume's row and then asks for the turn.
+	dropped before any lock, so they take none. Otherwise the caller's
+	status changes are flushed first, so the key share locks their history
+	rows take on every touched volume (rescan or not) are held; then the
+	rescan rows are taken in id order (volume_stem.locked_volume_query), and
+	only then the turn lock, once. A path that holds the turn lock never
+	waits for a volume row, so this cannot deadlock against a retake, which
+	holds its volume's row and then asks for the turn.
 	"""
 	from app.core import volume_stem
 
@@ -189,10 +191,13 @@ def award_rescan_turns(db: Session, collection_ids, actor: Optional[str]) -> Non
 	})
 	if not rescans:
 		return
+	# The caller's status changes go first: their history rows take a key
+	# share lock on every volume they touch, rescan or not, and those must
+	# be held before the turn lock, as the row locks below are.
+	db.flush()
 	for cid in rescans:
 		volume_stem.locked_volume_query(db, cid).first()
 	lock_turn(db)
-	db.flush()  # the caller's status changes, before the counts
 	for cid in rescans:
 		if has_event(db, RESCAN_COMPLETED_ACTION, cid):
 			continue
