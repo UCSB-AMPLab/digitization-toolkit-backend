@@ -17,12 +17,17 @@ pages retaken from the unit like any other.
 
 The bundle is a directory with
 
-* `plan.json`: `{"stem", "counterAfter", "records": [...]}`, each record with
-  `ordinal` (its position and its file name index; its sequence),
-  `captureId`, `pairId`, `mode` (`dual` or `single`), `capturedAt`,
-  `capturedAtSource` and `images`, each image with `volumeOrder`,
-  `filename`, `role` and `rotateDeg`. It decides records, names, ids, dates,
-  roles and rotation. A dual record has one `left` image named
+* `plan.json`: `{"stem", "counterAfter", "indexOffset", "records": [...]}`,
+  each record with `ordinal` (its position: its sequence), `captureId`,
+  `pairId`, `mode` (`dual` or `single`), `capturedAt`, `capturedAtSource`
+  and `images`, each image with `volumeOrder`, `filename`, `role` and
+  `rotateDeg`. It decides records, names, ids, dates, roles and rotation.
+  `indexOffset` K, a whole number from 0 to MAX_CAPTURE_NUMBER, is 0 when
+  absent: a record's file name index `<nnnn>` is its ordinal + K. A volume
+  rebuilt for the first time has none. A volume whose earlier records were
+  deleted to be rebuilt again takes the highest number they used, so the new
+  files are numbered after the old ones and no key in the bucket is named
+  twice; the records' sequences are still 1 to N. A dual record has one `left` image named
   `<stem>-img_<nnnn>_c0.jpg` (camera 0, the even image) and one `right`
   image named `..._c1.jpg` (camera 1, the odd image), and its filename
   index `<stem>-img_<nnnn>` as its pair id, as capture gives a dual capture
@@ -55,34 +60,41 @@ them. The EXIF Orientation is recorded as provenance only.
 The bundle is refused when the two files do not name the same images; when a
 volumeOrder, a file name, a capture id, a pair id or an ordinal repeats; when
 a dual record does not have exactly one `left` image named `_c0` and one
-`right` image named `_c1` for its ordinal, or a pair id other than its
+`right` image named `_c1` for its file name index, or a pair id other than its
 filename index (a UUID included); when a dual record's `missingSide` is
 neither absent, null, `left` nor `right`, or it misses a side and does not
 have exactly one image, on the other side, named for that side's camera;
 when a single record carries a `missingSide`, does not have exactly
 one `single` image named `_c0`, or has a pair id; when a rotateDeg is not 0, 90, 180 or 270; when the ordinals are not 1
-to N; when a sourceBucket is not one of SOURCE_BUCKETS; or when a sourceKey
+to N; when indexOffset is present and not a whole number from 0 to
+MAX_CAPTURE_NUMBER (null included); when a sourceBucket is not one of SOURCE_BUCKETS; or when a sourceKey
 repeats. The plan shape of 0.1, one entry per image, is not read: no unit
 ran it but the bench.
 
 Nothing is written unless every precondition holds:
 
 * the volume with the stem exists, is in a project, and has no records, no
-  images and a capture counter of 0. A rerun finds the counter an earlier
+  images and a capture counter of at most indexOffset: 0 for a volume never
+  captured, up to K for one whose earlier records were deleted, the volume
+  row kept with its counter. A rerun finds the counter an earlier
   run raised: equal to counterAfter, with records that run made, each
   whole, and nothing else; or above it, when an operator has captured into
   the volume since, and then each record not of the bundle must carry
-  numbers above counterAfter (a counter above 0 and below counterAfter is
-  refused);
+  numbers above counterAfter (a counter above indexOffset and below
+  counterAfter is refused);
 * offsite is configured (a remote and a valid tenant);
 * a fresh listing of `<tenant>/<stem>/captures/` (a listing: the unit's key
   cannot read) shows every planned key, both files of each pair, with the
   planned SHA1 and size;
-* `counterAfter` is at least the number of records;
+* `counterAfter` is at least indexOffset plus the number of records, the
+  highest planned file name index;
 * no planned master is on the card, no other offsite row holds a planned
   key, no image elsewhere carries a planned capture id, and the volume's
-  manifest holds no capture but this bundle's and those numbered above
-  counterAfter.
+  manifest holds no capture but this bundle's, those numbered above
+  counterAfter, and, with an indexOffset, those whose files are all
+  numbered from 1 to indexOffset and whose capture id no image on the unit
+  carries: the lines of the records the rebuild replaced, which the
+  append-only manifest keeps as history.
 
 An applied run holds an flock on `<stem>/metadata/.rebuild.lock` from its
 checks to its end, and refuses to start while another run holds it.
@@ -106,7 +118,7 @@ ordinal order, is written whole or not at all:
    (its line lists its one file);
    a rerun does not append a line a capture id already has;
 3. in one transaction, the record (dual or single, captured, sequence =
-   ordinal, missing_side as planned), its images (the canonical paths of the absent masters, each
+   ordinal, whatever the indexOffset, missing_side as planned), its images (the canonical paths of the absent masters, each
    master freed with the listed size, the shared capture id and pair id,
    each image's role and rotation) and a verified offsite row per image at
    the planned key with the planned SHA1, committed through
@@ -139,7 +151,14 @@ before the commit, so no other path can hold or wait on its lock, and the
 record-before-volume order of paths that lock existing records is not
 crossed. No database transaction stays open across the listing or a file copy.
 
-Version: 0.3.2
+Deleting a volume's records before a rebuild with an indexOffset (not done
+here) leaves their offsite rows, each keeping its key with record_image_id
+set NULL (offsite_objects' ON DELETE SET NULL), their capture lines in the
+manifest, and their offsite-freed lines. None blocks the run when K is at
+least the highest number the old records used: their keys then carry numbers
+1 to K, and the planned ones K + 1 on.
+
+Version: 0.3.3
 """
 
 import argparse
@@ -222,6 +241,7 @@ class Planned:
     captured_at_source: Optional[str]
     images: List[PlannedImage] = field(default_factory=list)  # in ROLES order
     missing_side: Optional[str] = None  # "left" or "right" for a dual opening that misses that page
+    number: int = 0  # its file name index: ordinal + indexOffset (set by load_bundle)
 
 
 # ---------------------------------------------------------------------------
@@ -290,12 +310,15 @@ def _repeats(entries: list, field: str, key: str = "volumeOrder") -> List[dict]:
             for e in entries if e[field] is not None and seen[e[field]] > 1]
 
 
-def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
-    """The first reason a plan record (with a valid ordinal) is refused, or None; the record parsed into `e`."""
+def _record_problem(stem: str, ordinal: int, e: dict, offset: int = 0) -> Optional[dict]:
+    """The first reason a plan record (with a valid ordinal) is refused, or None; the record parsed into `e`.
+
+    Its file names and pair id carry its file name index, ordinal + `offset`.
+    """
     from app.core.capture_naming import capture_filename_index
 
     base = {"ordinal": ordinal}
-    index = capture_filename_index(stem, ordinal)
+    index = capture_filename_index(stem, ordinal + offset)
     mode, capture_id, pair_id = e.get("mode"), e.get("captureId"), e.get("pairId")
     if mode not in MODES:
         return {**base, "reason": "mode_invalid", "value": mode}
@@ -335,7 +358,11 @@ def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
 
 
 def load_bundle(bundle_dir: str, stem: str) -> tuple:
-    """(counterAfter, [Planned] in ordinal order) from a bundle. Raises RebuildRefused."""
+    """(counterAfter, [Planned] in ordinal order) from a bundle. Raises RebuildRefused.
+
+    Each Planned's `number` is its file name index, its ordinal plus the
+    plan's indexOffset (0 when the plan has none).
+    """
     from app.core.capture_naming import MAX_CAPTURE_NUMBER
 
     bundle = Path(bundle_dir)
@@ -354,6 +381,12 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
     if not _is_int(counter_after) or not 0 <= counter_after <= MAX_CAPTURE_NUMBER:
         raise RebuildRefused(f"plan.json's counterAfter {counter_after!r} is not a whole number "
                              f"from 0 to {MAX_CAPTURE_NUMBER}")
+    # Absent for a volume rebuilt for the first time; a volume whose earlier
+    # records were deleted names its new files after their numbers.
+    offset = plan.get("indexOffset", 0)
+    if not _is_int(offset) or not 0 <= offset <= MAX_CAPTURE_NUMBER:
+        raise RebuildRefused(f"plan.json's indexOffset {offset!r} is not a whole number from 0 to "
+                             f"{MAX_CAPTURE_NUMBER}", [{"reason": "index_offset_invalid", "value": offset}])
     entries = plan.get("records")
     if not isinstance(entries, list) or not entries:
         raise RebuildRefused("plan.json has no records (the plan shape of 0.1, one entry per image, "
@@ -369,7 +402,7 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         if not _is_int(ordinal) or not 1 <= ordinal <= MAX_CAPTURE_NUMBER:
             problems.append({"index": index, "reason": "ordinal_invalid", "value": ordinal})
             continue
-        problem = _record_problem(stem, ordinal, e)
+        problem = _record_problem(stem, ordinal, e, offset)
         if problem is not None:
             problems.append(problem)
             continue
@@ -466,8 +499,13 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         order = ROLES[r["mode"]]
         out.append(Planned(r["ordinal"], r["captureId"], r["pairId"], r["mode"], r["at"], r["source"],
                            sorted(by_record[r["ordinal"]], key=lambda i: order.index(i.role)),
-                           r["missingSide"]))
+                           r["missingSide"], r["ordinal"] + offset))
     return counter_after, out
+
+
+def _index_offset(planned: List[Planned]) -> int:
+    """The plan's indexOffset: the same for every record, the amount its file name index exceeds its ordinal."""
+    return planned[0].number - planned[0].ordinal
 
 
 def _all_images(planned: List[Planned]) -> List[tuple]:
@@ -697,6 +735,18 @@ def _captures_since_raise(stem: str, others: List[dict], counter_after: int, cou
             if n is None or not counter_after < n <= counter:
                 return False
     return True
+
+
+def _capture_ids_held(db: Session, capture_ids: List[str]) -> set:
+    """The capture ids of `capture_ids` that an image on the unit, in any volume, still carries."""
+    from app.models.record import RecordImage
+
+    held = set()
+    for start in range(0, len(capture_ids), 500):
+        held |= {cid for (cid,) in db.query(RecordImage.capture_id).filter(
+            RecordImage.capture_id.in_(capture_ids[start:start + 500]))}
+    db.commit()
+    return held
 
 
 def _resequence_others(db: Session, collection_id: int, planned: List[Planned]) -> List[dict]:
@@ -933,7 +983,11 @@ def rebuild_volume(db: Session, stem: str, bundle_dir: str, *, apply: bool = Fal
         raise RebuildRefused(f"no volume has the file name stem {stem!r}")
     db.commit()
     counter_after, planned = load_bundle(bundle_dir, stem)
-    if counter_after < len(planned):
+    offset = _index_offset(planned)
+    if counter_after < offset + len(planned):
+        if offset:
+            raise RebuildRefused(f"plan.json's counterAfter {counter_after} is below its indexOffset {offset} "
+                                 f"plus its number of records {len(planned)}, its highest file name index")
         raise RebuildRefused(f"plan.json's counterAfter {counter_after} is below its number of records "
                              f"{len(planned)}, its highest ordinal")
     tenant = _offsite_tenant()
@@ -978,17 +1032,20 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
     paths = {img.filename: str(volume_dir / CAPTURES_DIR / img.filename) for _, img in _all_images(planned)}
 
     # The counter is raised to counterAfter before the first record, so it is
-    # 0 before any run, counterAfter after one, or above it by the captures
-    # an operator has taken into the volume since.
+    # at most the indexOffset (0 without one) before any run, counterAfter
+    # after one, or above it by the captures an operator has taken into the
+    # volume since. counterAfter is above the offset (rebuild_volume).
+    offset = _index_offset(planned)
     in_manifest = _manifest_captures(volume_dir)
     done, others, differ = _done(db, collection_id, planned, keys, paths, in_manifest)
     if differ:
         raise RebuildRefused(f"{len(differ)} record(s) an earlier run wrote differ from the plan and the bundle; "
                              "a record is never skipped as done unless it agrees with them", differ)
-    if counter_before == 0:
+    if counter_before <= offset:
         if others or done:
+            reason = "records_with_counter_0" if counter_before == 0 else "records_with_counter_within_offset"
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make",
-                                 others or [{"reason": "records_with_counter_0", "records": len(done)}])
+                                 others or [{"reason": reason, "records": len(done)}])
     elif counter_before == counter_after:
         if others:
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make", others)
@@ -998,9 +1055,10 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         if others and not _captures_since_raise(stem, others, counter_after, counter_before):
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make", others)
     else:
-        raise RebuildRefused(f"the capture counter of volume {stem!r} is {counter_before}; a rebuild needs a "
-                             f"volume that has never captured, or one an earlier run raised to {counter_after}",
-                             others)
+        first = ("a volume that has never captured" if not offset
+                 else f"an emptied volume whose counter is at most its indexOffset {offset}")
+        raise RebuildRefused(f"the capture counter of volume {stem!r} is {counter_before}; a rebuild needs "
+                             f"{first}, or one an earlier run raised to {counter_after}", others)
 
     todo = [p for p in planned if p.capture_id not in done]
     todo_images = _all_images(todo)
@@ -1030,17 +1088,25 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         raise RebuildRefused("a planned key or capture id is already recorded on this unit", taken)
 
     by_id = {p.capture_id: p for p in planned}
+    held_ids = _capture_ids_held(db, [cid for cid in in_manifest if cid not in by_id]) if offset else set()
     stray = []
     for cid, entry in in_manifest.items():
         p = by_id.get(cid)
         files = entry.get("files") or []
         if p is None:
             # A capture taken after an earlier run raised the counter (or one
-            # whose commit failed) carries a number above counterAfter.
+            # whose commit failed) carries a number above counterAfter. With
+            # an indexOffset, a line numbered at most the offset belongs to a
+            # record the rebuild replaces, deleted before it; the manifest is
+            # append-only and keeps it as history, once no image on the unit
+            # carries its capture id.
             numbers = [_capture_number(stem, Path(str(f.get("relative_path", ""))).name)
                        for f in files if isinstance(f, dict)]
-            if (counter_before < counter_after or not numbers
-                    or not all(n is not None and n > counter_after for n in numbers)):
+            numbered = bool(numbers) and all(n is not None for n in numbers)
+            since_raise = counter_before >= counter_after and numbered and all(n > counter_after for n in numbers)
+            replaced = (offset > 0 and numbered and all(1 <= n <= offset for n in numbers)
+                        and cid not in held_ids)
+            if not (since_raise or replaced):
                 stray.append({"capture_id": cid, "reason": "manifest_capture_not_planned"})
         elif cid not in done and _line_differences(p, entry):
             # A line a failed commit left: the append-only manifest keeps it, so it must be the plan's.
@@ -1059,6 +1125,7 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
 
     report = {"filename_stem": stem, "collection_id": collection_id, "bundle": str(bundle_dir),
               "applied": apply, "records": len(planned), "images": len(_all_images(planned)),
+              "index_offset": offset,
               "created": [], "skipped": [],
               "counter_before": counter_before, "counter_after": max(counter_before, counter_after),
               "freed_bytes": sum(sizes[keys[img.filename]] for _, img in todo_images), "manifest": None,

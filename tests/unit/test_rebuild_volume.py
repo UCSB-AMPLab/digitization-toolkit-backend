@@ -12,9 +12,13 @@ and 4 the second, and 5 has no partner. Each odd image is the right-hand page
 (camera 1, rotated 90), each even one the left-hand page (camera 0, rotated
 270).
 
+A volume whose earlier records were deleted to be rebuilt again
+(`indexOffset`) is the default bundle numbered after the old records: the
+old volume had OFFSET numbers, and the new files take OFFSET + 1 on.
+
     python -m pytest tests/unit/test_rebuild_volume.py
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import hashlib
@@ -1314,3 +1318,269 @@ def test_a_rerun_compares_a_done_records_missing_side(remote, db_session, overri
 
     refusal = _refused(db_session, bundle, override_projects_root, match="differ from the plan")
     assert [(p["ordinal"], p["fields"]) for p in refusal.problems] == [(2, ["missing_side"])]
+
+
+# ---------------------------------------------------------------------------
+# indexOffset: a volume rebuilt again, its new files numbered after the old ones
+# ---------------------------------------------------------------------------
+
+OFFSET = 7  # the numbers the deleted records' files carry, 1 to OFFSET
+
+
+def _old_capture_id(n: int) -> str:
+    return str(uuid.UUID(int=1000 + n, version=4))
+
+
+def _camera(role: str) -> int:
+    return 1 if role == "right" else 0
+
+
+def _offset_bundle(tmp_path: Path, remote, k=OFFSET, *, plan_over=(), image_over=(), envelope_over=None):
+    """The default bundle with `indexOffset` k: each record's files and pair id carry ordinal + k."""
+    def shift(records):
+        for rec in records:
+            n = rec["ordinal"] + k
+            if rec["mode"] == "dual":
+                rec["pairId"] = _pair_id(n)
+            for img in rec["images"]:
+                img["filename"] = _name(n, _camera(img["role"]))
+
+    envelope = {"indexOffset": k, "counterAfter": k + COUNTER_AFTER}
+    envelope.update(envelope_over or {})
+    bundle = _bundle(tmp_path, remote, put=False, plan_over=[shift, *plan_over], image_over=list(image_over),
+                     envelope_over=envelope)
+    for ordinal, _, files in LAYOUT:
+        for v, _, role, _ in files:
+            remote.put(_key(_name(ordinal + k, _camera(role))), _master(v))
+    return bundle
+
+
+def _emptied(db, vol, root: Path, *, k=OFFSET, keep=()):
+    """A volume whose earlier records, numbered 1 to k, were deleted, keeping the volume row and its counter k.
+
+    Each old record had one image, an offsite row at its key and a capture
+    line in the manifest. The records are deleted as the API deletes one
+    (the ORM cascade to their images); the offsite rows keep their keys with
+    no image, as PostgreSQL's ON DELETE SET NULL leaves them (the test
+    database is SQLite without foreign keys, so the update does it here).
+    The ordinals in `keep` are not deleted.
+    """
+    from datetime import datetime, timezone
+
+    from sqlalchemy import text
+
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import Record, RecordImage
+    from capture.manifestHandler import append_manifest_lines
+
+    records, lines = [], []
+    for n in range(1, k + 1):
+        name = _name(n)
+        rec = Record(title=f"P - {Path(name).stem}", collection_id=vol.id, capture_mode="single", sequence=n)
+        db.add(rec)
+        db.flush()
+        img = RecordImage(record_id=rec.id, filename=name, file_path=str(root / STEM / "captures" / name),
+                          format="jpg", capture_id=_old_capture_id(n), role="single")
+        db.add(img)
+        db.flush()
+        db.add(OffsiteObject(record_image_id=img.id, kind="capture", object_key=_key(name), local_sha1="0" * 40,
+                             verified_at=datetime.now(timezone.utc)))
+        records.append(rec)
+        lines.append(json.dumps({"capture_id": _old_capture_id(n), "project_name": "P", "pair_id": None,
+                                 "cameras": [], "files": [{"role": "single", "relative_path": f"captures/{name}",
+                                                           "sha256": "0" * 64, "rotate_deg": 0}]}))
+    db.commit()
+    append_manifest_lines(root / STEM, lines)
+    _set_counter(db, vol, k)
+    for n, rec in enumerate(records, start=1):
+        if n not in keep:
+            db.delete(rec)
+    db.commit()
+    db.execute(text("UPDATE offsite_objects SET record_image_id = NULL "
+                    "WHERE record_image_id NOT IN (SELECT id FROM record_images)"))
+    db.commit()
+
+
+@pytest.mark.unit
+def test_an_index_offset_names_the_files_after_the_old_numbers(remote, db_session, override_projects_root,
+                                                              tmp_path):
+    from app.core.capture_naming import take_filename_index
+    from app.models.collection import Collection
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    root = override_projects_root
+    _emptied(db_session, vol, root)
+    bundle = _offset_bundle(tmp_path, remote)
+
+    report = _rebuild(db_session, bundle, apply=True)
+
+    assert len(report["created"]) == 3 and report["counter_before"] == OFFSET
+    db_session.expire_all()
+    records = db_session.query(Record).filter(Record.collection_id == vol.id).order_by(Record.sequence).all()
+    assert [r.sequence for r in records] == [1, 2, 3]
+    for (ordinal, mode, files), rec in zip(LAYOUT, records):
+        n = ordinal + OFFSET
+        images = sorted(rec.images, key=lambda i: i.filename)
+        assert [i.filename for i in images] == [_name(n, _camera(role)) for _, _, role, _ in files]
+        assert {i.pair_id for i in images} == {_pair_id(n) if mode == "dual" else None}
+        for img in images:
+            row = db_session.query(OffsiteObject).filter(OffsiteObject.record_image_id == img.id).one()
+            assert row.object_key == _key(img.filename)
+    names = [_name(o + OFFSET, _camera(role)) for o, _, files in LAYOUT for _, _, role, _ in files]
+    assert sorted(f["key"] for f in _freed_lines(root)) == sorted(_key(n) for n in names)
+    lines = {line["capture_id"]: line for line in _manifest_lines(root)}
+    # The deleted records' lines stay, as history.
+    assert set(lines) == {_old_capture_id(n) for n in range(1, OFFSET + 1)} | {_capture_id(n) for n in (1, 2, 3)}
+    assert [f["relative_path"] for n in (1, 2, 3) for f in lines[_capture_id(n)]["files"]] == [
+        f"captures/{name}" for name in names]
+    assert lines[_capture_id(1)]["pair_id"] == _pair_id(1 + OFFSET)
+    assert db_session.get(Collection, vol.id).capture_counter == OFFSET + COUNTER_AFTER
+
+    index = take_filename_index(db_session, vol.id, STEM, root / STEM / "captures")
+    db_session.rollback()
+    assert index == f"{STEM}-img_{OFFSET + COUNTER_AFTER + 1:04d}"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_missing_side_and_a_single_record_under_an_offset_are_named_after_it(
+        remote, db_session, override_projects_root, tmp_path, side):
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    keep, role = OTHER_SIDE[side]
+    over = _missing_side_over(side)
+    bundle = _offset_bundle(tmp_path, remote, plan_over=over["plan_over"], image_over=over["image_over"])
+
+    _rebuild(db_session, bundle, apply=True)
+
+    db_session.expire_all()
+    records = db_session.query(Record).filter(Record.collection_id == vol.id).order_by(Record.sequence).all()
+    [img] = records[1].images
+    assert (records[1].sequence, records[1].missing_side) == (2, side)
+    assert (img.filename, img.role, img.pair_id) == (_name(2 + OFFSET, _camera(role)), role, _pair_id(2 + OFFSET))
+    [single] = records[2].images
+    assert (records[2].sequence, single.filename, single.pair_id) == (3, _name(3 + OFFSET), None)
+
+
+@pytest.mark.unit
+def test_an_emptied_volume_with_its_counter_at_the_offset_is_accepted(remote, db_session, override_projects_root,
+                                                                      tmp_path):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    report = _rebuild(db_session, _offset_bundle(tmp_path, remote), apply=False)
+    assert report["counter_before"] == OFFSET and len(report["created"]) == 3
+
+
+@pytest.mark.unit
+def test_an_emptied_volume_with_its_counter_above_the_offset_is_refused(remote, db_session,
+                                                                         override_projects_root, tmp_path):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    _set_counter(db_session, vol, OFFSET + 1)
+    _refused(db_session, _offset_bundle(tmp_path, remote), override_projects_root, match="capture counter")
+
+
+@pytest.mark.unit
+def test_an_emptied_volume_with_a_record_left_is_refused(remote, db_session, override_projects_root, tmp_path):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root, keep=(OFFSET,))
+    refusal = _refused(db_session, _offset_bundle(tmp_path, remote), override_projects_root,
+                       match="already has records")
+    assert [p["filenames"] for p in refusal.problems] == [[_name(OFFSET)]]
+
+
+@pytest.mark.unit
+def test_an_old_manifest_line_whose_capture_id_an_image_still_holds_is_refused(
+        remote, db_session, override_projects_root, tmp_path):
+    from app.models.record import Record, RecordImage
+
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    other = _volume(db_session, name="Tomo 2", stem="xx-test-002")
+    rec = Record(title="t", collection_id=other.id, capture_mode="single", sequence=1)
+    db_session.add(rec)
+    db_session.flush()
+    db_session.add(RecordImage(record_id=rec.id, filename="x.jpg", file_path="/nowhere/x.jpg", format="jpg",
+                               capture_id=_old_capture_id(3), role="single"))
+    db_session.commit()
+
+    refusal = _refused(db_session, _offset_bundle(tmp_path, remote), override_projects_root, match="manifest")
+    assert [(p["capture_id"], p["reason"]) for p in refusal.problems] == [
+        (_old_capture_id(3), "manifest_capture_not_planned")]
+
+
+@pytest.mark.unit
+def test_an_old_manifest_line_numbered_above_the_offset_is_refused(remote, db_session, override_projects_root,
+                                                                    tmp_path):
+    """Only the deleted records' numbers, 1 to the offset, are history; the new ones are the plan's."""
+    from capture.manifestHandler import append_manifest_lines
+
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    append_manifest_lines(override_projects_root / STEM, [json.dumps({
+        "capture_id": str(uuid.uuid4()), "files": [{"role": "single", "relative_path":
+                                                    f"captures/{_name(OFFSET + 1)}", "sha256": "0" * 64}]})])
+    _refused(db_session, _offset_bundle(tmp_path, remote), override_projects_root, match="manifest")
+
+
+@pytest.mark.unit
+def test_a_counter_after_below_the_offset_and_the_records_is_refused(remote, db_session, override_projects_root,
+                                                                     tmp_path):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    bundle = _offset_bundle(tmp_path, remote, envelope_over={"counterAfter": OFFSET + 2})
+    _refused(db_session, bundle, override_projects_root, match="counterAfter")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("offset", [-1, 1.5, "7", True, None, 10000])
+def test_an_index_offset_that_is_not_a_whole_number_in_range_is_refused(
+        remote, db_session, override_projects_root, tmp_path, offset):
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote, envelope_over={"indexOffset": offset})
+    refusal = _refused(db_session, bundle, override_projects_root, match="indexOffset")
+    assert refusal.problems == [{"reason": "index_offset_invalid", "value": offset}]
+
+
+@pytest.mark.unit
+def test_an_offset_plan_whose_files_carry_the_ordinals_is_refused(remote, db_session, override_projects_root,
+                                                                  tmp_path):
+    """With an offset, a file numbered by its ordinal alone is another record's old name."""
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    bundle = _bundle(tmp_path, remote, envelope_over={"indexOffset": OFFSET, "counterAfter": OFFSET + 5})
+    refusal = _refused(db_session, bundle, override_projects_root, match="plan.json")
+    assert {p["reason"] for p in refusal.problems} == {"pair_id_invalid", "filename_not_its_ordinal"}
+
+
+@pytest.mark.unit
+def test_a_rerun_after_an_offset_run_is_a_rerun(remote, db_session, override_projects_root, tmp_path):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    bundle = _offset_bundle(tmp_path, remote)
+    _rebuild(db_session, bundle, apply=True)
+    before = _snapshot(db_session, override_projects_root)
+
+    report = _rebuild(db_session, bundle, apply=True)
+
+    assert report["created"] == [] and len(report["skipped"]) == 3
+    after = _snapshot(db_session, override_projects_root)
+    assert {k: v for k, v in after.items() if k != "logs"} == {k: v for k, v in before.items() if k != "logs"}
+
+
+@pytest.mark.unit
+def test_a_rerun_after_an_interrupted_offset_run_completes_the_rest(remote, db_session, override_projects_root,
+                                                                    tmp_path, monkeypatch):
+    vol = _volume(db_session)
+    _emptied(db_session, vol, override_projects_root)
+    bundle = _offset_bundle(tmp_path, remote)
+    _interrupted(db_session, bundle, monkeypatch, on_call=3)
+
+    report = _rebuild(db_session, bundle, apply=True)
+
+    assert [c["capture_id"] for c in report["created"]] == [_capture_id(2), _capture_id(3)]
+    assert [s["capture_id"] for s in report["skipped"]] == [_capture_id(1)]
