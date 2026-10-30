@@ -32,7 +32,10 @@ The bundle is a directory with
   EXIF facts and `thumbnail`, a path relative to the bundle to a ready 600px
   thumbnail, made upright (from the pixels rotated by the plan's rotateDeg)
   as app.core.thumbnail makes one, and copied as it is. It decides bytes,
-  digests, size and thumbnails.
+  digests, size and thumbnails. A line may also carry `sourceBucket`, the
+  bucket its sourceKey is in, one of SOURCE_BUCKETS; a line without one
+  names `zasqua-transition`, so a bundle written before the field existed
+  reads as it did.
 
 `rotateDeg` is authoritative: a camera pointing straight down cannot tell
 which way is up, so the EXIF Orientation the cameras wrote is close to
@@ -47,8 +50,9 @@ a dual record does not have exactly one `left` image named `_c0` and one
 `right` image named `_c1` for its ordinal, or a pair id other than its
 filename index (a UUID included); when a single record does not have exactly
 one `single` image named `_c0`, or has a pair id; when a rotateDeg is not 0, 90, 180 or 270; when the ordinals are not 1
-to N; or when a sourceKey repeats. The plan shape of 0.1, one entry per
-image, is not read: no unit ran it but the bench.
+to N; when a sourceBucket is not one of SOURCE_BUCKETS; or when a sourceKey
+repeats. The plan shape of 0.1, one entry per image, is not read: no unit
+ran it but the bench.
 
 Nothing is written unless every precondition holds:
 
@@ -86,7 +90,8 @@ ordinal order, is written whole or not at all:
    record's capture id and pair id, one file per image (its role, path,
    bytes, sha256 and rotation), `cameras: []`, `timestamp_utc` from
    capturedAt and a `provenance` object: `rebuiltFrom`, naming for each
-   file the source object and its EXIF Orientation, and `capturedAtSource`;
+   file the source object (its bucket and key) and its EXIF Orientation,
+   and `capturedAtSource`;
    a rerun does not append a line a capture id already has;
 3. in one transaction, the record (dual or single, captured, sequence =
    ordinal), its images (the canonical paths of the absent masters, each
@@ -122,7 +127,7 @@ before the commit, so no other path can hold or wait on its lock, and the
 record-before-volume order of paths that lock existing records is not
 crossed. No database transaction stays open across the listing or a file copy.
 
-Version: 0.2.0
+Version: 0.3.1
 """
 
 import argparse
@@ -149,7 +154,10 @@ logger = logging.getLogger(__name__)
 CATEGORY = "system"
 REBUILT_ACTION = "volume_rebuilt"
 FREED_METHOD = "rebuild"
-SOURCE_BUCKET = "zasqua-transition"
+SOURCE_BUCKET = "zasqua-transition"  # an images.jsonl line's bucket when it names none
+# The buckets a source image may be read from: last year's transition copies,
+# and the AHR preservation bags.
+SOURCE_BUCKETS = frozenset({"zasqua-transition", "zasqua-preservation"})
 ROTATIONS = (0, 90, 180, 270)
 MODES = ("dual", "single")
 # The roles of a record's images, in the order they are written, and the
@@ -180,6 +188,7 @@ class PlannedImage:
     role: str
     rotate_deg: int
     source_key: str
+    source_bucket: str  # one of SOURCE_BUCKETS
     size: int
     sha256: str
     sha1: str
@@ -379,6 +388,7 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         sha256 = line.get("sha256").lower() if isinstance(line.get("sha256"), str) else None
         size, width, height = line.get("bytes"), line.get("width"), line.get("height")
         thumb_rel, source_key = line.get("thumbnail"), line.get("sourceKey")
+        source_bucket = line.get("sourceBucket", SOURCE_BUCKET)
         reason = None
         if not sha1 or not _SHA1.match(sha1):
             reason = "sha1_invalid"
@@ -392,6 +402,8 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
             reason = "not_a_jpeg"
         elif not isinstance(source_key, str) or not source_key:
             reason = "source_key_missing"
+        elif not isinstance(source_bucket, str) or source_bucket not in SOURCE_BUCKETS:
+            reason = "source_bucket_invalid"
         elif not isinstance(thumb_rel, str) or not thumb_rel or Path(thumb_rel).is_absolute():
             reason = "thumbnail_invalid"
         thumb = None
@@ -406,7 +418,7 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
             problems.append({"volumeOrder": order, "reason": reason})
             continue
         facts[order] = {"sha1": sha1, "sha256": sha256, "bytes": size, "width": width, "height": height,
-                        "thumbnail": thumb, "sourceKey": source_key,
+                        "thumbnail": thumb, "sourceKey": source_key, "sourceBucket": source_bucket,
                         "orientation": line.get("exifOrientation")}
     if problems:
         raise RebuildRefused(f"images.jsonl has {len(problems)} invalid or repeated line(s)", problems)
@@ -425,8 +437,8 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
     for i in images:
         f = facts[i["volumeOrder"]]
         by_record.setdefault(i["ordinal"], []).append(PlannedImage(
-            i["volumeOrder"], i["filename"], i["role"], i["rotate"], f["sourceKey"], f["bytes"], f["sha256"],
-            f["sha1"], f["width"], f["height"], f["thumbnail"], f["orientation"]))
+            i["volumeOrder"], i["filename"], i["role"], i["rotate"], f["sourceKey"], f["sourceBucket"],
+            f["bytes"], f["sha256"], f["sha1"], f["width"], f["height"], f["thumbnail"], f["orientation"]))
     out = []
     for r in sorted(records, key=lambda r: r["ordinal"]):
         order = ROLES[r["mode"]]
@@ -573,7 +585,7 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
     for want in p.images:
         s = sources.get(want.role, {})
         checks += [
-            (f"manifest.provenance.{want.role}.bucket", s.get("bucket") == SOURCE_BUCKET),
+            (f"manifest.provenance.{want.role}.bucket", s.get("bucket") == want.source_bucket),
             (f"manifest.provenance.{want.role}.key", s.get("key") == want.source_key),
             (f"manifest.provenance.{want.role}.exifOrientation",
              "exifOrientation" in s and s["exifOrientation"] == want.exif_orientation),
@@ -762,7 +774,7 @@ def _capture_line(p: Planned, project_name: str) -> str:
         cameras=[],
     ).to_dict()
     record["provenance"] = {
-        "rebuiltFrom": [{"role": img.role, "bucket": SOURCE_BUCKET, "key": img.source_key,
+        "rebuiltFrom": [{"role": img.role, "bucket": img.source_bucket, "key": img.source_key,
                          "exifOrientation": img.exif_orientation} for img in p.images],
         "capturedAtSource": p.captured_at_source,
     }

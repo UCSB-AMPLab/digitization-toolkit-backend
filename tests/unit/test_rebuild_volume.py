@@ -14,7 +14,7 @@ and 4 the second, and 5 has no partner. Each odd image is the right-hand page
 
     python -m pytest tests/unit/test_rebuild_volume.py
 
-Version: 0.2.0
+Version: 0.3.1
 """
 
 import hashlib
@@ -1143,3 +1143,66 @@ def test_a_leftover_line_that_is_the_plans_is_reused(remote, db_session, overrid
     assert len(_rebuild(db_session, bundle, apply=True)["created"]) == 3
     assert [line["capture_id"] for line in _manifest_lines(override_projects_root)] == [
         _capture_id(n) for n in (1, 2, 3)]
+
+
+# ---------------------------------------------------------------------------
+# The source bucket of each image
+# ---------------------------------------------------------------------------
+
+def _from_bucket(bucket, orders=(1, 2, 3, 4, 5)):
+    """An image_over that names `bucket` as the sourceBucket of the images at `orders`."""
+    def change(images):
+        for i in images:
+            if i["volumeOrder"] in orders:
+                i["sourceBucket"] = bucket
+    return change
+
+
+@pytest.mark.unit
+def test_a_line_without_a_source_bucket_names_zasqua_transition(remote, db_session, override_projects_root,
+                                                                tmp_path):
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path, remote), apply=True)
+
+    lines = _manifest_lines(override_projects_root)
+    assert [s["bucket"] for line in lines for s in line["provenance"]["rebuiltFrom"]] == ["zasqua-transition"] * 5
+
+
+@pytest.mark.unit
+def test_a_line_naming_zasqua_preservation_names_it_in_rebuilt_from(remote, db_session, override_projects_root,
+                                                                    tmp_path):
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path, remote, image_over=[_from_bucket("zasqua-preservation")]), apply=True)
+
+    lines = _manifest_lines(override_projects_root)
+    for (_, _, files), line in zip(LAYOUT, lines):
+        assert line["provenance"]["rebuiltFrom"] == [
+            {"role": role, "bucket": "zasqua-preservation", "key": _source(v), "exifOrientation": EXIF[v]}
+            for v, _, role, _ in files]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("bucket", ["zasqua-elsewhere", "Zasqua-Preservation", "", 7, None, ["zasqua-transition"]])
+def test_a_source_bucket_outside_the_allowed_set_is_refused(remote, db_session, override_projects_root, tmp_path,
+                                                            bucket):
+    _volume(db_session)
+    bundle = _bundle(tmp_path, remote, image_over=[_from_bucket(bucket, orders=(3,))])
+    refusal = _refused(db_session, bundle, override_projects_root, match="images.jsonl")
+    assert refusal.problems == [{"volumeOrder": 3, "reason": "source_bucket_invalid"}]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("first,second", [
+    ([], [_from_bucket("zasqua-preservation", orders=(1, 2))]),
+    ([_from_bucket("zasqua-preservation")], [_from_bucket("zasqua-transition", orders=(1, 2))]),
+], ids=["transition-then-preservation", "preservation-then-transition"])
+def test_a_rerun_compares_a_done_records_source_bucket(remote, db_session, override_projects_root, tmp_path,
+                                                       first, second):
+    _volume(db_session)
+    _rebuild(db_session, _bundle(tmp_path / "first", remote, image_over=first), apply=True)
+
+    # The second bundle is the first with record 1's two images moved to the other bucket.
+    refusal = _refused(db_session, _bundle(tmp_path / "second", remote, image_over=first + second),
+                       override_projects_root, match="differ from the plan")
+    assert [(p["ordinal"], p["fields"]) for p in refusal.problems] == [
+        (1, ["manifest.provenance.left.bucket", "manifest.provenance.right.bucket"])]
