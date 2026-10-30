@@ -18,10 +18,13 @@ promotion, finishing its retakes writes no recapture_volume_completed either,
 so a rescan earns one turn, not two. After it, its retakes earn turns as any
 volume's do. Sending it to review
 (POST /collections/{id}/promote, app/api/collections.py) completes it as
-finishing a volume's recaptures does, and opens the turn for one new volume:
-the first promotion that succeeds writes rescan_volume_completed, and no
-later one does, so taking the volume back and promoting it again opens no
-second turn.
+finishing a volume's recaptures does, and opens the turn for one new volume.
+It is sent to review when none of its records is left captured, through
+whichever route moved the last one: POST /collections/{id}/promote, PATCH
+/records/{id}/status or POST /records/bulk-status, each of which calls
+award_rescan_turns. The first time that holds, rescan_volume_completed is
+written, and never again, so taking the volume back and sending it again
+opens no second turn.
 
 A record is pending while its status is rejected, or while it is captured
 and a current image still carries a rejection_id: the state the
@@ -42,10 +45,10 @@ would start a new volume during the recaptures turn; an admin's is let
 through, and a full rescan's is never refused. They take lock_turn before reading the turn or writing either event,
 after the record and volume row locks they already hold, so two operators
 cannot both start a new volume on one completion. Promotion of a volume with
-any pending record is refused separately (app/api/collections.py). A
-promotion of a full rescan that goes through takes its record locks, then
-the volume's row, then lock_turn, before it writes rescan_volume_completed:
-the order of every path that takes lock_turn.
+any pending record is refused separately (app/api/collections.py). The
+routes that send a full rescan to review hold their record locks, then take
+the volume's row, then lock_turn (award_rescan_turns): the order of every
+path that takes lock_turn.
 
 Version: 0.3.1
 """
@@ -160,6 +163,42 @@ def has_event(db: Session, action: str, collection_id: int) -> bool:
 		SystemLog.action == action,
 		SystemLog.detail.like(f"collection\\_id={collection_id} %", escape="\\"),
 	).first() is not None
+
+
+def award_rescan_turns(db: Session, collection_ids, actor: Optional[str]) -> None:
+	"""Write rescan_volume_completed for each full rescan among the volumes that is now sent to review.
+
+	Called by the routes that move records out of captured, after their
+	status changes and before their commit, with the volumes those changes
+	touched. A volume is due when it is a full rescan, carries no such event
+	yet, has at least one record and none left captured.
+
+	The caller holds its record locks. Volumes that are not full rescans are
+	dropped before any lock, so they take none; the rest have their rows
+	taken in id order (volume_stem.locked_volume_query), and only then the
+	turn lock, once. A path that holds the turn lock never waits for a
+	volume row, so this cannot deadlock against a retake, which holds its
+	volume's row and then asks for the turn.
+	"""
+	from app.core import volume_stem
+
+	rescans = sorted({
+		cid for cid in collection_ids
+		if cid is not None and (volume := db.get(Collection, cid)) is not None
+		and volume_is_full_rescan(volume)
+	})
+	if not rescans:
+		return
+	for cid in rescans:
+		volume_stem.locked_volume_query(db, cid).first()
+	lock_turn(db)
+	db.flush()  # the caller's status changes, before the counts
+	for cid in rescans:
+		if has_event(db, RESCAN_COMPLETED_ACTION, cid):
+			continue
+		statuses = [s for (s,) in db.query(Record.status).filter(Record.collection_id == cid).distinct()]
+		if statuses and "captured" not in statuses:
+			record_event(db, RESCAN_COMPLETED_ACTION, db.get(Collection, cid), actor)
 
 
 def _newest(db: Session, *actions: str) -> Optional[SystemLog]:

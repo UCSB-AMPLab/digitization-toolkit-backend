@@ -899,10 +899,10 @@ def promote_collection(
 
     The first successful promotion of a full rescan opens the recapture turn
     for one new volume, as finishing a volume's recaptures does: it writes
-    rescan_volume_completed under the turn lock, in the handover's
-    transaction. A volume already carrying that event writes none, so a
-    take-back and a second promotion open no second turn
-    (app.core.recapture_turn). A refused or empty promotion writes nothing.
+    rescan_volume_completed in the handover's transaction
+    (recapture_turn.award_rescan_turns). A volume already carrying that event
+    writes none, so a take-back and a second promotion open no second turn.
+    A refused or empty promotion writes nothing.
 
     Locks, in the order every path that takes the turn lock keeps: the
     records, then the volume's row (locked_volume_query, as the capture
@@ -970,16 +970,11 @@ def promote_collection(
             },
         )
 
-    # Records, then the volume's row, then the turn: the capture paths' order.
-    # Before the status changes, whose history rows reference the volume.
-    from app.core import recapture_turn, volume_stem
-    if recapture_turn.volume_is_full_rescan(collection):
-        volume_stem.locked_volume_query(db, collection_id).first()
-        recapture_turn.lock_turn(db)
-        if not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, collection_id):
-            recapture_turn.record_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, collection, current_user.username)
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
+    # Records, then the volume's row, then the turn: the capture paths' order.
+    from app.core.recapture_turn import award_rescan_turns
+    award_rescan_turns(db, [collection_id], current_user.username)
     # Queued in the handover's transaction, after the records' locks, so a
     # handover and its manifest are committed together or not at all
     # (app.core.fisqua_outbox). Nothing is queued when Fisqua is not configured.
