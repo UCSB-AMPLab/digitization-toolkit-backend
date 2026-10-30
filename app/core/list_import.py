@@ -43,7 +43,17 @@ with a different hash is refused (ListIdReused). The uploaded file itself is
 kept beside the reports as `list.json` (store_list_file), and stored_lists
 reads every list back for the queue, item by item in list order.
 
-Version: 0.2.0
+The digitisation queue synced with Fisqua (contract 1.7,
+app.core.fisqua_queue) is stored the same way, as a list of its own under
+a fixed list id: each applied revision is written as that list's
+`list.json`, in this format, and as one more numbered report run, whose
+`source` is `queue`; only its newest QUEUE_REPORTS_KEPT runs are kept.
+It checks and creates each new item's volume with check_item and
+create_volume, the steps an import takes for one item. Its done marks are
+keyed by each entry's itemId, since positions change between revisions;
+a file's list keeps them by position (done_key).
+
+Version: 0.3.0
 """
 
 from __future__ import annotations
@@ -635,6 +645,70 @@ def _reject(position: int, code: Any, reason: str) -> dict:
     }
 
 
+def check_item(position: int, item: Any, first_code: dict, first_stem: dict) -> tuple[Optional[str], dict]:
+    """The reject reason for one item, or None and its volume's column values (see _check_item)."""
+    return _check_item(position, item, first_code, first_stem)
+
+
+def first_positions(items: list) -> tuple[dict, dict]:
+    """(first position of each referenceCode, first position of each filenameStem), as check_item takes them."""
+    return (_first_positions(items, _reference_code),
+            _first_positions(items, lambda item: item.get("filenameStem")))
+
+
+def create_volume(db: Session, list_id: str, position: int, project_id: int, actor: Optional[str],
+                  values: dict) -> tuple[Optional[int], Optional[str]]:
+    """Create one checked item's volume in `project_id` and commit it: (its id, None), or (None, a reject reason).
+
+    `values` are check_item's column values, to which a caller may add
+    other Collection columns. The volume is refused as reference_code_on_unit
+    or filename_stem_on_unit when a volume on the unit already has its code
+    or its stem; any failure at the database rolls back this volume only.
+    """
+    # The lookups and the insert are one step for the rollback-and-reject
+    # handling: a database failure at any of them costs this item only.
+    # The new id is taken at the flush, before the commit, so nothing is
+    # read back after it: with the session expiring on commit, reading
+    # the id afterwards is a query that can fail for a volume already
+    # committed, which a rollback could no longer remove.
+    try:
+        if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
+            return None, "reference_code_on_unit"
+        if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
+            return None, "filename_stem_on_unit"
+        volume = Collection(project_id=project_id, created_by=actor, **values)
+        db.add(volume)
+        db.flush()
+        volume_id = volume.id
+        db.commit()
+    except IntegrityError as exc:
+        db.rollback()
+        return None, _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+    except StemDirectoryCollisionError as exc:
+        # The model's flush listener refused the stem's directory; this
+        # item only is rolled back and reported.
+        db.rollback()
+        return None, _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
+    except StemHeldOffsiteError:
+        # The model's flush listener found offsite keys under the stem;
+        # this item only is rolled back and reported.
+        db.rollback()
+        return None, "filename_stem_held_offsite"
+    except ReferenceCodeDiffersFromStemError:
+        # _check_item refuses this first; the model's flush listener is
+        # the rule for every writer, so its refusal is reported the same.
+        db.rollback()
+        return None, "filename_stem_differs_from_reference_code"
+    except SQLAlchemyError:
+        # Any other database failure on this item (a lost connection, a
+        # full disk, a value the driver cannot bind) costs this item
+        # only: it is rolled back and reported, and the import goes on.
+        logger.exception("Import of list %s: item %d refused by the database", list_id, position)
+        db.rollback()
+        return None, "refused_by_database"
+    return volume_id, None
+
+
 def _import_items(db: Session, list_id: str, list_name: str, project: Project, project_created: bool,
                   items: list, actor: Optional[str], notes: Any = None) -> dict:
     """Create each item's volume in `project` (found or created by _project_for); return the report."""
@@ -658,55 +732,9 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             rejects.append(_reject(position, code, reason))
             continue
 
-        # The lookups and the insert are one step for the rollback-and-reject
-        # handling: a database failure at any of them costs this item only.
-        # The new id is taken at the flush, before the commit, so nothing is
-        # read back after it: with the session expiring on commit, reading
-        # the id afterwards is a query that can fail for a volume already
-        # committed, which a rollback could no longer remove.
-        try:
-            if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
-                rejects.append(_reject(position, code, "reference_code_on_unit"))
-                continue
-            if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
-                rejects.append(_reject(position, code, "filename_stem_on_unit"))
-                continue
-            volume = Collection(project_id=project_id, created_by=actor, **values)
-            db.add(volume)
-            db.flush()
-            volume_id = volume.id
-            db.commit()
-        except IntegrityError as exc:
-            db.rollback()
-            reason = _CONSTRAINT_REASONS.get(constraint_name(exc), "refused_by_database")
+        volume_id, reason = create_volume(db, list_id, position, project_id, actor, values)
+        if reason is not None:
             rejects.append(_reject(position, code, reason))
-            continue
-        except StemDirectoryCollisionError as exc:
-            # The model's flush listener refused the stem's directory; this
-            # item only is rolled back and reported.
-            db.rollback()
-            reason = _STEM_DIRECTORY_REASONS.get(type(exc), "refused_by_database")
-            rejects.append(_reject(position, code, reason))
-            continue
-        except StemHeldOffsiteError:
-            # The model's flush listener found offsite keys under the stem;
-            # this item only is rolled back and reported.
-            db.rollback()
-            rejects.append(_reject(position, code, "filename_stem_held_offsite"))
-            continue
-        except ReferenceCodeDiffersFromStemError:
-            # _check_item refuses this first; the model's flush listener is
-            # the rule for every writer, so its refusal is reported the same.
-            db.rollback()
-            rejects.append(_reject(position, code, "filename_stem_differs_from_reference_code"))
-            continue
-        except SQLAlchemyError:
-            # Any other database failure on this item (a lost connection, a
-            # full disk, a value the driver cannot bind) costs this item
-            # only: it is rolled back and reported, and the import goes on.
-            logger.exception("Import of list %s: item %d refused by the database", list_id, position)
-            db.rollback()
-            rejects.append(_reject(position, code, "refused_by_database"))
             continue
         created.append({
             "position": position,
@@ -1088,7 +1116,12 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
     an integer sequence comes after those with one. An item that is not a
     JSON object has no fields to show and is left out. `notes` is given as
     the file has it when it is a string, and so is `action`, which the
-    contract does not name; any other value of either is None.
+    contract does not name; any other value of either is None. `assignee`
+    (contract 1.7, a queue entry's unit username) is a string or None, and
+    `withdrawn` is True only when the item says true; a file import's items
+    have neither, so None and False. `itemId` is the queue entry's id, or
+    None, and `retakes` the entry's list of retakes as the item gives it
+    (a spot recapture's), or [] when it has none.
     """
     try:
         found_id, _, items = check_envelope(document)
@@ -1116,6 +1149,10 @@ def _list_items(document: Any, list_id: str) -> Optional[list[dict]]:
             "title": text(item, "title"),
             "notes": text(item, "notes"),
             "action": text(item, "action"),
+            "assignee": text(item, "assignee"),
+            "withdrawn": item.get("withdrawn") is True,
+            "itemId": text(item, "itemId"),
+            "retakes": item["retakes"] if isinstance(item.get("retakes"), list) else [],
         })
     out.sort(key=lambda i: (i["sequence"] is None, i["sequence"] or 0, i["position"]))
     return out
@@ -1131,7 +1168,9 @@ def stored_lists() -> list[dict]:
     from the file, the other two are None, and the list comes after every
     dated one. `items` is in list order (_list_items); when list.json is
     missing, cannot be read as a list, or is another list's file, `items`
-    is empty and `listFileMissing` is True. Reads only.
+    is empty and `listFileMissing` is True. `source` is `queue` for the
+    digitisation queue synced with Fisqua (its report says so), else
+    `file`. Reads only.
     """
     root = reports_dir()
     try:
@@ -1164,6 +1203,7 @@ def stored_lists() -> list[dict]:
             continue
         lists.append({
             "listId": list_id,
+            "source": QUEUE_SOURCE if report.get("source") == QUEUE_SOURCE else "file",
             "listName": report.get("listName"),
             "projectId": report.get("projectId"),
             "importedAt": report.get("importedAt"),
@@ -1179,18 +1219,90 @@ def stored_lists() -> list[dict]:
 
 DONE_FILE_NAME = "done.json"
 
+# The `source` of the digitisation queue's reports and of its entry in stored_lists.
+QUEUE_SOURCE = "queue"
+# The list id the digitisation queue is stored under, the same on every unit.
+QUEUE_LIST_ID = str(uuid.uuid5(uuid.NAMESPACE_OID, "captua.fisqua-digitisation-queue"))
+# How many of the queue's report runs are kept, newest first.
+QUEUE_REPORTS_KEPT = 20
+
+
+def project_for(db: Session, name: str, actor: Optional[str]) -> tuple[Project, bool]:
+    """The project named `name` as an import finds it, created (by an admin's rights) if there is none.
+
+    For the queue sync, which may create its list's project. Raises what
+    _project_for raises: ProjectLockUnavailable, or ListRefused when the
+    project's directory would be a volume's stem.
+    """
+    return _project_for(db, name, actor, True)
+
+
+def find_project(db: Session, name: str) -> Optional[Project]:
+    """The project an import of a list named `name` would use, or None."""
+    return _find_project(db, name)
+
+
+def store_queue_list(list_id: str, document: dict, report: dict) -> None:
+    """Keep one applied queue revision as the list `list_id`: its list.json, then a report run.
+
+    `document` is a digitisation-list envelope whose id is `list_id`; it
+    replaces list.json whole and atomically, since each revision is the
+    whole queue. `report` is stored as the list's next run (store_report),
+    with `source` set to QUEUE_SOURCE, so stored_lists dates the list by
+    the revision's `importedAt`. No hash file is written: a revision is
+    never refused as ListIdReused, and a file upload under this id is
+    refused as ListUnverifiable, since its runs carry no fileSha256. Under
+    the list lock, which done marks also take. Raises OSError if either
+    write fails.
+    """
+    list_id = str(uuid.UUID(list_id))
+    directory = reports_dir() / list_id
+    directory.mkdir(parents=True, exist_ok=True)
+    with _list_lock(list_id):
+        _replace_file(directory / LIST_FILE_NAME,
+                      json.dumps(document, ensure_ascii=False, indent=2).encode("utf-8"))
+        store_report({**report, "listId": list_id, "source": QUEUE_SOURCE})
+        _prune_runs(directory, list_id, QUEUE_REPORTS_KEPT)
+
+
+def _prune_runs(directory: Path, list_id: str, keep: int) -> None:
+    """Remove all but the `keep` highest-numbered report runs of a list; a failure is logged.
+
+    For the digitisation queue only, which stores a run per applied
+    revision: a file import's runs are its import history and are kept.
+    """
+    runs = _run_files(directory, list_id)
+    for _, path in runs[:-keep] if keep > 0 else runs:
+        try:
+            path.unlink()
+        except OSError:
+            logger.warning("Could not remove the old queue report %s", path)
+
 
 class ListItemNotFound(Exception):
     """No stored list file of this id holds an item at this position."""
 
 
-def read_done_marks(list_id: str) -> dict[int, dict]:
-    """The items marked done by hand, as position -> {by, at}, from `<list-id>/done.json`.
+def done_key(list_id: str, item: dict) -> Any:
+    """What an item's done mark is keyed by: its itemId in the digitisation queue, else its position.
 
-    The file holds {"<position>": {"done": true, "by": ..., "at": ...}}. A
-    file that is missing, unreadable or not such an object reads as no
-    marks, and an entry that is not one is skipped, so a damaged file never
-    stops the queue from being read.
+    Queue positions change from one revision to the next; an entry's itemId
+    does not. None for a queue item without an itemId, which cannot be marked.
+    """
+    if str(uuid.UUID(list_id)) == QUEUE_LIST_ID:
+        return item.get("itemId")
+    return item["position"]
+
+
+def read_done_marks(list_id: str) -> dict:
+    """The items marked done by hand, as key -> {by, at}, from `<list-id>/done.json`.
+
+    The key is done_key's: the position, an int, for a file's list, held in
+    the file as {"<position>": {"done": true, "by": ..., "at": ...}}; the
+    itemId for the digitisation queue, {"<itemId>": {...}}. A file that is
+    missing, unreadable or not such an object reads as no marks, and an
+    entry that is not one is skipped, so a damaged file never stops the
+    queue from being read.
     """
     path = reports_dir() / str(uuid.UUID(list_id)) / DONE_FILE_NAME
     try:
@@ -1199,26 +1311,49 @@ def read_done_marks(list_id: str) -> dict[int, dict]:
         return {}
     if not isinstance(data, dict):
         return {}
+    by_item = str(uuid.UUID(list_id)) == QUEUE_LIST_ID
     marks = {}
     for key, entry in data.items():
-        if not (isinstance(key, str) and key.isdigit() and isinstance(entry, dict) and entry.get("done") is True):
+        if not (isinstance(key, str) and key and isinstance(entry, dict) and entry.get("done") is True):
             continue
-        marks[int(key)] = {"by": entry.get("by"), "at": entry.get("at")}
+        if by_item:
+            marks[key] = {"by": entry.get("by"), "at": entry.get("at")}
+        elif key.isdigit():
+            marks[int(key)] = {"by": entry.get("by"), "at": entry.get("at")}
     return marks
 
 
-def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str]) -> tuple[dict, Optional[dict]]:
+class ListItemIdDiffers(Exception):
+    """The item at the position is not the queue entry the caller named."""
+
+
+class ListItemIdRequired(Exception):
+    """A done mark on the digitisation queue named no itemId; nothing has been written."""
+
+
+def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str],
+                  item_id: Optional[str] = None) -> tuple[dict, Optional[dict]]:
     """Mark the item at `position` done (or remove its mark), under the list lock.
 
     Returns the item, as _list_items gives it, and its mark ({by, at}, or
     None once removed). Raises ListItemNotFound when the list has no stored
-    file readable as that list, or the file holds no item object at that
-    position. done.json is rewritten whole, atomically (a temporary file,
+    file readable as that list, the file holds no item object at that
+    position, or (in the digitisation queue) that item has no itemId. The
+    mark is keyed by done_key: a queue item's by its itemId, so it stays
+    with the entry when a later revision moves it. For the queue `item_id`
+    is required (ListItemIdRequired without it), and an item at that
+    position whose itemId differs raises ListItemIdDiffers, so a mark sent
+    against an older revision is not put on another entry.
+    done.json is rewritten whole, atomically (a temporary file,
     fsynced, then os.replace); a damaged one is read as no marks and so
     replaced. Raises OSError, with done.json unchanged, if it cannot be
     written.
     """
     list_id = str(uuid.UUID(list_id))
+    if list_id == QUEUE_LIST_ID and item_id is None:
+        # A position alone names whatever entry the latest revision put
+        # there, which may not be the one the caller saw.
+        raise ListItemIdRequired(list_id)
     directory = reports_dir() / list_id
     if not directory.is_dir():
         raise ListItemNotFound(list_id)
@@ -1235,17 +1370,22 @@ def set_done_mark(list_id: str, position: int, done: bool, actor: Optional[str])
         item = next((i for i in items or [] if i["position"] == position), None)
         if item is None:
             raise ListItemNotFound(list_id)
+        if item_id is not None and item.get("itemId") != item_id:
+            raise ListItemIdDiffers(list_id)
+        key = done_key(list_id, item)
+        if key is None:
+            raise ListItemNotFound(list_id)
         marks = read_done_marks(list_id)
         if done:
-            marks[position] = {
+            marks[key] = {
                 "by": actor,
                 "at": datetime.now(timezone.utc).strftime("%Y-%m-%dT%H:%M:%S.%fZ"),
             }
         else:
-            marks.pop(position, None)
-        body = {str(p): {"done": True, **mark} for p, mark in sorted(marks.items())}
+            marks.pop(key, None)
+        body = {str(k): {"done": True, **mark} for k, mark in sorted(marks.items())}
         _replace_file(directory / DONE_FILE_NAME, json.dumps(body, ensure_ascii=False, indent=2).encode("utf-8"))
-    return item, marks.get(position)
+    return item, marks.get(key)
 
 
 def _replace_file(target: Path, data: bytes) -> None:

@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from datetime import datetime, timezone
 from sqlalchemy import event, inspect as sa_inspect, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
@@ -275,6 +275,16 @@ class Collection(Base):
     created_by = Column(String(255), nullable=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
+
+    # The digitisation queue synced with Fisqua (contract 1.7,
+    # app.core.fisqua_queue), and set only by that sync. assignee_username
+    # is the unit username the queue entry is assigned to, as users.username
+    # holds it (not a foreign key: Fisqua may name a user deleted since).
+    # queue_hidden_at is when a withdrawn entry took the volume off Cola,
+    # which only happens while the volume has no records; a later entry
+    # for the same reference code clears it.
+    assignee_username = Column(String(150), nullable=True)
+    queue_hidden_at = Column(DateTime, nullable=True)
 
     # Relationships
     project = relationship("Project", back_populates="collections")

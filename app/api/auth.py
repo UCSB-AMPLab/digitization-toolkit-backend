@@ -1,8 +1,8 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 import hmac
 
-from fastapi import APIRouter, Depends, HTTPException, Security, Query, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -14,6 +14,7 @@ from app.core.security import hash_password, verify_password, create_access_toke
 from app.core.config import settings, is_dev_env
 from app.core.login_throttle import login_throttle
 from app.core.audit import log_event
+from app.core.fisqua_queue import notify_operators_changed
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
@@ -56,6 +57,7 @@ def register(
     payload: UserCreate,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     bootstrap_token: Optional[str] = Header(default=None, alias="X-Bootstrap-Token"),
+    background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_dependency),
 ):
     is_first_user = db.query(User).count() == 0
@@ -102,7 +104,14 @@ def register(
     actor = caller.username if not is_first_user else "bootstrap"
     log_event(db, level="INFO", category="access", action="user_created",
               actor=actor, subject=user.username)
+    _operators_changed(background_tasks)
     return UserRead.model_validate(user)
+
+
+def _operators_changed(background_tasks: Optional[BackgroundTasks]) -> None:
+    """Send the unit's users to Fisqua after the response (contract 1.7); a failure never reaches the route."""
+    if background_tasks is not None:
+        background_tasks.add_task(notify_operators_changed)
 
 
 def _client_ip(request: Request) -> str:
@@ -285,6 +294,7 @@ def get_user(
 def update_user_role(
     user_id: int,
     payload: UserRoleUpdate,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
@@ -298,6 +308,7 @@ def update_user_role(
     db.add(user)
     db.commit()
     db.refresh(user)
+    _operators_changed(background_tasks)
     return UserRead.model_validate(user)
 
 
@@ -305,6 +316,7 @@ def update_user_role(
 def set_user_active(
     user_id: int,
     is_active: bool,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
@@ -318,12 +330,14 @@ def set_user_active(
     db.add(user)
     db.commit()
     db.refresh(user)
+    _operators_changed(background_tasks)
     return UserRead.model_validate(user)
 
 
 @router.delete("/users/{user_id}")
 def delete_user(
     user_id: int,
+    background_tasks: BackgroundTasks,
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency)
 ) -> dict:
@@ -346,4 +360,5 @@ def delete_user(
     db.commit()
     log_event(db, level="INFO", category="access", action="user_deleted",
               actor=current_user.username, subject=deleted_username)
+    _operators_changed(background_tasks)
     return {"detail": "user deleted successfully"}
