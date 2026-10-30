@@ -89,7 +89,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.3.0
+Version: 0.3.2
 """
 
 import hashlib
@@ -935,8 +935,12 @@ def _version_refused_volumes(db: Session) -> list:
     for row in rows:
         if not _version_refusal(row.problems):
             continue
+        # A record missing a side stays captured on the unit until it is
+        # recaptured and is left out of the handover (capture_manifest), so it
+        # does not hold the volume back.
         captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
-                                              Record.status == "captured").first()
+                                              Record.status == "captured",
+                                              Record.missing_side.is_(None)).first()
         collection = db.get(Collection, row.collection_id)
         if captured is not None or collection is None:
             continue

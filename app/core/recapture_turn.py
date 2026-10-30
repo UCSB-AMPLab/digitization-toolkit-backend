@@ -26,12 +26,21 @@ award_rescan_turns. The first time that holds, rescan_volume_completed is
 written, and never again, so taking the volume back and sending it again
 opens no second turn.
 
-A record is pending while its status is rejected, or while it is captured
-and a current image still carries a rejection_id: the state the
+A record is pending while its status is rejected; while it is captured
+and a current image still carries a rejection_id, the state the
 prepare-for-retake transition (PATCH /records/{id}/status, rejected ->
-captured) leaves it in until a capture replaces the image. pending_clause and
-record_is_pending are that one definition, used by the summary, the turn,
-the completion test and the promotion refusal.
+captured) leaves it in until a capture replaces the image; or while it
+misses a side (records.missing_side, set by app.core.rebuild_volume on a
+dual opening only one camera photographed) and is not excluded, until a
+dual retake writes both images and clears it. pending_clause and
+record_is_pending are that one definition, used by the summary, the
+to-retake list, the turn and the completion test. pending_reason names
+which of the three holds.
+
+The promotion refusal counts only the first two (retake_clause,
+volume_retakes_pending): a record that misses a side does not hold its
+volume back. Promotion and the status routes leave it captured on the unit,
+and send the volume's other records (app.api.collections.promote_collection).
 
 The turn is "free" when no record is pending; otherwise "new" when the
 newest completion, of either kind, is newer than the newest start, else
@@ -45,19 +54,19 @@ would start a new volume during the recaptures turn; an admin's is let
 through, and a full rescan's is never refused. They take lock_turn before reading the turn or writing either event,
 after the record and volume row locks they already hold, so two operators
 cannot both start a new volume on one completion. Promotion of a volume with
-any pending record is refused separately (app/api/collections.py). The
+a record waiting for a retake is refused separately (app/api/collections.py). The
 routes that send a full rescan to review hold their record locks, then take
 the volume's row, then lock_turn (award_rescan_turns): the order of every
 path that takes lock_turn.
 
-Version: 0.3.1
+Version: 0.3.2
 """
 from datetime import datetime, timezone
 import json
 import re
 from typing import Optional
 
-from sqlalchemy import and_, exists, func, or_, text
+from sqlalchemy import and_, case, exists, func, or_, text
 from sqlalchemy.orm import Session
 
 from app.models.collection import Collection
@@ -98,22 +107,61 @@ def lock_turn(db: Session) -> None:
 		db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _TURN_LOCK_KEY})
 
 
-def pending_clause(record=Record):
-	"""SQL for "this record is pending"; `record` may be an alias of Record."""
-	marked = exists().where(
+REJECTED = "rejected"
+PREPARED = "prepared"
+MISSING_SIDE = "missing_side"
+
+
+def _marked(record):
+	return exists().where(
 		RecordImage.record_id == record.id,
 		RecordImage.is_current.is_(True),
 		RecordImage.rejection_id.isnot(None),
 	)
-	return or_(record.status == "rejected", and_(record.status == "captured", marked))
+
+
+def retake_clause(record=Record):
+	"""SQL for "this record waits for the retake of a rejection": rejected, or prepared for retake."""
+	return or_(record.status == "rejected", and_(record.status == "captured", _marked(record)))
+
+
+def missing_side_clause(record=Record):
+	"""SQL for "this record misses a side and is not excluded"."""
+	return and_(record.missing_side.isnot(None), record.status != "excluded")
+
+
+def pending_clause(record=Record):
+	"""SQL for "this record is pending"; `record` may be an alias of Record."""
+	return or_(retake_clause(record), missing_side_clause(record))
+
+
+def pending_reason_clause(record=Record):
+	"""SQL for why a pending record is pending: REJECTED, PREPARED or MISSING_SIDE (NULL when it is not).
+
+	In that order: a rejected record that also misses a side is named rejected.
+	"""
+	return case(
+		(record.status == "rejected", REJECTED),
+		(and_(record.status == "captured", _marked(record)), PREPARED),
+		(missing_side_clause(record), MISSING_SIDE),
+		else_=None,
+	)
+
+
+def pending_reason(rec: Record) -> Optional[str]:
+	"""The same test as pending_reason_clause, on a loaded record."""
+	if rec.status == "rejected":
+		return REJECTED
+	if rec.status == "captured" and any(img.is_current and img.rejection_id is not None for img in rec.images):
+		return PREPARED
+	if rec.missing_side is not None and rec.status != "excluded":
+		return MISSING_SIDE
+	return None
 
 
 def record_is_pending(rec: Record) -> bool:
 	"""The same test as pending_clause, on a loaded record."""
-	if rec.status == "rejected":
-		return True
-	return rec.status == "captured" and any(
-		img.is_current and img.rejection_id is not None for img in rec.images)
+	return pending_reason(rec) is not None
 
 
 def pending_records(db: Session) -> int:
@@ -126,6 +174,15 @@ def volume_pending(db: Session, collection_id: int) -> int:
 	return (
 		db.query(func.count(Record.id))
 		.filter(Record.collection_id == collection_id, pending_clause())
+		.scalar() or 0
+	)
+
+
+def volume_retakes_pending(db: Session, collection_id: int) -> int:
+	"""How many records of the volume wait for the retake of a rejection; what refuses its promotion."""
+	return (
+		db.query(func.count(Record.id))
+		.filter(Record.collection_id == collection_id, retake_clause())
 		.scalar() or 0
 	)
 

@@ -1,4 +1,4 @@
-# Version: 0.3.1
+# Version: 0.3.2
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -1263,6 +1263,10 @@ def trigger_dual_capture(
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.
 			change_record_status(db, record, "captured", current_user.username)
+			# An opening that missed a side (app.core.rebuild_volume) has both
+			# pages now: the lone image is superseded above, and the record is
+			# an ordinary dual record, sent with its volume's next handover.
+			record.missing_side = None
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()

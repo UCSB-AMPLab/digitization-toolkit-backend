@@ -9,9 +9,10 @@ copied server-side into the bucket under contract names, at
 `<tenant>/<stem>/captures/<stem>-img_<nnnn>_c<n>.jpg`, and never come to the
 card. This command gives an empty volume the records it would have had if
 Captua had captured those openings, one dual record per pair, as
-app.api.cameras.trigger_dual_capture writes one, and a single record for an
-image left without a partner, with each master stored offsite and freed from
-birth, so the volume can be handed over, reviewed in Fisqua and its rejected
+app.api.cameras.trigger_dual_capture writes one, a single record for an
+image left without a partner, and a dual record with one image for an
+opening only one camera photographed, with each master stored offsite and
+freed from birth, so the volume can be handed over, reviewed in Fisqua and its rejected
 pages retaken from the unit like any other.
 
 The bundle is a directory with
@@ -26,7 +27,14 @@ The bundle is a directory with
   image named `..._c1.jpg` (camera 1, the odd image), and its filename
   index `<stem>-img_<nnnn>` as its pair id, as capture gives a dual capture
   one (capture.service.dual_capture_image); a single record has one
-  `single` image named `..._c0.jpg`, and a null pair id.
+  `single` image named `..._c0.jpg`, and a null pair id. A dual record may
+  also carry `missingSide`, `left` or `right`: the page of the opening
+  that was never photographed. It then has exactly one image, the other
+  page: the `right` image `_c1` when the left is missing, the `left` image
+  `_c0` when the right is missing, with its filename index as its pair id
+  as any dual record. The record is written with records.missing_side set,
+  which makes it pending (app.core.recapture_turn) until a dual retake
+  writes both pages. No other record carries `missingSide`.
 * `images.jsonl`: one line per source image, with `volumeOrder`,
   `sourceKey`, `bytes`, `sha256`, `sha1`, `width`, `height`, `format`, the
   EXIF facts and `thumbnail`, a path relative to the bundle to a ready 600px
@@ -48,7 +56,10 @@ The bundle is refused when the two files do not name the same images; when a
 volumeOrder, a file name, a capture id, a pair id or an ordinal repeats; when
 a dual record does not have exactly one `left` image named `_c0` and one
 `right` image named `_c1` for its ordinal, or a pair id other than its
-filename index (a UUID included); when a single record does not have exactly
+filename index (a UUID included); when a dual record's `missingSide` is
+neither absent, null, `left` nor `right`, or it misses a side and does not
+have exactly one image, on the other side, named for that side's camera;
+when a single record carries a `missingSide`, does not have exactly
 one `single` image named `_c0`, or has a pair id; when a rotateDeg is not 0, 90, 180 or 270; when the ordinals are not 1
 to N; when a sourceBucket is not one of SOURCE_BUCKETS; or when a sourceKey
 repeats. The plan shape of 0.1, one entry per image, is not read: no unit
@@ -91,10 +102,11 @@ ordinal order, is written whole or not at all:
    bytes, sha256 and rotation), `cameras: []`, `timestamp_utc` from
    capturedAt and a `provenance` object: `rebuiltFrom`, naming for each
    file the source object (its bucket and key) and its EXIF Orientation,
-   and `capturedAtSource`;
+   `capturedAtSource`, and `missingSide` for a record that misses a side
+   (its line lists its one file);
    a rerun does not append a line a capture id already has;
 3. in one transaction, the record (dual or single, captured, sequence =
-   ordinal), its images (the canonical paths of the absent masters, each
+   ordinal, missing_side as planned), its images (the canonical paths of the absent masters, each
    master freed with the listed size, the shared capture id and pair id,
    each image's role and rotation) and a verified offsite row per image at
    the planned key with the planned SHA1, committed through
@@ -127,7 +139,7 @@ before the commit, so no other path can hold or wait on its lock, and the
 record-before-volume order of paths that lock existing records is not
 crossed. No database transaction stays open across the listing or a file copy.
 
-Version: 0.3.1
+Version: 0.3.2
 """
 
 import argparse
@@ -165,6 +177,8 @@ MODES = ("dual", "single")
 # names them (app.api.cameras.trigger_dual_capture), and a single one.
 ROLES = {"dual": ("left", "right"), "single": ("single",)}
 CAMERA_FOR_ROLE = {"left": 0, "right": 1, "single": 0}
+# A dual record's missingSide, and the role of its one image.
+OTHER_SIDE = {"left": "right", "right": "left"}
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -207,6 +221,7 @@ class Planned:
     captured_at: datetime  # aware, UTC
     captured_at_source: Optional[str]
     images: List[PlannedImage] = field(default_factory=list)  # in ROLES order
+    missing_side: Optional[str] = None  # "left" or "right" for a dual opening that misses that page
 
 
 # ---------------------------------------------------------------------------
@@ -298,8 +313,14 @@ def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
     for img in images:
         if not _is_int(img.get("volumeOrder")) or img["volumeOrder"] < 1:
             return {**base, "reason": "volume_order_invalid", "value": img.get("volumeOrder")}
+    missing = e.get("missingSide")
+    if missing is not None and (mode != "dual" or not isinstance(missing, str) or missing not in OTHER_SIDE):
+        return {**base, "reason": "missing_side_invalid", "value": missing}
     roles = sorted(str(img.get("role")) for img in images)
-    if roles != sorted(ROLES[mode]):
+    if missing is not None:
+        if roles != [OTHER_SIDE[missing]]:
+            return {**base, "reason": "missing_side_images_invalid", "missingSide": missing, "roles": roles}
+    elif roles != sorted(ROLES[mode]):
         return {**base, "reason": f"{mode}_{'roles' if mode == 'dual' else 'images'}_invalid", "roles": roles}
     for img in images:
         wanted = f"{index}_c{CAMERA_FOR_ROLE[img['role']]}.jpg"
@@ -355,7 +376,8 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         source = e.get("capturedAtSource")
         records.append({"ordinal": ordinal, "captureId": e["captureId"], "pairId": e.get("pairId"),
                         "mode": e["mode"], "at": _captured_at(e["capturedAt"]),
-                        "source": source if isinstance(source, str) else None})
+                        "source": source if isinstance(source, str) else None,
+                        "missingSide": e.get("missingSide")})
         images.extend({"ordinal": ordinal, "volumeOrder": i["volumeOrder"], "filename": i["filename"],
                        "role": i["role"], "rotate": i["rotateDeg"]} for i in e["images"])
     if problems:
@@ -443,7 +465,8 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
     for r in sorted(records, key=lambda r: r["ordinal"]):
         order = ROLES[r["mode"]]
         out.append(Planned(r["ordinal"], r["captureId"], r["pairId"], r["mode"], r["at"], r["source"],
-                           sorted(by_record[r["ordinal"]], key=lambda i: order.index(i.role))))
+                           sorted(by_record[r["ordinal"]], key=lambda i: order.index(i.role)),
+                           r["missingSide"]))
     return counter_after, out
 
 
@@ -515,6 +538,7 @@ def _differences(p: Planned, rec, imgs: list, rows: Dict[tuple, object], line: O
         ("capture_mode", rec.capture_mode == p.mode),
         ("status", rec.status == "captured"),
         ("sequence", rec.sequence == p.ordinal),
+        ("missing_side", rec.missing_side == p.missing_side),
     ) if not ok]
     by_role = {img.role: img for img in imgs}
     if len(imgs) != len(p.images) or set(by_role) != {i.role for i in p.images}:
@@ -556,7 +580,7 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
     Its pair id; each file entry (path, sha256, bytes, rotation), named
     after its role; its timestamp_utc against capturedAt in UTC; and its
     provenance (capturedAtSource, and each file's rebuiltFrom bucket,
-    sourceKey and EXIF Orientation), each named on its own.
+    sourceKey and EXIF Orientation, and its missingSide), each named on its own.
     """
     if line is None:
         return ["manifest.missing"]
@@ -580,6 +604,7 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
     provenance = line.get("provenance") if isinstance(line.get("provenance"), dict) else {}
     checks.append(("manifest.provenance.capturedAtSource",
                    "capturedAtSource" in provenance and provenance["capturedAtSource"] == p.captured_at_source))
+    checks.append(("manifest.provenance.missingSide", provenance.get("missingSide") == p.missing_side))
     sources = provenance.get("rebuiltFrom")
     sources = {s.get("role"): s for s in sources if isinstance(s, dict)} if isinstance(sources, list) else {}
     for want in p.images:
@@ -778,6 +803,8 @@ def _capture_line(p: Planned, project_name: str) -> str:
                          "exifOrientation": img.exif_orientation} for img in p.images],
         "capturedAtSource": p.captured_at_source,
     }
+    if p.missing_side is not None:
+        record["provenance"]["missingSide"] = p.missing_side
     return json.dumps(record, ensure_ascii=False)
 
 
@@ -1044,7 +1071,8 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
                                       "record_id": done[p.capture_id]["record_id"]})
     if not apply:
         report["created"] = [{"ordinal": p.ordinal, "mode": p.mode, "capture_id": p.capture_id,
-                              "pair_id": p.pair_id, "files": files(p)} for p in todo]
+                              "pair_id": p.pair_id, "missing_side": p.missing_side, "files": files(p)}
+                             for p in todo]
         return report
 
     from app.core import audit, capture_counter
@@ -1094,8 +1122,8 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
                                               keys[img.filename], img.sha1, sizes[keys[img.filename]],
                                               created["freed_at"]))
         report["created"].append({"ordinal": p.ordinal, "mode": p.mode, "capture_id": p.capture_id,
-                                  "pair_id": p.pair_id, "files": files(p), "record_id": created["record_id"],
-                                  "image_ids": created["image_ids"]})
+                                  "pair_id": p.pair_id, "missing_side": p.missing_side, "files": files(p),
+                                  "record_id": created["record_id"], "image_ids": created["image_ids"]})
     report["manifest"] = str(freed_manifest.path) if freed_manifest.path else None
     report["resequenced"] = _resequence_others(db, collection_id, planned)
     db.expire_all()
@@ -1142,6 +1170,7 @@ def _write_record(db: Session, p: Planned, *, collection_id: int, stem: str, pro
             collection_id=collection_id,
             sequence=p.ordinal,
             capture_mode=p.mode,
+            missing_side=p.missing_side,
             created_at=p.captured_at,
         )
         db.add(record)

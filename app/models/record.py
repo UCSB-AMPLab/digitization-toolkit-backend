@@ -1,4 +1,4 @@
-# Version: 0.2.1
+# Version: 0.3.2
 
 from datetime import datetime, timezone
 from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
@@ -71,6 +71,16 @@ class Record(Base):
 	# and the recapture mode-match guard key off of (NEH-208).
 	capture_mode = Column(String(10), nullable=False)  # single, dual
 
+	# The page of a dual opening that was never photographed: "left",
+	# "right", or None. AHR volumes digitised in 2022-24 with two cameras have
+	# openings where only one camera fired; app.core.rebuild_volume writes
+	# such an opening as a dual record with its one image, on the other side,
+	# and sets this. Nothing else sets it. The record is pending
+	# (app.core.recapture_turn) until a dual retake writes both images, which
+	# clears it (app.api.cameras.trigger_dual_capture); until then promotion
+	# and the status routes leave it captured on the unit.
+	missing_side = Column(String(5), nullable=True)
+
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 	modified_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
@@ -100,6 +110,10 @@ class Record(Base):
 		CheckConstraint(
 			"capture_mode IN ('single','dual')",
 			name='check_record_capture_mode'
+		),
+		CheckConstraint(
+			"missing_side IS NULL OR missing_side IN ('left','right')",
+			name='check_record_missing_side'
 		),
 		# An end before its start. A half-open range passes: with either end
 		# NULL there is nothing to compare. The two NULL clauses say so
