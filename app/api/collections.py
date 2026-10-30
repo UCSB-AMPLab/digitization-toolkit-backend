@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.2.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -914,6 +914,23 @@ def promote_collection(
         .with_for_update(of=Record)
         .all()
     )
+    # A volume with a pending record (rejected, or prepared for retake with
+    # its rejected image still current; app.core.recapture_turn) stays on the
+    # unit until its retakes are done, for every role: Fisqua would hold a
+    # delivery with a rejected record anyway. Counted after the locks, and
+    # before the idempotent return, so a volume whose only records left are
+    # rejected is refused too.
+    from app.core.recapture_turn import volume_pending
+    pending = volume_pending(db, collection_id)
+    if pending:
+        raise HTTPException(
+            status_code=409,
+            detail={
+                "code": "recaptures_pending",
+                "pending": pending,
+                "message": f"The volume could not be sent to review: {pending} retakes left.",
+            },
+        )
     if not records:
         # Already handed over, or empty. Idempotent rather than an error: she
         # asked for a state that holds.

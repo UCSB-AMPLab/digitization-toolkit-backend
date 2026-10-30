@@ -5,7 +5,7 @@ item, in a project named after the basket; items that cannot be created are
 reported as rejects and the rest are still created. The fixtures are the two
 synthetic lists in tests/fixtures/ (tenant captua-test, codes xx-test-...).
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import json
@@ -300,6 +300,7 @@ def _item(code="xx-test-901", stem="xx-test-901", **kw):
     (_item(stem=""), "missing_filename_stem"),
     (_item(stem="xx--test"), "filename_stem_not_a_slug"),
     (_item(stem=7), "filename_stem_not_a_slug"),
+    (_item(code="xx-test-951", stem="xx-test-951\n"), "filename_stem_not_a_slug"),
     (_item(title=None), "missing_title"),
     (_item(title="  "), "missing_title"),
     (_item(title="x" * 256), "invalid_title"),
@@ -834,7 +835,7 @@ def test_the_report_carries_the_uploaded_files_sha256(client, db_session, report
     _as("op", "admin")
     report = _post_fixture(client, VALID).json()
     assert report["fileSha256"] == hashlib.sha256(VALID.read_bytes()).hexdigest()
-    stored = json.loads(next((reports_root / VALID_ID).glob("*.json")).read_text(encoding="utf-8"))
+    stored = json.loads(next((reports_root / VALID_ID).glob("import-report_*.json")).read_text(encoding="utf-8"))
     assert stored["fileSha256"] == report["fileSha256"]
 
 
@@ -996,7 +997,7 @@ def test_a_reject_echoes_at_most_120_characters_of_the_code(client, db_session, 
     (reject,) = report["rejects"]
     assert reject["referenceCode"] == code[:120]
     assert reject["referenceCodeTruncated"] is truncated
-    stored = next((reports_root / VALID_ID).glob("*.json"))
+    stored = next((reports_root / VALID_ID).glob("import-report_*.json"))
     assert stored.stat().st_size < 10_000
 
 

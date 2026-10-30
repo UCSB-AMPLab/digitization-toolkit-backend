@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.2.0
 
 from __future__ import annotations
 from typing import Optional, List, Literal
@@ -323,6 +323,28 @@ class RecordRejectionRead(BaseModel):
 
 	class Config:
 		from_attributes = True
+
+
+class RecordToRetake(BaseModel):
+	"""A rejected record waiting to be retaken, with its volume and its latest rejection.
+
+	The volume's fields are None for a record in no volume; the rejection's,
+	for a rejected record with no RecordRejection row.
+	"""
+	recordId: int
+	title: str
+	sequence: Optional[int] = None
+	collectionId: Optional[int] = None
+	# The volume's own project_id: None for a nested volume, which has only a parent.
+	projectId: Optional[int] = None
+	# The volume's name and stem.
+	name: Optional[str] = None
+	filenameStem: Optional[str] = None
+	# The latest rejection: its predefined reason code, comment, who and when (naive UTC).
+	reason: Optional[str] = None
+	comment: Optional[str] = None
+	rejectedBy: Optional[str] = None
+	rejectedAt: Optional[datetime] = None
 
 
 class RecordStatusChangeRead(BaseModel):

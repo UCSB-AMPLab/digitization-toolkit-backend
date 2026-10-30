@@ -11,7 +11,7 @@ uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import hashlib
@@ -1013,3 +1013,100 @@ def test_a_raw_master_of_another_make_without_a_preview_is_refused(client, vol, 
     (vol.root / "previews" / f"{Path(img.filename).stem}_preview.jpg").unlink()
     problems = _refusal(_export(client, vol.col))
     assert problems["raw_without_preview"]["image_ids"] == [img.id]
+
+
+# ---------------------------------------------------------------------------
+# rotateDeg (contract 1.5), behind CAPTUA_FISQUA_ROTATE_DEG
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def rotate_deg(monkeypatch):
+    from app.core import config
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", True)
+
+
+def _rotate(img, deg):
+    from sqlalchemy.orm import object_session
+    img.rotate_deg = deg
+    object_session(img).commit()
+
+
+@pytest.mark.unit
+def test_rotate_deg_is_off_by_default():
+    from app.core import config
+    assert config.Settings.model_fields["FISQUA_ROTATE_DEG"].default is False
+
+
+@pytest.mark.unit
+def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_1_1(client, vol):
+    rec = vol.record(layout=("left", "right"))
+    left, right = sorted(rec.images, key=lambda i: i.role)
+    _rotate(left, 90)
+    _rotate(right, 270)
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert doc["version"] == "1.1"
+    assert "rotateDeg" not in resp.text
+    assert all(set(i) == {"captureId", "pairId", "filename", "role", "objectKey", "sha256"}
+               for i in _images(doc))
+
+
+@pytest.mark.unit
+def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_5(client, vol, rotate_deg):
+    rec = vol.record(layout=("left", "right"))
+    left, right = sorted(rec.images, key=lambda i: i.role)
+    _rotate(left, 90)
+    _rotate(right, 0)
+    rec2 = vol.record(layout=("single",), ext="cr2")
+    [raw] = rec2.images
+    _rotate(raw, 180)
+    single = vol.record(layout=("single",)).images[0]
+    _rotate(single, 270)
+    doc = _export(client, vol.col).json()
+    assert doc["version"] == "1.5"
+    by_id = {i["captureId"] + i["role"]: i for i in _images(doc)}
+    out_left = by_id[left.capture_id + "left"]
+    out_right = by_id[right.capture_id + "right"]
+    out_raw = by_id[raw.capture_id + "single"]
+    out_single = by_id[single.capture_id + "single"]
+    assert out_left["rotateDeg"] == 90 and type(out_left["rotateDeg"]) is int
+    assert out_right["rotateDeg"] == 0 and type(out_right["rotateDeg"]) is int
+    assert out_raw["rotateDeg"] == 180 and "previewObjectKey" in out_raw
+    assert out_single["rotateDeg"] == 270
+
+
+@pytest.mark.unit
+def test_with_rotate_deg_on_an_image_with_no_rotation_has_no_key(client, vol, rotate_deg):
+    rec = vol.record(layout=("left", "right"))
+    left, right = sorted(rec.images, key=lambda i: i.role)
+    _rotate(left, 90)
+    assert right.rotate_deg is None
+    doc = _export(client, vol.col).json()
+    assert doc["version"] == "1.5"
+    out_left, out_right = doc["volumes"][0]["records"][0]["images"]
+    assert out_left["rotateDeg"] == 90
+    assert "rotateDeg" not in out_right
+
+
+@pytest.mark.unit
+def test_with_rotate_deg_on_a_rebuilt_jpeg_carries_its_recorded_rotation_not_its_exif_tag(
+        client, vol, rotate_deg, monkeypatch):
+    """The rebuilt 2022-24 JPEGs carry wrong EXIF tags and the right rotate_deg (app.core.rebuild_volume)."""
+    import io
+    from PIL import Image
+
+    rec = vol.record(layout=("single",))
+    [img] = rec.images
+    exif = Image.Exif()
+    exif[0x0112] = 6  # Orientation: 90 clockwise to display
+    buf = io.BytesIO()
+    Image.new("RGB", (8, 4)).save(buf, "JPEG", exif=exif.tobytes())
+    Path(img.file_path).write_bytes(buf.getvalue())
+    _rotate(img, 180)
+
+    def no_read(*a, **k):
+        raise AssertionError("the manifest read an image file")
+    monkeypatch.setattr(Image, "open", no_read)
+    [out] = _images(_export(client, vol.col).json())
+    assert out["rotateDeg"] == 180

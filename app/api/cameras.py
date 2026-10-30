@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.2.0
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -24,6 +24,7 @@ from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
 from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
+from app.core import recapture_turn
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -85,6 +86,48 @@ def _refuse_retake_out_of_the_operators_hands(retake_record: Optional[Record]) -
 	"""
 	if retake_record is not None and retake_record.status not in ("captured", "rejected"):
 		raise HTTPException(status_code=409, detail=RETAKE_STATUS_DETAIL)
+
+
+def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_record: Optional[Record], user: User) -> bool:
+	"""409 for an operator's capture that would start a new volume during the recaptures turn.
+
+	Returns whether the capture starts a new volume: it is not a retake and
+	the volume has no record yet, read under the volume's row lock, which
+	every path adding a record takes. Only then is the unit's turn lock taken,
+	after the record and volume locks, and held until the capture commits, so
+	the turn read here is still the turn when its new_volume_started event is
+	written and two operators cannot both start a volume on one completion
+	(app.core.recapture_turn). An admin may start one in any turn. Called
+	after the other refusals, before any number is taken or camera touched.
+	"""
+	if retake_record is not None or not recapture_turn.volume_is_empty(db, collection_id):
+		return False
+	recapture_turn.lock_turn(db)
+	if user.role != "admin" and recapture_turn.turn(db)["state"] == "recaptures":
+		raise HTTPException(status_code=409, detail=recapture_turn.RECAPTURE_TURN_DETAIL)
+	return True
+
+
+def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook_pending: bool, user: User) -> None:
+	"""Add the turn's events to the capture's transaction, just before it commits.
+
+	new_volume_started for a capture that created its volume's first record
+	(the turn lock is already held, from _refuse_a_new_volume_out_of_turn);
+	recapture_volume_completed for a retake of a pending record that leaves
+	its volume with none pending (app.core.recapture_turn), so once for each
+	time the volume reaches zero, and never for a status change alone. A retake takes the turn lock here, last of
+	its locks, so its event and a new volume's start are written in turn.
+	"""
+	if not (starts_volume or retook_pending):
+		return
+	volume = db.get(Collection, record.collection_id)
+	if starts_volume:
+		recapture_turn.record_event(db, recapture_turn.STARTED_ACTION, volume, user.username)
+		return
+	recapture_turn.lock_turn(db)
+	db.flush()  # the retaken record's new status and images, before the count
+	if recapture_turn.volume_pending(db, record.collection_id) == 0:
+		recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, user.username)
 
 
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
@@ -797,6 +840,8 @@ def trigger_capture(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
 		)
+	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
+	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
 		from capture.service import single_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
@@ -966,6 +1011,7 @@ def trigger_capture(
 			# prepare-for-retake transition, and reaches review again only
 			# when an operator promotes its volume; a captured one stays.
 			change_record_status(db, record, "captured", current_user.username)
+		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()
 		db.refresh(record)
@@ -1023,6 +1069,8 @@ def trigger_dual_capture(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
 		)
+	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
+	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
 		from capture.service import dual_capture_image, is_camera_connected
 		from capture.project_manager import projects_root
@@ -1203,6 +1251,7 @@ def trigger_dual_capture(
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.
 			change_record_status(db, record, "captured", current_user.username)
+		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()
 		db.refresh(record)

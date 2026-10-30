@@ -8,7 +8,7 @@ is `captured`.
 
 Run with: python -m pytest tests/unit/test_collection_handover.py
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import pytest
@@ -78,13 +78,14 @@ def test_promote_leaves_records_a_reviewer_has_already_ruled_on(client, db_sessi
     col = _collection(db_session)
     fresh = _record_with_image(db_session, col, name="fresh.jpg")
     approved = _record_with_image(db_session, col, status="approved", name="ok.jpg")
-    rejected = _record_with_image(db_session, col, status="rejected", name="bad.jpg")
+    # No rejected record: a volume with one cannot be promoted at all
+    # (tests/unit/test_recapture_turn.py).
     api = _client_as(client, "op", "operator")
 
     resp = api.post(f"/collections/{col.id}/promote")
     assert resp.status_code == 200, resp.text
     assert resp.json()["promoted"] == 1
-    for rec, expected in ((fresh, "in_review"), (approved, "approved"), (rejected, "rejected")):
+    for rec, expected in ((fresh, "in_review"), (approved, "approved")):
         db_session.refresh(rec)
         assert rec.status == expected
 

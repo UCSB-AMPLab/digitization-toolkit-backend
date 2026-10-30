@@ -32,13 +32,22 @@ whose files are still on disk.
   filenameStem its Fisqua reference code, unchanged, and the unit's
   interface has no field for external_id (ruled). The download and the
   manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
+* `rotateDeg` (contract 1.5) is sent only when CAPTUA_FISQUA_ROTATE_DEG is
+  on, and then the manifest is version 1.5; off, it is version 1.1 with no
+  such key. It is the image's recorded rotate_deg: the clockwise degrees
+  that display it upright from its stored pixels, whatever EXIF Orientation
+  the file carries (Captua never turns pixels; the rebuilt 2022-24 JPEGs of
+  app.core.rebuild_volume carry wrong tags and the right rotate_deg). It
+  describes the preview as well as the capture, since the tag is set on
+  both. An image with no recorded rotation has no `rotateDeg`, and Fisqua
+  follows the file's EXIF tag.
 
 The export is refused, with every problem named, when Fisqua's registration
 (fisqua-dev scripts/lib/capture-registration.ts) would refuse the file or
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import re
@@ -55,6 +64,9 @@ from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, i
 
 CONTRACT = "fisqua-captua-exchange"
 VERSION = "1.1"
+# The version when images carry rotateDeg (config FISQUA_ROTATE_DEG).
+ROTATE_DEG_VERSION = "1.5"
+ROTATE_DEGREES = (0, 90, 180, 270)
 KIND = "capture-manifest"
 EXPORT_ACTION = "capture_manifest_exported"
 
@@ -284,7 +296,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     stamp = (now or _now()).astimezone(timezone.utc)
     return {
         "contract": CONTRACT,
-        "version": VERSION,
+        "version": ROTATE_DEG_VERSION if config.settings.FISQUA_ROTATE_DEG else VERSION,
         "kind": KIND,
         "id": str(new_id()),
         "generatedAt": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -414,6 +426,8 @@ def _image_entry(img, rec, rows, index, tenant, capture_prefix, preview_prefix, 
     if preview_key is not None:
         entry["previewObjectKey"] = preview_key[len(tenant) + 1:]
         entry["previewSha256"] = preview_sha
+    if config.settings.FISQUA_ROTATE_DEG and img.rotate_deg in ROTATE_DEGREES:
+        entry["rotateDeg"] = int(img.rotate_deg)
     return entry
 
 

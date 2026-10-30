@@ -70,7 +70,7 @@ the hold, the listing) and run the rest as a background job.
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
 
-Version: 0.1.0-beta
+Version: 0.2.0
 """
 
 import json
@@ -488,10 +488,13 @@ def _set_freed(db: Session, obj: _Object, *, at: Optional[datetime], size: Optio
 class _RunManifest:
     """`<stem>/metadata/offsite-<action>-<UTC>.jsonl`, created on its first line, each line flushed to disk."""
 
-    def __init__(self, stem: str, action: str):
+    def __init__(self, stem: str, action: str, directory: Optional[Path] = None):
+        """`directory` is the volume's `metadata/` as a caller already resolved it (rebuild_volume), so a
+        storage switch cannot put this manifest on another drive than its other files; by default it is
+        resolved here, from the active projects root."""
         from capture.project_manager import volume_root
 
-        self.directory = volume_root(stem) / METADATA_DIR
+        self.directory = directory if directory is not None else volume_root(stem) / METADATA_DIR
         self.action = action
         self.path: Optional[Path] = None
 

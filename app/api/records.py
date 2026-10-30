@@ -1,9 +1,9 @@
-# Version: 0.1.0-beta
+# Version: 0.2.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
 from typing import Iterable, List, Optional
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session, aliased, joinedload
 from sqlalchemy.exc import IntegrityError
 from pathlib import Path
 import logging
@@ -13,6 +13,7 @@ from app.api.deps import get_db_dependency
 from app.api.auth import get_current_user, RoleChecker
 from datetime import datetime, timezone
 
+from app.models.collection import Collection
 from app.models.record import Record, RecordImage, ExifData, RecordAnnotation, RecordRejection
 from app.models.camera import CameraSettings
 from app.models.user import User
@@ -21,7 +22,7 @@ from app.schemas.record import (
 	RecordImageCreate, RecordImageRead, RecordImageUpdate,
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
-	RecordRejectRequest, RecordRejectionRead,
+	RecordRejectRequest, RecordRejectionRead, RecordToRetake,
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
@@ -280,6 +281,143 @@ def count_records(
 	if collection_id is not None:
 		query = query.filter(Record.collection_id == collection_id)
 	return {"count": query.count()}
+
+
+def _to_retake_query(db: Session):
+	"""The rejected records, each with its volume and its latest rejection, in one query.
+
+	The latest rejection is the one with the newest rejected_at (the highest
+	id on a tie), found by a correlated subquery in the join, so the rows
+	come from one statement whatever their number. Both joins are outer: a
+	record in no volume, or rejected with no RecordRejection row, is still
+	waiting.
+	"""
+	other = aliased(RecordRejection)
+	latest = (
+		db.query(other.id)
+		.filter(other.record_id == Record.id)
+		.order_by(other.rejected_at.desc(), other.id.desc())
+		.limit(1)
+		.correlate(Record)
+		.scalar_subquery()
+	)
+	return (
+		db.query(Record, Collection, RecordRejection)
+		.outerjoin(Collection, Collection.id == Record.collection_id)
+		.outerjoin(RecordRejection, RecordRejection.id == latest)
+		.filter(Record.status == "rejected")
+	)
+
+
+@router.get("/to-retake", response_model=List[RecordToRetake])
+def list_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Every rejected record, across all volumes, oldest latest rejection first.
+
+	Each row has the record, its volume's project id, name and stem, and its latest
+	rejection's reason code, comment, author and time. A rejected record
+	with no rejection row comes last; ties go by record id.
+	"""
+	rows = (
+		_to_retake_query(db)
+		.order_by(RecordRejection.rejected_at.asc().nulls_last(), Record.id)
+		.all()
+	)
+	return [
+		RecordToRetake(
+			recordId=rec.id,
+			title=rec.title,
+			sequence=rec.sequence,
+			collectionId=rec.collection_id,
+			projectId=col.project_id if col else None,
+			name=col.name if col else None,
+			filenameStem=col.filename_stem if col else None,
+			reason=rej.predefined_reason if rej else None,
+			comment=rej.comment if rej else None,
+			rejectedBy=rej.rejected_by if rej else None,
+			rejectedAt=rej.rejected_at if rej else None,
+		)
+		for rec, col, rej in rows
+	]
+
+
+@router.get("/to-retake/count")
+def count_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""How many records GET /records/to-retake lists, for the side menu's badge."""
+	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
+
+
+@router.get("/to-retake/summary")
+def summarise_records_to_retake(
+	current_user: User = Depends(allow_read_only),
+	db: Session = Depends(get_db_dependency)
+):
+	"""The retakes by volume, and the unit's recapture turn (app.core.recapture_turn).
+
+	pendingRecords is the unit's pending records: rejected, or prepared for
+	retake with the rejected image still current. Each volume with a pending
+	record is listed, most pending first, then by name: `pending` is its
+	pending records, `total` its records with at least one rejection whatever
+	their state now, pendingRecordIds every pending record of the volume by
+	sequence (a record with none last) then id, and firstPendingRecordId the
+	first of them. projectId is the project that owns the volume, through its
+	parents for a nested one.
+
+	The volumes come from one statement: every record in a volume that is
+	pending or was ever rejected, with its volume, in the order of the list.
+	Counts, list and first record are taken from the same rows, so a retake
+	committed while the summary is read cannot make them disagree, and a
+	volume left with no pending record is not listed. The same statement
+	runs on PostgreSQL and SQLite, with no array aggregate.
+	"""
+	from sqlalchemy import or_
+	from app.core import recapture_turn
+	from app.core.storage_ops import resolve_project
+
+	is_pending = recapture_turn.pending_clause()
+	ever_rejected = db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
+	rows = (
+		db.query(Collection.id, Collection.name, Collection.filename_stem,
+		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"))
+		.join(Record, Record.collection_id == Collection.id)
+		.filter(or_(is_pending, ever_rejected))
+		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
+		.all()
+	)
+	by_volume: dict = {}
+	for collection_id, name, stem, record_id, pending, rejected in rows:
+		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0})
+		if pending:
+			vol["ids"].append(record_id)
+		if rejected:
+			vol["total"] += 1
+	volumes = []
+	for collection_id, vol in by_volume.items():
+		if not vol["ids"]:
+			continue
+		project = resolve_project(db, db.get(Collection, collection_id))
+		volumes.append({
+			"collectionId": collection_id,
+			"projectId": project.id if project else None,
+			"name": vol["name"],
+			"filenameStem": vol["stem"],
+			"pending": len(vol["ids"]),
+			"total": vol["total"],
+			"firstPendingRecordId": vol["ids"][0],
+			"pendingRecordIds": vol["ids"],
+		})
+	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
+	pending_records = recapture_turn.pending_records(db)
+	return {
+		"pendingRecords": pending_records,
+		"volumes": volumes,
+		"turn": recapture_turn.turn(db, pending_records),
+	}
 
 
 @router.get("/{rec_id}", response_model=RecordRead)
@@ -1353,7 +1491,7 @@ def list_record_rejections(
 		db.query(RecordRejection)
 		.options(joinedload(RecordRejection.images))
 		.filter(RecordRejection.record_id == rec_id)
-		.order_by(RecordRejection.rejected_at.desc())
+		.order_by(RecordRejection.rejected_at.desc(), RecordRejection.id.desc())
 		.all()
 	)
 	return [RecordRejectionRead.model_validate(r) for r in rejections]
