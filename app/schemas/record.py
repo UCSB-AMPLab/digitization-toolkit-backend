@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.2.1
 
 from __future__ import annotations
 from typing import Optional, List, Literal
@@ -22,7 +22,14 @@ from datetime import date as dt_date
 # STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
 # formal rejection, so it carries no reason and no rejection record. The
 # change itself is dated in record_status_changes, like every other.
-RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+#
+# "excluded" is Fisqua's third QC decision (contract 1.6): the opening is not
+# a page of the volume, such as a test shot of the rig or a duplicate. Only a
+# Fisqua decision sets it (app.core.fisqua_decisions, through
+# DECISION_TRANSITIONS below); no route offers it, so a request names one of
+# RequestedRecordStatus and a response may carry any RecordStatus.
+RequestedRecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+RecordStatus = Literal["captured", "in_review", "rejected", "approved", "excluded"]
 
 # Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
 #
@@ -40,7 +47,7 @@ RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 #
 # - in_review -> rejected. Formal rejection is its own endpoint (POST
 #   /records/{id}/reject) with a mandatory predefined_reason. RecordStatusUpdate
-#   types its status as RecordStatus rather than a restricted literal, so this
+#   types its status as RequestedRecordStatus rather than a restricted literal, so this
 #   table is the only thing keeping the generic and bulk endpoints from writing
 #   "rejected" with no reason and no record_rejections row.
 # - in_review -> captured. Taking a handover back is a collection-level act
@@ -60,6 +67,20 @@ STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
 	("approved", "in_review"): {"reviewer", "admin"},
 	("rejected", "in_review"): {"reviewer", "admin"},
 	("rejected", "captured"): {"operator", "admin"},
+}
+
+# The transitions a Fisqua decision may also take, as the reviewer
+# `Fisqua: <decidedBy>`, and no route: into "excluded" from in_review (from
+# approved or rejected the decision goes through in_review first, as approved
+# and rejected do), and out of it when a later decision approves or rejects
+# the record. excluded -> rejected is written by reject_locked_record, which
+# checks no table; it is listed so that the table names every way out.
+DECISION_TRANSITIONS: dict[tuple[str, str], set[str]] = {
+	**STATUS_TRANSITIONS,
+	("in_review", "excluded"): {"reviewer"},
+	("excluded", "in_review"): {"reviewer"},
+	("excluded", "approved"): {"reviewer"},
+	("excluded", "rejected"): {"reviewer"},
 }
 
 # The predefined rejection reasons. The first six mirror the list the
@@ -264,12 +285,12 @@ class RecordRead(RecordBase):
 # ==============================================================================
 
 class RecordStatusUpdate(BaseModel):
-	status: RecordStatus
+	status: RequestedRecordStatus
 
 
 class BulkStatusUpdate(BaseModel):
 	record_ids: List[int]
-	status: RecordStatus
+	status: RequestedRecordStatus
 
 	@field_validator("record_ids")
 	@classmethod
@@ -356,6 +377,8 @@ class RecordStatusChangeRead(BaseModel):
 	to_status: RecordStatus
 	changed_by: Optional[str] = None
 	changed_at: datetime
+	# The note of a Fisqua exclusion; None for every other change.
+	note: Optional[str] = None
 
 	class Config:
 		from_attributes = True

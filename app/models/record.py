@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.2.1
 
 from datetime import datetime, timezone
 from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
@@ -59,8 +59,10 @@ class Record(Base):
 	# QA workflow. A record is born "captured" and stays there until the
 	# operator promotes the collection it belongs to (NEH-260); "in_review"
 	# means handed over for review, which is why deletion is locked from that
-	# point on. See app/schemas/record.py for the transition table.
-	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
+	# point on. "excluded" is set only by a Fisqua decision (contract 1.6):
+	# the opening is not a page of the volume. See app/schemas/record.py for
+	# the transition table.
+	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved, excluded
 	sequence = Column(Integer, nullable=True)  # ordering within a collection
 
 	# Which camera setup produced this document: "single" (one image) or
@@ -92,7 +94,7 @@ class Record(Base):
 			name='check_record_single_parent'
 		),
 		CheckConstraint(
-			"status IN ('captured','in_review','rejected','approved')",
+			"status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status'
 		),
 		CheckConstraint(
@@ -298,16 +300,22 @@ class RecordStatusChange(Base):
 
 	changed_by = Column(String(255), nullable=True)
 	changed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+	# The note of the Fisqua decision that made the change, when it has one:
+	# only an exclusion's is kept here (contract 1.6; a rejection's note is
+	# its RecordRejection comment). At most REJECTION_COMMENT_MAX_LENGTH
+	# characters, checked where it is written (app.core.fisqua_decisions),
+	# as the rejection comment is.
+	note = Column(Text, nullable=True)
 
 	record = relationship("Record", back_populates="status_changes")
 
 	__table_args__ = (
 		CheckConstraint(
-			"from_status IN ('captured','in_review','rejected','approved')",
+			"from_status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status_change_from'
 		),
 		CheckConstraint(
-			"to_status IN ('captured','in_review','rejected','approved')",
+			"to_status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status_change_to'
 		),
 	)

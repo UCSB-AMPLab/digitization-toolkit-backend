@@ -70,13 +70,13 @@ def test_the_migration_chains_onto_the_decisions_migration(backend_root):
 
 @pytest.mark.unit
 def test_alembic_has_a_single_head(backend_root):
-    """The newest revision pins the head."""
+    """The migrations have one head: no branch was left unmerged."""
     from alembic.config import Config
     from alembic.script import ScriptDirectory
 
     cfg = Config(str(backend_root / "alembic.ini"))
     cfg.set_main_option("script_location", str(backend_root / "alembic"))
-    assert ScriptDirectory.from_config(cfg).get_heads() == [REVISION]
+    assert len(ScriptDirectory.from_config(cfg).get_heads()) == 1
 
 
 @pytest.mark.unit

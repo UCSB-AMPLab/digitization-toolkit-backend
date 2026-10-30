@@ -13,7 +13,7 @@ The hardware is stood in for as tests/unit/test_capture_birth_and_retake.py does
 
 Run with: python -m pytest tests/unit/test_recapture_turn.py
 
-Version: 0.2.0
+Version: 0.2.1
 """
 
 from datetime import datetime
@@ -138,7 +138,7 @@ def test_summary_shape_counts_and_order(client, db_session, test_project):
     assert [v["collectionId"] for v in body["volumes"]] == [b.id, d.id, a.id]
     assert body["volumes"][0] == {
         "collectionId": b.id, "projectId": test_project.id, "name": "Tomo B",
-        "filenameStem": "co-test-b", "pending": 3, "total": 3,
+        "filenameStem": "co-test-b", "pending": 3, "total": 3, "excluded": 0,
         "firstPendingRecordId": first_b.id,
         "pendingRecordIds": [first_b.id, b2.id, b4.id],
     }
@@ -403,7 +403,7 @@ def test_a_prepared_record_is_still_pending(client, db_session, test_project):
     assert body["pendingRecords"] == 1
     assert body["volumes"] == [{
         "collectionId": a.id, "projectId": test_project.id, "name": "Tomo A",
-        "filenameStem": "co-test-a", "pending": 1, "total": 1,
+        "filenameStem": "co-test-a", "pending": 1, "total": 1, "excluded": 0,
         "firstPendingRecordId": prepared.id,
         "pendingRecordIds": [prepared.id],
     }]
@@ -544,3 +544,96 @@ def test_the_volume_and_its_ids_go_when_nothing_is_pending(client, db_session, t
 
     assert _capture(api, test_project, a, record_id=r2.id).status_code == 200
     assert [v["collectionId"] for v in _summary(api)["volumes"]] == [b.id]
+
+
+# ---------------------------------------------------------------------------
+# An excluded record (Fisqua contract 1.6) is never pending: it is not a page
+# of the volume, so nothing asks for its retake, even after a rejection.
+# ---------------------------------------------------------------------------
+
+def _excluded(db_session, volume, sequence, rejections=1):
+    return _record(db_session, volume, "excluded", sequence, rejections=rejections)
+
+
+@pytest.mark.unit
+def test_an_excluded_record_is_not_pending(db_session, test_project):
+    from app.core import recapture_turn
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    rec = _excluded(db_session, a, 1)
+    # Its image still carries the rejection it had before it was excluded.
+    from app.models.record import RecordRejection
+    rej = db_session.query(RecordRejection).filter(RecordRejection.record_id == rec.id).first()
+    for img in rec.images:
+        img.rejection_id = rej.id
+    db_session.commit()
+    db_session.refresh(rec)
+    assert recapture_turn.record_is_pending(rec) is False
+    assert recapture_turn.volume_pending(db_session, a.id) == 0
+    assert recapture_turn.pending_records(db_session) == 0
+
+
+@pytest.mark.unit
+def test_an_excluded_record_is_not_in_to_retake_or_its_count(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _excluded(db_session, a, 1)
+    waiting = _rejected(db_session, a, 2)
+    api = _client_as(client, "op", "operator")
+    rows = api.get("/records/to-retake")
+    assert rows.status_code == 200, rows.text
+    assert [r["recordId"] for r in rows.json()] == [waiting.id]
+    assert api.get("/records/to-retake/count").json() == {"count": 1}
+
+
+@pytest.mark.unit
+def test_an_excluded_record_is_not_in_the_summary_or_its_pending_ids(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    b = _volume(db_session, test_project, "Tomo B", "co-test-b")
+    _excluded(db_session, a, 1)
+    waiting = _rejected(db_session, a, 2)
+    _excluded(db_session, b, 1)
+
+    body = _summary(_client_as(client, "op", "operator"))
+
+    assert body["pendingRecords"] == 1
+    [vol] = body["volumes"]
+    assert vol["collectionId"] == a.id
+    assert (vol["pending"], vol["firstPendingRecordId"], vol["pendingRecordIds"]) == (1, waiting.id, [waiting.id])
+
+
+@pytest.mark.unit
+def test_a_unit_with_only_excluded_records_is_free(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _excluded(db_session, a, 1)
+    body = _summary(_client_as(client, "op", "operator"))
+    assert (body["pendingRecords"], body["volumes"]) == (0, [])
+    assert body["turn"] == {"state": "free", "unlockedBy": None}
+
+
+@pytest.mark.unit
+def test_an_excluded_record_does_not_block_promotion(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    _excluded(db_session, a, 1)
+    _record(db_session, a, "captured", 2)
+    resp = _client_as(client, "op", "operator").post(f"/collections/{a.id}/promote")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["promoted"] == 1
+
+
+@pytest.mark.unit
+def test_the_summary_counts_a_volumes_exclusions_and_leaves_them_out_of_total(client, db_session, test_project):
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    b = _volume(db_session, test_project, "Tomo B", "co-test-b")
+    waiting = _rejected(db_session, a, 1)
+    _excluded(db_session, a, 2, rejections=1)   # rejected before it was excluded
+    _excluded(db_session, a, 3, rejections=0)
+    _record(db_session, a, "in_review", 4, rejections=1)
+    _excluded(db_session, b, 1)                 # exclusions alone do not list a volume
+
+    body = _summary(_client_as(client, "op", "operator"))
+
+    assert body["volumes"] == [{
+        "collectionId": a.id, "projectId": test_project.id, "name": "Tomo A",
+        "filenameStem": "co-test-a", "pending": 1, "total": 2, "excluded": 2,
+        "firstPendingRecordId": waiting.id,
+        "pendingRecordIds": [waiting.id],
+    }]

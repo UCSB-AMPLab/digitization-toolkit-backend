@@ -85,7 +85,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.2.0
+Version: 0.2.1
 """
 
 import hashlib
@@ -215,9 +215,9 @@ def config_fingerprint() -> str:
     read), so that an update, or failing that a restart, clears a stop for
     a manifest Fisqua could not read (reason `version`); a retest that
     Fisqua accepts clears it too, without any change here
-    (_retest_version_stop). CAPTUA_FISQUA_ROTATE_DEG picks the contract
-    version the manifests are written in (app.core.capture_manifest), so
-    changing it clears a version stop in the same way. Neither the token nor
+    (_retest_version_stop). CAPTUA_FISQUA_ROTATE_DEG decides whether the
+    manifests carry rotateDeg (app.core.capture_manifest), so changing it
+    clears a version stop in the same way. Neither the token nor
     a full hash of it is kept anywhere.
     """
     from app.core import version

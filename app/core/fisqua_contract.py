@@ -9,7 +9,7 @@ that shape it is opaque to the unit, sent as it is and never parsed.
 
 Contract 1.2 is approved (archiving 5e480b7, §9).
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import re
@@ -140,6 +140,10 @@ F_QUARTER_TURNS = "quarterTurns"
 
 DECISION_APPROVED = "approved"
 DECISION_REJECTED = "rejected"
+# Contract 1.6: an opening that is not a page of the volume (a test shot of
+# the rig, a duplicate). It carries no reason, no side and no rotations, and
+# asks for no retake; a later approved or rejected decision restores it.
+DECISION_EXCLUDED = "excluded"
 ROTATION_ROLES = ("single", "left", "right")
 QUARTER_TURNS = (1, 2, 3)
 

@@ -1,7 +1,8 @@
-"""Applying Fisqua's QC decisions to a volume's records (contract 1.2 §9.5).
+"""Applying Fisqua's QC decisions to a volume's records (contract 1.2 §9.5, 1.6).
 
-Fisqua decides each opening (each Captua record): approved, or rejected for
-retake with a reason, and may correct an image's rotation. Fisqua is
+Fisqua decides each opening (each Captua record): approved, rejected for
+retake with a reason, or (contract 1.6) excluded, not a page of the volume;
+and may correct an image's rotation. Fisqua is
 authoritative for this second layer, so its decision is applied over a local
 one through the undo transitions. The status poll
 (app.core.fisqua_outbox.poll_fisqua_status) reads a volume's set when its
@@ -25,10 +26,20 @@ Per record, in one transaction, with the records' rows locked in id order
   rejected with the same reason, note and reviewer is left as it is; one
   rejected otherwise goes rejected -> in_review -> rejected, so the
   rejection it carries is Fisqua's. It stays rejected until it is retaken.
+  From excluded, excluded -> rejected.
+* excluded: in_review -> excluded; from approved or rejected, through
+  in_review; excluded stays excluded. No rejection is written and no image
+  changes, its rotation corrections included. A later approval goes
+  excluded -> approved. The decision's note, if any, is kept on the
+  status change into excluded (record_status_changes.note); an approval
+  keeps none. A note longer than REJECTION_COMMENT_MAX_LENGTH is skipped
+  (`note_too_long`), as a rejection's is.
+  No route sets or leaves excluded; the moves are in
+  app.schemas.record.DECISION_TRANSITIONS, which only this path passes.
 * Every transition goes through app.api.records._apply_status_change as a
   reviewer named `Fisqua: <decidedBy>`, so the history row names the
   reviewer and that the decision came from Fisqua.
-* Rotations: each current image of a decided record takes the correction
+* Rotations: each current image of an approved or rejected record takes the correction
   the set gives it by captureId and role, in quarter-turns clockwise (1-3),
   or none when the set lists none for it. No file is touched.
 
@@ -42,8 +53,10 @@ the volume (or an id that is not one), a record that is `captured` (its
 volume taken back, or it was retaken), a record whose current images are not
 exactly those the decided manifest listed for it, compared image by image as
 capture id, role and object key (`images_changed`: retaken since, or an
-image of a pair removed, replaced or given the other role), a decision that is neither approved
-nor rejected, and a rejection that POST /records/{id}/reject would refuse
+image of a pair removed, replaced or given the other role), a decision that is not approved,
+rejected or excluded (`invalid_decision`), an exclusion with a reason
+(`invalid_reason`), with rotations (`invalid_decision`) or with a note too
+long (`note_too_long`), and a rejection that POST /records/{id}/reject would refuse
 (checked with the same RecordRejectRequest): a reason not in
 app.schemas.record.PREDEFINED_REJECTION_REASONS, `other` with no note, or a
 note longer than REJECTION_COMMENT_MAX_LENGTH (`note_too_long`).
@@ -52,7 +65,7 @@ An unusable rotation is skipped on its own.
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import logging
@@ -188,8 +201,20 @@ def _why_not(decision: dict) -> Optional[str]:
     )
 
     kind = decision.get(fc.F_DECISION)
-    if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED):
+    if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED, fc.DECISION_EXCLUDED):
         return "invalid_decision"
+    if kind == fc.DECISION_EXCLUDED:
+        # An exclusion carries no reason and no rotations (contract 1.6). Any
+        # reason at all is refused; rotations arrive as a list, and an empty
+        # one, or none, lists none.
+        if decision.get(fc.F_REASON) is not None:
+            return "invalid_reason"
+        if decision.get(fc.F_ROTATIONS):
+            return "invalid_decision"
+        note = decision.get(fc.F_NOTE)
+        if isinstance(note, str) and len(note) > REJECTION_COMMENT_MAX_LENGTH:
+            return "note_too_long"
+        return None
     if kind == fc.DECISION_REJECTED:
         reason = decision.get(fc.F_REASON)
         if reason not in PREDEFINED_REJECTION_REASONS:
@@ -216,8 +241,9 @@ def _actor(decision: dict) -> str:
 
 
 def _apply_one(db: Session, rec, decision: dict) -> str:
-    """Move one record to Fisqua's decision. Returns approved, rejected or unchanged; raises HTTPException if refused."""
+    """Move one record to Fisqua's decision. Returns approved, rejected, excluded or unchanged; raises HTTPException if refused."""
     from app.api.records import _apply_status_change, reject_locked_record
+    from app.schemas.record import DECISION_TRANSITIONS
 
     actor = _actor(decision)
     reviewer = SimpleNamespace(role="reviewer", username=actor)
@@ -226,8 +252,16 @@ def _apply_one(db: Session, rec, decision: dict) -> str:
             return "unchanged"
         if rec.status == "rejected":
             _apply_status_change(db, rec, "in_review", reviewer)
-        _apply_status_change(db, rec, "approved", reviewer)
+        _apply_status_change(db, rec, "approved", reviewer, DECISION_TRANSITIONS)
         return "approved"
+
+    if decision[fc.F_DECISION] == fc.DECISION_EXCLUDED:
+        if rec.status == "excluded":
+            return "unchanged"
+        if rec.status in ("approved", "rejected"):
+            _apply_status_change(db, rec, "in_review", reviewer)
+        _apply_status_change(db, rec, "excluded", reviewer, DECISION_TRANSITIONS, note=_note(decision))
+        return "excluded"
 
     reason, note = decision[fc.F_REASON], _note(decision)
     if rec.status == "rejected" and rec.rejections:
@@ -282,7 +316,7 @@ def _lock_records(db: Session, ids: list) -> dict:
 
 
 def _empty_report() -> dict:
-    return {"counts": {"approved": 0, "rejected": 0, "unchanged": 0, "skipped": 0,
+    return {"counts": {"approved": 0, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 0,
                        "rotations": 0, "rotations_skipped": 0},
             "skipped": [], "rotation_skips": []}
 
@@ -381,8 +415,9 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             if rec.id not in listed or current_images[rec.id] != listed[rec.id]:
                 skip("images_changed")
                 continue
-            # Every transition _apply_one takes is in STATUS_TRANSITIONS for a
-            # reviewer, from the statuses checked above, so none is refused
+            # Every transition _apply_one takes is in DECISION_TRANSITIONS (or,
+            # for a rejection, the in_review step before it in
+            # STATUS_TRANSITIONS) for a reviewer, from the statuses checked above, so none is refused
             # part-way; the guard is for a table changed later.
             try:
                 outcome = _apply_one(db, rec, decision)
@@ -390,7 +425,9 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
                 skip("transition_refused")
                 continue
             report["counts"][outcome] += 1
-            _apply_rotations(rec, decision, report)
+            # An exclusion has no rotations, and leaves the images as they are.
+            if decision[fc.F_DECISION] != fc.DECISION_EXCLUDED:
+                _apply_rotations(rec, decision, report)
 
         status.decisions_id = decisions_id
         status.decisions_decided_at = _parse_time(body.get(fc.F_DECIDED_AT))
@@ -405,12 +442,13 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
         return {"status": "error", "decisions_id": decisions_id}
 
     c = report["counts"]
-    logger.info("Fisqua decisions %s applied to volume %s: approved=%s rejected=%s unchanged=%s skipped=%s "
-                "rotations=%s rotations_skipped=%s", decisions_id, collection_id, c["approved"], c["rejected"],
-                c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"])
+    logger.info("Fisqua decisions %s applied to volume %s: approved=%s rejected=%s excluded=%s unchanged=%s "
+                "skipped=%s rotations=%s rotations_skipped=%s", decisions_id, collection_id, c["approved"],
+                c["rejected"], c["excluded"], c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"])
     audit.log_event(db, level="INFO", category="activity", action=APPLIED_ACTION, subject=stem,
                     detail=(f"volume {collection_id} decisions={decisions_id} approved={c['approved']} "
-                            f"rejected={c['rejected']} unchanged={c['unchanged']} skipped={c['skipped']} "
+                            f"rejected={c['rejected']} excluded={c['excluded']} unchanged={c['unchanged']} "
+                            f"skipped={c['skipped']} "
                             f"rotations={c['rotations']} rotations_skipped={c['rotations_skipped']}"))
     return {"status": "applied", "decisions_id": decisions_id, **report}
 

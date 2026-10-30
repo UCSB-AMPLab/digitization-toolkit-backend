@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.2.1
 
 import datetime as dt
 from datetime import datetime
@@ -14,13 +14,15 @@ class StatusCounts(BaseModel):
     in_review: int = 0
     rejected: int = 0
     approved: int = 0
+    # Excluded by a Fisqua decision (contract 1.6): not a page of the volume.
+    excluded: int = 0
 
 
 class CollectionActivity(BaseModel):
     """One collection's place in the capture-and-review pipeline."""
     collection_id: int
     status_counts: StatusCounts
-    # The sum of the four status counts.
+    # The sum of the five status counts.
     record_count: int
     # The newest status change among the collection's records, live and
     # deleted; None when no change has been recorded. Naive UTC.
@@ -32,6 +34,6 @@ class DailyActivity(BaseModel):
     date: dt.date
     # record_images rows created that day, retakes included.
     captured_images: int
-    # Distinct records approved or rejected that day; each status change of a
+    # Distinct records approved, rejected or excluded that day; each status change of a
     # deleted record counts as one.
     reviewed_records: int

@@ -7,7 +7,7 @@ written directly as naive UTC, the form they are stored in.
 
 Run with: python -m pytest tests/unit/test_activity.py
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 from datetime import date, datetime, timedelta
 
@@ -328,7 +328,7 @@ def test_collections_counts_statuses(client, db_session):
     rows = _client_as(client, "rev", "reviewer").get("/activity/collections").json()
     assert rows == [{
         "collection_id": col.id,
-        "status_counts": {"captured": 1, "in_review": 2, "rejected": 0, "approved": 1},
+        "status_counts": {"captured": 1, "in_review": 2, "rejected": 0, "approved": 1, "excluded": 0},
         "record_count": 4,
         "last_status_change_at": None,
     }]
@@ -340,7 +340,7 @@ def test_collections_empty_collection_has_zeros_and_null(client, db_session):
     rows = _client_as(client, "rev", "reviewer").get("/activity/collections").json()
     assert rows == [{
         "collection_id": col.id,
-        "status_counts": {"captured": 0, "in_review": 0, "rejected": 0, "approved": 0},
+        "status_counts": {"captured": 0, "in_review": 0, "rejected": 0, "approved": 0, "excluded": 0},
         "record_count": 0,
         "last_status_change_at": None,
     }]
@@ -442,3 +442,26 @@ def test_no_credentials_is_refused(client, db_session, path):
     from app.api.auth import get_current_user
     app.dependency_overrides.pop(get_current_user, None)
     assert client.get(path).status_code == 401
+
+
+# ---------------------------------------------------------------------------
+# Excluded (Fisqua contract 1.6)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_collections_count_excluded_records(client, db_session):
+    col = _collection(db_session)
+    for i, status in enumerate(["approved", "excluded", "excluded"]):
+        _record(db_session, status=status, col=col, name=f"{i}.jpg")
+    [row] = _client_as(client, "rev", "reviewer").get("/activity/collections").json()
+    assert row["status_counts"] == {"captured": 0, "in_review": 0, "rejected": 0, "approved": 1, "excluded": 2}
+    assert row["record_count"] == 3
+
+
+@pytest.mark.unit
+def test_daily_counts_an_exclusion_as_a_review(client, db_session, clock):
+    a, _ = _record(db_session, name="a.jpg")
+    _change(db_session, a.id, "excluded", datetime(2026, 10, 21, 15, 0))
+    rows = _by_date(_client_as(client, "op", "operator").get(
+        "/activity/daily", params={"days": 2}).json())
+    assert rows["2026-10-21"]["reviewed_records"] == 1
