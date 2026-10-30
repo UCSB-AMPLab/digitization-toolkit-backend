@@ -12,7 +12,7 @@ test_promotion_invariant.py).
 
 Run with: python -m pytest tests/unit/test_record_status_transitions.py
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import pytest
@@ -165,3 +165,54 @@ def test_bulk_status_update_skips_invalid_transitions_and_updates_valid_ones(cli
 
 if __name__ == "__main__":
     pytest.main([__file__, "-v"])
+
+
+# ---------------------------------------------------------------------------
+# An excluded record (Fisqua contract 1.6) and its images are protected from
+# deletion as in_review and approved ones are: its masters stay where they are.
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["excluded", "in_review", "approved"])
+def test_an_operator_cannot_delete_a_handed_over_or_excluded_record(client, db_session, status):
+    from app.models.record import Record
+    rec = _with_image(db_session, _make_record(db_session, status=status))
+    resp = _client_as(client, "op", "operator").delete(f"/records/{rec.id}")
+    assert resp.status_code == 409, resp.text
+    assert status in resp.json()["detail"]
+    db_session.expire_all()
+    assert db_session.get(Record, rec.id) is not None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("status", ["excluded", "in_review", "approved"])
+def test_an_operator_cannot_delete_an_image_of_a_handed_over_or_excluded_record(client, db_session, status):
+    from app.models.record import RecordImage
+    rec = _with_image(db_session, _make_record(db_session, status=status))
+    [img] = rec.images
+    resp = _client_as(client, "op", "operator").delete(f"/records/images/{img.id}")
+    assert resp.status_code == 409, resp.text
+    assert status in resp.json()["detail"]
+    db_session.expire_all()
+    assert db_session.get(RecordImage, img.id) is not None
+
+
+@pytest.mark.unit
+def test_an_admin_can_still_delete_an_excluded_record(client, db_session):
+    from app.models.record import Record
+    rec = _with_image(db_session, _make_record(db_session, status="excluded"))
+    resp = _client_as(client, "ad", "admin").delete(f"/records/{rec.id}")
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert db_session.get(Record, rec.id) is None
+
+
+@pytest.mark.unit
+def test_an_admin_deleting_an_excluded_records_last_image_leaves_it_excluded(client, db_session):
+    from app.models.record import Record
+    rec = _with_image(db_session, _make_record(db_session, status="excluded"))
+    [img] = rec.images
+    resp = _client_as(client, "ad", "admin").delete(f"/records/images/{img.id}")
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert db_session.get(Record, rec.id).status == "excluded"

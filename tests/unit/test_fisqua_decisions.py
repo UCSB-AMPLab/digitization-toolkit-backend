@@ -10,7 +10,7 @@ cannot apply are skipped and reported.
 
     python -m pytest tests/unit/test_fisqua_decisions.py
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import json
@@ -298,7 +298,7 @@ def test_other_without_a_note_is_skipped(client, db_session, handed):
     assert _refresh(db_session, b).status == "approved"
     state = _decisions_state(client, vol.col)
     assert state["skipped"] == [{"captua_record_id": a.id, "reason": "other_without_note"}]
-    assert state["counts"] == {"approved": 1, "rejected": 0, "unchanged": 0, "skipped": 1,
+    assert state["counts"] == {"approved": 1, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 1,
                                "rotations": 0, "rotations_skipped": 0}
 
 
@@ -394,7 +394,7 @@ def test_the_offsite_state_shows_the_applied_set(client, db_session, handed):
     assert state["decided_at"].startswith("2026-10-25T10:00:00")
     assert state["applied_at"] is not None
     assert state["stale"] is False
-    assert state["counts"] == {"approved": 1, "rejected": 1, "unchanged": 0, "skipped": 0,
+    assert state["counts"] == {"approved": 1, "rejected": 1, "excluded": 0, "unchanged": 0, "skipped": 0,
                                "rotations": 1, "rotations_skipped": 0}
     assert state["skipped"] == []
 
@@ -937,3 +937,222 @@ def test_the_default_reviewer_name_is_kept_as_given(db_session, handed):
     [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
     assert rej.rejected_by == "Fisqua: Fisqua reviewer"
     assert _history(db_session, a)[-1][2] == "Fisqua: Fisqua reviewer"
+
+
+# ---------------------------------------------------------------------------
+# Excluded (contract 1.6): an opening that is not a page of the volume
+# ---------------------------------------------------------------------------
+
+def _exclude(rec, **extra):
+    return {"captuaRecordId": rec.id, "decision": "excluded", "decidedBy": "Ana Gómez",
+            "decidedAt": "2026-10-25T09:00:00Z", **extra}
+
+
+@pytest.mark.unit
+def test_an_exclusion_excludes_the_record_names_the_reviewer_and_makes_no_rejection(client, db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, note="duplicate of 0003")])
+    _poll(db_session, fake)
+    rec = _refresh(db_session, a)
+    assert rec.status == "excluded"
+    assert _refresh(db_session, b).status == "in_review"
+    assert _history(db_session, a)[-1] == ("in_review", "excluded", "Fisqua: Ana Gómez")
+    assert db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).count() == 0
+    assert all(img.rejection_id is None for img in rec.images)
+    state = _decisions_state(client, vol.col)
+    assert state["counts"] == {"approved": 0, "rejected": 0, "excluded": 1, "unchanged": 0, "skipped": 0,
+                               "rotations": 0, "rotations_skipped": 0}
+    assert state["skipped"] == []
+    # The record reads back with its status, and so does its history.
+    body = _as(client, "reviewer").get(f"/records/{a.id}").json()
+    assert body["status"] == "excluded"
+    changes = _as(client, "reviewer").get(f"/collections/{vol.col.id}/status-changes")
+    assert changes.status_code == 200, changes.text
+    assert ("in_review", "excluded") in [(c["from_status"], c["to_status"]) for c in changes.json()]
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_rotations_listed_as_none_applies(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, rotations=[]), _exclude(b, rotations=None)])
+    _poll(db_session, fake)
+    assert (_refresh(db_session, a).status, _refresh(db_session, b).status) == ("excluded", "excluded")
+
+
+@pytest.mark.unit
+def test_an_exclusion_overrides_a_local_approval_through_in_review(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    assert _as(client, "reviewer").patch(f"/records/{a.id}/status", json={"status": "approved"}).status_code == 200
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "excluded"
+    assert [h[:2] for h in _history(db_session, a)][-2:] == [("approved", "in_review"), ("in_review", "excluded")]
+
+
+@pytest.mark.unit
+def test_an_exclusion_overrides_a_rejection_through_in_review(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_reject(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "excluded"
+    assert [h[:2] for h in _history(db_session, a)][-2:] == [("rejected", "in_review"), ("in_review", "excluded")]
+
+
+@pytest.mark.unit
+def test_an_exclusion_repeated_in_a_later_set_is_unchanged(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    history = _history(db_session, a)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _history(db_session, a) == history
+    assert _decisions_state(client, vol.col)["counts"]["unchanged"] == 1
+
+
+@pytest.mark.unit
+def test_a_later_approval_restores_an_excluded_record(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_approve(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"
+    assert _history(db_session, a)[-1] == ("excluded", "approved", "Fisqua: Ana Gómez")
+
+
+@pytest.mark.unit
+def test_a_later_rejection_of_an_excluded_record_applies_normally(db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_reject(a, reason="glare", note="reflejo")], decisions_id="d-2")
+    _poll(db_session, fake)
+    rec = _refresh(db_session, a)
+    assert rec.status == "rejected"
+    [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
+    assert (rej.predefined_reason, rej.comment, rej.rejected_by) == ("glare", "reflejo", "Fisqua: Ana Gómez")
+    assert all(img.rejection_id == rej.id for img in rec.images if img.is_current)
+    assert _history(db_session, a)[-1] == ("excluded", "rejected", "Fisqua: Ana Gómez")
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_a_reason_is_refused_for_that_record_only(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, reason="blur"), _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_reason"}]
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_rotations_is_refused_for_that_record_only(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    left = next(i for i in a.images if i.role == "left")
+    _decide(fake, row, [_exclude(a, rotations=[{"captureId": left.capture_id, "role": "left", "quarterTurns": 1}]),
+                        _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert all(i.rotation_correction_quarter_turns is None for i in _refresh(db_session, a).images)
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_decision"}]
+
+
+@pytest.mark.unit
+def test_an_exclusion_leaves_an_earlier_rotation_correction_as_it_is(db_session, handed):
+    vol, (a, b), row, fake = handed
+    left = next(i for i in a.images if i.role == "left")
+    _decide(fake, row, [_approve(a, rotations=[{"captureId": left.capture_id, "role": "left", "quarterTurns": 1}])])
+    _poll(db_session, fake)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    images = {i.role: i for i in _refresh(db_session, a).images}
+    assert images["left"].rotation_correction_quarter_turns == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["maybe", "Excluded", "EXCLUDED", "", None, 1])
+def test_any_other_decision_value_is_still_invalid(client, db_session, handed, value):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [{"captuaRecordId": a.id, "decision": value, "decidedBy": "Ana", "rotations": []}])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_decision"}]
+
+
+@pytest.mark.unit
+def test_the_contract_names_the_excluded_decision():
+    import app.core.fisqua_contract as fc
+    assert fc.DECISION_EXCLUDED == "excluded"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role", ["reviewer", "admin", "operator"])
+def test_the_reviewer_and_operator_routes_do_not_offer_excluded(client, db_session, handed, role):
+    vol, (a, b), row, fake = handed
+    api = _as(client, role)
+    assert api.patch(f"/records/{a.id}/status", json={"status": "excluded"}).status_code == 422
+    resp = api.post("/records/bulk-status", json={"record_ids": [b.id], "status": "excluded"})
+    assert resp.status_code == 422
+    assert (_refresh(db_session, a).status, _refresh(db_session, b).status) == ("in_review", "in_review")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("target", ["in_review", "approved", "captured"])
+def test_no_route_moves_an_excluded_record(client, db_session, handed, target):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    resp = _as(client, "admin").patch(f"/records/{a.id}/status", json={"status": target})
+    assert resp.status_code == 422, resp.text
+    assert _refresh(db_session, a).status == "excluded"
+    resp = _as(client, "admin").post(f"/records/{a.id}/reject", json={"predefined_reason": "blur"})
+    assert resp.status_code == 422
+    assert _refresh(db_session, a).status == "excluded"
+
+
+def _notes(db, rec):
+    from app.models.record import RecordStatusChange
+    return [(h.from_status, h.to_status, h.note) for h in
+            db.query(RecordStatusChange).filter(RecordStatusChange.record_id == rec.id)
+            .order_by(RecordStatusChange.id)]
+
+
+@pytest.mark.unit
+def test_an_exclusions_note_is_kept_on_its_status_change(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    assert _as(client, "reviewer").patch(f"/records/{a.id}/status", json={"status": "approved"}).status_code == 200
+    _decide(fake, row, [_exclude(a, note="  duplicate of 0003 "), _exclude(b)])
+    _poll(db_session, fake)
+    # Only the change into excluded carries it; the step through in_review does not.
+    assert _notes(db_session, a)[-2:] == [("approved", "in_review", None),
+                                          ("in_review", "excluded", "duplicate of 0003")]
+    assert _notes(db_session, b)[-1] == ("in_review", "excluded", None)
+    changes = _as(client, "reviewer").get(f"/collections/{vol.col.id}/status-changes").json()
+    shown = {(c["record_id"], c["to_status"]): c["note"] for c in changes}
+    assert shown[(a.id, "excluded")] == "duplicate of 0003"
+    assert shown[(a.id, "approved")] is None
+
+
+@pytest.mark.unit
+def test_an_approval_and_a_rejection_keep_no_note_on_their_status_change(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a, note="bien"), _reject(b, note="borroso")])
+    _poll(db_session, fake)
+    assert _notes(db_session, a)[-1] == ("in_review", "approved", None)
+    assert _notes(db_session, b)[-1] == ("in_review", "rejected", None)
+
+
+@pytest.mark.unit
+def test_an_exclusion_note_over_2000_characters_is_skipped_not_cut(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, note="x" * 2001), _exclude(b, note="y" * 2000)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _notes(db_session, b)[-1] == ("in_review", "excluded", "y" * 2000)
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "note_too_long"}]

@@ -11,7 +11,7 @@ uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
 
-Version: 0.2.0
+Version: 0.2.1
 """
 
 import hashlib
@@ -1110,3 +1110,44 @@ def test_with_rotate_deg_on_a_rebuilt_jpeg_carries_its_recorded_rotation_not_its
     monkeypatch.setattr(Image, "open", no_read)
     [out] = _images(_export(client, vol.col).json())
     assert out["rotateDeg"] == 180
+
+
+# ---------------------------------------------------------------------------
+# Excluded (contract 1.6): listed with its status and images, not a page
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_an_excluded_record_is_listed_with_its_status_and_images_and_is_not_a_page(client, vol):
+    page = vol.record(status="in_review", sequence=1)
+    out = vol.record(status="excluded", sequence=2)
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    records = resp.json()["volumes"][0]["records"]
+    assert [(r["captuaRecordId"], r["status"]) for r in records] == [(page.id, "in_review"), (out.id, "excluded")]
+    assert records[1]["rejectionNote"] is None
+    assert sorted(i["role"] for i in records[1]["images"]) == ["left", "right"]
+
+
+@pytest.mark.unit
+def test_a_volume_with_one_excluded_record_among_in_review_ones_exports(client, vol):
+    vol.record(status="in_review", sequence=1)
+    vol.record(status="excluded", sequence=2)
+    vol.record(status="in_review", sequence=3)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_an_excluded_record_gets_no_roles_check(client, vol):
+    vol.record(status="in_review", sequence=1)
+    vol.record(status="excluded", sequence=2, layout=("left", "left"))
+    bare = vol.record(status="excluded", sequence=3)
+    vol.supersede(bare)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_whose_records_are_all_excluded_has_no_pages(client, vol):
+    vol.record(status="excluded", sequence=1)
+    vol.record(status="excluded", sequence=2)
+    problems = _refusal(_export(client, vol.col))
+    assert list(problems) == ["no_pages"]

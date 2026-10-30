@@ -2,7 +2,7 @@
 whose bytes no longer match its capture-time checksum both fail the export. 
 The export runs as a background job, so these surface as a failed job with detail.
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import json
@@ -216,3 +216,92 @@ def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
     assert "material" not in entry
     # schema_version 2: every image carries rotate_deg (null for an image with none recorded).
     assert entry["images"] and all("rotate_deg" in i for i in entry["images"])
+
+
+# ---------------------------------------------------------------------------
+# An excluded record (Fisqua contract 1.6) is not a page of the volume: the
+# export skips it, and it blocks nothing.
+# ---------------------------------------------------------------------------
+
+def _excluded(db_session, col, title="test shot", with_image=True):
+    from app.models.record import Record, RecordImage
+    rec = Record(title=title, collection_id=col.id, status="excluded", capture_mode="single")
+    db_session.add(rec)
+    db_session.commit()
+    db_session.refresh(rec)
+    if with_image:
+        # A file that is not on disk: the export would refuse it if it were planned.
+        db_session.add(RecordImage(record_id=rec.id, filename="gone.jpg", file_path="/nowhere/gone.jpg",
+                                   format="jpg", role="single", is_current=True))
+        db_session.commit()
+    return rec
+
+
+def test_the_workflow_gate_skips_excluded_records():
+    from types import SimpleNamespace
+    from app.core.export_service import exported_records, workflow_blockers
+    approved = SimpleNamespace(id=1, status="approved")
+    excluded = SimpleNamespace(id=2, status="excluded")
+    review = SimpleNamespace(id=3, status="in_review")
+    assert exported_records([approved, excluded]) == [approved]
+    assert workflow_blockers(exported_records([approved, excluded])) is None
+    assert workflow_blockers(exported_records([excluded, review]))[1] == [3]
+    assert workflow_blockers(exported_records([excluded]))[0] == "Collection has no records to export."
+
+
+def test_an_excluded_record_neither_blocks_the_export_nor_enters_the_bag(
+    export_client, db_session, override_projects_root, monkeypatch, tmp_path
+):
+    import hashlib, zipfile, bagit
+    from app.core import config
+    from app.models.record import RecordImage
+    from capture.project_manager import secure_project_filename
+
+    exports = tmp_path / "exp"
+    exports.mkdir()
+    monkeypatch.setattr(config.settings, "EXPORTS_ROOT", str(exports))
+    proot = override_projects_root / secure_project_filename("P")
+    (proot / "images").mkdir(parents=True)
+    (proot / "metadata").mkdir(parents=True)
+    f = proot / "images" / "cap.jpg"
+    f.write_bytes(b"captured bytes here")
+    sha = hashlib.sha256(b"captured bytes here").hexdigest()
+    (proot / "metadata" / "manifest.jsonl").write_text(
+        json.dumps({"capture_id": "cid1", "files": [
+            {"role": "single", "relative_path": "images/cap.jpg", "sha256": sha}]}) + "\n")
+
+    col, rec = _approved_collection(db_session)
+    db_session.add(RecordImage(record_id=rec.id, filename="cap.jpg", file_path=str(f),
+                               format="jpg", role="single", capture_id="cid1", is_current=True))
+    db_session.commit()
+    out = _excluded(db_session, col)
+    _excluded(db_session, col, title="no image", with_image=False)
+
+    resp = export_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 202, resp.text
+    st = _run_to_completion(export_client, col.id, resp.json()["job_id"])
+    assert st["state"] == "done", st
+
+    zname = st["zip_filename"]
+    ext = tmp_path / "ext"
+    with zipfile.ZipFile(exports / zname) as zf:
+        meta = json.loads(zf.read(next(n for n in zf.namelist() if n.endswith("data/metadata.json"))))
+        zf.extractall(ext)
+    assert [r["id"] for r in meta["records"]] == [rec.id]
+    assert out.id not in [r["id"] for r in meta["records"]]
+    bagit.Bag(str(ext / zname[:-4])).validate()
+
+
+def test_a_collection_of_excluded_records_only_has_nothing_to_export(export_client, db_session):
+    from app.models.project import Project
+    from app.models.collection import Collection
+    proj = Project(name="P")
+    db_session.add(proj)
+    db_session.commit()
+    col = Collection(name="C", project_id=proj.id)
+    db_session.add(col)
+    db_session.commit()
+    _excluded(db_session, col)
+    resp = export_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["message"] == "Collection has no records to export."

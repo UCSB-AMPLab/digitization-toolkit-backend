@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.2.1
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -363,13 +363,15 @@ def summarise_records_to_retake(
 	retake with the rejected image still current. Each volume with a pending
 	record is listed, most pending first, then by name: `pending` is its
 	pending records, `total` its records with at least one rejection whatever
-	their state now, pendingRecordIds every pending record of the volume by
+	their state now except excluded, `excluded` its records now excluded by
+	a Fisqua decision (contract 1.6), which are never pending, pendingRecordIds every pending record of the volume by
 	sequence (a record with none last) then id, and firstPendingRecordId the
 	first of them. projectId is the project that owns the volume, through its
 	parents for a nested one.
 
 	The volumes come from one statement: every record in a volume that is
-	pending or was ever rejected, with its volume, in the order of the list.
+	pending, was ever rejected or is excluded, with its volume, in the order
+	of the list. A volume with exclusions and nothing pending is not listed.
 	Counts, list and first record are taken from the same rows, so a retake
 	committed while the summary is read cannot make them disagree, and a
 	volume left with no pending record is not listed. The same statement
@@ -383,18 +385,21 @@ def summarise_records_to_retake(
 	ever_rejected = db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
 	rows = (
 		db.query(Collection.id, Collection.name, Collection.filename_stem,
-		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"))
+		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"),
+		         Record.status)
 		.join(Record, Record.collection_id == Collection.id)
-		.filter(or_(is_pending, ever_rejected))
+		.filter(or_(is_pending, ever_rejected, Record.status == "excluded"))
 		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
 		.all()
 	)
 	by_volume: dict = {}
-	for collection_id, name, stem, record_id, pending, rejected in rows:
-		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0})
+	for collection_id, name, stem, record_id, pending, rejected, status in rows:
+		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0, "excluded": 0})
 		if pending:
 			vol["ids"].append(record_id)
-		if rejected:
+		if status == "excluded":
+			vol["excluded"] += 1
+		elif rejected:
 			vol["total"] += 1
 	volumes = []
 	for collection_id, vol in by_volume.items():
@@ -408,6 +413,7 @@ def summarise_records_to_retake(
 			"filenameStem": vol["stem"],
 			"pending": len(vol["ids"]),
 			"total": vol["total"],
+			"excluded": vol["excluded"],
 			"firstPendingRecordId": vol["ids"][0],
 			"pendingRecordIds": vol["ids"],
 		})
@@ -519,6 +525,17 @@ def update_record(
 	return _serialize_record(rec)
 
 
+# Statuses whose records, and their images, only an admin may delete.
+LOCKED_STATUSES = ("in_review", "approved", "excluded")
+
+
+def _locked_detail(what: str, status: str) -> str:
+	if status == "excluded":
+		return (f"Cannot delete {what} with status 'excluded': Fisqua excluded it from the volume, "
+		        "and only an admin can delete it.")
+	return f"Cannot delete {what} with status '{status}'. Move it to 'rejected' first."
+
+
 @router.delete("/{rec_id}")
 def delete_record(
 	rec_id: int,
@@ -530,11 +547,12 @@ def delete_record(
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
-	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first
-	if rec.status in ("in_review", "approved") and current_user.role != "admin":
+	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first.
+	# An excluded one (a Fisqua decision, contract 1.6) is locked too: its masters stay where they are.
+	if rec.status in LOCKED_STATUSES and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
-			detail=f"Cannot delete a record with status '{rec.status}'. Move it to 'rejected' first."
+			detail=_locked_detail("a record", rec.status)
 		)
 	
 	# Count images before delete/commit; rec.images is unusable once the row is expired
@@ -825,10 +843,10 @@ def delete_image(
 	)
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
+	if rec and rec.status in LOCKED_STATUSES and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
-			detail=f"Cannot delete an image from a record with status '{rec.status}'. Move it to 'rejected' first."
+			detail=_locked_detail("an image from a record", rec.status)
 		)
 
 	# Collect the file, its preview sidecar and the thumbnail; only paths inside
@@ -1277,10 +1295,17 @@ def _apply_status_change(
 	rec: Record,
 	new_status: str,
 	user: User,
+	transitions: Optional[dict] = None,
+	note: Optional[str] = None,
 ) -> None:
 	"""
 	Validate and apply a status transition on a Record.
 	Raises HTTPException on invalid transition or insufficient role.
+
+	`transitions` is the table checked, STATUS_TRANSITIONS unless given. Only
+	app.core.fisqua_decisions passes another, DECISION_TRANSITIONS, which adds
+	the moves into and out of "excluded" that no route offers, and `note`,
+	the exclusion's note, which the history row keeps.
 
 	Every promotion goes through here — PATCH /{id}/status, POST /bulk-status
 	and POST /collections/{id}/promote all call it — so the invariant on
@@ -1300,7 +1325,7 @@ def _apply_status_change(
 	if current_status == new_status:
 		return  # no-op
 
-	allowed_roles = STATUS_TRANSITIONS.get((current_status, new_status))
+	allowed_roles = (STATUS_TRANSITIONS if transitions is None else transitions).get((current_status, new_status))
 	if allowed_roles is None:
 		raise HTTPException(
 			status_code=422,
@@ -1315,7 +1340,7 @@ def _apply_status_change(
 	if current_status == "captured":
 		_assert_promotable(rec)
 
-	change_record_status(db, rec, new_status, user.username)
+	change_record_status(db, rec, new_status, user.username, note)
 
 
 @router.patch("/{rec_id}/status", response_model=RecordRead)

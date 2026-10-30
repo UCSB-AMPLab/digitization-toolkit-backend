@@ -6,7 +6,7 @@ columns. Neither loads ORM objects, because a unit holds thousands of records
 and the dashboard calls them on every visit. status_counts is also what
 GET /imports/digitisation-lists shows for each item's volume.
 
-Version: 0.2.0
+Version: 0.2.1
 """
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone
@@ -28,8 +28,9 @@ router = APIRouter()
 
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
-STATUSES = ("captured", "in_review", "rejected", "approved")
-REVIEW_OUTCOMES = ("approved", "rejected")
+STATUSES = ("captured", "in_review", "rejected", "approved", "excluded")
+# The decisions that review a record; "excluded" is Fisqua's third (contract 1.6).
+REVIEW_OUTCOMES = ("approved", "rejected", "excluded")
 
 
 def _collections_in_scope(db: Session, project_id: Optional[int]) -> List[int]:

@@ -1,7 +1,7 @@
 """The work a background export job runs: validate, check disk, stream the bag,
 prune old zips. Runs in a worker thread with its own DB session.
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 
 import json
@@ -45,6 +45,17 @@ def source_organization(project) -> str:
     """The bag's Source-Organization: the project's name, or the software's
     name for a collection with no project."""
     return project.name if project else "Captua"
+
+
+def exported_records(records) -> list:
+    """The records an export bags: every one but those Fisqua excluded.
+
+    An excluded record (contract 1.6) is not a page of the volume, such as a
+    test shot of the rig or a duplicate, so it is skipped: it neither blocks
+    the export nor enters the bag. Both callers of workflow_blockers pass
+    their records through this first, and so does the worker's re-check.
+    """
+    return [r for r in records if r.status != "excluded"]
 
 
 def workflow_blockers(records) -> tuple[str, list[int]] | None:
@@ -107,6 +118,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
+    records = exported_records(records)
     # Re-checked here, not just at request time. Nothing is built before this.
     blocker = workflow_blockers(records)
     if blocker:
@@ -195,6 +207,8 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             .populate_existing()
             .all()
         )
+        # A record excluded since the gate leaves this set, so the states differ.
+        rechecked = exported_records(rechecked)
         now_state = {rec.id: (rec.status, rec.sequence,
                               tuple(sorted(i.id for i in rec.images if i.is_current)))
                      for rec in rechecked}

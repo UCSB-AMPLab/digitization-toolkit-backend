@@ -9,7 +9,7 @@ collection in a single UPDATE and adds its rows with
 record_bulk_status_changes. A record's birth as "captured" is not a change and
 writes no row; its created_at dates it.
 
-Version: 0.1.0-beta
+Version: 0.2.1
 """
 from typing import Iterable
 
@@ -18,8 +18,12 @@ from sqlalchemy.orm import Session
 from app.models.record import Record, RecordStatusChange
 
 
-def change_record_status(db: Session, rec: Record, new_status: str, actor: str | None) -> None:
+def change_record_status(db: Session, rec: Record, new_status: str, actor: str | None,
+                         note: str | None = None) -> None:
 	"""Set rec.status to new_status and add the history row; no-op if unchanged.
+
+	`note` goes on the history row: the note of an exclusion by Fisqua
+	(app.core.fisqua_decisions), and None for every other change.
 
 	The caller validates the transition and commits. The row is added by
 	record_id rather than through rec.status_changes, so a promotion of 825
@@ -33,6 +37,7 @@ def change_record_status(db: Session, rec: Record, new_status: str, actor: str |
 		from_status=rec.status,
 		to_status=new_status,
 		changed_by=actor,
+		note=note,
 	))
 	rec.status = new_status
 

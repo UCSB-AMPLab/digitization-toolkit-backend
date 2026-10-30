@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.2.1
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -27,7 +27,7 @@ from app.core.record_status import record_bulk_status_changes
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
-from app.core.export_service import run_export, workflow_blockers
+from app.core.export_service import exported_records, run_export, workflow_blockers
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
     VOLUME_CHANGED_MESSAGE,
@@ -1095,7 +1095,8 @@ def export_collection_bagit(
     """
     Start a background BagIt export of this collection and return a job to poll.
 
-    Requires all records to be approved. The heavy work (integrity verification and
+    Requires all records to be approved, except those Fisqua excluded, which
+    are skipped (app.core.export_service.exported_records). The heavy work (integrity verification and
     streaming the zip straight into the exports dir, with no staging copy) runs in a
     background job, so proxied clients never hit nginx's read timeout; poll
     GET /{collection_id}/export/status/{job_id} for progress.
@@ -1110,6 +1111,7 @@ def export_collection_bagit(
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
+    records = exported_records(records)
     # Handover first, approval second — two different things to tell her. A
     # collection she has not promoted is work in progress, not work that failed
     # review (NEH-260). The predicate lives in export_service beside the worker

@@ -27,6 +27,11 @@ whose files are still on disk.
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
   2026-10-17: the manifest carries every record's status).
+* Pages are the images of records `in_review` or `approved` (HANDED_OVER).
+  A record `excluded` by a Fisqua decision (contract 1.6) is listed with
+  that status and its current images, so Fisqua keeps its decision, but it
+  is not a page and its roles are not checked; a volume whose records are
+  all excluded has no pages and is refused.
 * `externalId` is the volume's recorded reference code (collections.external_id)
   or, when none is recorded, its stem: contract 1.2 §8 makes a volume's
   filenameStem its Fisqua reference code, unchanged, and the unit's
@@ -47,7 +52,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.2.0
+Version: 0.2.1
 """
 
 import re
@@ -257,7 +262,8 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     for rec in records:
         imgs = current[rec.id]
         layout = tuple(sorted(i.role or "" for i in imgs))
-        if imgs and layout not in VALID_LAYOUTS:
+        # An excluded record is not a page, so its roles are not checked (module header).
+        if imgs and rec.status != "excluded" and layout not in VALID_LAYOUTS:
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: {', '.join(i.role or 'no role' for i in imgs)}")
         elif not imgs and rec.status in HANDED_OVER:
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: no image")
