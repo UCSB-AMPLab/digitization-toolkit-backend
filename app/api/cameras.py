@@ -1,4 +1,4 @@
-# Version: 0.3.2
+# Version: 0.3.3
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Query, Response
@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, field_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -22,7 +22,7 @@ from app.core.volume_stem import RETAKE_STATUS_DETAIL, RETAKE_VOLUME_DETAIL, STE
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
-from app.core.record_sequence import next_sequences
+from app.core.record_sequence import VOLUME_CHANGED_MESSAGE, VolumeChangedError, insert_after, lock_volume_records, next_sequences
 from app.core.record_status import change_record_status
 from app.core import recapture_turn
 
@@ -32,6 +32,12 @@ logger = logging.getLogger(__name__)
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+
+PLACEHOLDER_NEEDS_DUAL_DETAIL = {
+	"code": "placeholder_needs_dual",
+	"message": "This record is a placeholder for a whole opening; capture it with both cameras.",
+}
 
 
 def _next_record_sequence(db: Session, collection_id: int) -> int:
@@ -261,6 +267,12 @@ class DualCaptureRequest(BaseModel):
 	sequence: Optional[int] = None  # Page number/order
 	left_camera_index: int = 0  # Which camera index maps to the left page (0 or 1)
 	collection_id: Optional[int] = None  # Collection to link the record to
+	# Insert the new record right after this record of the volume, moving
+	# every later record's sequence up one, instead of after the highest
+	# (contract 1.9 §10.2). Not with record_id. Sent as afterRecordId.
+	after_record_id: Optional[int] = Field(default=None, alias="afterRecordId")
+
+	model_config = ConfigDict(populate_by_name=True)
 
 	@field_validator("rotate_deg_cam0", "rotate_deg_cam1")
 	@classmethod
@@ -846,6 +858,9 @@ def trigger_capture(
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
+	# A placeholder (contract 1.9 §10) is a whole opening: only a dual capture fills it.
+	if retake_record is not None and retake_record.missing_side == "both":
+		raise HTTPException(status_code=409, detail=PLACEHOLDER_NEEDS_DUAL_DETAIL)
 	# A retake is redone only in the mode the record was captured in.
 	if retake_record is not None and retake_record.capture_mode != "single":
 		raise HTTPException(
@@ -1067,13 +1082,36 @@ def trigger_dual_capture(
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
+	if request.after_record_id is not None and request.record_id:
+		raise HTTPException(
+			status_code=422,
+			detail="afterRecordId inserts a new record; it cannot be combined with record_id, which recaptures one.",
+		)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
 		retake_record = _locked_record(db, request.record_id)
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	if request.after_record_id is not None and request.collection_id:
+		# Inserting rewrites the volume's order, so the volume's records are
+		# locked and then its row (app.core.record_sequence), in the place a
+		# retake takes its record's lock: before the volume's row below.
+		try:
+			lock_volume_records(db, request.collection_id)
+		except VolumeChangedError:
+			db.rollback()
+			raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	if request.after_record_id is not None:
+		after = db.get(Record, request.after_record_id)
+		if after is None:
+			raise HTTPException(status_code=404, detail=f"Record {request.after_record_id} not found")
+		if after.collection_id != request.collection_id:
+			raise HTTPException(
+				status_code=422,
+				detail=f"Record {request.after_record_id} is not in volume {request.collection_id}.",
+			)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
 	# A retake is redone only in the mode the record was captured in.
 	if retake_record is not None and retake_record.capture_mode != "dual":
@@ -1167,12 +1205,18 @@ def trigger_dual_capture(
 			from app.api.records import _supersede_current_images
 			_supersede_current_images(record)
 		else:
+			# After a given record (contract 1.9 §10.2), under the locks taken
+			# at the top; otherwise after the highest.
+			if request.after_record_id is not None:
+				sequence = insert_after(db, request.collection_id, request.after_record_id, 1)[0]
+			else:
+				sequence = _next_record_sequence(db, request.collection_id)
 			record = Record(
 				title=request.record_title or f"{project_name} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
-				sequence=_next_record_sequence(db, request.collection_id),
+				sequence=sequence,
 				created_by=current_user.username,
 				capture_mode="dual",
 			)
@@ -1263,10 +1307,18 @@ def trigger_dual_capture(
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.
 			change_record_status(db, record, "captured", current_user.username)
-			# An opening that missed a side (app.core.rebuild_volume) has both
-			# pages now: the lone image is superseded above, and the record is
+			# A missing record (contract 1.9 §10: a page or a whole opening
+			# never captured, a placeholder included) has both pages now: any
+			# lone image is superseded above, it keeps its sequence, and it is
 			# an ordinary dual record, sent with its volume's next handover.
+			# What it was expected to hold and its closing go with its missing
+			# side; the Fisqua request it came from stays, so the manifest
+			# still names it (app.core.capture_manifest).
 			record.missing_side = None
+			record.missing_expected = None
+			record.missing_note = None
+			record.closed_reason = None
+			record.closed_note = None
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
 
 		db.commit()

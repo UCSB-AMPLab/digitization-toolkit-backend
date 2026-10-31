@@ -1,4 +1,4 @@
-# Version: 0.3.2
+# Version: 0.3.3
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -23,6 +23,7 @@ from app.schemas.record import (
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
 	RecordRejectRequest, RecordRejectionRead, RecordToRetake,
+	MissingPageRequest, CloseMissingRequest,
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
@@ -33,6 +34,7 @@ from app.core.capture_naming import CaptureNameRefused, take_filename_index
 from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
+from app.core import recapture_turn
 from app.core.export_jobs import export_jobs
 from app.core.storage_override import refuse_writes_under_unusable_root
 
@@ -287,7 +289,7 @@ def _to_retake_query(db: Session):
 	"""The pending records, each with its volume, its latest rejection and why it is pending, in one query.
 
 	Pending is app.core.recapture_turn's one definition: rejected, prepared
-	for retake, or missing a side. The latest rejection is the one with the
+	for retake, or missing and open. The latest rejection is the one with the
 	newest rejected_at (the highest id on a tie), found by a correlated
 	subquery in the join, so the rows come from one statement whatever their
 	number. Both joins are outer: a record in no volume, or pending with no
@@ -317,18 +319,33 @@ def list_records_to_retake(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Every pending record, across all volumes, oldest latest rejection first.
+	"""Every pending record, across all volumes, in volume order and then in the volume's order.
 
 	Pending as app.core.recapture_turn defines it: rejected, prepared for
-	retake, or missing a side. Each row has the record, its volume's project
-	id, name and stem, its latest rejection's reason code, comment, author
-	and time, why it is pending (pendingReason) and the side it misses
-	(missingSide). A record with no rejection row, as a missing side has
-	none, comes last; ties go by record id.
+	retake, or missing and open (a page or a whole opening never captured,
+	and not closed; contract 1.9 §10). Each row has the record, its volume's
+	project id, name and stem, its latest rejection's reason code, comment,
+	author and time, why it is pending (pendingReason), the side it misses
+	(missingSide), and for a missing record what it should hold, the note on
+	it and the Fisqua request it came from (missingExpected, missingNote,
+	requestId). A record with no rejection row, as a missing one has none,
+	has None for the rejection's fields.
+
+	Ordered by volume, its stem (a volume without one after every stemmed
+	volume), name and id, so a record in no volume comes last; then by the
+	record's sequence (one without last) and id, so an operator works
+	through a volume in its own order. GET /to-retake/count counts the same
+	set.
 	"""
 	rows = (
 		_to_retake_query(db)
-		.order_by(RecordRejection.rejected_at.asc().nulls_last(), Record.id)
+		.order_by(
+			Collection.filename_stem.asc().nulls_last(),
+			Collection.name.asc().nulls_last(),
+			Collection.id.asc().nulls_last(),
+			Record.sequence.asc().nulls_last(),
+			Record.id,
+		)
 		.all()
 	)
 	return [
@@ -346,6 +363,9 @@ def list_records_to_retake(
 			rejectedAt=rej.rejected_at if rej else None,
 			pendingReason=reason,
 			missingSide=rec.missing_side,
+			missingExpected=rec.missing_expected,
+			missingNote=rec.missing_note,
+			requestId=rec.missing_request_id,
 		)
 		for rec, col, rej, reason in rows
 	]
@@ -356,7 +376,7 @@ def count_records_to_retake(
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""How many records GET /records/to-retake lists, for the side menu's badge."""
+	"""How many records GET /records/to-retake lists, for the side menu's badge: the same pending set."""
 	from app.core import recapture_turn
 	return {"count": recapture_turn.pending_records(db)}
 
@@ -1282,15 +1302,19 @@ def _assert_promotable(rec: Record) -> None:
 	"""
 	Refuse to let a record leave 'captured' unless the work is there to hand
 	over: at least one current image, no current image carrying a
-	rejection_id (NEH-260), and no missing side. A record that misses a side
-	(app.core.rebuild_volume) stays captured on the unit until a dual retake
-	writes both pages: PATCH /{id}/status refuses it, and POST /bulk-status
-	and POST /collections/{id}/promote leave it out.
+	rejection_id (NEH-260), and not missing and open. A record that misses a
+	page or a whole opening (records.missing_side, contract 1.9 §10) and has
+	not been closed stays captured on the unit until a dual capture writes
+	both pages: PATCH /{id}/status refuses it, and POST /bulk-status and POST
+	/collections/{id}/promote leave it out. One the operator closed without
+	capturing (records.closed_reason) is handed over as it is, with no image
+	needed: a closed placeholder has none, and the manifest lists it as
+	missing and not as a page (app.core.capture_manifest).
 
-	The second clause is the substantive test. rejection_id is written in
+	The rejection_id clause is the substantive test. rejection_id is written in
 	reject_record below, on the images current at the moment of rejection, and
 	a retake supersedes those while the replacements carry none — so a marked
-	current image means the rejection has not been answered. The first clause
+	current image means the rejection has not been answered. The image clause
 	closes a vacuous pass: delete every current image and a purely negative
 	predicate holds on a record with nothing in it.
 
@@ -1301,8 +1325,17 @@ def _assert_promotable(rec: Record) -> None:
 	the link on images that are still current and still the rejected bytes. No
 	endpoint deletes rejections today; one added later has to account for it.
 	"""
+	if rec.missing_side is not None and rec.closed_reason is None:
+		missing = "both pages" if rec.missing_side == "both" else f"its {rec.missing_side} page"
+		raise HTTPException(
+			status_code=422,
+			detail=(
+				f"Record {rec.id} misses {missing}. "
+				f"Capture the opening, or close it as not to be captured, before handing it over."
+			)
+		)
 	current = [img for img in rec.images if img.is_current]
-	if not current:
+	if not current and rec.missing_side is None:
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {rec.id} has no current image, so there is nothing to hand over."
@@ -1314,14 +1347,6 @@ def _assert_promotable(rec: Record) -> None:
 			detail=(
 				f"Record {rec.id} still carries the rejected image(s) {marked}. "
 				f"Retake it before handing it over."
-			)
-		)
-	if rec.missing_side is not None:
-		raise HTTPException(
-			status_code=422,
-			detail=(
-				f"Record {rec.id} misses its {rec.missing_side} page. "
-				f"Retake the opening before handing it over."
 			)
 		)
 
@@ -1551,6 +1576,155 @@ def reject_record(
 
 	db.commit()
 	db.refresh(rec)
+	return _serialize_record(rec)
+
+
+# ==============================================================================
+# Pages and openings never captured (contract 1.9 §10)
+# ==============================================================================
+
+MISSING_PAGE_NOT_DUAL = "missing_page_not_dual"
+MISSING_PAGE_HAS_IMAGE = "missing_page_has_image"
+
+
+def missing_page_refusal(rec: Record, side: str) -> Optional[str]:
+	"""Why `side` cannot be marked missing on the record, as a code; None when it can.
+
+	Only a dual record can miss a page, and only one it has no current image
+	of. A record already missing that side, or both, can always be marked
+	again, and nothing changes (mark_missing_page).
+	"""
+	if rec.capture_mode != "dual":
+		return MISSING_PAGE_NOT_DUAL
+	if rec.missing_side in (side, "both"):
+		return None
+	if any(img.is_current and img.role == side for img in rec.images):
+		return MISSING_PAGE_HAS_IMAGE
+	return None
+
+
+def mark_missing_page(rec: Record, side: str, note: Optional[str] = None) -> bool:
+	"""Mark `side` missing on a locked record that missing_page_refusal passed; return whether it changed.
+
+	The one place a page is marked missing, for POST /{rec_id}/missing-page
+	and for Fisqua's `missing_page` decision (app.core.fisqua_decisions). A
+	record already missing that side, or both, is left as it is. One already
+	missing the other side, with no image of this one either, misses both.
+	A note, when given, is kept as records.missing_note. The record is then
+	pending until it is captured into or closed (app.core.recapture_turn);
+	its status does not change. The caller commits.
+	"""
+	if rec.missing_side in (side, "both"):
+		return False
+	rec.missing_side = side if rec.missing_side is None else "both"
+	if note is not None and note.strip():
+		rec.missing_note = note.strip()
+	return True
+
+
+@router.post("/{rec_id}/missing-page", response_model=RecordRead)
+def mark_record_missing_page(
+	rec_id: int,
+	payload: MissingPageRequest,
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Mark a page of a dual record as never captured (contract 1.9 §10.1).
+
+	Body: {"side": "left" | "right", "note": optional, at most 2,000
+	characters}. Applies only to a dual record with no current image of that
+	side: otherwise 409 with code missing_page_not_dual or
+	missing_page_has_image, and nothing changes. A record already missing
+	that side is answered as it is. The record is then pending, listed in GET
+	/to-retake, until a dual capture into it or POST /{rec_id}/close-missing.
+	The record's row is locked, as every path that reads which of its images
+	are current and changes its state takes it.
+	"""
+	rec = _locked_record(db, rec_id)
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	refusal = missing_page_refusal(rec, payload.side)
+	if refusal == MISSING_PAGE_NOT_DUAL:
+		raise HTTPException(status_code=409, detail={
+			"code": refusal,
+			"message": f"Record {rec.id} was captured in '{rec.capture_mode}' mode; only a dual opening can miss a page.",
+		})
+	if refusal == MISSING_PAGE_HAS_IMAGE:
+		raise HTTPException(status_code=409, detail={
+			"code": refusal,
+			"message": f"Record {rec.id} has a current {payload.side} image, so that page is not missing.",
+		})
+	changed = mark_missing_page(rec, payload.side, payload.note)
+	db.commit()
+	db.refresh(rec)
+	if changed:
+		log_event(db, level="INFO", category="activity", action="missing_page_marked",
+		          actor=current_user.username, subject=rec.title,
+		          detail=f"record {rec.id} side={payload.side} missing_side={rec.missing_side}")
+	return _serialize_record(rec)
+
+
+@router.post("/{rec_id}/close-missing", response_model=RecordRead)
+def close_missing_record(
+	rec_id: int,
+	payload: CloseMissingRequest,
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Close a missing record without capturing it (contract 1.9 §10.1).
+
+	Body: {"reason": "foliation_skip" | "leaf_missing_from_volume" |
+	"captured_elsewhere" | "other", "note": optional, at most 2,000
+	characters, and required for "other"}. Only a record that misses a page
+	or a whole opening (records.missing_side) and is not closed yet: 409 with
+	code not_missing or already_closed otherwise. The record keeps its
+	missing side, stays in its volume, is no longer pending
+	(app.core.recapture_turn) and is promoted with its volume like a captured
+	record; its volume's manifest lists it as missing with its reason. A dual
+	capture into it later clears the closing. There is no route to reopen
+	one. Writes `missing_record_closed` to the system log.
+
+	Closing a pending record that leaves its volume with none pending
+	completes the volume's recaptures, as a retake does: it writes
+	recapture_volume_completed in the same transaction (app.core.recapture_turn),
+	taking the record's row, then the volume's, then the turn lock, the order
+	of the capture path. A full rescan not yet promoted writes none, as for a
+	retake. Closing a record that was not pending, or one in a volume that
+	still has pending records, writes nothing.
+	"""
+	rec = _locked_record(db, rec_id)
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	if rec.missing_side is None:
+		raise HTTPException(status_code=409, detail={
+			"code": "not_missing",
+			"message": f"Record {rec.id} is not missing a page, so there is nothing to close.",
+		})
+	if rec.closed_reason is not None:
+		raise HTTPException(status_code=409, detail={
+			"code": "already_closed",
+			"message": f"Record {rec.id} was already closed ({rec.closed_reason}).",
+		})
+	was_pending = recapture_turn.record_is_pending(rec)
+	rec.closed_reason = payload.reason
+	rec.closed_note = payload.note.strip() if payload.note and payload.note.strip() else None
+	if was_pending and rec.collection_id is not None:
+		# As a retake that leaves its volume with nothing pending
+		# (app.api.cameras._record_turn_events): the record's row, then the
+		# volume's, then the turn, and the event in this transaction.
+		volume = locked_volume_query(db, rec.collection_id).first()
+		recapture_turn.lock_turn(db)
+		db.flush()
+		if volume is not None and recapture_turn.volume_pending(db, volume.id) == 0 and not (
+				recapture_turn.volume_is_full_rescan(volume)
+				and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
+			recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, current_user.username)
+	db.commit()
+	db.refresh(rec)
+	log_event(db, level="INFO", category="activity", action="missing_record_closed",
+	          actor=current_user.username, subject=rec.title,
+	          detail=(f"record {rec.id} volume {rec.collection_id} missing_side={rec.missing_side} "
+	                  f"reason={rec.closed_reason}"))
 	return _serialize_record(rec)
 
 

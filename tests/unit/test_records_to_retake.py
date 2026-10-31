@@ -2,7 +2,8 @@
 
 Every pending record (app.core.recapture_turn: rejected, prepared for retake,
 or missing a side), across all volumes, with its volume, its latest
-RecordRejection and why it is pending, oldest latest rejection first. The
+RecordRejection and why it is pending, by volume (stem, NULLs last, then
+name and id) and then sequence (NULLs last) and id. The
 prepared and missing-side rows are covered in test_recapture_turn.py and
 test_missing_side.py. Rejections are
 written directly with their rejected_at, so the order does not depend on the
@@ -10,7 +11,7 @@ clock.
 
 Run with: python -m pytest tests/unit/test_records_to_retake.py
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 from datetime import datetime
@@ -124,17 +125,22 @@ def test_a_row_carries_the_record_its_volume_and_the_latest_rejection(client, db
         "rejectedAt": "2026-10-03T15:30:00",
         "pendingReason": "rejected",
         "missingSide": None,
+        "missingExpected": None,
+        "missingNote": None,
+        "requestId": None,
     }
 
 
 @pytest.mark.unit
-def test_oldest_latest_rejection_comes_first(client, db_session):
+def test_within_a_volume_by_sequence_whatever_the_rejection_dates(client, db_session):
     api = _client_as(client, "op", "operator")
     col = _collection(db_session)
-    # a's first rejection is the oldest of all, but its latest is the newest.
     a = _rejected(db_session, col, "a.jpg", datetime(2026, 10, 1), datetime(2026, 10, 9))
     b = _rejected(db_session, col, "b.jpg", datetime(2026, 10, 5))
     c = _rejected(db_session, col, "c.jpg", datetime(2026, 10, 3), datetime(2026, 10, 7))
+    for rec, seq in ((a, 3), (b, 1), (c, 2)):
+        rec.sequence = seq
+    db_session.commit()
 
     rows = _retakes(api)
     assert [r["recordId"] for r in rows] == [b.id, c.id, a.id]
@@ -142,7 +148,34 @@ def test_oldest_latest_rejection_comes_first(client, db_session):
 
 
 @pytest.mark.unit
-def test_a_rejected_record_without_a_rejection_row_comes_last(client, db_session):
+def test_volumes_by_stem_then_name_then_id_and_records_without_a_sequence_last(client, db_session):
+    from app.models.collection import Collection
+    api = _client_as(client, "op", "operator")
+    p = _collection(db_session).project_id
+    stemmed_b = Collection(name="A", filename_stem="co-b", project_id=p)
+    stemmed_a = Collection(name="Z", filename_stem="co-a", project_id=p)
+    named_x = Collection(name="X", project_id=p)
+    named_y1 = Collection(name="Y", project_id=p)
+    named_y2 = Collection(name="Y", project_id=p)
+    for c in (stemmed_b, stemmed_a, named_x, named_y1, named_y2):
+        db_session.add(c)
+        db_session.commit()
+    rows = {}
+    for col in (named_y2, named_y1, named_x, stemmed_b, stemmed_a):
+        rows[col.id] = _rejected(db_session, col, f"{col.id}.jpg", datetime(2026, 10, 1))
+    loose_seq = _rejected(db_session, stemmed_a, "loose.jpg", datetime(2026, 9, 1))
+    first = rows[stemmed_a.id]
+    first.sequence = 4
+    db_session.commit()
+    outside = _rejected(db_session, None, "outside.jpg", datetime(2026, 9, 1))
+
+    assert [r["recordId"] for r in _retakes(api)] == [
+        first.id, loose_seq.id, rows[stemmed_b.id].id, rows[named_x.id].id,
+        rows[named_y1.id].id, rows[named_y2.id].id, outside.id]
+
+
+@pytest.mark.unit
+def test_a_rejected_record_without_a_rejection_row_is_listed_with_none(client, db_session):
     """Every path to rejected writes a RecordRejection; a row from before that still shows."""
     api = _client_as(client, "op", "operator")
     col = _collection(db_session)
@@ -150,8 +183,8 @@ def test_a_rejected_record_without_a_rejection_row_comes_last(client, db_session
     later = _rejected(db_session, col, "later.jpg", datetime(2026, 10, 9))
 
     rows = _retakes(api)
-    assert [r["recordId"] for r in rows] == [later.id, bare.id]
-    assert {k: rows[1][k] for k in ("reason", "comment", "rejectedBy", "rejectedAt")} == {
+    assert [r["recordId"] for r in rows] == [bare.id, later.id]
+    assert {k: rows[0][k] for k in ("reason", "comment", "rejectedBy", "rejectedAt")} == {
         "reason": None, "comment": None, "rejectedBy": None, "rejectedAt": None,
     }
 

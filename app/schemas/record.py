@@ -1,8 +1,8 @@
-# Version: 0.3.2
+# Version: 0.3.3
 
 from __future__ import annotations
 from typing import Optional, List, Literal
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 # Aliased: `date` is already a field name on RecordBase (the free-text display
 # date), so importing the type under its own name would shadow it.
@@ -102,8 +102,18 @@ PredefinedRejectionReason = Literal[
 # Which camera setup produced a document: one image, or an L+R pair fired
 # together on a single shutter press. Set once at capture time.
 CaptureMode = Literal["single", "dual"]
-# The page of a dual opening never photographed (records.missing_side).
-MissingSide = Literal["left", "right"]
+# The page or pages of a dual opening never captured (records.missing_side):
+# "both" is a placeholder for a whole opening (contract 1.9 §10).
+MissingSide = Literal["left", "right", "both"]
+# The page a route or a Fisqua decision marks as missing on a dual record.
+MissingPage = Literal["left", "right"]
+# Why the operator closed a missing record without capturing it (records.closed_reason).
+ClosedReason = Literal["foliation_skip", "leaf_missing_from_volume", "captured_elsewhere", "other"]
+# Fisqua keeps notes to 2,000 characters (REJECTION_COMMENT_MAX_LENGTH below);
+# what a placeholder expects and every note on a missing record are held to the same.
+MISSING_TEXT_MAX_LENGTH = 2000
+MISSING_REQUEST_ID_MAX_LENGTH = 64
+MISSING_OPENINGS_MAX_COUNT = 50
 # Why a record is pending (app.core.recapture_turn.pending_reason): rejected,
 # prepared for retake with its rejected image still current, or missing a side.
 PendingReason = Literal["rejected", "prepared", "missing_side"]
@@ -279,10 +289,19 @@ class RecordRead(RecordBase):
 	created_by: Optional[str] = None
 	created_at: Optional[datetime]
 	modified_at: Optional[datetime]
-	# The page of a dual opening never photographed, set only by
-	# app.core.rebuild_volume and cleared by a dual retake; None otherwise.
-	# The record's one current image is the other page.
+	# The page or pages of a dual opening never captured (records.missing_side):
+	# "left" or "right", whose one current image, if any, is the other page,
+	# or "both" for a placeholder, which has no image. Cleared by a dual
+	# capture into the record; None otherwise.
 	missing_side: Optional[MissingSide] = None
+	# What a placeholder should hold and a note on it; the Fisqua request it
+	# came from (kept after it is captured into); why it was closed without
+	# capturing, and the note on that.
+	missing_expected: Optional[str] = None
+	missing_note: Optional[str] = None
+	missing_request_id: Optional[str] = None
+	closed_reason: Optional[ClosedReason] = None
+	closed_note: Optional[str] = None
 	images: List[RecordImageRead] = []
 
 	class Config:
@@ -378,6 +397,45 @@ class RecordToRetake(BaseModel):
 	# Why it is pending, and for "missing_side" which page is missing (None otherwise).
 	pendingReason: PendingReason
 	missingSide: Optional[MissingSide] = None
+	# For a missing record: what it should hold, the note on it, and the
+	# Fisqua request it came from (records.missing_expected, missing_note,
+	# missing_request_id); None otherwise.
+	missingExpected: Optional[str] = None
+	missingNote: Optional[str] = None
+	requestId: Optional[str] = None
+
+
+# ==============================================================================
+# Openings and pages never captured (contract 1.9 §10)
+# ==============================================================================
+
+class MissingOpeningsCreate(BaseModel):
+	"""POST /collections/{id}/records/missing-opening: placeholders right after a record of the volume."""
+	afterRecordId: int
+	# How many openings are missing; one when null or absent.
+	count: Optional[int] = Field(default=None, ge=1, le=MISSING_OPENINGS_MAX_COUNT)
+	expected: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+	requestId: Optional[str] = Field(default=None, max_length=MISSING_REQUEST_ID_MAX_LENGTH)
+
+
+class MissingPageRequest(BaseModel):
+	"""POST /records/{id}/missing-page: the page of a dual record that was never captured."""
+	side: MissingPage
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+
+
+class CloseMissingRequest(BaseModel):
+	"""POST /records/{id}/close-missing: close a missing record without capturing it."""
+	reason: ClosedReason
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+
+	@model_validator(mode="after")
+	def _other_needs_a_note(self) -> "CloseMissingRequest":
+		# As a rejection's 'other': the note is the only record of why.
+		if self.reason == "other" and not (self.note or "").strip():
+			raise ValueError("Closing with reason 'other' needs a note saying why.")
+		return self
 
 
 class RecordStatusChangeRead(BaseModel):

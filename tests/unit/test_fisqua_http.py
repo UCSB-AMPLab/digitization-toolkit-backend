@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.2.1
+Version: 0.3.3
 """
 
 import json
@@ -857,7 +857,7 @@ def test_turning_rotate_deg_on_clears_the_stop_and_resends_under_a_new_id(
     assert rows[1].manifest_id != refused.manifest_id
     sent = json.loads(server.requests[0].content)
     assert sent["id"] == rows[1].manifest_id
-    assert sent["version"] == "1.6"
+    assert sent["version"] == "1.9"
 
 
 @pytest.mark.unit
@@ -1239,3 +1239,23 @@ def test_a_version_refused_volume_with_a_record_missing_a_side_is_resent(
     server = Server(_ok())
     _send(db_session, server)
     assert [r.state for r in _rows(db_session, queued.col)] == ["refused", "delivered"]
+
+
+@pytest.mark.unit
+def test_a_version_refused_volume_with_a_closed_record_still_captured_is_not_resent(
+        client, db_session, queued, monkeypatch):
+    # A closed missing record is promoted like any captured one, so while it
+    # is captured the volume has not been handed over again.
+    from app.core import config
+    from app.models.record import Record
+    _send(db_session, Server(_version_refusal()))
+    rec = Record(title="p", collection_id=queued.col.id, status="captured", capture_mode="dual",
+                 sequence=99, missing_side="both", closed_reason="foliation_skip")
+    db_session.add(rec)
+    db_session.commit()
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server)
+    assert server.requests == []
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]

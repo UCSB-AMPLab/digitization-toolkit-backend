@@ -1,4 +1,4 @@
-"""A volume's capture manifest for Fisqua (exchange contract 1.6; §4, artefact 2, as in 1.1).
+"""A volume's capture manifest for Fisqua (exchange contract 1.9; §4, artefact 2, as in 1.1).
 
 Built only from the catalogue (the volume, its records and their current
 images), the capture manifests (`metadata/manifest.jsonl`, read through
@@ -26,14 +26,30 @@ whose files are still on disk.
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
-  2026-10-17: the manifest carries every record's status), but a captured
-  record that misses a side (records.missing_side, an opening only one
-  camera photographed): promotion leaves it captured on the unit, so the
-  manifest leaves it out, with its images, and it does not refuse the
-  export as a captured record does. Its capture line stays in the volume's
-  manifest.jsonl. Once a dual retake has cleared its missing side it is an
-  ordinary record, listed in the next handover.
-* Pages are the images of records `in_review` or `approved` (HANDED_OVER).
+  2026-10-17: the manifest carries every record's status), in the order of
+  its `sequence` (§10.2).
+* A record that is missing (records.missing_side: a page, or a whole
+  opening, never captured; contract 1.9 §10.1) is listed with `status`
+  "missing", whatever its status on the unit, and `missingSide` ("left",
+  "right" or "both"), with its current images: the other page's for a side,
+  none for a placeholder. Once the operator has closed it without capturing,
+  it also carries `closedReason` and, when she wrote one, `closedNote`. An
+  open one stays captured on the unit (promotion leaves it there) and does
+  not refuse the export as a captured record does; a closed one is promoted
+  like any record, and one still captured does refuse it. An open missing
+  record's images are listed, so they must pass every image check (uploaded,
+  digests, a preview for a RAW) like any listed image, and the export
+  refuses otherwise; the record holds its volume in Fisqua anyway (§10.3).
+  A captured-into
+  placeholder is an ordinary record again and carries no `missingSide`.
+* `requestId` is carried by a record made from a Fisqua request (§10.4,
+  records.missing_request_id), whatever its status, after it is captured
+  into as well (_request_id).
+* Pages are the images of records `in_review` or `approved` (HANDED_OVER),
+  except a missing record's: those are pages only once it is closed and
+  handed over (§10.3: a closed one with an image needs approval in capture
+  QC like any opening). An open missing record's image, and a placeholder,
+  are not pages, and a missing record with no image is not refused for it.
   A record `excluded` by a Fisqua decision (contract 1.6) is listed with
   that status and its current images, so Fisqua keeps its decision, but it
   is not a page and its roles are not checked; a volume whose records are
@@ -43,7 +59,7 @@ whose files are still on disk.
   filenameStem its Fisqua reference code, unchanged, and the unit's
   interface has no field for external_id (ruled). The download and the
   manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
-* The manifest always declares version 1.6, whatever its records and
+* The manifest always declares version 1.9, whatever its records and
   whatever CAPTUA_FISQUA_ROTATE_DEG; Fisqua reads any 1.x.
 * `rotateDeg` (contract 1.5) is sent only when CAPTUA_FISQUA_ROTATE_DEG is
   on; off, no image carries the key. It is the image's recorded rotate_deg: the clockwise degrees
@@ -59,7 +75,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import re
@@ -76,8 +92,9 @@ from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, i
 
 CONTRACT = "fisqua-captua-exchange"
 # One version for every manifest, with or without rotateDeg (config
-# FISQUA_ROTATE_DEG) or an excluded record.
-VERSION = "1.6"
+# FISQUA_ROTATE_DEG), an excluded record or a missing one.
+VERSION = "1.9"
+MISSING = "missing"
 ROTATE_DEGREES = (0, 90, 180, 270)
 KIND = "capture-manifest"
 EXPORT_ACTION = "capture_manifest_exported"
@@ -190,9 +207,44 @@ def _rejection_note(record) -> Optional[str]:
     return comment or latest.predefined_reason
 
 
-def _left_on_the_unit(rec) -> bool:
-    """Whether the record is a captured opening that misses a side, which the handover leaves out."""
-    return rec.status == "captured" and rec.missing_side is not None
+def _is_missing(rec) -> bool:
+    """Whether the record is listed as missing: a page or an opening never captured (records.missing_side)."""
+    return rec.missing_side is not None
+
+
+def _is_open_missing(rec) -> bool:
+    """Whether the record is missing and not closed: pending, and left captured on the unit by promotion."""
+    return rec.missing_side is not None and rec.closed_reason is None
+
+
+def _request_id(rec) -> Optional[str]:
+    """The Fisqua request id the record carries in the manifest, if any (module header).
+
+    Every record with records.missing_request_id set carries it, captured
+    into or not; pending Fisqua's confirmation of that, this is the one
+    place to change it.
+    """
+    return rec.missing_request_id
+
+
+def _record_entry(rec, out_images) -> dict:
+    entry = {
+        "captuaRecordId": rec.id,
+        "sequence": rec.sequence,
+        "status": MISSING if _is_missing(rec) else rec.status,
+        "rejectionNote": _rejection_note(rec),
+        "images": out_images,
+    }
+    if _is_missing(rec):
+        entry["missingSide"] = rec.missing_side
+        if rec.closed_reason is not None:
+            entry["closedReason"] = rec.closed_reason
+            if rec.closed_note is not None:
+                entry["closedNote"] = rec.closed_note
+    request_id = _request_id(rec)
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
 
 
 def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] = None,
@@ -238,14 +290,13 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
-    # A captured opening that misses a side stays on the unit until it is
-    # recaptured, as promotion leaves it (module header).
-    records = [rec for rec in records if not _left_on_the_unit(rec)]
     found = _Collector()
 
     by_sequence: Dict[int, List[int]] = {}
     for rec in records:
-        if rec.status == "captured":
+        # An open missing record stays captured on the unit; it is listed as
+        # missing and does not hold the export back (module header).
+        if rec.status == "captured" and not _is_open_missing(rec):
             found.add("records_captured", rec.id)
         if rec.sequence is None:
             found.add("sequence_missing", rec.id)
@@ -277,12 +328,13 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     for rec in records:
         imgs = current[rec.id]
         layout = tuple(sorted(i.role or "" for i in imgs))
-        # An excluded record is not a page, so its roles are not checked (module header).
+        # An excluded record is not a page, so its roles are not checked; a
+        # missing one may have no image at all (module header).
         if imgs and rec.status != "excluded" and layout not in VALID_LAYOUTS:
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: {', '.join(i.role or 'no role' for i in imgs)}")
-        elif not imgs and rec.status in HANDED_OVER:
+        elif not imgs and rec.status in HANDED_OVER and not _is_missing(rec):
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: no image")
-        if imgs and rec.status in HANDED_OVER:
+        if imgs and rec.status in HANDED_OVER and not _is_open_missing(rec):
             pages += len(imgs)
 
         out_images = []
@@ -291,13 +343,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
                                  file_form, found, page_keys)
             if entry is not None:
                 out_images.append(entry)
-        out_records.append({
-            "captuaRecordId": rec.id,
-            "sequence": rec.sequence,
-            "status": rec.status,
-            "rejectionNote": _rejection_note(rec),
-            "images": out_images,
-        })
+        out_records.append(_record_entry(rec, out_images))
 
     for key, owners in page_keys.items():
         if len(owners) > 1:

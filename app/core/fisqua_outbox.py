@@ -89,7 +89,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import hashlib
@@ -935,12 +935,15 @@ def _version_refused_volumes(db: Session) -> list:
     for row in rows:
         if not _version_refusal(row.problems):
             continue
-        # A record missing a side stays captured on the unit until it is
-        # recaptured and is left out of the handover (capture_manifest), so it
-        # does not hold the volume back.
+        # An open missing record (a page or an opening never captured, and
+        # not closed) stays captured on the unit until it is captured into or
+        # closed, and the manifest lists it as missing (capture_manifest), so
+        # it does not hold the volume back. A closed one is promoted like any
+        # record, so while it is captured it does.
+        from app.core.recapture_turn import open_missing_clause
         captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
                                               Record.status == "captured",
-                                              Record.missing_side.is_(None)).first()
+                                              ~open_missing_clause()).first()
         collection = db.get(Collection, row.collection_id)
         if captured is not None or collection is None:
             continue

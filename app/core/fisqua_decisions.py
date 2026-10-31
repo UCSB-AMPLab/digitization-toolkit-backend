@@ -1,8 +1,10 @@
-"""Applying Fisqua's QC decisions to a volume's records (contract 1.2 §9.5, 1.6).
+"""Applying Fisqua's QC decisions to a volume's records (contract 1.2 §9.5, 1.6, 1.9 §10.4).
 
 Fisqua decides each opening (each Captua record): approved, rejected for
-retake with a reason, or (contract 1.6) excluded, not a page of the volume;
-and may correct an image's rotation. Fisqua is
+retake with a reason, (contract 1.6) excluded, not a page of the volume, or
+(contract 1.9) missing_page, the opening lacks a page; and may correct an
+image's rotation. A set may also carry `requests` (1.9): openings Fisqua
+asks the unit to add as placeholders. Fisqua is
 authoritative for this second layer, so its decision is applied over a local
 one through the undo transitions. The status poll
 (app.core.fisqua_outbox.poll_fisqua_status) reads a volume's set when its
@@ -15,7 +17,11 @@ and not applied. A set whose `decisionsId` was applied already changes
 nothing.
 
 Per record, in one transaction, with the records' rows locked in id order
-(as every path that locks several records does) and nothing else locked:
+(as every path that locks several records does) and nothing else locked;
+when the set carries requests, every record of the volume is locked in id
+order and then the volume's row (app.core.record_sequence.lock_volume_records,
+the order of every path that rewrites a volume's order), and a decided
+record outside the volume is skipped without being locked:
 
 * approved: in_review -> approved; from rejected, rejected -> in_review ->
   approved; approved stays approved.
@@ -39,6 +45,13 @@ Per record, in one transaction, with the records' rows locked in id order
 * Every transition goes through app.api.records._apply_status_change as a
   reviewer named `Fisqua: <decidedBy>`, so the history row names the
   reviewer and that the decision came from Fisqua.
+* missing_page, with `side` "left" or "right": the record is marked as
+  missing that side by app.api.records.mark_missing_page, the rule POST
+  /records/{id}/missing-page applies: only a dual record with no current
+  image of that side (otherwise skipped, `missing_page_not_dual` or
+  `missing_page_has_image`; a side other than those two is `invalid_side`).
+  One already missing it is unchanged. Its status does not change; it is
+  pending until it is captured into or closed. Counted as `missing_pages`.
 * Rotations: each current image of an approved or rejected record takes the correction
   the set gives it by captureId and role, in quarter-turns clockwise (1-3),
   or none when the set lists none for it. No file is touched.
@@ -62,10 +75,30 @@ app.schemas.record.PREDEFINED_REJECTION_REASONS, `other` with no note, or a
 note longer than REJECTION_COMMENT_MAX_LENGTH (`note_too_long`).
 An unusable rotation is skipped on its own.
 
+Requests (contract 1.9 §10.4), after the decisions, in the same
+transaction: each of kind `missing_opening` makes placeholders after its
+`afterRecordId`, wherever that record sits in the volume and whatever its
+status, excluded included: `count` of them, or one when it is null, each
+carrying the request's `expected`, `note` and `requestId`
+(app.core.record_sequence.insert_placeholders), the records after it moved
+up. Each is written to the system log as `missing_openings_marked`, with
+who asked and when (requestedBy, requestedAt). A request whose `requestId`
+a record of the unit already carries has been applied and is skipped
+(`already_applied`). Also skipped, each with its reason in the report's
+request_skips: a request that is not an object (`invalid_request`), one with
+no requestId or one longer than 64 characters (`invalid_request_id`), a kind
+other than missing_opening (`invalid_kind`), an afterRecordId that is not a
+record of the volume (`not_in_volume`), a count that is not an integer from
+1 to 50 (`invalid_count`), and an expected or note longer than 2,000
+characters (`text_too_long`). Placeholders made are counted as
+`placeholders`. The unit does not hand the volume over again by itself:
+the placeholders are pending, and the volume reaches Fisqua again through
+the operator's next promotion, once she has captured or closed them.
+
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
 
-Version: 0.2.1
+Version: 0.3.3
 """
 
 import logging
@@ -81,6 +114,7 @@ from app.core import fisqua_contract as fc
 logger = logging.getLogger(__name__)
 
 APPLIED_ACTION = "fisqua_decisions_applied"
+PLACEHOLDERS_ACTION = "missing_openings_marked"
 STALE_ACTION = "fisqua_decisions_stale"
 ACTOR_PREFIX = "Fisqua"
 _ID_LIMIT = 64
@@ -201,8 +235,15 @@ def _why_not(decision: dict) -> Optional[str]:
     )
 
     kind = decision.get(fc.F_DECISION)
-    if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED, fc.DECISION_EXCLUDED):
+    if kind not in (fc.DECISION_APPROVED, fc.DECISION_REJECTED, fc.DECISION_EXCLUDED, fc.DECISION_MISSING_PAGE):
         return "invalid_decision"
+    if kind == fc.DECISION_MISSING_PAGE:
+        if decision.get(fc.F_SIDE) not in fc.MISSING_PAGE_SIDES:
+            return "invalid_side"
+        note = decision.get(fc.F_NOTE)
+        if isinstance(note, str) and len(note) > REJECTION_COMMENT_MAX_LENGTH:
+            return "note_too_long"
+        return None
     if kind == fc.DECISION_EXCLUDED:
         # An exclusion carries no reason and no rotations (contract 1.6). Any
         # reason at all is refused; rotations arrive as a list, and an empty
@@ -317,8 +358,71 @@ def _lock_records(db: Session, ids: list) -> dict:
 
 def _empty_report() -> dict:
     return {"counts": {"approved": 0, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 0,
-                       "rotations": 0, "rotations_skipped": 0},
-            "skipped": [], "rotation_skips": []}
+                       "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
+                       "requests_skipped": 0},
+            "skipped": [], "rotation_skips": [], "request_skips": []}
+
+
+MAX_REQUEST_COUNT = 50
+MAX_TEXT = 2000
+_REQUEST_ID_LIMIT = 64
+
+
+def _request_why_not(db: Session, req: Any, volume_ids: set) -> Optional[str]:
+    """Why a request cannot be applied; None when it can (module header)."""
+    from app.models.record import Record
+
+    if not isinstance(req, dict):
+        return "invalid_request"
+    rid = req.get(fc.F_REQUEST_ID)
+    if not isinstance(rid, str) or not rid.strip() or len(rid) > _REQUEST_ID_LIMIT:
+        return "invalid_request_id"
+    if req.get(fc.F_REQUEST_KIND) != fc.REQUEST_MISSING_OPENING:
+        return "invalid_kind"
+    if _record_id(req.get(fc.F_AFTER_RECORD_ID)) not in volume_ids:
+        return "not_in_volume"
+    count = req.get(fc.F_COUNT)
+    if count is not None and (isinstance(count, bool) or not isinstance(count, int)
+                              or not 1 <= count <= MAX_REQUEST_COUNT):
+        return "invalid_count"
+    for key in (fc.F_EXPECTED, fc.F_NOTE):
+        text = req.get(key)
+        if isinstance(text, str) and len(text) > MAX_TEXT:
+            return "text_too_long"
+    if db.query(Record.id).filter(Record.missing_request_id == rid).first() is not None:
+        return "already_applied"
+    return None
+
+
+def _text(req: dict, key: str) -> Optional[str]:
+    value = req.get(key)
+    return value.strip() if isinstance(value, str) and value.strip() else None
+
+
+def _apply_request(db: Session, collection, req: dict) -> list:
+    """Make one request's placeholders and log them in the caller's transaction; return them."""
+    from app.core import record_sequence
+    from app.models.system_log import SystemLog
+
+    rid = req[fc.F_REQUEST_ID]
+    after = _record_id(req[fc.F_AFTER_RECORD_ID])
+    count = req.get(fc.F_COUNT) or 1
+    by = _text(req, fc.F_REQUESTED_BY)
+    actor = (f"{ACTOR_PREFIX}: {by}" if by else ACTOR_PREFIX)[:255]
+    made = record_sequence.insert_placeholders(
+        db, collection.id, after, count, expected=_text(req, fc.F_EXPECTED), note=_text(req, fc.F_NOTE),
+        request_id=rid, created_by=actor)
+    requested_at = req.get(fc.F_REQUESTED_AT)
+    # In the transaction, not app.core.audit.log_event, which commits at once.
+    db.add(SystemLog(
+        level="INFO", category="activity", action=PLACEHOLDERS_ACTION, actor=actor[:150],
+        subject=collection.filename_stem[:300] if collection.filename_stem else None,
+        detail=(f"volume {collection.id} after {after} count={count} requestId={rid} "
+                f"requestedBy={by} requestedAt={requested_at if isinstance(requested_at, str) else None} "
+                f"records={[r.id for r in made]}")[:500],
+        created_at=datetime.now(timezone.utc),
+    ))
+    return made
 
 
 def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[datetime] = None) -> dict:
@@ -372,8 +476,22 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
     report = _empty_report()
     listed = _listed_captures(db, current_row[0])
     decisions = [d for d in body[fc.F_RECORDS] if isinstance(d, dict)]
+    requests = body.get(fc.F_REQUESTS)
+    requests = requests if isinstance(requests, list) else []
     ids = sorted({i for i in (_record_id(d.get(fc.F_CAPTUA_RECORD_ID)) for d in decisions) if i is not None})
     try:
+        volume_ids: set = set()
+        if requests:
+            # Placeholders rewrite the volume's order: its records, then its
+            # row (module header). A decided record outside it is skipped as
+            # not_in_volume, so it is not locked after the row.
+            from app.core import record_sequence
+            _, volume_records = record_sequence.lock_volume_records(db, collection_id)
+            if status not in db:
+                # A retry inside the locks rolled back, dropping a new status row.
+                db.add(status)
+            volume_ids = {r.id for r in volume_records}
+            ids = [i for i in ids if i in volume_ids]
         records = _lock_records(db, ids)
         # Again, under the locks: a promotion may have committed while the
         # locks were awaited. A promotion locks only the volume's captured
@@ -415,6 +533,15 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             if rec.id not in listed or current_images[rec.id] != listed[rec.id]:
                 skip("images_changed")
                 continue
+            if decision[fc.F_DECISION] == fc.DECISION_MISSING_PAGE:
+                from app.api.records import mark_missing_page, missing_page_refusal
+                refusal = missing_page_refusal(rec, decision[fc.F_SIDE])
+                if refusal is not None:
+                    skip(refusal)
+                    continue
+                changed = mark_missing_page(rec, decision[fc.F_SIDE], _note(decision))
+                report["counts"]["missing_pages" if changed else "unchanged"] += 1
+                continue
             # Every transition _apply_one takes is in DECISION_TRANSITIONS (or,
             # for a rejection, the in_review step before it in
             # STATUS_TRANSITIONS) for a reviewer, from the statuses checked above, so none is refused
@@ -428,6 +555,19 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             # An exclusion has no rotations, and leaves the images as they are.
             if decision[fc.F_DECISION] != fc.DECISION_EXCLUDED:
                 _apply_rotations(rec, decision, report)
+
+        if requests:
+            db.flush()
+            for req in requests:
+                why = _request_why_not(db, req, volume_ids)
+                if why is not None:
+                    raw_id = req.get(fc.F_REQUEST_ID) if isinstance(req, dict) else None
+                    report["counts"]["requests_skipped"] += 1
+                    report["request_skips"].append({
+                        "request_id": raw_id[:_REQUEST_ID_LIMIT] if isinstance(raw_id, str) else None,
+                        "reason": why})
+                    continue
+                report["counts"]["placeholders"] += len(_apply_request(db, collection, req))
 
         status.decisions_id = decisions_id
         status.decisions_decided_at = _parse_time(body.get(fc.F_DECIDED_AT))
@@ -443,13 +583,17 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
 
     c = report["counts"]
     logger.info("Fisqua decisions %s applied to volume %s: approved=%s rejected=%s excluded=%s unchanged=%s "
-                "skipped=%s rotations=%s rotations_skipped=%s", decisions_id, collection_id, c["approved"],
-                c["rejected"], c["excluded"], c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"])
+                "skipped=%s rotations=%s rotations_skipped=%s missing_pages=%s placeholders=%s "
+                "requests_skipped=%s", decisions_id, collection_id, c["approved"],
+                c["rejected"], c["excluded"], c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"],
+                c["missing_pages"], c["placeholders"], c["requests_skipped"])
     audit.log_event(db, level="INFO", category="activity", action=APPLIED_ACTION, subject=stem,
                     detail=(f"volume {collection_id} decisions={decisions_id} approved={c['approved']} "
                             f"rejected={c['rejected']} excluded={c['excluded']} unchanged={c['unchanged']} "
                             f"skipped={c['skipped']} "
-                            f"rotations={c['rotations']} rotations_skipped={c['rotations_skipped']}"))
+                            f"rotations={c['rotations']} rotations_skipped={c['rotations_skipped']} "
+                            f"missing_pages={c['missing_pages']} placeholders={c['placeholders']} "
+                            f"requests_skipped={c['requests_skipped']}"))
     return {"status": "applied", "decisions_id": decisions_id, **report}
 
 
@@ -466,6 +610,7 @@ def decisions_state(status) -> Optional[dict]:
         "counts": report.get("counts"),
         "skipped": report.get("skipped", []),
         "rotation_skips": report.get("rotation_skips", []),
+        "request_skips": report.get("request_skips", []),
         # The last set Fisqua offered was for another manifest, and was not applied.
         "stale": status.decisions_stale_id is not None,
     }
