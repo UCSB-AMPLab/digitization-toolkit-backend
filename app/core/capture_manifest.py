@@ -30,7 +30,8 @@ whose files are still on disk.
   its `sequence` (§10.2).
 * A record that is missing (records.missing_side: a page, or a whole
   opening, never captured; contract 1.9 §10.1) is listed with `status`
-  "missing", whatever its status on the unit, and `missingSide` ("left",
+  "missing", whatever its status on the unit but excluded, which keeps
+  "excluded" (contract 1.6), and `missingSide` ("left",
   "right" or "both"), with its current images: the other page's for a side,
   none for a placeholder. Once the operator has closed it without capturing,
   it also carries `closedReason` and, when she wrote one, `closedNote`. An
@@ -231,7 +232,8 @@ def _record_entry(rec, out_images) -> dict:
     entry = {
         "captuaRecordId": rec.id,
         "sequence": rec.sequence,
-        "status": MISSING if _is_missing(rec) else rec.status,
+        # An exclusion keeps its 1.6 meaning: excluded, with its missing fields.
+        "status": MISSING if _is_missing(rec) and rec.status != "excluded" else rec.status,
         "rejectionNote": _rejection_note(rec),
         "images": out_images,
     }

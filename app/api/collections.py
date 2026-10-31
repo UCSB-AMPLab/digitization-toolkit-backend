@@ -852,6 +852,8 @@ def mark_missing_openings(
     answers 409 with VOLUME_CHANGED_MESSAGE. Returns the placeholders, in
     order. 404 for an unknown volume or record, 422 for a record of another
     volume or a bad body. Writes `missing_openings_marked` to the system log.
+    A volume handed over before is handed over again in the same transaction
+    when nothing else holds it (app.core.fisqua_outbox.hand_over_again_after_missing_change).
     """
     volume = db.query(Collection).filter(Collection.id == collection_id).first()
     if volume is None:
@@ -878,7 +880,13 @@ def mark_missing_openings(
     if made is None:
         db.rollback()
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # After the volume's locks, as promotion queues its handover after its own.
+    from app.core.fisqua_outbox import hand_over_again_after_missing_change
+    queued = hand_over_again_after_missing_change(db, collection_id)
     db.commit()
+    if queued is not None:
+        from app.core.image_upload import image_upload_scheduler
+        image_upload_scheduler.wake()
     for rec in made:
         db.refresh(rec)
     out = [_serialize_record(rec) for rec in made]

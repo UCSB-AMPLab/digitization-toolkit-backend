@@ -50,7 +50,8 @@ record outside the volume is skipped without being locked:
   /records/{id}/missing-page applies: only a dual record with no current
   image of that side (otherwise skipped, `missing_page_not_dual` or
   `missing_page_has_image`; a side other than those two is `invalid_side`).
-  One already missing it is unchanged. Its status does not change; it is
+  One already missing it is unchanged. A record in review or approved
+  returns to captured, under the reviewer `Fisqua: <decidedBy>`; it is
   pending until it is captured into or closed. Counted as `missing_pages`.
 * Rotations: each current image of an approved or rejected record takes the correction
   the set gives it by captureId and role, in quarter-turns clockwise (1-3),
@@ -91,9 +92,10 @@ other than missing_opening (`invalid_kind`), an afterRecordId that is not a
 record of the volume (`not_in_volume`), a count that is not an integer from
 1 to 50 (`invalid_count`), and an expected or note longer than 2,000
 characters (`text_too_long`). Placeholders made are counted as
-`placeholders`. The unit does not hand the volume over again by itself:
-the placeholders are pending, and the volume reaches Fisqua again through
-the operator's next promotion, once she has captured or closed them.
+`placeholders`. When the set marked a page missing or made a placeholder,
+and the volume holds no captured record other than open missing ones and
+no record waiting for a retake, it is handed over again in the same
+transaction (app.core.fisqua_outbox.hand_over_again_after_missing_change).
 
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
@@ -539,7 +541,7 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
                 if refusal is not None:
                     skip(refusal)
                     continue
-                changed = mark_missing_page(rec, decision[fc.F_SIDE], _note(decision))
+                changed = mark_missing_page(db, rec, decision[fc.F_SIDE], _note(decision), _actor(decision))
                 report["counts"]["missing_pages" if changed else "unchanged"] += 1
                 continue
             # Every transition _apply_one takes is in DECISION_TRANSITIONS (or,
@@ -568,6 +570,11 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
                         "reason": why})
                     continue
                 report["counts"]["placeholders"] += len(_apply_request(db, collection, req))
+
+        if report["counts"]["missing_pages"] or report["counts"]["placeholders"]:
+            # After every lock this set takes, as promotion queues its handover (contract 1.9 §10.4).
+            from app.core.fisqua_outbox import hand_over_again_after_missing_change
+            hand_over_again_after_missing_change(db, collection_id)
 
         status.decisions_id = decisions_id
         status.decisions_decided_at = _parse_time(body.get(fc.F_DECIDED_AT))

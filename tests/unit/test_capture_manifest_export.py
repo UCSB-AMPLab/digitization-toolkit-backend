@@ -1295,10 +1295,15 @@ def test_an_ordinary_captured_record_beside_an_open_missing_one_still_refuses(cl
 
 
 @pytest.mark.unit
-def test_an_excluded_missing_record_is_listed_as_missing(client, vol):
+def test_an_excluded_missing_record_keeps_excluded_and_carries_its_missing_fields(client, vol):
     vol.record(status="in_review")
-    rec = _missing_side(vol, "right", status="excluded")
-    assert _entry(_export(client, vol.col).json(), rec)["status"] == "missing"
+    rec = _missing_side(vol, "right", status="excluded", closed="other", note="duplicado")
+    entry = _entry(_export(client, vol.col).json(), rec)
+    assert (entry["status"], entry["missingSide"], entry["closedReason"], entry["closedNote"]) == (
+        "excluded", "right", "other", "duplicado")
+    open_ = _missing_side(vol, "left", status="excluded")
+    entry = _entry(_export(client, vol.col).json(), open_)
+    assert (entry["status"], entry["missingSide"]) == ("excluded", "left") and "closedReason" not in entry
 
 
 @pytest.mark.unit

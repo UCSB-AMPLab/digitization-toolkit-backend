@@ -1212,7 +1212,8 @@ def test_a_missing_page_decision_marks_the_record(client, db_session, handed_one
     _decide(fake, row, [_missing_page(lone, "right")])
     _poll(db_session, fake)
     rec = _refresh(db_session, lone)
-    assert (rec.missing_side, rec.status) == ("right", "in_review")
+    # Back to captured, so an operator can capture into it (contract 1.9 §10.4).
+    assert (rec.missing_side, rec.status) == ("right", "captured")
     assert recapture_turn.record_is_pending(rec)
     state = _decisions_state(client, vol.col)
     assert state["counts"]["missing_pages"] == 1 and state["skipped"] == []
@@ -1237,15 +1238,16 @@ def test_a_missing_page_that_cannot_apply_is_skipped(client, db_session, handed_
 
 
 @pytest.mark.unit
-def test_a_missing_page_already_marked_is_unchanged(client, db_session, handed_one_sided):
+def test_a_repeated_missing_page_set_waits_for_the_handover_the_first_queued(client, db_session, handed_one_sided):
     vol, (pair, lone, single), row, fake = handed_one_sided
     _decide(fake, row, [_missing_page(lone, "right")])
     _poll(db_session, fake)
     _decide(fake, row, [_missing_page(lone, "right")], decisions_id="d-2")
-    _poll(db_session, fake)
-    assert _refresh(db_session, lone).missing_side == "right"
-    counts = _decisions_state(client, vol.col)["counts"]
-    assert (counts["missing_pages"], counts["unchanged"]) == (0, 1)
+    result = _poll(db_session, fake)
+    assert result["decisions_applied"] == 0
+    rec = _refresh(db_session, lone)
+    assert (rec.missing_side, rec.status) == ("right", "captured")
+    assert _decisions_state(client, vol.col)["decisions_id"] == "d-1"
 
 
 @pytest.mark.unit
@@ -1295,6 +1297,11 @@ def test_each_request_is_applied_once(client, db_session, handed_one_sided):
     vol, (pair, lone, single), row, fake = handed_one_sided
     _decide_with(fake, row, [], [_request(pair.id)])
     _poll(db_session, fake)
+    # The placeholder handed the volume over again; Fisqua answers that manifest next.
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[-1]
+    assert row.state == "delivered"
+    fake.status["manifestId"] = row.manifest_id
     _decide_with(fake, row, [], [_request(single.id), _request(single.id, request_id="req-2")], decisions_id="d-2")
     _poll(db_session, fake)
     db_session.expire_all()
@@ -1359,19 +1366,29 @@ def test_requests_and_decisions_apply_together(client, db_session, handed_one_si
 @pytest.mark.unit
 def test_a_set_with_requests_locks_the_volumes_records_then_its_row(client, db_session, handed_one_sided,
                                                                       monkeypatch):
-    from app.core import record_sequence
+    from app.core import fisqua_decisions, record_sequence
     vol, (pair, lone, single), row, fake = handed_one_sided
     calls = []
-    real = record_sequence.lock_volume_records
+    real_volume, real_records = record_sequence.lock_volume_records, fisqua_decisions._lock_records
 
-    def spy(db, collection_id):
-        calls.append(collection_id)
-        return real(db, collection_id)
+    def spy_volume(db, collection_id):
+        calls.append(("volume", collection_id))
+        return real_volume(db, collection_id)
 
-    monkeypatch.setattr(record_sequence, "lock_volume_records", spy)
+    def spy_records(db, ids):
+        calls.append(("records", tuple(ids)))
+        return real_records(db, ids)
+
+    monkeypatch.setattr(record_sequence, "lock_volume_records", spy_volume)
+    monkeypatch.setattr(fisqua_decisions, "_lock_records", spy_records)
     _decide_with(fake, row, [_approve(pair)], [_request(pair.id)])
     _poll(db_session, fake)
-    assert calls and set(calls) == {vol.col.id}
+    # The volume's records and row first, then the decided records (already
+    # held), then the volume again for the placeholders, under the same locks.
+    assert calls[0] == ("volume", vol.col.id)
+    assert calls[1] == ("records", (pair.id,))
+    assert all(c == ("volume", vol.col.id) for c in calls[2:]) and len(calls) >= 3
+    assert _refresh(db_session, pair).status == "approved"
 
 
 @pytest.mark.unit

@@ -1603,23 +1603,30 @@ def missing_page_refusal(rec: Record, side: str) -> Optional[str]:
 	return None
 
 
-def mark_missing_page(rec: Record, side: str, note: Optional[str] = None) -> bool:
-	"""Mark `side` missing on a locked record that missing_page_refusal passed; return whether it changed.
+def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], actor: Optional[str]) -> bool:
+	"""Mark `side` missing on a locked record that missing_page_refusal passed; return whether anything changed.
 
 	The one place a page is marked missing, for POST /{rec_id}/missing-page
 	and for Fisqua's `missing_page` decision (app.core.fisqua_decisions). A
-	record already missing that side, or both, is left as it is. One already
+	record already missing that side, or both, keeps its side. One already
 	missing the other side, with no image of this one either, misses both.
-	A note, when given, is kept as records.missing_note. The record is then
-	pending until it is captured into or closed (app.core.recapture_turn);
-	its status does not change. The caller commits.
+	A note, when given, is kept as records.missing_note. A record in review
+	or approved returns to captured, written to its status history under
+	`actor`, so an operator can capture into it (app.api.cameras refuses a
+	capture into a record a reviewer holds); a rejected one stays rejected.
+	The record is then pending until it is captured into or closed
+	(app.core.recapture_turn). The caller commits.
 	"""
-	if rec.missing_side in (side, "both"):
-		return False
-	rec.missing_side = side if rec.missing_side is None else "both"
-	if note is not None and note.strip():
-		rec.missing_note = note.strip()
-	return True
+	changed = False
+	if rec.missing_side not in (side, "both"):
+		rec.missing_side = side if rec.missing_side is None else "both"
+		changed = True
+		if note is not None and note.strip():
+			rec.missing_note = note.strip()
+	if rec.status in ("in_review", "approved") and rec.missing_side is not None and rec.closed_reason is None:
+		change_record_status(db, rec, "captured", actor)
+		changed = True
+	return changed
 
 
 @router.post("/{rec_id}/missing-page", response_model=RecordRead)
@@ -1635,8 +1642,11 @@ def mark_record_missing_page(
 	characters}. Applies only to a dual record with no current image of that
 	side: otherwise 409 with code missing_page_not_dual or
 	missing_page_has_image, and nothing changes. A record already missing
-	that side is answered as it is. The record is then pending, listed in GET
+	that side is answered as it is. A record in review or approved returns
+	to captured (mark_missing_page). The record is then pending, listed in GET
 	/to-retake, until a dual capture into it or POST /{rec_id}/close-missing.
+	A volume handed over before is handed over again when nothing else holds
+	it (app.core.fisqua_outbox.hand_over_again_after_missing_change).
 	The record's row is locked, as every path that reads which of its images
 	are current and changes its state takes it.
 	"""
@@ -1654,9 +1664,16 @@ def mark_record_missing_page(
 			"code": refusal,
 			"message": f"Record {rec.id} has a current {payload.side} image, so that page is not missing.",
 		})
-	changed = mark_missing_page(rec, payload.side, payload.note)
+	changed = mark_missing_page(db, rec, payload.side, payload.note, current_user.username)
+	queued = None
+	if changed:
+		from app.core.fisqua_outbox import hand_over_again_after_missing_change
+		queued = hand_over_again_after_missing_change(db, rec.collection_id)
 	db.commit()
 	db.refresh(rec)
+	if queued is not None:
+		from app.core.image_upload import image_upload_scheduler
+		image_upload_scheduler.wake()
 	if changed:
 		log_event(db, level="INFO", category="activity", action="missing_page_marked",
 		          actor=current_user.username, subject=rec.title,
@@ -1691,6 +1708,13 @@ def close_missing_record(
 	of the capture path. A full rescan not yet promoted writes none, as for a
 	retake. Closing a record that was not pending, or one in a volume that
 	still has pending records, writes nothing.
+
+	In a volume handed over before, a closed captured record goes to review
+	(captured -> in_review, through _apply_status_change, as promotion
+	sends it), and the volume is handed over again when nothing else holds
+	it (app.core.fisqua_outbox.hand_over_again_after_missing_change). A
+	rejected record stays rejected, and still pending. In a volume never
+	handed over the status is left alone; the next promotion sends it.
 	"""
 	rec = _locked_record(db, rec_id)
 	if not rec:
@@ -1719,7 +1743,19 @@ def close_missing_record(
 				recapture_turn.volume_is_full_rescan(volume)
 				and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
 			recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, current_user.username)
+	from app.core.fisqua_outbox import hand_over_again_after_missing_change, handed_over_before
+	if rec.status == "captured" and handed_over_before(db, rec.collection_id):
+		# Its volume was handed over before: the closed record goes to review
+		# now, as promotion would send it, so the volume can be handed over
+		# again (contract 1.9 §10.3: one with an image needs capture QC).
+		rescans = recapture_turn.lock_rescan_volumes(db, [rec.collection_id])
+		_apply_status_change(db, rec, "in_review", current_user)
+		recapture_turn.award_rescan_turns(db, rescans, current_user.username)
+	queued = hand_over_again_after_missing_change(db, rec.collection_id)
 	db.commit()
+	if queued is not None:
+		from app.core.image_upload import image_upload_scheduler
+		image_upload_scheduler.wake()
 	db.refresh(rec)
 	log_event(db, level="INFO", category="activity", action="missing_record_closed",
 	          actor=current_user.username, subject=rec.title,

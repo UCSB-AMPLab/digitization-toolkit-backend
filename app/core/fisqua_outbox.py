@@ -662,6 +662,48 @@ def enqueue_handover(db: Session, collection):
     return row
 
 
+def handed_over_before(db: Session, collection_id: Optional[int]) -> bool:
+    """Whether the volume has been handed over to Fisqua before: it has an outbox row, whatever its state."""
+    from app.models.fisqua import FisquaOutbox
+
+    if collection_id is None:
+        return False
+    return db.query(FisquaOutbox.id).filter(FisquaOutbox.collection_id == collection_id).first() is not None
+
+
+def hand_over_again_after_missing_change(db: Session, collection_id: Optional[int]):
+    """Queue a new handover after a volume's missing records changed, when one is due (contract 1.9 §10.4).
+
+    Called in the transaction of a change to a volume's missing records:
+    placeholders inserted (POST /collections/{id}/records/missing-opening or
+    a Fisqua request), a page marked missing (POST /records/{id}/missing-page
+    or a Fisqua decision), or a missing record closed (POST
+    /records/{id}/close-missing), after that path's record and volume locks,
+    as promotion queues its handover after its own. Due when the volume has
+    been handed over before (it has an outbox row) and now holds no captured
+    record other than open missing ones, which the manifest lists as
+    missing, and no record waiting for a retake, which would refuse its
+    promotion (app.core.recapture_turn.retake_clause). Then it is
+    enqueue_handover, as promotion does. Does not commit. Returns the new
+    row, or None when none was queued.
+    """
+    from app.core.recapture_turn import open_missing_clause, retake_clause
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    if not handed_over_before(db, collection_id):
+        return None
+    db.flush()
+    held = db.query(Record.id).filter(
+        Record.collection_id == collection_id,
+        ((Record.status == "captured") & ~open_missing_clause()) | retake_clause(),
+    ).first()
+    collection = db.get(Collection, collection_id)
+    if held is not None or collection is None:
+        return None
+    return enqueue_handover(db, collection)
+
+
 def _reference_problem(collection) -> Optional[dict]:
     """The reference_code_differs problem when the volume's recorded code is not its stem; else None.
 
