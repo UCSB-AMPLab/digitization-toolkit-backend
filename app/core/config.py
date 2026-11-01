@@ -1,4 +1,4 @@
-# Version: 0.2.1
+# Version: 0.3.3
 
 import logging
 import os
@@ -163,7 +163,7 @@ class Settings(BaseSettings):
     FISQUA_TIMEOUT_SECONDS: float = Field(default=60.0, validation_alias=_names("FISQUA_TIMEOUT"))
     # On: each image in a capture manifest carries `rotateDeg`, its recorded
     # rotate_deg (clockwise from the stored pixels, EXIF ignored). Off: no
-    # image carries it. The manifest declares contract 1.6 either way
+    # image carries it. The manifest declares contract 1.9 either way
     # (app.core.capture_manifest). Fisqua staging reads rotateDeg; production
     # does not yet, and drops a key it does not know, so this stays off for
     # production until Fisqua reads it there.

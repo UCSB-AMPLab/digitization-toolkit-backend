@@ -467,3 +467,40 @@ def test_promotion_locks_the_volume_before_history_and_the_outbox(client, db_ses
                         lambda *a, **k: (order.append("outbox"), real_enqueue(*a, **k))[1])
     assert _handover(client, vol.col)["promoted"] == 2
     assert order == ["volume", "history", "history", "outbox"]
+
+
+# ---------------------------------------------------------------------------
+# Promotion locks every record of the volume, open placeholders included
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_promotion_locks_every_record_of_the_volume_before_the_volume_row(client, db_session, vol, fisqua,
+                                                                           monkeypatch):
+    from sqlalchemy import event
+    from app.core import volume_stem
+    a = vol.record(status="captured")
+    hole = _placeholder(vol)
+    order = []
+    real_volume = volume_stem.locked_volume_query
+    monkeypatch.setattr(volume_stem, "locked_volume_query",
+                        lambda db, cid: (order.append(("volume", None)), real_volume(db, cid))[1])
+    engine = db_session.get_bind()
+
+    def seen(conn, cursor, statement, parameters, *args):
+        if "FROM records LEFT OUTER JOIN record_images" in statement:
+            order.append(("records", statement))
+
+    event.listen(engine, "before_cursor_execute", seen)
+    try:
+        assert _handover(client, vol.col)["promoted"] == 1
+    finally:
+        event.remove(engine, "before_cursor_execute", seen)
+    # The locking read takes every record of the volume, the open placeholder
+    # included (no status or missing-side filter), before the volume's row,
+    # so a close cannot slip in between the promotion's choice and its handover.
+    kinds = [k for k, _ in order]
+    assert kinds.index("records") < kinds.index("volume")
+    [(_, locking)] = [o for o in order if o[0] == "records"][:1]
+    where = locking.split("WHERE", 1)[1]
+    assert "missing_side" not in where and "records.status" not in where, where
+    assert _status(db_session, hole) == "captured" and _status(db_session, a) == "in_review"
