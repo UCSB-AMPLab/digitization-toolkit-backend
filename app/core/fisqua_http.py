@@ -309,10 +309,37 @@ def _failed(exc: Exception) -> TransportResult:
 
 
 class HttpFisquaTransport:
+    """The only object that opens a connection to Fisqua.
+
+    **The mode gate.** Every request reads the unit's stored mode
+    (app.core.unit_mode.stored_mode_now, on a session of its own) just
+    before it is made, and is not made unless the mode is `fisqua`: the
+    method answers outcome `off_in_this_mode` instead, which every caller
+    handles. Why this covers every call to Fisqua:
+
+    * every request goes through `self._client`, which is private and made
+      here, and nothing else in the backend speaks to Fisqua (the hosts are
+      only in fisqua_contract and fisqua_outbox.base_url);
+    * the methods that use `self._client` are exactly the seven of the
+      FisquaTransport protocol: send_manifest, get_status, get_decisions,
+      put_operators, get_queue, post_queue_ack and get_description; each
+      calls `self._mode_refusal()` before it touches the client
+      (tests/unit/test_unit_mode.py checks both by reading this class);
+    * the gate is skipped only for a transport built with
+      `bypass_mode` set, which only app.core.unit_mode.get_transport asks
+      for, for the calls a change of mode makes on purpose: the switch PUT
+      to fisqua, the down-switch PUT, the resend of the stored mode after a
+      change that did not commit, and an admin's reference code lookup.
+
+    The call sites' own mode checks stop a run early; this is the guarantee.
+    A mode that cannot be read counts as not `fisqua`.
+    """
+
     def __init__(self, base_url: str, token: str, *, timeout: float = 60.0,
-                 client: Optional[httpx.Client] = None):
+                 client: Optional[httpx.Client] = None, bypass_mode: bool = False):
         self._base = base_url.rstrip("/")
         self._token = token
+        self._bypass_mode = bypass_mode
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT_SECONDS),
             verify=True, follow_redirects=False)
@@ -320,10 +347,25 @@ class HttpFisquaTransport:
     def __repr__(self) -> str:
         return f"HttpFisquaTransport({self._base!r})"
 
+    def _mode_refusal(self) -> Optional[TransportResult]:
+        """None when the request may be made; else the `off_in_this_mode` answer, with nothing sent."""
+        if self._bypass_mode:
+            return None
+        from app.core import unit_mode
+
+        mode = unit_mode.stored_mode_now()
+        if mode == unit_mode.FISQUA:
+            return None
+        return TransportResult(outcome=unit_mode.OFF_STATUS,
+                               error=f"the unit is in {mode or 'an unreadable'} mode, so nothing is sent to Fisqua")
+
     def _headers(self) -> dict:
         return {fc.AUTH_HEADER: f"{fc.AUTH_SCHEME} {self._token}", "Accept": "application/json"}
 
     def send_manifest(self, manifest: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.post(self._base + fc.MANIFESTS_PATH, json=manifest, headers=self._headers())
         except httpx.HTTPError as exc:
@@ -331,6 +373,9 @@ class HttpFisquaTransport:
         return read_send_answer(response, sent_id=manifest.get("id") if isinstance(manifest, dict) else None)
 
     def get_status(self, refs: Iterable[str]) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         refs = list(refs)
         if len(refs) > fc.MAX_REFS_PER_CALL:
             raise ValueError(f"at most {fc.MAX_REFS_PER_CALL} refs per call, not {len(refs)}")
@@ -342,6 +387,9 @@ class HttpFisquaTransport:
         return read_status_answer(response)
 
     def get_decisions(self, ref: str) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         from urllib.parse import quote
 
         path = fc.DECISIONS_PATH.format(ref=quote(ref, safe=""))
@@ -352,6 +400,9 @@ class HttpFisquaTransport:
         return read_decisions_answer(response)
 
     def put_operators(self, body: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.put(self._base + fc.OPERATORS_PATH, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
@@ -359,6 +410,9 @@ class HttpFisquaTransport:
         return read_operators_answer(response)
 
     def get_queue(self, revision: Optional[str]) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         headers = self._headers()
         if revision:
             headers[fc.IF_NONE_MATCH_HEADER] = f'"{revision}"'
@@ -369,6 +423,9 @@ class HttpFisquaTransport:
         return read_queue_answer(response)
 
     def post_queue_ack(self, body: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.post(self._base + fc.QUEUE_ACK_PATH, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
@@ -376,6 +433,9 @@ class HttpFisquaTransport:
         return read_queue_ack_answer(response)
 
     def get_description(self, ref: str) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         path = fc.DESCRIPTIONS_PATH.format(ref=encode_segment(ref))
         try:
             response = self._client.get(self._base + path, headers=self._headers())

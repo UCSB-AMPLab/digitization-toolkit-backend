@@ -18,9 +18,12 @@ image_upload.run_image_upload and catalogue_backup.run_catalogue_backup
 answer OFF_STATUS outside backup and fisqua, and fisqua_outbox's send and
 poll and fisqua_queue's sync and operators PUT outside fisqua. Each run
 reads the mode again between objects, sends, batches and decisions reads,
-so a switch stops a run in progress before its next step. Freeing,
-restore and mark-freed are refused in offline mode
-(app.core.offsite_free). Changing
+so a switch stops a run in progress before its next step; the transport
+itself refuses every request outside fisqua mode
+(fisqua_http.HttpFisquaTransport), but for the calls made here on purpose.
+Freeing and mark-freed are refused in offline mode
+(app.core.offsite_free); restore, the free dry run and the adopt commands,
+which only read from the bucket, are not. Changing
 mode changes no data: outbox rows, statuses and records stay as they are,
 and unsent rows go out if the unit returns to fisqua. The offsite hold
 file keeps its meaning in every mode.
@@ -318,53 +321,60 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
 
     if mode is not None and mode not in MODES:
         raise ValueError(f"unknown mode {mode!r}")
-    before = current(db)
-    target = before.mode if mode is None else mode
-    unsent = None
-    told = None  # the mode Fisqua accepted in this change, if any
-    if target != before.mode:
-        if target in (BACKUP, FISQUA):
-            missing = prerequisites()[target]
-            if missing:
-                raise ModeRefused(target, [_problem(code) for code in missing])
-        if target == FISQUA:
-            if offsite_hold.held("switch to fisqua mode"):
-                raise ModeRefused(target, [_problem(OFFSITE_HELD)])
-            ok, error = fisqua_queue.send_operators_with_mode(db, FISQUA, transport=transport)
-            if not ok:
-                raise ModeRefused(target, [_problem(FISQUA_UNREACHABLE, error)])
-            told = FISQUA
-        elif before.mode == FISQUA:
-            # Before the link stops; best effort.
-            ok, error = fisqua_queue.send_operators_with_mode(db, target, transport=transport)
-            if ok:
-                told = target
-            else:
-                unsent = error
-                logger.warning("Fisqua was not told the unit's new mode %s (%s); the switch goes ahead",
-                               target, error)
-    try:
-        row = _ensure_row(db)
-        old_mode, old_projects = row.mode, bool(row.projects_enabled)
-        if (old_mode, old_projects) != (before.mode, before.projects_enabled):
-            # Committed by another change since `before` was read: the checks
-            # and the PUT above were for a state that no longer holds.
+    # From the PUT to the commit (or the rollback and resend) under the lock
+    # the regular operators send takes, so no body with the old mode can
+    # follow this change's PUT. Lock order: _operators.lock, then the
+    # unit_settings row lock (_ensure_row); see fisqua_queue._operators.
+    with fisqua_queue._operators.lock:
+        before = current(db)
+        target = before.mode if mode is None else mode
+        unsent = None
+        told = None  # the mode Fisqua accepted in this change, if any
+        if target != before.mode:
+            if target in (BACKUP, FISQUA):
+                missing = prerequisites()[target]
+                if missing:
+                    raise ModeRefused(target, [_problem(code) for code in missing])
+            if target == FISQUA:
+                if offsite_hold.held("switch to fisqua mode"):
+                    raise ModeRefused(target, [_problem(OFFSITE_HELD)])
+                ok, error = fisqua_queue.send_operators_with_mode(db, FISQUA, transport=transport,
+                                                                      lock_held=True)
+                if not ok:
+                    raise ModeRefused(target, [_problem(FISQUA_UNREACHABLE, error)])
+                told = FISQUA
+            elif before.mode == FISQUA:
+                # Before the link stops; best effort.
+                ok, error = fisqua_queue.send_operators_with_mode(db, target, transport=transport,
+                                                                      lock_held=True)
+                if ok:
+                    told = target
+                else:
+                    unsent = error
+                    logger.warning("Fisqua was not told the unit's new mode %s (%s); the switch goes ahead",
+                                   target, error)
+        try:
+            row = _ensure_row(db)
+            old_mode, old_projects = row.mode, bool(row.projects_enabled)
+            if (old_mode, old_projects) != (before.mode, before.projects_enabled):
+                # Committed by another change since `before` was read: the checks
+                # and the PUT above were for a state that no longer holds.
+                db.rollback()
+                _resend_stored(db, told, actor, transport)
+                raise ModeRefused(target, [_problem(MODE_CHANGED)])
+            row.mode = target
+            if projects_enabled is not None:
+                row.projects_enabled = bool(projects_enabled)
+            row.updated_at = _now()
+            row.updated_by = actor
+            new_projects = bool(row.projects_enabled)
+            db.commit()
+        except ModeRefused:
+            raise
+        except Exception:
             db.rollback()
             _resend_stored(db, told, actor, transport)
-            raise ModeRefused(target, [_problem(MODE_CHANGED)])
-        row.mode = target
-        if projects_enabled is not None:
-            row.projects_enabled = bool(projects_enabled)
-        row.updated_at = _now()
-        row.updated_by = actor
-        new_projects = bool(row.projects_enabled)
-        db.commit()
-    except ModeRefused:
-        raise
-    except Exception:
-        db.rollback()
-        _resend_stored(db, told, actor, transport)
-        raise
+            raise
     if old_mode != target:
         detail = f"{old_mode} -> {target}"
         if unsent is not None:
@@ -392,7 +402,8 @@ def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], trans
         return
     if stored == told:
         return
-    ok, error = fisqua_queue.send_operators_with_mode(db, stored, transport=transport)
+    # The caller, change(), holds _operators.lock.
+    ok, error = fisqua_queue.send_operators_with_mode(db, stored, transport=transport, lock_held=True)
     detail = f"Fisqua was told {told}, which was not stored; sent {stored}"
     if ok:
         logger.info("%s", detail)
@@ -466,10 +477,33 @@ def default_project(db: Session, actor: Optional[str]):
 # ---------------------------------------------------------------------------
 
 def get_transport():
-    """The link's transport (a seam for tests)."""
+    """The transport for the calls a change of mode and an admin's lookup make on purpose (a seam for tests).
+
+    It bypasses the transport's mode gate (fisqua_http.HttpFisquaTransport):
+    the switch PUT to fisqua, the down-switch PUT, the resend of the stored
+    mode, and the 1.8 lookup. Nothing else asks for a bypass.
+    """
     from app.core import fisqua_outbox
 
-    return fisqua_outbox.get_transport()
+    return fisqua_outbox.get_transport(bypass_mode=True)
+
+
+def stored_mode_now() -> Optional[str]:
+    """The stored (or inferred) mode, read on a session of its own; None when it cannot be read."""
+    from app.core.db import SessionLocal
+
+    try:
+        db = SessionLocal()
+    except Exception:
+        logger.exception("The unit's mode could not be read; Fisqua is not called")
+        return None
+    try:
+        return mode(db)
+    except Exception:
+        logger.exception("The unit's mode could not be read; Fisqua is not called")
+        return None
+    finally:
+        db.close()
 
 
 class CodeRefused(Exception):

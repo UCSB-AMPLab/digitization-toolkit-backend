@@ -73,6 +73,7 @@ Version: 0.3.3
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -159,6 +160,12 @@ class _OperatorsState:
 
 
 # Due at process start, so the first send happens whatever else runs.
+#
+# Lock order: _operators.lock first, then the unit's settings row lock.
+# unit_mode.change takes them in that order and holds both until its
+# commit; the regular send takes _operators.lock and reads the mode with a
+# plain SELECT, no row lock; unit_mode.default_project takes the row lock
+# and never _operators.lock. Nothing takes them the other way round.
 _operators = _OperatorsState()
 
 
@@ -225,6 +232,14 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
         if only_if_due and refused is None and not _operators.is_due():
             return {"status": "not_due"}
         try:
+            # Read again under the lock a change of mode holds from its PUT to
+            # its commit (unit_mode.change): a switch out of fisqua that won
+            # the lock is seen here, and the body below carries the mode
+            # stored now, never the one a switch has just replaced.
+            if not unit_mode.link_on(db):
+                db.rollback()
+                _operators.due = True
+                return unit_mode.off(db)
             if fisqua_outbox.config_error() is not None:
                 return {"status": "config_error"}
             body = operators_body(db)
@@ -248,6 +263,10 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
             _operators.due = True
             return {"status": "rate_limited"}
         answer = _call(transport, "put_operators", body)
+        if answer.outcome == unit_mode.OFF_STATUS:
+            # The transport's mode gate refused it, and nothing was sent.
+            _operators.due = True
+            return {"status": unit_mode.OFF_STATUS}
         if answer.outcome == "config_error":
             fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
             _operators.due = True
@@ -276,8 +295,8 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
         return {"status": "sent", "operators": len(body[fc.F_OPERATORS])}
 
 
-def send_operators_with_mode(db: Session, mode: str, *, transport=None,
-                             now: Optional[datetime] = None) -> tuple[bool, Optional[str]]:
+def send_operators_with_mode(db: Session, mode: str, *, transport=None, now: Optional[datetime] = None,
+                             lock_held: bool = False) -> tuple[bool, Optional[str]]:
     """PUT the unit's users with `mode`, now, for a change of mode: (sent, None) or (False, why). Never raises.
 
     Bypasses the mode gate, since it is the call that tells Fisqua the mode
@@ -287,16 +306,20 @@ def send_operators_with_mode(db: Session, mode: str, *, transport=None,
     outcome first (`not_configured`, `held`, `config_error`,
     `rate_limited`, `error`, `unsupported`, `refused`), then the redacted
     error. A body Fisqua accepts counts as the regular send.
+
+    The default transport is unit_mode.get_transport, the one that bypasses
+    the transport's mode gate. `lock_held`: the caller (unit_mode.change)
+    already holds _operators.lock, which it keeps until its commit.
     """
     if not fisqua_outbox.fisqua_configured():
         return False, "not_configured"
     if offsite_hold.held("fisqua mode change"):
         return False, "held"
-    transport = transport if transport is not None else get_transport()
+    transport = transport if transport is not None else unit_mode.get_transport()
     if isinstance(transport, NullTransport):
         return False, "not_configured"
     now = fisqua_outbox._naive(now) or fisqua_outbox._now()
-    with _operators.lock:
+    with (contextlib.nullcontext() if lock_held else _operators.lock):
         try:
             if fisqua_outbox.config_error() is not None:
                 return False, "config_error: the link is stopped until its configuration changes"
@@ -676,10 +699,12 @@ def _revision_refused(answer: TransportResult) -> bool:
 
 
 def _post_ack(transport, body: dict, now: datetime) -> str:
-    """`acknowledged`, `dropped` (refused: 400, 413 or 422), `config_error` or `error`."""
+    """`acknowledged`, `dropped` (refused: 400, 413 or 422), `config_error`, `off_in_this_mode` or `error`."""
     if not fisqua_outbox.call_budget.take():
         return "error"
     answer = _call(transport, "post_queue_ack", body)
+    if answer.outcome == unit_mode.OFF_STATUS:
+        return unit_mode.OFF_STATUS
     if answer.outcome == "config_error":
         fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
         return "config_error"
@@ -712,6 +737,10 @@ def _settle_ack(transport, body: dict, now: datetime) -> Optional[dict]:
     outcome = _post_ack(transport, body, now)
     if outcome == "config_error":
         return {"status": "config_error"}
+    if outcome == unit_mode.OFF_STATUS:
+        # Refused for the unit's mode, with nothing sent: the ack stays owed,
+        # and is posted at the first tick back in fisqua mode.
+        return {"status": unit_mode.OFF_STATUS, "revision": body.get(fc.F_REVISION)}
     if outcome == "dropped":
         try:
             _write_state({"revision": None, "pendingAck": None})
@@ -762,6 +791,8 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
             if not fisqua_outbox.call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                 return {"status": "rate_limited", "operators": operators["status"]}
             answer = _call(transport, "get_queue", revision)
+            if answer.outcome == unit_mode.OFF_STATUS:
+                return {"status": unit_mode.OFF_STATUS, "operators": operators["status"]}
             if answer.outcome == "config_error":
                 fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
                 return {"status": "config_error", "operators": operators["status"]}

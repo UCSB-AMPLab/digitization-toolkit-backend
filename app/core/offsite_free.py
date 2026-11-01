@@ -70,9 +70,11 @@ the hold, the listing) and run the rest as a background job.
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
 
-In offline mode (app.core.unit_mode) everything stays on the scanner:
-freeing, restore and mark-freed are refused (409, code `off_in_this_mode`,
-for the routes). The dry run is not: it changes nothing.
+In offline mode (app.core.unit_mode) nothing leaves the scanner: freeing
+and mark-freed are refused (409, code `off_in_this_mode`, for the route;
+ValueError for the command). Reading from the bucket sends nothing out,
+so restore and the dry run are allowed in every mode, as are the adopt
+commands of app.core.image_upload.
 
 Version: 0.3.3
 """
@@ -669,8 +671,8 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
 
 OFF_IN_THIS_MODE = "off_in_this_mode"
-OFFLINE_MESSAGE = ("The unit is in offline mode, so everything stays on the scanner: files are neither freed, "
-                   "restored nor marked freed.")
+OFFLINE_MESSAGE = ("The unit is in offline mode, so nothing leaves the scanner: files are neither freed nor "
+                   "marked freed.")
 
 
 def _refuse_offline(db: Session) -> None:
@@ -890,7 +892,7 @@ def _prepare_restore(db: Session, collection_id: int):
     from app.core.storage_override import refuse_writes_under_unusable_root
     from capture.project_manager import volume_root
 
-    _refuse_offline(db)
+    # Not refused in offline mode: restore reads from the bucket and sends nothing out.
     collection = _stem_volume(db, collection_id)
     if not config.settings.OFFSITE_READ_REMOTE.strip():
         raise FreeRefused(NO_READ_REMOTE_MESSAGE)

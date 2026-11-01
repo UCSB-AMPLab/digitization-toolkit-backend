@@ -343,14 +343,19 @@ class NullTransport:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
-def get_transport() -> FisquaTransport:
-    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured."""
+def get_transport(bypass_mode: bool = False) -> FisquaTransport:
+    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured.
+
+    Its every request is refused outside fisqua mode (fisqua_http.HttpFisquaTransport)
+    unless `bypass_mode`, which only app.core.unit_mode asks for.
+    """
     url = base_url()
     if url is None:
         return NullTransport()
     from app.core.fisqua_http import HttpFisquaTransport
 
-    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS)
+    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS,
+                               bypass_mode=bypass_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1199,6 +1204,13 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
             logger.info("Fisqua accepted manifest %s of volume %s: %s",
                         row.manifest_id, row.collection_id, answer.status or "no state given")
         result.delivered += 1
+    elif answer.outcome == "off_in_this_mode":
+        # The transport refused it for the unit's mode, and sent nothing: it
+        # goes back to ready, without an attempt counted, and is sent once
+        # the unit is back in fisqua mode.
+        _end_send(db, row.id, state="ready", attempts=attempts - 1)
+        result.status = "off_in_this_mode"
+        return False
     elif answer.outcome == "config_error":
         # Not this manifest's fault: it goes back to ready, to be sent as it
         # is once the configuration is changed.
@@ -1306,7 +1318,7 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                 # Nothing is built under the software Fisqua could not read,
                 # but the one manifest of a retest, once an interval.
                 if not _retest_version_stop(db, transport, clock, result, stopping):
-                    if result.status != "stopped":
+                    if result.status not in ("stopped", "off_in_this_mode"):
                         result.status = "config_error"
                     return result.as_dict()
                 unit_stop = None
@@ -1483,6 +1495,8 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                 except Exception as exc:
                     answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
                 answer = _redacted(answer)
+                if answer.outcome == "off_in_this_mode":
+                    return {**result, "status": "off_in_this_mode"}
                 if answer.outcome == "config_error":
                     record_config_error(answer.status_code, answer.reason, now)
                     return {**result, "status": "config_error"}
@@ -1605,6 +1619,9 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
         except Exception as exc:
             answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
         answer = _redacted(answer)
+        if answer.outcome == "off_in_this_mode":
+            result["status"] = "off_in_this_mode"
+            break
         if answer.outcome == "config_error":
             record_config_error(answer.status_code, answer.reason, now)
             return False

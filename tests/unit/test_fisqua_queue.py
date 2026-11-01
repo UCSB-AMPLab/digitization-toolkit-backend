@@ -535,8 +535,11 @@ def test_notes_come_from_the_newest_of_a_file_import_and_a_queue_revision(client
 # ---------------------------------------------------------------------------
 
 def _http(server):
+    # These tests read how answers are understood, with no unit behind them,
+    # so they skip the transport's mode gate (tested in test_unit_mode).
     from app.core.fisqua_http import HttpFisquaTransport
-    return HttpFisquaTransport(BASE, TOKEN, client=httpx.Client(transport=httpx.MockTransport(server)))
+    return HttpFisquaTransport(BASE, TOKEN, client=httpx.Client(transport=httpx.MockTransport(server)),
+                               bypass_mode=True)
 
 
 @pytest.mark.unit

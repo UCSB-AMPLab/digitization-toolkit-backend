@@ -664,9 +664,11 @@ class Server:
         return answer
 
 
-def _http(server):
+def _http(server, bypass=False):
+    """The real transport over a fake Fisqua; `bypass` for the tests of how answers are read, which have no unit."""
     from app.core.fisqua_http import HttpFisquaTransport
-    return HttpFisquaTransport(BASE, TOKEN, client=httpx.Client(transport=httpx.MockTransport(server)))
+    return HttpFisquaTransport(BASE, TOKEN, client=httpx.Client(transport=httpx.MockTransport(server)),
+                               bypass_mode=bypass)
 
 
 @pytest.mark.unit
@@ -675,7 +677,7 @@ def test_the_lookup_path_encodes_the_code_as_one_segment():
     assert fc.DESCRIPTIONS_PATH == "/api/capture/v1/descriptions/{ref}"
     server = Server(httpx.Response(200, json={"referenceCode": "a/b c", "title": "T", "level": "file",
                                               "dates": {"display": None, "start": None, "end": None}}))
-    result = _http(server).get_description("a/b c!*'()~")
+    result = _http(server, bypass=True).get_description("a/b c!*'()~")
     assert result.outcome == "description" and result.response["title"] == "T"
     request = server.requests[0]
     assert request.method == "GET"
@@ -697,7 +699,7 @@ def test_the_lookup_path_encodes_the_code_as_one_segment():
     (httpx.Response(200, text="not json"), "error"),
 ])
 def test_the_lookup_answers(response, outcome):
-    result = _http(Server(response)).get_description("xx-test-1")
+    result = _http(Server(response), bypass=True).get_description("xx-test-1")
     assert result.outcome == outcome
     if response.status_code == 429:
         assert result.retry_after == 12.0
@@ -705,7 +707,7 @@ def test_the_lookup_answers(response, outcome):
 
 @pytest.mark.unit
 def test_a_network_failure_on_the_lookup_is_an_error_without_the_token():
-    result = _http(Server(httpx.ConnectError(f"refused {TOKEN}"))).get_description("xx-test-1")
+    result = _http(Server(httpx.ConnectError(f"refused {TOKEN}")), bypass=True).get_description("xx-test-1")
     assert result.outcome == "error" and "ConnectError" in result.error
 
 
@@ -909,7 +911,7 @@ def test_override_events_are_info_in_activity(client, db_session, link, reports_
 def test_a_change_committed_during_the_switch_is_not_overwritten(client, db_session, link, monkeypatch):
     from app.core import fisqua_queue, unit_mode
 
-    def racing_put(db, mode, transport=None, now=None):
+    def racing_put(db, mode, transport=None, now=None, **kw):
         _unit(db_session, "offline")  # another admin's switch commits meanwhile
         return True, None
 
@@ -1000,7 +1002,7 @@ def test_a_lost_race_resends_the_stored_mode(client, db_session, link, monkeypat
     from app.core import fisqua_queue, unit_mode
     told = []
 
-    def put(db, mode, transport=None, now=None):
+    def put(db, mode, transport=None, now=None, **kw):
         told.append(mode)
         if len(told) == 1:
             _unit(db_session, "offline")  # another admin's switch commits meanwhile
@@ -1029,7 +1031,7 @@ def test_a_failed_commit_after_the_put_resends_the_stored_mode(db_session, link,
             raise OperationalError("COMMIT", {}, Exception("connection lost"))
         return real_commit()
 
-    def put(db, mode, transport=None, now=None):
+    def put(db, mode, transport=None, now=None, **kw):
         told.append(mode)
         if len(told) == 1:
             armed.append(1)
@@ -1120,7 +1122,7 @@ def test_a_200_without_a_string_reference_code_is_unreachable(client, db_session
 @pytest.mark.unit
 def test_a_dot_code_is_sent_as_one_segment_not_a_dot_segment():
     server = Server(httpx.Response(200, json={"referenceCode": "."}))
-    _http(server).get_description(".")
+    _http(server, bypass=True).get_description(".")
     assert server.requests[0].url.raw_path.decode() == "/api/capture/v1/descriptions/%2E"
 
 
@@ -1161,13 +1163,10 @@ def test_hidden_projects_keep_subcollections_outside_fisqua_mode(client, db_sess
 # 7. Freeing, restore and mark-freed in offline mode.
 
 @pytest.mark.unit
-@pytest.mark.parametrize("action", ["free", "restore"])
-def test_offline_refuses_freeing_and_restore(client, db_session, link, monkeypatch, action):
-    from app.core import config
-    monkeypatch.setattr(config.settings, "OFFSITE_READ_REMOTE", "b2read:bucket")
+def test_offline_refuses_freeing(client, db_session, link):
     _unit(db_session, "offline")
     vol = _volume(db_session, _project(db_session, "P"))
-    resp = _as(client, "admin").post(f"/collections/{vol.id}/offsite/{action}")
+    resp = _as(client, "admin").post(f"/collections/{vol.id}/offsite/free")
     assert resp.status_code == 409, resp.text
     assert resp.json()["detail"]["code"] == "off_in_this_mode"
 
@@ -1245,3 +1244,191 @@ def test_a_down_switch_put_failure_is_logged_as_warn(client, db_session, link):
     assert _as(client, "admin").put("/system/unit", json={"mode": "backup"}).status_code == 200
     logs = _logs(db_session, "unit_mode_changed")
     assert len(logs) == 1 and logs[0].level == "WARN" and "Fisqua not told" in logs[0].detail
+
+
+# ---------------------------------------------------------------------------
+# Round 4
+# ---------------------------------------------------------------------------
+
+LINK_CALLS = [
+    ("send_manifest", ({"id": "m-1"},)),
+    ("get_status", (["xx-a"],)),
+    ("get_decisions", ("xx-a",)),
+    ("put_operators", ({"operators": [], "mode": "fisqua"},)),
+    ("get_queue", (None,)),
+    ("post_queue_ack", ({"revision": "r1", "applied": [], "skipped": []},)),
+    ("get_description", ("xx-a",)),
+]
+
+
+# 1. The transport is the gate.
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode", ["offline", "backup"])
+def test_outside_fisqua_mode_none_of_the_seven_calls_is_sent_and_each_bypass_is(db_session, fisqua, mode):
+    from app.core.fisqua_http import HttpFisquaTransport
+    _unit(db_session, mode)
+    server = Server(*[httpx.Response(200, json={"referenceCode": "xx-a"}) for _ in LINK_CALLS])
+    gated = _http(server)
+    for name, args in LINK_CALLS:
+        assert getattr(gated, name)(*args).outcome == "off_in_this_mode", name
+    assert server.requests == []
+    bypass = HttpFisquaTransport(BASE, TOKEN, client=httpx.Client(transport=httpx.MockTransport(server)),
+                                 bypass_mode=True)
+    for name, args in LINK_CALLS:
+        getattr(bypass, name)(*args)
+    assert len(server.requests) == len(LINK_CALLS)
+
+
+@pytest.mark.unit
+def test_in_fisqua_mode_the_gated_transport_sends(db_session, fisqua):
+    _unit(db_session, "fisqua")
+    server = Server(httpx.Response(200, json={"referenceCode": "xx-a"}))
+    assert _http(server).get_description("xx-a").outcome == "description"
+    assert len(server.requests) == 1
+
+
+@pytest.mark.unit
+def test_every_public_transport_call_reads_the_mode_before_it_sends():
+    """The completeness check: each method that touches the client asks the gate first."""
+    import inspect
+    from app.core.fisqua_http import HttpFisquaTransport
+    senders = []
+    for name, fn in inspect.getmembers(HttpFisquaTransport, inspect.isfunction):
+        source = inspect.getsource(fn)
+        if "self._client." in source and name != "close":
+            senders.append(name)
+            assert source.index("self._mode_refusal()") < source.index("self._client."), name
+    assert sorted(senders) == sorted(name for name, _ in LINK_CALLS)
+
+
+@pytest.mark.unit
+def test_only_unit_mode_asks_for_a_bypass(backend_root):
+    users = sorted(p.relative_to(backend_root).as_posix() for p in (backend_root / "app").rglob("*.py")
+                   if "bypass_mode=True" in p.read_text(encoding="utf-8"))
+    assert users == ["app/core/unit_mode.py"]
+
+
+@pytest.mark.unit
+def test_a_send_refused_by_the_gate_leaves_the_row_ready_without_an_attempt(db_session, fisqua, monkeypatch):
+    """With the run's own mode checks out of the way, the transport still sends nothing."""
+    from app.core import fisqua_outbox, unit_mode
+    from app.models.fisqua import FisquaOutbox
+    p = _project(db_session, "P")
+    _ready_row(db_session, _volume(db_session, p, stem="xx-test-801"), "m-1")
+    _unit(db_session, "offline")
+    monkeypatch.setattr(unit_mode, "link_on", lambda db: True)
+    server = Server()
+    result = fisqua_outbox.run_fisqua_outbox(db_session, transport=_http(server))
+    assert server.requests == []
+    assert result["status"] == "off_in_this_mode"
+    db_session.expire_all()
+    row = db_session.query(FisquaOutbox).one()
+    assert (row.state, row.attempts) == ("ready", 0)
+
+
+# 2. A queue ack refused by the mode is kept.
+
+@pytest.mark.unit
+def test_an_ack_refused_by_the_mode_is_kept_and_posted_after_the_return(db_session, link, reports_root):
+    from app.core import fisqua_queue
+    from tests.unit.test_fisqua_queue import QueueTransport, _ok_ack, _qitem, _queue
+    transport = QueueTransport(queues=[_queue([_qitem()], revision="r1")],
+                               acks=[_result("off_in_this_mode", error="not in fisqua mode"), _ok_ack()])
+    result = fisqua_queue.sync_fisqua_queue(db_session, transport=transport)
+    assert result["status"] == "off_in_this_mode", result
+    pending = fisqua_queue._read_state()["pendingAck"]
+    assert pending["revision"] == "r1"
+    result = fisqua_queue.sync_fisqua_queue(db_session, transport=transport)
+    assert len(transport.acks_sent) == 2 and transport.acks_sent[1] == pending
+    assert fisqua_queue._read_state() == {"revision": "r1", "pendingAck": None}
+
+
+# 3. The mode PUT and its commit are serialised with regular operators sends.
+
+@pytest.mark.unit
+def test_a_regular_operators_send_waits_for_a_switch_and_then_follows_it(db_session, link):
+    import threading
+    import time
+    from app.core import fisqua_queue, unit_mode
+    from app.core.db import SessionLocal
+    _unit(db_session, "fisqua")
+    regular = LinkTransport(operators=[_result("delivered")])
+    outcome = {}
+
+    def regular_send():
+        db = SessionLocal()
+        try:
+            fisqua_queue.mark_operators_due()
+            outcome["result"] = fisqua_queue.send_operators(db, transport=regular)
+        finally:
+            db.close()
+
+    thread = threading.Thread(target=regular_send)
+
+    class Switching(LinkTransport):
+        def put_operators(self, body):
+            self.operators_sent.append(body)
+            thread.start()
+            time.sleep(0.3)
+            outcome["waited"] = thread.is_alive()
+            return _result("delivered")
+
+    unit_mode.change(db_session, actor="boss", mode="backup", transport=Switching())
+    thread.join(5)
+    assert outcome["waited"] is True
+    assert regular.operators_sent == []
+    assert outcome["result"]["status"] == "off_in_this_mode"
+
+
+# 4. Reading from the bucket is allowed in offline mode.
+
+@pytest.mark.unit
+def test_offline_allows_restore(db_session, link, monkeypatch):
+    from app.core import config, offsite_free
+    monkeypatch.setattr(config.settings, "OFFSITE_READ_REMOTE", "b2read:bucket")
+    _unit(db_session, "offline")
+    vol = _volume(db_session, _project(db_session, "P"))
+    collection, hold = offsite_free._prepare_restore(db_session, vol.id)
+    hold.release()
+    assert collection.id == vol.id
+
+
+@pytest.mark.unit
+def test_offline_allows_the_free_dry_run(client, db_session, link):
+    _unit(db_session, "offline")
+    vol = _volume(db_session, _project(db_session, "P"))
+    resp = _as(client, "admin").get(f"/collections/{vol.id}/offsite/free")
+    detail = resp.json().get("detail") if resp.status_code != 200 else {}
+    assert not (isinstance(detail, dict) and detail.get("code") == "off_in_this_mode"), resp.text
+
+
+# 5. A retest stopped by a switch is labelled as the mode's.
+
+@pytest.mark.unit
+def test_a_retest_stopped_by_a_switch_is_labelled_off_in_this_mode(db_session, link, monkeypatch):
+    from datetime import datetime
+    from app.core import fisqua_outbox, unit_mode
+    fisqua_outbox.record_config_error(400, "version", datetime(2020, 1, 1))
+    answers = iter([True])
+    monkeypatch.setattr(unit_mode, "link_on", lambda db: next(answers, False))
+    result = fisqua_outbox.run_fisqua_outbox(db_session, transport=link)
+    assert result["status"] == "off_in_this_mode"
+
+
+# 6. An admin subcollection in fisqua mode.
+
+@pytest.mark.unit
+def test_an_admin_subcollection_in_fisqua_mode_is_checked_and_logged(client, db_session, link):
+    from app.models.collection import Collection
+    _unit(db_session, "fisqua")
+    parent = _volume(db_session, _project(db_session, "P"), stem="xx-test-901")
+    link.description_answers = [_found("xx-test-902")]
+    resp = _as(client, "admin").post("/collections/", json={
+        "name": "T", "parent_collection_id": parent.id, "filename_stem": "xx-test-902"})
+    assert resp.status_code == 201, resp.text
+    assert link.descriptions_asked == ["xx-test-902"]
+    db_session.expire_all()
+    assert db_session.get(Collection, resp.json()["id"]).parent_collection_id == parent.id
+    logs = _logs(db_session, "volume_created_override")
+    assert len(logs) == 1 and "xx-test-902" in logs[0].detail
