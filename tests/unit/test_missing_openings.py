@@ -299,8 +299,8 @@ def test_marking_a_page_it_has_an_image_for_supersedes_that_image(client, db_ses
     assert resp.json()["images"] == []
     old = _fresh(db_session, RecordImage, img.id)
     assert old.is_current is False and old.superseded_at is not None
-    # Its other side was never recorded as missing, and it has no image either way.
-    assert _fresh(db_session, Record, rec.id).missing_side == "left"
+    # No image is left, so the whole opening is missing, whichever side was named.
+    assert _fresh(db_session, Record, rec.id).missing_side == "both"
 
 
 @pytest.mark.unit
@@ -619,3 +619,46 @@ def test_closing_takes_the_record_then_the_volume_then_the_turn(client, db_sessi
     assert _client_as(client, "op", "operator").post(
         f"/records/{rec.id}/close-missing", json={"reason": "foliation_skip"}).status_code == 200
     assert order == ["record", "volume", "turn"]
+
+
+# ---------------------------------------------------------------------------
+# A page marked on a closed record reopens it; locks before status changes
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_marking_a_page_on_a_closed_record_reopens_it(client, db_session, test_project):
+    from app.core import recapture_turn
+    from app.core.export_service import exported_records
+    from app.models.record import Record
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    rec = _missing(db_session, a, 1, "left")
+    api = _client_as(client, "op", "operator")
+    assert api.post(f"/records/{rec.id}/close-missing", json={"reason": "other", "note": "n"}).status_code == 200
+
+    resp = api.post(f"/records/{rec.id}/missing-page", json={"side": "right"})
+    assert resp.status_code == 200, resp.text
+    rec = _fresh(db_session, Record, rec.id)
+    assert (rec.missing_side, rec.closed_reason, rec.closed_note) == ("both", None, None)
+    assert recapture_turn.record_is_pending(rec)
+    assert [r["recordId"] for r in api.get("/records/to-retake").json()] == [rec.id]
+    assert exported_records([rec]) == [rec]
+    [event] = _events(db_session, "missing_page_marked")
+    assert "reopened=other" in event.detail
+
+
+@pytest.mark.unit
+def test_the_route_locks_the_volume_before_any_status_change(client, db_session, test_project, monkeypatch):
+    from app.api import records as records_api
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    rec = _dual_only(db_session, a, 1, "left")
+    rec.status = "in_review"
+    db_session.commit()
+    order = []
+    real_volume, real_status = records_api.locked_volume_query, records_api.change_record_status
+    monkeypatch.setattr(records_api, "locked_volume_query",
+                        lambda db, cid: (order.append("volume"), real_volume(db, cid))[1])
+    monkeypatch.setattr(records_api, "change_record_status",
+                        lambda *a, **k: (order.append("status"), real_status(*a, **k))[1])
+    resp = _client_as(client, "op", "operator").post(f"/records/{rec.id}/missing-page", json={"side": "right"})
+    assert resp.status_code == 200, resp.text
+    assert "status" in order and order.index("volume") < order.index("status")

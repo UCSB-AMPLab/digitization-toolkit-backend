@@ -1215,11 +1215,11 @@ def export_collection_bagit(
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
-    records = exported_records(records)
     # Handover first, approval second — two different things to tell her. A
     # collection she has not promoted is work in progress, not work that failed
     # review (NEH-260). The predicate lives in export_service beside the worker
-    # that re-checks it, so the two cannot drift apart.
+    # that re-checks it, so the two cannot drift apart. It is given every
+    # record, and leaves out excluded ones and closed placeholders itself.
     blocker = workflow_blockers(records)
     if blocker:
         message, blocking_ids = blocker
@@ -1227,6 +1227,7 @@ def export_collection_bagit(
             status_code=422,
             detail={"message": message, "blocking_record_ids": blocking_ids},
         )
+    records = exported_records(records)
 
     image_less = [r.id for r in records if not any(i.is_current for i in r.images)]
     if image_less:

@@ -65,8 +65,10 @@ def exported_records(records) -> list:
     the export nor enters the bag. So is a missing record closed without
     capturing that has no current image (contract 1.9 §10.3: it never
     becomes a page); one with an image is bagged once approved, as any
-    record. Both callers of workflow_blockers pass their records through
-    this first, and so does the worker's re-check.
+    record. The bag is built from these, and the worker's re-check reads
+    them again; workflow_blockers is given the records before this filter,
+    so it can tell an operator why a volume of closed placeholders has
+    nothing to export.
     """
     return [r for r in records if r.status != "excluded" and not _closed_without_image(r)]
 
@@ -88,12 +90,15 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
     collection whose last record was deleted after the request and write
     `"records": []` into the metadata.
 
-    A missing record closed without capturing that has no current image
-    (contract 1.9 §10.3) blocks neither check: it never becomes a page. A
+    Given every record of the collection; it leaves out excluded ones itself
+    (contract 1.6), so a collection of excluded records only has no records
+    to export. A missing record closed without capturing that has no current
+    image (contract 1.9 §10.3) blocks neither check: it never becomes a page. A
     collection left with no record holding a current image has nothing to
     export (NOTHING_TO_EXPORT_MESSAGE), reported after the handover and
     approval checks.
     """
+    records = [r for r in records if r.status != "excluded"]
     if not records:
         return ("Collection has no records to export.", [])
     # A missing record closed without capturing, with no current image,
@@ -144,9 +149,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
-    records = exported_records(records)
     # Re-checked here, not just at request time. Nothing is built before this.
     blocker = workflow_blockers(records)
+    records = exported_records(records)
     if blocker:
         message, blocking_ids = blocker
         raise ExportError(message, detail={"blocking_record_ids": blocking_ids})

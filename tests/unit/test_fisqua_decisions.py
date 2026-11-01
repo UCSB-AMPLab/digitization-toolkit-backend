@@ -1398,3 +1398,22 @@ def test_the_contract_names_the_1_9_decision_and_request():
     assert (fc.F_REQUEST_ID, fc.F_REQUEST_KIND, fc.F_AFTER_RECORD_ID, fc.F_COUNT, fc.F_EXPECTED,
             fc.F_REQUESTED_BY, fc.F_REQUESTED_AT) == (
         "requestId", "kind", "afterRecordId", "count", "expected", "requestedBy", "requestedAt")
+
+
+
+@pytest.mark.unit
+def test_a_missing_page_set_locks_the_volume_before_any_status_change(client, db_session, handed_one_sided,
+                                                                      monkeypatch):
+    from app.api import records as records_api
+    from app.core import volume_stem
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    order = []
+    real_volume, real_status = volume_stem.locked_volume_query, records_api.change_record_status
+    monkeypatch.setattr(volume_stem, "locked_volume_query",
+                        lambda db, cid: (order.append("volume"), real_volume(db, cid))[1])
+    monkeypatch.setattr(records_api, "change_record_status",
+                        lambda *a, **k: (order.append("status"), real_status(*a, **k))[1])
+    _decide(fake, row, [_approve(pair), _missing_page(lone, "right")])
+    _poll(db_session, fake)
+    assert _refresh(db_session, lone).status == "captured"
+    assert "status" in order and order.index("volume") < order.index("status")

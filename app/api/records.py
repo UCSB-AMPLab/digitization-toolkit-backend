@@ -1613,7 +1613,10 @@ def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], 
 	Otherwise a current image of that side is superseded, as a retake
 	supersedes (_supersede_current_images): its file stays on the unit and in
 	the bucket, and it drops out of the manifest. The record then misses that
-	side, or both when it already missed the other, with no image left. A
+	side, or both when no current image is left (it already missed the
+	other, or it had none), whichever side was named. A side added to a
+	closed record reopens it: its closed_reason and closed_note are cleared,
+	so it is pending again. A
 	note, when given, is kept as records.missing_note. A record in review or
 	approved returns to captured, written to its status history under
 	`actor`, so an operator can capture into it (app.api.cameras refuses a
@@ -1624,7 +1627,11 @@ def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], 
 	changed = False
 	if rec.missing_side not in (side, "both"):
 		_supersede_current_images(rec, role=side)
-		rec.missing_side = side if rec.missing_side is None else "both"
+		left = any(img.is_current for img in rec.images)
+		rec.missing_side = side if rec.missing_side is None and left else "both"
+		# A side added to a closed record reopens it: it is pending again.
+		rec.closed_reason = None
+		rec.closed_note = None
 		changed = True
 		if note is not None and note.strip():
 			rec.missing_note = note.strip()
@@ -1658,12 +1665,19 @@ def mark_record_missing_page(
 	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# The volume's row, FOR UPDATE, before any status change: a status-history
+	# row takes FOR KEY SHARE on it (its collection_id foreign key), and the
+	# handover check below would then upgrade that lock, which deadlocks two
+	# such requests on PostgreSQL. As recapture_turn.lock_rescan_volumes does.
+	if rec.collection_id is not None:
+		locked_volume_query(db, rec.collection_id).first()
 	refusal = missing_page_refusal(rec, payload.side)
 	if refusal is not None:
 		raise HTTPException(status_code=409, detail={
 			"code": refusal,
 			"message": f"Record {rec.id} was captured in '{rec.capture_mode}' mode; only a dual opening can miss a page.",
 		})
+	reopened = rec.closed_reason if rec.missing_side not in (payload.side, "both") else None
 	changed = mark_missing_page(db, rec, payload.side, payload.note, current_user.username)
 	queued = None
 	if changed:
@@ -1677,7 +1691,8 @@ def mark_record_missing_page(
 	if changed:
 		log_event(db, level="INFO", category="activity", action="missing_page_marked",
 		          actor=current_user.username, subject=rec.title,
-		          detail=f"record {rec.id} side={payload.side} missing_side={rec.missing_side}")
+		          detail=(f"record {rec.id} side={payload.side} missing_side={rec.missing_side}"
+		                  + (f" reopened={reopened}" if reopened else "")))
 	return _serialize_record(rec)
 
 

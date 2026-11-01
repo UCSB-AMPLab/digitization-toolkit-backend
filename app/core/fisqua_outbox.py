@@ -699,6 +699,8 @@ def hand_over_again_after_missing_change(db: Session, collection_id: Optional[in
         return None
     # The volume's row, after the caller's record locks, so two missing
     # changes on one volume take turns and only one queues a live handover.
+    # The routes and apply_decisions take it before any status change, so
+    # here it is usually held already; kept for callers that came without it.
     volume_stem.locked_volume_query(db, collection_id).first()
     if not handed_over_before(db, collection_id):
         return None

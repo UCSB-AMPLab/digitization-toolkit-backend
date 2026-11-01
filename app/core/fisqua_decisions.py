@@ -495,6 +495,14 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             volume_ids = {r.id for r in volume_records}
             ids = [i for i in ids if i in volume_ids]
         records = _lock_records(db, ids)
+        if not requests and any(d.get(fc.F_DECISION) == fc.DECISION_MISSING_PAGE for d in decisions):
+            # The volume's row, FOR UPDATE, before any status change, as
+            # recapture_turn.lock_rescan_volumes takes it: a status-history row
+            # takes FOR KEY SHARE on it, and the handover check would upgrade
+            # that lock. A set with requests holds the row already
+            # (lock_volume_records, above), in the same order.
+            from app.core import volume_stem
+            volume_stem.locked_volume_query(db, collection_id).first()
         # Again, under the locks: a promotion may have committed while the
         # locks were awaited. A promotion locks only the volume's captured
         # records, not these, so one can still commit after this check; what

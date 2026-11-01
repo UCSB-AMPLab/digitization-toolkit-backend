@@ -276,8 +276,21 @@ def test_a_volume_with_no_current_image_left_has_nothing_to_export():
     closed_bare = SimpleNamespace(id=2, status="in_review", missing_side="both", closed_reason="foliation_skip",
                                   images=[])
     assert workflow_blockers([bare]) == (NOTHING_TO_EXPORT_MESSAGE, [])
-    assert workflow_blockers(exported_records([closed_bare])) == ("Collection has no records to export.", [])
     assert workflow_blockers([closed_bare]) == (NOTHING_TO_EXPORT_MESSAGE, [])
+    excluded = SimpleNamespace(id=3, status="excluded", missing_side=None, closed_reason=None, images=[])
+    assert workflow_blockers([excluded]) == ("Collection has no records to export.", [])
+    assert workflow_blockers([excluded, closed_bare]) == (NOTHING_TO_EXPORT_MESSAGE, [])
+
+
+def test_a_volume_of_closed_placeholders_only_answers_nothing_to_export(export_client, db_session):
+    from app.core.export_service import NOTHING_TO_EXPORT_MESSAGE
+    from app.models.record import Record
+    col, rec = _approved_collection(db_session)
+    rec.status, rec.capture_mode, rec.missing_side, rec.closed_reason = "in_review", "dual", "both", "foliation_skip"
+    db_session.commit()
+    resp = export_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 422, resp.text
+    assert resp.json()["detail"]["message"] == NOTHING_TO_EXPORT_MESSAGE
 
 
 def test_exported_records_leave_out_a_closed_missing_record_with_no_image():
