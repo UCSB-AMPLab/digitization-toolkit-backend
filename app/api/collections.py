@@ -24,6 +24,7 @@ from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusCh
 from app.api.records import _apply_status_change, _assert_promotable, _serialize_record, is_movable
 from app.core.audit import log_event
 from app.core.record_status import record_bulk_status_changes
+from app.core.volume_stem import locked_volume_query
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
@@ -1128,6 +1129,11 @@ def take_back_collection(
     ]
     taken_back = 0
     if locked_ids:
+        # The volume's row, FOR UPDATE, after the records and before the
+        # history rows (which take FOR KEY SHARE on it) and the outbox: record,
+        # volume, history, outbox, the order of every path that hands a
+        # volume over or takes it back (app.core.fisqua_outbox).
+        locked_volume_query(db, collection_id).first()
         # RETURNING names the rows the predicate actually matched, so the
         # history rows below are written for those and no others.
         moved_ids = db.execute(

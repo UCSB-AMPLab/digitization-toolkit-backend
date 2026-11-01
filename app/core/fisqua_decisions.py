@@ -53,6 +53,9 @@ record outside the volume is skipped without being locked:
   One already missing it is unchanged. A record in review or approved
   returns to captured, under the reviewer `Fisqua: <decidedBy>`; it is
   pending until it is captured into or closed. Counted as `missing_pages`.
+  A closed record it reopens is listed in the report's `reopened`
+  ({recordId, reason, note}, the closing it had), counted, and written to
+  the system log as `missing_record_reopened` under that reviewer.
 * Rotations: each current image of an approved or rejected record takes the correction
   the set gives it by captureId and role, in quarter-turns clockwise (1-3),
   or none when the set lists none for it. No file is touched.
@@ -361,8 +364,28 @@ def _lock_records(db: Session, ids: list) -> dict:
 def _empty_report() -> dict:
     return {"counts": {"approved": 0, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 0,
                        "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
-                       "requests_skipped": 0},
-            "skipped": [], "rotation_skips": [], "request_skips": []}
+                       "requests_skipped": 0, "reopened": 0},
+            "skipped": [], "rotation_skips": [], "request_skips": [], "reopened": []}
+
+
+REOPENED_ACTION = "missing_record_reopened"
+
+
+def _record_reopened(db: Session, rec, closed: tuple, actor: str, report: dict) -> None:
+    """Note a closed record that a missing_page decision reopened: in the report and the system log."""
+    from app.models.system_log import SystemLog
+
+    reason, note = closed
+    report["counts"]["reopened"] += 1
+    report["reopened"].append({"recordId": rec.id, "reason": reason, "note": note})
+    # In the transaction, not app.core.audit.log_event, which commits at once.
+    db.add(SystemLog(
+        level="INFO", category="activity", action=REOPENED_ACTION, actor=actor[:150],
+        subject=rec.title[:300] if rec.title else None,
+        detail=(f"record {rec.id} volume {rec.collection_id} was closed ({reason}) and misses "
+                f"{rec.missing_side} again; note: {note}")[:500],
+        created_at=datetime.now(timezone.utc),
+    ))
 
 
 MAX_REQUEST_COUNT = 50
@@ -549,8 +572,12 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
                 if refusal is not None:
                     skip(refusal)
                     continue
+                closed = (rec.closed_reason, rec.closed_note) \
+                    if rec.missing_side not in (decision[fc.F_SIDE], "both") else (None, None)
                 changed = mark_missing_page(db, rec, decision[fc.F_SIDE], _note(decision), _actor(decision))
                 report["counts"]["missing_pages" if changed else "unchanged"] += 1
+                if closed[0] is not None:
+                    _record_reopened(db, rec, closed, _actor(decision), report)
                 continue
             # Every transition _apply_one takes is in DECISION_TRANSITIONS (or,
             # for a rejection, the in_review step before it in
@@ -599,16 +626,16 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
     c = report["counts"]
     logger.info("Fisqua decisions %s applied to volume %s: approved=%s rejected=%s excluded=%s unchanged=%s "
                 "skipped=%s rotations=%s rotations_skipped=%s missing_pages=%s placeholders=%s "
-                "requests_skipped=%s", decisions_id, collection_id, c["approved"],
+                "requests_skipped=%s reopened=%s", decisions_id, collection_id, c["approved"],
                 c["rejected"], c["excluded"], c["unchanged"], c["skipped"], c["rotations"], c["rotations_skipped"],
-                c["missing_pages"], c["placeholders"], c["requests_skipped"])
+                c["missing_pages"], c["placeholders"], c["requests_skipped"], c["reopened"])
     audit.log_event(db, level="INFO", category="activity", action=APPLIED_ACTION, subject=stem,
                     detail=(f"volume {collection_id} decisions={decisions_id} approved={c['approved']} "
                             f"rejected={c['rejected']} excluded={c['excluded']} unchanged={c['unchanged']} "
                             f"skipped={c['skipped']} "
                             f"rotations={c['rotations']} rotations_skipped={c['rotations_skipped']} "
                             f"missing_pages={c['missing_pages']} placeholders={c['placeholders']} "
-                            f"requests_skipped={c['requests_skipped']}"))
+                            f"requests_skipped={c['requests_skipped']} reopened={c['reopened']}"))
     return {"status": "applied", "decisions_id": decisions_id, **report}
 
 
@@ -626,6 +653,7 @@ def decisions_state(status) -> Optional[dict]:
         "skipped": report.get("skipped", []),
         "rotation_skips": report.get("rotation_skips", []),
         "request_skips": report.get("request_skips", []),
+        "reopened": report.get("reopened", []),
         # The last set Fisqua offered was for another manifest, and was not applied.
         "stale": status.decisions_stale_id is not None,
     }

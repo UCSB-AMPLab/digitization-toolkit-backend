@@ -395,3 +395,55 @@ def test_closing_a_record_waiting_for_a_retake_closes_it_and_leaves_its_status(c
     rec = db_session.get(Record, rec.id)
     assert (rec.closed_reason, rec.status) == ("foliation_skip", "captured")
     assert _states(db_session, vol) == ["waiting_for_upload"]
+
+
+# ---------------------------------------------------------------------------
+# Take-back's lock order; a decision that reopens a closed record
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_take_back_locks_the_volume_before_history_and_the_outbox(client, db_session, vol, fisqua, monkeypatch):
+    import app.api.collections as collections_api
+    from app.core import fisqua_outbox
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    order = []
+    real_volume = collections_api.locked_volume_query
+    real_history = collections_api.record_bulk_status_changes
+    real_withdraw = fisqua_outbox.withdraw_unsent
+    monkeypatch.setattr(collections_api, "locked_volume_query",
+                        lambda db, cid: (order.append("volume"), real_volume(db, cid))[1])
+    monkeypatch.setattr(collections_api, "record_bulk_status_changes",
+                        lambda *a, **k: (order.append("history"), real_history(*a, **k))[1])
+    monkeypatch.setattr(fisqua_outbox, "withdraw_unsent",
+                        lambda *a, **k: (order.append("outbox"), real_withdraw(*a, **k))[1])
+    resp = _as(client, "operator").post(f"/collections/{vol.col.id}/take-back")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["taken_back"] == 1
+    assert order == ["volume", "history", "outbox"]
+
+
+@pytest.mark.unit
+def test_a_decision_that_reopens_a_closed_record_reports_and_logs_it(client, db_session, vol, fisqua):
+    from app.models.system_log import SystemLog
+    vol.record(status="captured")
+    rec = _one_sided(vol, "captured", role="right")
+    rec.missing_side, rec.closed_reason, rec.closed_note = "left", "other", "hoja suelta"
+    db_session.commit()
+    _handover(client, vol.col)
+    assert _status(db_session, rec) == "in_review"
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[0]
+    fake = Fisqua(vol.col.filename_stem)
+    fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}
+    _decide(fake, row, [_missing_page(rec, "right")])
+    _poll(db_session, fake)
+
+    state = _as(client, "reviewer").get(f"/collections/{vol.col.id}/offsite").json()["fisqua"]["decisions"]
+    assert state["reopened"] == [{"recordId": rec.id, "reason": "other", "note": "hoja suelta"}]
+    assert state["counts"]["reopened"] == 1
+    db_session.expire_all()
+    [event] = db_session.query(SystemLog).filter(SystemLog.action == "missing_record_reopened").all()
+    assert event.actor == "Fisqua: Ana Gómez" and f"record {rec.id}" in event.detail and "other" in event.detail
+    [applied] = db_session.query(SystemLog).filter(SystemLog.action == "fisqua_decisions_applied").all()
+    assert "reopened=1" in applied.detail

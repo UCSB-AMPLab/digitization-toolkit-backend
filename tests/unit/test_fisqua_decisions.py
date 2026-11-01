@@ -300,7 +300,7 @@ def test_other_without_a_note_is_skipped(client, db_session, handed):
     assert state["skipped"] == [{"captua_record_id": a.id, "reason": "other_without_note"}]
     assert state["counts"] == {"approved": 1, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 1,
                                "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
-                               "requests_skipped": 0}
+                               "requests_skipped": 0, "reopened": 0}
 
 
 @pytest.mark.unit
@@ -397,7 +397,7 @@ def test_the_offsite_state_shows_the_applied_set(client, db_session, handed):
     assert state["stale"] is False
     assert state["counts"] == {"approved": 1, "rejected": 1, "excluded": 0, "unchanged": 0, "skipped": 0,
                                "rotations": 1, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
-                               "requests_skipped": 0}
+                               "requests_skipped": 0, "reopened": 0}
     assert state["skipped"] == []
 
 
@@ -965,7 +965,7 @@ def test_an_exclusion_excludes_the_record_names_the_reviewer_and_makes_no_reject
     state = _decisions_state(client, vol.col)
     assert state["counts"] == {"approved": 0, "rejected": 0, "excluded": 1, "unchanged": 0, "skipped": 0,
                                "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
-                               "requests_skipped": 0}
+                               "requests_skipped": 0, "reopened": 0}
     assert state["skipped"] == []
     # The record reads back with its status, and so does its history.
     body = _as(client, "reviewer").get(f"/records/{a.id}").json()
