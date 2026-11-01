@@ -22,7 +22,7 @@ import pytest
 import sqlalchemy as sa
 from sqlalchemy.exc import IntegrityError
 
-from tests.unit.test_capture_manifest_export import TENANT, _as, tenant  # noqa: F401  (fixture)
+from tests.unit.test_capture_manifest_export import TENANT, _as, tenant, vol  # noqa: F401  (fixtures)
 from tests.unit.test_fisqua_outbox import TOKEN, fisqua  # noqa: F401  (fixture)
 from tests.unit.test_list_import import (  # noqa: F401  (reports_root is a fixture)
     _as as _as_importer, _item, _list_with, _post, reports_root,
@@ -105,6 +105,24 @@ class LinkTransport:
     def post_queue_ack(self, body):
         self.other_calls.append("post_queue_ack")
         return _result("acknowledged")
+
+
+def _found(code):
+    """A 200 to the 1.8 lookup for `code`."""
+    return _result("description", response={"referenceCode": code, "title": "T", "level": "file",
+                                             "dates": {"display": None, "start": None, "end": None}})
+
+
+@pytest.fixture(autouse=True)
+def recipient(monkeypatch):
+    """A valid catalogue dump recipient, so the dump counts as configured wherever the remote is."""
+    import pyrage
+    from app.core import config
+    key = str(pyrage.x25519.Identity.generate().to_public())
+    # In the environment too: db_session's fixture rebuilds the settings from it.
+    monkeypatch.setenv("CAPTUA_OFFSITE_DUMP_RECIPIENT", key)
+    monkeypatch.setattr(config.settings, "OFFSITE_DUMP_RECIPIENT", key, raising=False)
+    return key
 
 
 @pytest.fixture
@@ -587,7 +605,7 @@ def test_a_401_on_the_lookup_takes_the_link_config_error_handling(client, db_ses
 def test_an_admin_changing_a_stem_in_fisqua_mode_is_checked_and_logged(client, db_session, link):
     _unit(db_session, "fisqua")
     vol = _volume(db_session, _project(db_session, "P"), stem=None)
-    link.description_answers = [_result("description", response={})]
+    link.description_answers = [_found("xx-test-300")]
     resp = _as(client, "admin").patch(f"/collections/{vol.id}", json={"filename_stem": "xx-test-300"})
     assert resp.status_code == 200, resp.text
     assert link.descriptions_asked == ["xx-test-300"]
@@ -873,7 +891,7 @@ def test_a_default_project_import_reports_its_notes_skipped_as_default_project(c
 def test_override_events_are_info_in_activity(client, db_session, link, reports_root):
     _unit(db_session, "fisqua")
     p = _project(db_session, "P")
-    link.description_answers = [_result("description", response={})] * 2
+    link.description_answers = [_found("xx-test-200")] * 2
     resp = _as(client, "admin").post("/collections/", json={"name": "T", "project_id": p.id,
                                                             "filename_stem": "xx-test-200"})
     assert resp.status_code == 201, resp.text
@@ -901,3 +919,329 @@ def test_a_change_committed_during_the_switch_is_not_overwritten(client, db_sess
     assert _problem_codes(resp) == ["mode_changed"]
     assert unit_mode.current(db_session).mode == "offline"
     assert _logs(db_session, "unit_mode_changed") == []
+
+
+# ---------------------------------------------------------------------------
+# Round 3 (verifier and Codex)
+# ---------------------------------------------------------------------------
+
+# 1. A switch stops a run in progress.
+
+@pytest.mark.unit
+def test_a_switch_to_offline_stops_the_upload_drain_before_the_next_object(db_session, link, monkeypatch):
+    from app.core import image_upload
+    _unit(db_session, "backup")
+    done = []
+    monkeypatch.setattr(image_upload, "pending_work", lambda db: ["first", "second"])
+
+    def process(db, tenant, item, result):
+        done.append(item)
+        _unit(db_session, "offline")
+
+    monkeypatch.setattr(image_upload, "_process", process)
+    result = image_upload.run_image_upload(db_session)
+    assert done == ["first"]
+    assert result["status"] == "off_in_this_mode"
+
+
+def _ready_row(db, vol, manifest_id):
+    from app.models.fisqua import FisquaOutbox
+    db.add(FisquaOutbox(collection_id=vol.id, manifest_id=manifest_id, stem=vol.filename_stem,
+                        state="ready", attempts=0, manifest={"id": manifest_id}))
+    db.commit()
+
+
+@pytest.mark.unit
+def test_a_switch_down_stops_the_outbox_between_sends(db_session, link):
+    from app.core import fisqua_outbox
+    from app.models.fisqua import FisquaOutbox
+    _unit(db_session, "fisqua")
+    p = _project(db_session, "P")
+    _ready_row(db_session, _volume(db_session, p, stem="xx-test-601"), "m-1")
+    _ready_row(db_session, _volume(db_session, p, stem="xx-test-602"), "m-2")
+    sent = []
+
+    class Switching(LinkTransport):
+        def send_manifest(self, manifest):
+            sent.append(manifest["id"])
+            _unit(db_session, "backup")
+            return _result("delivered", external_id="fq-1", response={"volumeId": "fq-1"})
+
+    result = fisqua_outbox.run_fisqua_outbox(db_session, transport=Switching())
+    assert sent == ["m-1"]
+    assert result["status"] == "off_in_this_mode"
+    db_session.expire_all()
+    assert db_session.query(FisquaOutbox).filter_by(manifest_id="m-2").one().state == "ready"
+
+
+@pytest.mark.unit
+def test_a_switch_down_stops_the_poll_between_batches(db_session, link, monkeypatch):
+    from app.core import fisqua_contract, fisqua_outbox
+    _unit(db_session, "fisqua")
+    monkeypatch.setattr(fisqua_contract, "MAX_REFS_PER_CALL", 1)
+    monkeypatch.setattr(fisqua_outbox, "volumes_to_poll", lambda db: {"xx-a": (1, "m-a"), "xx-b": (2, "m-b")})
+    asked = []
+
+    class Switching(LinkTransport):
+        def get_status(self, refs):
+            asked.append(list(refs))
+            _unit(db_session, "offline")
+            return _result("status", volumes=[])
+
+    result = fisqua_outbox.poll_fisqua_status(db_session, transport=Switching())
+    assert asked == [["xx-a"]]
+    assert result["status"] == "off_in_this_mode"
+
+
+# 2. Fisqua is told the mode actually stored.
+
+@pytest.mark.unit
+def test_a_lost_race_resends_the_stored_mode(client, db_session, link, monkeypatch):
+    from app.core import fisqua_queue, unit_mode
+    told = []
+
+    def put(db, mode, transport=None, now=None):
+        told.append(mode)
+        if len(told) == 1:
+            _unit(db_session, "offline")  # another admin's switch commits meanwhile
+        return True, None
+
+    monkeypatch.setattr(fisqua_queue, "send_operators_with_mode", put)
+    _unit(db_session, "backup")
+    resp = _as(client, "admin").put("/system/unit", json={"mode": "fisqua"})
+    assert _problem_codes(resp) == ["mode_changed"]
+    assert told == ["fisqua", "offline"]
+    assert unit_mode.current(db_session).mode == "offline"
+    assert len(_logs(db_session, "unit_mode_resent")) == 1
+
+
+@pytest.mark.unit
+def test_a_failed_commit_after_the_put_resends_the_stored_mode(db_session, link, monkeypatch):
+    from sqlalchemy.exc import OperationalError
+    from app.core import fisqua_queue, unit_mode
+    told = []
+    armed = []
+    real_commit = db_session.commit
+
+    def commit():
+        if armed:
+            armed.clear()
+            raise OperationalError("COMMIT", {}, Exception("connection lost"))
+        return real_commit()
+
+    def put(db, mode, transport=None, now=None):
+        told.append(mode)
+        if len(told) == 1:
+            armed.append(1)
+        return True, None
+
+    _unit(db_session, "backup")
+    monkeypatch.setattr(fisqua_queue, "send_operators_with_mode", put)
+    monkeypatch.setattr(db_session, "commit", commit)
+    with pytest.raises(OperationalError):
+        unit_mode.change(db_session, actor="boss", mode="fisqua")
+    assert told == ["fisqua", "backup"]
+    assert unit_mode.current(db_session).mode == "backup"
+
+
+# 3. Retry-After before a mode-change PUT.
+
+@pytest.mark.unit
+def test_while_cooling_a_switch_to_fisqua_is_refused_without_a_put(client, db_session, link):
+    from app.core import fisqua_outbox, unit_mode
+    _unit(db_session, "backup")
+    fisqua_outbox.call_budget.cool_down(60)
+    link.operators_answers = [_result("delivered")]
+    resp = _as(client, "admin").put("/system/unit", json={"mode": "fisqua"})
+    assert _problem_codes(resp) == ["fisqua_unreachable"]
+    assert resp.json()["detail"]["problems"][0]["error"].startswith("rate_limited")
+    assert link.operators_sent == []
+    assert unit_mode.current(db_session).mode == "backup"
+
+
+@pytest.mark.unit
+def test_while_cooling_a_down_switch_skips_the_put_and_is_logged(client, db_session, link):
+    from app.core import fisqua_outbox, unit_mode
+    _unit(db_session, "fisqua")
+    fisqua_outbox.call_budget.cool_down(60)
+    resp = _as(client, "admin").put("/system/unit", json={"mode": "backup"})
+    assert resp.status_code == 200, resp.text
+    assert link.operators_sent == []
+    assert unit_mode.current(db_session).mode == "backup"
+    logs = _logs(db_session, "unit_mode_changed")
+    assert logs[0].level == "WARN" and "rate_limited" in logs[0].detail
+
+
+# 4. The catalogue dump's recipient.
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["", "not-a-key", "AGE-SECRET-KEY-1QQQQ"])
+def test_a_missing_or_invalid_recipient_is_a_missing_dump(db_session, tenant, monkeypatch, value):
+    from app.core import config, unit_mode
+    monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "b2unit:bucket")
+    monkeypatch.setattr(config.settings, "OFFSITE_DUMP_RECIPIENT", value, raising=False)
+    assert unit_mode.prerequisites()["backup"] == ["catalogue_dump_not_configured"]
+
+
+@pytest.mark.unit
+def test_a_valid_recipient_completes_the_dump(db_session, tenant, monkeypatch):
+    from app.core import config, unit_mode
+    monkeypatch.setattr(config.settings, "OFFSITE_REMOTE", "b2unit:bucket")
+    assert unit_mode.prerequisites()["backup"] == []
+
+
+# 5. The lookup's answer names the code asked for.
+
+@pytest.mark.unit
+@pytest.mark.parametrize("external_id, answered", [("xx-test-200", "xx-test-201"), (".", "xx-test-200")])
+def test_a_200_for_another_code_is_an_unknown_code(client, db_session, link, external_id, answered):
+    from app.models.collection import Collection
+    _unit(db_session, "fisqua")
+    p = _project(db_session, "P")
+    link.description_answers = ([_found(answered)] if external_id == "xx-test-200"
+                                else [_found("xx-test-200"), _found(answered)])
+    resp = _as(client, "admin").post("/collections/", json={
+        "name": "T", "project_id": p.id, "filename_stem": "xx-test-200", "external_id": external_id})
+    _detail(resp, 422, "unknown_reference_code")
+    assert db_session.query(Collection).count() == 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body", [{}, {"referenceCode": 7}, {"title": "T"}, ["xx-test-200"]])
+def test_a_200_without_a_string_reference_code_is_unreachable(client, db_session, link, body):
+    _unit(db_session, "fisqua")
+    p = _project(db_session, "P")
+    link.description_answers = [_result("description", response=body)]
+    resp = _as(client, "admin").post("/collections/", json={"name": "T", "project_id": p.id,
+                                                            "filename_stem": "xx-test-200"})
+    _detail(resp, 409, "fisqua_unreachable")
+
+
+@pytest.mark.unit
+def test_a_dot_code_is_sent_as_one_segment_not_a_dot_segment():
+    server = Server(httpx.Response(200, json={"referenceCode": "."}))
+    _http(server).get_description(".")
+    assert server.requests[0].url.raw_path.decode() == "/api/capture/v1/descriptions/%2E"
+
+
+# 6. Hidden projects ignore project_id.
+
+@pytest.mark.unit
+def test_hidden_projects_ignore_a_given_project_id(client, db_session):
+    a = _project(db_session, "A")
+    _project(db_session, "B")
+    resp = _as(client, "operator").post("/collections/", json={"name": "T", "project_id": a.id,
+                                                               "filename_stem": "xx-test-700"})
+    assert resp.status_code == 201, resp.text
+    assert _project_of(db_session, resp.json()["id"]).name == "default"
+
+
+@pytest.mark.unit
+def test_shown_projects_keep_a_given_project_id(client, db_session):
+    _unit(db_session, "offline", projects_enabled=True)
+    a = _project(db_session, "A")
+    _project(db_session, "B")
+    resp = _as(client, "operator").post("/collections/", json={"name": "T", "project_id": a.id,
+                                                               "filename_stem": "xx-test-700"})
+    assert _project_of(db_session, resp.json()["id"]).id == a.id
+
+
+@pytest.mark.unit
+def test_hidden_projects_keep_subcollections_outside_fisqua_mode(client, db_session):
+    from app.models.collection import Collection
+    parent = _volume(db_session, _project(db_session, "A"), stem="xx-test-701")
+    resp = _as(client, "operator").post("/collections/", json={
+        "name": "T", "parent_collection_id": parent.id, "filename_stem": "xx-test-702"})
+    assert resp.status_code == 201, resp.text
+    db_session.expire_all()
+    child = db_session.get(Collection, resp.json()["id"])
+    assert (child.parent_collection_id, child.project_id) == (parent.id, None)
+
+
+# 7. Freeing, restore and mark-freed in offline mode.
+
+@pytest.mark.unit
+@pytest.mark.parametrize("action", ["free", "restore"])
+def test_offline_refuses_freeing_and_restore(client, db_session, link, monkeypatch, action):
+    from app.core import config
+    monkeypatch.setattr(config.settings, "OFFSITE_READ_REMOTE", "b2read:bucket")
+    _unit(db_session, "offline")
+    vol = _volume(db_session, _project(db_session, "P"))
+    resp = _as(client, "admin").post(f"/collections/{vol.id}/offsite/{action}")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"]["code"] == "off_in_this_mode"
+
+
+@pytest.mark.unit
+def test_backup_lets_freeing_reach_its_own_checks(client, db_session, link):
+    _unit(db_session, "backup")
+    vol = _volume(db_session, _project(db_session, "P"))
+    resp = _as(client, "admin").post(f"/collections/{vol.id}/offsite/free")
+    assert resp.status_code == 409, resp.text
+    assert resp.json()["detail"].get("code") != "off_in_this_mode"
+
+
+@pytest.mark.unit
+def test_offline_refuses_mark_freed(db_session, link):
+    from app.core.offsite_free import mark_freed
+    _unit(db_session, "offline")
+    _volume(db_session, _project(db_session, "P"))
+    with pytest.raises(ValueError, match="offline"):
+        mark_freed(db_session, "xx-test-100")
+
+
+# 8. Unknown keys.
+
+@pytest.mark.unit
+def test_put_unit_refuses_unknown_keys(client, db_session):
+    resp = _as(client, "admin").put("/system/unit", json={"mode": "offline", "projects": True})
+    assert resp.status_code == 422, resp.text
+
+
+# 9. More.
+
+@pytest.mark.unit
+def test_the_token_never_reaches_the_lookup_refusal_or_the_log(client, db_session, link, monkeypatch, caplog):
+    from app.core import unit_mode
+    server = Server(httpx.ConnectError(f"refused for {TOKEN}"))
+    monkeypatch.setattr(unit_mode, "get_transport", lambda: _http(server))
+    _unit(db_session, "fisqua")
+    p = _project(db_session, "P")
+    resp = _as(client, "admin").post("/collections/", json={"name": "T", "project_id": p.id,
+                                                            "filename_stem": "xx-test-200"})
+    _detail(resp, 409, "fisqua_unreachable")
+    assert server.requests and TOKEN not in resp.text
+    assert TOKEN not in caplog.text
+
+
+@pytest.mark.unit
+def test_a_retry_after_on_the_lookup_cools_the_link(client, db_session, link):
+    from app.core import fisqua_outbox
+    _unit(db_session, "fisqua")
+    p = _project(db_session, "P")
+    link.description_answers = [_result("error", status_code=429, error="HTTP 429", retry_after=30.0)]
+    _as(client, "admin").post("/collections/", json={"name": "T", "project_id": p.id,
+                                                     "filename_stem": "xx-test-200"})
+    assert fisqua_outbox.call_budget.cooling()
+
+
+@pytest.mark.unit
+def test_rows_queued_outside_fisqua_mode_are_sent_after_returning(client, db_session, vol, fisqua):
+    from tests.unit.test_fisqua_outbox import FakeTransport, _delivered, _handover, _rows, _run
+    _unit(db_session, "backup", projects_enabled=False)
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    assert _run(db_session, FakeTransport(sends=[_delivered()]))["status"] == "off_in_this_mode"
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
+    _unit(db_session, "fisqua")
+    _run(db_session, FakeTransport(sends=[_delivered("fq-9")]))
+    assert [(r.state, r.external_id) for r in _rows(db_session, vol.col)] == [("delivered", "fq-9")]
+
+
+@pytest.mark.unit
+def test_a_down_switch_put_failure_is_logged_as_warn(client, db_session, link):
+    _unit(db_session, "fisqua")
+    link.operators_answers = [_result("error", error="HTTP 503")]
+    assert _as(client, "admin").put("/system/unit", json={"mode": "backup"}).status_code == 200
+    logs = _logs(db_session, "unit_mode_changed")
+    assert len(logs) == 1 and logs[0].level == "WARN" and "Fisqua not told" in logs[0].detail

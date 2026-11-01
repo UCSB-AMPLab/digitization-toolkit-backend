@@ -16,7 +16,11 @@ A unit runs in one mode, set by an admin (PUT /system/unit):
 The existing gates read the mode, so every caller follows it:
 image_upload.run_image_upload and catalogue_backup.run_catalogue_backup
 answer OFF_STATUS outside backup and fisqua, and fisqua_outbox's send and
-poll and fisqua_queue's sync and operators PUT outside fisqua. Changing
+poll and fisqua_queue's sync and operators PUT outside fisqua. Each run
+reads the mode again between objects, sends, batches and decisions reads,
+so a switch stops a run in progress before its next step. Freeing,
+restore and mark-freed are refused in offline mode
+(app.core.offsite_free). Changing
 mode changes no data: outbox rows, statuses and records stay as they are,
 and unsent rows go out if the unit returns to fisqua. The offsite hold
 file keeps its meaning in every mode.
@@ -30,7 +34,7 @@ writing it. Anything that needs the row (a change, the default project)
 writes it, with the same inference and the same log line.
 
 **Switching.** `backup` needs offsite upload and the catalogue dump
-configured; `fisqua` needs those and Fisqua configured, and then an
+configured, its age recipient included; `fisqua` needs those and Fisqua configured, and then an
 operators PUT carrying `mode: fisqua` that Fisqua accepts, sent during the
 switch. A missing prerequisite or a failed PUT refuses the switch
 (ModeRefused, a 409 naming each problem) and nothing changes; so does
@@ -61,6 +65,7 @@ from typing import Any, Optional
 from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
+from app.core import fisqua_contract as fc
 from app.core import offsite_hold
 
 logger = logging.getLogger(__name__)
@@ -170,6 +175,17 @@ def off(db: Session) -> dict:
     return {"status": OFF_STATUS, "mode": mode(db)}
 
 
+def _recipient_valid() -> bool:
+    """Whether the catalogue dump's age recipient is set and valid (catalogue_backup.dump_recipient; no side effect)."""
+    from app.core import catalogue_backup
+
+    try:
+        catalogue_backup.dump_recipient()
+    except catalogue_backup.BackupError:
+        return False
+    return True
+
+
 def prerequisites() -> dict:
     """The missing prerequisites of `backup` and `fisqua`, as codes, from the configuration alone (no call)."""
     from app.core import catalogue_backup, fisqua_outbox, image_upload
@@ -177,7 +193,7 @@ def prerequisites() -> dict:
     backup = []
     if not image_upload.is_enabled():
         backup.append(OFFSITE_NOT_CONFIGURED)
-    if not catalogue_backup.is_configured():
+    if not catalogue_backup.is_configured() or not _recipient_valid():
         backup.append(CATALOGUE_DUMP_NOT_CONFIGURED)
     fisqua = list(backup)
     if not fisqua_outbox.fisqua_configured():
@@ -293,6 +309,10 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
     Raises ModeRefused, with nothing changed, when the new mode's
     prerequisites are missing or, for fisqua, the operators PUT carrying it
     fails. The caller holds no uncommitted change.
+
+    When Fisqua was told a mode that is then not stored (the change lost a
+    race, `mode_changed`, or its commit failed), the mode actually stored is
+    sent at once, best effort, and the outcome logged `unit_mode_resent`.
     """
     from app.core import audit, fisqua_queue
 
@@ -301,6 +321,7 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
     before = current(db)
     target = before.mode if mode is None else mode
     unsent = None
+    told = None  # the mode Fisqua accepted in this change, if any
     if target != before.mode:
         if target in (BACKUP, FISQUA):
             missing = prerequisites()[target]
@@ -312,27 +333,38 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
             ok, error = fisqua_queue.send_operators_with_mode(db, FISQUA, transport=transport)
             if not ok:
                 raise ModeRefused(target, [_problem(FISQUA_UNREACHABLE, error)])
+            told = FISQUA
         elif before.mode == FISQUA:
             # Before the link stops; best effort.
             ok, error = fisqua_queue.send_operators_with_mode(db, target, transport=transport)
-            if not ok:
+            if ok:
+                told = target
+            else:
                 unsent = error
                 logger.warning("Fisqua was not told the unit's new mode %s (%s); the switch goes ahead",
                                target, error)
-    row = _ensure_row(db)
-    old_mode, old_projects = row.mode, bool(row.projects_enabled)
-    if (old_mode, old_projects) != (before.mode, before.projects_enabled):
-        # Committed by another change since `before` was read: the checks
-        # and the PUT above were for a state that no longer holds.
+    try:
+        row = _ensure_row(db)
+        old_mode, old_projects = row.mode, bool(row.projects_enabled)
+        if (old_mode, old_projects) != (before.mode, before.projects_enabled):
+            # Committed by another change since `before` was read: the checks
+            # and the PUT above were for a state that no longer holds.
+            db.rollback()
+            _resend_stored(db, told, actor, transport)
+            raise ModeRefused(target, [_problem(MODE_CHANGED)])
+        row.mode = target
+        if projects_enabled is not None:
+            row.projects_enabled = bool(projects_enabled)
+        row.updated_at = _now()
+        row.updated_by = actor
+        new_projects = bool(row.projects_enabled)
+        db.commit()
+    except ModeRefused:
+        raise
+    except Exception:
         db.rollback()
-        raise ModeRefused(target, [_problem(MODE_CHANGED)])
-    row.mode = target
-    if projects_enabled is not None:
-        row.projects_enabled = bool(projects_enabled)
-    row.updated_at = _now()
-    row.updated_by = actor
-    new_projects = bool(row.projects_enabled)
-    db.commit()
+        _resend_stored(db, told, actor, transport)
+        raise
     if old_mode != target:
         detail = f"{old_mode} -> {target}"
         if unsent is not None:
@@ -343,6 +375,32 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
         audit.log_event(db, level="INFO", category="system", action="unit_projects_changed", actor=actor,
                         detail=f"projects_enabled {old_projects} -> {new_projects}")
     return current(db)
+
+
+def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], transport=None) -> None:
+    """After a change that told Fisqua `told` and then stored nothing: send the stored mode. Never raises."""
+    from app.core import audit, fisqua_queue
+
+    if told is None:
+        return
+    try:
+        stored = current(db).mode
+        db.rollback()
+    except Exception:
+        db.rollback()
+        logger.exception("Reading the unit's mode after a failed change raised; Fisqua may show %s", told)
+        return
+    if stored == told:
+        return
+    ok, error = fisqua_queue.send_operators_with_mode(db, stored, transport=transport)
+    detail = f"Fisqua was told {told}, which was not stored; sent {stored}"
+    if ok:
+        logger.info("%s", detail)
+    else:
+        detail = f"Fisqua was told {told}, which was not stored; {stored} not sent: {error}"
+        logger.warning("%s", detail)
+    audit.log_event(db, level="INFO" if ok else "WARN", category="system", action="unit_mode_resent",
+                    actor=actor, detail=detail)
 
 
 # ---------------------------------------------------------------------------
@@ -439,6 +497,9 @@ def check_reference_code(db: Session, reference_code: str, *, transport=None,
     One GET /api/capture/v1/descriptions/{code} through the link's call
     budget, configuration stop, hold and redaction. 200: the description.
     404 with rule unknown-reference-code: 422 unknown_reference_code. A
+    200 whose referenceCode is not exactly `reference_code`: 422
+    unknown_reference_code; a 200 without a string referenceCode: 409
+    fisqua_unreachable. A
     bare 404 or a 405: 409 fisqua_no_lookup (a Fisqua without 1.8). A
     401, 403 or redirect is recorded as the link's configuration stop, as
     on every other path, and with a network error, a timeout, a 429 or
@@ -471,7 +532,15 @@ def check_reference_code(db: Session, reference_code: str, *, transport=None,
         answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
     answer = fisqua_outbox._redacted(answer)
     if answer.outcome == "description":
-        return answer.response
+        body = answer.response
+        answered = body.get(fc.F_REFERENCE_CODE) if isinstance(body, dict) else None
+        if not isinstance(answered, str):
+            raise unreachable(f"unreadable: the answer has no {fc.F_REFERENCE_CODE}")
+        if answered != reference_code:
+            # Not the description asked for: the code is not known as given.
+            raise CodeRefused(422, UNKNOWN_REFERENCE_CODE,
+                              UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code), reference_code)
+        return body
     if answer.outcome == "unknown_code":
         raise CodeRefused(422, UNKNOWN_REFERENCE_CODE, UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code),
                           reference_code)

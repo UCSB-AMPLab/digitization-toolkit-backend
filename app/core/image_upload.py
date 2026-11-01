@@ -810,7 +810,8 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
     that is not a prefix), "off_in_this_mode" (the unit is in offline mode,
     app.core.unit_mode: nothing is listed or uploaded), "held" (the hold file exists, app.core.offsite_hold:
     nothing is listed or uploaded; also the status of a run stopped between
-    objects because the file appeared), "done", "stopped" (asked to stop between
+    objects because the file appeared; "off_in_this_mode" likewise for a
+    switch to offline), "done", "stopped" (asked to stop between
     objects), "aborted" (a listing did not answer), "failed" (an upload failed).
     """
     result = RunResult()
@@ -845,6 +846,11 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
                 result.status = "held"
                 logger.info("offsite uploads are on hold: %s exists; image upload stopped",
                             offsite_hold.hold_file())
+                break
+            # And a switch to offline mode, the same way.
+            if not unit_mode.offsite_on(db):
+                result.status = unit_mode.OFF_STATUS
+                logger.info("the unit is now in offline mode; image upload stopped")
                 break
             try:
                 _process(db, tenant, item, result)

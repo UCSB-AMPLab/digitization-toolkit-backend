@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
@@ -158,6 +158,8 @@ def get_catalogue_backup_state(
 # ---------------------------------------------------------------------------
 
 class UnitUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
     mode: Optional[Literal["offline", "backup", "fisqua"]] = None
     projectsEnabled: Optional[bool] = None
 

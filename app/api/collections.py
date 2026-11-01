@@ -116,8 +116,9 @@ def create_collection(
     Must specify either project_id (for top-level collection) OR parent_collection_id (for nested subcollection).
 
     The unit's mode and projects setting (app.core.unit_mode) apply. While
-    projects are hidden, a volume given neither goes into the unit's
-    default project; with projects shown, that is still a 400. In fisqua
+    projects are hidden, a volume without a parent collection goes into the
+    unit's default project, and any project_id given is ignored; with
+    projects shown, giving neither is still a 400. In fisqua
     mode an operator is refused with a 403 (`volumes_from_fisqua`); an
     admin's volume is saved only once Fisqua knows its stem, and its
     external_id when set (contract 1.8; 422 `unknown_reference_code`, 409
@@ -132,7 +133,10 @@ def create_collection(
     if from_fisqua and current_user.role != "admin":
         raise _volumes_from_fisqua()
 
-    project_id = payload.project_id
+    # While projects are hidden every new volume goes into the unit's default
+    # project, whoever creates it: a given project_id is ignored. A
+    # subcollection (parent_collection_id) is created as before.
+    project_id = payload.project_id if unit.projects_shown else None
     # Validate that exactly one parent is specified
     if project_id is None and payload.parent_collection_id is None and unit.projects_shown:
         raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
@@ -369,8 +373,9 @@ def free_collection(
     Refused with 409 when the volume has no stem, when not every one of its
     objects is verified in the bucket, while an export of it is queued or
     running or its files are being read for upload, when the bucket
-    cannot be listed, and while the offsite upload hold file exists
-    (app.core.offsite_hold; the detail carries `hold_file`). Each file is freed only when its local SHA1 and the
+    cannot be listed, while the offsite upload hold file exists
+    (app.core.offsite_hold; the detail carries `hold_file`), and in offline
+    mode (app.core.unit_mode; the detail's `code` is `off_in_this_mode`). Each file is freed only when its local SHA1 and the
     bucket listing's both equal its offsite row's; the job's result lists
     the files freed and those refused.
     """
@@ -392,8 +397,9 @@ def restore_collection(
     """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
 
     Refused with 409 when the volume has no stem, when no read remote is
-    configured (CAPTUA_OFFSITE_READ_REMOTE), and while an export of it is
-    queued or running or its files are being read for upload.
+    configured (CAPTUA_OFFSITE_READ_REMOTE), while an export of it is
+    queued or running or its files are being read for upload, and in
+    offline mode (code `off_in_this_mode`).
     """
     from app.core.offsite_free import FreeRefused, start_restore
 

@@ -292,10 +292,15 @@ _URI_COMPONENT_SAFE = "!*'()"
 
 
 def encode_segment(value: str) -> str:
-    """`value` as one URL path segment, encoded as JavaScript's encodeURIComponent encodes it."""
+    """`value` as one URL path segment, encoded as JavaScript's encodeURIComponent encodes it, but never a dot segment."""
     from urllib.parse import quote
 
-    return quote(value, safe=_URI_COMPONENT_SAFE)
+    encoded = quote(value, safe=_URI_COMPONENT_SAFE)
+    # "." and ".." would be read as dot segments and removed from the path
+    # before the request is sent; %2E decodes to the same code.
+    if encoded in (".", ".."):
+        encoded = encoded.replace(".", "%2E")
+    return encoded
 
 
 def _failed(exc: Exception) -> TransportResult:

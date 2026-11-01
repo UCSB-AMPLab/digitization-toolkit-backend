@@ -282,8 +282,8 @@ def send_operators_with_mode(db: Session, mode: str, *, transport=None,
 
     Bypasses the mode gate, since it is the call that tells Fisqua the mode
     is changing, but keeps everything else every call keeps: Fisqua
-    configured, the offsite hold, the configuration stop, the call budget,
-    redaction, and a 401, 403 or redirect recorded as the stop. `why` is the
+    configured, the offsite hold, the configuration stop, the call budget
+    and its Retry-After cooldown, redaction, and a 401, 403 or redirect recorded as the stop. `why` is the
     outcome first (`not_configured`, `held`, `config_error`,
     `rate_limited`, `error`, `unsupported`, `refused`), then the redacted
     error. A body Fisqua accepts counts as the regular send.
@@ -308,6 +308,9 @@ def send_operators_with_mode(db: Session, mode: str, *, transport=None,
             return False, f"error: {type(exc).__name__}"
         if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
             return False, f"refused: more than {fc.MAX_OPERATORS} admins and operators"
+        # Fisqua asked the unit to wait (a Retry-After on any call): nothing is sent until it has passed.
+        if fisqua_outbox.call_budget.cooling():
+            return False, "rate_limited: cooling down after Fisqua's Retry-After"
         if not fisqua_outbox.call_budget.take():
             return False, "rate_limited"
         answer = _call(transport, "put_operators", body)
@@ -752,6 +755,10 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
                     return {**stopped, "operators": operators["status"]}
                 revision = pending.get(fc.F_REVISION)
 
+            # A switch out of fisqua mode during the tick stops it before the queue is asked for.
+            if not unit_mode.link_on(db):
+                db.rollback()
+                return {**unit_mode.off(db), "operators": operators["status"]}
             if not fisqua_outbox.call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                 return {"status": "rate_limited", "operators": operators["status"]}
             answer = _call(transport, "get_queue", revision)

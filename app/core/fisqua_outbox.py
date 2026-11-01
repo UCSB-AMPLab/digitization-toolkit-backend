@@ -1279,6 +1279,10 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
         if stop is not None and stop.is_set():
             result.status = "stopped"
             return True
+        # A switch out of fisqua mode stops the pass before the next row.
+        if not unit_mode.link_on(db):
+            result.status = unit_mode.OFF_STATUS
+            return True
         return False
 
     with _step_lock:
@@ -1465,6 +1469,10 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             offered = {}
             for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
                 chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
+                # A switch out of fisqua mode stops the poll before the next call.
+                if not unit_mode.link_on(db):
+                    db.rollback()
+                    return {**result, "status": unit_mode.OFF_STATUS}
                 if not call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                     result["status"] = "rate_limited"
                     break
@@ -1522,6 +1530,9 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                                 response=entry, last_error=None, next_attempt_at=None,
                                 external_id=str(volume_id) if volume_id not in (None, "") else None):
                             result["recovered"] += 1
+            if not unit_mode.link_on(db):
+                db.rollback()
+                return {**result, "status": unit_mode.OFF_STATUS}
             if _fetch_decisions(db, transport, offered, now, result) is False:
                 return {**result, "status": "config_error"}
         except Exception:
@@ -1572,7 +1583,13 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     if _decisions_cursor is not None:
         at = bisect_right([ref for _cid, (ref, _d) in order], _decisions_cursor)
         order = order[at:] + order[:at]
+    from app.core import unit_mode
+
     for cid, (ref, decisions_id) in order:
+        if not unit_mode.link_on(db):
+            db.rollback()
+            result["status"] = unit_mode.OFF_STATUS
+            break
         status = db.get(FisquaStatus, cid)
         seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
         db.rollback()
