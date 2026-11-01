@@ -524,6 +524,13 @@ class CodeRefused(Exception):
         return detail
 
 
+def get_lookup_transport():
+    """The gated transport the reference-code lookup uses (no bypass); a seam for the tests."""
+    from app.core import fisqua_outbox
+
+    return fisqua_outbox.get_transport()
+
+
 def check_reference_code(db: Session, reference_code: str, *, transport=None,
                          now: Optional[datetime] = None) -> Any:
     """Ask Fisqua whether its workspace holds `reference_code`; return the description, or raise CodeRefused.
@@ -553,7 +560,9 @@ def check_reference_code(db: Session, reference_code: str, *, transport=None,
         raise unreachable("held")
     if fisqua_outbox.config_error() is not None:
         raise unreachable("config_error: the link is stopped until its configuration changes")
-    transport = transport if transport is not None else get_transport()
+    # The gated transport: the lookup runs only in fisqua mode, so it needs no
+    # bypass, and a switch out of fisqua made meanwhile stops it (off_in_this_mode).
+    transport = transport if transport is not None else get_lookup_transport()
     if isinstance(transport, NullTransport):
         raise unreachable("not_configured")
     if fisqua_outbox.call_budget.cooling():

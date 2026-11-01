@@ -70,10 +70,11 @@ the hold, the listing) and run the rest as a background job.
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
 
-In offline mode (app.core.unit_mode) nothing leaves the scanner: freeing
-and mark-freed are refused (409, code `off_in_this_mode`, for the route;
-ValueError for the command). Reading from the bucket sends nothing out,
-so restore and the dry run are allowed in every mode, as are the adopt
+In offline mode (app.core.unit_mode) the bucket copy is not kept up, so no
+file on the unit is removed on its account: freeing and mark-freed are
+refused (409, code `off_in_this_mode`, for the route; ValueError for the
+command). Reading from the bucket changes nothing on either side, so
+restore and the dry run are allowed in every mode, as are the adopt
 commands of app.core.image_upload.
 
 Version: 0.3.3
@@ -671,8 +672,11 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
 
 OFF_IN_THIS_MODE = "off_in_this_mode"
-OFFLINE_MESSAGE = ("The unit is in offline mode, so nothing leaves the scanner: files are neither freed nor "
-                   "marked freed.")
+# Freeing removes the unit's copy because the bucket keeps one. In offline mode
+# the bucket copy is no longer kept up, so no local copy is removed or marked
+# removed; reading from the bucket (restore, the dry run) stays allowed.
+OFFLINE_MESSAGE = ("The unit is in offline mode, so the bucket copy is not kept up and no file on the unit is "
+                   "freed or marked freed. Switch to a mode with the offsite copy to free space.")
 
 
 def _refuse_offline(db: Session) -> None:

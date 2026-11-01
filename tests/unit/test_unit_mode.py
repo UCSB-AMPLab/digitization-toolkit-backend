@@ -131,6 +131,7 @@ def link(fisqua, monkeypatch):
     from app.core import fisqua_queue, unit_mode
     transport = LinkTransport()
     monkeypatch.setattr(unit_mode, "get_transport", lambda: transport)
+    monkeypatch.setattr(unit_mode, "get_lookup_transport", lambda: transport)
     monkeypatch.setattr(fisqua_queue, "get_transport", lambda: transport)
     monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState(due=False))
     return transport
@@ -1203,7 +1204,7 @@ def test_put_unit_refuses_unknown_keys(client, db_session):
 def test_the_token_never_reaches_the_lookup_refusal_or_the_log(client, db_session, link, monkeypatch, caplog):
     from app.core import unit_mode
     server = Server(httpx.ConnectError(f"refused for {TOKEN}"))
-    monkeypatch.setattr(unit_mode, "get_transport", lambda: _http(server))
+    monkeypatch.setattr(unit_mode, "get_lookup_transport", lambda: _http(server))
     _unit(db_session, "fisqua")
     p = _project(db_session, "P")
     resp = _as(client, "admin").post("/collections/", json={"name": "T", "project_id": p.id,
