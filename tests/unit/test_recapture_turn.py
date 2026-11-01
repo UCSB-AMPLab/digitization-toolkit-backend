@@ -17,7 +17,7 @@ The hardware is stood in for as tests/unit/test_capture_birth_and_retake.py does
 
 Run with: python -m pytest tests/unit/test_recapture_turn.py
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 from datetime import datetime
@@ -662,12 +662,22 @@ def test_a_rescan_promotion_locks_the_volume_before_the_turn(client, db_session,
 
 
 @pytest.mark.unit
-def test_any_other_promotion_takes_neither_lock(client, db_session, test_project, monkeypatch):
+def test_any_other_promotion_takes_the_volume_once_and_not_the_turn(client, db_session, test_project, monkeypatch):
+    # The volume's row, before the history rows and the outbox (NEH-316); no turn lock.
     other = _volume(db_session, test_project, "Tomo V", "co-test-v", _with_action("full-digitisation"))
     _record(db_session, other, "captured", 1)
     taken = _spy_locks(monkeypatch, other.id)
     assert _client_as(client, "op", "operator").post(f"/collections/{other.id}/promote").status_code == 200
-    assert taken == []
+    assert taken == ["volume"]
+
+
+@pytest.mark.unit
+def test_a_rescan_promotion_takes_the_volume_once(client, db_session, test_project, monkeypatch):
+    rescan = _volume(db_session, test_project, "Tomo R", "co-test-r", _with_action("full-rescan"))
+    _record(db_session, rescan, "captured", 1)
+    taken = _spy_locks(monkeypatch, rescan.id)
+    assert _client_as(client, "op", "operator").post(f"/collections/{rescan.id}/promote").status_code == 200
+    assert taken == ["volume", "turn"]
 
 
 # The record status routes: PATCH /records/{id}/status and POST /records/bulk-status

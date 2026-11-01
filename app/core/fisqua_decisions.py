@@ -67,7 +67,11 @@ what that handover sends.
 
 Skipped and reported, with nothing changed for that record: a record not in
 the volume (or an id that is not one), a record that is `captured` (its
-volume taken back, or it was retaken), a record whose current images are not
+volume taken back, or it was retaken, or it was delivered as an open
+missing record, which stays captured on the unit: the contract sends
+missing_page only for openings with two images, and an open missing record
+holds its volume, so Fisqua decides it only once it has been captured into
+or closed and handed over again), a record whose current images are not
 exactly those the decided manifest listed for it, compared image by image as
 capture id, role and object key (`images_changed`: retaken since, or an
 image of a pair removed, replaced or given the other role), a decision that is not approved,

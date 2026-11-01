@@ -447,3 +447,23 @@ def test_a_decision_that_reopens_a_closed_record_reports_and_logs_it(client, db_
     assert event.actor == "Fisqua: Ana Gómez" and f"record {rec.id}" in event.detail and "other" in event.detail
     [applied] = db_session.query(SystemLog).filter(SystemLog.action == "fisqua_decisions_applied").all()
     assert "reopened=1" in applied.detail
+
+
+@pytest.mark.unit
+def test_promotion_locks_the_volume_before_history_and_the_outbox(client, db_session, vol, fisqua, monkeypatch):
+    from app.api import records as records_api
+    from app.core import fisqua_outbox, volume_stem
+    vol.record(status="captured")
+    vol.record(status="captured")
+    order = []
+    real_volume = volume_stem.locked_volume_query
+    real_status = records_api.change_record_status
+    real_enqueue = fisqua_outbox.enqueue_handover
+    monkeypatch.setattr(volume_stem, "locked_volume_query",
+                        lambda db, cid: (order.append("volume"), real_volume(db, cid))[1])
+    monkeypatch.setattr(records_api, "change_record_status",
+                        lambda *a, **k: (order.append("history"), real_status(*a, **k))[1])
+    monkeypatch.setattr(fisqua_outbox, "enqueue_handover",
+                        lambda *a, **k: (order.append("outbox"), real_enqueue(*a, **k))[1])
+    assert _handover(client, vol.col)["promoted"] == 2
+    assert order == ["volume", "history", "history", "outbox"]

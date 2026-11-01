@@ -991,7 +991,12 @@ def promote_collection(
     paths take it), then the turn. A retake holds its volume's row and then
     asks for the turn; a promotion holding the turn and then needing the row
     (its status-change rows reference the volume) would deadlock against it.
-    Other promotions take neither lock.
+    Every promotion takes the volume's row FOR UPDATE once, after the
+    records and before any status change or the outbox: a full rescan
+    through lock_rescan_volumes, before the turn, any other volume directly,
+    with no turn lock. So promotion is records, volume, history, outbox, as
+    take-back and the missing changes (contract 1.9 §10) are; the history
+    rows' FOR KEY SHARE on the volume then never needs upgrading.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -1058,8 +1063,13 @@ def promote_collection(
 
     # Records, then the volume's row, then the turn: the capture paths' order.
     # The row is taken before the status changes write their history rows.
+    from app.core import volume_stem
     from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
     rescans = lock_rescan_volumes(db, [collection_id])
+    if not rescans:
+        # Any other volume's row as well, once, so every promotion is records,
+        # volume, history, outbox, as take-back and the missing changes are.
+        volume_stem.locked_volume_query(db, collection_id).first()
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
     award_rescan_turns(db, rescans, current_user.username)
