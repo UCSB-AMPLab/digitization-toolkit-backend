@@ -1629,6 +1629,11 @@ def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], 
 		_supersede_current_images(rec, role=side)
 		left = any(img.is_current for img in rec.images)
 		rec.missing_side = side if rec.missing_side is None and left else "both"
+		if rec.missing_side == "both":
+			# A whole opening missing keeps no image, even one left on the side
+			# already recorded as missing (the manifest refuses that,
+			# missing_side_contradicted).
+			_supersede_current_images(rec)
 		# A side added to a closed record reopens it: it is pending again.
 		rec.closed_reason = None
 		rec.closed_note = None

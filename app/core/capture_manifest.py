@@ -51,6 +51,12 @@ whose files are still on disk.
   handed over (§10.3: a closed one with an image needs approval in capture
   QC like any opening). An open missing record's image, and a placeholder,
   are not pages, and a missing record with no image is not refused for it.
+  A volume with no page is refused (no_pages) only when no record is
+  missing and open: Fisqua accepts such a delivery, which the open record
+  holds (§10.3, amended). A missing record whose current images contradict
+  its side is refused (missing_side_contradicted) exactly as Fisqua refuses
+  it (`missing-side`, §9.2): an image on the missing side, or any image with
+  "both". Nothing stricter, so the unit never refuses what Fisqua accepts.
   A record `excluded` by a Fisqua decision (contract 1.6) is listed with
   that status and its current images, so Fisqua keeps its decision, but it
   is not a page and its roles are not checked; a volume whose records are
@@ -117,6 +123,7 @@ RULES = (
     "sequence_missing",
     "sequence_repeated",
     "roles_invalid",
+    "missing_side_contradicted",
     "capture_id_missing",
     "not_uploaded",
     "preview_not_uploaded",
@@ -216,6 +223,21 @@ def _is_missing(rec) -> bool:
 def _is_open_missing(rec) -> bool:
     """Whether the record is missing and not closed: pending, and left captured on the unit by promotion."""
     return rec.missing_side is not None and rec.closed_reason is None
+
+
+def _contradicts_its_side(rec, imgs) -> bool:
+    """Whether a missing record's current images contradict its missing side (Fisqua's `missing-side`, §9.2).
+
+    Exactly Fisqua's two clauses, and no more, so the unit never refuses a
+    handover Fisqua would accept: an image on the missing side, or any image
+    with "both". An excluded record is listed as excluded, not missing, and
+    is not checked.
+    """
+    if rec.missing_side is None or rec.status == "excluded":
+        return False
+    if rec.missing_side == "both":
+        return bool(imgs)
+    return any(i.role == rec.missing_side for i in imgs)
 
 
 def _request_id(rec) -> Optional[str]:
@@ -332,6 +354,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     page_keys: Dict[str, List[tuple]] = {}
     out_records = []
     pages = 0
+    open_missing = 0
     for rec in records:
         imgs = current[rec.id]
         layout = tuple(sorted(i.role or "" for i in imgs))
@@ -343,6 +366,12 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: no image")
         if imgs and rec.status in HANDED_OVER and not _is_open_missing(rec):
             pages += len(imgs)
+        if _contradicts_its_side(rec, imgs):
+            found.add("missing_side_contradicted", rec.id,
+                      note=f"record {rec.id}: misses {rec.missing_side}, has "
+                           f"{', '.join(i.role or 'no role' for i in imgs) or 'no image'}")
+        if _is_open_missing(rec) and rec.status != "excluded":
+            open_missing += 1
 
         out_images = []
         for img in imgs:
@@ -357,11 +386,13 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             for rid, iid in owners:
                 found.add("page_key_repeated", rid, iid, note=key)
 
-    if pages == 0:
+    # Fisqua accepts a delivery with no page while one record is an open
+    # missing one, which holds the volume (contract 1.9 §10.3, amended).
+    if pages == 0 and open_missing == 0:
         problems.append(Problem(
             "no_pages",
-            "No record under review or approved has an image, so Fisqua has no page to register. "
-            "Hand over records with images."))
+            "No record under review or approved has an image, and no record is missing and open, so "
+            "Fisqua has no page to register. Hand over records with images."))
 
     problems.extend(_problems(found, tenant, stem))
     if problems:
@@ -544,6 +575,10 @@ def _problems(found: _Collector, tenant: Optional[str], stem: Optional[str]) -> 
             f"{len(n)} image(s) are stored offsite under names not of the form "
             f"{stem}-img_<nnnn>_c<n>.<ext> (records {_ids(r)}): {'; '.join(n[:_LIST_LIMIT])}. "
             "Offsite keys never change, so those records have to be captured again."),
+        "missing_side_contradicted": lambda r, n: (
+            f"{len(r)} missing record(s) have current images that contradict the side they miss: "
+            f"{'; '.join(n[:_LIST_LIMIT])}. A record missing a side has no image of that side, and "
+            "one missing both has none. Capture the opening again, or correct the missing page."),
         "page_key_repeated": lambda r, n: (
             f"More than one image is stored under the name {', '.join(n[:_LIST_LIMIT])} "
             f"(records {_ids(r)}), and Fisqua names each page by it. Those records have to be captured again."),

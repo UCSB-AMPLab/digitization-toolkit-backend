@@ -66,6 +66,13 @@ RULE_RUN_STARTED = "run-started"  # 409: a newer manifest for a volume a run has
 # manifest's objectKey or previewObjectKey, captureId, role, and kind
 # ("capture" or "preview").
 RULE_OBJECT_MISSING = "object-missing"
+# Contract 1.9 (§9.2): 422, two records share a `sequence`; 422, a missing
+# record's images contradict its missingSide. The unit acts on neither by
+# name: each is a plain refusal of that manifest, with its problems kept,
+# and the unit's own checks (capture_manifest: sequence_repeated,
+# missing_side_contradicted) catch both before a manifest is sent.
+RULE_SEQUENCE = "sequence"
+RULE_MISSING_SIDE = "missing-side"
 F_OBJECT_KEY = "objectKey"
 F_KIND = "kind"
 # Not Fisqua's: the problems the unit records for a 413 or a 400 with no problems in it.

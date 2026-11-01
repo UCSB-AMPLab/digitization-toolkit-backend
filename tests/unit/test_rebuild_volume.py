@@ -1306,6 +1306,33 @@ def test_a_missing_side_record_that_is_not_one_image_on_the_other_side_is_refuse
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_rebuilt_volume_with_a_missing_side_record_builds_its_manifest(
+        remote, db_session, override_projects_root, tmp_path, side):
+    # The record goes to Fisqua as missing with its one image (contract 1.9),
+    # and nothing about it refuses the manifest.
+    from app.core.capture_manifest import build_capture_manifest
+    from app.models.record import Record
+
+    vol = _volume(db_session)
+    keep, role = OTHER_SIDE[side]
+    _rebuild(db_session, _bundle(tmp_path, remote, **_missing_side_over(side)), apply=True)
+    db_session.expire_all()
+    records = db_session.query(Record).order_by(Record.sequence).all()
+    for rec in records:
+        if rec.missing_side is None:
+            rec.status = "in_review"
+    db_session.commit()
+
+    doc = build_capture_manifest(db_session, vol)
+    listed = {r["captuaRecordId"]: r for r in doc["volumes"][0]["records"]}
+    entry = listed[records[1].id]
+    assert (entry["status"], entry["missingSide"]) == ("missing", side)
+    assert [i["role"] for i in entry["images"]] == [role]
+    assert [listed[r.id]["status"] for r in (records[0], records[2])] == ["in_review", "in_review"]
+
+
+@pytest.mark.unit
 def test_a_rerun_compares_a_done_records_missing_side(remote, db_session, override_projects_root, tmp_path):
     from app.models.record import Record
 
