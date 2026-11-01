@@ -176,11 +176,15 @@ def _collection_of(rec: Optional[Record]) -> List[int]:
 	return [rec.collection_id] if rec is not None and rec.collection_id is not None else []
 
 
-def _supersede_current_images(record: Record) -> None:
-	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
+def _supersede_current_images(record: Record, role: Optional[str] = None) -> None:
+	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208).
+
+	With `role`, only the current images of that role: a page marked missing
+	(mark_missing_page, contract 1.9 §10.4).
+	"""
 	now = datetime.now(timezone.utc)
 	for img in record.images:
-		if img.is_current:
+		if img.is_current and (role is None or img.role == role):
 			img.is_current = False
 			img.superseded_at = now
 
@@ -1583,23 +1587,20 @@ def reject_record(
 # Pages and openings never captured (contract 1.9 §10)
 # ==============================================================================
 
-MISSING_PAGE_NOT_DUAL = "missing_page_not_dual"
-MISSING_PAGE_HAS_IMAGE = "missing_page_has_image"
+MISSING_PAGE_SINGLE_RECORD = "missing_page_single_record"
 
 
 def missing_page_refusal(rec: Record, side: str) -> Optional[str]:
 	"""Why `side` cannot be marked missing on the record, as a code; None when it can.
 
-	Only a dual record can miss a page, and only one it has no current image
-	of. A record already missing that side, or both, can always be marked
-	again, and nothing changes (mark_missing_page).
+	The one place the rule lives, for POST /{rec_id}/missing-page and for
+	Fisqua's `missing_page` decision. Only a dual record can miss a page; a
+	single one is refused (missing_page_single_record). A dual record with a
+	current image of that side can be marked: mark_missing_page supersedes
+	the image (contract 1.9 §10.4, confirmed by Fisqua).
 	"""
 	if rec.capture_mode != "dual":
-		return MISSING_PAGE_NOT_DUAL
-	if rec.missing_side in (side, "both"):
-		return None
-	if any(img.is_current and img.role == side for img in rec.images):
-		return MISSING_PAGE_HAS_IMAGE
+		return MISSING_PAGE_SINGLE_RECORD
 	return None
 
 
@@ -1608,10 +1609,13 @@ def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], 
 
 	The one place a page is marked missing, for POST /{rec_id}/missing-page
 	and for Fisqua's `missing_page` decision (app.core.fisqua_decisions). A
-	record already missing that side, or both, keeps its side. One already
-	missing the other side, with no image of this one either, misses both.
-	A note, when given, is kept as records.missing_note. A record in review
-	or approved returns to captured, written to its status history under
+	record already missing that side, or both, keeps its side and its images.
+	Otherwise a current image of that side is superseded, as a retake
+	supersedes (_supersede_current_images): its file stays on the unit and in
+	the bucket, and it drops out of the manifest. The record then misses that
+	side, or both when it already missed the other, with no image left. A
+	note, when given, is kept as records.missing_note. A record in review or
+	approved returns to captured, written to its status history under
 	`actor`, so an operator can capture into it (app.api.cameras refuses a
 	capture into a record a reviewer holds); a rejected one stays rejected.
 	The record is then pending until it is captured into or closed
@@ -1619,6 +1623,7 @@ def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], 
 	"""
 	changed = False
 	if rec.missing_side not in (side, "both"):
+		_supersede_current_images(rec, role=side)
 		rec.missing_side = side if rec.missing_side is None else "both"
 		changed = True
 		if note is not None and note.strip():
@@ -1639,9 +1644,9 @@ def mark_record_missing_page(
 	"""Mark a page of a dual record as never captured (contract 1.9 §10.1).
 
 	Body: {"side": "left" | "right", "note": optional, at most 2,000
-	characters}. Applies only to a dual record with no current image of that
-	side: otherwise 409 with code missing_page_not_dual or
-	missing_page_has_image, and nothing changes. A record already missing
+	characters}. Applies only to a dual record: a single one answers 409 with
+	code missing_page_single_record, and nothing changes. A current image of
+	that side is superseded (mark_missing_page). A record already missing
 	that side is answered as it is. A record in review or approved returns
 	to captured (mark_missing_page). The record is then pending, listed in GET
 	/to-retake, until a dual capture into it or POST /{rec_id}/close-missing.
@@ -1654,15 +1659,10 @@ def mark_record_missing_page(
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 	refusal = missing_page_refusal(rec, payload.side)
-	if refusal == MISSING_PAGE_NOT_DUAL:
+	if refusal is not None:
 		raise HTTPException(status_code=409, detail={
 			"code": refusal,
 			"message": f"Record {rec.id} was captured in '{rec.capture_mode}' mode; only a dual opening can miss a page.",
-		})
-	if refusal == MISSING_PAGE_HAS_IMAGE:
-		raise HTTPException(status_code=409, detail={
-			"code": refusal,
-			"message": f"Record {rec.id} has a current {payload.side} image, so that page is not missing.",
 		})
 	changed = mark_missing_page(db, rec, payload.side, payload.note, current_user.username)
 	queued = None
@@ -1713,7 +1713,9 @@ def close_missing_record(
 	(captured -> in_review, through _apply_status_change, as promotion
 	sends it), and the volume is handed over again when nothing else holds
 	it (app.core.fisqua_outbox.hand_over_again_after_missing_change). A
-	rejected record stays rejected, and still pending. In a volume never
+	record waiting for a retake (rejected, or captured with its rejected image
+	still current; app.core.recapture_turn.retake_clause) is closed and keeps
+	its status, and is still pending. In a volume never
 	handed over the status is left alone; the next promotion sends it.
 	"""
 	rec = _locked_record(db, rec_id)
@@ -1744,7 +1746,8 @@ def close_missing_record(
 				and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
 			recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, current_user.username)
 	from app.core.fisqua_outbox import hand_over_again_after_missing_change, handed_over_before
-	if rec.status == "captured" and handed_over_before(db, rec.collection_id):
+	if rec.status == "captured" and handed_over_before(db, rec.collection_id) and not any(
+			img.is_current and img.rejection_id is not None for img in rec.images):
 		# Its volume was handed over before: the closed record goes to review
 		# now, as promotion would send it, so the volume can be handed over
 		# again (contract 1.9 §10.3: one with an image needs capture QC).

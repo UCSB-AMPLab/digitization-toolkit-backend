@@ -1,7 +1,7 @@
 """The work a background export job runs: validate, check disk, stream the bag,
 prune old zips. Runs in a worker thread with its own DB session.
 
-Version: 0.2.1
+Version: 0.3.3
 """
 
 import json
@@ -47,15 +47,28 @@ def source_organization(project) -> str:
     return project.name if project else "Captua"
 
 
+NOTHING_TO_EXPORT_MESSAGE = "Collection has nothing to export: no record has a current image."
+
+
+def _closed_without_image(record) -> bool:
+    """A missing record closed without capturing that has no current image (contract 1.9 §10.3)."""
+    return (getattr(record, "missing_side", None) is not None
+            and getattr(record, "closed_reason", None) is not None
+            and not any(i.is_current for i in getattr(record, "images", [])))
+
+
 def exported_records(records) -> list:
-    """The records an export bags: every one but those Fisqua excluded.
+    """The records an export bags: every one but those Fisqua excluded and closed placeholders.
 
     An excluded record (contract 1.6) is not a page of the volume, such as a
     test shot of the rig or a duplicate, so it is skipped: it neither blocks
-    the export nor enters the bag. Both callers of workflow_blockers pass
-    their records through this first, and so does the worker's re-check.
+    the export nor enters the bag. So is a missing record closed without
+    capturing that has no current image (contract 1.9 §10.3: it never
+    becomes a page); one with an image is bagged once approved, as any
+    record. Both callers of workflow_blockers pass their records through
+    this first, and so does the worker's re-check.
     """
-    return [r for r in records if r.status != "excluded"]
+    return [r for r in records if r.status != "excluded" and not _closed_without_image(r)]
 
 
 def workflow_blockers(records) -> tuple[str, list[int]] | None:
@@ -74,9 +87,20 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
     An empty collection is reported here too, so the worker does not bag a
     collection whose last record was deleted after the request and write
     `"records": []` into the metadata.
+
+    A missing record closed without capturing that has no current image
+    (contract 1.9 §10.3) blocks neither check: it never becomes a page. A
+    collection left with no record holding a current image has nothing to
+    export (NOTHING_TO_EXPORT_MESSAGE), reported after the handover and
+    approval checks.
     """
     if not records:
         return ("Collection has no records to export.", [])
+    # A missing record closed without capturing, with no current image,
+    # never becomes a page (contract 1.9 §10.3), so it waits for no review
+    # (exported_records leaves it out already). One with an image needs
+    # approval like any record.
+    records = [r for r in records if not _closed_without_image(r)]
     not_handed_over = [r.id for r in records if r.status == "captured"]
     if not_handed_over:
         return (
@@ -89,6 +113,8 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
             f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
             non_approved,
         )
+    if not any(i.is_current for r in records for i in getattr(r, "images", [])):
+        return (NOTHING_TO_EXPORT_MESSAGE, [])
     return None
 
 

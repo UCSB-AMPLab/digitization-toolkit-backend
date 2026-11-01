@@ -233,3 +233,165 @@ def test_a_set_with_no_missing_change_hands_nothing_over(db_session, delivered):
     _decide(fake, row, [_approve(pair)])
     _poll(db_session, fake)
     assert _states(db_session, vol) == ["delivered"]
+
+
+# ---------------------------------------------------------------------------
+# A missing page on a side that has an image: the image is superseded
+# ---------------------------------------------------------------------------
+
+def _manifest_entry(client, vol, rec):
+    resp = _as(client, "operator").get(f"/collections/{vol.col.id}/capture-manifest")
+    assert resp.status_code == 200, resp.text
+    [entry] = [r for r in resp.json()["volumes"][0]["records"] if r["captuaRecordId"] == rec.id]
+    return entry
+
+
+def _current_roles(db, rec):
+    from app.models.record import Record
+    db.expire_all()
+    return sorted(i.role for i in db.get(Record, rec.id).images if i.is_current)
+
+
+def _superseded(db, rec, role):
+    from app.models.record import Record
+    db.expire_all()
+    [img] = [i for i in db.get(Record, rec.id).images if i.role == role]
+    return img.is_current is False and img.superseded_at is not None
+
+
+@pytest.mark.unit
+def test_the_route_supersedes_the_sides_image_and_the_manifest_lists_only_the_other(client, db_session, vol, fisqua):
+    other = vol.record(status="captured")
+    pair = vol.record(status="captured")
+    _handover(client, vol.col)
+    resp = _as(client, "operator").post(f"/records/{pair.id}/missing-page", json={"side": "right"})
+    assert resp.status_code == 200, resp.text
+    assert _superseded(db_session, pair, "right")
+    assert _current_roles(db_session, pair) == ["left"]
+    assert _status(db_session, pair) == "captured"
+    assert _states(db_session, vol) == ["superseded", "waiting_for_upload"]
+    entry = _manifest_entry(client, vol, pair)
+    assert (entry["status"], entry["missingSide"]) == ("missing", "right")
+    assert [i["role"] for i in entry["images"]] == ["left"]
+    assert _manifest_entry(client, vol, other)["status"] == "in_review"
+
+
+@pytest.mark.unit
+def test_the_decision_supersedes_the_sides_image_and_hands_over_again(client, db_session, delivered):
+    vol, (pair, lone), row, fake = delivered
+    _decide(fake, row, [_missing_page(pair, "left")])
+    _poll(db_session, fake)
+    assert _superseded(db_session, pair, "left")
+    assert _current_roles(db_session, pair) == ["right"]
+    assert _status(db_session, pair) == "captured"
+    assert _states(db_session, vol) == ["delivered", "waiting_for_upload"]
+    entry = _manifest_entry(client, vol, pair)
+    assert (entry["status"], entry["missingSide"], [i["role"] for i in entry["images"]]) == (
+        "missing", "left", ["right"])
+
+
+@pytest.mark.unit
+def test_a_page_marked_on_a_record_missing_the_other_side_leaves_both_and_no_image(client, db_session, delivered):
+    from app.models.record import Record
+    vol, (pair, lone), row, fake = delivered
+    _decide(fake, row, [_missing_page(lone, "right")])
+    _poll(db_session, fake)
+    # lone (only a left image) now misses right; marking left as well leaves it with nothing.
+    resp = _as(client, "operator").post(f"/records/{lone.id}/missing-page", json={"side": "left"})
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    assert db_session.get(Record, lone.id).missing_side == "both"
+    assert _current_roles(db_session, lone) == []
+
+
+@pytest.mark.unit
+def test_a_single_record_is_skipped_and_refused(client, db_session, vol, fisqua):
+    single = vol.record(status="captured", layout=("single",))
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[0]
+    fake = Fisqua(vol.col.filename_stem)
+    fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}
+    _decide(fake, row, [_missing_page(single, "left")])
+    _poll(db_session, fake)
+    state = _as(client, "reviewer").get(f"/collections/{vol.col.id}/offsite").json()["fisqua"]["decisions"]
+    assert state["skipped"] == [{"captua_record_id": single.id, "reason": "missing_page_single_record"}]
+    resp = _as(client, "operator").post(f"/records/{single.id}/missing-page", json={"side": "left"})
+    assert resp.status_code == 409 and resp.json()["detail"]["code"] == "missing_page_single_record"
+    assert _current_roles(db_session, single) == ["single"]
+    assert _states(db_session, vol) == ["delivered"]
+
+
+@pytest.mark.unit
+def test_a_side_already_marked_on_a_rejected_record_is_unchanged_and_hands_nothing_over(client, db_session, vol, fisqua):
+    vol.record(status="captured")
+    rec = _one_sided(vol, "captured")
+    rec.missing_side = "right"
+    db_session.commit()
+    _handover(client, vol.col)
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "delivered"
+    rec.status = "rejected"
+    db_session.commit()
+    fake = Fisqua(vol.col.filename_stem)
+    fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}
+    _decide(fake, row, [_missing_page(rec, "right")])
+    _poll(db_session, fake)
+    counts = _as(client, "reviewer").get(f"/collections/{vol.col.id}/offsite").json()["fisqua"]["decisions"]["counts"]
+    assert (counts["missing_pages"], counts["unchanged"], counts["skipped"]) == (0, 1, 0)
+    assert _status(db_session, rec) == "rejected"
+    assert _current_roles(db_session, rec) == ["left"]
+    assert _states(db_session, vol) == ["delivered"]
+
+
+# ---------------------------------------------------------------------------
+# The volume lock, and closing a record that waits for a retake
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_handing_over_again_takes_the_volumes_row_first(client, db_session, vol, fisqua, monkeypatch):
+    from app.core import fisqua_outbox, volume_stem
+    a = vol.record(status="captured")
+    _handover(client, vol.col)
+    calls = []
+    real = volume_stem.locked_volume_query
+    real_handed = fisqua_outbox.handed_over_before
+
+    def spy(db, cid):
+        calls.append(("volume", cid))
+        return real(db, cid)
+
+    def spy_handed(db, cid):
+        calls.append(("check", cid))
+        return real_handed(db, cid)
+
+    monkeypatch.setattr(volume_stem, "locked_volume_query", spy)
+    monkeypatch.setattr(fisqua_outbox, "handed_over_before", spy_handed)
+    calls.clear()
+    fisqua_outbox.hand_over_again_after_missing_change(db_session, vol.col.id)
+    assert calls[:2] == [("volume", vol.col.id), ("check", vol.col.id)]
+    db_session.rollback()
+    assert a.id
+
+
+@pytest.mark.unit
+def test_closing_a_record_waiting_for_a_retake_closes_it_and_leaves_its_status(client, db_session, vol, fisqua):
+    from app.models.record import Record, RecordRejection
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    rec = _one_sided(vol, "captured")
+    rec.missing_side = "right"
+    rejection = RecordRejection(record_id=rec.id, predefined_reason="blur")
+    db_session.add(rejection)
+    db_session.commit()
+    for img in rec.images:
+        img.rejection_id = rejection.id
+    db_session.commit()
+    resp = _as(client, "operator").post(f"/records/{rec.id}/close-missing", json={"reason": "foliation_skip"})
+    assert resp.status_code == 200, resp.text
+    db_session.expire_all()
+    rec = db_session.get(Record, rec.id)
+    assert (rec.closed_reason, rec.status) == ("foliation_skip", "captured")
+    assert _states(db_session, vol) == ["waiting_for_upload"]

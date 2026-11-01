@@ -678,8 +678,10 @@ def hand_over_again_after_missing_change(db: Session, collection_id: Optional[in
     placeholders inserted (POST /collections/{id}/records/missing-opening or
     a Fisqua request), a page marked missing (POST /records/{id}/missing-page
     or a Fisqua decision), or a missing record closed (POST
-    /records/{id}/close-missing), after that path's record and volume locks,
-    as promotion queues its handover after its own. Due when the volume has
+    /records/{id}/close-missing), after that path's record locks, as
+    promotion queues its handover after its own. It takes the volume's row
+    first (app.core.volume_stem.locked_volume_query), so two changes on one
+    volume take turns. Due when the volume has
     been handed over before (it has an outbox row) and now holds no captured
     record other than open missing ones, which the manifest lists as
     missing, and no record waiting for a retake, which would refuse its
@@ -691,6 +693,13 @@ def hand_over_again_after_missing_change(db: Session, collection_id: Optional[in
     from app.models.collection import Collection
     from app.models.record import Record
 
+    from app.core import volume_stem
+
+    if collection_id is None:
+        return None
+    # The volume's row, after the caller's record locks, so two missing
+    # changes on one volume take turns and only one queues a live handover.
+    volume_stem.locked_volume_query(db, collection_id).first()
     if not handed_over_before(db, collection_id):
         return None
     db.flush()

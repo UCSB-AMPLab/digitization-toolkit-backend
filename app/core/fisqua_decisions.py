@@ -47,9 +47,9 @@ record outside the volume is skipped without being locked:
   reviewer and that the decision came from Fisqua.
 * missing_page, with `side` "left" or "right": the record is marked as
   missing that side by app.api.records.mark_missing_page, the rule POST
-  /records/{id}/missing-page applies: only a dual record with no current
-  image of that side (otherwise skipped, `missing_page_not_dual` or
-  `missing_page_has_image`; a side other than those two is `invalid_side`).
+  /records/{id}/missing-page applies: only a dual record (a single one is
+  skipped, `missing_page_single_record`; a side other than those two is
+  `invalid_side`), whose current image of that side, if any, is superseded.
   One already missing it is unchanged. A record in review or approved
   returns to captured, under the reviewer `Fisqua: <decidedBy>`; it is
   pending until it is captured into or closed. Counted as `missing_pages`.

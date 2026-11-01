@@ -289,14 +289,18 @@ def test_a_dual_record_without_a_right_image_is_marked_missing_right(client, db_
 
 
 @pytest.mark.unit
-def test_marking_a_page_it_has_an_image_for_is_409(client, db_session, test_project):
-    from app.models.record import Record
+def test_marking_a_page_it_has_an_image_for_supersedes_that_image(client, db_session, test_project):
+    from app.models.record import Record, RecordImage
     a = _volume(db_session, test_project, "Tomo A", "co-test-a")
     rec = _dual_only(db_session, a, 1, "left")
+    [img] = rec.images
     resp = _client_as(client, "op", "operator").post(f"/records/{rec.id}/missing-page", json={"side": "left"})
-    assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["code"] == "missing_page_has_image"
-    assert _fresh(db_session, Record, rec.id).missing_side is None
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["images"] == []
+    old = _fresh(db_session, RecordImage, img.id)
+    assert old.is_current is False and old.superseded_at is not None
+    # Its other side was never recorded as missing, and it has no image either way.
+    assert _fresh(db_session, Record, rec.id).missing_side == "left"
 
 
 @pytest.mark.unit
@@ -305,7 +309,7 @@ def test_marking_a_single_record_is_409(client, db_session, test_project):
     rec = _record(db_session, a, "captured", 1)
     resp = _client_as(client, "op", "operator").post(f"/records/{rec.id}/missing-page", json={"side": "left"})
     assert resp.status_code == 409, resp.text
-    assert resp.json()["detail"]["code"] == "missing_page_not_dual"
+    assert resp.json()["detail"]["code"] == "missing_page_single_record"
 
 
 @pytest.mark.unit

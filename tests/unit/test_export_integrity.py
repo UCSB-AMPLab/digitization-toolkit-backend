@@ -2,7 +2,7 @@
 whose bytes no longer match its capture-time checksum both fail the export. 
 The export runs as a background job, so these surface as a failed job with detail.
 
-Version: 0.2.1
+Version: 0.3.3
 """
 
 import json
@@ -240,13 +240,114 @@ def _excluded(db_session, col, title="test shot", with_image=True):
 def test_the_workflow_gate_skips_excluded_records():
     from types import SimpleNamespace
     from app.core.export_service import exported_records, workflow_blockers
-    approved = SimpleNamespace(id=1, status="approved")
+    approved = SimpleNamespace(id=1, status="approved", images=[SimpleNamespace(is_current=True)])
     excluded = SimpleNamespace(id=2, status="excluded")
     review = SimpleNamespace(id=3, status="in_review")
     assert exported_records([approved, excluded]) == [approved]
     assert workflow_blockers(exported_records([approved, excluded])) is None
     assert workflow_blockers(exported_records([excluded, review]))[1] == [3]
     assert workflow_blockers(exported_records([excluded]))[0] == "Collection has no records to export."
+
+
+def test_a_closed_missing_record_with_no_image_does_not_block_the_export():
+    # Contract 1.9 §10.3: a closed missing record with no image never becomes a page.
+    from types import SimpleNamespace
+    from app.core.export_service import workflow_blockers
+    image = SimpleNamespace(is_current=True)
+    approved = SimpleNamespace(id=1, status="approved", missing_side=None, closed_reason=None, images=[image])
+    closed_bare = SimpleNamespace(id=2, status="in_review", missing_side="both", closed_reason="foliation_skip",
+                                  images=[SimpleNamespace(is_current=False)])
+    closed_captured = SimpleNamespace(id=3, status="captured", missing_side="both",
+                                      closed_reason="foliation_skip", images=[])
+    closed_with_image = SimpleNamespace(id=4, status="in_review", missing_side="left",
+                                        closed_reason="leaf_missing_from_volume", images=[image])
+    open_bare = SimpleNamespace(id=5, status="captured", missing_side="both", closed_reason=None, images=[])
+    assert workflow_blockers([approved, closed_bare]) is None
+    assert workflow_blockers([approved, closed_captured]) is None
+    assert workflow_blockers([approved, closed_with_image])[1] == [4]
+    assert workflow_blockers([approved, open_bare])[1] == [5]
+
+
+def test_a_volume_with_no_current_image_left_has_nothing_to_export():
+    from types import SimpleNamespace
+    from app.core.export_service import NOTHING_TO_EXPORT_MESSAGE, exported_records, workflow_blockers
+    bare = SimpleNamespace(id=1, status="approved", missing_side=None, closed_reason=None,
+                           images=[SimpleNamespace(is_current=False)])
+    closed_bare = SimpleNamespace(id=2, status="in_review", missing_side="both", closed_reason="foliation_skip",
+                                  images=[])
+    assert workflow_blockers([bare]) == (NOTHING_TO_EXPORT_MESSAGE, [])
+    assert workflow_blockers(exported_records([closed_bare])) == ("Collection has no records to export.", [])
+    assert workflow_blockers([closed_bare]) == (NOTHING_TO_EXPORT_MESSAGE, [])
+
+
+def test_exported_records_leave_out_a_closed_missing_record_with_no_image():
+    from types import SimpleNamespace
+    from app.core.export_service import exported_records
+    image = SimpleNamespace(is_current=True)
+    approved = SimpleNamespace(id=1, status="approved", missing_side=None, closed_reason=None, images=[image])
+    closed_bare = SimpleNamespace(id=2, status="in_review", missing_side="both", closed_reason="foliation_skip",
+                                  images=[SimpleNamespace(is_current=False)])
+    closed_with_image = SimpleNamespace(id=3, status="approved", missing_side="left",
+                                        closed_reason="leaf_missing_from_volume", images=[image])
+    open_bare = SimpleNamespace(id=4, status="captured", missing_side="both", closed_reason=None, images=[])
+    assert exported_records([approved, closed_bare, closed_with_image, open_bare]) == [
+        approved, closed_with_image, open_bare]
+
+
+def test_a_bag_with_a_closed_placeholder_builds_without_it_and_bags_a_closed_record_with_an_image(
+    export_client, db_session, override_projects_root, monkeypatch, tmp_path
+):
+    import hashlib, zipfile, bagit
+    from app.core import config
+    from app.models.record import Record, RecordImage
+    from capture.project_manager import secure_project_filename
+
+    exports = tmp_path / "exp"
+    exports.mkdir()
+    monkeypatch.setattr(config.settings, "EXPORTS_ROOT", str(exports))
+    proot = override_projects_root / secure_project_filename("P")
+    (proot / "images").mkdir(parents=True)
+    (proot / "metadata").mkdir(parents=True)
+    lines = []
+    paths = {}
+    for name in ("cap.jpg", "half.jpg"):
+        data = f"{name} bytes".encode()
+        (proot / "images" / name).write_bytes(data)
+        paths[name] = proot / "images" / name
+        lines.append(json.dumps({"capture_id": f"cid-{name}", "files": [
+            {"role": "single" if name == "cap.jpg" else "left", "relative_path": f"images/{name}",
+             "sha256": hashlib.sha256(data).hexdigest()}]}))
+    (proot / "metadata" / "manifest.jsonl").write_text("\n".join(lines) + "\n")
+
+    col, rec = _approved_collection(db_session)
+    rec.sequence = 1
+    db_session.add(RecordImage(record_id=rec.id, filename="cap.jpg", file_path=str(paths["cap.jpg"]),
+                               format="jpg", role="single", capture_id="cid-cap.jpg", is_current=True))
+    hole = Record(title="placeholder hole", collection_id=col.id, status="in_review", capture_mode="dual",
+                  sequence=2, missing_side="both", closed_reason="foliation_skip")
+    half = Record(title="half", collection_id=col.id, status="approved", capture_mode="dual", sequence=3,
+                  missing_side="right", closed_reason="leaf_missing_from_volume")
+    db_session.add_all([hole, half])
+    db_session.commit()
+    db_session.add(RecordImage(record_id=half.id, filename="half.jpg", file_path=str(paths["half.jpg"]),
+                               format="jpg", role="left", capture_id="cid-half.jpg", is_current=True))
+    db_session.commit()
+
+    resp = export_client.post(f"/collections/{col.id}/export")
+    assert resp.status_code == 202, resp.text
+    st = _run_to_completion(export_client, col.id, resp.json()["job_id"])
+    assert st["state"] == "done", st
+
+    zname = st["zip_filename"]
+    ext = tmp_path / "ext"
+    with zipfile.ZipFile(exports / zname) as zf:
+        names = zf.namelist()
+        meta = json.loads(zf.read(next(n for n in names if n.endswith("data/metadata.json"))))
+        zf.extractall(ext)
+    assert [r["id"] for r in meta["records"]] == [rec.id, half.id]
+    assert "placeholder" not in json.dumps(meta)
+    assert not any("placeholder" in n for n in names)
+    bagit.Bag(str(ext / zname[:-4])).validate()
 
 
 def test_an_excluded_record_neither_blocks_the_export_nor_enters_the_bag(

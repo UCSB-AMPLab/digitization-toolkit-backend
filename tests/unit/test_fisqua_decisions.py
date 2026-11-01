@@ -1222,19 +1222,17 @@ def test_a_missing_page_decision_marks_the_record(client, db_session, handed_one
 @pytest.mark.unit
 def test_a_missing_page_that_cannot_apply_is_skipped(client, db_session, handed_one_sided):
     vol, (pair, lone, single), row, fake = handed_one_sided
-    _decide(fake, row, [_missing_page(pair, "left"), _missing_page(single, "right"),
-                        _missing_page(lone, "both"), _missing_page(lone, None)])
+    _decide(fake, row, [_missing_page(single, "right"), _missing_page(lone, "both"), _missing_page(lone, None)])
     _poll(db_session, fake)
     assert [_refresh(db_session, r).missing_side for r in (pair, lone, single)] == [None, None, None]
     state = _decisions_state(client, vol.col)
     assert state["counts"]["missing_pages"] == 0
     assert state["skipped"] == [
-        {"captua_record_id": pair.id, "reason": "missing_page_has_image"},
-        {"captua_record_id": single.id, "reason": "missing_page_not_dual"},
+        {"captua_record_id": single.id, "reason": "missing_page_single_record"},
         {"captua_record_id": lone.id, "reason": "invalid_side"},
         {"captua_record_id": lone.id, "reason": "invalid_side"},
     ]
-    assert state["counts"]["skipped"] == 4
+    assert state["counts"]["skipped"] == 3
 
 
 @pytest.mark.unit
