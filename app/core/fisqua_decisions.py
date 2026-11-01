@@ -531,9 +531,9 @@ def apply_decisions(db: Session, collection_id: int, body: Any, now: Optional[da
             from app.core import volume_stem
             volume_stem.locked_volume_query(db, collection_id).first()
         # Again, under the locks: a promotion may have committed while the
-        # locks were awaited. A promotion locks only the volume's captured
-        # records, not these, so one can still commit after this check; what
-        # it cannot do is change these records' images, since a retake takes
+        # locks were awaited. A promotion locks every record of the volume, so
+        # it waits for these locks and commits only after this set does; nor
+        # can anything else change these records' images, since a retake takes
         # the record lock (app.api.cameras, through records._locked_record). The images
         # check below reads the records as locked, so a decision is never
         # applied to images other than those it decided.
