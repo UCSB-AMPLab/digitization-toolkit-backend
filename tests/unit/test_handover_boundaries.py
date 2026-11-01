@@ -13,7 +13,7 @@
 
 Run with: python -m pytest tests/unit/test_handover_boundaries.py
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
@@ -285,7 +285,8 @@ def test_the_workflow_gate_reports_handover_before_approval():
     assert "not approved yet" in message
     assert ids == [2]
 
-    assert workflow_blockers([SimpleNamespace(id=3, status="approved")]) is None
+    image = SimpleNamespace(is_current=True)
+    assert workflow_blockers([SimpleNamespace(id=3, status="approved", images=[image])]) is None
 
 
 @pytest.mark.unit

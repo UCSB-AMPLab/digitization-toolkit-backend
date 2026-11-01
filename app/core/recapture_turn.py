@@ -29,18 +29,21 @@ opens no second turn.
 A record is pending while its status is rejected; while it is captured
 and a current image still carries a rejection_id, the state the
 prepare-for-retake transition (PATCH /records/{id}/status, rejected ->
-captured) leaves it in until a capture replaces the image; or while it
-misses a side (records.missing_side, set by app.core.rebuild_volume on a
-dual opening only one camera photographed) and is not excluded, until a
-dual retake writes both images and clears it. pending_clause and
-record_is_pending are that one definition, used by the summary, the
-to-retake list, the turn and the completion test. pending_reason names
-which of the three holds.
+captured) leaves it in until a capture replaces the image; or while it is
+missing (records.missing_side: a page, or a whole opening, never captured;
+contract 1.9 §10), open (no records.closed_reason) and not excluded, until
+a dual capture into it writes both images and clears it, or the operator
+closes it (POST /records/{id}/close-missing). A closed record is not
+pending: it stays in its volume and is promoted like a captured record.
+pending_clause and record_is_pending are that one definition, used by the
+summary, the to-retake list, the turn and the completion test.
+pending_reason names which of the three holds.
 
 The promotion refusal counts only the first two (retake_clause,
-volume_retakes_pending): a record that misses a side does not hold its
-volume back. Promotion and the status routes leave it captured on the unit,
-and send the volume's other records (app.api.collections.promote_collection).
+volume_retakes_pending): an open missing record does not hold its volume
+back. Promotion and the status routes leave it captured on the unit, and
+send the volume's other records (app.api.collections.promote_collection);
+its volume's manifest lists it as missing (app.core.capture_manifest).
 
 The turn is "free" when no record is pending; otherwise "new" when the
 newest completion, of either kind, is newer than the newest start, else
@@ -59,7 +62,7 @@ routes that send a full rescan to review hold their record locks, then take
 the volume's row, then lock_turn (award_rescan_turns): the order of every
 path that takes lock_turn.
 
-Version: 0.3.2
+Version: 0.3.3
 """
 from datetime import datetime, timezone
 import json
@@ -125,9 +128,19 @@ def retake_clause(record=Record):
 	return or_(record.status == "rejected", and_(record.status == "captured", _marked(record)))
 
 
+def open_missing_clause(record=Record):
+	"""SQL for "this record is missing and open": a missing side, and not closed without capturing."""
+	return and_(record.missing_side.isnot(None), record.closed_reason.is_(None))
+
+
+def is_open_missing(rec: Record) -> bool:
+	"""The same test as open_missing_clause, on a loaded record."""
+	return rec.missing_side is not None and rec.closed_reason is None
+
+
 def missing_side_clause(record=Record):
-	"""SQL for "this record misses a side and is not excluded"."""
-	return and_(record.missing_side.isnot(None), record.status != "excluded")
+	"""SQL for "this record is missing, open and not excluded"."""
+	return and_(open_missing_clause(record), record.status != "excluded")
 
 
 def pending_clause(record=Record):
@@ -154,7 +167,7 @@ def pending_reason(rec: Record) -> Optional[str]:
 		return REJECTED
 	if rec.status == "captured" and any(img.is_current and img.rejection_id is not None for img in rec.images):
 		return PREPARED
-	if rec.missing_side is not None and rec.status != "excluded":
+	if is_open_missing(rec) and rec.status != "excluded":
 		return MISSING_SIDE
 	return None
 

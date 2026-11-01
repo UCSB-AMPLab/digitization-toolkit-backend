@@ -7,11 +7,12 @@ nowhere else.
 The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
 that shape it is opaque to the unit, sent as it is and never parsed.
 
-Contract 1.2 is approved (archiving 5e480b7, §9). The digitisation queue
+Contract 1.2 is approved (archiving 5e480b7, §9). The QC decisions include
+1.6's exclusion and 1.9's missing page and requests. The digitisation queue
 (contract 1.7) is at the end: the unit's users, the queue and its
 acknowledgement.
 
-Version: 0.3.0
+Version: 0.3.3
 """
 
 import re
@@ -148,6 +149,24 @@ DECISION_REJECTED = "rejected"
 DECISION_EXCLUDED = "excluded"
 ROTATION_ROLES = ("single", "left", "right")
 QUARTER_TURNS = (1, 2, 3)
+
+# Contract 1.9 §10.4: the opening lacks a page. Carries `side` (F_SIDE),
+# "left" or "right", which the unit marks missing on the record
+# (app.api.records.mark_missing_page).
+DECISION_MISSING_PAGE = "missing_page"
+MISSING_PAGE_SIDES = ("left", "right")
+
+# Contract 1.9 §10.4: the decisions answer's `requests`, openings Fisqua asks
+# the unit to add as placeholders after a record.
+F_REQUESTS = "requests"
+F_REQUEST_ID = "requestId"
+F_REQUEST_KIND = "kind"
+F_AFTER_RECORD_ID = "afterRecordId"
+F_COUNT = "count"
+F_EXPECTED = "expected"
+F_REQUESTED_BY = "requestedBy"
+F_REQUESTED_AT = "requestedAt"
+REQUEST_MISSING_OPENING = "missing_opening"
 
 # The rejection reasons are Captua's own list,
 # app.schemas.record.PREDEFINED_REJECTION_REASONS, the nine of §8; a

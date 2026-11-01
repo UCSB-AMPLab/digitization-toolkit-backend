@@ -14,7 +14,7 @@ The hardware is stood in for as tests/unit/test_capture_birth_and_retake.py does
 
 Run with: python -m pytest tests/unit/test_missing_side.py
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import pytest
@@ -130,8 +130,8 @@ def test_to_retake_lists_every_pending_record_with_why(client, db_session, test_
         prepared.id: ("prepared", None),
         missing.id: ("missing_side", "left"),
     }
-    # A missing side has no rejection behind it, so it comes after every rejected one.
-    assert rows.json()[-1]["recordId"] == missing.id
+    # In sequence order: the missing side is folio 1.
+    assert rows.json()[0]["recordId"] == missing.id
     assert {k: by_id[missing.id][k] for k in ("reason", "comment", "rejectedBy", "rejectedAt")} == {
         "reason": None, "comment": None, "rejectedBy": None, "rejectedAt": None}
     assert (by_id[missing.id]["sequence"], by_id[missing.id]["collectionId"]) == (1, a.id)

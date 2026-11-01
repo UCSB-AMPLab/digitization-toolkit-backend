@@ -1,4 +1,4 @@
-# Version: 0.3.2
+# Version: 0.3.3
 
 from datetime import datetime, timezone
 from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
@@ -71,15 +71,34 @@ class Record(Base):
 	# and the recapture mode-match guard key off of (NEH-208).
 	capture_mode = Column(String(10), nullable=False)  # single, dual
 
-	# The page of a dual opening that was never photographed: "left",
-	# "right", or None. AHR volumes digitised in 2022-24 with two cameras have
-	# openings where only one camera fired; app.core.rebuild_volume writes
-	# such an opening as a dual record with its one image, on the other side,
-	# and sets this. Nothing else sets it. The record is pending
-	# (app.core.recapture_turn) until a dual retake writes both images, which
-	# clears it (app.api.cameras.trigger_dual_capture); until then promotion
-	# and the status routes leave it captured on the unit.
+	# The page or pages of a dual opening never captured: "left", "right",
+	# "both", or None (contract 1.9 §10). Three paths write it.
+	# app.core.rebuild_volume sets "left" or "right" on an AHR opening
+	# digitised in 2022-24 where only one camera fired: a dual record with
+	# its one image, on the other side. POST /records/{id}/missing-page, and
+	# a Fisqua `missing_page` decision (app.core.fisqua_decisions), set
+	# "left" or "right" on a dual record with no current image of that side.
+	# A placeholder (app.core.record_sequence.insert_placeholders, from POST
+	# /collections/{id}/records/missing-opening or a Fisqua request) is a
+	# dual record with no image and "both". The record is pending
+	# (app.core.recapture_turn) until a dual capture into it writes both
+	# images, which clears it (app.api.cameras.trigger_dual_capture), or the
+	# operator closes it (closed_reason below). An open one stays captured on
+	# the unit when its volume is promoted; a closed one is promoted.
 	missing_side = Column(String(5), nullable=True)
+	# What a placeholder should hold (the folios expected) and a note on it,
+	# from the operator or Fisqua; cleared by the capture that fills it.
+	missing_expected = Column(Text, nullable=True)
+	missing_note = Column(Text, nullable=True)
+	# The Fisqua request (contract 1.9 §10.4) the placeholder was made from.
+	# Kept after it is captured into, so Fisqua can tell its request was met.
+	missing_request_id = Column(String(64), nullable=True)
+	# Why the operator closed a missing record without capturing it
+	# (POST /records/{id}/close-missing), and her note; set only while
+	# missing_side is (check_record_closed_needs_missing). A capture into the
+	# record clears both.
+	closed_reason = Column(String(32), nullable=True)  # foliation_skip, leaf_missing_from_volume, captured_elsewhere, other
+	closed_note = Column(Text, nullable=True)
 
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -112,8 +131,17 @@ class Record(Base):
 			name='check_record_capture_mode'
 		),
 		CheckConstraint(
-			"missing_side IS NULL OR missing_side IN ('left','right')",
+			"missing_side IS NULL OR missing_side IN ('left','right','both')",
 			name='check_record_missing_side'
+		),
+		CheckConstraint(
+			"closed_reason IS NULL OR closed_reason IN "
+			"('foliation_skip','leaf_missing_from_volume','captured_elsewhere','other')",
+			name='check_record_closed_reason'
+		),
+		CheckConstraint(
+			"closed_reason IS NULL OR missing_side IS NOT NULL",
+			name='check_record_closed_needs_missing'
 		),
 		# An end before its start. A half-open range passes: with either end
 		# NULL there is nothing to compare. The two NULL clauses say so

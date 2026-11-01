@@ -1,4 +1,4 @@
-# Version: 0.3.2
+# Version: 0.3.3
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -17,13 +17,14 @@ from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
 from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
-from app.schemas.record import RecordStatusChangeRead, ReorderRecords
+from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusChangeRead, ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
 # (NEH-260). cameras.py imports _supersede_current_images the same way.
-from app.api.records import _apply_status_change, _assert_promotable, is_movable
+from app.api.records import _apply_status_change, _assert_promotable, _serialize_record, is_movable
 from app.core.audit import log_event
 from app.core.record_status import record_bulk_status_changes
+from app.core.volume_stem import locked_volume_query
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
 from app.core.export_jobs import ExportBlockedError, export_jobs
@@ -31,11 +32,13 @@ from app.core.export_service import exported_records, run_export, workflow_block
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
     VOLUME_CHANGED_MESSAGE,
+    AfterRecordError,
     ReorderIdsError,
     VolumeChangedError,
     listing_order,
     next_sequences,
     renumber_volume_records,
+    insert_placeholders,
     reorder_volume_records,
 )
 from app.core.storage_ops import (
@@ -823,6 +826,79 @@ def reorder_collection_records(
 
 
 # ==============================================================================
+# Openings never captured (contract 1.9 §10)
+# ==============================================================================
+
+@router.post("/{collection_id}/records/missing-opening", response_model=List[RecordRead])
+def mark_missing_openings(
+    collection_id: int,
+    payload: MissingOpeningsCreate,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Mark openings never captured: insert placeholders right after a record of the volume.
+
+    Body: {"afterRecordId", "count" (1 to 50, or null for one), "expected",
+    "note" (each at most 2,000 characters), "requestId" (at most 64)}, all
+    but afterRecordId optional. afterRecordId names a record of this volume,
+    of any status, excluded included. Each placeholder is a dual record with
+    no image that misses both pages (missing_side "both"), captured, carrying
+    what it should hold, the note and the request id
+    (app.core.record_sequence.insert_placeholders). They take the sequences
+    right after the record, and every later record's sequence moves up by
+    the count; no file is renamed or touched (contract 1.9 §10.2). The
+    volume's records and then its row are locked for the transaction
+    (app/core/record_sequence.py); if records keep being added meanwhile it
+    answers 409 with VOLUME_CHANGED_MESSAGE. Returns the placeholders, in
+    order. 404 for an unknown volume or record, 422 for a record of another
+    volume or a bad body. Writes `missing_openings_marked` to the system log.
+    A volume handed over before is handed over again in the same transaction
+    when nothing else holds it (app.core.fisqua_outbox.hand_over_again_after_missing_change).
+    """
+    volume = db.query(Collection).filter(Collection.id == collection_id).first()
+    if volume is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    after = db.get(Record, payload.afterRecordId)
+    if after is None:
+        raise HTTPException(status_code=404, detail=f"Record {payload.afterRecordId} not found")
+    other_volume = (f"Record {payload.afterRecordId} is not in volume {collection_id}, "
+                    "so no opening can be marked after it there.")
+    if after.collection_id != collection_id:
+        raise HTTPException(status_code=422, detail=other_volume)
+    count = payload.count or 1
+    try:
+        made = insert_placeholders(db, collection_id, payload.afterRecordId, count,
+                                   expected=payload.expected, note=payload.note,
+                                   request_id=payload.requestId, created_by=current_user.username)
+    except AfterRecordError:
+        # Moved out of the volume while its records were being locked.
+        db.rollback()
+        raise HTTPException(status_code=422, detail=other_volume)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
+    if made is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # After the volume's locks, as promotion queues its handover after its own.
+    from app.core.fisqua_outbox import hand_over_again_after_missing_change
+    queued = hand_over_again_after_missing_change(db, collection_id)
+    db.commit()
+    if queued is not None:
+        from app.core.image_upload import image_upload_scheduler
+        image_upload_scheduler.wake()
+    for rec in made:
+        db.refresh(rec)
+    out = [_serialize_record(rec) for rec in made]
+    log_event(db, level="INFO", category="activity", action="missing_openings_marked",
+              actor=current_user.username, subject=volume.name,
+              detail=(f"volume {collection_id} after {payload.afterRecordId} count={count} "
+                      f"requestId={payload.requestId} records={[r.id for r in out]}"))
+    return out
+
+
+# ==============================================================================
 # Renumbering (records' sequence only)
 # ==============================================================================
 
@@ -881,8 +957,10 @@ def promote_collection(
 ):
     """
     Hand a finished collection over for review: apply captured -> in_review to
-    every captured record in it but those that miss a side
-    (records.missing_side), which stay captured until they are recaptured.
+    every captured record in it but the open missing ones (records.missing_side
+    set and records.closed_reason not: a page or an opening never captured,
+    contract 1.9 §10), which stay captured until they are captured into or
+    closed. A missing record the operator closed is promoted like any other.
 
     The act is per collection — an operator promotes a tomo when she has
     finished it — while the transition itself stays per record, which is what
@@ -892,10 +970,10 @@ def promote_collection(
     All or nothing. A collection reads as handed over when none of its records
     is captured, so promoting some of them would leave it unsubmitted while
     reporting success; the records that cannot go are named instead and
-    nothing changes. The one exception is a record that misses a side: it
-    is pending, not unfinished work to refuse over, so the others go and it
-    stays, and the volume does not read as handed over until it is
-    recaptured and handed over too.
+    nothing changes. The one exception is an open missing record: it is
+    pending, not unfinished work to refuse over, so the others go and it
+    stays, and the volume's manifest lists it as missing
+    (app.core.capture_manifest).
 
     Submitted state is derived, never stored. Capture another folio into a
     promoted collection and it is no longer submitted, which is the right
@@ -913,7 +991,12 @@ def promote_collection(
     paths take it), then the turn. A retake holds its volume's row and then
     asks for the turn; a promotion holding the turn and then needing the row
     (its status-change rows reference the volume) would deadlock against it.
-    Other promotions take neither lock.
+    Every promotion takes the volume's row FOR UPDATE once, after the
+    records and before any status change or the outbox: a full rescan
+    through lock_rescan_volumes, before the turn, any other volume directly,
+    with no turn lock. So promotion is records, volume, history, outbox, as
+    take-back and the missing changes (contract 1.9 §10) are; the history
+    rows' FOR KEY SHARE on the volume then never needs upgrading.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -928,7 +1011,7 @@ def promote_collection(
         db.query(Record)
         .options(joinedload(Record.images))
         .filter(Record.collection_id == collection_id, Record.status == "captured",
-                Record.missing_side.is_(None))
+                or_(Record.missing_side.is_(None), Record.closed_reason.isnot(None)))
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
@@ -938,10 +1021,10 @@ def promote_collection(
     # stays on the unit until its retakes are done, for every role: Fisqua
     # would hold a delivery with a rejected record anyway. Counted after the
     # locks, and before the idempotent return, so a volume whose only records
-    # left are rejected is refused too. A record that misses a side is
-    # pending but does not hold the volume back: it is left out of the
-    # records above, stays captured, and goes with the next handover once a
-    # dual retake has written both pages.
+    # left are rejected is refused too. An open missing record is pending
+    # but does not hold the volume back: it is left out of the records
+    # above, stays captured, and is listed as missing in the manifest until
+    # a dual capture writes both pages or the operator closes it.
     from app.core.recapture_turn import volume_retakes_pending
     pending = volume_retakes_pending(db, collection_id)
     if pending:
@@ -980,8 +1063,13 @@ def promote_collection(
 
     # Records, then the volume's row, then the turn: the capture paths' order.
     # The row is taken before the status changes write their history rows.
+    from app.core import volume_stem
     from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
     rescans = lock_rescan_volumes(db, [collection_id])
+    if not rescans:
+        # Any other volume's row as well, once, so every promotion is records,
+        # volume, history, outbox, as take-back and the missing changes are.
+        volume_stem.locked_volume_query(db, collection_id).first()
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
     award_rescan_turns(db, rescans, current_user.username)
@@ -1051,6 +1139,11 @@ def take_back_collection(
     ]
     taken_back = 0
     if locked_ids:
+        # The volume's row, FOR UPDATE, after the records and before the
+        # history rows (which take FOR KEY SHARE on it) and the outbox: record,
+        # volume, history, outbox, the order of every path that hands a
+        # volume over or takes it back (app.core.fisqua_outbox).
+        locked_volume_query(db, collection_id).first()
         # RETURNING names the rows the predicate actually matched, so the
         # history rows below are written for those and no others.
         moved_ids = db.execute(
@@ -1138,11 +1231,11 @@ def export_collection_bagit(
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
     )
-    records = exported_records(records)
     # Handover first, approval second — two different things to tell her. A
     # collection she has not promoted is work in progress, not work that failed
     # review (NEH-260). The predicate lives in export_service beside the worker
-    # that re-checks it, so the two cannot drift apart.
+    # that re-checks it, so the two cannot drift apart. It is given every
+    # record, and leaves out excluded ones and closed placeholders itself.
     blocker = workflow_blockers(records)
     if blocker:
         message, blocking_ids = blocker
@@ -1150,6 +1243,7 @@ def export_collection_bagit(
             status_code=422,
             detail={"message": message, "blocking_record_ids": blocking_ids},
         )
+    records = exported_records(records)
 
     image_less = [r.id for r in records if not any(i.is_current for i in r.images)]
     if image_less:

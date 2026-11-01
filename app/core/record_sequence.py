@@ -19,7 +19,13 @@ takes both a record's row and its volume's takes the record's first
 them in id order. On SQLite, which the test suite runs on, no lock clause is
 emitted.
 
-Version: 0.1.0-beta
+Inserting records after a given one (insert_after, and insert_placeholders
+on top of it: contract 1.9 §10.2) both rewrites the order and adds records,
+so it takes the rewrite's locks, the records and then the row, and holds
+both while it adds. A caller that has already taken them, as a capture after
+a record does before it touches the cameras, waits for nothing new.
+
+Version: 0.3.3
 """
 from typing import List, Optional, Tuple
 
@@ -43,6 +49,10 @@ LOCK_ATTEMPTS = 5
 
 class VolumeChangedError(RuntimeError):
     """Records kept being added to the volume while its records were being locked."""
+
+
+class AfterRecordError(ValueError):
+    """The record to insert after is not a record of the volume."""
 
 
 def listing_order(records: List[Record]) -> List[Record]:
@@ -158,3 +168,66 @@ def next_sequences(db: Session, collection_id: int, count: int) -> Optional[List
     )
     start = 1 if highest is None else highest + 1
     return list(range(start, start + count))
+
+
+def insert_after(db: Session, collection_id: int, after_record_id: int, count: int) -> Optional[List[int]]:
+    """Make room for `count` records right after one record of the volume; return their sequences.
+
+    Takes the volume's records and then its row (lock_volume_records), and
+    adds `count` to the sequence of every record whose sequence is after the
+    given record's, so the values right after it are free; the caller gives
+    them to the records it adds before it commits, under the same locks. The
+    record may have any status, excluded included. A record without a
+    sequence keeps none. When the given record has no sequence, or another
+    record shares its sequence, the volume is first numbered 1..N in listing
+    order (as renumber_volume_records does), since there is otherwise no
+    "right after" it. No file is read or written (§3), and nothing is
+    committed here. Returns None when no volume has the id; raises
+    AfterRecordError when the record is not one of the volume's, and
+    VolumeChangedError as lock_volume_records does.
+    """
+    # The locks re-read the volume's records over what the session holds, so
+    # whatever the caller changed and has not flushed is written first.
+    db.flush()
+    volume, records = lock_volume_records(db, collection_id)
+    if volume is None:
+        return None
+    after = next((r for r in records if r.id == after_record_id), None)
+    if after is None:
+        raise AfterRecordError(after_record_id)
+    if after.sequence is None or any(r.sequence == after.sequence for r in records if r is not after):
+        _assign(records)
+    start = after.sequence
+    for record in records:
+        if record.sequence is not None and record.sequence > start:
+            record.sequence += count
+    return list(range(start + 1, start + 1 + count))
+
+
+def insert_placeholders(db: Session, collection_id: int, after_record_id: int, count: int, *,
+                        expected: Optional[str] = None, note: Optional[str] = None,
+                        request_id: Optional[str] = None, created_by: Optional[str] = None) -> Optional[List[Record]]:
+    """Add `count` placeholders right after a record of the volume (contract 1.9 §10); return them.
+
+    A placeholder is a dual record with no image that misses both pages
+    (missing_side "both"), captured, in the volume. It is titled as a dual
+    capture into the volume would title its new record, after the volume's
+    project. The sequences come from insert_after, under its locks, and the
+    records are flushed so they have ids; the caller commits. Returns None
+    and raises as insert_after does.
+    """
+    from app.core.storage_ops import resolve_project_name
+
+    sequences = insert_after(db, collection_id, after_record_id, count)
+    if sequences is None:
+        return None
+    volume = db.get(Collection, collection_id)
+    project_name = resolve_project_name(db, volume)
+    title = f"{project_name} - Dual capture" if project_name else "Dual capture"
+    made = [Record(title=title, collection_id=collection_id, sequence=sequence, status="captured",
+                   capture_mode="dual", missing_side="both", missing_expected=expected,
+                   missing_note=note, missing_request_id=request_id, created_by=created_by)
+            for sequence in sequences]
+    db.add_all(made)
+    db.flush()
+    return made

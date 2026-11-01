@@ -2,15 +2,14 @@
 
 A nullable String(5), "left", "right" or null, held to those values by
 `check_record_missing_side`. Upgrade adds the column and the check; downgrade
-drops both. It sits on the head of dev, so the tree keeps a single head.
+drops both. The placeholders revision after it widens the check to "both".
 
 Run with: python -m pytest tests/unit/test_missing_side_migration.py
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import importlib.util
-import re
 from pathlib import Path
 
 import pytest
@@ -62,25 +61,18 @@ def _set(engine, value):
 
 
 @pytest.mark.unit
-def test_it_follows_the_queue_fields_revision_and_leaves_one_head():
-    mod = _load_migration()
-    assert mod.down_revision == "b3d5f7a9c1e2"
-    revisions, downs = set(), set()
-    for path in VERSIONS.glob("*.py"):
-        text = path.read_text()
-        revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
-        downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    assert revisions - downs == {mod.revision}
+def test_it_follows_the_queue_fields_revision():
+    # The head is now the placeholders revision (test_missing_openings_migration.py).
+    assert _load_migration().down_revision == "b3d5f7a9c1e2"
 
 
 @pytest.mark.unit
-def test_the_models_column_and_check_match_the_migration():
+def test_the_models_column_matches_the_migration():
+    # The check was widened to "both" by the placeholders revision, which
+    # test_missing_openings_migration.py compares with the model.
     from app.models.record import Record
-    mod = _load_migration()
     col = Record.__table__.c.missing_side
     assert col.nullable is True and col.type.length == 5
-    [check] = [c for c in Record.__table__.constraints if getattr(c, "name", None) == "check_record_missing_side"]
-    assert str(check.sqltext) == mod.CHECK
 
 
 @pytest.mark.unit

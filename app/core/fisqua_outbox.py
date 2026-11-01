@@ -89,7 +89,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.3.2
+Version: 0.3.3
 """
 
 import hashlib
@@ -662,6 +662,59 @@ def enqueue_handover(db: Session, collection):
     return row
 
 
+def handed_over_before(db: Session, collection_id: Optional[int]) -> bool:
+    """Whether the volume has been handed over to Fisqua before: it has an outbox row, whatever its state."""
+    from app.models.fisqua import FisquaOutbox
+
+    if collection_id is None:
+        return False
+    return db.query(FisquaOutbox.id).filter(FisquaOutbox.collection_id == collection_id).first() is not None
+
+
+def hand_over_again_after_missing_change(db: Session, collection_id: Optional[int]):
+    """Queue a new handover after a volume's missing records changed, when one is due (contract 1.9 §10.4).
+
+    Called in the transaction of a change to a volume's missing records:
+    placeholders inserted (POST /collections/{id}/records/missing-opening or
+    a Fisqua request), a page marked missing (POST /records/{id}/missing-page
+    or a Fisqua decision), or a missing record closed (POST
+    /records/{id}/close-missing), after that path's record locks, as
+    promotion queues its handover after its own. It takes the volume's row
+    first (app.core.volume_stem.locked_volume_query), so two changes on one
+    volume take turns. Due when the volume has
+    been handed over before (it has an outbox row) and now holds no captured
+    record other than open missing ones, which the manifest lists as
+    missing, and no record waiting for a retake, which would refuse its
+    promotion (app.core.recapture_turn.retake_clause). Then it is
+    enqueue_handover, as promotion does. Does not commit. Returns the new
+    row, or None when none was queued.
+    """
+    from app.core.recapture_turn import open_missing_clause, retake_clause
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    from app.core import volume_stem
+
+    if collection_id is None:
+        return None
+    # The volume's row, after the caller's record locks, so two missing
+    # changes on one volume take turns and only one queues a live handover.
+    # The routes and apply_decisions take it before any status change, so
+    # here it is usually held already; kept for callers that came without it.
+    volume_stem.locked_volume_query(db, collection_id).first()
+    if not handed_over_before(db, collection_id):
+        return None
+    db.flush()
+    held = db.query(Record.id).filter(
+        Record.collection_id == collection_id,
+        ((Record.status == "captured") & ~open_missing_clause()) | retake_clause(),
+    ).first()
+    collection = db.get(Collection, collection_id)
+    if held is not None or collection is None:
+        return None
+    return enqueue_handover(db, collection)
+
+
 def _reference_problem(collection) -> Optional[dict]:
     """The reference_code_differs problem when the volume's recorded code is not its stem; else None.
 
@@ -935,12 +988,15 @@ def _version_refused_volumes(db: Session) -> list:
     for row in rows:
         if not _version_refusal(row.problems):
             continue
-        # A record missing a side stays captured on the unit until it is
-        # recaptured and is left out of the handover (capture_manifest), so it
-        # does not hold the volume back.
+        # An open missing record (a page or an opening never captured, and
+        # not closed) stays captured on the unit until it is captured into or
+        # closed, and the manifest lists it as missing (capture_manifest), so
+        # it does not hold the volume back. A closed one is promoted like any
+        # record, so while it is captured it does.
+        from app.core.recapture_turn import open_missing_clause
         captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
                                               Record.status == "captured",
-                                              Record.missing_side.is_(None)).first()
+                                              ~open_missing_clause()).first()
         collection = db.get(Collection, row.collection_id)
         if captured is not None or collection is None:
             continue

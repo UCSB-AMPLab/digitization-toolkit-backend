@@ -9,7 +9,7 @@ ERROR. No line carries the token or a key's credentials.
 
     python -m pytest tests/unit/test_worker_logging.py
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import logging
@@ -167,4 +167,4 @@ def test_applied_decisions_write_one_info_line(client, db_session, vol, fisqua, 
         {"captuaRecordId": 999999, "decision": "approved", "decidedBy": "Ana", "rotations": []}]})
     assert _lines(caplog, "app.core.fisqua_decisions") == [
         f"Fisqua decisions d-1 applied to volume {vol.col.id}: approved=1 rejected=0 excluded=0 unchanged=0 "
-        "skipped=1 rotations=0 rotations_skipped=0"]
+        "skipped=1 rotations=0 rotations_skipped=0 missing_pages=0 placeholders=0 requests_skipped=0 reopened=0"]
