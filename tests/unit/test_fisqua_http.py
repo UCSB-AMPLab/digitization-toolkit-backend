@@ -1230,7 +1230,9 @@ def test_a_version_refused_volume_with_a_record_missing_a_side_is_resent(
     # resend after a version stop clears.
     from app.core import config
     _send(db_session, Server(_version_refusal()))
-    rec = queued.record(status="captured")
+    # Only its right image: a record missing left with a left image is refused
+    # by the unit itself (missing_side_contradicted).
+    rec = queued.record(status="captured", layout=("right",))
     rec.capture_mode = "dual"
     rec.missing_side = "left"
     db_session.commit()
@@ -1259,3 +1261,18 @@ def test_a_version_refused_volume_with_a_closed_record_still_captured_is_not_res
     _send(db_session, server)
     assert server.requests == []
     assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rule", ["sequence", "missing-side"])
+def test_a_1_9_refusal_is_a_plain_refusal_with_its_problems_kept(db_session, queued, rule):
+    from app.core import fisqua_contract as fc
+    from app.core.fisqua_outbox import config_error
+    assert rule in (fc.RULE_SEQUENCE, fc.RULE_MISSING_SIDE)
+    problem = {"rule": rule, "message": "refused", "captuaRecordId": 1}
+    _send(db_session, Server(httpx.Response(422, json={"problems": [problem]})))
+    row = _rows(db_session, queued.col)[0]
+    assert (row.state, row.refusal) == ("refused", "fisqua")
+    assert row.problems == [problem]
+    assert config_error() is None

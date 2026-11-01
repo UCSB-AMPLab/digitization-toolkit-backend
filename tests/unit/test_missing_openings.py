@@ -662,3 +662,21 @@ def test_the_route_locks_the_volume_before_any_status_change(client, db_session,
     resp = _client_as(client, "op", "operator").post(f"/records/{rec.id}/missing-page", json={"side": "right"})
     assert resp.status_code == 200, resp.text
     assert "status" in order and order.index("volume") < order.index("status")
+
+
+
+@pytest.mark.unit
+def test_marking_the_other_side_of_a_record_that_still_has_that_sides_image_leaves_no_image(
+        client, db_session, test_project):
+    # A record recorded as missing left that still carries a left image, a
+    # state the manifest refuses: marking right ends at both, with no image.
+    from app.models.record import Record
+    a = _volume(db_session, test_project, "Tomo A", "co-test-a")
+    rec = _dual_only(db_session, a, 1, "left")
+    rec.missing_side = "left"
+    db_session.commit()
+    resp = _client_as(client, "op", "operator").post(f"/records/{rec.id}/missing-page", json={"side": "right"})
+    assert resp.status_code == 200, resp.text
+    rec = _fresh(db_session, Record, rec.id)
+    assert rec.missing_side == "both"
+    assert [i for i in rec.images if i.is_current] == []

@@ -1260,9 +1260,11 @@ def test_a_volume_of_closed_placeholders_only_has_no_pages(client, vol):
 
 
 @pytest.mark.unit
-def test_an_open_missing_records_image_is_not_a_page(client, vol):
+def test_an_open_missing_records_image_is_not_a_page_but_the_record_holds_no_pages_off(client, vol):
+    # Amended §10.3: a delivery whose records are all missing is accepted while
+    # one is open, so the unit no longer refuses it for no_pages.
     _missing_side(vol, "left")
-    assert list(_refusal(_export(client, vol.col))) == ["no_pages"]
+    assert _export(client, vol.col).status_code == 200
 
 
 @pytest.mark.unit
@@ -1376,3 +1378,83 @@ def test_the_records_and_their_images_are_read_in_one_statement(client, vol, db_
     touching = [s for s in statements if "record_images" in s and "offsite_objects" not in s]
     assert len(touching) == 1, touching
     assert "FROM records" in touching[0]
+
+
+# ---------------------------------------------------------------------------
+# Contract 1.9 amendments (§9.2, §10.3): no_pages and missing_side_contradicted
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_volume_whose_only_record_is_open_missing_builds(client, vol):
+    rec = _missing_side(vol, "left")
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    assert _entry(resp.json(), rec)["status"] == "missing"
+
+
+@pytest.mark.unit
+def test_an_open_missing_record_among_excluded_ones_builds(client, vol):
+    vol.record(status="excluded")
+    _missing_side(vol, "right")
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_of_open_placeholders_only_builds(client, vol):
+    _placeholder(vol)
+    _placeholder(vol)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_of_closed_imageless_placeholders_only_has_no_pages(client, vol):
+    _placeholder(vol, status="in_review", closed="foliation_skip")
+    _placeholder(vol, status="in_review", closed="captured_elsewhere")
+    assert list(_refusal(_export(client, vol.col))) == ["no_pages"]
+
+
+def _contradicted(vol, side, layout, status="in_review"):
+    rec = vol.record(status=status, layout=layout)
+    rec.capture_mode = "dual"
+    rec.missing_side = side
+    vol.db.commit()
+    vol.db.refresh(rec)
+    return rec
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side, layout", [
+    ("both", ("left",)),
+    ("both", ("left", "right")),
+    ("left", ("left",)),
+    ("left", ("left", "right")),
+    ("right", ("right",)),
+    ("right", ("left", "right")),
+    ("left", ("single",)),
+    ("right", ("single",)),
+])
+def test_a_missing_record_whose_images_contradict_its_side_is_refused(client, vol, side, layout):
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, layout)
+    problems = _refusal(_export(client, vol.col))
+    assert problems["missing_side_contradicted"]["record_ids"] == [rec.id]
+    assert f"record {rec.id}" in problems["missing_side_contradicted"]["message"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_missing_side_with_no_image_at_all_is_refused(client, vol, side):
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, ("left",))
+    vol.supersede(rec)
+    problems = _refusal(_export(client, vol.col))
+    assert problems["missing_side_contradicted"]["record_ids"] == [rec.id]
+
+
+@pytest.mark.unit
+def test_consistent_missing_records_are_not_refused_for_their_side(client, vol):
+    vol.record(status="in_review")
+    _missing_side(vol, "left")
+    _missing_side(vol, "right", status="in_review", closed="leaf_missing_from_volume")
+    _placeholder(vol)
+    assert _export(client, vol.col).status_code == 200
