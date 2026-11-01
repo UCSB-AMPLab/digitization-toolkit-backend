@@ -1426,14 +1426,14 @@ def _contradicted(vol, side, layout, status="in_review"):
 @pytest.mark.parametrize("side, layout", [
     ("both", ("left",)),
     ("both", ("left", "right")),
+    ("both", ("single",)),
     ("left", ("left",)),
     ("left", ("left", "right")),
     ("right", ("right",)),
     ("right", ("left", "right")),
-    ("left", ("single",)),
-    ("right", ("single",)),
 ])
 def test_a_missing_record_whose_images_contradict_its_side_is_refused(client, vol, side, layout):
+    # Fisqua's missing-side (amended §9.2): an image on the missing side, or any image with both.
     vol.record(status="in_review")
     rec = _contradicted(vol, side, layout)
     problems = _refusal(_export(client, vol.col))
@@ -1443,12 +1443,25 @@ def test_a_missing_record_whose_images_contradict_its_side_is_refused(client, vo
 
 @pytest.mark.unit
 @pytest.mark.parametrize("side", ["left", "right"])
-def test_a_missing_side_with_no_image_at_all_is_refused(client, vol, side):
+def test_a_missing_side_with_no_image_at_all_builds(client, vol, side):
+    # Fisqua accepts it (§9.2 names no such case), so the unit does not refuse it.
     vol.record(status="in_review")
     rec = _contradicted(vol, side, ("left",))
     vol.supersede(rec)
-    problems = _refusal(_export(client, vol.col))
-    assert problems["missing_side_contradicted"]["record_ids"] == [rec.id]
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    entry = _entry(resp.json(), rec)
+    assert (entry["status"], entry["missingSide"], entry["images"]) == ("missing", side, [])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_single_image_on_a_record_missing_one_side_is_not_refused_for_its_side(client, vol, side):
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, ("single",))
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    assert [i["role"] for i in _entry(resp.json(), rec)["images"]] == ["single"]
 
 
 @pytest.mark.unit

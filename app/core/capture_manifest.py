@@ -54,9 +54,9 @@ whose files are still on disk.
   A volume with no page is refused (no_pages) only when no record is
   missing and open: Fisqua accepts such a delivery, which the open record
   holds (§10.3, amended). A missing record whose current images contradict
-  its side is refused (missing_side_contradicted), as Fisqua refuses it
-  (`missing-side`, §9.2): an image on the missing side, any image with
-  "both", no image of the other side, or a single image.
+  its side is refused (missing_side_contradicted) exactly as Fisqua refuses
+  it (`missing-side`, §9.2): an image on the missing side, or any image with
+  "both". Nothing stricter, so the unit never refuses what Fisqua accepts.
   A record `excluded` by a Fisqua decision (contract 1.6) is listed with
   that status and its current images, so Fisqua keeps its decision, but it
   is not a page and its roles are not checked; a volume whose records are
@@ -228,19 +228,16 @@ def _is_open_missing(rec) -> bool:
 def _contradicts_its_side(rec, imgs) -> bool:
     """Whether a missing record's current images contradict its missing side (Fisqua's `missing-side`, §9.2).
 
-    "both" with any image; "left" with a left image or without a right one;
-    "right" the mirror; any image whose role is single. An excluded record is
-    listed as excluded, not missing, and is not checked.
+    Exactly Fisqua's two clauses, and no more, so the unit never refuses a
+    handover Fisqua would accept: an image on the missing side, or any image
+    with "both". An excluded record is listed as excluded, not missing, and
+    is not checked.
     """
     if rec.missing_side is None or rec.status == "excluded":
         return False
-    roles = [i.role for i in imgs]
-    if "single" in roles:
-        return True
     if rec.missing_side == "both":
-        return bool(roles)
-    other = "right" if rec.missing_side == "left" else "left"
-    return rec.missing_side in roles or other not in roles
+        return bool(imgs)
+    return any(i.role == rec.missing_side for i in imgs)
 
 
 def _request_id(rec) -> Optional[str]:
@@ -580,7 +577,7 @@ def _problems(found: _Collector, tenant: Optional[str], stem: Optional[str]) -> 
             "Offsite keys never change, so those records have to be captured again."),
         "missing_side_contradicted": lambda r, n: (
             f"{len(r)} missing record(s) have current images that contradict the side they miss: "
-            f"{'; '.join(n[:_LIST_LIMIT])}. A record missing a side has only the other side's image, and "
+            f"{'; '.join(n[:_LIST_LIMIT])}. A record missing a side has no image of that side, and "
             "one missing both has none. Capture the opening again, or correct the missing page."),
         "page_key_repeated": lambda r, n: (
             f"More than one image is stored under the name {', '.join(n[:_LIST_LIMIT])} "
