@@ -86,7 +86,7 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload
 
 from app.core import config
 from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, is_raw_suffix, preview_sidecar_of
@@ -285,9 +285,14 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             "no_project",
             "The volume is not in a project, and the manifest names its project. Move the volume into a project."))
 
+    # The records, their images and their rejections in one statement, so a
+    # record's status and its current images are read at one instant: a page
+    # marked missing (app.api.records.mark_missing_page) committed between
+    # two reads could pair an old approved status with only its surviving
+    # image, listing that image as a page and leaving out missingSide.
     records = (
         db.query(Record)
-        .options(selectinload(Record.images), selectinload(Record.rejections))
+        .options(joinedload(Record.images), joinedload(Record.rejections))
         .filter(Record.collection_id == collection.id)
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()

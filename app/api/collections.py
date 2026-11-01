@@ -991,8 +991,10 @@ def promote_collection(
     paths take it), then the turn. A retake holds its volume's row and then
     asks for the turn; a promotion holding the turn and then needing the row
     (its status-change rows reference the volume) would deadlock against it.
-    Every promotion takes the volume's row FOR UPDATE once, after the
-    records and before any status change or the outbox: a full rescan
+    The records locked are all the volume's, open missing ones included, in
+    id order; the ones to promote are chosen from them. Every promotion
+    takes the volume's row FOR UPDATE once, after the records and before any
+    status change or the outbox: a full rescan
     through lock_rescan_volumes, before the turn, any other volume directly,
     with no turn lock. So promotion is records, volume, history, outbox, as
     take-back and the missing changes (contract 1.9 §10) are; the history
@@ -1007,15 +1009,23 @@ def promote_collection(
     # the pre-check below validates a snapshot: a reject arriving between the
     # check and the commit puts a rejected image back on a record this call
     # then hands over (NEH-260, reproduced).
-    records = (
+    # Every record of the volume is locked, open missing ones included, and
+    # the promotable ones are chosen from the locked rows: a close-missing
+    # committed between a narrower lock and the volume's row would leave a
+    # closed captured record out of this handover, and its manifest would
+    # be refused (records_captured).
+    locked = (
         db.query(Record)
         .options(joinedload(Record.images))
-        .filter(Record.collection_id == collection_id, Record.status == "captured",
-                or_(Record.missing_side.is_(None), Record.closed_reason.isnot(None)))
+        .filter(Record.collection_id == collection_id)
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
+    records = [
+        rec for rec in locked
+        if rec.status == "captured" and (rec.missing_side is None or rec.closed_reason is not None)
+    ]
     # A volume with a record waiting for a retake (rejected, or prepared for
     # retake with its rejected image still current; app.core.recapture_turn)
     # stays on the unit until its retakes are done, for every role: Fisqua

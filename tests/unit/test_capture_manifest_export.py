@@ -1351,3 +1351,28 @@ def test_once_recaptured_and_handed_over_it_is_an_ordinary_record(client, vol, d
     assert entry["status"] == "in_review" and "missingSide" not in entry
     assert sorted(i["role"] for i in entry["images"]) == ["left", "right"]
     assert {i["captureId"] for i in entry["images"]} == {i.capture_id for i in current}
+
+
+@pytest.mark.unit
+def test_the_records_and_their_images_are_read_in_one_statement(client, vol, db_session):
+    # A missing page committed between two reads could pair a record's old
+    # status with only its surviving image; one statement sees one instant.
+    from sqlalchemy import event
+    vol.record(status="in_review")
+    vol.record(status="in_review", layout=("single",))
+    _missing_side(vol, "left", status="in_review", closed="foliation_skip")
+    engine = db_session.get_bind()
+    statements = []
+
+    def count(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        resp = _export(client, vol.col)
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert resp.status_code == 200, resp.text
+    touching = [s for s in statements if "record_images" in s and "offsite_objects" not in s]
+    assert len(touching) == 1, touching
+    assert "FROM records" in touching[0]
