@@ -78,6 +78,24 @@ def _volume_change_detail(collection_id: int, **changes) -> str:
     return "; ".join(parts)
 
 
+def _volumes_from_fisqua() -> HTTPException:
+    """The 403 for an operator creating a volume or changing its codes in fisqua mode (app.core.unit_mode)."""
+    from app.core import unit_mode
+
+    return HTTPException(status_code=403, detail={"code": unit_mode.VOLUMES_FROM_FISQUA,
+                                                  "message": unit_mode.VOLUMES_FROM_FISQUA_MESSAGE})
+
+
+def _check_codes_with_fisqua(db: Session, codes) -> None:
+    """An admin's new reference codes in fisqua mode, checked with Fisqua (contract 1.8); an HTTPException if refused."""
+    from app.core import unit_mode
+
+    try:
+        unit_mode.check_reference_codes(db, codes)
+    except unit_mode.CodeRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+
+
 def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
@@ -96,18 +114,47 @@ def create_collection(
     Create a new collection.
     
     Must specify either project_id (for top-level collection) OR parent_collection_id (for nested subcollection).
+
+    The unit's mode and projects setting (app.core.unit_mode) apply. While
+    projects are hidden, a volume given neither goes into the unit's
+    default project; with projects shown, that is still a 400. In fisqua
+    mode an operator is refused with a 403 (`volumes_from_fisqua`); an
+    admin's volume is saved only once Fisqua knows its stem, and its
+    external_id when set (contract 1.8; 422 `unknown_reference_code`, 409
+    `fisqua_no_lookup` or `fisqua_unreachable`), and is logged
+    `volume_created_override`.
     """
+    from app.core import unit_mode
+    from app.core.list_import import ListRefused, ProjectLockUnavailable
+
+    unit = unit_mode.current(db)
+    from_fisqua = unit.mode == unit_mode.FISQUA
+    if from_fisqua and current_user.role != "admin":
+        raise _volumes_from_fisqua()
+
+    project_id = payload.project_id
     # Validate that exactly one parent is specified
-    if payload.project_id is None and payload.parent_collection_id is None:
+    if project_id is None and payload.parent_collection_id is None and unit.projects_shown:
         raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
     
-    if payload.project_id is not None and payload.parent_collection_id is not None:
+    if project_id is not None and payload.parent_collection_id is not None:
         raise HTTPException(status_code=400, detail="Cannot specify both project_id and parent_collection_id")
-    
-    if payload.project_id is not None:
-        project = db.query(Project).filter(Project.id == payload.project_id).first()
+
+    if from_fisqua:
+        _check_codes_with_fisqua(db, [payload.filename_stem, payload.external_id])
+
+    if project_id is None and payload.parent_collection_id is None:
+        try:
+            project_id = unit_mode.default_project(db, current_user.username)[0].id
+        except ProjectLockUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except ListRefused as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc)})
+
+    if project_id is not None:
+        project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
-            raise HTTPException(status_code=404, detail=f"Project {payload.project_id} not found")
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
     
     if payload.parent_collection_id is not None:
         parent = db.query(Collection).filter(Collection.id == payload.parent_collection_id).first()
@@ -119,7 +166,7 @@ def create_collection(
         description=payload.description,
         collection_type=payload.collection_type,
         archival_metadata=payload.archival_metadata,
-        project_id=payload.project_id,
+        project_id=project_id,
         parent_collection_id=payload.parent_collection_id,
         filename_stem=payload.filename_stem,
         external_id=payload.external_id,
@@ -147,6 +194,11 @@ def create_collection(
     db.refresh(collection)
     log_event(db, level="INFO", category="activity", action="collection_created",
               actor=current_user.username, subject=collection.name)
+    if from_fisqua:
+        log_event(db, level="INFO", category="activity", action="volume_created_override",
+                  actor=current_user.username, subject=collection.name,
+                  detail=_volume_change_detail(collection.id, stem=(None, collection.filename_stem),
+                                               external_id=(None, collection.external_id)))
     return CollectionRead.model_validate(collection)
 
 
@@ -464,13 +516,69 @@ def update_collection(
     volume in the subtree whose directory changes, and the rows follow. That
     is refused with 409 while an export of any of those volumes is queued or
     running. Other edits are not refused.
+
+    In fisqua mode (app.core.unit_mode) a change of filename_stem or
+    external_id is refused from an operator with a 403
+    (`volumes_from_fisqua`); other fields, and a value equal to the stored
+    one, stay allowed. An admin's change is saved only once Fisqua knows
+    the new code (contract 1.8, as POST /collections/), and is logged
+    `volume_code_override`; clearing the stem is refused with a 422
+    (`stem_required`), since the stem is the volume's Fisqua reference code.
     """
+    from app.core import unit_mode
+
+    from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
+    code_fields = {name: value for name, value in payload.model_dump(exclude_unset=True).items()
+                   if name in ("filename_stem", "external_id")}
+    checked: set = set()
+
+    def code_changes(stem, external_id) -> dict:
+        stored = {"filename_stem": stem, "external_id": external_id}
+        return {name: value for name, value in code_fields.items() if value != stored[name]}
+
+    if from_fisqua and code_fields:
+        # Before the row lock, so that Fisqua is not asked while the row is
+        # held; read as plain columns, so the locked read below loads the
+        # row afresh. Checked again under the lock.
+        stored = (db.query(Collection.filename_stem, Collection.external_id)
+                  .filter(Collection.id == collection_id).first())
+        if stored is not None:
+            changes = code_changes(*stored)
+            if changes and current_user.role != "admin":
+                raise _volumes_from_fisqua()
+            if "filename_stem" in changes and changes["filename_stem"] is None:
+                raise HTTPException(status_code=422, detail={"code": unit_mode.STEM_REQUIRED,
+                                                             "message": unit_mode.STEM_REQUIRED_MESSAGE})
+            new_codes = [value for value in changes.values() if value is not None]
+            _check_codes_with_fisqua(db, new_codes)
+            checked.update(new_codes)
+
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
     # write-once guards compare against the committed value.
     collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+
+    code_override = False
+    if from_fisqua and code_fields:
+        changes = code_changes(collection.filename_stem, collection.external_id)
+        if "filename_stem" in changes and changes["filename_stem"] is None:
+            db.rollback()
+            raise HTTPException(status_code=422, detail={"code": unit_mode.STEM_REQUIRED,
+                                                         "message": unit_mode.STEM_REQUIRED_MESSAGE})
+        if changes and current_user.role != "admin":
+            db.rollback()
+            raise _volumes_from_fisqua()
+        unchecked = [value for value in changes.values() if value is not None and value not in checked]
+        if unchecked:
+            # The row changed since the read above: rare, and checked here.
+            try:
+                _check_codes_with_fisqua(db, unchecked)
+            except HTTPException:
+                db.rollback()
+                raise
+        code_override = bool(changes)
     
     if payload.parent_collection_id is not None:
         # Prevent circular references
@@ -518,6 +626,7 @@ def update_collection(
             update_data["project_id"] = root.project_id
     before = (collection.name, collection.filename_stem,
               collection.project_id, collection.parent_collection_id)
+    old_external_id = collection.external_id
     layout_changed = (
         ("name" in update_data and update_data["name"] != collection.name)
         or ("parent_collection_id" in update_data
@@ -594,6 +703,13 @@ def update_collection(
                       collection_id,
                       project=(old_project, collection.project_id),
                       parent=(old_parent, collection.parent_collection_id)))
+    if code_override and (old_stem, old_external_id) != (collection.filename_stem, collection.external_id):
+        log_event(db, level="INFO", category="activity", action="volume_code_override",
+                  actor=current_user.username, subject=collection.name,
+                  detail=_volume_change_detail(
+                      collection_id,
+                      stem=(old_stem, collection.filename_stem),
+                      external_id=(old_external_id, collection.external_id)))
     if not_moved:
         # Preview sidecars that stayed in the old directory (see relocate_image).
         # The key is outside CollectionRead, so this body bypasses response_model.

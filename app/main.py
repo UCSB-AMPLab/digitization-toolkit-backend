@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.3
 
 from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -52,6 +52,12 @@ async def lifespan(app: FastAPI):
         migrate_volume_layout_at_startup(db)
     finally:
         db.close()
+    # Write the unit's mode on first start after the upgrade that brought it,
+    # with the mode the configuration implies (app.core.unit_mode); a no-op
+    # once written. Before the schedulers, whose runs read it.
+    from app.core import unit_mode
+
+    unit_mode.initialise()
     # Schedule the offsite catalogue dump (NEH-249). A no-op on a unit with no
     # offsite remote configured.
     from app.core.catalogue_backup import catalogue_backup_scheduler

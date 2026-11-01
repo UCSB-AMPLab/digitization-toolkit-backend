@@ -5,7 +5,7 @@ item, in a project named after the basket; items that cannot be created are
 reported as rejects and the rest are still created. The fixtures are the two
 synthetic lists in tests/fixtures/ (tenant captua-test, codes xx-test-...).
 
-Version: 0.2.0
+Version: 0.3.3
 """
 
 import json
@@ -19,6 +19,20 @@ VALID = FIXTURES / "digitisation-list_captua-test_prueba-valida_2026-10-23.json"
 REJECTS = FIXTURES / "digitisation-list_captua-test_prueba-rechazos_2026-10-23.json"
 VALID_ID = "00000000-0000-4000-8000-000000000001"
 REJECTS_ID = "00000000-0000-4000-8000-000000000002"
+
+
+@pytest.fixture(autouse=True)
+def projects_shown(db_session):
+    """These tests file a list in a project named after it, which needs projects shown.
+
+    Projects are shown only in offline mode with projects on
+    (app.core.unit_mode); otherwise an import goes into the unit's default
+    project (tests/unit/test_unit_mode.py). Imported by the other list
+    import test modules, where it is autouse too.
+    """
+    from app.models.unit_settings import UnitSettings
+    db_session.add(UnitSettings(id=1, mode="offline", projects_enabled=True))
+    db_session.commit()
 
 
 @pytest.fixture

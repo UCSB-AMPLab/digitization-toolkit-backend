@@ -8,7 +8,7 @@ imports.
 
     python -m pytest tests/unit/test_fisqua_queue.py
 
-Version: 0.3.0
+Version: 0.3.3
 """
 
 import json
@@ -138,10 +138,11 @@ def test_the_operators_body_has_admins_and_operators_only_by_username_without_em
     _user(db_session, "beto", "operator", active=False)
     _user(db_session, "carla", "reviewer")
     body = operators_body(db_session)
+    # With the unit's mode (app.core.unit_mode): offline here, nothing being configured.
     assert body == {"operators": [
         {"username": "ana", "displayName": "ana", "role": "admin", "active": True},
         {"username": "beto", "displayName": "beto", "role": "operator", "active": False},
-    ]}
+    ], "mode": "offline"}
     assert "@" not in json.dumps(body)
 
 
@@ -276,7 +277,9 @@ def test_the_hold_is_respected(synced, db_session, monkeypatch, tmp_path):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-def test_a_new_item_creates_its_volume_in_the_list_project_created_if_missing(synced, db_session):
+def test_a_new_item_creates_its_volume_in_the_default_project_created_if_missing(synced, db_session):
+    # Projects are hidden in fisqua mode, so the queue files its volumes in
+    # the unit's default project, not one named after the list (app.core.unit_mode).
     from app.models.project import Project
     transport = QueueTransport(queues=[_queue([_qitem(assignee="ana", notes="Con cuidado")])],
                                acks=[_ok_ack()])
@@ -284,14 +287,14 @@ def test_a_new_item_creates_its_volume_in_the_list_project_created_if_missing(sy
     assert result["status"] == "applied", result
     vol = _volumes(db_session)["xx-test-901"]
     project = db_session.get(Project, vol.project_id)
-    assert project.name == LIST_NAME
+    assert project.name == "default"
     assert vol.filename_stem == "xx-test-901" and vol.name == "Tomo xx-test-901"
     assert vol.assignee_username == "ana"
     assert json.loads(vol.custom_attributes)["fisqua"]["notes"] == "Con cuidado"
 
 
 @pytest.mark.unit
-def test_a_new_item_goes_into_an_existing_project_of_that_name(synced, db_session):
+def test_a_new_item_goes_into_the_only_project_as_the_default(synced, db_session):
     from app.models.project import Project
     existing = Project(name=LIST_NAME)
     db_session.add(existing)

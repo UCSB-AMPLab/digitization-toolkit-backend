@@ -74,6 +74,10 @@ app.core.fisqua_contract. Here:
   scheduler tick, after the status poll, sends the unit's users when due
   and polls, applies and acknowledges the queue, through the same
   transport, call budget, configuration stop and hold.
+* **The unit's mode** (app.core.unit_mode). The send pass and the poll
+  make no call outside fisqua mode. Handovers still queue their rows while
+  Fisqua is configured, whatever the mode, and those rows wait until the
+  unit returns to fisqua.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
@@ -310,6 +314,9 @@ class FisquaTransport(Protocol):
 
     def post_queue_ack(self, body: dict) -> TransportResult: ...
 
+    # Contract 1.8 (app.core.unit_mode.check_reference_code).
+    def get_description(self, ref: str) -> TransportResult: ...
+
 
 class NullTransport:
     """Sends nothing, for a unit with Fisqua not configured. The worker leaves `ready` rows as they are."""
@@ -330,6 +337,9 @@ class NullTransport:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
     def post_queue_ack(self, body: dict) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def get_description(self, ref: str) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
@@ -1236,7 +1246,8 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
     Statuses: "rate_limited" (the shared call_budget was spent: the rest is
-    sent at a later pass), "disabled" (Fisqua not configured), "held" (the offsite upload
+    sent at a later pass), "disabled" (Fisqua not configured), "off_in_this_mode" (the
+    unit is not in fisqua mode, app.core.unit_mode: nothing is promoted or sent), "held" (the offsite upload
     hold exists, app.core.offsite_hold: nothing is promoted or sent, and no
     call is made), "no_transport" (rows are promoted, nothing is sent), "config_error" (Fisqua refused the
     configuration: rows are promoted, nothing is sent until it changes), "done",
@@ -1246,6 +1257,12 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    # Outside fisqua mode the link makes no call (app.core.unit_mode); the
+    # rows stay as they are and go out if the unit returns to fisqua.
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     # Promotion too: while the hold exists the one-time commands are still
     # completing the objects' state, and a volume can read as received, or
     # not exportable, on what they have not yet written.
@@ -1408,12 +1425,17 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
     """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises.
 
     Answers "held", with no call, while the offsite upload hold exists
-    (app.core.offsite_hold).
+    (app.core.offsite_hold), and "off_in_this_mode", with no call, outside
+    fisqua mode (app.core.unit_mode).
     """
     from app.models.fisqua import FisquaOutbox
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     if offsite_hold.held("fisqua status poll"):
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
     transport = transport if transport is not None else get_transport()

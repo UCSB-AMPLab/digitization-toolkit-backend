@@ -3,7 +3,7 @@
 Usage: python list_import_race_worker.py <import|import_noflock> <sqlite file> <sha256>
 CAPTUA_DATA_DIR comes from the environment. Prints one RESULT line.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 import os
 import sys
@@ -32,10 +32,14 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from app.core.db import Base  # noqa: E402
 from app.models import user, project, project_member, collection, record, camera, system_log, offsite_object  # noqa: E402,F401
+from app.models.unit_settings import UnitSettings  # noqa: E402
 
 engine = create_engine(f"sqlite:///{dbfile}")
 Base.metadata.create_all(engine)
 db = sessionmaker(bind=engine)()
+# Projects shown (app.core.unit_mode), so the list is filed in its own project.
+db.add(UnitSettings(id=1, mode="offline", projects_enabled=True))
+db.commit()
 if mode == "import_noflock":
     # Without flock an import may not create a project (the project lock
     # cannot be taken, ProjectLockUnavailable), so the project exists

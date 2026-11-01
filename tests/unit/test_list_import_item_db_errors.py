@@ -5,13 +5,13 @@ run inside the same rollback-and-reject handling as the insert, so a lost
 connection there is reported as `refused_by_database` for that item, the
 other items are still created, and the report is stored.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
 from sqlalchemy.exc import OperationalError
 
-from tests.unit.test_list_import import _as, _item, _list_with, _post, _volumes, reports_root  # noqa: F401
+from tests.unit.test_list_import import _as, _item, _list_with, _post, _volumes, projects_shown, reports_root  # noqa: F401
 
 
 @pytest.mark.unit

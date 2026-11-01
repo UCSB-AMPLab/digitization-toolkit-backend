@@ -53,7 +53,7 @@ create_volume, the steps an import takes for one item. Its done marks are
 keyed by each entry's itemId, since positions change between revisions;
 a file's list keeps them by position (done_key).
 
-Version: 0.3.0
+Version: 0.3.3
 """
 
 from __future__ import annotations
@@ -821,23 +821,38 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     stored report, so two concurrent runs cannot both pass the check. If
     the lock file cannot be created the import goes on unlocked and says
     so in the log; the run file is still created exclusively.
+
+    While projects are hidden (app.core.unit_mode: any mode but offline
+    with projects on), the volumes go into the unit's default project
+    (unit_mode.default_project) instead of a project named after the list,
+    whoever imports: ProjectNeedsAdmin is never raised, and the list's
+    notes are not stored on that project (`projectNotesSkipped` is
+    `default_project`). `projectCreated` says whether the default project
+    was created by this import.
     """
+    from app.core import unit_mode
+
     list_id, list_name, items = check_envelope(document)
+    use_default = not unit_mode.current(db).projects_shown
     # Checked before the lock too, so that a refusal creates no lock file;
     # _project_for checks again under the lock.
-    if not may_create_project and _find_project(db, list_name) is None:
+    if not use_default and not may_create_project and _find_project(db, list_name) is None:
         raise ProjectNeedsAdmin(PROJECT_NEEDS_ADMIN_MESSAGE)
     with _list_lock(list_id) as lock:
         # Every refusal of the whole list is decided before the hash is
         # written, so a refused file leaves no hash for its corrected
         # version to be refused against (ListIdReused).
-        _refuse_list_before_hash(db, list_name, may_create_project)
+        if not use_default:
+            _refuse_list_before_hash(db, list_name, may_create_project)
         wrote_hash = False
         if file_sha256 is not None:
             wrote_hash = _check_hash(reports_dir() / list_id, list_id, file_sha256)
         notes = document["list"].get("notes")
         try:
-            project, project_created = _project_for(db, list_name, actor, may_create_project, notes)
+            if use_default:
+                project, project_created = unit_mode.default_project(db, actor)
+            else:
+                project, project_created = _project_for(db, list_name, actor, may_create_project, notes)
         except BaseException:
             # A refusal the check above could not see (the project deleted
             # since, a concurrent create): no volume exists yet, so the
@@ -856,7 +871,13 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
                         "file under this id is refused until it is removed.",
                         list_id, reports_dir() / list_id / HASH_FILE_NAME)
             raise
-        report = _import_items(db, list_id, list_name, project, project_created, items, actor, notes=notes)
+        # The default project is the unit's, not the list's: the list's
+        # notes are never its description.
+        report = _import_items(db, list_id, list_name, project, project_created and not use_default, items,
+                               actor, notes=notes)
+        report["projectCreated"] = project_created
+        if use_default:
+            report["projectNotesSkipped"] = "default_project"
         report["fileSha256"] = file_sha256
         list_stored = False
         if raw is not None:

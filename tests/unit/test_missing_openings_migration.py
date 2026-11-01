@@ -15,7 +15,6 @@ Version: 0.3.3
 """
 
 import importlib.util
-import re
 from pathlib import Path
 
 import pytest
@@ -72,15 +71,10 @@ def _set(engine, **values):
 
 
 @pytest.mark.unit
-def test_it_follows_the_missing_side_revision_and_leaves_one_head():
+def test_it_follows_the_missing_side_revision():
+    # The one-head check moved to the next revision's test (test_unit_mode).
     mod = _load_migration()
     assert mod.down_revision == "e9a1c3d5f7b2"
-    revisions, downs = set(), set()
-    for path in VERSIONS.glob("*.py"):
-        text = path.read_text()
-        revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
-        downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    assert revisions - downs == {mod.revision}
 
 
 @pytest.mark.unit

@@ -12,7 +12,7 @@ logged), and a different file under the id is refused as before. A corrected
 file under the same id then imports. A hash recorded by an earlier import is
 never removed; one that cannot be removed is logged with its path.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
@@ -20,7 +20,7 @@ import pytest
 import errno
 import threading
 
-from tests.unit.test_list_import import VALID_ID, _as, _item, _list_with, _post, _volumes, reports_root  # noqa: F401
+from tests.unit.test_list_import import VALID_ID, _as, _item, _list_with, _post, _volumes, projects_shown, reports_root  # noqa: F401
 
 
 def _hash_file(reports_root, doc):

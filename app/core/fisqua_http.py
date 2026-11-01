@@ -34,7 +34,15 @@ without 1.7, asked again at the next poll and never a configuration error,
 so it never stops the unit's handovers, status or decisions. The rest are
 errors, retried.
 
-Version: 0.3.0
+Answers to GET of a reference code's description (contract 1.8, the
+admin's check in fisqua mode, app.core.unit_mode.check_reference_code):
+2xx with an object `description`; 404 with rule unknown-reference-code
+`unknown_code`; a bare 404, or one with another rule, or a 405
+`unsupported` (a Fisqua without 1.8); 401, 403 and any 3xx the same
+configuration errors as above; the rest, 429 included, errors. The code is
+one path segment, encoded as encodeURIComponent encodes it.
+
+Version: 0.3.3
 """
 
 from datetime import datetime, timezone
@@ -259,6 +267,37 @@ def read_queue_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def read_description_answer(response: httpx.Response) -> TransportResult:
+    code = response.status_code
+    body = _json(response)
+    if 200 <= code < 300:
+        if not isinstance(body, dict):
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=f"Fisqua answered HTTP {code} without a description object")
+        return TransportResult(outcome="description", response=body, status_code=code)
+    if code == 404 and _has_rule(body, fc.RULE_UNKNOWN_REFERENCE_CODE):
+        return TransportResult(outcome="unknown_code", response=body, status_code=code)
+    if code in UNSUPPORTED_CODES:
+        return TransportResult(outcome="unsupported", response=body, status_code=code,
+                               error=f"Fisqua has no contract 1.8 lookup here (HTTP {code})")
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
+    return _transient(response, body)
+
+
+# What encodeURIComponent leaves as it is, beside the letters, digits and
+# "-_.~" that urllib.parse.quote always leaves.
+_URI_COMPONENT_SAFE = "!*'()"
+
+
+def encode_segment(value: str) -> str:
+    """`value` as one URL path segment, encoded as JavaScript's encodeURIComponent encodes it."""
+    from urllib.parse import quote
+
+    return quote(value, safe=_URI_COMPONENT_SAFE)
+
+
 def _failed(exc: Exception) -> TransportResult:
     kind = "timeout" if isinstance(exc, httpx.TimeoutException) else type(exc).__name__
     return TransportResult(outcome="error", error=f"Fisqua could not be reached: {kind}: {exc}")
@@ -330,6 +369,14 @@ class HttpFisquaTransport:
         except httpx.HTTPError as exc:
             return _failed(exc)
         return read_queue_ack_answer(response)
+
+    def get_description(self, ref: str) -> TransportResult:
+        path = fc.DESCRIPTIONS_PATH.format(ref=encode_segment(ref))
+        try:
+            response = self._client.get(self._base + path, headers=self._headers())
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_description_answer(response)
 
     def close(self) -> None:
         self._client.close()

@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.3
 
 from contextlib import contextmanager
 from typing import Generator
@@ -63,6 +63,7 @@ def init_db() -> None:
 	import app.models.project_member # noqa: F401
 	import app.models.offsite_object # noqa: F401
 	import app.models.fisqua         # noqa: F401
+	import app.models.unit_settings  # noqa: F401
 
 	# Note: Tables are created via Alembic migrations, not create_all()
 	# Run: alembic upgrade head
