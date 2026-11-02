@@ -18,9 +18,12 @@ from pydantic_settings import (
 # Every setting the backend reads under a prefix has two names: CAPTUA_<X>,
 # and DTK_<X>, the name the env files on field units carry. Both are read, and
 # a CAPTUA_ name wins over its DTK_ name wherever either is set (the process
-# environment, ../.env or offsite.env). A CAPTUA_ name set to the empty string
-# counts as unset, as in ${VAR:-default} (scripts/captua-env.sh), so its DTK_
-# name or the default is read instead; a value of spaces is not empty. The
+# environment, ../.env or offsite.env). A CAPTUA_ name set to the empty string,
+# or written in a file as a bare name with no `=`, counts as unset, as in
+# ${VAR:-default} (scripts/captua-env.sh). The rule is applied to each file on
+# its own, so such a line never hides a CAPTUA_ value set in another file or
+# in the process environment; with no value anywhere, its DTK_ name or the
+# default is read instead. A value of spaces is not empty. The
 # units' files keep their DTK_ names because a rollback restores code that
 # reads only those.
 NEW_PREFIX = "CAPTUA_"
@@ -39,12 +42,16 @@ def _is_old_name(key: str) -> bool:
     return key.upper().startswith(OLD_PREFIX)
 
 
+def _is_unset_new_name(key: str, value: Optional[str]) -> bool:
+    """True for a CAPTUA_ name set to the empty string, or written in an env
+    file as a bare name, which python-dotenv returns as None."""
+    return key.upper().startswith(NEW_PREFIX) and value in ("", None)
+
+
 def _is_new_name_read(key: str, value: Optional[str]) -> bool:
-    """False for a DTK_ name and for a CAPTUA_ name set to the empty string.
-    A name without a prefix is kept whatever its value."""
-    if _is_old_name(key):
-        return False
-    return not (key.upper().startswith(NEW_PREFIX) and value == "")
+    """False for a DTK_ name and for an unset CAPTUA_ name
+    (_is_unset_new_name). A name without a prefix is kept whatever its value."""
+    return not _is_old_name(key) and not _is_unset_new_name(key, value)
 
 
 class _NewNamesEnv(EnvSettingsSource):
@@ -63,11 +70,13 @@ class _OldNamesEnv(EnvSettingsSource):
 
 
 class _NewNamesDotEnv(DotEnvSettingsSource):
-    """The env files without their DTK_ variables and without their empty
-    CAPTUA_ variables."""
+    """The env files without their DTK_ variables and without their unset
+    CAPTUA_ variables. Each file is filtered before the files are merged, so
+    an unset CAPTUA_ name in a later file leaves the value an earlier file
+    gives it. Names without a prefix are merged as before."""
 
-    def _load_env_vars(self) -> Mapping[str, Optional[str]]:
-        return {k: v for k, v in super()._load_env_vars().items() if _is_new_name_read(k, v)}
+    def _read_env_file(self, file_path: Path) -> Mapping[str, Optional[str]]:
+        return {k: v for k, v in super()._read_env_file(file_path).items() if _is_new_name_read(k, v)}
 
 
 class _OldNamesDotEnv(DotEnvSettingsSource):
@@ -220,8 +229,10 @@ class Settings(BaseSettings):
         # Earlier sources win. Each source is split in two, so that a CAPTUA_
         # name set anywhere wins over a DTK_ name set anywhere, and within each
         # family the process environment still wins over the files, and
-        # offsite.env over ../.env. An empty CAPTUA_ name is left out of the
-        # first pair, so the value is read from the second pair or the default.
+        # offsite.env over ../.env. An unset CAPTUA_ name (empty, or bare in a
+        # file) is left out of the first pair, source by source and file by
+        # file, so the value is read from another place it is set, or from
+        # the second pair, or from the default.
         # Names without a prefix (DATABASE_*, SECRET_KEY, ...) are in the
         # first pair only, empty or not.
         env_file = getattr(dotenv_settings, "env_file", ENV_FILES)
@@ -344,20 +355,21 @@ def aliased_suffixes() -> list[str]:
 
 def _environment_variables(env_files=ENV_FILES) -> dict[str, str]:
     """Every variable the settings could read, by upper-case name: the env
-    files in order, then the process environment over them. An empty CAPTUA_
-    variable in the process environment does not replace the files' value,
-    because the settings do not read it (_NewNamesEnv)."""
+    files in order, then the process environment over them. An unset CAPTUA_
+    variable (_is_unset_new_name) in a file does not replace an earlier file's
+    value, and one in the process environment does not replace the files'
+    value, because the settings do not read it (_NewNamesDotEnv,
+    _NewNamesEnv)."""
     merged: dict[str, str] = {}
     for env_file in env_files:
         path = Path(env_file).expanduser()
         if path.is_file():
             for key, value in dotenv_values(path, encoding="utf-8").items():
-                if value is not None:
+                if value is not None and not _is_unset_new_name(key, value):
                     merged[key.upper()] = value
     for key, value in os.environ.items():
-        if key.upper().startswith(NEW_PREFIX) and value == "":
-            continue
-        merged[key.upper()] = value
+        if not _is_unset_new_name(key, value):
+            merged[key.upper()] = value
     return merged
 
 
@@ -366,21 +378,22 @@ def environment_names_report(env_files=ENV_FILES) -> dict[str, list[str]]:
 
     `new` and `old` list the CAPTUA_ and DTK_ names that are set; `conflicts`
     lists each <X> whose two names are both set to different values, where
-    the CAPTUA_ value is the one used. A CAPTUA_ name set to the empty string
-    counts as unset, so it is in neither `new` nor `conflicts`.
+    the CAPTUA_ value is the one used. A CAPTUA_ name set to the empty string,
+    or bare in a file, counts as unset, so it is in neither `new` nor
+    `conflicts`.
     """
     variables = _environment_variables(env_files)
     report: dict[str, list[str]] = {"new": [], "old": [], "conflicts": []}
     for suffix in aliased_suffixes():
         new, old = f"{NEW_PREFIX}{suffix}", f"{OLD_PREFIX}{suffix}"
-        # An empty CAPTUA_ value is not read (_is_new_name_read), so it is not
-        # counted. An empty DTK_ value is still read, and is counted.
-        new_set = variables.get(new, "") != ""
-        if new_set:
+        # An unset CAPTUA_ value is not read (_is_unset_new_name), and
+        # _environment_variables leaves it out. An empty DTK_ value is still
+        # read, and is counted.
+        if new in variables:
             report["new"].append(new)
         if old in variables:
             report["old"].append(old)
-        if new_set and old in variables and variables[new] != variables[old]:
+        if new in variables and old in variables and variables[new] != variables[old]:
             report["conflicts"].append(suffix)
     return report
 

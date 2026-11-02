@@ -4,9 +4,11 @@ Every prefixed setting is read as CAPTUA_<X> and as DTK_<X>, the name field
 units carry in their .env and offsite.env. A
 CAPTUA_ name wins over its DTK_ name wherever either is set; within one family
 the process environment wins over the files, and offsite.env over ../.env.
-A CAPTUA_ name set to the empty string counts as unset, as in
-scripts/captua-env.sh, so the DTK_ name or the default is read instead; names
-without a prefix are read as before, empty or not.
+A CAPTUA_ name set to the empty string, or bare in a file, counts as unset, as
+in scripts/captua-env.sh. The rule is applied file by file, so such a line
+never hides a CAPTUA_ value set elsewhere; with no value anywhere, the DTK_
+name or the default is read instead. Names without a prefix are read as
+before, empty or not.
 
     python -m pytest tests/unit/test_env_names.py
 
@@ -243,7 +245,6 @@ def test_an_empty_new_name_in_the_environment_falls_back_to_the_old_name_in_a_fi
 @pytest.mark.parametrize(
     "suffix, field, default",
     [
-        ("OFFSITE_TENANT", "OFFSITE_TENANT", ""),
         ("OFFSITE_BWLIMIT", "OFFSITE_BWLIMIT", "750k"),
         ("FISQUA_POLL_INTERVAL", "FISQUA_POLL_INTERVAL_SECONDS", 600),
         ("FISQUA_ROTATE_DEG", "FISQUA_ROTATE_DEG", False),
@@ -324,3 +325,41 @@ def test_an_empty_new_name_in_the_environment_leaves_the_new_name_in_a_file(monk
     report = config.environment_names_report((offsite,))
     assert "CAPTUA_OFFSITE_TENANT" in report["new"]
     assert report["conflicts"] == ["OFFSITE_TENANT"]
+
+
+def _dot_env_with_value_and_offsite_without(tmp_path, offsite_line):
+    dot_env = _env_file(tmp_path / ".env", CAPTUA_OFFSITE_TENANT="val")
+    offsite = tmp_path / "offsite.env"
+    offsite.write_text(offsite_line + "DTK_OFFSITE_TENANT=old\n", encoding="utf-8")
+    return dot_env, offsite
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("offsite_line", ["CAPTUA_OFFSITE_TENANT=\n", "CAPTUA_OFFSITE_TENANT\n"])
+def test_an_empty_new_name_in_offsite_env_leaves_the_new_name_in_dot_env(tmp_path, offsite_line):
+    """Each file is read on its own: an empty or bare CAPTUA_ line in offsite.env
+    does not remove the CAPTUA_ value in ../.env."""
+    dot_env, offsite = _dot_env_with_value_and_offsite_without(tmp_path, offsite_line)
+    assert Settings(_env_file=(dot_env, offsite)).OFFSITE_TENANT == "val"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("offsite_line", ["CAPTUA_OFFSITE_TENANT=\n", "CAPTUA_OFFSITE_TENANT\n"])
+def test_an_empty_new_name_in_offsite_env_is_reported_as_the_settings_read_it(tmp_path, offsite_line):
+    dot_env, offsite = _dot_env_with_value_and_offsite_without(tmp_path, offsite_line)
+    report = config.environment_names_report((dot_env, offsite))
+    assert "CAPTUA_OFFSITE_TENANT" in report["new"]
+    assert "DTK_OFFSITE_TENANT" in report["old"]
+    assert report["conflicts"] == ["OFFSITE_TENANT"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dot_env_line", ["CAPTUA_OFFSITE_TENANT=\n", "CAPTUA_OFFSITE_TENANT\n"])
+def test_an_empty_or_bare_new_name_in_both_files_falls_back_to_the_old_name(tmp_path, dot_env_line):
+    dot_env = tmp_path / ".env"
+    dot_env.write_text(dot_env_line, encoding="utf-8")
+    offsite = _env_file(tmp_path / "offsite.env", CAPTUA_OFFSITE_TENANT="", DTK_OFFSITE_TENANT="old")
+    assert Settings(_env_file=(dot_env, offsite)).OFFSITE_TENANT == "old"
+    report = config.environment_names_report((dot_env, offsite))
+    assert "CAPTUA_OFFSITE_TENANT" not in report["new"]
+    assert report["conflicts"] == []

@@ -263,7 +263,7 @@ def mark_list_item_done(
     file's item) and `doneMark` ({by, at}, or null once removed). A 422
     when the list id is not a UUID or the body is not {"done": true|false,
     "itemId"?: string}; a 404 when no stored list file of this id has an
-    item at that position (or the queue's item has no itemId); a 503 when
+    item at that position; a 503 when
     the mark cannot be written, in which case nothing has changed.
     """
     try:
