@@ -23,9 +23,9 @@ from pydantic_settings import (
 # ${VAR:-default} (scripts/captua-env.sh). The rule is applied to each file on
 # its own, so such a line never hides a CAPTUA_ value set in another file or
 # in the process environment; with no value anywhere, its DTK_ name or the
-# default is read instead. A value of spaces is not empty. The
-# units' files keep their DTK_ names because a rollback restores code that
-# reads only those.
+# default is read. Spaces are a value in the process environment or quoted in
+# a file; python-dotenv strips an unquoted value, so `CAPTUA_X=   ` is empty.
+# The units' files keep DTK_ names: a rollback restores code that reads only those.
 NEW_PREFIX = "CAPTUA_"
 OLD_PREFIX = "DTK_"
 ENV_FILES = ("../.env", "/var/lib/dtk/offsite.env")
