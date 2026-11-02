@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.3
 
 import json
 import logging
@@ -10,7 +10,7 @@ from pathlib import Path
 from typing import Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel
+from pydantic import BaseModel, ConfigDict
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
@@ -151,6 +151,67 @@ def get_catalogue_backup_state(
         # error while Fisqua refuses the configuration, the last send and poll.
         "fisqua":           unit_fisqua_summary(),
     }
+
+
+# ---------------------------------------------------------------------------
+# The unit's mode and projects setting (app.core.unit_mode)
+# ---------------------------------------------------------------------------
+
+class UnitUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    mode: Optional[Literal["offline", "backup", "fisqua"]] = None
+    projectsEnabled: Optional[bool] = None
+
+
+@router.get("/unit")
+def get_unit(
+    current_user: User = Depends(allow_read_only),
+    db: Session = Depends(get_db_dependency),
+):
+    """The unit's mode and projects setting, for every role.
+
+    `mode` is `offline`, `backup` or `fisqua`. `projectsEnabled` is the
+    admin's setting; `projectsShown` is whether the interface shows
+    projects, true only in offline mode with projects enabled.
+    `defaultProjectId` is the project new volumes go into while projects
+    are hidden, null until first needed. `prerequisites` lists, for
+    `backup` and `fisqua`, the codes of what the configuration lacks for
+    that mode (`offsite_not_configured`, `catalogue_dump_not_configured`,
+    `fisqua_not_configured`); an empty list means the switch may be tried.
+    A switch to fisqua also needs Fisqua to take the operators call.
+    """
+    from app.core import unit_mode
+
+    return unit_mode.as_api(db)
+
+
+@router.put("/unit")
+def put_unit(
+    payload: UnitUpdate,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Change the unit's mode, its projects setting, or both. Admin only.
+
+    Returns the GET /system/unit body. A switch whose prerequisites are
+    missing, or a switch to fisqua whose operators call (carrying the new
+    mode) Fisqua does not take, is a 409 whose detail lists each problem
+    as {code, message} (with `error` for `fisqua_unreachable`), and nothing
+    changes: `offsite_held` while the offsite hold is in place, and
+    `mode_changed` when another change was committed meanwhile. Switching down from fisqua tells Fisqua the new mode, best
+    effort. `projectsEnabled` is stored in any mode, and matters only in
+    offline mode. Each change is logged: `unit_mode_changed`,
+    `unit_projects_changed`.
+    """
+    from app.core import unit_mode
+
+    try:
+        unit_mode.change(db, actor=current_user.username, mode=payload.mode,
+                         projects_enabled=payload.projectsEnabled)
+    except unit_mode.ModeRefused as exc:
+        raise HTTPException(status_code=409, detail=exc.detail())
+    return unit_mode.as_api(db)
 
 
 # ---------------------------------------------------------------------------

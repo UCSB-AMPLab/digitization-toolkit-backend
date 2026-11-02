@@ -9,7 +9,7 @@ list with its items and the volume each one names. The import itself is
 app/core/list_import.py. The digitisation queue synced with Fisqua
 (app/core/fisqua_queue.py) is one more list there, with `source` `queue`.
 
-Version: 0.3.0
+Version: 0.3.3
 """
 
 import hashlib
@@ -104,7 +104,20 @@ def import_digitisation_list(
     whether the report was also kept on the unit for
     GET /imports/digitisation-list/{list_id}/report, and `listStored`
     whether the uploaded file was kept for GET /imports/digitisation-lists.
+
+    In fisqua mode (app.core.unit_mode) volumes come from Fisqua's queue:
+    an operator is refused with a 403, code `volumes_from_fisqua`, before
+    the file is read; an admin's import goes ahead, the fallback while the
+    link is down, and is logged `list_import_override`. While projects are
+    hidden the volumes go into the unit's default project, and no admin is
+    needed for it.
     """
+    from app.core import unit_mode
+
+    from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
+    if from_fisqua and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": unit_mode.VOLUMES_FROM_FISQUA,
+                                                     "message": unit_mode.VOLUMES_FROM_FISQUA_MESSAGE})
     raw = _read_capped(file)
     try:
         document = parse_list_file(raw)
@@ -133,6 +146,14 @@ def import_digitisation_list(
         detail=(f"list {report['listId']}: {report['created']} created, "
                 f"{report['skipped']} skipped" + ("" if stored else "; report not stored")),
     )
+    if from_fisqua:
+        codes = ", ".join(f"{v['referenceCode']} (volume {v['captuaCollectionId']})" for v in report["volumes"])
+        log_event(
+            db, level="INFO", category="activity", action="list_import_override",
+            actor=current_user.username, subject=report["listName"],
+            detail=f"list {report['listId']} imported in fisqua mode: {report['created']} created"
+                   + (f": {codes}" if codes else ""),
+        )
     return JSONResponse(content=report)
 
 

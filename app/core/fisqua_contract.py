@@ -9,8 +9,9 @@ that shape it is opaque to the unit, sent as it is and never parsed.
 
 Contract 1.2 is approved (archiving 5e480b7, §9). The QC decisions include
 1.6's exclusion and 1.9's missing page and requests. The digitisation queue
-(contract 1.7) is at the end: the unit's users, the queue and its
-acknowledgement.
+(contract 1.7) follows: the unit's users, the queue and its
+acknowledgement, the operators PUT carrying the unit's mode. The reference
+code lookup (contract 1.8) is at the end.
 
 Version: 0.3.3
 """
@@ -225,3 +226,27 @@ F_UNKNOWN = "unknown"
 # A 422 to the ack with this rule: the revision is malformed or later than
 # Fisqua's. The owed ack is dropped and the queue asked for afresh.
 RULE_REVISION = "revision"
+# The unit's mode (NEH-311), in the operators PUT beside `operators`:
+# `offline`, `backup` or `fisqua` (app.core.unit_mode.MODES). Fisqua shows
+# it on its Scanner screen, and warns on its queue screen when it is not
+# `fisqua`.
+F_MODE = "mode"
+
+
+# ---------------------------------------------------------------------------
+# The reference code lookup (contract 1.8)
+# ---------------------------------------------------------------------------
+
+# GET, with the reference code encoded as one path segment, as
+# encodeURIComponent encodes it (fisqua_http.encode_segment). 200
+# {referenceCode, title, level, dates: {display, start, end}} for any
+# description with that code in the workspace, published or not; 404 with
+# this rule when the workspace holds no such code. A bare 404 (an unknown
+# host, or digitisation turned off) or a 405 means this Fisqua has no 1.8.
+# 401, 403 and 429 as on the other link routes, sharing their rate limit.
+DESCRIPTIONS_PATH = "/api/capture/v1/descriptions/{ref}"
+RULE_UNKNOWN_REFERENCE_CODE = "unknown-reference-code"
+F_REFERENCE_CODE = "referenceCode"
+F_TITLE = "title"
+F_LEVEL = "level"
+F_DATES = "dates"

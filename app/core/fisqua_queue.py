@@ -26,8 +26,10 @@ offsite hold (app.core.fisqua_outbox).
   (action, notes and the item's other fields that have no column) are
   updated, and a hidden volume is shown again; its project, stem, reference
   code, title and dates are never changed. Otherwise the volume is created
-  as an import creates one (list_import.create_volume), in the project named
-  `listName`, which is created when there is none. An item the import would
+  as an import creates one (list_import.create_volume), in the unit's
+  default project while projects are hidden (app.core.unit_mode.default_project,
+  always so in fisqua mode, the only mode the sync runs in), else in the
+  project named `listName`, which is created when there is none. An item the import would
   reject, whose assignee is not a username, or whose `retakes` is not the
   agreed shape (a spot recapture's [{captuaRecordId, pairId, side}]) is
   skipped with that reason. The retakes are kept with the item for Cola;
@@ -60,12 +62,18 @@ offsite hold (app.core.fisqua_outbox).
   `unsupported`: logged once per process, asked again at the next tick, and
   never a configuration stop or a Retry-After wait, so handovers, status and
   decisions go on. Any other error takes the link's usual handling.
+* **The unit's mode** (app.core.unit_mode). Nothing here calls Fisqua
+  outside fisqua mode: the sync and the operators PUT answer
+  "off_in_this_mode". The operators body carries the unit's mode
+  (`mode`), and a change of mode sends it at once
+  (send_operators_with_mode), bypassing that gate.
 
-Version: 0.3.0
+Version: 0.3.3
 """
 
 from __future__ import annotations
 
+import contextlib
 import json
 import logging
 import threading
@@ -78,7 +86,7 @@ from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 
 from app.core import fisqua_contract as fc
-from app.core import fisqua_outbox, list_import, offsite_hold
+from app.core import fisqua_outbox, list_import, offsite_hold, unit_mode
 from app.core.fisqua_outbox import NullTransport, TransportResult
 
 logger = logging.getLogger(__name__)
@@ -152,11 +160,21 @@ class _OperatorsState:
 
 
 # Due at process start, so the first send happens whatever else runs.
+#
+# Lock order: _operators.lock first, then the unit's settings row lock.
+# unit_mode.change takes them in that order and holds both until its
+# commit; the regular send takes _operators.lock and reads the mode with a
+# plain SELECT, no row lock; unit_mode.default_project takes the row lock
+# and never _operators.lock. Nothing takes them the other way round.
 _operators = _OperatorsState()
 
 
-def operators_body(db: Session) -> dict:
-    """The PUT body: every admin and operator, active or not, by username."""
+def operators_body(db: Session, mode: Optional[str] = None) -> dict:
+    """The PUT body: every admin and operator, active or not, by username, and the unit's mode.
+
+    `mode` is the stored one (app.core.unit_mode) unless given: a change of
+    mode sends the new one before it is stored.
+    """
     from app.models.user import User
 
     users = (db.query(User.username, User.role, User.is_active)
@@ -167,17 +185,19 @@ def operators_body(db: Session) -> dict:
         {fc.F_USERNAME: username, fc.F_DISPLAY_NAME: username, fc.F_OPERATOR_ROLE: role,
          fc.F_ACTIVE: bool(active)}
         for username, role, active in users
-    ]}
+    ], fc.F_MODE: mode if mode is not None else unit_mode.mode(db)}
 
 
 def mark_operators_due() -> None:
     _operators.due = True
 
 
-def _gate() -> Optional[dict]:
+def _gate(db: Session) -> Optional[dict]:
     """The answer for a call that is not to be made now, or None."""
     if not fisqua_outbox.fisqua_configured():
         return {"status": "disabled"}
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     if offsite_hold.held("fisqua queue sync"):
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
     return None
@@ -200,7 +220,7 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
     refuses (422, logged with its problems, or 413), or one longer than
     MAX_OPERATORS, is not sent again until the list it reads is different.
     """
-    gated = _gate()
+    gated = _gate(db)
     if gated is not None:
         return gated
     transport = transport if transport is not None else get_transport()
@@ -212,6 +232,14 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
         if only_if_due and refused is None and not _operators.is_due():
             return {"status": "not_due"}
         try:
+            # Read again under the lock a change of mode holds from its PUT to
+            # its commit (unit_mode.change): a switch out of fisqua that won
+            # the lock is seen here, and the body below carries the mode
+            # stored now, never the one a switch has just replaced.
+            if not unit_mode.link_on(db):
+                db.rollback()
+                _operators.due = True
+                return unit_mode.off(db)
             if fisqua_outbox.config_error() is not None:
                 return {"status": "config_error"}
             body = operators_body(db)
@@ -235,6 +263,10 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
             _operators.due = True
             return {"status": "rate_limited"}
         answer = _call(transport, "put_operators", body)
+        if answer.outcome == unit_mode.OFF_STATUS:
+            # The transport's mode gate refused it, and nothing was sent.
+            _operators.due = True
+            return {"status": unit_mode.OFF_STATUS}
         if answer.outcome == "config_error":
             fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
             _operators.due = True
@@ -261,6 +293,65 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
         _operators.due = False
         _operators.sent_at = _monotonic()
         return {"status": "sent", "operators": len(body[fc.F_OPERATORS])}
+
+
+def send_operators_with_mode(db: Session, mode: str, *, transport=None, now: Optional[datetime] = None,
+                             lock_held: bool = False) -> tuple[bool, Optional[str]]:
+    """PUT the unit's users with `mode`, now, for a change of mode: (sent, None) or (False, why). Never raises.
+
+    Bypasses the mode gate, since it is the call that tells Fisqua the mode
+    is changing, but keeps everything else every call keeps: Fisqua
+    configured, the offsite hold, the configuration stop, the call budget
+    and its Retry-After cooldown, redaction, and a 401, 403 or redirect recorded as the stop. `why` is the
+    outcome first (`not_configured`, `held`, `config_error`,
+    `rate_limited`, `error`, `unsupported`, `refused`), then the redacted
+    error. A body Fisqua accepts counts as the regular send.
+
+    The default transport is unit_mode.get_transport, the one that bypasses
+    the transport's mode gate. `lock_held`: the caller (unit_mode.change)
+    already holds _operators.lock, which it keeps until its commit.
+    """
+    if not fisqua_outbox.fisqua_configured():
+        return False, "not_configured"
+    if offsite_hold.held("fisqua mode change"):
+        return False, "held"
+    transport = transport if transport is not None else unit_mode.get_transport()
+    if isinstance(transport, NullTransport):
+        return False, "not_configured"
+    now = fisqua_outbox._naive(now) or fisqua_outbox._now()
+    with (contextlib.nullcontext() if lock_held else _operators.lock):
+        try:
+            if fisqua_outbox.config_error() is not None:
+                return False, "config_error: the link is stopped until its configuration changes"
+            body = operators_body(db, mode)
+            db.rollback()
+        except Exception as exc:
+            db.rollback()
+            logger.exception("Reading the unit's users for Fisqua failed")
+            return False, f"error: {type(exc).__name__}"
+        if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
+            return False, f"refused: more than {fc.MAX_OPERATORS} admins and operators"
+        # Fisqua asked the unit to wait (a Retry-After on any call): nothing is sent until it has passed.
+        if fisqua_outbox.call_budget.cooling():
+            return False, "rate_limited: cooling down after Fisqua's Retry-After"
+        if not fisqua_outbox.call_budget.take():
+            return False, "rate_limited"
+        answer = _call(transport, "put_operators", body)
+        if answer.outcome == "delivered":
+            _operators.due = False
+            _operators.refused_body = None
+            _operators.sent_at = _monotonic()
+            return True, None
+        if answer.outcome == "config_error":
+            fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
+        elif answer.outcome == "unsupported":
+            _note_unsupported(answer)
+        elif answer.retry_after is not None:
+            fisqua_outbox.call_budget.cool_down(answer.retry_after)
+        # Whatever happened, the regular send goes again once the mode allows it.
+        _operators.due = True
+        detail = answer.error or (f"HTTP {answer.status_code}" if answer.status_code else answer.outcome)
+        return False, f"{answer.outcome}: {fisqua_outbox.scrub(detail)}"
 
 
 def notify_operators_changed() -> None:
@@ -432,6 +523,9 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
     live_codes: set = set()
     project_id: Optional[int] = None
     project_refused = False
+    # Never shown in fisqua mode, the only mode the sync runs in; read all
+    # the same, so the rule is the import's.
+    projects_shown = unit_mode.current(db).projects_shown
 
     def item_id_of(position: int, item: Any) -> Optional[str]:
         value = item.get(fc.F_ITEM_ID) if isinstance(item, dict) else None
@@ -491,7 +585,10 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
 
         if project_id is None and not project_refused:
             try:
-                project, _created = list_import.project_for(db, list_name, QUEUE_ACTOR)
+                if projects_shown:
+                    project, _created = list_import.project_for(db, list_name, QUEUE_ACTOR)
+                else:
+                    project, _created = unit_mode.default_project(db, QUEUE_ACTOR)
                 project_id = project.id
             except list_import.ProjectLockUnavailable as exc:
                 raise QueueRetry(str(exc)) from exc
@@ -538,7 +635,14 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
             continue
         applied.append({fc.F_ITEM_ID: item_id, fc.F_COLLECTION_ID: volume_id})
 
-    project = list_import.find_project(db, list_name)
+    if project_id is not None:
+        from app.models.project import Project
+
+        project = db.get(Project, project_id)
+    elif projects_shown:
+        project = list_import.find_project(db, list_name)
+    else:
+        project = unit_mode.stored_default_project(db)
     report = {
         "listId": QUEUE_LIST_ID,
         "listName": list_name,
@@ -595,10 +699,12 @@ def _revision_refused(answer: TransportResult) -> bool:
 
 
 def _post_ack(transport, body: dict, now: datetime) -> str:
-    """`acknowledged`, `dropped` (refused: 400, 413 or 422), `config_error` or `error`."""
+    """`acknowledged`, `dropped` (refused: 400, 413 or 422), `config_error`, `off_in_this_mode` or `error`."""
     if not fisqua_outbox.call_budget.take():
         return "error"
     answer = _call(transport, "post_queue_ack", body)
+    if answer.outcome == unit_mode.OFF_STATUS:
+        return unit_mode.OFF_STATUS
     if answer.outcome == "config_error":
         fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
         return "config_error"
@@ -631,6 +737,10 @@ def _settle_ack(transport, body: dict, now: datetime) -> Optional[dict]:
     outcome = _post_ack(transport, body, now)
     if outcome == "config_error":
         return {"status": "config_error"}
+    if outcome == unit_mode.OFF_STATUS:
+        # Refused for the unit's mode, with nothing sent: the ack stays owed,
+        # and is posted at the first tick back in fisqua mode.
+        return {"status": unit_mode.OFF_STATUS, "revision": body.get(fc.F_REVISION)}
     if outcome == "dropped":
         try:
             _write_state({"revision": None, "pendingAck": None})
@@ -648,7 +758,7 @@ def _settle_ack(transport, body: dict, now: datetime) -> Optional[dict]:
 
 def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = None) -> dict:
     """One tick: send the users when due, then poll, apply and acknowledge the queue. Never raises."""
-    gated = _gate()
+    gated = _gate(db)
     if gated is not None:
         return gated
     transport = transport if transport is not None else get_transport()
@@ -674,9 +784,15 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
                     return {**stopped, "operators": operators["status"]}
                 revision = pending.get(fc.F_REVISION)
 
+            # A switch out of fisqua mode during the tick stops it before the queue is asked for.
+            if not unit_mode.link_on(db):
+                db.rollback()
+                return {**unit_mode.off(db), "operators": operators["status"]}
             if not fisqua_outbox.call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                 return {"status": "rate_limited", "operators": operators["status"]}
             answer = _call(transport, "get_queue", revision)
+            if answer.outcome == unit_mode.OFF_STATUS:
+                return {"status": unit_mode.OFF_STATUS, "operators": operators["status"]}
             if answer.outcome == "config_error":
                 fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
                 return {"status": "config_error", "operators": operators["status"]}

@@ -34,7 +34,15 @@ without 1.7, asked again at the next poll and never a configuration error,
 so it never stops the unit's handovers, status or decisions. The rest are
 errors, retried.
 
-Version: 0.3.0
+Answers to GET of a reference code's description (contract 1.8, the
+admin's check in fisqua mode, app.core.unit_mode.check_reference_code):
+2xx with an object `description`; 404 with rule unknown-reference-code
+`unknown_code`; a bare 404, or one with another rule, or a 405
+`unsupported` (a Fisqua without 1.8); 401, 403 and any 3xx the same
+configuration errors as above; the rest, 429 included, errors. The code is
+one path segment, encoded as encodeURIComponent encodes it.
+
+Version: 0.3.3
 """
 
 from datetime import datetime, timezone
@@ -259,16 +267,79 @@ def read_queue_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def read_description_answer(response: httpx.Response) -> TransportResult:
+    code = response.status_code
+    body = _json(response)
+    if 200 <= code < 300:
+        if not isinstance(body, dict):
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=f"Fisqua answered HTTP {code} without a description object")
+        return TransportResult(outcome="description", response=body, status_code=code)
+    if code == 404 and _has_rule(body, fc.RULE_UNKNOWN_REFERENCE_CODE):
+        return TransportResult(outcome="unknown_code", response=body, status_code=code)
+    if code in UNSUPPORTED_CODES:
+        return TransportResult(outcome="unsupported", response=body, status_code=code,
+                               error=f"Fisqua has no contract 1.8 lookup here (HTTP {code})")
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
+    return _transient(response, body)
+
+
+# What encodeURIComponent leaves as it is, beside the letters, digits and
+# "-_.~" that urllib.parse.quote always leaves.
+_URI_COMPONENT_SAFE = "!*'()"
+
+
+def encode_segment(value: str) -> str:
+    """`value` as one URL path segment, encoded as JavaScript's encodeURIComponent encodes it, but never a dot segment."""
+    from urllib.parse import quote
+
+    encoded = quote(value, safe=_URI_COMPONENT_SAFE)
+    # "." and ".." would be read as dot segments and removed from the path
+    # before the request is sent; %2E decodes to the same code.
+    if encoded in (".", ".."):
+        encoded = encoded.replace(".", "%2E")
+    return encoded
+
+
 def _failed(exc: Exception) -> TransportResult:
     kind = "timeout" if isinstance(exc, httpx.TimeoutException) else type(exc).__name__
     return TransportResult(outcome="error", error=f"Fisqua could not be reached: {kind}: {exc}")
 
 
 class HttpFisquaTransport:
+    """The only object that opens a connection to Fisqua.
+
+    **The mode gate.** Every request reads the unit's stored mode
+    (app.core.unit_mode.stored_mode_now, on a session of its own) just
+    before it is made, and is not made unless the mode is `fisqua`: the
+    method answers outcome `off_in_this_mode` instead, which every caller
+    handles. Why this covers every call to Fisqua:
+
+    * every request goes through `self._client`, which is private and made
+      here, and nothing else in the backend speaks to Fisqua (the hosts are
+      only in fisqua_contract and fisqua_outbox.base_url);
+    * the methods that use `self._client` are exactly the seven of the
+      FisquaTransport protocol: send_manifest, get_status, get_decisions,
+      put_operators, get_queue, post_queue_ack and get_description; each
+      calls `self._mode_refusal()` before it touches the client
+      (tests/unit/test_unit_mode.py checks both by reading this class);
+    * the gate is skipped only for a transport built with
+      `bypass_mode` set, which only app.core.unit_mode.get_transport asks
+      for, for the calls a change of mode makes on purpose: the switch PUT
+      to fisqua, the down-switch PUT, the resend of the stored mode after a
+      change that did not commit, and an admin's reference code lookup.
+
+    The call sites' own mode checks stop a run early; this is the guarantee.
+    A mode that cannot be read counts as not `fisqua`.
+    """
+
     def __init__(self, base_url: str, token: str, *, timeout: float = 60.0,
-                 client: Optional[httpx.Client] = None):
+                 client: Optional[httpx.Client] = None, bypass_mode: bool = False):
         self._base = base_url.rstrip("/")
         self._token = token
+        self._bypass_mode = bypass_mode
         self._client = client or httpx.Client(
             timeout=httpx.Timeout(timeout, connect=CONNECT_TIMEOUT_SECONDS),
             verify=True, follow_redirects=False)
@@ -276,10 +347,25 @@ class HttpFisquaTransport:
     def __repr__(self) -> str:
         return f"HttpFisquaTransport({self._base!r})"
 
+    def _mode_refusal(self) -> Optional[TransportResult]:
+        """None when the request may be made; else the `off_in_this_mode` answer, with nothing sent."""
+        if self._bypass_mode:
+            return None
+        from app.core import unit_mode
+
+        mode = unit_mode.stored_mode_now()
+        if mode == unit_mode.FISQUA:
+            return None
+        return TransportResult(outcome=unit_mode.OFF_STATUS,
+                               error=f"the unit is in {mode or 'an unreadable'} mode, so nothing is sent to Fisqua")
+
     def _headers(self) -> dict:
         return {fc.AUTH_HEADER: f"{fc.AUTH_SCHEME} {self._token}", "Accept": "application/json"}
 
     def send_manifest(self, manifest: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.post(self._base + fc.MANIFESTS_PATH, json=manifest, headers=self._headers())
         except httpx.HTTPError as exc:
@@ -287,6 +373,9 @@ class HttpFisquaTransport:
         return read_send_answer(response, sent_id=manifest.get("id") if isinstance(manifest, dict) else None)
 
     def get_status(self, refs: Iterable[str]) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         refs = list(refs)
         if len(refs) > fc.MAX_REFS_PER_CALL:
             raise ValueError(f"at most {fc.MAX_REFS_PER_CALL} refs per call, not {len(refs)}")
@@ -298,6 +387,9 @@ class HttpFisquaTransport:
         return read_status_answer(response)
 
     def get_decisions(self, ref: str) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         from urllib.parse import quote
 
         path = fc.DECISIONS_PATH.format(ref=quote(ref, safe=""))
@@ -308,6 +400,9 @@ class HttpFisquaTransport:
         return read_decisions_answer(response)
 
     def put_operators(self, body: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.put(self._base + fc.OPERATORS_PATH, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
@@ -315,6 +410,9 @@ class HttpFisquaTransport:
         return read_operators_answer(response)
 
     def get_queue(self, revision: Optional[str]) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         headers = self._headers()
         if revision:
             headers[fc.IF_NONE_MATCH_HEADER] = f'"{revision}"'
@@ -325,11 +423,25 @@ class HttpFisquaTransport:
         return read_queue_answer(response)
 
     def post_queue_ack(self, body: dict) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
         try:
             response = self._client.post(self._base + fc.QUEUE_ACK_PATH, json=body, headers=self._headers())
         except httpx.HTTPError as exc:
             return _failed(exc)
         return read_queue_ack_answer(response)
+
+    def get_description(self, ref: str) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
+        path = fc.DESCRIPTIONS_PATH.format(ref=encode_segment(ref))
+        try:
+            response = self._client.get(self._base + path, headers=self._headers())
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_description_answer(response)
 
     def close(self) -> None:
         self._client.close()

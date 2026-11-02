@@ -56,7 +56,7 @@ Three rules it is built around:
 Nothing here deletes or overwrites anything at the destination, and the B2 key
 is scoped so that it could not.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import gzip
@@ -696,7 +696,8 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
     """Dump, upload, verify, record. Never raises; the caller gets a status.
 
     Statuses: "disabled" (no remote or no tenant prefix configured),
-    "misconfigured" (a tenant that is not a prefix), "held" (the upload hold
+    "misconfigured" (a tenant that is not a prefix), "off_in_this_mode" (the
+    unit is in offline mode, app.core.unit_mode: no dump is taken), "held" (the upload hold
     file exists, app.core.offsite_hold: no dump is taken), "up-to-date"
     (already verified today), "verified", "failed" (the bucket answered and
     the answer was bad, or the dump or upload failed), "aborted" (verification
@@ -717,6 +718,13 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
         return {"status": "misconfigured", "error": str(exc)}
     if tenant is None:
         return {"status": "disabled"}
+
+    # Read on every run, after the sweep: offline mode takes no dump, and a
+    # change of mode takes effect at the next tick (app.core.unit_mode).
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        return unit_mode.off(db)
 
     # Read on every run, after the sweep: a held unit still clears its card.
     if offsite_hold.held("catalogue backup"):

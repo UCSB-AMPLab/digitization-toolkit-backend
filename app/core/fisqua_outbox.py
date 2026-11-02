@@ -74,6 +74,10 @@ app.core.fisqua_contract. Here:
   scheduler tick, after the status poll, sends the unit's users when due
   and polls, applies and acknowledges the queue, through the same
   transport, call budget, configuration stop and hold.
+* **The unit's mode** (app.core.unit_mode). The send pass and the poll
+  make no call outside fisqua mode. Handovers still queue their rows while
+  Fisqua is configured, whatever the mode, and those rows wait until the
+  unit returns to fisqua.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
@@ -310,6 +314,9 @@ class FisquaTransport(Protocol):
 
     def post_queue_ack(self, body: dict) -> TransportResult: ...
 
+    # Contract 1.8 (app.core.unit_mode.check_reference_code).
+    def get_description(self, ref: str) -> TransportResult: ...
+
 
 class NullTransport:
     """Sends nothing, for a unit with Fisqua not configured. The worker leaves `ready` rows as they are."""
@@ -332,15 +339,23 @@ class NullTransport:
     def post_queue_ack(self, body: dict) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
+    def get_description(self, ref: str) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
 
-def get_transport() -> FisquaTransport:
-    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured."""
+
+def get_transport(bypass_mode: bool = False) -> FisquaTransport:
+    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured.
+
+    Its every request is refused outside fisqua mode (fisqua_http.HttpFisquaTransport)
+    unless `bypass_mode`, which only app.core.unit_mode asks for.
+    """
     url = base_url()
     if url is None:
         return NullTransport()
     from app.core.fisqua_http import HttpFisquaTransport
 
-    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS)
+    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS,
+                               bypass_mode=bypass_mode)
 
 
 # ---------------------------------------------------------------------------
@@ -1189,6 +1204,13 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
             logger.info("Fisqua accepted manifest %s of volume %s: %s",
                         row.manifest_id, row.collection_id, answer.status or "no state given")
         result.delivered += 1
+    elif answer.outcome == "off_in_this_mode":
+        # The transport refused it for the unit's mode, and sent nothing: it
+        # goes back to ready, without an attempt counted, and is sent once
+        # the unit is back in fisqua mode.
+        _end_send(db, row.id, state="ready", attempts=attempts - 1)
+        result.status = "off_in_this_mode"
+        return False
     elif answer.outcome == "config_error":
         # Not this manifest's fault: it goes back to ready, to be sent as it
         # is once the configuration is changed.
@@ -1236,7 +1258,8 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
     Statuses: "rate_limited" (the shared call_budget was spent: the rest is
-    sent at a later pass), "disabled" (Fisqua not configured), "held" (the offsite upload
+    sent at a later pass), "disabled" (Fisqua not configured), "off_in_this_mode" (the
+    unit is not in fisqua mode, app.core.unit_mode: nothing is promoted or sent), "held" (the offsite upload
     hold exists, app.core.offsite_hold: nothing is promoted or sent, and no
     call is made), "no_transport" (rows are promoted, nothing is sent), "config_error" (Fisqua refused the
     configuration: rows are promoted, nothing is sent until it changes), "done",
@@ -1246,6 +1269,12 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    # Outside fisqua mode the link makes no call (app.core.unit_mode); the
+    # rows stay as they are and go out if the unit returns to fisqua.
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     # Promotion too: while the hold exists the one-time commands are still
     # completing the objects' state, and a volume can read as received, or
     # not exportable, on what they have not yet written.
@@ -1261,6 +1290,10 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
     def stopping() -> bool:
         if stop is not None and stop.is_set():
             result.status = "stopped"
+            return True
+        # A switch out of fisqua mode stops the pass before the next row.
+        if not unit_mode.link_on(db):
+            result.status = unit_mode.OFF_STATUS
             return True
         return False
 
@@ -1285,7 +1318,7 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
                 # Nothing is built under the software Fisqua could not read,
                 # but the one manifest of a retest, once an interval.
                 if not _retest_version_stop(db, transport, clock, result, stopping):
-                    if result.status != "stopped":
+                    if result.status not in ("stopped", "off_in_this_mode"):
                         result.status = "config_error"
                     return result.as_dict()
                 unit_stop = None
@@ -1408,12 +1441,17 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
     """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises.
 
     Answers "held", with no call, while the offsite upload hold exists
-    (app.core.offsite_hold).
+    (app.core.offsite_hold), and "off_in_this_mode", with no call, outside
+    fisqua mode (app.core.unit_mode).
     """
     from app.models.fisqua import FisquaOutbox
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     if offsite_hold.held("fisqua status poll"):
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
     transport = transport if transport is not None else get_transport()
@@ -1443,6 +1481,10 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
             offered = {}
             for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
                 chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
+                # A switch out of fisqua mode stops the poll before the next call.
+                if not unit_mode.link_on(db):
+                    db.rollback()
+                    return {**result, "status": unit_mode.OFF_STATUS}
                 if not call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
                     result["status"] = "rate_limited"
                     break
@@ -1453,6 +1495,8 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                 except Exception as exc:
                     answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
                 answer = _redacted(answer)
+                if answer.outcome == "off_in_this_mode":
+                    return {**result, "status": "off_in_this_mode"}
                 if answer.outcome == "config_error":
                     record_config_error(answer.status_code, answer.reason, now)
                     return {**result, "status": "config_error"}
@@ -1500,6 +1544,9 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
                                 response=entry, last_error=None, next_attempt_at=None,
                                 external_id=str(volume_id) if volume_id not in (None, "") else None):
                             result["recovered"] += 1
+            if not unit_mode.link_on(db):
+                db.rollback()
+                return {**result, "status": unit_mode.OFF_STATUS}
             if _fetch_decisions(db, transport, offered, now, result) is False:
                 return {**result, "status": "config_error"}
         except Exception:
@@ -1550,7 +1597,13 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     if _decisions_cursor is not None:
         at = bisect_right([ref for _cid, (ref, _d) in order], _decisions_cursor)
         order = order[at:] + order[:at]
+    from app.core import unit_mode
+
     for cid, (ref, decisions_id) in order:
+        if not unit_mode.link_on(db):
+            db.rollback()
+            result["status"] = unit_mode.OFF_STATUS
+            break
         status = db.get(FisquaStatus, cid)
         seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
         db.rollback()
@@ -1566,6 +1619,9 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
         except Exception as exc:
             answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
         answer = _redacted(answer)
+        if answer.outcome == "off_in_this_mode":
+            result["status"] = "off_in_this_mode"
+            break
         if answer.outcome == "config_error":
             record_config_error(answer.status_code, answer.reason, now)
             return False

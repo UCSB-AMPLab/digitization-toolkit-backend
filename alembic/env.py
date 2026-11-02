@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.3
 
 from logging.config import fileConfig
 import os
@@ -26,6 +26,7 @@ import app.models.system_log  # noqa: F401
 import app.models.project_member  # noqa: F401
 import app.models.offsite_object  # noqa: F401
 import app.models.fisqua  # noqa: F401
+import app.models.unit_settings  # noqa: F401
 
 config = context.config
 

@@ -6,12 +6,12 @@ turns that refusal into a reject of that item with a fixed reason; the other
 items are still created. A list whose project name folds to an existing stem
 is refused whole, before any volume is written.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
 
-from tests.unit.test_list_import import _as, _item, _list_with, _post, _volumes, reports_root  # noqa: F401
+from tests.unit.test_list_import import _as, _item, _list_with, _post, _volumes, projects_shown, reports_root  # noqa: F401
 
 
 @pytest.mark.unit

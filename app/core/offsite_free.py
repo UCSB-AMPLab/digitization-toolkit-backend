@@ -70,7 +70,14 @@ the hold, the listing) and run the rest as a background job.
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
 
-Version: 0.2.0
+In offline mode (app.core.unit_mode) the bucket copy is not kept up, so no
+file on the unit is removed on its account: freeing and mark-freed are
+refused (409, code `off_in_this_mode`, for the route; ValueError for the
+command). Reading from the bucket changes nothing on either side, so
+restore and the dry run are allowed in every mode, as are the adopt
+commands of app.core.image_upload.
+
+Version: 0.3.3
 """
 
 import json
@@ -664,6 +671,22 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
             "manifest": str(manifest.path) if manifest.path else None}
 
 
+OFF_IN_THIS_MODE = "off_in_this_mode"
+# Freeing removes the unit's copy because the bucket keeps one. In offline mode
+# the bucket copy is no longer kept up, so no local copy is removed or marked
+# removed; reading from the bucket (restore, the dry run) stays allowed.
+OFFLINE_MESSAGE = ("The unit is in offline mode, so the bucket copy is not kept up and no file on the unit is "
+                   "freed or marked freed. Switch to a mode with the offsite copy to free space.")
+
+
+def _refuse_offline(db: Session) -> None:
+    """FreeRefused (409, code off_in_this_mode) in offline mode (app.core.unit_mode); backup and fisqua pass."""
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        raise FreeRefused(OFFLINE_MESSAGE, detail={"code": OFF_IN_THIS_MODE, "mode": unit_mode.mode(db)})
+
+
 def _prepare_free(db: Session, collection_id: int):
     """The checks a free must pass before it starts; returns (collection, hold). The caller releases the hold.
 
@@ -674,6 +697,7 @@ def _prepare_free(db: Session, collection_id: int):
     """
     from app.core import offsite_hold
 
+    _refuse_offline(db)
     if offsite_hold.is_held():
         raise FreeRefused(HOLD_MESSAGE, detail={"hold_file": str(offsite_hold.hold_file())})
     collection = _stem_volume(db, collection_id)
@@ -872,6 +896,7 @@ def _prepare_restore(db: Session, collection_id: int):
     from app.core.storage_override import refuse_writes_under_unusable_root
     from capture.project_manager import volume_root
 
+    # Not refused in offline mode: restore reads from the bucket and sends nothing out.
     collection = _stem_volume(db, collection_id)
     if not config.settings.OFFSITE_READ_REMOTE.strip():
         raise FreeRefused(NO_READ_REMOTE_MESSAGE)
@@ -1052,13 +1077,17 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
     Runs in a process of its own, outside the backend's hold, so each file's
     absence is checked again right before its row is written. Raises
     ValueError for an unknown stem and VerificationUnavailable when a
-    listing does not answer.
+    listing does not answer, and ValueError in offline mode (app.core.unit_mode).
     """
     from app.core.image_upload import local_file
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        raise ValueError("the unit is in offline mode, so mark-freed, which lists the bucket, is refused")
     collection = db.query(Collection).filter(Collection.filename_stem == stem).one_or_none()
     if collection is None:
         raise ValueError(f"no volume has the file name stem {stem!r}")

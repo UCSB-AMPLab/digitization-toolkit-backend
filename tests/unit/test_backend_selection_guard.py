@@ -18,7 +18,7 @@ these tests run in CI whatever their names say.
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
@@ -176,6 +176,9 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
         core_db, "SessionLocal", lambda: type("S", (), {"close": lambda self: None})()
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
+    # The unit's mode is written on a database these stubs do not have.
+    import app.core.unit_mode as unit_mode
+    monkeypatch.setattr(unit_mode, "initialise", lambda: None)
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto")
 
     served = []
@@ -208,6 +211,9 @@ def test_the_lifespan_still_starts_on_a_value_it_has(monkeypatch):
         core_db, "SessionLocal", lambda: type("S", (), {"close": lambda self: None})()
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
+    # The unit's mode is written on a database these stubs do not have.
+    import app.core.unit_mode as unit_mode
+    monkeypatch.setattr(unit_mode, "initialise", lambda: None)
     monkeypatch.setattr(capture_service, "shutdown_backend", lambda: None)
     monkeypatch.setattr(capture_service.settings, "CAMERA_BACKEND", "gphoto2")
 

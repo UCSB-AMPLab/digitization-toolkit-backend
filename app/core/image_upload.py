@@ -53,7 +53,7 @@ while it is uploaded. A renumber renames nothing. Where a hard link cannot
 be made (a file system without hard links), a copy is made there instead,
 and removed after the upload.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import argparse
@@ -807,9 +807,11 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
     """One pass over the pending objects. Never raises; the caller gets a status.
 
     Statuses: "disabled" (no remote or no tenant), "misconfigured" (a tenant
-    that is not a prefix), "held" (the hold file exists, app.core.offsite_hold:
+    that is not a prefix), "off_in_this_mode" (the unit is in offline mode,
+    app.core.unit_mode: nothing is listed or uploaded), "held" (the hold file exists, app.core.offsite_hold:
     nothing is listed or uploaded; also the status of a run stopped between
-    objects because the file appeared), "done", "stopped" (asked to stop between
+    objects because the file appeared; "off_in_this_mode" likewise for a
+    switch to offline), "done", "stopped" (asked to stop between
     objects), "aborted" (a listing did not answer), "failed" (an upload failed).
     """
     result = RunResult()
@@ -822,6 +824,12 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
         return {"status": "misconfigured", "error": str(exc)}
     if tenant is None:
         return {"status": "disabled"}
+    # Read on every run, as the hold is: offline mode uploads nothing, and a
+    # change of mode takes effect at the next tick (app.core.unit_mode).
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        return unit_mode.off(db)
     # Read on every run, so a hold created or removed while the backend runs
     # takes effect at the next tick.
     if offsite_hold.held("image upload"):
@@ -838,6 +846,11 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
                 result.status = "held"
                 logger.info("offsite uploads are on hold: %s exists; image upload stopped",
                             offsite_hold.hold_file())
+                break
+            # And a switch to offline mode, the same way.
+            if not unit_mode.offsite_on(db):
+                result.status = unit_mode.OFF_STATUS
+                logger.info("the unit is now in offline mode; image upload stopped")
                 break
             try:
                 _process(db, tenant, item, result)

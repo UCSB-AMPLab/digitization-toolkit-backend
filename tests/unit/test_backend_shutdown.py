@@ -5,7 +5,7 @@ process, and their cleanup is what waits for whatever is running and releases
 them. The application lifespan calls it on the way out; without that call, a
 restart would drop the sessions rather than close them.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import pytest
@@ -93,6 +93,9 @@ def test_the_application_lifespan_closes_the_backend_on_the_way_out(monkeypatch)
         core_db, "SessionLocal", lambda: type("S", (), {"close": lambda self: None})()
     )
     monkeypatch.setattr(storage_ops, "reconcile_pending_rename", lambda db: None)
+    # The unit's mode is written on a database these stubs do not have.
+    import app.core.unit_mode as unit_mode
+    monkeypatch.setattr(unit_mode, "initialise", lambda: None)
 
     closed = []
     monkeypatch.setattr(

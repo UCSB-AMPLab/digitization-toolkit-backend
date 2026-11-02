@@ -9,7 +9,7 @@ tests/conftest.py imports every model, which hides that failure in-process, so
 each command runs here in a fresh interpreter (cli_session_worker.py) against
 the SQLite file the db_session fixture has created.
 
-Version: 0.2.0
+Version: 0.3.3
 """
 import json
 import os
@@ -33,6 +33,10 @@ def seeded(db_session):
     db_session.add(project)
     db_session.commit()
     db_session.add(Collection(name="V", project_id=project.id, filename_stem=STEM))
+    # mark-freed is refused in offline mode (app.core.unit_mode), the mode a
+    # unit with nothing configured starts in.
+    from app.models.unit_settings import UnitSettings
+    db_session.add(UnitSettings(id=1, mode="backup"))
     db_session.commit()
     return db_session.get_bind().url.database
 
