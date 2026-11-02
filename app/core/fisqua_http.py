@@ -328,8 +328,9 @@ class HttpFisquaTransport:
     * the gate is skipped only for a transport built with
       `bypass_mode` set, which only app.core.unit_mode.get_transport asks
       for, for the calls a change of mode makes on purpose: the switch PUT
-      to fisqua, the down-switch PUT, the resend of the stored mode after a
-      change that did not commit, and an admin's reference code lookup.
+      to fisqua, the down-switch PUT, and the resend of the stored mode
+      after a change that did not commit. An admin's reference code lookup
+      does not bypass it (unit_mode.get_lookup_transport).
 
     The call sites' own mode checks stop a run early; this is the guarantee.
     A mode that cannot be read counts as not `fisqua`.
