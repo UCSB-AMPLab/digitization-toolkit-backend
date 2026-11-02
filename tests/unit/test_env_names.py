@@ -4,6 +4,9 @@ Every prefixed setting is read as CAPTUA_<X> and as DTK_<X>, the name field
 units carry in their .env and offsite.env. A
 CAPTUA_ name wins over its DTK_ name wherever either is set; within one family
 the process environment wins over the files, and offsite.env over ../.env.
+A CAPTUA_ name set to the empty string counts as unset, as in
+scripts/captua-env.sh, so the DTK_ name or the default is read instead; names
+without a prefix are read as before, empty or not.
 
     python -m pytest tests/unit/test_env_names.py
 
@@ -193,3 +196,131 @@ def test_the_schema_check_skip_reads_both_names(monkeypatch, variables, skipped)
     for key, value in variables.items():
         monkeypatch.setenv(key, value)
     assert _skip_requested() is skipped
+
+
+# An empty CAPTUA_ value counts as unset, as ${VAR:-default} does in
+# scripts/captua-env.sh: the DTK_ name, or the default, is read instead.
+
+_EMPTY_NEW_CASES = [
+    # (suffix, DTK_ value, field, expected value)
+    ("OFFSITE_TENANT", "rionegro", "OFFSITE_TENANT", "rionegro"),
+    ("FISQUA_POLL_INTERVAL", "900", "FISQUA_POLL_INTERVAL_SECONDS", 900),
+    ("FISQUA_ROTATE_DEG", "true", "FISQUA_ROTATE_DEG", True),
+]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("suffix, old_value, field, expected", _EMPTY_NEW_CASES)
+def test_an_empty_new_name_in_the_environment_falls_back_to_the_old_name(
+    monkeypatch, suffix, old_value, field, expected
+):
+    monkeypatch.setenv(f"CAPTUA_{suffix}", "")
+    monkeypatch.setenv(f"DTK_{suffix}", old_value)
+    assert getattr(Settings(_env_file=None), field) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("suffix, old_value, field, expected", _EMPTY_NEW_CASES)
+def test_an_empty_new_name_in_dot_env_falls_back_to_the_old_name_in_offsite_env(
+    tmp_path, suffix, old_value, field, expected
+):
+    dot_env = _env_file(tmp_path / ".env", **{f"CAPTUA_{suffix}": ""})
+    offsite = _env_file(tmp_path / "offsite.env", **{f"DTK_{suffix}": old_value})
+    assert getattr(Settings(_env_file=(dot_env, offsite)), field) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("suffix, old_value, field, expected", _EMPTY_NEW_CASES)
+def test_an_empty_new_name_in_the_environment_falls_back_to_the_old_name_in_a_file(
+    monkeypatch, tmp_path, suffix, old_value, field, expected
+):
+    monkeypatch.setenv(f"CAPTUA_{suffix}", "")
+    offsite = _env_file(tmp_path / "offsite.env", **{f"DTK_{suffix}": old_value})
+    assert getattr(Settings(_env_file=(offsite,)), field) == expected
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "suffix, field, default",
+    [
+        ("OFFSITE_TENANT", "OFFSITE_TENANT", ""),
+        ("OFFSITE_BWLIMIT", "OFFSITE_BWLIMIT", "750k"),
+        ("FISQUA_POLL_INTERVAL", "FISQUA_POLL_INTERVAL_SECONDS", 600),
+        ("FISQUA_ROTATE_DEG", "FISQUA_ROTATE_DEG", False),
+    ],
+)
+def test_an_empty_new_name_without_an_old_name_gives_the_default(monkeypatch, tmp_path, suffix, field, default):
+    monkeypatch.setenv(f"CAPTUA_{suffix}", "")
+    assert getattr(Settings(_env_file=None), field) == default
+    monkeypatch.delenv(f"CAPTUA_{suffix}")
+    dot_env = _env_file(tmp_path / ".env", **{f"CAPTUA_{suffix}": ""})
+    assert getattr(Settings(_env_file=(dot_env,)), field) == default
+
+
+@pytest.mark.unit
+def test_a_whitespace_new_name_is_not_empty(monkeypatch):
+    """Only "" counts as empty, as in the script; a space is a value."""
+    monkeypatch.setenv("CAPTUA_OFFSITE_TENANT", " ")
+    monkeypatch.setenv("DTK_OFFSITE_TENANT", "rionegro")
+    assert Settings(_env_file=None).OFFSITE_TENANT == " "
+
+
+@pytest.mark.unit
+def test_an_empty_unprefixed_name_is_still_read_as_empty(monkeypatch, tmp_path):
+    monkeypatch.setenv("DATABASE_HOST", "")
+    assert Settings(_env_file=None).DATABASE_HOST == ""
+    monkeypatch.delenv("DATABASE_HOST")
+    dot_env = _env_file(tmp_path / ".env", BOOTSTRAP_TOKEN="", DATABASE_HOST="")
+    s = Settings(_env_file=(dot_env,))
+    assert s.DATABASE_HOST == ""
+    assert s.BOOTSTRAP_TOKEN == ""
+
+
+@pytest.mark.unit
+def test_an_empty_new_name_is_reported_as_neither_set_nor_in_conflict(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAPTUA_OFFSITE_TENANT", "")
+    monkeypatch.setenv("DTK_OFFSITE_TENANT", "rionegro")
+    offsite = _env_file(tmp_path / "offsite.env", CAPTUA_FISQUA_ENV="", DTK_FISQUA_ENV="staging")
+    report = config.environment_names_report((offsite,))
+    assert "CAPTUA_OFFSITE_TENANT" not in report["new"]
+    assert "CAPTUA_FISQUA_ENV" not in report["new"]
+    assert {"DTK_OFFSITE_TENANT", "DTK_FISQUA_ENV"} <= set(report["old"])
+    assert report["conflicts"] == []
+
+
+@pytest.mark.unit
+def test_a_non_empty_new_name_is_still_reported_and_in_conflict(monkeypatch):
+    monkeypatch.setenv("CAPTUA_OFFSITE_TENANT", "new")
+    monkeypatch.setenv("DTK_OFFSITE_TENANT", "old")
+    report = config.environment_names_report(())
+    assert "CAPTUA_OFFSITE_TENANT" in report["new"]
+    assert report["conflicts"] == ["OFFSITE_TENANT"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "variables, skipped",
+    [
+        ({"CAPTUA_SKIP_SCHEMA_CHECK": "", "DTK_SKIP_SCHEMA_CHECK": "1"}, True),
+        ({"CAPTUA_SKIP_SCHEMA_CHECK": ""}, False),
+    ],
+)
+def test_an_empty_schema_check_skip_falls_back_to_the_old_name(monkeypatch, variables, skipped):
+    from app.core.schema import _skip_requested
+
+    monkeypatch.delenv("CAPTUA_SKIP_SCHEMA_CHECK", raising=False)
+    monkeypatch.delenv("DTK_SKIP_SCHEMA_CHECK", raising=False)
+    for key, value in variables.items():
+        monkeypatch.setenv(key, value)
+    assert _skip_requested() is skipped
+
+
+@pytest.mark.unit
+def test_an_empty_new_name_in_the_environment_leaves_the_new_name_in_a_file(monkeypatch, tmp_path):
+    monkeypatch.setenv("CAPTUA_OFFSITE_TENANT", "")
+    monkeypatch.setenv("DTK_OFFSITE_TENANT", "old")
+    offsite = _env_file(tmp_path / "offsite.env", CAPTUA_OFFSITE_TENANT="new")
+    assert Settings(_env_file=(offsite,)).OFFSITE_TENANT == "new"
+    report = config.environment_names_report((offsite,))
+    assert "CAPTUA_OFFSITE_TENANT" in report["new"]
+    assert report["conflicts"] == ["OFFSITE_TENANT"]
