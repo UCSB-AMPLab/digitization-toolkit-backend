@@ -477,11 +477,12 @@ def default_project(db: Session, actor: Optional[str]):
 # ---------------------------------------------------------------------------
 
 def get_transport():
-    """The transport for the calls a change of mode and an admin's lookup make on purpose (a seam for tests).
+    """The transport for the calls a change of mode makes on purpose (a seam for tests).
 
     It bypasses the transport's mode gate (fisqua_http.HttpFisquaTransport):
-    the switch PUT to fisqua, the down-switch PUT, the resend of the stored
-    mode, and the 1.8 lookup. Nothing else asks for a bypass.
+    the switch PUT to fisqua, the down-switch PUT, and the resend of the
+    stored mode. Nothing else asks for a bypass; the 1.8 lookup uses
+    get_lookup_transport, which keeps the gate.
     """
     from app.core import fisqua_outbox
 
