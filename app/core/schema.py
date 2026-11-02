@@ -7,7 +7,7 @@ is stamped at head, turning a late, obscure 500 into a clear, immediate failure.
 
 Set CAPTUA_SKIP_SCHEMA_CHECK=1 to bypass (e.g. tooling that manages the schema out
 of band); DTK_SKIP_SCHEMA_CHECK, the other name every setting has, is read
-when CAPTUA_SKIP_SCHEMA_CHECK is unset. If Alembic or the config cannot be loaded the check is skipped with a
+when CAPTUA_SKIP_SCHEMA_CHECK is unset or empty. If Alembic or the config cannot be loaded the check is skipped with a
 warning; only a genuine revision mismatch aborts startup.
 
 Version: 0.1.0-beta
@@ -28,8 +28,9 @@ class SchemaOutOfDateError(RuntimeError):
 
 
 def _skip_requested() -> bool:
+    # An empty CAPTUA_ value counts as unset, as in app.core.config.
     val = os.environ.get("CAPTUA_SKIP_SCHEMA_CHECK")
-    if val is None:
+    if not val:
         val = os.environ.get("DTK_SKIP_SCHEMA_CHECK", "")
     return val.strip().lower() not in ("", "0", "false", "no")
 
