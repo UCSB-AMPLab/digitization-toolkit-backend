@@ -1311,6 +1311,14 @@ def test_only_unit_mode_asks_for_a_bypass(backend_root):
 
 
 @pytest.mark.unit
+def test_the_lookup_transport_is_gated_and_the_mode_change_transport_is_not(fisqua):
+    """The lookup needs no bypass; only the mode-change PUTs use one."""
+    from app.core import unit_mode
+    assert unit_mode.get_lookup_transport()._bypass_mode is False
+    assert unit_mode.get_transport()._bypass_mode is True
+
+
+@pytest.mark.unit
 def test_a_send_refused_by_the_gate_leaves_the_row_ready_without_an_attempt(db_session, fisqua, monkeypatch):
     """With the run's own mode checks out of the way, the transport still sends nothing."""
     from app.core import fisqua_outbox, unit_mode
