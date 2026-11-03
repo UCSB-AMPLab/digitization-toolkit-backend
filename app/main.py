@@ -93,13 +93,17 @@ app = FastAPI(lifespan=lifespan)
 # cross-origin too, not only the dev server. A response header the frontend
 # reads must be listed in expose_headers: Retry-After is, so the login page
 # can say how long a lockout lasts.
+# The browser session is an httpOnly cookie (app/api/auth.py), so credentials
+# are allowed and the origins must be an explicit list, never "*"
+# (app/core/config.py refuses to start with one). X-Requested-With is the
+# CSRF header that a cookie-authenticated state change must carry.
 # Methods and headers are restricted to those required by the app.
 app.add_middleware(
     CORSMiddleware,
     allow_origins=settings.CORS_ORIGINS,
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
-    allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token"],
+    allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token", "X-Requested-With"],
     expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "Retry-After"],
 )
 

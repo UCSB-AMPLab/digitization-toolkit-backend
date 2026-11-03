@@ -2,7 +2,7 @@
 
 import hmac
 
-from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request
+from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
 from sqlalchemy.orm import Session
 from typing import List, Optional
@@ -25,6 +25,101 @@ users_router = APIRouter()  # mounted at /users in main.py
 # answer"); each dependency below raises HTTPException(401, ...) explicitly.
 # See NEH-167.
 _optional_bearer = HTTPBearer(auto_error=False)
+
+
+# ---------------------------------------------------------------------------
+# Session cookie (NEH-61)
+#
+# The browser app authenticates with an httpOnly cookie that holds the same
+# signed token login issues. No page script can read the cookie, and no URL
+# carries the token: the browser attaches the cookie itself to fetch calls,
+# <img src> requests and download links. API clients and the e2e scripts
+# authenticate with `Authorization: Bearer`; when a request carries both, the
+# backend uses the header and ignores the cookie. The backend reads no
+# `?token=` query parameter anywhere.
+#
+# CSRF: with SameSite=Strict, the browser leaves the cookie off any request
+# that a cross-site page starts. In addition, a cookie-authenticated request
+# with a state-changing method must carry an X-Requested-With header. A
+# cross-site page can add a custom header only through a CORS preflight, and
+# CORSMiddleware answers the preflight only for the origins in CORS_ORIGINS,
+# so a forged form post or a no-cors fetch from another site cannot include
+# it. The backend checks this header rather than Origin because the allowed
+# origins differ per unit (the unit's host name or IP, localhost in the
+# kiosk, the dev server), and an Origin check would have to repeat CORS_ORIGINS exactly.
+# Bearer requests skip the check: a browser never adds an Authorization header
+# on its own.
+#
+# Tokens stay stateless. Logout clears the cookie, but a token copied out of
+# it remains valid until its exp; the backend keeps no revocation list.
+# ---------------------------------------------------------------------------
+
+SESSION_COOKIE_NAME = "dtk_session"
+CSRF_HEADER = "X-Requested-With"
+_SAFE_METHODS = frozenset({"GET", "HEAD", "OPTIONS"})
+
+
+def _request_is_https(request: Request) -> bool:
+    """True when the browser reached the backend over HTTPS, directly or through nginx.
+
+    The appliance serves plain HTTP on the LAN (nginx.conf listens on 80
+    only), and a browser never returns a Secure cookie over HTTP, so the
+    backend sets Secure only when the request really is HTTPS. nginx passes
+    the scheme it received in X-Forwarded-Proto; without that header the
+    backend uses the scheme of the request it received.
+    """
+    forwarded = request.headers.get("x-forwarded-proto", "")
+    if forwarded:
+        return forwarded.split(",")[0].strip().lower() == "https"
+    return request.url.scheme == "https"
+
+
+def set_session_cookie(response: Response, request: Request, token: str) -> None:
+    """Set the session cookie on `response`, with a Max-Age equal to the token's lifetime."""
+    response.set_cookie(
+        key=SESSION_COOKIE_NAME,
+        value=token,
+        max_age=settings.ACCESS_TOKEN_EXPIRE_SECONDS,
+        path="/",
+        httponly=True,
+        samesite="strict",
+        secure=_request_is_https(request),
+    )
+
+
+def clear_session_cookie(response: Response, request: Request) -> None:
+    """Tell the browser to drop the session cookie (Max-Age=0, same Path and flags)."""
+    response.delete_cookie(
+        key=SESSION_COOKIE_NAME,
+        path="/",
+        httponly=True,
+        samesite="strict",
+        secure=_request_is_https(request),
+    )
+
+
+def _require_csrf_header(request: Request) -> None:
+    if not request.headers.get(CSRF_HEADER):
+        raise HTTPException(status_code=403, detail=f"Missing {CSRF_HEADER} header")
+
+
+def _session_token(
+    request: Request, credentials: Optional[HTTPAuthorizationCredentials]
+) -> tuple[Optional[str], Optional[str]]:
+    """Return the raw token a request carries and where the backend found it.
+
+    Returns (token, "bearer"), (token, "cookie") or (None, None). Raises 403
+    when the token came from the cookie on a state-changing request that
+    lacks the CSRF header.
+    """
+    if credentials:
+        return credentials.credentials, "bearer"
+    cookie = request.cookies.get(SESSION_COOKIE_NAME)
+    if not cookie:
+        return None, None
+    if request.method.upper() not in _SAFE_METHODS:
+        _require_csrf_header(request)
+    return cookie, "cookie"
 
 
 def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None:
@@ -55,6 +150,7 @@ def setup_status(db: Session = Depends(get_db_dependency)):
 @router.post("/register", response_model=UserRead)
 def register(
     payload: UserCreate,
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     bootstrap_token: Optional[str] = Header(default=None, alias="X-Bootstrap-Token"),
     background_tasks: BackgroundTasks = None,
@@ -67,9 +163,10 @@ def register(
         _authorize_bootstrap(bootstrap_token)
     else:
         # After bootstrap, only admins may create accounts.
-        if not credentials:
+        raw_token, _ = _session_token(request, credentials)
+        if not raw_token:
             raise HTTPException(status_code=401, detail="Not authenticated")
-        token_payload = verify_access_token(credentials.credentials)
+        token_payload = verify_access_token(raw_token)
         if not token_payload:
             raise HTTPException(status_code=401, detail="Invalid or expired token")
         caller = db.query(User).filter(
@@ -133,7 +230,7 @@ def _client_ip(request: Request) -> str:
 
 
 @router.post("/login")
-def login(payload: UserLogin, request: Request, db: Session = Depends(get_db_dependency)):
+def login(payload: UserLogin, request: Request, response: Response, db: Session = Depends(get_db_dependency)):
     # Throttle brute force per account and per client IP on the untrusted LAN.
     ip = _client_ip(request)
     acct_key = f"user:{payload.username.strip().lower()}"
@@ -167,17 +264,40 @@ def login(payload: UserLogin, request: Request, db: Session = Depends(get_db_dep
     log_event(db, level="INFO", category="access", action="login_success",
               actor=user.username)
     token = create_access_token(subject=str(user.id))
+    set_session_cookie(response, request, token)
+    if request.headers.get(CSRF_HEADER):
+        # The browser app sends X-Requested-With on every request and keeps
+        # its session in the cookie, so the backend leaves the token out of
+        # the body and no page script receives a token it could use elsewhere.
+        return {"access_token": None, "token_type": "cookie"}
+    # API clients and the e2e scripts read the token from the body.
     return {"access_token": token, "token_type": "bearer"}
+
+
+@router.post("/logout", status_code=204)
+def logout(request: Request):
+    """Clear the session cookie.
+
+    Needs no session, so an operator whose token has expired can still log
+    out. Needs the CSRF header, so a cross-site page cannot log the operator
+    out.
+    """
+    _require_csrf_header(request)
+    response = Response(status_code=204)
+    clear_session_cookie(response, request)
+    return response
 
 
 @router.post("/refresh", response_model=TokenRefresh)
 def refresh_token(
+    request: Request,
+    response: Response,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     db: Session = Depends(get_db_dependency),
 ):
-    if not credentials:
+    token, source = _session_token(request, credentials)
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    token = credentials.credentials
     payload = verify_access_token(token)
     if not payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
@@ -186,26 +306,33 @@ def refresh_token(
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
     new_token = create_access_token(subject=str(user.id))
+    if source == "cookie":
+        # A cookie session receives the new token in a new cookie only, so no
+        # page script receives a token it could use elsewhere.
+        set_session_cookie(response, request, new_token)
+        return {"access_token": None, "token_type": "cookie"}
     return {"access_token": new_token, "token_type": "bearer"}
 
 
 @router.post("/password-reset")
 def reset_password(
     payload: PasswordReset,
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
     db: Session = Depends(get_db_dependency)
 ):
-    if not credentials:
+    token, _ = _session_token(request, credentials)
+    if not token:
         raise HTTPException(status_code=401, detail="Not authenticated")
-    token = credentials.credentials
     token_payload = verify_access_token(token)
     if not token_payload:
         raise HTTPException(status_code=401, detail="Invalid or expired token")
 
     user_id = int(token_payload.get("sub"))
-    user = db.query(User).filter(User.id == user_id).first()
+    # Reject deactivated users, as get_current_user and refresh_token do.
+    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
-        raise HTTPException(status_code=401, detail="User not found")
+        raise HTTPException(status_code=401, detail="User not found or inactive")
 
     if not verify_password(payload.old_password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Old password incorrect")
@@ -217,12 +344,12 @@ def reset_password(
 
 
 def get_current_user(
+    request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
-    token: Optional[str] = Query(default=None),
     db: Session = Depends(get_db_dependency)
 ):
-    # Accept token from Authorization header OR ?token= query param (needed for <img src>)
-    raw_token = credentials.credentials if credentials else token
+    # The Authorization header, else the session cookie; never a query parameter.
+    raw_token, _ = _session_token(request, credentials)
     if not raw_token:
         raise HTTPException(status_code=401, detail="Not authenticated")
     payload = verify_access_token(raw_token)

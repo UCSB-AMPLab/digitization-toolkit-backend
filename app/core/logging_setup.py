@@ -17,10 +17,11 @@ The `capture_service` and `project_manager` loggers are outside both packages
 and keep writing only to their rotating files under CAPTUA_LOG_DIR.
 
 uvicorn's own loggers get one thing from here: a filter that masks session
-tokens in the request targets they print. `<img src>` cannot send an
-Authorization header, so image, thumbnail and download URLs carry the JWT as
-`?token=` (NEH-61), and uvicorn's access line prints the target in full to the
-journal, which anyone with a shell on the unit can read. The filter sits on the
+tokens in the request targets they print. Since NEH-61 the browser sends the
+session in a cookie and the backend reads no `?token=` parameter, but an older
+page or a script can still put one in a URL, and uvicorn's access line prints
+the target in full to the journal, which anyone with a shell on the unit can
+read. The filter sits on the
 loggers rather than on uvicorn's handlers so it holds whatever handlers
 `--log-config` or uvicorn's defaults install.
 

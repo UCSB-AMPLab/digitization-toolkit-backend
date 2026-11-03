@@ -70,5 +70,6 @@ class PasswordResetRequest(BaseModel):
 
 
 class TokenRefresh(BaseModel):
-    access_token: str
+    # None for a cookie session: the backend puts the new token in the cookie only.
+    access_token: Optional[str] = None
     token_type: str
