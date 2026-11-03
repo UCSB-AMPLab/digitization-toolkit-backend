@@ -423,6 +423,23 @@ def log_environment_names(env_files=ENV_FILES) -> dict[str, list[str]]:
     return report
 
 
+def _guard_cors_origins(config: "Settings") -> None:
+    """Refuse to start with a wildcard in CORS_ORIGINS, in any environment.
+
+    The browser session is a cookie (app/api/auth.py) and app/main.py allows
+    credentials. With "*" in the list, Starlette's CORSMiddleware answers a
+    request that carries a cookie with that request's own Origin, so a page on
+    any site could make credentialed calls to the API. The list must name each
+    origin.
+    """
+    if any(origin.strip() == "*" for origin in config.CORS_ORIGINS):
+        raise RuntimeError(
+            "CORS_ORIGINS contains '*'. The session cookie needs an explicit list "
+            "of origins, e.g. [\"http://captua.local\",\"http://localhost:5173\"]."
+        )
+
+
 settings = Settings()
 _guard_secret_key(settings)
 _guard_database_password(settings)
+_guard_cors_origins(settings)
