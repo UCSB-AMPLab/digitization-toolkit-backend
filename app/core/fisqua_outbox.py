@@ -323,6 +323,9 @@ class FisquaTransport(Protocol):
     # Contract 1.8 (app.core.unit_mode.check_reference_code).
     def get_description(self, ref: str) -> TransportResult: ...
 
+    # Contract 1.10 (app.core.unit_mode.search_descriptions).
+    def search_descriptions(self, q: str) -> TransportResult: ...
+
 
 class NullTransport:
     """Sends nothing, for a unit with Fisqua not configured. The worker leaves `ready` rows as they are."""
@@ -346,6 +349,9 @@ class NullTransport:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
     def get_description(self, ref: str) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def search_descriptions(self, q: str) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
 
@@ -613,6 +619,11 @@ class CallBudget:
         with self._lock:
             until = self._clock() + max(0.0, float(seconds))
             self._cool_until = max(getattr(self, "_cool_until", 0.0), until)
+
+    def cooling_for(self) -> float:
+        """The seconds left of the latest Retry-After; 0 when it has passed."""
+        with self._lock:
+            return max(0.0, getattr(self, "_cool_until", float("-inf")) - self._clock())
 
     def cooling(self) -> bool:
         """Whether a Retry-After from a status or decisions answer has not yet passed."""
