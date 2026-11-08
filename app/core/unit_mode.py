@@ -360,7 +360,11 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
     `kept_volumes_released` with their count and ids; `keep` leaves them
     kept, logged `kept_volumes_kept` with their count. Into offline, or with
     no kept volume, `kept` is ignored. A refusal for any reason leaves the
-    flags as they were.
+    flags as they were. The check for kept volumes runs again once the
+    settings row is held FOR UPDATE (_ensure_row): a creation in offline
+    mode, a keep and a release all take that row FOR SHARE first, so a kept
+    volume committed after the first check is seen there and refuses the
+    switch, and none can commit until the switch does.
 
     When Fisqua was told a mode that is then not stored (the change lost a
     race, `mode_changed`, or its commit failed), the mode actually stored is
@@ -416,6 +420,13 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
                 db.rollback()
                 _resend_stored(db, told, actor, transport)
                 raise ModeRefused(target, [_problem(MODE_CHANGED)])
+            if leaving_offline and kept is None and _any_kept(db):
+                # A volume created in offline mode committed after the first
+                # check and before this lock (creation holds the row FOR
+                # SHARE through its insert, so none can commit from here on).
+                db.rollback()
+                _resend_stored(db, told, actor, transport)
+                raise ModeRefused(target, [_problem(kept_volumes.KEPT_VOLUMES_DECISION)])
             row.mode = target
             if projects_enabled is not None:
                 row.projects_enabled = bool(projects_enabled)

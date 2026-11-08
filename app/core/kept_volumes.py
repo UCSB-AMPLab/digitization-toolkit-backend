@@ -59,7 +59,18 @@ The catalogue dump is a pg_dumpall of the whole database
 volume's records go offsite with the daily dump in backup and fisqua mode;
 its images stay on the unit.
 
-**Lock order.** Every path here that locks more than one collection row
+**Lock order.** The unit's settings row comes first, then collection
+rows. The switch of mode (unit_mode.change) holds the settings row FOR
+UPDATE from its second check for kept volumes through its include and its
+commit; keep() and release() take it FOR SHARE (unit_mode.mode_for_insert)
+before any collection lock, as both creation paths do before their
+insert. So a keep, a release or a creation runs wholly before or after a
+switch: a keep committed first is seen whole by the include's query (a new
+statement under the switch's lock), and the switch's re-check sees a kept
+volume created after its first check. With no settings row yet (before
+start-up writes it, unit_mode.initialise) mode_for_insert locks nothing.
+
+Every path here that locks more than one collection row
 takes them in ascending id order: refuse_kept_move (after the records'
 locks), lock_for_reparent, keep() and release(). A path that takes one
 collection row only (image_upload._claim, record FOR UPDATE then its
@@ -103,7 +114,13 @@ in id order:
 The Fisqua outbox's promotion (fisqua_outbox._kept_now) takes one volume
 row FOR SHARE before it moves a waiting row out of waiting_for_upload, so
 a keep and a promotion take turns on the volume's row; one collection row
-only, so it closes no cycle with the paths above.
+only, so it closes no cycle with the paths above. The Fisqua queue
+(fisqua_queue.apply_queue, through _volume_by_code) takes the one volume
+it is about to update, or hide on a withdrawal, FOR NO KEY UPDATE and
+reads its kept_on_unit under that lock until the update commits; it holds
+no other row lock in that transaction (its process-wide _queue_lock is a
+thread lock, not a row lock, and the settings row is not taken there), so
+it closes no cycle either.
 
 Version: 0.3.3
 """
@@ -339,9 +356,11 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
     not refused, or an outbox row in any state but waiting_for_upload,
     superseded or withdrawn. Their unsent rows stay waiting.
 
-    Locks: the volume and every volume inside it FOR NO KEY UPDATE, in one
-    pass in ascending id order (_lock_in_id_order), checked under those
-    locks. The
+    Locks: first the unit's settings row FOR SHARE
+    (unit_mode.mode_for_insert), so a switch of mode and its include run
+    wholly before or after the keep; then the volume and every volume
+    inside it FOR NO KEY UPDATE, in one pass in ascending id order
+    (_lock_in_id_order), checked under those locks. The
     set of volumes inside it is read before the locks, so it is read again
     under them; when it changed (a volume created under one of them, or
     moved in or out, committed in between) the locks are let go and the
@@ -366,6 +385,9 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
     from app.core import unit_mode
 
     for _ in range(LOCK_ATTEMPTS):
+        # The settings row FOR SHARE first, so a switch of mode (which holds
+        # it FOR UPDATE through its include) runs before or after this keep.
+        unit_mode.mode_for_insert(db)
         tree = _subtree(db, collection_id)
         if not tree:
             db.rollback()
@@ -395,7 +417,8 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
     raise KeepRefused(409, KEPT_CHANGED, KEPT_CHANGED_MESSAGE)
 
 
-def release(db: Session, collection_id: int, actor: Optional[str], *, check=None):
+def release(db: Session, collection_id: int, actor: Optional[str], *, check=None,
+            mode: Optional[str] = None, check_for=None):
     """Release a kept volume, and every kept volume inside it; commits. Returns the volume, or None if not found.
 
     Refused (KeepRefused 409) when the volume is not kept (not_kept_on_unit)
@@ -413,8 +436,19 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
     release starts again and checks them again. Once released the volumes
     are copied offsite and, in fisqua mode, sent like any other.
 
-    Locks: the parent FOR SHARE (so a keep of it waits, or commits first and
-    is seen here), the volume and every volume inside it FOR NO KEY UPDATE, all in
+    `mode` and `check_for` (the route's): `mode` is the unit's mode the
+    caller read, and `check_for(mode)` returns the check for a mode (None
+    for none). The mode is read again under the settings row's FOR SHARE;
+    when it differs (a switch committed meanwhile, say into fisqua mode),
+    the release starts again with the check for the mode now stored, and
+    after LOCK_ATTEMPTS such changes it is a 409 `mode_changed`. Without
+    `check_for`, `check` is used whatever the mode.
+
+    Locks: first the unit's settings row FOR SHARE (unit_mode.mode_for_insert,
+    after the check and before any collection lock), so a switch of mode
+    runs wholly before or after the release; then the parent FOR SHARE (so
+    a keep of it waits, or commits first and is seen here), the volume and
+    every volume inside it FOR NO KEY UPDATE, all in
     one pass in ascending id order (_lock_in_id_order); the parent is not
     one of the others, so each row is locked once, in one mode. The set of
     volumes inside it, and the parent, are read before the locks and read
@@ -429,7 +463,10 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
     from app.core import unit_mode
     from app.models.collection import Collection
 
+    mode_changed = False
     for _ in range(LOCK_ATTEMPTS):
+        if check_for is not None:
+            check = check_for(mode)
         stored = (db.query(Collection.kept_on_unit, Collection.parent_collection_id)
                   .filter(Collection.id == collection_id).first())
         if stored is None:
@@ -450,6 +487,14 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
             for i in sorted(to_release):
                 check(*to_release[i])
 
+        stored_mode = unit_mode.mode_for_insert(db)
+        if check_for is not None and stored_mode != mode:
+            # A switch committed after the caller read the mode: start again
+            # with the check for the mode now stored.
+            db.rollback()
+            mode, mode_changed = stored_mode, True
+            continue
+        mode_changed = False
         ids = set(tree) | ({parent_id} if parent_id is not None else set())
         locked = _lock_in_id_order(db, ids, share={parent_id} if parent_id is not None else ())
         collection = locked.get(collection_id)
@@ -476,6 +521,8 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
                                   actor=actor, subject=collection.name)
         db.commit()
         return collection
+    if mode_changed:
+        raise KeepRefused(409, unit_mode.MODE_CHANGED, unit_mode.PREREQUISITE_MESSAGES[unit_mode.MODE_CHANGED])
     raise KeepRefused(409, KEPT_CHANGED, KEPT_CHANGED_MESSAGE)
 
 

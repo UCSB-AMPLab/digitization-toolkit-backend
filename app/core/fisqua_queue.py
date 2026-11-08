@@ -474,12 +474,27 @@ def _has_records(db: Session, collection_id: int) -> bool:
     return db.query(Record.id).filter(Record.collection_id == collection_id).first() is not None
 
 
-def _volume_by_code(db: Session, code: Any):
+def _volume_by_code(db: Session, code: Any, lock: bool = False):
+    """The volume whose reference code is `code`, or None; with `lock`, its row FOR NO KEY UPDATE, read afresh.
+
+    The queue takes the lock before it reads the volume's kept_on_unit and
+    writes to it (NEH-320), and holds it until that write commits: a keep
+    (app.core.kept_volumes.keep, which takes the row FOR NO KEY UPDATE)
+    either committed first and is seen, or waits for the queue's commit.
+    FOR NO KEY UPDATE rather than FOR SHARE because the queue then updates
+    the row (none of the columns it writes is a key), which would upgrade a
+    share lock in the same transaction. One collection row only, with no
+    other row lock in that transaction, so it closes no cycle with the
+    lockers in app.core.kept_volumes ("Lock order").
+    """
     from app.models.collection import Collection
 
     if not isinstance(code, str) or not code or "\x00" in code:
         return None
-    return db.query(Collection).filter(Collection.external_id == code).first()
+    query = db.query(Collection).filter(Collection.external_id == code)
+    if lock:
+        query = query.with_for_update(key_share=True).populate_existing()
+    return query.first()
 
 
 # The skip reason for an item whose volume Captua keeps on the unit (NEH-320).
@@ -589,7 +604,12 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
                 db.rollback()
                 skip(item_id, KEPT_ON_UNIT_REASON)
                 continue
-            volume = _volume_by_code(db, code)
+            volume = _volume_by_code(db, code, lock=True)
+            if volume is not None and volume.kept_on_unit:
+                # Kept by an admin after the check above: read under the lock.
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
             if volume is not None:
                 attributes = _merge_attributes(volume.custom_attributes, fisqua)
                 if attributes is None:
@@ -647,10 +667,15 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
                 db.rollback()
                 skip(item_id, KEPT_ON_UNIT_REASON)
                 continue
-            volume = _volume_by_code(db, item.get("referenceCode"))
+            volume = _volume_by_code(db, item.get("referenceCode"), lock=True)
             if volume is None:
                 db.rollback()
                 skip(item_id, "withdrawn_not_on_unit")
+                continue
+            if volume.kept_on_unit:
+                # Kept by an admin after the check above: read under the lock.
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
                 continue
             volume_id = volume.id
             # A live entry for the same code in this revision decides, and a

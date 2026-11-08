@@ -1142,12 +1142,19 @@ NO_KEY_UPDATE = {"key_share": True}
 
 
 def _spy_locked_ids(monkeypatch):
-    """(collection id, kwargs) for every row lock a query asks for, in the order asked."""
+    """(collection id, kwargs) for every collections row lock a query asks for, in the order asked.
+
+    The settings row's lock (keep and release take it first) is left out:
+    _spy_lock_entities checks it.
+    """
     from sqlalchemy.orm import Query
     asked = []
     real = Query.with_for_update
 
     def spy(self, *a, **kw):
+        entity = self.column_descriptions[0].get("entity")
+        if entity is not None and entity.__name__ != "Collection":
+            return real(self, *a, **kw)
         try:
             locked = self.whereclause.right.value
         except AttributeError:
@@ -1560,3 +1567,149 @@ def test_post_collections_reads_the_parent_for_share_before_the_insert(client, d
         "name": "Sub", "parent_collection_id": parent.id, "filename_stem": "xx-test-sub"})
     assert resp.status_code == 201, resp.text
     assert asked == [(parent.id, {"read": True})]
+
+
+# ---------------------------------------------------------------------------
+# Round 8: keep and release serialized with the switch through unit_settings
+# ---------------------------------------------------------------------------
+
+def _spy_lock_entities(monkeypatch):
+    """(entity name, id, kwargs) for every row lock a query asks for, in the order asked."""
+    from sqlalchemy.orm import Query
+    asked = []
+    real = Query.with_for_update
+
+    def spy(self, *a, **kw):
+        entity = self.column_descriptions[0].get("entity")
+        try:
+            locked = self.whereclause.right.value
+        except AttributeError:
+            locked = None
+        asked.append((entity.__name__ if entity is not None else None, locked, kw))
+        return real(self, *a, **kw)
+
+    monkeypatch.setattr(Query, "with_for_update", spy)
+    return asked
+
+
+@pytest.mark.unit
+def test_keep_takes_the_settings_row_for_share_before_any_volume(db_session, monkeypatch):
+    from app.core import kept_volumes
+    _unit(db_session, "backup")
+    top, child, grandchild = _tree(db_session, child_kept=False)
+    asked = _spy_lock_entities(monkeypatch)
+    kept_volumes.keep(db_session, top.id, "boss")
+    assert asked[0] == ("UnitSettings", 1, {"read": True})
+    assert [e for e, _, _ in asked[1:]] == ["Collection"] * 3
+
+
+@pytest.mark.unit
+def test_release_takes_the_settings_row_for_share_before_any_volume(db_session, monkeypatch):
+    from app.core import kept_volumes
+    _unit(db_session, "backup")
+    parent = _plain_volume(db_session, "Parent", "xx-test-p0", kept=False)
+    volume = _child(db_session, parent, "Volume", "xx-test-v1", kept=True)
+    asked = _spy_lock_entities(monkeypatch)
+    kept_volumes.release(db_session, volume.id, "boss", mode="backup", check_for=lambda mode: None)
+    assert asked[0] == ("UnitSettings", 1, {"read": True})
+    assert [e for e, _, _ in asked[1:]] == ["Collection"] * 2
+
+
+@pytest.mark.unit
+def test_a_release_decided_in_backup_mode_checks_with_fisqua_after_a_switch(client, db_session, link,
+                                                                           monkeypatch):
+    from app.core import kept_volumes
+    _unit(db_session, "backup")
+    col = _kept_volume(db_session, stem="xx-test-910")
+    link.description_answers = [_found("xx-test-910")]
+    real = kept_volumes._subtree
+    switched = []
+
+    def subtree_then_switch(db, root_id):
+        if not switched:  # an admin's switch to fisqua mode commits after the route read the mode
+            switched.append(True)
+            _unit(db_session, "fisqua")
+        return real(db, root_id)
+
+    monkeypatch.setattr(kept_volumes, "_subtree", subtree_then_switch)
+    resp = _as(client, "admin").post(f"/collections/{col.id}/release-from-unit")
+    assert resp.status_code == 200, resp.text
+    assert link.descriptions_asked == ["xx-test-910"]
+    assert _kept(db_session, col.id) is False
+
+
+@pytest.mark.unit
+def test_a_release_whose_mode_keeps_changing_is_a_409(db_session, monkeypatch):
+    from app.core import kept_volumes
+    _unit(db_session, "backup")
+    col = _kept_volume(db_session)
+    real = kept_volumes._subtree
+    flips = iter(["fisqua", "backup", "fisqua", "backup", "fisqua", "backup"])
+
+    def subtree_then_flip(db, root_id):
+        _unit(db_session, next(flips))
+        return real(db, root_id)
+
+    monkeypatch.setattr(kept_volumes, "_subtree", subtree_then_flip)
+    with pytest.raises(kept_volumes.KeepRefused) as refused:
+        kept_volumes.release(db_session, col.id, "boss", mode="backup", check_for=lambda mode: None)
+    assert refused.value.status == 409 and refused.value.code == "mode_changed"
+    assert _kept(db_session, col.id) is True
+
+
+@pytest.mark.unit
+def test_a_kept_volume_created_before_the_settings_lock_still_needs_a_decision(client, db_session, link,
+                                                                             monkeypatch):
+    from app.core import unit_mode
+    _unit(db_session, "offline")
+    real = unit_mode._any_kept
+    calls = []
+
+    def first_check_then_a_creation(db):
+        out = real(db)
+        calls.append(out)
+        if len(calls) == 1:  # an offline creation commits between the first check and the lock
+            _kept_volume(db_session)
+        return out
+
+    monkeypatch.setattr(unit_mode, "_any_kept", first_check_then_a_creation)
+    resp = _as(client, "admin").put("/system/unit", json={"mode": "backup"})
+    assert resp.status_code == 409, resp.text
+    assert _problem_codes(resp) == ["kept_volumes_decision"]
+    assert unit_mode.current(db_session).mode == "offline"
+    assert calls == [False, True]
+
+
+def _queued_volume(db, code="xx-test-901"):
+    col = _plain_volume(db, "Queued", code)
+    col.external_id = code
+    db.commit()
+    return col
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("withdrawn", [False, True])
+def test_a_keep_committed_after_the_queues_kept_check_stops_the_update(db_session, synced, monkeypatch,
+                                                                      withdrawn):
+    from app.core import fisqua_queue
+    from app.models.collection import Collection
+    col = _queued_volume(db_session)
+    real = fisqua_queue._kept_volume_for
+
+    def check_then_keep(db, code, stem):
+        out = real(db, code, stem)
+        _set_kept(db_session, db_session.get(Collection, col.id))  # an admin's keep commits meanwhile
+        return out
+
+    monkeypatch.setattr(fisqua_queue, "_kept_volume_for", check_then_keep)
+    asked = _spy_locked_ids(monkeypatch)
+    transport = QueueTransport(queues=[_queue([_qitem("xx-test-901", withdrawn=withdrawn, sequence=7)])],
+                               acks=[_ok_ack()])
+    _sync(db_session, transport)
+    [ack] = transport.acks_sent
+    assert ack["applied"] == []
+    assert [s["reason"] for s in ack["skipped"]] == ["kept_on_unit"]
+    assert ("xx-test-901", NO_KEY_UPDATE) in asked  # the volume, found by its reference code
+    db_session.expire_all()
+    kept = db_session.get(Collection, col.id)
+    assert kept.sequence is None and kept.queue_hidden_at is None

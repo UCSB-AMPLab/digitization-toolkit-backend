@@ -405,12 +405,18 @@ def release_collection_from_unit(
     """
     from app.core import kept_volumes, unit_mode
 
-    check = None
-    if unit_mode.mode(db) == unit_mode.FISQUA:
-        def check(stem, external_id):
-            _check_codes_with_fisqua(db, [stem, external_id])
+    def fisqua_check(stem, external_id):
+        _check_codes_with_fisqua(db, [stem, external_id])
+
+    def check_for(mode):
+        return fisqua_check if mode == unit_mode.FISQUA else None
+
+    # The mode read here decides the check; release() reads it again under the
+    # settings row's lock and starts again with the right check if it changed.
+    observed = unit_mode.mode(db)
     try:
-        collection = kept_volumes.release(db, collection_id, current_user.username, check=check)
+        collection = kept_volumes.release(db, collection_id, current_user.username,
+                                          mode=observed, check_for=check_for)
     except kept_volumes.KeepRefused as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail())
     if collection is None:
