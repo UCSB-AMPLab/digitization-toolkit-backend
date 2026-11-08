@@ -133,11 +133,15 @@ def get_catalogue_backup_state(
     (app.core.offsite_hold): no dump is taken and no image is uploaded until
     it is removed. `hold_file` is its path. Both are under `images` too.
 
-    `images.enabled` and `fisqua.configured` are the configuration's answers;
-    `images.mode_allows` and `fisqua.mode_allows` are the unit mode's
-    (app.core.unit_mode: offsite_on, link_on), so the interface can say that a
-    configured unit sends nothing in its current mode (NEH-319).
+    `enabled`, `images.enabled` and `fisqua.configured` are the
+    configuration's answers; `mode_allows`, `images.mode_allows` and
+    `fisqua.mode_allows` are the unit mode's (app.core.unit_mode: offsite_on,
+    link_on), so the interface can say that a configured unit sends nothing in
+    its current mode (NEH-319). The top-level `mode_allows` is false in
+    offline mode, where no catalogue dump is taken, so the age of the last
+    verified dump says nothing about whether the copy has stopped.
     """
+    from app.core import unit_mode
     from app.core.catalogue_backup import is_configured, last_verified_backup
     from app.core.fisqua_outbox import unit_fisqua_summary
     from app.core.image_upload import unit_upload_summary
@@ -146,6 +150,7 @@ def get_catalogue_backup_state(
     state = last_verified_backup(db)
     return {
         "enabled":          is_configured(),
+        "mode_allows":      unit_mode.offsite_on(db),
         "last_verified_at": state["verified_at"] if state else None,
         "object":           state["object"] if state else None,
         "detail":           state["detail"] if state else None,
