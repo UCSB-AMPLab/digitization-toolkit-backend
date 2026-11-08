@@ -638,6 +638,24 @@ def test_the_status_endpoint_is_read_only(offsite, reader_client):
         response = getattr(reader_client, method)("/system/catalogue-backup")
         assert response.status_code == 405, (method, response.status_code)
 
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode,allows", [("offline", False), ("backup", True), ("fisqua", True)])
+def test_the_status_endpoint_says_whether_the_mode_allows_the_dump(offsite, reader_client, db_session, mode, allows):
+    """NEH-319: the top-level `mode_allows` follows unit_mode.offsite_on; `enabled` stays the configuration's answer."""
+    from app.models.unit_settings import UnitSettings
+    row = db_session.get(UnitSettings, 1)
+    if row is None:
+        db_session.add(UnitSettings(id=1, mode=mode, projects_enabled=False))
+    else:
+        row.mode = mode
+    db_session.commit()
+
+    body = reader_client.get("/system/catalogue-backup").json()
+    assert body["mode_allows"] is allows
+    assert body["enabled"] is True
+    assert body["images"]["mode_allows"] is allows
+
 @pytest.fixture
 def rclone(offsite, monkeypatch):
     """Capture every rclone call the real transport makes, and answer listings.
