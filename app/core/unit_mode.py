@@ -123,6 +123,19 @@ UNKNOWN_REFERENCE_CODE_MESSAGE = "Fisqua has no description with the reference c
 FISQUA_NO_LOOKUP_MESSAGE = "This Fisqua cannot check reference codes (contract 1.8). " + _LIST_INSTEAD
 FISQUA_UNREACHABLE_MESSAGE = "Fisqua could not be reached to check the reference code {code}. " + _LIST_INSTEAD
 
+# The description search (contract 1.10): its problem codes beside the
+# lookup's, and its messages. The form shows its own text for each.
+QUERY_TOO_SHORT = "query_too_short"
+RATE_LIMITED = "rate_limited"
+SEARCH_MESSAGES = {
+    OFF_STATUS: "The unit is not in Fisqua mode, so Fisqua's descriptions cannot be searched.",
+    FISQUA_NOT_CONFIGURED: PREREQUISITE_MESSAGES[FISQUA_NOT_CONFIGURED],
+    QUERY_TOO_SHORT: f"A search needs at least {fc.SEARCH_MIN_CHARS} characters.",
+    RATE_LIMITED: "Too many calls to Fisqua in the last minute; search again shortly.",
+    FISQUA_UNREACHABLE: "Fisqua could not be reached to search its descriptions. The exact reference code can "
+                        "still be typed.",
+}
+
 
 def _now() -> datetime:
     return datetime.now(timezone.utc).replace(tzinfo=None)
@@ -728,3 +741,137 @@ def check_reference_codes(db: Session, codes) -> None:
             continue
         seen.add(code)
         check_reference_code(db, code)
+
+
+# ---------------------------------------------------------------------------
+# The description search (contract 1.10)
+# ---------------------------------------------------------------------------
+
+class SearchRefused(Exception):
+    """A description search that gets no list: an HTTP status, a problem code, and a Retry-After when there is one."""
+
+    def __init__(self, status: int, code: str, error: Optional[str] = None,
+                 retry_after: Optional[int] = None):
+        super().__init__(SEARCH_MESSAGES[code])
+        self.status = status
+        self.code = code
+        self.message = SEARCH_MESSAGES[code]
+        self.error = error
+        self.retry_after = retry_after
+
+    def detail(self) -> dict:
+        detail = {"code": self.code, "message": self.message}
+        if self.error is not None:
+            detail["error"] = self.error
+        return detail
+
+
+def _seconds(value: float) -> int:
+    """A Retry-After in whole seconds, rounded up, at least 1."""
+    import math
+
+    return max(1, math.ceil(value))
+
+
+def _text_or_none(value: Any) -> Optional[str]:
+    return value if isinstance(value, str) else None
+
+
+def _search_entry(entry: Any) -> Optional[dict]:
+    """One result in the 1.8 answer's shape, or None for an entry without a string referenceCode."""
+    if not isinstance(entry, dict) or not isinstance(entry.get(fc.F_REFERENCE_CODE), str):
+        return None
+    dates = entry.get(fc.F_DATES)
+    dates = dates if isinstance(dates, dict) else {}
+    title = entry.get(fc.F_TITLE)
+    return {
+        fc.F_REFERENCE_CODE: entry[fc.F_REFERENCE_CODE],
+        fc.F_TITLE: title if isinstance(title, str) else "",
+        fc.F_LEVEL: _text_or_none(entry.get(fc.F_LEVEL)),
+        fc.F_DATES: {key: _text_or_none(dates.get(key))
+                     for key in (fc.F_DATES_DISPLAY, fc.F_DATES_START, fc.F_DATES_END)},
+    }
+
+
+def search_descriptions(db: Session, q: Optional[str], *, transport=None,
+                        now: Optional[datetime] = None) -> dict:
+    """Search Fisqua's descriptions for `q` (contract 1.10); the answer for the form, or raise SearchRefused.
+
+    Only in fisqua mode (409 off_in_this_mode) with Fisqua configured (409
+    fisqua_not_configured). `q` is trimmed; under fc.SEARCH_MIN_CHARS
+    characters it is a 400 query_too_short, and Fisqua is not called.
+    Otherwise one GET /api/capture/v1/descriptions?q= through what the 1.8
+    lookup goes through: the hold, the configuration stop, the gated
+    transport and the link's call budget, taken with
+    fc.SEARCH_RESERVED_CALLS held back for the decisions reads and the
+    save-time 1.8 lookup. The session's transaction is committed after the
+    mode is read, so no pooled connection is held while Fisqua answers; the
+    rest needs no database. The call has its own short timeout
+    (fc.SEARCH_TIMEOUT_SECONDS).
+
+    200 from Fisqua: {results}, each entry in the 1.8 shape, entries
+    without a string referenceCode dropped, at most fc.SEARCH_MAX_RESULTS;
+    a 200 without a results list is 503 fisqua_unreachable. A bare 404 or a
+    405 (a Fisqua without 1.10): {results: [], search: False}. 400
+    query-too-short: 400 query_too_short. 429, or the budget spent or
+    cooling down: 429 rate_limited, with the Retry-After when there is
+    one (none when the reserve stops it), and Fisqua's Retry-After holds the link back as elsewhere. 401,
+    403 or a redirect is recorded as the link's configuration stop, as the
+    lookup records it, and is 503 fisqua_unreachable, as are a stop
+    already in place, the hold, 5xx, any other answer, a timeout and a
+    network failure. A switch out of fisqua mode meanwhile: 409
+    off_in_this_mode.
+    """
+    from app.core import fisqua_outbox
+    from app.core.fisqua_outbox import NullTransport, TransportResult
+
+    if mode(db) != FISQUA:
+        raise SearchRefused(409, OFF_STATUS)
+    if not fisqua_outbox.fisqua_configured():
+        raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
+    query = (q or "").strip()
+    if len(query) < fc.SEARCH_MIN_CHARS:
+        raise SearchRefused(400, QUERY_TOO_SHORT)
+    # Nothing below reads the database: release its connection to the pool
+    # before a call that can take up to the search's timeout.
+    db.commit()
+    if offsite_hold.held("Fisqua description search"):
+        raise SearchRefused(503, FISQUA_UNREACHABLE, "held")
+    if fisqua_outbox.config_error() is not None:
+        raise SearchRefused(503, FISQUA_UNREACHABLE,
+                            "config_error: the link is stopped until its configuration changes")
+    transport = transport if transport is not None else get_lookup_transport()
+    if isinstance(transport, NullTransport):
+        raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
+    if fisqua_outbox.call_budget.cooling():
+        raise SearchRefused(429, RATE_LIMITED, "cooling_down",
+                            _seconds(fisqua_outbox.call_budget.cooling_for()))
+    if not fisqua_outbox.call_budget.take(reserve=fc.SEARCH_RESERVED_CALLS):
+        raise SearchRefused(429, RATE_LIMITED, "rate_limited")
+    try:
+        answer = transport.search_descriptions(query)
+    except Exception as exc:
+        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+    answer = fisqua_outbox._redacted(answer)
+    if answer.outcome == "search":
+        results = answer.response.get(fc.F_RESULTS) if isinstance(answer.response, dict) else None
+        if not isinstance(results, list):
+            raise SearchRefused(503, FISQUA_UNREACHABLE, f"unreadable: the answer has no {fc.F_RESULTS} list")
+        entries = [e for e in (_search_entry(entry) for entry in results) if e is not None]
+        return {fc.F_RESULTS: entries[:fc.SEARCH_MAX_RESULTS]}
+    if answer.outcome == "unsupported":
+        return {fc.F_RESULTS: [], "search": False}
+    if answer.outcome == "query_too_short":
+        raise SearchRefused(400, QUERY_TOO_SHORT)
+    if answer.outcome == OFF_STATUS:
+        raise SearchRefused(409, OFF_STATUS)
+    if answer.outcome == "config_error":
+        fisqua_outbox.record_config_error(answer.status_code, answer.reason,
+                                          fisqua_outbox._naive(now) or fisqua_outbox._now())
+    elif answer.retry_after is not None:
+        fisqua_outbox.call_budget.cool_down(answer.retry_after)
+    error = f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}"
+    if answer.status_code == 429:
+        raise SearchRefused(429, RATE_LIMITED, error,
+                            _seconds(answer.retry_after) if answer.retry_after is not None else None)
+    raise SearchRefused(503, FISQUA_UNREACHABLE, error)

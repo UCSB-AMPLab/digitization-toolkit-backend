@@ -1262,6 +1262,7 @@ LINK_CALLS = [
     ("get_queue", (None,)),
     ("post_queue_ack", ({"revision": "r1", "applied": [], "skipped": []},)),
     ("get_description", ("xx-a",)),
+    ("search_descriptions", ("xx-a",)),
 ]
 
 
@@ -1269,7 +1270,7 @@ LINK_CALLS = [
 
 @pytest.mark.unit
 @pytest.mark.parametrize("mode", ["offline", "backup"])
-def test_outside_fisqua_mode_none_of_the_seven_calls_is_sent_and_each_bypass_is(db_session, fisqua, mode):
+def test_outside_fisqua_mode_none_of_the_eight_calls_is_sent_and_each_bypass_is(db_session, fisqua, mode):
     from app.core.fisqua_http import HttpFisquaTransport
     _unit(db_session, mode)
     server = Server(*[httpx.Response(200, json={"referenceCode": "xx-a"}) for _ in LINK_CALLS])

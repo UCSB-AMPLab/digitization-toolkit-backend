@@ -23,6 +23,7 @@ from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
 from app.api.activity import router as activity_router
 from app.api.imports import router as imports_router
+from app.api.fisqua import router as fisqua_router
 
 @asynccontextmanager
 async def lifespan(app: FastAPI):
@@ -116,6 +117,7 @@ app.include_router(users_router, prefix="/users", tags=["users"])
 app.include_router(system_router, prefix="/system", tags=["system"])
 app.include_router(activity_router, prefix="/activity", tags=["activity"])
 app.include_router(imports_router, prefix="/imports", tags=["imports"])
+app.include_router(fisqua_router, prefix="/fisqua", tags=["fisqua"])
 
 
 from app.core.storage_override import StorageUnavailableError

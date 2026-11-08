@@ -42,6 +42,14 @@ admin's check in fisqua mode, app.core.unit_mode.check_reference_code):
 configuration errors as above; the rest, 429 included, errors. The code is
 one path segment, encoded as encodeURIComponent encodes it.
 
+Answers to GET of the description search (contract 1.10, the new-volume
+form's search, app.core.unit_mode.search_descriptions): 2xx with an object
+`search`; 400 with rule query-too-short `query_too_short`; a 404 or 405
+`unsupported` (a Fisqua without 1.10); 401, 403 and any 3xx the same
+configuration errors as above; the rest, 429 and any other 400 included,
+errors. The query goes as the one query parameter `q`, with the search's
+own timeout (fisqua_contract.SEARCH_TIMEOUT_SECONDS) for every phase.
+
 Version: 0.3.3
 """
 
@@ -286,6 +294,25 @@ def read_description_answer(response: httpx.Response) -> TransportResult:
     return _transient(response, body)
 
 
+def read_search_answer(response: httpx.Response) -> TransportResult:
+    code = response.status_code
+    body = _json(response)
+    if 200 <= code < 300:
+        if not isinstance(body, dict):
+            return TransportResult(outcome="error", response=body, status_code=code,
+                                   error=f"Fisqua answered HTTP {code} without a search object")
+        return TransportResult(outcome="search", response=body, status_code=code)
+    if code == 400 and _has_rule(body, fc.RULE_QUERY_TOO_SHORT):
+        return TransportResult(outcome="query_too_short", response=body, status_code=code)
+    if code in UNSUPPORTED_CODES:
+        return TransportResult(outcome="unsupported", response=body, status_code=code,
+                               error=f"Fisqua has no contract 1.10 search here (HTTP {code})")
+    stop = _config_error(code, body)
+    if stop is not None:
+        return stop
+    return _transient(response, body)
+
+
 # What encodeURIComponent leaves as it is, beside the letters, digits and
 # "-_.~" that urllib.parse.quote always leaves.
 _URI_COMPONENT_SAFE = "!*'()"
@@ -320,9 +347,10 @@ class HttpFisquaTransport:
     * every request goes through `self._client`, which is private and made
       here, and nothing else in the backend speaks to Fisqua (the hosts are
       only in fisqua_contract and fisqua_outbox.base_url);
-    * the methods that use `self._client` are exactly the seven of the
+    * the methods that use `self._client` are exactly the eight of the
       FisquaTransport protocol: send_manifest, get_status, get_decisions,
-      put_operators, get_queue, post_queue_ack and get_description; each
+      put_operators, get_queue, post_queue_ack, get_description and
+      search_descriptions; each
       calls `self._mode_refusal()` before it touches the client
       (tests/unit/test_unit_mode.py checks both by reading this class);
     * the gate is skipped only for a transport built with
@@ -330,7 +358,8 @@ class HttpFisquaTransport:
       for, for the calls a change of mode makes on purpose: the switch PUT
       to fisqua, the down-switch PUT, and the resend of the stored mode
       after a change that did not commit. An admin's reference code lookup
-      does not bypass it (unit_mode.get_lookup_transport).
+      and the description search do not bypass it
+      (unit_mode.get_lookup_transport).
 
     The call sites' own mode checks stop a run early; this is the guarantee.
     A mode that cannot be read counts as not `fisqua`.
@@ -443,6 +472,18 @@ class HttpFisquaTransport:
         except httpx.HTTPError as exc:
             return _failed(exc)
         return read_description_answer(response)
+
+    def search_descriptions(self, q: str) -> TransportResult:
+        refused = self._mode_refusal()
+        if refused is not None:
+            return refused
+        try:
+            response = self._client.get(self._base + fc.DESCRIPTION_SEARCH_PATH, headers=self._headers(),
+                                        params={fc.SEARCH_QUERY_PARAM: q},
+                                        timeout=httpx.Timeout(fc.SEARCH_TIMEOUT_SECONDS))
+        except httpx.HTTPError as exc:
+            return _failed(exc)
+        return read_search_answer(response)
 
     def close(self) -> None:
         self._client.close()

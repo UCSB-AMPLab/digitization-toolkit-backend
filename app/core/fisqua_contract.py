@@ -11,7 +11,8 @@ Contract 1.2 is approved (archiving 5e480b7, §9). The QC decisions include
 1.6's exclusion and 1.9's missing page and requests. The digitisation queue
 (contract 1.7) follows: the unit's users, the queue and its
 acknowledgement, the operators PUT carrying the unit's mode. The reference
-code lookup (contract 1.8) is at the end.
+code lookup (contract 1.8) and the description search (contract 1.10)
+are at the end.
 
 Version: 0.3.3
 """
@@ -250,3 +251,34 @@ F_REFERENCE_CODE = "referenceCode"
 F_TITLE = "title"
 F_LEVEL = "level"
 F_DATES = "dates"
+
+
+# ---------------------------------------------------------------------------
+# The description search (contract 1.10)
+# ---------------------------------------------------------------------------
+
+# GET with the query in SEARCH_QUERY_PARAM, beside the 1.8 lookup's path.
+# 200 {results: [...]}: at most SEARCH_MAX_RESULTS entries, each in the
+# 1.8 answer's shape (referenceCode, title, level, dates). 400 with this
+# rule at the top level for a q under SEARCH_MIN_CHARS characters after
+# trimming. A bare 404, or a 405, means this Fisqua has no 1.10. 401, 403
+# and 429 as on the other link routes; each search takes one of the
+# link's CALLS_PER_MINUTE.
+DESCRIPTION_SEARCH_PATH = "/api/capture/v1/descriptions"
+SEARCH_QUERY_PARAM = "q"
+SEARCH_MIN_CHARS = 3
+SEARCH_MAX_RESULTS = 20
+# The search's own connect and read timeout, in seconds, much shorter than
+# the link's FISQUA_TIMEOUT_SECONDS: the admin is waiting at the form, and
+# a stalled Fisqua must not hold the request (or a worker) for a minute.
+SEARCH_TIMEOUT_SECONDS = 5.0
+# Calls of the minute a search leaves to others: the decisions reads'
+# reserve, and LOOKUP_RESERVED_CALLS for the 1.8 lookup an admin's save runs.
+# Past it a search answers 429 and the save can still check its code.
+LOOKUP_RESERVED_CALLS = 5
+SEARCH_RESERVED_CALLS = DECISIONS_RESERVED_CALLS + LOOKUP_RESERVED_CALLS
+RULE_QUERY_TOO_SHORT = "query-too-short"
+F_RESULTS = "results"
+F_DATES_DISPLAY = "display"
+F_DATES_START = "start"
+F_DATES_END = "end"
