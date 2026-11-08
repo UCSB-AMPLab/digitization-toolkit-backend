@@ -1776,13 +1776,22 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     }
 
 
-def unit_fisqua_summary() -> dict:
-    """The unit-level Fisqua state for the system panel: configured, environment, configuration error, last runs."""
+def unit_fisqua_summary(db: Session) -> dict:
+    """The unit-level Fisqua state for the system panel: configured, environment, configuration error, last runs.
+
+    `configured` is the configuration's answer (fisqua_configured) and
+    `mode_allows` the unit mode's (unit_mode.link_on: fisqua mode only), so a
+    unit configured for Fisqua but in offline or backup mode answers
+    configured true and mode_allows false, and calls Fisqua for nothing
+    (NEH-319). `db` is the caller's session; none is opened here.
+    """
+    from app.core import unit_mode
     from app.core.image_upload import image_upload_scheduler
 
     configured = fisqua_configured()
     return {
         "configured": configured,
+        "mode_allows": unit_mode.link_on(db),
         # A token is set but is not of the contract's shape; its value is never shown.
         "token_invalid": token_invalid(),
         "environment": fisqua_environment() if configured else None,

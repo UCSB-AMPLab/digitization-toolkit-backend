@@ -729,6 +729,21 @@ def test_a_well_formed_token_is_not_reported_invalid(client, fisqua):
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("mode,allows", [("offline", False), ("backup", False), ("fisqua", True)])
+def test_the_unit_summary_says_whether_the_mode_allows_the_link(client, db_session, fisqua, mode, allows):
+    """NEH-319: `mode_allows` follows unit_mode.link_on; `configured` stays the configuration's answer."""
+    from app.core.fisqua_outbox import unit_fisqua_summary
+    from app.models.unit_settings import UnitSettings
+    db_session.add(UnitSettings(id=1, mode=mode, projects_enabled=False))
+    db_session.commit()
+
+    assert unit_fisqua_summary(db_session)["mode_allows"] is allows
+    fq = _as(client, "admin").get("/system/catalogue-backup").json()["fisqua"]
+    assert fq["mode_allows"] is allows
+    assert fq["configured"] is True and fq["environment"] == ENV
+
+
+@pytest.mark.unit
 def test_no_token_is_not_reported_invalid(client, fisqua, monkeypatch):
     from pydantic import SecretStr
 
