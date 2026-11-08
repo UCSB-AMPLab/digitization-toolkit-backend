@@ -787,6 +787,33 @@ def test_the_unit_summary_is_on_the_offsite_status_route(remote, client, db_sess
     assert images["last_verified_at"] is not None
 
 
+def _unit_mode(db, mode):
+    """Store the unit's mode row directly, as a unit already set up has it (app.core.unit_mode)."""
+    from app.models.unit_settings import UnitSettings
+    row = db.get(UnitSettings, 1)
+    if row is None:
+        db.add(UnitSettings(id=1, mode=mode, projects_enabled=False))
+    else:
+        row.mode = mode
+    db.commit()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode,allows", [("offline", False), ("backup", True), ("fisqua", True)])
+def test_the_unit_summary_says_whether_the_mode_allows_the_copy(remote, client, db_session, mode, allows):
+    """NEH-319: `mode_allows` follows unit_mode.offsite_on; `enabled` stays the configuration's answer."""
+    from app.core.image_upload import unit_upload_summary
+    _as("reviewer")
+    _unit_mode(db_session, mode)
+
+    summary = unit_upload_summary(db_session)
+    assert summary["mode_allows"] is allows
+    assert summary["enabled"] is True and summary["misconfigured"] is None
+    images = client.get("/system/catalogue-backup").json()["images"]
+    assert images["mode_allows"] is allows
+    assert images["enabled"] is True
+
+
 # ---------------------------------------------------------------------------
 # Staging
 # ---------------------------------------------------------------------------

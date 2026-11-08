@@ -1520,7 +1520,15 @@ def volume_upload_state(db: Session, collection) -> dict:
 
 
 def unit_upload_summary(db: Session) -> dict:
-    """Totals over every stemmed volume, for the system panel, with the upload hold (`held`, `hold_file`)."""
+    """Totals over every stemmed volume, for the system panel, with the upload hold (`held`, `hold_file`).
+
+    `enabled` is the configuration's answer (is_enabled) and `mode_allows`
+    the unit mode's (unit_mode.offsite_on: backup and fisqua), so a unit
+    configured for the copy but in offline mode answers enabled true and
+    mode_allows false, and uploads nothing (NEH-319).
+    """
+    from app.core import unit_mode
+
     try:
         tenant = configured_tenant()
         misconfigured = None
@@ -1530,6 +1538,7 @@ def unit_upload_summary(db: Session) -> dict:
     last = [s["last_verified_at"] for s in per_volume.values() if s["last_verified_at"]]
     return {
         "enabled": is_enabled(),
+        "mode_allows": unit_mode.offsite_on(db),
         "tenant": tenant,
         "misconfigured": misconfigured,
         "volumes": len(per_volume),

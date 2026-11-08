@@ -132,6 +132,11 @@ def get_catalogue_backup_state(
     `held` is true while the offsite upload hold file exists
     (app.core.offsite_hold): no dump is taken and no image is uploaded until
     it is removed. `hold_file` is its path. Both are under `images` too.
+
+    `images.enabled` and `fisqua.configured` are the configuration's answers;
+    `images.mode_allows` and `fisqua.mode_allows` are the unit mode's
+    (app.core.unit_mode: offsite_on, link_on), so the interface can say that a
+    configured unit sends nothing in its current mode (NEH-319).
     """
     from app.core.catalogue_backup import is_configured, last_verified_backup
     from app.core.fisqua_outbox import unit_fisqua_summary
@@ -147,9 +152,10 @@ def get_catalogue_backup_state(
         **hold_state(),
         # Per-volume counts are on GET /collections/{id}/offsite.
         "images":           unit_upload_summary(db),
-        # Delivery to Fisqua: configured, environment, the unit-level configuration
-        # error while Fisqua refuses the configuration, the last send and poll.
-        "fisqua":           unit_fisqua_summary(),
+        # Delivery to Fisqua: configured, whether the mode allows the link, environment,
+        # the unit-level configuration error while Fisqua refuses the configuration,
+        # the last send and poll.
+        "fisqua":           unit_fisqua_summary(db),
     }
 
 
