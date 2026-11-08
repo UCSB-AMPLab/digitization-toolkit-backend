@@ -522,6 +522,14 @@ def update_record(
 		              data.get("collection_id", rec.collection_id))
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
+			# Not between a volume Captua keeps on the unit and one it does
+			# not, nor out of or into a kept one from outside every volume (NEH-320).
+			from app.core import kept_volumes
+			try:
+				kept_volumes.refuse_kept_move(db, rec.collection_id, new_parent[1])
+			except kept_volumes.KeepRefused as exc:
+				db.rollback()
+				raise HTTPException(status_code=exc.status, detail=exc.detail())
 			# A record whose images are in the bucket stays in its volume:
 			# their keys are under the volume's stem and never change. A
 			# record with such images that is outside every volume (one taken

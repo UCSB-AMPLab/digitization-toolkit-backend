@@ -75,6 +75,11 @@ class CollectionCreate(VolumeIdentityFields, CollectionBase):
     project_id: Optional[int] = Field(None, description="Parent project (for top-level collections)")
     parent_collection_id: Optional[int] = Field(None, description="Parent collection (for nested subcollections)")
     created_by: Optional[str] = None
+    # Keep the new volume on the unit (NEH-320): Captua copies none of its
+    # images offsite and sends none of its manifests to Fisqua until an
+    # admin releases it. Only an admin may set it; in offline mode every new
+    # volume is kept whatever is sent.
+    kept_on_unit: Optional[bool] = None
 
     class Config:
         json_schema_extra = {
@@ -122,6 +127,10 @@ class CollectionRead(CollectionBase):
     # assigned to, and when a withdrawn entry hid it from Cola.
     assignee_username: Optional[str] = None
     queue_hidden_at: Optional[datetime] = None
+    # Read-only here (NEH-320): whether Captua keeps the volume on the unit.
+    # Set at creation, by POST /collections/{id}/keep-on-unit, and cleared by
+    # POST /collections/{id}/release-from-unit or a switch out of offline mode.
+    kept_on_unit: bool = False
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

@@ -18,7 +18,7 @@ import logging
 import uuid
 from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
 from pydantic import BaseModel, StrictBool, StrictStr
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
@@ -86,6 +86,7 @@ def _read_capped(upload: UploadFile) -> bytes:
 @router.post("/digitisation-list", status_code=200)
 def import_digitisation_list(
     file: UploadFile = File(..., description="A digitisation-list JSON file (exchange contract 1.1, artefact 1)"),
+    kept_on_unit: bool = Form(False, description="Keep the list's volumes on the unit (NEH-320); admin only"),
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
@@ -111,8 +112,14 @@ def import_digitisation_list(
     link is down, and is logged `list_import_override`. While projects are
     hidden the volumes go into the unit's default project, and no admin is
     needed for it.
+
+    `kept_on_unit` (NEH-320, app.core.kept_volumes): in offline mode every
+    volume is kept on the unit whatever is sent; in backup and fisqua mode
+    an admin may ask for it (the report's `keptOnUnit`; in fisqua mode the
+    override's log line says so), and from anyone else it is a 403
+    (`kept_on_unit_admin_only`) with nothing written.
     """
-    from app.core import unit_mode
+    from app.core import kept_volumes, unit_mode
 
     from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
     if from_fisqua and current_user.role != "admin":
@@ -127,7 +134,10 @@ def import_digitisation_list(
     try:
         report = import_list(db, document, current_user.username,
                              may_create_project=current_user.role == "admin",
-                             file_sha256=hashlib.sha256(raw).hexdigest(), raw=raw)
+                             file_sha256=hashlib.sha256(raw).hexdigest(), raw=raw,
+                             kept_on_unit=kept_on_unit, is_admin=current_user.role == "admin")
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
@@ -152,7 +162,8 @@ def import_digitisation_list(
             db, level="INFO", category="activity", action="list_import_override",
             actor=current_user.username, subject=report["listName"],
             detail=f"list {report['listId']} imported in fisqua mode: {report['created']} created"
-                   + (f": {codes}" if codes else ""),
+                   + (f": {codes}" if codes else "")
+                   + ("; kept on the unit" if report.get("keptOnUnit") else ""),
         )
     return JSONResponse(content=report)
 

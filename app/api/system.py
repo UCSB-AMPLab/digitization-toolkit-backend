@@ -173,6 +173,8 @@ class UnitUpdate(BaseModel):
 
     mode: Optional[Literal["offline", "backup", "fisqua"]] = None
     projectsEnabled: Optional[bool] = None
+    # Leaving offline mode while volumes are kept on the unit (NEH-320).
+    keptVolumes: Optional[Literal["include", "keep"]] = None
 
 
 @router.get("/unit")
@@ -191,6 +193,8 @@ def get_unit(
     that mode (`offsite_not_configured`, `catalogue_dump_not_configured`,
     `fisqua_not_configured`); an empty list means the switch may be tried.
     A switch to fisqua also needs Fisqua to take the operators call.
+    `keptVolumes` lists every volume Captua keeps on the unit (NEH-320) as
+    {id, name, files}, `files` being the count it would copy offsite.
     """
     from app.core import unit_mode
 
@@ -214,12 +218,19 @@ def put_unit(
     effort. `projectsEnabled` is stored in any mode, and matters only in
     offline mode. Each change is logged: `unit_mode_changed`,
     `unit_projects_changed`.
+
+    Leaving offline mode while volumes are kept on the unit (NEH-320) needs
+    `keptVolumes`: absent, a 409 with the problem `kept_volumes_decision`
+    and nothing changes; `include` releases every kept volume with the
+    switch (`kept_volumes_released`); `keep` leaves them kept
+    (`kept_volumes_kept`). Into offline, or with no kept volume, it is
+    ignored.
     """
     from app.core import unit_mode
 
     try:
         unit_mode.change(db, actor=current_user.username, mode=payload.mode,
-                         projects_enabled=payload.projectsEnabled)
+                         projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
     except unit_mode.ModeRefused as exc:
         raise HTTPException(status_code=409, detail=exc.detail())
     return unit_mode.as_api(db)

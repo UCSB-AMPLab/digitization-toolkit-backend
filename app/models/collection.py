@@ -1,7 +1,7 @@
 # Version: 0.3.0
 
 from datetime import datetime, timezone
-from sqlalchemy import event, inspect as sa_inspect, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
+from sqlalchemy import event, inspect as sa_inspect, Boolean, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, false, select, text
 from sqlalchemy.orm import Session, relationship, validates, object_session
 
 from app.core.db import Base
@@ -285,6 +285,13 @@ class Collection(Base):
     # for the same reference code clears it.
     assignee_username = Column(String(150), nullable=True)
     queue_hidden_at = Column(DateTime, nullable=True)
+
+    # Whether Captua keeps the volume on the unit (NEH-320, app.core.kept_volumes):
+    # while true, none of its images is copied offsite and none of its Fisqua
+    # manifests is promoted or sent. Set at creation in offline mode, or by an
+    # admin; cleared by an admin, or for every kept volume when an admin
+    # switches out of offline mode and includes them.
+    kept_on_unit = Column(Boolean, nullable=False, default=False, server_default=false())
 
     # Relationships
     project = relationship("Project", back_populates="collections")

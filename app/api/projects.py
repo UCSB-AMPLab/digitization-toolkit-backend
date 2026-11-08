@@ -133,6 +133,13 @@ def add_record_to_project(
             from app.core.image_upload import STORED_OFFSITE_MESSAGE, records_stored_offsite
             if records_stored_offsite(db, [r.id]):
                 raise HTTPException(status_code=409, detail=STORED_OFFSITE_MESSAGE)
+            # Out of a volume Captua keeps on the unit (NEH-320): refused.
+            from app.core import kept_volumes
+            try:
+                kept_volumes.refuse_kept_move(db, r.collection_id, None)
+            except kept_volumes.KeepRefused as exc:
+                db.rollback()
+                raise HTTPException(status_code=exc.status, detail=exc.detail())
     # A record has one parent: attaching it to a project detaches it from any collection
     r.project_id = p.id
     r.collection_id = None

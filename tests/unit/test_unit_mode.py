@@ -187,7 +187,9 @@ def test_the_migration_follows_the_head_it_was_written_on_and_leaves_one_head(ba
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    assert revisions - downs == {REVISION}
+    # The head is now the kept_on_unit revision (test_kept_on_unit.py), which follows this one.
+    assert REVISION in downs
+    assert len(revisions - downs) == 1
 
 
 @pytest.mark.unit
@@ -379,7 +381,8 @@ def test_get_unit_shape_for_any_role(client, db_session, fisqua):
         assert resp.status_code == 200, resp.text
     body = resp.json()
     assert body == {"mode": "offline", "projectsEnabled": True, "projectsShown": True,
-                    "defaultProjectId": None, "prerequisites": {"backup": [], "fisqua": []}}
+                    "defaultProjectId": None, "prerequisites": {"backup": [], "fisqua": []},
+                    "keptVolumes": []}
 
 
 @pytest.mark.unit

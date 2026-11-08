@@ -96,6 +96,14 @@ def _check_codes_with_fisqua(db: Session, codes) -> None:
         raise HTTPException(status_code=exc.status, detail=exc.detail())
 
 
+def _kept_parent(db: Session, parent_id: int, lock: bool = False) -> bool:
+    """Whether Captua keeps the parent volume on the unit (NEH-320); its row FOR SHARE with `lock`."""
+    query = db.query(Collection.kept_on_unit).filter(Collection.id == parent_id)
+    if lock:
+        query = query.with_for_update(read=True)
+    return bool(query.scalar())
+
+
 def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
@@ -124,14 +132,33 @@ def create_collection(
     external_id when set (contract 1.8; 422 `unknown_reference_code`, 409
     `fisqua_no_lookup` or `fisqua_unreachable`), and is logged
     `volume_created_override`.
+
+    `kept_on_unit` (NEH-320, app.core.kept_volumes): in offline mode every
+    new volume is kept on the unit, whatever is sent. In backup and fisqua
+    mode an admin may ask for it, and in fisqua mode such a volume is not
+    checked with Fisqua, its override logged with the flag; from anyone
+    else, true is a 403 (`kept_on_unit_admin_only`). A subcollection of a
+    kept volume is kept. The mode, and the parent's flag, are read again in
+    the insert's transaction, the settings row and the parent's row FOR
+    SHARE; a switch, or a keep or a release of the parent, committed
+    meanwhile is a 409 `mode_changed` and nothing is created.
     """
-    from app.core import unit_mode
+    from app.core import kept_volumes, unit_mode
     from app.core.list_import import ListRefused, ProjectLockUnavailable
 
     unit = unit_mode.current(db)
     from_fisqua = unit.mode == unit_mode.FISQUA
     if from_fisqua and current_user.role != "admin":
         raise _volumes_from_fisqua()
+    try:
+        kept = kept_volumes.kept_on_create(unit.mode, payload.kept_on_unit, current_user.role == "admin")
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    # A subcollection of a volume Captua keeps on the unit is kept too.
+    parent_kept = (payload.parent_collection_id is not None
+                   and _kept_parent(db, payload.parent_collection_id))
+    if parent_kept:
+        kept = True
 
     # While projects are hidden every new volume goes into the unit's default
     # project, whoever creates it: a given project_id is ignored. A
@@ -144,7 +171,7 @@ def create_collection(
     if project_id is not None and payload.parent_collection_id is not None:
         raise HTTPException(status_code=400, detail="Cannot specify both project_id and parent_collection_id")
 
-    if from_fisqua:
+    if from_fisqua and not kept:
         _check_codes_with_fisqua(db, [payload.filename_stem, payload.external_id])
 
     if project_id is None and payload.parent_collection_id is None:
@@ -179,7 +206,8 @@ def create_collection(
         date_end=payload.date_end,
         sequence=payload.sequence,
         custom_attributes=payload.custom_attributes,
-        created_by=payload.created_by or current_user.username
+        created_by=payload.created_by or current_user.username,
+        kept_on_unit=kept,
     )
     
     # A stem may not name a project's directory (app.models.collection).
@@ -187,6 +215,18 @@ def create_collection(
         message = stem_directory_collision(db, stem=payload.filename_stem)
         if message:
             raise HTTPException(status_code=409, detail={"message": message})
+
+    # The mode, and the parent's flag, read again in the insert's transaction
+    # (NEH-320): the settings row FOR SHARE, the parent's row FOR SHARE, so a
+    # switch, a keep or a release either committed before and is seen here,
+    # or waits for this commit. What was decided under another mode, or on a
+    # parent flag that a keep or a release has changed since, is refused
+    # (409 mode_changed) rather than stored with its flag.
+    if unit_mode.mode_for_insert(db) != unit.mode or (
+            payload.parent_collection_id is not None
+            and _kept_parent(db, payload.parent_collection_id, lock=True) != parent_kept):
+        db.rollback()
+        raise HTTPException(status_code=409, detail=unit_mode.ModeChangedDuringWrite().detail())
 
     try:
         db.add(collection)
@@ -199,10 +239,12 @@ def create_collection(
     log_event(db, level="INFO", category="activity", action="collection_created",
               actor=current_user.username, subject=collection.name)
     if from_fisqua:
+        detail = _volume_change_detail(collection.id, stem=(None, collection.filename_stem),
+                                       external_id=(None, collection.external_id))
+        if kept:
+            detail += "; kept on the unit, not checked with Fisqua"
         log_event(db, level="INFO", category="activity", action="volume_created_override",
-                  actor=current_user.username, subject=collection.name,
-                  detail=_volume_change_detail(collection.id, stem=(None, collection.filename_stem),
-                                               external_id=(None, collection.external_id)))
+                  actor=current_user.username, subject=collection.name, detail=detail)
     return CollectionRead.model_validate(collection)
 
 
@@ -318,14 +360,97 @@ def get_collection_offsite_state(
     the volume's capture manifests for Fisqua, newest first, each with its
     delivery state (app.models.fisqua), and `status` is the latest status
     Fisqua gave for the volume, or null.
-    """
-    from app.core.fisqua_outbox import volume_fisqua_state
-    from app.core.image_upload import volume_upload_state
 
+    `kept_on_unit` is true while Captua keeps the volume on the unit
+    (NEH-320): nothing of it is pending, and `total` counts the files Captua
+    would copy once an admin releases it.
+    """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return _offsite_state(db, collection)
+
+
+def _offsite_state(db: Session, collection) -> dict:
+    from app.core.fisqua_outbox import volume_fisqua_state
+    from app.core.image_upload import volume_upload_state
+
     return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id)}
+
+
+# ==============================================================================
+# Keeping a volume on the unit, and releasing it (NEH-320, app.core.kept_volumes)
+# ==============================================================================
+
+@router.post("/{collection_id}/release-from-unit")
+def release_collection_from_unit(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Release a volume Captua keeps on the unit, and every kept volume inside it, in any mode; admin only.
+
+    Returns the volume's offsite state. From then on their images are
+    copied offsite and, in fisqua mode, their manifests sent like any other
+    volume's. Logged as one `volume_released_from_unit` entry for the
+    volume, naming how many were released with it. A volume not kept is a
+    409 (`not_kept_on_unit`); one whose parent volume is kept is a 409
+    (`kept_parent`), since a volume inside a kept volume is kept; volumes
+    inside it that changed during the request are a 409
+    (`kept_volumes_changed`). In fisqua mode the stem and external_id of
+    each volume it releases are first checked with Fisqua (contract 1.8, as
+    POST /collections/), and any refusal answers Fisqua's status and detail
+    with every volume still kept; offline and backup mode make no call.
+    Locks and their order: kept_volumes.release.
+    """
+    from app.core import kept_volumes, unit_mode
+
+    def fisqua_check(stem, external_id):
+        _check_codes_with_fisqua(db, [stem, external_id])
+
+    def check_for(mode):
+        return fisqua_check if mode == unit_mode.FISQUA else None
+
+    # The mode read here decides the check; release() reads it again under the
+    # settings row's lock and starts again with the right check if it changed.
+    observed = unit_mode.mode(db)
+    try:
+        collection = kept_volumes.release(db, collection_id, current_user.username,
+                                          mode=observed, check_for=check_for)
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if collection is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return _offsite_state(db, collection)
+
+
+@router.post("/{collection_id}/keep-on-unit")
+def keep_collection_on_unit(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Keep an existing volume on the unit, and every volume inside it, in any mode; admin only.
+
+    Returns the volume's offsite state. Captua then copies none of their
+    images offsite and sends none of their manifests; their unsent outbox
+    rows wait. Logged as one `volume_kept_on_unit` entry for the volume,
+    naming how many were kept with it. Refused as a whole with a 409 when
+    the volume is already kept (`already_kept_on_unit`), when anything of
+    it or of any volume inside it has left the unit (`already_left_unit`):
+    a file uploaded or verified offsite, or a manifest sent or being sent;
+    and when the volumes inside it changed during the request
+    (`kept_volumes_changed`). Locks and their order: kept_volumes.keep.
+    """
+    from app.core import kept_volumes
+
+    try:
+        collection = kept_volumes.keep(db, collection_id, current_user.username)
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if collection is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return _offsite_state(db, collection)
 
 
 # ==============================================================================
@@ -530,6 +655,19 @@ def update_collection(
     the new code (contract 1.8, as POST /collections/), and is logged
     `volume_code_override`; clearing the stem is refused with a 422
     (`stem_required`), since the stem is the volume's Fisqua reference code.
+    A volume Captua keeps on the unit (NEH-320) is not checked with Fisqua:
+    its codes are checked when an admin releases it.
+
+    A re-parent is refused (409 `kept_on_unit_move`) when the new parent is
+    kept on the unit and the volume is not (kept_volumes.refuse_kept_reparent).
+    Locks: the volume FOR UPDATE (the PATCH may change its unique stem or
+    external_id, which a weaker lock would have to upgrade at the flush)
+    and, with a new parent, the parent FOR SHARE, taken together in
+    ascending id order before any other locked read
+    (kept_volumes.lock_for_reparent), so the PATCH and a records move
+    (refuse_kept_move: source FOR SHARE, target FOR UPDATE), a keep or a
+    release (FOR NO KEY UPDATE) between the same volumes lock them in one
+    order.
     """
     from app.core import unit_mode
 
@@ -546,23 +684,31 @@ def update_collection(
         # Before the row lock, so that Fisqua is not asked while the row is
         # held; read as plain columns, so the locked read below loads the
         # row afresh. Checked again under the lock.
-        stored = (db.query(Collection.filename_stem, Collection.external_id)
+        stored = (db.query(Collection.filename_stem, Collection.external_id, Collection.kept_on_unit)
                   .filter(Collection.id == collection_id).first())
         if stored is not None:
-            changes = code_changes(*stored)
+            changes = code_changes(stored.filename_stem, stored.external_id)
             if changes and current_user.role != "admin":
                 raise _volumes_from_fisqua()
             if "filename_stem" in changes and changes["filename_stem"] is None:
                 raise HTTPException(status_code=422, detail={"code": unit_mode.STEM_REQUIRED,
                                                              "message": unit_mode.STEM_REQUIRED_MESSAGE})
             new_codes = [value for value in changes.values() if value is not None]
-            _check_codes_with_fisqua(db, new_codes)
-            checked.update(new_codes)
+            if not stored.kept_on_unit:
+                _check_codes_with_fisqua(db, new_codes)
+                checked.update(new_codes)
 
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
-    # write-once guards compare against the committed value.
-    collection = _locked_collection_query(db, collection_id).first()
+    # write-once guards compare against the committed value. With a new
+    # parent, its row is taken FOR SHARE in the same pass, the two in id
+    # order (kept_volumes.lock_for_reparent), before any other locked read.
+    from app.core import kept_volumes
+    new_parent_id = payload.model_dump(exclude_unset=True).get("parent_collection_id")
+    if new_parent_id is None or new_parent_id == collection_id:
+        collection = _locked_collection_query(db, collection_id).first()
+    else:
+        collection = kept_volumes.lock_for_reparent(db, collection_id, new_parent_id)
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
 
@@ -577,7 +723,7 @@ def update_collection(
             db.rollback()
             raise _volumes_from_fisqua()
         unchecked = [value for value in changes.values() if value is not None and value not in checked]
-        if unchecked:
+        if unchecked and not collection.kept_on_unit:
             # The row changed since the read above: rare, and checked here.
             try:
                 _check_codes_with_fisqua(db, unchecked)
@@ -586,6 +732,16 @@ def update_collection(
                 raise
         code_override = bool(changes)
     
+    # A re-parent that would put a volume Captua does not keep inside a kept
+    # one (NEH-320); a kept volume may move anywhere.
+    reparent = payload.model_dump(exclude_unset=True)
+    if "parent_collection_id" in reparent and reparent["parent_collection_id"] != collection.parent_collection_id:
+        try:
+            kept_volumes.refuse_kept_reparent(db, collection, reparent["parent_collection_id"])
+        except kept_volumes.KeepRefused as exc:
+            db.rollback()
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+
     if payload.parent_collection_id is not None:
         # Prevent circular references
         if payload.parent_collection_id == collection_id:
@@ -795,6 +951,14 @@ def move_collection_records(
                 "blocking_record_ids": stored,
             },
         )
+
+    # Not between a volume Captua keeps on the unit and one it does not (NEH-320).
+    from app.core import kept_volumes
+    try:
+        kept_volumes.refuse_kept_move(db, collection_id, target_collection_id)
+    except kept_volumes.KeepRefused as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
     # The moved records take the sequences after the target's highest, in
     # their listing order in the source, so no two records of the target
@@ -1207,7 +1371,7 @@ def promote_collection(
     award_rescan_turns(db, rescans, current_user.username)
     # Queued in the handover's transaction, after the records' locks, so a
     # handover and its manifest are committed together or not at all
-    # (app.core.fisqua_outbox). Nothing is queued when Fisqua is not configured.
+    # (app.core.fisqua_outbox). Queued whatever the configuration (NEH-320).
     from app.core.fisqua_outbox import enqueue_handover
     enqueue_handover(db, collection)
     db.commit()

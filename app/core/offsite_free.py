@@ -10,7 +10,8 @@ The rules:
 
 * **Only a received volume.** Every uploadable object of the volume must be
   verified (image_upload.volume_upload_state). Review state and Fisqua play
-  no part.
+  no part. A volume Captua keeps on the unit (app.core.kept_volumes) is
+  refused (`kept_on_unit`), by the free, its dry run and mark-freed.
 * **A RAW preview needs its sha256 first.** One whose capture manifests
   carry no sha256 for it (in its capture record, or a `preview_digest`
   record from `backfill-preview-digests`) stays on the card, reported as
@@ -140,6 +141,11 @@ NOT_IN_OWN_FOLDER_MESSAGE = (
     "time it starts. If they are still not moved after a restart, the backend's log says "
     "why (for example, the folder already holds files that are not this volume's); once "
     "that is cleared and Captua has restarted, the volume can be freed."
+)
+KEPT_ON_UNIT = "kept_on_unit"
+KEPT_MESSAGE = (
+    "Captua keeps this volume on the unit and copies none of its files offsite, so none of them "
+    "can be freed from the card."
 )
 HOLD_MESSAGE = (
     "Offsite uploads are on hold on this unit while it is being upgraded, so no "
@@ -397,6 +403,11 @@ def _stem_volume(db: Session, collection_id: int):
 def _require_received(db: Session, collection) -> None:
     from app.core.image_upload import volume_upload_state
 
+    if collection.kept_on_unit:
+        # Kept on the unit (app.core.kept_volumes): nothing of it is copied
+        # offsite, so nothing of it is freed, whatever its rows say.
+        db.commit()
+        raise FreeRefused(KEPT_MESSAGE, detail={"code": KEPT_ON_UNIT})
     state = volume_upload_state(db, collection)
     db.commit()
     if not state["received"]:
@@ -1077,7 +1088,8 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
     Runs in a process of its own, outside the backend's hold, so each file's
     absence is checked again right before its row is written. Raises
     ValueError for an unknown stem and VerificationUnavailable when a
-    listing does not answer, and ValueError in offline mode (app.core.unit_mode).
+    listing does not answer, and ValueError in offline mode (app.core.unit_mode)
+    and for a volume kept on the unit (app.core.kept_volumes).
     """
     from app.core.image_upload import local_file
     from app.models.collection import Collection
@@ -1091,6 +1103,8 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
     collection = db.query(Collection).filter(Collection.filename_stem == stem).one_or_none()
     if collection is None:
         raise ValueError(f"no volume has the file name stem {stem!r}")
+    if collection.kept_on_unit:
+        raise ValueError(f"Captua keeps the volume {stem!r} on the unit, so none of its files is marked freed")
 
     absent, unaccounted = [], []
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,

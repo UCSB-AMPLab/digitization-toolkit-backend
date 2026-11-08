@@ -48,6 +48,14 @@ down from fisqua sends the PUT once with the new mode, best effort: a
 failure is logged and does not stop the switch. offline and backup have
 no link, so a change between them sends nothing.
 
+**Kept volumes** (NEH-320, app.core.kept_volumes). A volume created in
+offline mode is kept on the unit: none of its images is copied offsite and
+none of its manifests sent to Fisqua until an admin releases it. Leaving
+offline mode while any is kept needs the admin's decision (`kept`, the
+PUT's `keptVolumes`): `include` releases them all with the switch, `keep`
+leaves them kept; without one the switch is refused
+(`kept_volumes_decision`). as_api lists them as `keptVolumes`.
+
 **Projects.** Shown only in `offline` mode with projects_enabled on; the
 setting is stored in any mode. While they are hidden every new volume goes
 into the unit's default project (default_project): the stored one, else
@@ -69,6 +77,7 @@ from sqlalchemy.exc import IntegrityError
 from sqlalchemy.orm import Session
 
 from app.core import fisqua_contract as fc
+from app.core import kept_volumes
 from app.core import offsite_hold
 
 logger = logging.getLogger(__name__)
@@ -99,7 +108,10 @@ PREREQUISITE_MESSAGES = {
     FISQUA_UNREACHABLE: "Fisqua did not take the unit's new mode: the operators call failed.",
     OFFSITE_HELD: "The offsite hold is in place, so nothing can be sent to Fisqua until it is removed.",
     MODE_CHANGED: "The unit's settings were changed by someone else meanwhile; read them again and retry.",
+    kept_volumes.KEPT_VOLUMES_DECISION: kept_volumes.KEPT_VOLUMES_DECISION_MESSAGE,
 }
+# What an admin leaving offline mode decides for the kept volumes (NEH-320).
+KEPT_INCLUDE, KEPT_KEEP = "include", "keep"
 STEM_REQUIRED_MESSAGE = "In Fisqua mode a volume's file name stem is its Fisqua reference code, so it cannot be empty."
 
 VOLUMES_FROM_FISQUA_MESSAGE = (
@@ -163,6 +175,30 @@ def mode(db: Session) -> str:
     return current(db).mode
 
 
+def mode_for_insert(db: Session) -> str:
+    """The stored mode with the settings row taken FOR SHARE, in the caller's transaction (NEH-320).
+
+    For a writer whose insert depends on the mode (a new volume's
+    kept_on_unit and Fisqua-mode gates): read in the transaction that
+    commits the insert, so a change of mode (change(), which takes the row
+    FOR UPDATE) either commits before this read or waits for the insert's
+    commit. Lock order: unit_settings, then collections, as change() takes
+    them. With no row yet, the inferred mode, and nothing is locked.
+    """
+    from app.models.unit_settings import UnitSettings
+
+    row = (db.query(UnitSettings).filter(UnitSettings.id == ROW_ID)
+           .with_for_update(read=True).populate_existing().first())
+    return row.mode if row is not None else inferred()[0]
+
+
+class ModeChangedDuringWrite(Exception):
+    """The mode a write was decided under changed before its insert committed (mode_for_insert)."""
+
+    def detail(self) -> dict:
+        return {"code": MODE_CHANGED, "message": PREREQUISITE_MESSAGES[MODE_CHANGED]}
+
+
 def offsite_on(db: Session) -> bool:
     """Whether images and the catalogue go to the bucket (backup and fisqua)."""
     return mode(db) in (BACKUP, FISQUA)
@@ -213,6 +249,8 @@ def as_api(db: Session) -> dict:
         "projectsShown": state.projects_shown,
         "defaultProjectId": state.default_project_id,
         "prerequisites": prerequisites(),
+        # NEH-320: the volumes Captua keeps on the unit, {id, name, files}.
+        "keptVolumes": kept_volumes.kept_volumes(db),
     }
 
 
@@ -306,12 +344,27 @@ def _problem(code: str, error: Optional[str] = None) -> dict:
 
 
 def change(db: Session, *, actor: str, mode: Optional[str] = None,
-           projects_enabled: Optional[bool] = None, transport=None) -> UnitState:
+           projects_enabled: Optional[bool] = None, kept: Optional[str] = None,
+           transport=None) -> UnitState:
     """Apply an admin's change; commits, and logs unit_mode_changed / unit_projects_changed.
 
     Raises ModeRefused, with nothing changed, when the new mode's
     prerequisites are missing or, for fisqua, the operators PUT carrying it
     fails. The caller holds no uncommitted change.
+
+    Leaving offline mode while Captua keeps volumes on the unit (NEH-320,
+    app.core.kept_volumes) needs `kept`: without it the switch is refused
+    (`kept_volumes_decision`, with any missing prerequisite in the same
+    refusal) before any call to Fisqua; `include` releases every kept
+    volume in the transaction that stores the mode, logged
+    `kept_volumes_released` with their count and ids; `keep` leaves them
+    kept, logged `kept_volumes_kept` with their count. Into offline, or with
+    no kept volume, `kept` is ignored. A refusal for any reason leaves the
+    flags as they were. The check for kept volumes runs again once the
+    settings row is held FOR UPDATE (_ensure_row): a creation in offline
+    mode, a keep and a release all take that row FOR SHARE first, so a kept
+    volume committed after the first check is seen there and refuses the
+    switch, and none can commit until the switch does.
 
     When Fisqua was told a mode that is then not stored (the change lost a
     race, `mode_changed`, or its commit failed), the mode actually stored is
@@ -330,11 +383,16 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
         target = before.mode if mode is None else mode
         unsent = None
         told = None  # the mode Fisqua accepted in this change, if any
+        leaving_offline = target != before.mode and before.mode == OFFLINE
+        if kept is not None and kept not in (KEPT_INCLUDE, KEPT_KEEP):
+            raise ValueError(f"unknown kept volumes decision {kept!r}")
         if target != before.mode:
-            if target in (BACKUP, FISQUA):
-                missing = prerequisites()[target]
-                if missing:
-                    raise ModeRefused(target, [_problem(code) for code in missing])
+            missing = prerequisites()[target] if target in (BACKUP, FISQUA) else []
+            problems = [_problem(code) for code in missing]
+            if leaving_offline and kept is None and _any_kept(db):
+                problems.append(_problem(kept_volumes.KEPT_VOLUMES_DECISION))
+            if problems:
+                raise ModeRefused(target, problems)
             if target == FISQUA:
                 if offsite_hold.held("switch to fisqua mode"):
                     raise ModeRefused(target, [_problem(OFFSITE_HELD)])
@@ -362,9 +420,18 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
                 db.rollback()
                 _resend_stored(db, told, actor, transport)
                 raise ModeRefused(target, [_problem(MODE_CHANGED)])
+            if leaving_offline and kept is None and _any_kept(db):
+                # A volume created in offline mode committed after the first
+                # check and before this lock (creation holds the row FOR
+                # SHARE through its insert, so none can commit from here on).
+                db.rollback()
+                _resend_stored(db, told, actor, transport)
+                raise ModeRefused(target, [_problem(kept_volumes.KEPT_VOLUMES_DECISION)])
             row.mode = target
             if projects_enabled is not None:
                 row.projects_enabled = bool(projects_enabled)
+            if leaving_offline and kept is not None:
+                _decide_kept(db, kept, actor)
             row.updated_at = _now()
             row.updated_by = actor
             new_projects = bool(row.projects_enabled)
@@ -385,6 +452,60 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
         audit.log_event(db, level="INFO", category="system", action="unit_projects_changed", actor=actor,
                         detail=f"projects_enabled {old_projects} -> {new_projects}")
     return current(db)
+
+
+def _any_kept(db: Session) -> bool:
+    from app.models.collection import Collection
+
+    return db.query(Collection.id).filter(Collection.kept_on_unit.is_(True)).first() is not None
+
+
+DETAIL_MAX = 500  # system_logs.detail, as _log_in_session cuts it
+
+
+def released_detail(ids: list) -> str:
+    """The kept_volumes_released detail: the count and the ids, within DETAIL_MAX.
+
+    When every id does not fit, as many as fit, then `…` and the number left out.
+    """
+    head = f"{len(ids)} volume(s) included on leaving offline mode: ids "
+    full = head + ", ".join(str(i) for i in ids)
+    if len(full) <= DETAIL_MAX:
+        return full
+    shown: list = []
+    for i in ids:
+        tail = f" … {len(ids) - len(shown) - 1} more"
+        candidate = head + ", ".join(str(x) for x in shown + [i]) + tail
+        if len(candidate) > DETAIL_MAX:
+            break
+        shown.append(i)
+    return head + ", ".join(str(x) for x in shown) + f" … {len(ids) - len(shown)} more"
+
+
+def _decide_kept(db: Session, kept: str, actor: Optional[str]) -> None:
+    """The admin's decision for the kept volumes, in the caller's transaction (not committed).
+
+    The kept rows are locked FOR NO KEY UPDATE in ascending id order (the row lock
+    is taken above the sort) before the UPDATE that releases them, so the
+    include locks collection rows in the order keep(), release(),
+    lock_for_reparent and refuse_kept_move take them (app.core.kept_volumes,
+    "Lock order"). It holds the unit_settings row first, which none of
+    those take, so that lock cannot close a cycle either.
+    """
+    from app.models.collection import Collection
+
+    ids = [cid for (cid,) in db.query(Collection.id).filter(Collection.kept_on_unit.is_(True))
+           .order_by(Collection.id).with_for_update(key_share=True).all()]
+    if not ids:
+        return
+    if kept == KEPT_INCLUDE:
+        (db.query(Collection).filter(Collection.id.in_(ids))
+         .update({Collection.kept_on_unit: False}, synchronize_session=False))
+        _log_in_session(db, "kept_volumes_released", released_detail(ids), actor=actor)
+        logger.info("Leaving offline mode: %d kept volume(s) released", len(ids))
+    else:
+        _log_in_session(db, "kept_volumes_kept",
+                        f"{len(ids)} volume(s) kept on the unit on leaving offline mode", actor=actor)
 
 
 def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], transport=None) -> None:

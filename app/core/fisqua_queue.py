@@ -105,6 +105,7 @@ QUEUE_REASONS = {
     "invalid_assignee": f"The assignee is not null or a username of at most {ASSIGNEE_MAX_LENGTH} characters.",
     "withdrawn_not_on_unit": "The item was withdrawn and no volume on this unit has its referenceCode.",
     "list_name_refused": "The project named after listName cannot be created on this unit.",
+    "kept_on_unit": "Captua keeps a volume with this referenceCode or filenameStem on this unit, so the queue does not change it.",
     "invalid_retakes": (
         "The retakes are not a list of objects, each with an integer captuaRecordId, a pairId that is "
         "a non-empty string or null, and a side of left, right or both."
@@ -473,12 +474,50 @@ def _has_records(db: Session, collection_id: int) -> bool:
     return db.query(Record.id).filter(Record.collection_id == collection_id).first() is not None
 
 
-def _volume_by_code(db: Session, code: Any):
+def _volume_by_code(db: Session, code: Any, lock: bool = False):
+    """The volume whose reference code is `code`, or None; with `lock`, its row FOR NO KEY UPDATE, read afresh.
+
+    The queue takes the lock before it reads the volume's kept_on_unit and
+    writes to it (NEH-320), and holds it until that write commits: a keep
+    (app.core.kept_volumes.keep, which takes the row FOR NO KEY UPDATE)
+    either committed first and is seen, or waits for the queue's commit.
+    FOR NO KEY UPDATE rather than FOR SHARE because the queue then updates
+    the row (none of the columns it writes is a key), which would upgrade a
+    share lock in the same transaction. One collection row only, with no
+    other row lock in that transaction, so it closes no cycle with the
+    lockers in app.core.kept_volumes ("Lock order").
+    """
     from app.models.collection import Collection
 
     if not isinstance(code, str) or not code or "\x00" in code:
         return None
-    return db.query(Collection).filter(Collection.external_id == code).first()
+    query = db.query(Collection).filter(Collection.external_id == code)
+    if lock:
+        query = query.with_for_update(key_share=True).populate_existing()
+    return query.first()
+
+
+# The skip reason for an item whose volume Captua keeps on the unit (NEH-320).
+KEPT_ON_UNIT_REASON = "kept_on_unit"
+
+
+def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
+    """Whether a volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
+
+    The stem is the reference code (contract 1.2 §8), and an admin's kept
+    volume may have only a stem.
+    """
+    from sqlalchemy import or_
+
+    from app.models.collection import Collection
+
+    names = [v for v in (code, stem) if isinstance(v, str) and v and "\x00" not in v]
+    if not names:
+        return False
+    return db.query(Collection.id).filter(
+        Collection.kept_on_unit.is_(True),
+        or_(Collection.external_id.in_(names), Collection.filename_stem.in_(names)),
+    ).first() is not None
 
 
 def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[dict, dict, dict]:
@@ -560,7 +599,17 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
         live_codes.add(code)
         fisqua = json.loads(values["custom_attributes"])["fisqua"]
         try:
-            volume = _volume_by_code(db, code)
+            # A volume Captua keeps on the unit (NEH-320) is the admin's, not the queue's.
+            if _kept_volume_for(db, code, values.get("filename_stem")):
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
+            volume = _volume_by_code(db, code, lock=True)
+            if volume is not None and volume.kept_on_unit:
+                # Kept by an admin after the check above: read under the lock.
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
             if volume is not None:
                 attributes = _merge_attributes(volume.custom_attributes, fisqua)
                 if attributes is None:
@@ -599,7 +648,8 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
             skip(item_id, "list_name_refused")
             continue
         volume_id, reason = list_import.create_volume(
-            db, QUEUE_LIST_ID, position, project_id, QUEUE_ACTOR, {**values, "assignee_username": assignee})
+            db, QUEUE_LIST_ID, position, project_id, QUEUE_ACTOR, {**values, "assignee_username": assignee},
+            expected_mode=unit_mode.FISQUA)
         if reason is not None:
             skip(item_id, reason)
             continue
@@ -613,10 +663,19 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
         if item_id is None:
             continue
         try:
-            volume = _volume_by_code(db, item.get("referenceCode"))
+            if _kept_volume_for(db, item.get("referenceCode"), item.get("filenameStem")):
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
+            volume = _volume_by_code(db, item.get("referenceCode"), lock=True)
             if volume is None:
                 db.rollback()
                 skip(item_id, "withdrawn_not_on_unit")
+                continue
+            if volume.kept_on_unit:
+                # Kept by an admin after the check above: read under the lock.
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
                 continue
             volume_id = volume.id
             # A live entry for the same code in this revision decides, and a
