@@ -147,6 +147,7 @@ REASONS = {
     "filename_stem_held_offsite": (
         "Images are stored offsite under this filenameStem, so it cannot be given to a new volume."
     ),
+    "mode_changed": "Someone changed the unit's mode during the import, so Captua did not create the volume.",
 }
 
 # A refusal by app.models.collection's stem directory check, mapped to its reason.
@@ -657,13 +658,18 @@ def first_positions(items: list) -> tuple[dict, dict]:
 
 
 def create_volume(db: Session, list_id: str, position: int, project_id: int, actor: Optional[str],
-                  values: dict) -> tuple[Optional[int], Optional[str]]:
+                  values: dict, expected_mode: Optional[str] = None) -> tuple[Optional[int], Optional[str]]:
     """Create one checked item's volume in `project_id` and commit it: (its id, None), or (None, a reject reason).
 
     `values` are check_item's column values, to which a caller may add
     other Collection columns. The volume is refused as reference_code_on_unit
     or filename_stem_on_unit when a volume on the unit already has its code
     or its stem; any failure at the database rolls back this volume only.
+
+    With `expected_mode`, the unit's mode is read in the insert's
+    transaction with the settings row FOR SHARE (unit_mode.mode_for_insert,
+    NEH-320), and a volume decided under another mode (its kept_on_unit)
+    is refused as mode_changed.
     """
     # The lookups and the insert are one step for the rollback-and-reject
     # handling: a database failure at any of them costs this item only.
@@ -672,6 +678,12 @@ def create_volume(db: Session, list_id: str, position: int, project_id: int, act
     # the id afterwards is a query that can fail for a volume already
     # committed, which a rollback could no longer remove.
     try:
+        if expected_mode is not None:
+            from app.core import unit_mode
+
+            if unit_mode.mode_for_insert(db) != expected_mode:
+                db.rollback()
+                return None, "mode_changed"
         if db.query(Collection.id).filter(Collection.external_id == values["external_id"]).first():
             return None, "reference_code_on_unit"
         if db.query(Collection.id).filter(Collection.filename_stem == values["filename_stem"]).first():
@@ -710,8 +722,14 @@ def create_volume(db: Session, list_id: str, position: int, project_id: int, act
 
 
 def _import_items(db: Session, list_id: str, list_name: str, project: Project, project_created: bool,
-                  items: list, actor: Optional[str], notes: Any = None) -> dict:
-    """Create each item's volume in `project` (found or created by _project_for); return the report."""
+                  items: list, actor: Optional[str], notes: Any = None, kept_on_unit: bool = False,
+                  mode: Optional[str] = None) -> dict:
+    """Create each item's volume in `project` (found or created by _project_for); return the report.
+
+    Each volume is created with `kept_on_unit` (app.core.kept_volumes),
+    and, with `mode`, only while the unit is still in that mode
+    (create_volume's expected_mode).
+    """
     project_id = project.id
     project_name = project.name
     # Stored only when this import created the project with a description.
@@ -732,7 +750,8 @@ def _import_items(db: Session, list_id: str, list_name: str, project: Project, p
             rejects.append(_reject(position, code, reason))
             continue
 
-        volume_id, reason = create_volume(db, list_id, position, project_id, actor, values)
+        volume_id, reason = create_volume(db, list_id, position, project_id, actor,
+                                          {**values, "kept_on_unit": kept_on_unit}, expected_mode=mode)
         if reason is not None:
             rejects.append(_reject(position, code, reason))
             continue
@@ -787,7 +806,8 @@ _SHA256_RE = re.compile(r"[0-9a-f]{64}")
 
 
 def import_list(db: Session, document: Any, actor: Optional[str], may_create_project: bool,
-                file_sha256: Optional[str] = None, raw: Optional[bytes] = None) -> dict:
+                file_sha256: Optional[str] = None, raw: Optional[bytes] = None,
+                kept_on_unit: Optional[bool] = None, is_admin: Optional[bool] = None) -> dict:
     """Import a digitisation list, store its report, and return it.
 
     Raises, before writing anything to the database or a report:
@@ -829,11 +849,21 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
     notes are not stored on that project (`projectNotesSkipped` is
     `default_project`). `projectCreated` says whether the default project
     was created by this import.
+
+    Every volume is kept on the unit (NEH-320, app.core.kept_volumes) when
+    the unit is in offline mode, and in any other mode when `kept_on_unit`
+    is asked for by an admin (`is_admin`, which defaults to
+    `may_create_project`); `keptOnUnit` in the report says which. Asked for
+    by anyone else outside offline mode, kept_volumes.KeepRefused is raised
+    before anything is written.
     """
-    from app.core import unit_mode
+    from app.core import kept_volumes, unit_mode
 
     list_id, list_name, items = check_envelope(document)
-    use_default = not unit_mode.current(db).projects_shown
+    unit = unit_mode.current(db)
+    kept = kept_volumes.kept_on_create(unit.mode, kept_on_unit,
+                                       may_create_project if is_admin is None else is_admin)
+    use_default = not unit.projects_shown
     # Checked before the lock too, so that a refusal creates no lock file;
     # _project_for checks again under the lock.
     if not use_default and not may_create_project and _find_project(db, list_name) is None:
@@ -874,7 +904,8 @@ def import_list(db: Session, document: Any, actor: Optional[str], may_create_pro
         # The default project is the unit's, not the list's: the list's
         # notes are never its description.
         report = _import_items(db, list_id, list_name, project, project_created and not use_default, items,
-                               actor, notes=notes)
+                               actor, notes=notes, kept_on_unit=kept, mode=unit.mode)
+        report["keptOnUnit"] = kept
         report["projectCreated"] = project_created
         if use_default:
             report["projectNotesSkipped"] = "default_project"

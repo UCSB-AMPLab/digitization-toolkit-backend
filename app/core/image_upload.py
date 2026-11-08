@@ -402,7 +402,8 @@ def pending_work(db: Session) -> list:
     """The objects of stemmed volumes that have no verified or refused row, in volume and image order.
 
     A RAW master's preview is listed whether or not its file exists; the run
-    skips one that is not on disk.
+    skips one that is not on disk. A volume Captua keeps on the unit
+    (kept_on_unit, app.core.kept_volumes) is left out.
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
@@ -417,6 +418,7 @@ def pending_work(db: Session) -> list:
         .outerjoin(cap, and_(cap.record_image_id == RecordImage.id, cap.kind == "capture"))
         .outerjoin(prev, and_(prev.record_image_id == RecordImage.id, prev.kind == "preview"))
         .filter(Collection.filename_stem.isnot(None))
+        .filter(Collection.kept_on_unit.is_(False))
         .filter(or_(
             cap.id.is_(None),
             and_(cap.verified_at.is_(None), cap.refused_at.is_(None)),
@@ -522,16 +524,18 @@ class RunResult:
 
 
 def _image_state(db: Session, image_id: int) -> Optional[tuple]:
-    """(file_path, capture_id, collection_id, filename_stem) of an image as committed now, or None if it is gone.
+    """(file_path, capture_id, collection_id, filename_stem, kept_on_unit) of an image as committed now, or None if it is gone.
 
     A column query, so it reads the database rather than the session's
-    identity map. The stem is that of the record's volume at this moment.
+    identity map. The stem and the kept flag are those of the record's
+    volume at this moment, so a keep committed after the work list was built
+    is caught here, and by _claim's comparison before a first row is written.
     """
     from app.models.collection import Collection
     from app.models.record import Record, RecordImage
 
     return (db.query(RecordImage.file_path, RecordImage.capture_id, Record.collection_id,
-                     Collection.filename_stem)
+                     Collection.filename_stem, Collection.kept_on_unit)
             .join(Record, RecordImage.record_id == Record.id)
             .outerjoin(Collection, Record.collection_id == Collection.id)
             .filter(RecordImage.id == image_id)
@@ -599,6 +603,11 @@ def _read_object(db: Session, item: Work, result: RunResult) -> Optional[_Read]:
         result.skipped.append({"image_id": item.image_id, "kind": item.kind,
                                "reason": "record not in a volume with a stem"})
         return None
+    if first.kept_on_unit:
+        # Kept on the unit since the work list was built (app.core.kept_volumes).
+        result.skipped.append({"image_id": item.image_id, "kind": item.kind,
+                               "reason": "volume kept on the unit"})
+        return None
     try:
         with export_jobs.hold_for_reading([first.collection_id]):
             if _image_state(db, item.image_id) != first:
@@ -652,14 +661,26 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
     record's row is locked, so the order is record before volume, as on every
     path that takes both. An existing row is updated without the lock: its
     record is already held in place by it.
+
+    The volume's row is then taken FOR SHARE (NEH-320), after the record's,
+    so a keep on the unit (kept_volumes.keep, which takes it FOR NO KEY
+    UPDATE, a lock that conflicts with FOR SHARE)
+    and this first row take turns: a keep committed first shows in the
+    re-read state (kept_on_unit), and nothing is written; a claim committed
+    first is the pending row the keep then refuses on.
     """
     if row is not None:
         return _save(db, row, item.image_id, item.kind, key, **fields)
+    from app.models.collection import Collection
     from app.models.record import Record, RecordImage
 
     record_id = db.query(RecordImage.record_id).filter(RecordImage.id == item.image_id).scalar()
     if record_id is not None:
         db.query(Record.id).filter(Record.id == record_id).with_for_update().one_or_none()
+    collection_id = state[2] if state else None
+    if collection_id is not None:
+        (db.query(Collection.id).filter(Collection.id == collection_id)
+         .with_for_update(read=True).one_or_none())
     if record_id is None or _image_state(db, item.image_id) != state:
         db.rollback()
         raise _ImageMoved()
@@ -1444,7 +1465,9 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
     master, its preview when the preview has a row or its file is on disk.
     `freed_files` and `freed_bytes` count the objects whose local file was
     freed from the card (app.core.offsite_free); they are counted among the
-    verified too, since freeing needs a verified object.
+    verified too, since freeing needs a verified object. `kept_on_unit` is
+    the volume's flag (app.core.kept_volumes); its counts are what they are,
+    and callers decide what a kept volume's pending means.
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
@@ -1455,7 +1478,7 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
          .join(Record, RecordImage.record_id == Record.id)
          .join(Collection, Record.collection_id == Collection.id)
          .filter(Collection.filename_stem.isnot(None)))
-    stemmed = db.query(Collection.id).filter(Collection.filename_stem.isnot(None))
+    stemmed = db.query(Collection.id, Collection.kept_on_unit).filter(Collection.filename_stem.isnot(None))
     if collection_ids is not None:
         ids = list(collection_ids)
         q = q.filter(Collection.id.in_(ids))
@@ -1470,8 +1493,8 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
             rows[(row.record_image_id, row.kind)] = row
 
     out = {cid: {"total": 0, "verified": 0, "refused": 0, "last_verified_at": None, "refusals": [],
-                 "freed_files": 0, "freed_bytes": 0}
-           for (cid,) in stemmed.all()}
+                 "freed_files": 0, "freed_bytes": 0, "kept_on_unit": bool(kept)}
+           for cid, kept in stemmed.all()}
     for image_id, file_path, cid, master_freed, preview_freed in images:
         state = out[cid]
         for freed_bytes in (master_freed, preview_freed):
@@ -1509,14 +1532,23 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
 
 
 def volume_upload_state(db: Session, collection) -> dict:
-    """The received indicator of one volume, with the unit's upload hold (`held`, `hold_file`)."""
+    """The received indicator of one volume, with the unit's upload hold (`held`, `hold_file`).
+
+    `kept_on_unit` is true while Captua keeps the volume on the unit
+    (NEH-320, app.core.kept_volumes); such a volume has nothing pending
+    (`pending` 0), and `total` is the count of files Captua would copy.
+    """
+    kept = bool(collection.kept_on_unit)
     base = {"collection_id": collection.id, "filename_stem": collection.filename_stem,
             "uploadable": collection.filename_stem is not None, **offsite_hold.hold_state()}
     if collection.filename_stem is None:
         return {**base, "total": 0, "verified": 0, "pending": 0, "refused": 0,
                 "last_verified_at": None, "received": False, "refusals": [],
-                "freed_files": 0, "freed_bytes": 0}
-    return {**base, **_object_counts(db, [collection.id])[collection.id]}
+                "freed_files": 0, "freed_bytes": 0, "kept_on_unit": kept}
+    state = {**base, **_object_counts(db, [collection.id])[collection.id], "kept_on_unit": kept}
+    if kept:
+        state["pending"] = 0
+    return state
 
 
 def unit_upload_summary(db: Session) -> dict:
@@ -1526,7 +1558,13 @@ def unit_upload_summary(db: Session) -> dict:
     the unit mode's (unit_mode.offsite_on: backup and fisqua), so a unit
     configured for the copy but in offline mode answers enabled true and
     mode_allows false, and uploads nothing (NEH-319).
+
+    The volumes Captua keeps on the unit (NEH-320, app.core.kept_volumes)
+    are left out of every count and total, pending included: `kept_volumes`
+    counts them (with or without a stem) and `kept_files` the files Captua
+    would copy of them.
     """
+    from app.models.collection import Collection
     from app.core import unit_mode
 
     try:
@@ -1534,7 +1572,10 @@ def unit_upload_summary(db: Session) -> dict:
         misconfigured = None
     except ImageUploadMisconfigured as exc:
         tenant, misconfigured = None, str(exc)
-    per_volume = _object_counts(db)
+    counted = _object_counts(db)
+    per_volume = {cid: s for cid, s in counted.items() if not s["kept_on_unit"]}
+    kept_files = sum(s["total"] for s in counted.values() if s["kept_on_unit"])
+    kept_volumes = db.query(func.count(Collection.id)).filter(Collection.kept_on_unit.is_(True)).scalar() or 0
     last = [s["last_verified_at"] for s in per_volume.values() if s["last_verified_at"]]
     return {
         "enabled": is_enabled(),
@@ -1550,6 +1591,8 @@ def unit_upload_summary(db: Session) -> dict:
         "freed_files": sum(s["freed_files"] for s in per_volume.values()),
         "freed_bytes": sum(s["freed_bytes"] for s in per_volume.values()),
         "last_verified_at": max(last) if last else None,
+        "kept_volumes": kept_volumes,
+        "kept_files": kept_files,
         "last_run": image_upload_scheduler.last_result,
         **offsite_hold.hold_state(),
     }

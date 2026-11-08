@@ -8,7 +8,10 @@ app.core.fisqua_contract. Here:
 
 * **Enqueue at handover** (enqueue_handover). A handover that promotes at
   least one record adds a `waiting_for_upload` row in the same transaction,
-  with a fresh manifest id, when Fisqua is configured. A volume's reference
+  with a fresh manifest id, whatever the configuration and the mode
+  (NEH-320): the row waits until the unit is in fisqua mode with Fisqua
+  configured, so whether a volume reaches Fisqua no longer depends on the
+  configuration at handover time. A volume's reference
   code is its recorded external_id, else its stem
   (capture_manifest.reference_code); a volume whose recorded external_id is
   not its stem is `refused` (`not_exportable`) at once, with the problem
@@ -20,7 +23,10 @@ app.core.fisqua_contract. Here:
   already delivered or refused, is left as it is: nothing is sent to Fisqua
   on a take-back, and Fisqua replaces an older manifest with a newer one
   until a run has started on it, after which it refuses the newer one.
-* **Promotion to ready** (run_fisqua_outbox). A `waiting_for_upload` row is
+* **Promotion to ready** (run_fisqua_outbox). A row of a volume Captua
+  keeps on the unit (kept_on_unit, app.core.kept_volumes) is never
+  promoted: it stays `waiting_for_upload`, neither superseded nor refused,
+  until an admin releases the volume. Any other `waiting_for_upload` row is
   promoted once the volume is received (app.core.image_upload's received
   indicator: every object verified in the bucket). The manifest is built
   then, under export_jobs.hold_for_reading, with the row's manifest id, and
@@ -649,8 +655,9 @@ def enqueue_handover(db: Session, collection):
     """Queue a new manifest for a volume just handed over; supersede its unsent ones.
 
     Does not commit: the caller commits it with the handover. Returns the new
-    row, or None when Fisqua is not configured (the unsent rows are
-    superseded all the same).
+    row, queued whatever the configuration (NEH-320): on a unit without
+    Fisqua configured, or outside fisqua mode, it waits, and nothing is sent
+    (run_fisqua_outbox answers `disabled` or `off_in_this_mode`).
     """
     from app.models.fisqua import FisquaOutbox
 
@@ -664,8 +671,6 @@ def enqueue_handover(db: Session, collection):
         .execution_options(synchronize_session=False)
     )
     _cancel_sending(db, collection.id, "superseded")
-    if not fisqua_configured():
-        return None
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
@@ -852,7 +857,34 @@ class _Run:
         return dict(self.__dict__)
 
 
+def _kept_now(db: Session, collection_id: int) -> bool:
+    """Whether the volume is kept on the unit, read with its row FOR SHARE in a new transaction (NEH-320).
+
+    Taken just before a waiting row is moved out of waiting_for_upload; the
+    move's commit ends the lock. A keep (app.core.kept_volumes.keep, which
+    takes the volume FOR NO KEY UPDATE) either committed before this read
+    and is seen, or waits for the move's commit and then finds the row moved
+    (a manifest on its way, so the keep is refused as already_left_unit).
+    One collection row only, taken before the outbox row's update, so it
+    cannot close a cycle with the lockers in kept_volumes' "Lock order".
+    A volume deleted meanwhile counts as kept: nothing is moved.
+    """
+    from app.models.collection import Collection
+
+    kept = (db.query(Collection.kept_on_unit).filter(Collection.id == collection_id)
+            .with_for_update(read=True).first())
+    return kept is None or bool(kept.kept_on_unit)
+
+
 def _promote(db: Session, row, result: _Run) -> None:
+    """Move a waiting row to ready (or refused, when not exportable) once its volume's files are offsite.
+
+    A kept volume's row waits. The flag is read first without a lock and,
+    after the manifest is built and that read transaction ended, again with
+    the volume's row FOR SHARE before each move out of waiting_for_upload
+    (_kept_now), so a keep committed while the manifest was built leaves
+    the row waiting.
+    """
     from app.core import capture_manifest
     from app.core.export_jobs import FilesChanging, export_jobs
     from app.core.image_upload import volume_upload_state
@@ -861,6 +893,10 @@ def _promote(db: Session, row, result: _Run) -> None:
     collection = db.get(Collection, row.collection_id)
     if collection is None:
         return
+    if collection.kept_on_unit:
+        # Kept on the unit (app.core.kept_volumes): the row waits, whatever the volume's state.
+        result.waiting += 1
+        return
     state = volume_upload_state(db, collection)
     if state["uploadable"] and not state["received"]:
         result.waiting += 1
@@ -868,6 +904,10 @@ def _promote(db: Session, row, result: _Run) -> None:
     problem = _reference_problem(collection)
     if problem is not None:
         db.rollback()
+        if _kept_now(db, row.collection_id):
+            db.rollback()
+            result.waiting += 1
+            return
         if _move(db, row.id, "waiting_for_upload", state="refused", refusal="not_exportable",
                  problems=[problem], last_error=problem["message"]):
             result.not_exportable += 1
@@ -884,6 +924,10 @@ def _promote(db: Session, row, result: _Run) -> None:
         return
     except capture_manifest.ManifestRefused as exc:
         db.rollback()
+        if _kept_now(db, row.collection_id):
+            db.rollback()
+            result.waiting += 1
+            return
         if _move(db, row.id, "waiting_for_upload", state="refused", refusal="not_exportable",
                  problems=[p.as_dict() for p in exc.problems], last_error=scrub(exc.message)):
             result.not_exportable += 1
@@ -891,6 +935,10 @@ def _promote(db: Session, row, result: _Run) -> None:
                            row.manifest_id, collection.id, ", ".join(p.rule for p in exc.problems))
         return
     db.rollback()  # end the build's read transaction
+    if _kept_now(db, row.collection_id):
+        db.rollback()
+        result.waiting += 1
+        return
     sent_ref = (doc.get("volumes") or [{}])[0].get("externalId")
     if _move(db, row.id, "waiting_for_upload", state="ready", manifest=doc,
              reference_code=sent_ref[:255] if isinstance(sent_ref, str) and sent_ref else None):

@@ -105,6 +105,7 @@ QUEUE_REASONS = {
     "invalid_assignee": f"The assignee is not null or a username of at most {ASSIGNEE_MAX_LENGTH} characters.",
     "withdrawn_not_on_unit": "The item was withdrawn and no volume on this unit has its referenceCode.",
     "list_name_refused": "The project named after listName cannot be created on this unit.",
+    "kept_on_unit": "Captua keeps a volume with this referenceCode or filenameStem on this unit, so the queue does not change it.",
     "invalid_retakes": (
         "The retakes are not a list of objects, each with an integer captuaRecordId, a pairId that is "
         "a non-empty string or null, and a side of left, right or both."
@@ -481,6 +482,29 @@ def _volume_by_code(db: Session, code: Any):
     return db.query(Collection).filter(Collection.external_id == code).first()
 
 
+# The skip reason for an item whose volume Captua keeps on the unit (NEH-320).
+KEPT_ON_UNIT_REASON = "kept_on_unit"
+
+
+def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
+    """Whether a volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
+
+    The stem is the reference code (contract 1.2 §8), and an admin's kept
+    volume may have only a stem.
+    """
+    from sqlalchemy import or_
+
+    from app.models.collection import Collection
+
+    names = [v for v in (code, stem) if isinstance(v, str) and v and "\x00" not in v]
+    if not names:
+        return False
+    return db.query(Collection.id).filter(
+        Collection.kept_on_unit.is_(True),
+        or_(Collection.external_id.in_(names), Collection.filename_stem.in_(names)),
+    ).first() is not None
+
+
 def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[dict, dict, dict]:
     """Apply one queue answer; return (the ack body, the report, the list document for Cola).
 
@@ -560,6 +584,11 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
         live_codes.add(code)
         fisqua = json.loads(values["custom_attributes"])["fisqua"]
         try:
+            # A volume Captua keeps on the unit (NEH-320) is the admin's, not the queue's.
+            if _kept_volume_for(db, code, values.get("filename_stem")):
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
             volume = _volume_by_code(db, code)
             if volume is not None:
                 attributes = _merge_attributes(volume.custom_attributes, fisqua)
@@ -599,7 +628,8 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
             skip(item_id, "list_name_refused")
             continue
         volume_id, reason = list_import.create_volume(
-            db, QUEUE_LIST_ID, position, project_id, QUEUE_ACTOR, {**values, "assignee_username": assignee})
+            db, QUEUE_LIST_ID, position, project_id, QUEUE_ACTOR, {**values, "assignee_username": assignee},
+            expected_mode=unit_mode.FISQUA)
         if reason is not None:
             skip(item_id, reason)
             continue
@@ -613,6 +643,10 @@ def apply_queue(db: Session, body: Any, revision: str, now: datetime) -> tuple[d
         if item_id is None:
             continue
         try:
+            if _kept_volume_for(db, item.get("referenceCode"), item.get("filenameStem")):
+                db.rollback()
+                skip(item_id, KEPT_ON_UNIT_REASON)
+                continue
             volume = _volume_by_code(db, item.get("referenceCode"))
             if volume is None:
                 db.rollback()

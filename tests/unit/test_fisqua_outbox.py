@@ -183,10 +183,15 @@ def test_a_handover_enqueues_a_row_waiting_for_upload(client, db_session, vol, f
 
 
 @pytest.mark.unit
-def test_no_row_without_fisqua_configured(client, db_session, vol):
+def test_a_handover_without_fisqua_configured_queues_a_row_that_waits(client, db_session, vol):
+    # NEH-320: queued whatever the configuration; nothing is sent while unconfigured.
     vol.record(status="captured")
     assert _handover(client, vol.col)["promoted"] == 1
-    assert _rows(db_session, vol.col) == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
+    transport = FakeTransport(sends=[_delivered()])
+    assert _run(db_session, transport)["status"] == "disabled"
+    assert transport.sent == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
 
 
 @pytest.mark.unit
@@ -203,7 +208,11 @@ def test_a_half_configured_fisqua_is_not_configured(client, db_session, vol, mon
     monkeypatch.setattr(config.settings, "OFFSITE_TENANT", tenant_value)
     vol.record(status="captured")
     _handover(client, vol.col)
-    assert _rows(db_session, vol.col) == []
+    # NEH-320: the row is queued all the same, and waits.
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
+    transport = FakeTransport(sends=[_delivered()])
+    assert _run(db_session, transport)["status"] == "disabled"
+    assert transport.sent == []
 
 
 @pytest.mark.unit
@@ -366,13 +375,17 @@ def test_a_handover_while_unconfigured_still_supersedes_the_queued_row(client, d
 
     monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
     vol.record(status="captured")
-    _handover(client, vol.col)  # unconfigured: no new row, the queued one is superseded
+    _handover(client, vol.col)  # unconfigured: the queued one is superseded, a new one queued (NEH-320)
+    rows = _rows(db_session, vol.col)
+    assert [r.state for r in rows] == ["withdrawn", "superseded", "waiting_for_upload"]
+    newest = rows[-1].manifest_id
     monkeypatch.setattr(config.settings, "FISQUA_ENV", ENV)
 
+    # Configured again: only the newest handover's manifest is sent.
     transport = FakeTransport(sends=[_delivered()])
     _run(db_session, transport)
-    assert transport.sent == []
-    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn", "superseded"]
+    assert [m["id"] for m in transport.sent] == [newest]
+    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn", "superseded", "delivered"]
 
 
 @pytest.mark.unit
@@ -715,7 +728,8 @@ def test_a_malformed_token_leaves_fisqua_unconfigured_and_is_reported(client, db
     assert fisqua_configured() is False
     vol.record(status="captured")
     _handover(client, vol.col)
-    assert _rows(db_session, vol.col) == []
+    # NEH-320: queued all the same; nothing is sent while unconfigured.
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
     resp = _as(client, "admin").get("/system/catalogue-backup")
     fq = resp.json()["fisqua"]
     assert fq["configured"] is False and fq["token_invalid"] is True
