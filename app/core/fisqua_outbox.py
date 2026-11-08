@@ -1035,7 +1035,10 @@ def _resend_version_refusals(db: Session) -> int:
     how many were handed over again.
     """
     again = 0
-    for row, collection in _version_refused_volumes(db):
+    for row, _ in _version_refused_volumes(db):
+        collection = _lock_version_refused(db, row.collection_id, row.id)
+        if collection is None:
+            continue
         enqueue_handover(db, collection)
         db.commit()
         again += 1
@@ -1050,7 +1053,6 @@ def _version_refused_volumes(db: Session) -> list:
 
     from app.models.collection import Collection
     from app.models.fisqua import FisquaOutbox
-    from app.models.record import Record
 
     newest = (db.query(FisquaOutbox.collection_id, func.max(FisquaOutbox.id))
               .group_by(FisquaOutbox.collection_id).subquery())
@@ -1062,20 +1064,60 @@ def _version_refused_volumes(db: Session) -> list:
     for row in rows:
         if not _version_refusal(row.problems):
             continue
-        # An open missing record (a page or an opening never captured, and
-        # not closed) stays captured on the unit until it is captured into or
-        # closed, and the manifest lists it as missing (capture_manifest), so
-        # it does not hold the volume back. A closed one is promoted like any
-        # record, so while it is captured it does.
-        from app.core.recapture_turn import open_missing_clause
-        captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
-                                              Record.status == "captured",
-                                              ~open_missing_clause()).first()
         collection = db.get(Collection, row.collection_id)
-        if captured is not None or collection is None:
+        if _holds_captured(db, row.collection_id) or collection is None:
             continue
         found.append((row, collection))
     return found
+
+
+def _holds_captured(db: Session, collection_id: int) -> bool:
+    """Whether the volume holds a captured record other than an open missing one.
+
+    An open missing record (a page or an opening never captured, and not
+    closed) stays captured on the unit until it is captured into or closed,
+    and the manifest lists it as missing (capture_manifest), so it does not
+    hold the volume back. A closed one is promoted like any record, so while
+    it is captured it does.
+    """
+    from app.core.recapture_turn import open_missing_clause
+    from app.models.record import Record
+
+    return db.query(Record.id).filter(Record.collection_id == collection_id,
+                                      Record.status == "captured",
+                                      ~open_missing_clause()).first() is not None
+
+
+def _lock_version_refused(db: Session, collection_id: int, row_id: int):
+    """The volume FOR UPDATE, if row_id is still its newest row and it still qualifies; else None, after a rollback.
+
+    _version_refused_volumes chose the volume without a lock. A handover
+    takes the volume's row before its outbox rows
+    (app.core.volume_stem.locked_volume_query), and enqueue_handover then
+    updates those rows and inserts one whose key takes the volume's row FOR
+    KEY SHARE; taken in this order here too, the two cannot deadlock. Under
+    the lock the choice is made again: the volume's newest outbox row is
+    still that version refusal, and it holds no captured record other than
+    open missing ones. A handover or a capture committed since the choice
+    stands for the volume instead, so it is skipped.
+    """
+    from sqlalchemy import func
+
+    from app.core import volume_stem
+    from app.models.fisqua import FisquaOutbox
+
+    collection = volume_stem.locked_volume_query(db, collection_id).first()
+    newest = None
+    if collection is not None:
+        newest_id = (db.query(func.max(FisquaOutbox.id))
+                     .filter(FisquaOutbox.collection_id == collection_id).scalar())
+        newest = (db.query(FisquaOutbox.state, FisquaOutbox.refusal, FisquaOutbox.problems)
+                  .filter(FisquaOutbox.id == newest_id).first() if newest_id == row_id else None)
+    if (newest is None or newest.state != "refused" or newest.refusal != "fisqua"
+            or not _version_refusal(newest.problems) or _holds_captured(db, collection_id)):
+        db.rollback()
+        return None
+    return collection
 
 
 def _retest_candidates(db: Session, retest_row: Optional[int]) -> list:
@@ -1183,6 +1225,9 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
     row = None
     for kind, row_id, collection in _retest_candidates(db, retest_row):
         if kind == "hand_over":
+            collection = _lock_version_refused(db, collection.id, row_id)
+            if collection is None:
+                continue
             new = enqueue_handover(db, collection)
             db.commit()
             if new is None:
