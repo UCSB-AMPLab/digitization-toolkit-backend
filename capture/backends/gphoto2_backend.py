@@ -215,6 +215,11 @@ class _PTPSession:
         # Body serial as read at session open; "" when the body does not
         # answer one. This is what pins the session's index to a body.
         self.serial = ""
+        # The body's own model name as read at session open, e.g. "Canon EOS
+        # Rebel T7" where libgphoto2's abilities name (self.model) is "Canon
+        # EOS 1500D"; None when the body does not answer one. self.model stays
+        # the abilities name: lookup_model and session matching depend on it.
+        self.body_model = None
         self._open()
 
     def _open(self):
@@ -240,9 +245,15 @@ class _PTPSession:
             self._enforce_flash_off()
             # Read once, here: the identity of the body on this port is fixed
             # for the life of the session, and every later use of it happens
-            # without a second PTP round trip.
-            serial = self._get_config("serialnumber")
+            # without a second PTP round trip. The serial and the body's own
+            # model come off one fetch of the config tree.
+            try:
+                cfg = self._cam.get_config()
+            except gp.GPhoto2Error:
+                cfg = None
+            serial = self._child_value(cfg, "serialnumber")
             self.serial = str(serial).strip() if serial is not None else ""
+            self.body_model = self._read_body_model(cfg)
         except Exception as exc:
             self._logger.warning(
                 f"[gphoto2] {self.port}: error during session init ({exc}), releasing device"
@@ -270,6 +281,16 @@ class _PTPSession:
     def _get_config(self, key: str):
         try:
             cfg = self._cam.get_config()
+            return cfg.get_child_by_name(key).get_value()
+        except gp.GPhoto2Error:
+            return None
+
+    @staticmethod
+    def _child_value(cfg, key: str):
+        """`key`'s value in an already fetched config tree, as _get_config reads it."""
+        if cfg is None:
+            return None
+        try:
             return cfg.get_child_by_name(key).get_value()
         except gp.GPhoto2Error:
             return None
@@ -330,6 +351,27 @@ class _PTPSession:
                 f"[gphoto2] {self.port}: focusmode={focusmode!r} - "
                 "AF causes ~12s PTP hangs. Flip lens barrel switch to MF."
             )
+
+    def _read_body_model(self, cfg) -> "str | None":
+        """The model name the body reports for itself in `cfg`, or None.
+
+        libgphoto2's "cameramodel" widget is the PTP DeviceInfo Model string,
+        which is what the body writes into its own files; "None" is
+        libgphoto2's text when DeviceInfo carries no Model. Canon's "model"
+        widget is not tried: on EOS it is the numeric ModelID. Any failure
+        gives None and never fails the session open.
+        """
+        try:
+            value = self._child_value(cfg, "cameramodel")
+        except Exception as exc:
+            self._logger.debug(f"[gphoto2] {self.port}: cameramodel not read ({exc})")
+            return None
+        if not isinstance(value, str):
+            return None
+        value = value.strip()
+        if not value or value == "None":
+            return None
+        return value
 
     def _enforce_flash_off(self) -> bool:
         """Actively disable camera flash before every capture.
@@ -597,6 +639,13 @@ class GPhoto2Backend(CameraBackend):
         self._seeded_serials: set[str] = set()
         # usb port -> body serial, as last read on that port
         self._serial_by_port: dict[str, str] = {}
+        # usb port -> (abilities model, serial or "", body's own model) as
+        # read by the last session opened on that port. It outlives the
+        # session, so a capture's model lookup that lands after the session
+        # was closed still names the body as the camera does; camera_model
+        # returns it only while the port map and the serial cache still
+        # describe the same body. Pruned with the serial cache.
+        self._body_model_by_port: dict[str, tuple[str, str, str]] = {}
         # the last autodetect() result, so the map can be rebuilt against new
         # identity knowledge without a second USB enumeration
         self._last_detected: list[tuple[str, str]] = []
@@ -848,12 +897,14 @@ class GPhoto2Backend(CameraBackend):
         result is the positional map, in autodetect order.
 
         Ports the given detection does not report are dropped from the serial
-        cache: a usb devnum is not reused until the bus counter wraps, so a
-        port that is gone carries no information about the body that left it.
+        cache and the body-model cache: a usb devnum is not reused until the
+        bus counter wraps, so a port that is gone carries no information about
+        the body that left it.
 
-        The pins and the cache are passed in rather than read from self,
-        because this is the single builder for the map and every caller of it
-        already holds _map_lock; taking that lock here would deadlock. Passing
+        The pins and the serial cache are passed in rather than read from
+        self, and the body-model cache is pruned on self directly: this is the
+        single builder for the map and every caller of it already holds
+        _map_lock, so taking that lock here would deadlock. Passing
         the live dicts (not copies) is deliberate - the cache prune above is a
         write the callers want to keep. `detected` is the autodetect result to
         lay out; when it is None a fresh autodetect() runs and is remembered,
@@ -869,6 +920,9 @@ class GPhoto2Backend(CameraBackend):
         for port in list(serial_by_port):
             if port not in present:
                 del serial_by_port[port]
+        for port in list(self._body_model_by_port):
+            if port not in present:
+                del self._body_model_by_port[port]
 
         port_map: dict[int, tuple[str, str]] = {}
         for model, port in detected:
@@ -919,20 +973,58 @@ class GPhoto2Backend(CameraBackend):
         """The model of the body at this index, from the session or the map.
 
         The open session is the one a capture at this index just used, so
-        its model is preferred; otherwise the published port map's entry,
-        which is autodetect()'s model name. Neither is built here: an empty
-        map stays empty rather than going through _get_port_map(), which
-        would run autodetect(). Both are read without _map_lock, so a lookup
-        never waits behind an enumeration: the map is only ever replaced
-        whole, and a dict lookup is atomic.
+        its model is preferred: first the body's own name, read once at
+        session open, then libgphoto2's abilities name. With no session (one
+        can be closed between the capture and this lookup) the port map's
+        entry decides: the body's own name cached at its last open, when that
+        cache still describes the same body (see _cached_body_model), else
+        the entry's own model, which is autodetect()'s name. Nothing is built
+        here: an empty map stays empty rather than going through
+        _get_port_map(), which would run autodetect(). All of it is read
+        without _map_lock, so a lookup never waits behind an enumeration: the
+        map and the cache entries are only ever replaced whole, and a dict
+        lookup is atomic.
         """
         session = self._sessions.get(camera_index)
         if session is not None:
-            model = normalise_camera_model(getattr(session, "model", None))
-            if model is not None:
-                return model
+            for attr in ("body_model", "model"):
+                model = normalise_camera_model(getattr(session, attr, None))
+                if model is not None:
+                    return model
         entry = self._port_map.get(camera_index)
-        return normalise_camera_model(entry[0]) if entry else None
+        if not entry:
+            return None
+        return self._cached_body_model(*entry) or normalise_camera_model(entry[0])
+
+    def _remember_body_model(self, model: str, port: str, serial: str,
+                             body_model: "str | None"):
+        """Record what the session just opened on `port` called itself.
+
+        Written on every open, whether or not the body turns out to belong at
+        the index, since it is a true observation about the port; a body that
+        answered no model clears what an earlier one left.
+        """
+        with self._map_lock:
+            if body_model:
+                self._body_model_by_port[port] = (model, serial, body_model)
+            else:
+                self._body_model_by_port.pop(port, None)
+
+    def _cached_body_model(self, model: str, port: str) -> "str | None":
+        """The body model cached for `port`, if it is still the same body.
+
+        Same body means the map entry names the same abilities model on the
+        same port, and the backend's serial for that port is the serial the
+        session read: a different serial, or a serial now known where the
+        session read none, is a different body and gets nothing.
+        """
+        cached = self._body_model_by_port.get(port)
+        if cached is None:
+            return None
+        cached_model, cached_serial, body_model = cached
+        if cached_model != model or self._serial_by_port.get(port, "") != cached_serial:
+            return None
+        return normalise_camera_model(body_model)
 
     def _learn_serial(self, camera_index: int, port: str, serial: str) -> bool:
         """Record that `port` answered `serial`, and pin the index if it is free.
@@ -1175,6 +1267,9 @@ class GPhoto2Backend(CameraBackend):
             raise
         # From here the session owns the claim; _close_session gives it back.
         serial = getattr(session, "serial", "") or ""
+        self._remember_body_model(
+            model, port, serial, getattr(session, "body_model", None)
+        )
         if not serial:
             # Documented limitation: a body that does not answer a serial
             # cannot be pinned, so it stays positional.
@@ -1920,5 +2015,6 @@ class GPhoto2Backend(CameraBackend):
             # persisting it.
             self._pins.clear()
             self._serial_by_port.clear()
+            self._body_model_by_port.clear()
             self._seeded_serials.clear()
         self.logger.info("[gphoto2] All sessions closed.")
