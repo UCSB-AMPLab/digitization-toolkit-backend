@@ -90,7 +90,7 @@ python -m pytest tests/test_cameras.py -m camera
 
 **Issue: Camera not detected**
 - Verify hardware connection: `rpicam-hello --list-cameras`
-- Check device setup: See [docs/developers/device_setup_pi5_imx519.qmd](../docs/developers/device_setup_pi5_imx519.qmd)
+- Check device setup: see the [Pi 5 and IMX519 guide](https://captua.org/docs/deployment/pi5-imx519/)
 
 **Issue: Picamera2 backend fails**
 - Fall back to subprocess: `export CAMERA_BACKEND=subprocess`
