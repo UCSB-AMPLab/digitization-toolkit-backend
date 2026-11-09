@@ -222,6 +222,27 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     return backend.is_camera_connected(camera_index)
 
 
+def camera_model(camera_index: int) -> Optional[str]:
+    """The model of the camera at this index, for CameraSettings, or None.
+
+    Asks the backend the capture just used and never constructs one: with no
+    backend there is no camera to name. Never raises - a lookup that fails is
+    logged and is None, so recording the model cannot fail a capture.
+    """
+    from .backends.base import normalise_camera_model
+
+    backend = _backend
+    if backend is None:
+        return None
+    try:
+        return normalise_camera_model(backend.camera_model(camera_index))
+    except Exception as exc:
+        subprocess_logger.warning(
+            f"Could not read the model of camera {camera_index}: {exc!r}"
+        )
+        return None
+
+
 # EXIF Orientation tag values for clockwise rotations.
 # The pixel data is never modified; viewers that honour EXIF display the page upright.
 _EXIF_ORIENTATION_FOR_DEG = {

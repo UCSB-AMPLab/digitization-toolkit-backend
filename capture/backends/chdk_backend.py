@@ -84,7 +84,7 @@ except ImportError:
     pychdk = None  # type: ignore[assignment]
     _PYCHDK_AVAILABLE = False
 
-from .base import CameraBackend
+from .base import CameraBackend, normalise_camera_model
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
 
@@ -612,6 +612,17 @@ class ChdkBackend(CameraBackend):
         with self._map_lock:
             key = self._indices.get(camera_index)
             return self._bodies.get(key) if key is not None else None
+
+    def camera_model(self, camera_index):
+        """The model of the body holding this index, as read when it opened.
+
+        _ChdkBody.model is the USB product string, or the product id label
+        when the body answered none, read once in _open_body. Nothing here
+        talks to the camera or scans the bus: an index no open body holds,
+        including every index before the first scan, is None.
+        """
+        body = self._body_at(camera_index)
+        return normalise_camera_model(body.model) if body is not None else None
 
     def _open_body(self, info):
         """Open one camera and read enough of it to name it. None on failure."""

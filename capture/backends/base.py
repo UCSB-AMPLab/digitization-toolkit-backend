@@ -11,6 +11,28 @@ from typing import Optional
 from pathlib import Path
 
 
+# CameraSettings.camera_model is String(255).
+_CAMERA_MODEL_MAX = 255
+# Strings that name no camera: picamera2's fallback, libgphoto2's generic
+# label for a body it cannot name, and the CameraConfig class name the
+# capture routes once recorded in its place (NEH-329).
+_MODEL_PLACEHOLDERS = {"unknown", "usb ptp class camera", "cameraconfig"}
+
+
+def normalise_camera_model(value) -> Optional[str]:
+    """A model string fit to store, or None when it names no camera.
+
+    Whitespace is stripped; an empty string, a placeholder or anything that
+    is not a string is None; the rest is cut to the column's 255 characters.
+    """
+    if not isinstance(value, str):
+        return None
+    model = value.strip()
+    if not model or model.lower() in _MODEL_PLACEHOLDERS:
+        return None
+    return model[:_CAMERA_MODEL_MAX]
+
+
 class CameraBackend(ABC):
     """
     Abstract base class for camera capture backends.
@@ -120,6 +142,20 @@ class CameraBackend(ABC):
         override to provide accurate enumeration for their hardware type.
         """
         return []
+
+    def camera_model(self, camera_index: int) -> Optional[str]:
+        """The model of the camera at this index, from state already held.
+
+        Called after a capture to record which camera took the image, so it
+        must not talk to the hardware: no enumeration, no rescan, no device
+        conversation. A backend answers from what it cached when it last
+        enumerated or opened the camera, and returns None when it holds
+        nothing for the index. The default holds nothing.
+
+        Returns:
+            str | None: The model, normalised by normalise_camera_model.
+        """
+        return None
 
     def rescan(self) -> list:
         """
