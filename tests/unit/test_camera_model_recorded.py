@@ -126,6 +126,271 @@ def test_gphoto2_prefers_the_open_session_that_took_the_image(gphoto2_backend):
 
 
 @pytest.mark.unit
+def test_gphoto2_prefers_the_bodys_own_model_without_a_device_call(gphoto2_backend):
+    # gp is already a _NoDeviceCalls; the session's camera handle is one too,
+    # so reading the cached body model must not go back to the body.
+    gphoto2_backend._port_map = {0: ("Canon EOS 1500D", "usb:001,004")}
+    gphoto2_backend._sessions = {0: types.SimpleNamespace(
+        model="Canon EOS 1500D", body_model="Canon EOS Rebel T7",
+        _cam=_NoDeviceCalls("cam"),
+    )}
+    assert gphoto2_backend.camera_model(0) == "Canon EOS Rebel T7"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("body_model", [None, "", "unknown"])
+def test_gphoto2_without_a_body_model_falls_back_to_the_session_model(
+        gphoto2_backend, body_model):
+    gphoto2_backend._sessions = {0: types.SimpleNamespace(
+        model="Canon EOS 1500D", body_model=body_model, _cam=_NoDeviceCalls("cam"),
+    )}
+    assert gphoto2_backend.camera_model(0) == "Canon EOS 1500D"
+
+
+# A real _PTPSession opened against a fake libgphoto2 whose config answers
+# from a dict. A name it does not hold raises GPhoto2Error, as libgphoto2's
+# get_child_by_name does; a value that is an exception is raised instead.
+
+class _FakeGPhoto2Error(Exception):
+    pass
+
+
+def _fake_gp_for_session(widgets, fetches=None):
+    """`fetches`, when given, gets one entry per get_config() call: the list
+    of widget names read from that fetched tree."""
+    class Widget:
+        def __init__(self, name):
+            self._name = name
+
+        def get_value(self):
+            value = widgets[self._name]
+            if isinstance(value, BaseException):
+                raise value
+            return value
+
+        def set_value(self, value):
+            widgets[self._name] = value
+
+    class Config:
+        def __init__(self):
+            self.read = []
+            if fetches is not None:
+                fetches.append(self.read)
+
+        def get_child_by_name(self, name):
+            self.read.append(name)
+            if name not in widgets:
+                raise _FakeGPhoto2Error(f"-2: no widget {name}")
+            return Widget(name)
+
+    class Camera:
+        def set_abilities(self, abilities):
+            pass
+
+        def set_port_info(self, info):
+            pass
+
+        def init(self):
+            pass
+
+        def exit(self):
+            pass
+
+        def get_config(self):
+            return Config()
+
+        def set_config(self, cfg):
+            pass
+
+    class _List:
+        def load(self):
+            pass
+
+        def lookup_model(self, model):
+            return 0
+
+        def lookup_path(self, path):
+            return 0
+
+        def __getitem__(self, idx):
+            return object()
+
+    return types.SimpleNamespace(
+        GPhoto2Error=_FakeGPhoto2Error, Camera=Camera,
+        CameraAbilitiesList=_List, PortInfoList=_List,
+    )
+
+
+def _base_widgets(widgets):
+    base = {"focusmode": "Manual", "flashmode": "Off", "autopoweroff": "0",
+            "serialnumber": " 0123 "}
+    base.update(widgets)
+    return {k: v for k, v in base.items() if v is not _ABSENT}
+
+
+_ABSENT = object()
+
+
+def _open_session(monkeypatch, widgets, fetches=None):
+    import capture.backends.gphoto2_backend as gb
+
+    monkeypatch.setattr(gb, "gp", _fake_gp_for_session(_base_widgets(widgets), fetches))
+    return gb._PTPSession("usb:001,004", "Canon EOS 1500D", logging.getLogger("t"))
+
+
+# Fetches of the whole config tree at session open before NEH-329b, on the
+# widgets _base_widgets() gives: capturetarget, reviewtime, autopoweroff,
+# focusmode, flashmode and serialnumber each fetched their own tree.
+_OPEN_FETCHES_BEFORE = 6
+
+
+@pytest.mark.unit
+def test_session_open_fetches_the_config_tree_no_more_often_than_before(monkeypatch):
+    fetches = []
+    session = _open_session(monkeypatch, {"cameramodel": "Canon EOS Rebel T7"}, fetches)
+    assert (session.serial, session.body_model) == ("0123", "Canon EOS Rebel T7")
+    assert len(fetches) <= _OPEN_FETCHES_BEFORE
+    # The serial and the body model come off one fetched tree.
+    [shared] = [read for read in fetches if "serialnumber" in read]
+    assert "cameramodel" in shared
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("model_widget", [
+    _ABSENT, "", _FakeGPhoto2Error("-1: read failed"), RuntimeError("bus gone"),
+], ids=["missing", "empty", "gphoto2-error", "other-error"])
+def test_a_failed_body_model_read_keeps_the_serial(monkeypatch, model_widget):
+    session = _open_session(monkeypatch, {"cameramodel": model_widget})
+    assert (session.serial, session.body_model) == ("0123", None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("serial_widget", [_ABSENT, _FakeGPhoto2Error("-1: read failed")],
+                         ids=["missing", "gphoto2-error"])
+def test_a_failed_serial_read_keeps_the_body_model(monkeypatch, serial_widget):
+    session = _open_session(monkeypatch, {"serialnumber": serial_widget,
+                                          "cameramodel": "Canon EOS Rebel T7"})
+    assert (session.serial, session.body_model) == ("", "Canon EOS Rebel T7")
+
+
+# ---------------------------------------------------------------------------
+# gphoto2: the body's own model outlives its session, for the same body only
+# ---------------------------------------------------------------------------
+
+_PORT = "usb:001,004"
+_ABILITIES = "Canon EOS 1500D"
+
+
+def _open_and_close(monkeypatch, backend, widgets, index=0):
+    """Open a session through the backend's identity path, then close it."""
+    import capture.backends.gphoto2_backend as gb
+
+    monkeypatch.setattr(gb, "gp", _fake_gp_for_session(_base_widgets(widgets)))
+    backend._port_map = {index: (_ABILITIES, _PORT)}
+    session = backend._open_identified_session(index, _ABILITIES, _PORT)
+    backend._sessions[index] = session
+    assert backend.camera_model(index) == (session.body_model or _ABILITIES)
+    backend._close_session(index)
+    assert index not in backend._sessions
+    # From here any use of the library fails the test.
+    monkeypatch.setattr(gb, "gp", _NoDeviceCalls("gp"))
+    return session
+
+
+@pytest.mark.unit
+def test_a_closed_sessions_body_keeps_its_own_name(monkeypatch, gphoto2_backend):
+    _open_and_close(monkeypatch, gphoto2_backend, {"cameramodel": "Canon EOS Rebel T7"})
+    assert gphoto2_backend.camera_model(0) == "Canon EOS Rebel T7"
+
+
+@pytest.mark.unit
+def test_a_closed_sessions_body_without_a_serial_keeps_its_own_name(
+        monkeypatch, gphoto2_backend):
+    _open_and_close(monkeypatch, gphoto2_backend,
+                    {"serialnumber": _ABSENT, "cameramodel": "Canon EOS Rebel T7"})
+    assert gphoto2_backend.camera_model(0) == "Canon EOS Rebel T7"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("entry, serial, expected", [
+    (("Canon EOS 1500D", "usb:001,009"), None, "Canon EOS 1500D"),   # another port
+    (("Canon EOS 80D", _PORT), None, "Canon EOS 80D"),               # another model
+    ((_ABILITIES, _PORT), "9999", "Canon EOS 1500D"),                # another serial
+], ids=["other-port", "other-model", "other-serial"])
+def test_the_cached_name_is_never_given_to_a_different_body(
+        monkeypatch, gphoto2_backend, entry, serial, expected):
+    _open_and_close(monkeypatch, gphoto2_backend, {"cameramodel": "Canon EOS Rebel T7"})
+    gphoto2_backend._port_map = {0: entry}
+    if serial is not None:
+        gphoto2_backend._serial_by_port[entry[1]] = serial
+    assert gphoto2_backend.camera_model(0) == expected
+
+
+@pytest.mark.unit
+def test_a_body_without_a_serial_does_not_lend_its_name_to_one_with_a_serial(
+        monkeypatch, gphoto2_backend):
+    _open_and_close(monkeypatch, gphoto2_backend,
+                    {"serialnumber": _ABSENT, "cameramodel": "Canon EOS Rebel T7"})
+    gphoto2_backend._serial_by_port[_PORT] = "9999"
+    assert gphoto2_backend.camera_model(0) == _ABILITIES
+
+
+@pytest.mark.unit
+def test_a_reopen_that_reads_no_body_model_forgets_the_old_one(monkeypatch, gphoto2_backend):
+    _open_and_close(monkeypatch, gphoto2_backend, {"cameramodel": "Canon EOS Rebel T7"})
+    _open_and_close(monkeypatch, gphoto2_backend, {"cameramodel": RuntimeError("bus gone")})
+    assert gphoto2_backend.camera_model(0) == _ABILITIES
+
+
+@pytest.mark.unit
+def test_a_port_that_leaves_the_detection_drops_its_cached_name(monkeypatch, gphoto2_backend):
+    _open_and_close(monkeypatch, gphoto2_backend, {"cameramodel": "Canon EOS Rebel T7"})
+    with gphoto2_backend._map_lock:
+        gphoto2_backend._port_map = gphoto2_backend._build_port_map(
+            gphoto2_backend._pins, gphoto2_backend._serial_by_port,
+            [("Canon EOS 80D", "usb:001,007")],
+        )
+    assert _PORT not in gphoto2_backend._body_model_by_port
+    # The same port coming back is a different body to the cache.
+    gphoto2_backend._port_map = {0: (_ABILITIES, _PORT)}
+    assert gphoto2_backend.camera_model(0) == _ABILITIES
+
+
+@pytest.mark.unit
+def test_opening_a_session_caches_the_bodys_own_model(monkeypatch, gphoto2_backend):
+    session = _open_session(monkeypatch, {"cameramodel": "Canon EOS Rebel T7"})
+    assert session.body_model == "Canon EOS Rebel T7"
+    assert session.model == "Canon EOS 1500D"
+    assert session.serial == "0123"
+
+    gphoto2_backend._sessions = {0: session}
+    session._cam = _NoDeviceCalls("cam")
+    assert gphoto2_backend.camera_model(0) == "Canon EOS Rebel T7"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("widgets", [
+    {},
+    {"cameramodel": ""},
+    {"cameramodel": "   "},
+    {"cameramodel": "None"},  # libgphoto2's value when DeviceInfo has no Model
+    {"cameramodel": None},
+    {"cameramodel": _FakeGPhoto2Error("-1: read failed")},
+    {"cameramodel": RuntimeError("bus gone")},
+], ids=["missing", "empty", "blank", "none-text", "none", "gphoto2-error", "other-error"])
+def test_no_body_model_leaves_it_none_and_the_session_opens(
+        monkeypatch, gphoto2_backend, widgets):
+    session = _open_session(monkeypatch, widgets)
+    assert session.body_model is None
+    assert session.model == "Canon EOS 1500D"
+    assert session.serial == "0123"
+
+    gphoto2_backend._sessions = {0: session}
+    session._cam = _NoDeviceCalls("cam")
+    assert gphoto2_backend.camera_model(0) == "Canon EOS 1500D"
+
+
+@pytest.mark.unit
 def test_gphoto2_unknown_index_or_empty_map_is_none_without_autodetect(gphoto2_backend):
     # An empty map is not built here: _get_port_map() would run autodetect().
     assert gphoto2_backend.camera_model(0) is None
