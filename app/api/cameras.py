@@ -1412,6 +1412,8 @@ def calibrate_camera(
 			distance_meters=result.get("distance_meters"),
 			af_time=result.get("af_time"),
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"Autofocus calibration failed: {e}")
 		return CalibrationResponse(success=False, error=str(e))
@@ -1477,6 +1479,8 @@ def calibrate_white_balance(
 			colour_temperature=result.get("colour_temperature"),
 			converged=result.get("converged"),
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"White balance calibration failed: {e}")
 		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
