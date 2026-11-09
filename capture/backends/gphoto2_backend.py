@@ -49,7 +49,7 @@ except ImportError:
     gp = None  # type: ignore[assignment]
     _GP_AVAILABLE = False
 
-from .base import CameraBackend
+from .base import CameraBackend, normalise_camera_model
 # Re-exported below for the callers that import it from here (app/api/cameras.py,
 # tests/unit/test_test_capture_route.py). The class itself is shared, so a CHDK
 # timeout and a DSLR timeout are one class and take the same route out.
@@ -914,6 +914,25 @@ class GPhoto2Backend(CameraBackend):
                     self._pins, self._serial_by_port
                 )
             return dict(self._port_map)
+
+    def camera_model(self, camera_index: int) -> "str | None":
+        """The model of the body at this index, from the session or the map.
+
+        The open session is the one a capture at this index just used, so
+        its model is preferred; otherwise the published port map's entry,
+        which is autodetect()'s model name. Neither is built here: an empty
+        map stays empty rather than going through _get_port_map(), which
+        would run autodetect(). Both are read without _map_lock, so a lookup
+        never waits behind an enumeration: the map is only ever replaced
+        whole, and a dict lookup is atomic.
+        """
+        session = self._sessions.get(camera_index)
+        if session is not None:
+            model = normalise_camera_model(getattr(session, "model", None))
+            if model is not None:
+                return model
+        entry = self._port_map.get(camera_index)
+        return normalise_camera_model(entry[0]) if entry else None
 
     def _learn_serial(self, camera_index: int, port: str, serial: str) -> bool:
         """Record that `port` answered `serial`, and pin the index if it is free.

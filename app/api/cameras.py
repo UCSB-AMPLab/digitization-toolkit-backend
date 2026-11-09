@@ -870,7 +870,7 @@ def trigger_capture(
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
-		from capture.service import single_capture_image, is_camera_connected
+		from capture.service import single_capture_image, is_camera_connected, camera_model
 		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, IMG_SIZES, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
@@ -1018,7 +1018,9 @@ def trigger_capture(
 		
 		cs = CameraSettings(
 			record_image_id=img.id,
-			camera_model=camera_config.__class__.__name__,
+			# From the backend's cached state for this index; None when it
+			# holds none (NEH-329). Never fails the capture.
+			camera_model=camera_model(camera_config.camera_index),
 			iso=None,
 			aperture=None,
 			focal_length=None,
@@ -1122,7 +1124,7 @@ def trigger_dual_capture(
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
-		from capture.service import dual_capture_image, is_camera_connected
+		from capture.service import dual_capture_image, is_camera_connected, camera_model
 		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
@@ -1284,7 +1286,9 @@ def trigger_dual_capture(
 			cam_config = cam0_config if camera_idx == 0 else cam1_config
 			cs = CameraSettings(
 				record_image_id=img.id,
-				camera_model=cam_config.__class__.__name__,
+				# The camera that took this image: path0 is cam0_config's
+				# capture and path1 cam1_config's, whichever page each is.
+				camera_model=camera_model(cam_config.camera_index),
 				iso=None,
 				aperture=None,
 				focal_length=None,

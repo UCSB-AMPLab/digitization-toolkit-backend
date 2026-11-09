@@ -51,7 +51,7 @@ if sys.platform == "linux":
 
 
 
-from .base import CameraBackend
+from .base import CameraBackend, normalise_camera_model
 from ..camera import CameraConfig, IMG_SIZES
 from ..utils import atomic_write
 
@@ -182,6 +182,19 @@ class Picamera2Backend(CameraBackend):
             self._camera_info = Picamera2.global_camera_info()
         return self._camera_info
     
+    def camera_model(self, camera_index: int) -> Optional[str]:
+        """The camera's Model from the cached global_camera_info(), if cached.
+
+        The cache is filled by the first is_camera_connected() or
+        list_devices() call and never refreshed, so a capture has normally
+        filled it already. When it is still empty this returns None rather
+        than call global_camera_info(), which asks libcamera.
+        """
+        info = self._camera_info
+        if info is None or camera_index < 0 or camera_index >= len(info):
+            return None
+        return normalise_camera_model(info[camera_index].get("Model"))
+
     def _get_camera(self, camera_index: int) -> Picamera2:
         """
         Get or create a Picamera2 instance for the given camera index.
