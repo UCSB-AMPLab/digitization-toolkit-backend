@@ -301,6 +301,18 @@ def _capture_paths(actual_path) -> list[Path]:
     return [Path(str(actual_path))]
 
 
+def _image_of(actual_path) -> str:
+    """The path a capture's callers record as its image: the JPEG of a multi-format capture.
+
+    A multi-format capture reports (jpeg_path, raw_path). The JPEG is the
+    record's image and the raw file its sidecar, found again from the JPEG by
+    app.core.paths.raw_sidecar_of, so the tuple goes no further than the
+    manifest record and single_capture_image and dual_capture_image hand
+    their callers one path (NEH-261).
+    """
+    return str(_capture_paths(actual_path)[0])
+
+
 def _rotate_capture_files(paths: list[Path], rotate_deg: int) -> None:
     """Record rotate_deg on every JPEG of a capture.
 
@@ -444,7 +456,9 @@ def single_capture_image(
         root (Path): The projects root, read once by the caller; read here when not given.
     Returns:
         tuple: (output_path, capture_id, pair_id) - path to image and manifest IDs.
-            pair_id is None: a single capture has no pair.
+            output_path is one path: for a multi-format capture, the JPEG,
+            whose raw sidecar raw_sidecar_of names. pair_id is None: a single
+            capture has no pair.
     """
     if not filename_index:
         raise ValueError("single_capture_image needs a filename_index; there is no timestamp fallback")
@@ -494,7 +508,7 @@ def single_capture_image(
         f"Single capture: cam{camera_config.camera_index}={elapsed_time:.3f}s, capture_id={record.capture_id}"
     )
     
-    return output_path, record.capture_id, record.pair_id
+    return _image_of(output_path), record.capture_id, record.pair_id
 
 
 def _unlink_capture_output(path) -> None:
@@ -621,6 +635,8 @@ def dual_capture_image(
             as the caller records them in the database. ["left", "right"] when not given.
     Returns:
         tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
+            Each path is one path: for a multi-format capture, the JPEG, whose
+            raw sidecar raw_sidecar_of names.
         
     Example:
         cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
@@ -744,7 +760,7 @@ def dual_capture_image(
         f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     
-    return img1_path, img2_path, record.capture_id, record.pair_id
+    return _image_of(img1_path), _image_of(img2_path), record.capture_id, record.pair_id
     
 def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """

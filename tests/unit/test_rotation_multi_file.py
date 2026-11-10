@@ -80,7 +80,9 @@ def test_dual_capture_rotates_the_jpeg_of_each_multiformat_capture(
         "proj", cam0, cam1, check_camera=False, stagger_ms=0,
         filename_index="proj-img_0001", root=tmp_path)
 
-    for paths in (p0, p1):
-        jpeg, raw = (Path(p) for p in paths)
+    # dual_capture_image hands back each JPEG; its raw sidecar is beside it (NEH-261).
+    for p in (p0, p1):
+        jpeg = Path(p)
+        assert jpeg.suffix == ".jpg"
         assert _orientation(jpeg) == _ORIENTATION_270
-        assert raw.read_bytes() == _RAW_BYTES
+        assert jpeg.with_suffix(".raw").read_bytes() == _RAW_BYTES

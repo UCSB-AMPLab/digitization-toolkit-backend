@@ -36,6 +36,10 @@ What is moved, and how:
   before the migration (rollback-update.sh) on files the migration moved. A
   row with no such checksum, or whose candidate does not match, is reported
   as missing and the candidate as a file no row references.
+- A JPEG master's `.raw` buffer (a multi-format capture, NEH-261) moves to
+  the volume's `captures/` beside it, under the name its master's final
+  name derives (raw_sidecar_of); one that cannot follow is retried as a
+  preview is.
 - A RAW master's `_preview.jpg` sidecar moves to the volume's `previews/`,
   under the name its master's final name derives (preview_sidecar_of). A
   sidecar that cannot follow is recorded in a second file in the data
@@ -134,8 +138,8 @@ from sqlalchemy.orm import Session
 
 from app.core import config
 from app.core.paths import (
-    CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, THUMBNAILS_DIR, is_raw_suffix, preview_sidecar_of,
-    resolve_within_storage,
+    CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, RAW_SIDECAR_SUFFIX, THUMBNAILS_DIR, is_raw_suffix,
+    FileIdentities, preview_sidecar_of, raw_buffer_of, raw_sidecar_of, resolve_within_storage,
 )
 from app.core.storage_override import StorageUnavailableError
 from app.models.collection import Collection
@@ -387,15 +391,32 @@ def _suffixed_stems(stem: str, image_id: int) -> Iterable[str]:
         n += 1
 
 
+def _masters(db: Session) -> FileIdentities:
+    """The files every row, in every volume, has as its master: what raw_buffer_of may never claim.
+
+    Held by file identity (FileIdentities), so a `.raw` is matched to a row
+    whatever spelling, case or directory symlink either path goes through.
+    """
+    return FileIdentities(fp for (fp,) in db.query(RecordImage.file_path).all() if fp)
+
+
 def _owners(db: Session) -> Dict[Path, int]:
-    """Every file a row references, by resolved path, with its record: masters, RAW sidecars, thumbnails."""
+    """Every file a row references, by resolved path, with its record: masters, their sidecars, thumbnails."""
     owners: Dict[Path, int] = {}
-    for record_id, fp, tp in db.query(RecordImage.record_id, RecordImage.file_path, RecordImage.thumbnail_path).all():
+    rows = db.query(RecordImage.record_id, RecordImage.file_path, RecordImage.thumbnail_path).all()
+    masters = FileIdentities(fp for _record_id, fp, _tp in rows if fp)
+    for record_id, fp, tp in rows:
         master = resolve_within_storage(fp)
         if master is not None:
             owners[master] = record_id
             if is_raw_suffix(master):
                 owners[preview_sidecar_of(master)] = record_id
+            else:
+                # A multi-format capture's raw buffer, beside its JPEG (NEH-261),
+                # unless another row has that `.raw` as its own master.
+                buffer = raw_buffer_of(master, masters)
+                if buffer is not None:
+                    owners[buffer] = record_id
         thumb = resolve_within_storage(tp)
         if thumb is not None:
             owners[thumb] = record_id
@@ -562,7 +583,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     The volume's are, inside the four directories only:
     - in `captures/`, a file named as one of its rows' masters is, or as the
       migration names a clashing one (`<stem>_img<image id>...`), so a
-      restored row's moved file can still be adopted;
+      restored row's moved file can still be adopted, and the `.raw` buffer
+      of such a name when the master is not RAW (NEH-261);
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
     - in `metadata/`, `manifest.jsonl`, always (see owned()), the
@@ -596,11 +618,26 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
         stem = stem.casefold()
         return any(stem == exact or stem.startswith(prefix) for exact, prefix, _ in stems)
 
+    masters: List[FileIdentities] = []
+
+    def another_rows_master(f: Path) -> bool:
+        if not masters:
+            masters.append(_masters(db))
+        return masters[0].holds(f)
+
     def owned(sub: str, f: Path) -> bool:
         name = f.name.casefold()
         if sub == CAPTURES_DIR:
-            return any((Path(name).stem == exact or Path(name).stem.startswith(prefix)) and Path(name).suffix == suffix
-                       for exact, prefix, suffix in stems)
+            # A JPEG master's `.raw` buffer is its sidecar, under the master's
+            # stem (NEH-261), unless a row has it as its own master
+            # (raw_buffer_of): then only that row's own entry owns it.
+            if any((Path(name).stem == exact or Path(name).stem.startswith(prefix)) and Path(name).suffix == suffix
+                   for exact, prefix, suffix in stems):
+                return True
+            return (Path(name).suffix == RAW_SIDECAR_SUFFIX and not another_rows_master(f)
+                    and any((Path(name).stem == exact or Path(name).stem.startswith(prefix))
+                            and not is_raw_suffix(Path(f"x{suffix}"))
+                            for exact, prefix, suffix in stems))
         if sub == PREVIEWS_DIR:
             return name.endswith(PREVIEW_SIDECAR_SUFFIX) and stem_owned(f.name[: -len(PREVIEW_SIDECAR_SUFFIX)])
         if sub == THUMBNAILS_DIR:
@@ -672,6 +709,7 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
     from capture.project_manager import image_output_dir
 
     owners = _owners(db)
+    all_masters = _masters(db)
     project_dirs = _project_dir_names(db)
     occupied: Dict[int, List[str]] = {}
     temps: List[str] = []
@@ -757,6 +795,8 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
             "to": None,
             "sidecar_from": None,
             "sidecar_to": None,
+            "raw_from": None,
+            "raw_to": None,
             "thumb_from": None,
             "thumb_to": None,
             "thumb_clear": None,
@@ -829,6 +869,20 @@ def _plan(db: Session, root: Path, out_of_place: List[Tuple[int, int]]) -> Tuple
                 # A freed preview follows its master's name; reserved like the master.
                 entry["preview_freed"] = True
                 previews.add(preview_sidecar_of(dst).name, img.record_id)
+        else:
+            # A multi-format capture's raw buffer moves beside its JPEG under
+            # the master's final stem (raw_sidecar_of, NEH-261), when
+            # raw_buffer_of grants it: a `.raw` that any row, in any volume,
+            # has as its own master stays with that row. A `<stem>.raw`
+            # in the target that is no row's already made master_taken rename
+            # the master, so the buffer is never moved onto it.
+            buffer = raw_buffer_of(src, all_masters)
+            if (buffer is not None and buffer.is_file() and buffer not in carried
+                    and resolve_within_storage(str(buffer)) is not None):
+                carried.add(buffer)
+                buffer_dst = raw_sidecar_of(dst)
+                entry["raw_from"], entry["raw_to"] = str(buffer), str(buffer_dst)
+                state.add(buffer_dst.name, img.record_id)
 
         if img.thumbnail_path:
             if thumb is None or not thumb.is_file():
@@ -940,16 +994,20 @@ def _free_name(e: dict, src: Path, dst: Path, reserved: Optional[Set[str]] = Non
     taken: List[Path] = []
     raw = is_raw_suffix(src)
     reserved = reserved or set()
+    carries_raw = bool(e.get("raw_from"))
     for stem in [dst.stem] + list(itertools.islice(_suffixed_stems(src.stem, e["image_id"]), 10000)):
         cand = dst.with_name(f"{stem}{src.suffix}")
         sidecar = preview_sidecar_of(cand)
+        buffer = raw_sidecar_of(cand)
         # Any entry takes a name, a directory included; only files are
         # listed for the report, which names files no row references.
         if (not _taken_in(cand.parent, cand.name) and not (raw and _taken_in(sidecar.parent, sidecar.name))
+                and not (carries_raw and _taken_in(buffer.parent, buffer.name))
                 and str(cand).casefold() not in reserved
                 and not (raw and str(sidecar).casefold() in reserved)):
             return cand, taken
-        taken.extend(_entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else []))
+        taken.extend(_entries_named(cand.parent, cand.name) + (_entries_named(sidecar.parent, sidecar.name) if raw else [])
+                     + (_entries_named(buffer.parent, buffer.name) if carries_raw else []))
     raise AssertionError("unreachable")
 
 
@@ -1098,6 +1156,8 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
             e["to"] = str(new_dst)
             if e["sidecar_from"]:
                 e["sidecar_to"] = str(preview_sidecar_of(new_dst))
+            if e.get("raw_from"):
+                e["raw_to"] = str(raw_sidecar_of(new_dst))
             write_layout_journal({"version": JOURNAL_VERSION, "root": str(root),
                                   "collection_id": batch["collection_id"], "entries": batch["entries"]})
             dst = new_dst
@@ -1155,6 +1215,23 @@ def _execute(db: Session, root: Path, batch: dict, report: dict, pending_sidecar
                 pending_sidecars.append({"image_id": e["image_id"], "master": str(dst),
                                          "from": e["sidecar_from"], "to": e["sidecar_to"]})
                 report["sidecars_not_moved"].append({"image_id": e["image_id"], "path": e["sidecar_from"]})
+
+        # A version-1 or -2 journal written before NEH-261 has no "raw_from".
+        if e.get("raw_from"):
+            r_src, r_dst = Path(e["raw_from"]), Path(e["raw_to"])
+            try:
+                r_at = _settle(r_src, r_dst)
+            except OSError as err:
+                logger.warning(f"Volume layout: moved {src} to {dst} but its raw buffer could not follow, left at {r_src}: {err}")
+                r_at = r_src
+            if r_at == r_dst:
+                originals.append(r_src)
+                touched.update({r_src.parent, r_dst.parent})
+                report["sidecars_moved"].append({"from": e["raw_from"], "to": e["raw_to"]})
+            elif r_at == r_src:
+                pending_sidecars.append({"image_id": e["image_id"], "master": str(dst), "kind": "raw",
+                                         "from": e["raw_from"], "to": e["raw_to"]})
+                report["sidecars_not_moved"].append({"image_id": e["image_id"], "path": e["raw_from"]})
 
         if e["thumb_clear"]:
             img.thumbnail_path = None
@@ -1362,6 +1439,7 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
         return
     keep: List[dict] = []
     originals: List[Path] = []
+    cache: Dict[str, FileIdentities] = {}
 
     def pending(s: dict, why: str) -> None:
         logger.warning(f"Volume layout: sidecar {s['from']} of image {s['image_id']} not moved to {s['to']}: {why}; "
@@ -1384,13 +1462,26 @@ def _retry_sidecars(db: Session, root: Path, report: dict, dry_run: bool) -> Non
         if master is None or not master.is_file():
             pending(s, f"its master is not at {img.file_path}")
             continue
+        if s.get("kind") == "raw" and frm.exists():
+            if "masters" not in cache:
+                cache["masters"] = _masters(db)
+            if cache["masters"].holds(frm):
+                # A row has this `.raw` as its own master now: it is that row's
+                # file, not a buffer to carry (raw_buffer_of). It stays.
+                logger.warning(f"Volume layout: pending raw buffer {frm} of image {s['image_id']} is now another "
+                               "row's master; it is left where it is and no longer retried")
+                continue
         if img.file_path != s["master"]:
-            if not is_raw_suffix(master):
-                pending(s, f"its master's row now names {img.file_path}, which is not a RAW master")
+            # A raw buffer (kind "raw", NEH-261) belongs to a JPEG master; a preview to a RAW one.
+            is_buffer = s.get("kind") == "raw"
+            if is_raw_suffix(master) == is_buffer:
+                pending(s, f"its master's row now names {img.file_path}, which is not a "
+                           f"{'JPEG' if is_buffer else 'RAW'} master")
                 continue
             logger.warning(f"Volume layout: the master of pending sidecar {frm} was renamed from {s['master']} "
                            f"to {img.file_path}; the sidecar follows it")
-            s = dict(s, master=img.file_path, to=str(preview_sidecar_of(master)))
+            follows = raw_sidecar_of(master) if is_buffer else preview_sidecar_of(master)
+            s = dict(s, master=img.file_path, to=str(follows))
         to = Path(s["to"])
         if not frm.exists():
             if not to.exists():
