@@ -27,7 +27,9 @@ from app.schemas.record import (
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import (
+	is_raw_suffix, preview_sidecar_of, raw_buffer_of, raw_sidecar_of, resolve_within_storage, same_file,
+)
 from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
 from app.core.capture_naming import CaptureNameRefused, take_filename_index
@@ -80,8 +82,9 @@ def _image_files_to_unlink(
 	raw_path: Optional[str],
 	raw_thumbnail_path: Optional[str],
 	sibling_paths: Iterable[Optional[str]] = (),
+	db: Optional[Session] = None,
 ) -> List[Path]:
-	"""The files on the card an image row's delete removes: master, `_preview.jpg` sidecar, thumbnail.
+	"""The files on the card an image row's delete removes: master, `_preview.jpg` and `.raw` sidecars, thumbnail.
 
 	Nothing is unlinked here. The delete handlers call this while they hold the
 	record's row lock, commit the row deletion, and only then pass the list to
@@ -120,20 +123,45 @@ def _image_files_to_unlink(
 	which every site that derives it shares (NEH-264). `capture/service.py`
 	uses it too when it rolls back a capture that never reached the manifest;
 	that rollback and these handlers share the name rule and nothing else.
+
+	A multi-format capture (Picamera2Backend with raw) also writes the raw
+	sensor buffer beside its JPEG master as `<stem>.raw` (NEH-261). The JPEG
+	is the row's image and the raw file has no row of its own, so it is found
+	from the master by `raw_sidecar_of`, the name the backend writes it under.
+	Every master names one; a master without a raw buffer names a file that
+	does not exist, and `_unlink_after_commit` skips a missing file. A
+	capture's name is free under every suffix when it is taken
+	(capture_name_taken), so a `<stem>.raw` beside the master belongs to the
+	same capture. The claim goes through `raw_buffer_of`: a RAW master
+	(`f.CR2`) claims no `f.raw`, a `.raw` that does not exist is not listed,
+	and a `.raw` that is the same file as any row's master, in this record
+	or any other (`db` is queried by name for the candidates), is that row's
+	file and is not listed. It is also kept when it is the same file as a
+	surviving sibling's own buffer.
 	"""
 	paths: List[Path] = []
 	master = resolve_within_storage(raw_path)
 	if master is not None:
 		paths.append(master)
-		sidecar = preview_sidecar_of(master)
-		shared = False
-		for raw_sibling in sibling_paths:
-			sibling = resolve_within_storage(raw_sibling)
-			if sibling is not None and preview_sidecar_of(sibling) == sidecar:
-				shared = True
-				break
-		if not shared:
-			paths.append(sidecar)
+		siblings = [
+			sibling
+			for sibling in (resolve_within_storage(s) for s in sibling_paths)
+			if sibling is not None
+		]
+		preview = preview_sidecar_of(master)
+		if not any(preview_sidecar_of(sibling) == preview for sibling in siblings):
+			paths.append(preview)
+		# The raw buffer only through raw_buffer_of: never for a RAW master,
+		# and never a `.raw` that any row, in any record, has as its master.
+		# Ownership is decided by file identity (raw_buffer_of), against the
+		# siblings and every row stored under the buffer's name.
+		from app.core.storage_ops import raw_buffer_candidate_names, rows_master_paths_named
+		candidate = raw_sidecar_of(master)
+		owners = siblings + rows_master_paths_named(db, raw_buffer_candidate_names(candidate))
+		buffer = raw_buffer_of(master, owners)
+		if buffer is not None and not any(
+				not is_raw_suffix(sibling) and same_file(raw_sidecar_of(sibling), buffer) for sibling in siblings):
+			paths.append(buffer)
 	thumbnail = resolve_within_storage(raw_thumbnail_path)
 	if thumbnail is not None:
 		paths.append(thumbnail)
@@ -613,7 +641,7 @@ def delete_record(
 	# sidecar two of these masters share.
 	files_to_unlink: List[Path] = []
 	for img in rec.images:
-		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
+		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path, db=db))
 
 	# An export of the record's collection reads these files; refused while one
 	# runs. No check of the storage root here: a delete creates nothing.
@@ -919,7 +947,7 @@ def delete_image(
 			RecordImage.id != img.id,
 		)
 	]
-	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
+	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings, db)
 
 	# An export of the record's collection reads this file if it is current;
 	# refused while one runs, and held from before the delete until the file

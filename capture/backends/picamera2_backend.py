@@ -707,8 +707,10 @@ class Picamera2Backend(CameraBackend):
                     # Raw buffer contains full sensor data for archival preservation
                     # JPEG provides quick viewing/preview
                     
-                    # Generate raw filename (.raw extension for now due to picamera2 DNG bug)
-                    raw_path = Path(str(output_path).rsplit('.', 1)[0] + '.raw')
+                    # Generate raw filename (.raw extension for now due to picamera2 DNG bug).
+                    # The name is the one the delete paths derive (raw_sidecar_of).
+                    from app.core.paths import raw_sidecar_of
+                    raw_path = raw_sidecar_of(Path(output_path))
                     
                     # Save JPEG first (durable: temp + fsync + atomic replace)
                     atomic_write(output_path, lambda tmp: request.save("main", tmp))

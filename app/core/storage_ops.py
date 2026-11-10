@@ -8,6 +8,7 @@ provide the guard that stops a delete from erasing files still referenced by sur
 Version: 0.1.0-beta
 """
 
+import errno
 import glob
 import json
 import logging
@@ -18,13 +19,14 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, object_session
 
 from app.core import config
 from app.models.collection import Collection
 from app.models.project import Project
 from app.models.record import Record, RecordImage
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import is_raw_suffix, preview_sidecar_of, raw_buffer_of, raw_sidecar_of, resolve_within_storage
 
 logger = logging.getLogger(__name__)
 
@@ -299,6 +301,75 @@ def _raw_sidecar_to_carry(master: Path) -> Optional[Path]:
     return sidecar
 
 
+def _like_literal(text: str) -> str:
+    """`text` with the LIKE wildcards and the escape character escaped, for `ESCAPE '\\'`."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def rows_master_paths_named(db: Optional[Session], names: Iterable[str]) -> List[Path]:
+    """The stored master paths of the rows, in any record or volume, whose file name is one of `names`.
+
+    Names are compared case-insensitively, so a row that stored `F.RAW` is a
+    candidate for `f.raw`; whether it is the same file is for same_file to
+    say (raw_buffer_of), since a case-sensitive volume keeps the two apart.
+    The LIKE pattern escapes its wildcards, so `a_b%c.raw` matches only
+    itself, and the match is checked again on the name in Python. With no
+    session, there are none.
+    """
+    wanted = {n.casefold() for n in names if n}
+    if db is None or not wanted:
+        return []
+    clauses = [func.lower(RecordImage.file_path).like("%/" + _like_literal(n.lower()), escape="\\")
+               for n in wanted]
+    rows = db.query(RecordImage.file_path).filter(or_(*clauses)).all()
+    return sorted({Path(fp) for (fp,) in rows if fp and Path(fp).name.casefold() in wanted})
+
+
+def raw_buffer_candidate_names(buffer: Path) -> set:
+    """The names a row owning `buffer` could store: its own, and the name a symlink there points at."""
+    names = {buffer.name}
+    try:
+        names.add(Path(os.path.realpath(buffer)).name)
+    except (OSError, ValueError):
+        pass
+    return names
+
+
+def _raw_buffer_to_carry(master: Path, sibling_masters: set, db: Optional[Session] = None) -> Optional[Path]:
+    """The `.raw` sidecar that moves or is renamed with a JPEG `master`, or None (NEH-261).
+
+    A multi-format capture (Picamera2Backend with raw) writes the raw sensor
+    buffer beside its JPEG master under the same stem; it has no row, and
+    the delete paths find it by raw_buffer_of. It is carried when it is a
+    file inside the storage roots and raw_buffer_of grants it against the
+    record's siblings and every row `db` holds under the buffer's name
+    (rows_master_paths_named). The entry beside the master is what moves,
+    never the target of a symlink there.
+    """
+    candidate = raw_sidecar_of(master)
+    rows = list(sibling_masters) + rows_master_paths_named(db, raw_buffer_candidate_names(candidate))
+    buffer = raw_buffer_of(master, rows)
+    if buffer is None or not buffer.is_file() or resolve_within_storage(str(buffer)) is None:
+        return None
+    return buffer
+
+
+def _carry_sidecar(sidecar: Path, sidecar_dst: Path, master_dst: Path, src: Path,
+                   not_moved: Optional[List[str]], moved: Optional[List[Tuple[Path, Path]]]) -> None:
+    """Move a sidecar after its master; a failure is logged at WARNING and listed in `not_moved`, never raised."""
+    try:
+        if sidecar_dst.exists():
+            raise FileExistsError(errno.EEXIST, "name taken", str(sidecar_dst))
+        sidecar_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(sidecar), str(sidecar_dst))
+        if moved is not None:
+            moved.append((sidecar, sidecar_dst))
+    except OSError as e:
+        logger.warning(f"Moved {src} to {master_dst} but its sidecar could not follow, left at {sidecar}: {e}")
+        if not_moved is not None:
+            not_moved.append(sidecar.name)
+
+
 def _name_taken(dst: Path, src: Path, sibling_masters: set) -> bool:
     """True if moving `src` to `dst` would clash with something already in dst's directory.
 
@@ -330,6 +401,12 @@ def relocate_image(
     fixity_index: Optional[FixityIndexOnce] = None,
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
+
+    A JPEG master's `.raw` sidecar (a multi-format capture, NEH-261) moves
+    with it the same way, to raw_sidecar_of the master's final path, so a
+    master renamed on a clash keeps its raw buffer under its new stem. A
+    `<stem>.raw` already in the target is a clash (`_name_taken`), so the
+    master is renamed rather than the buffer overwritten.
 
     A RAW master's `_preview.jpg` sidecar moves with it and is named and
     placed from the master's final path (preview_sidecar_of): beside the
@@ -380,6 +457,7 @@ def relocate_image(
             if resolved is not None:
                 sibling_masters.add(resolved)
     sidecar = _raw_sidecar_to_carry(src)
+    raw_buffer = _raw_buffer_to_carry(src, sibling_masters, object_session(img))
     if _name_taken(dst, src, sibling_masters):
         dst = target_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
 
@@ -407,6 +485,10 @@ def relocate_image(
             logger.warning(f"Moved {src} to {dst} but its preview sidecar could not follow, left at {sidecar}: {e}")
             if not_moved is not None:
                 not_moved.append(sidecar.name)
+
+    if raw_buffer is not None:
+        # Beside the master under its final stem, so a renamed master keeps it (raw_sidecar_of).
+        _carry_sidecar(raw_buffer, raw_sidecar_of(dst), dst, src, not_moved, moved)
 
     old_thumb = resolve_within_storage(img.thumbnail_path)
     img.thumbnail_path = None

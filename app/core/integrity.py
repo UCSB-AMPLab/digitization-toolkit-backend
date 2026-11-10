@@ -23,7 +23,11 @@ from typing import Dict, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import OFFSITE_STAGING_DIR, RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import (
+    OFFSITE_STAGING_DIR, RAW_SUFFIXES, FileIdentities, is_raw_suffix, preview_sidecar_of, raw_buffer_of,
+    raw_sidecar_of,
+    resolve_within_storage,
+)
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
@@ -173,6 +177,11 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     preview of `to`, and keeps its digest. Those are applied after the
     masters' chains, swept the same way, so a preview renamed twice, by
     records in any order or in different manifests, resolves.
+
+    A JPEG master's `.raw` buffer (a multi-format capture, NEH-261) is
+    followed by the same rule: every relocation record of a JPEG master is
+    also read as one for the buffer raw_sidecar_of names beside it, which
+    keeps its capture-time digest. It is not a preview.
     """
     from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
@@ -180,6 +189,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         return index
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
     preview_moves: List[Tuple[str, str, str]] = []  # (capture_id, preview of from, preview of to), absolute
+    raw_moves: List[Tuple[str, str, str]] = []  # (capture_id, raw buffer of from, raw buffer of to), absolute
 
     for manifest in _manifests(projects_dir):
         project_root = manifest_base(manifest, projects_dir)
@@ -205,6 +215,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                 continue
             if rec.get("record_type") == "relocation":
                 _note_preview_move(preview_moves, cid, project_root, rec.get("from"), rec.get("to"))
+                _note_raw_buffer_move(raw_moves, cid, project_root, rec.get("from"), rec.get("to"))
                 image_id, sha = rec.get("image_id"), rec.get("sha256")
                 if isinstance(image_id, int) and sha:
                     key = (cid, image_id)
@@ -259,22 +270,33 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         if not changed:
             break
 
-    for _ in range(len(preview_moves) + 1):
+    _follow_sidecar_moves(index, preview_moves, previews=True)
+    _follow_sidecar_moves(index, raw_moves, previews=False)
+    return index
+
+
+def _follow_sidecar_moves(index: FixityIndex, moves: List[Tuple[str, str, str]], previews: bool) -> None:
+    """Give each sidecar's new path the digest its old path has, sweeping until nothing changes (build_fixity_index).
+
+    `previews` says the sidecars are RAW previews, whose paths also go into
+    index.previews; a JPEG master's `.raw` buffer is not a preview.
+    """
+    for _ in range(len(moves) + 1):
         changed = False
-        for cid, frm, to in preview_moves:
+        for cid, frm, to in moves:
             # By path, then by name under the capture id, as a master is
             # found: the record's paths may predate an SD re-clone.
             sha = index.by_path.get(cid, {}).get(frm) or index.by_name.get(cid, {}).get(Path(frm).name)
             if not sha:
                 continue
-            if index.by_path.get(cid, {}).get(to) != sha or to not in index.previews:
+            if index.by_path.get(cid, {}).get(to) != sha or (previews and to not in index.previews):
                 index.by_path.setdefault(cid, {})[to] = sha
                 index.by_name.setdefault(cid, {})[Path(to).name] = sha
-                index.previews.add(to)
+                if previews:
+                    index.previews.add(to)
                 changed = True
         if not changed:
             break
-    return index
 
 
 def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
@@ -289,6 +311,25 @@ def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> No
     except OSError:
         return
     moves.append((cid, str(preview_sidecar_of(src)), str(preview_sidecar_of(dst))))
+
+
+def _note_raw_buffer_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
+    """Record that a JPEG master's relocation from `frm` to `to` moved its `.raw` buffer too (NEH-261).
+
+    The same rule as _note_preview_move: app.core.storage_ops.relocate_image
+    and the layout migration move the buffer to the name raw_sidecar_of
+    derives from the master's new path and write a record for the master only.
+    """
+    if not (isinstance(frm, str) and isinstance(to, str) and frm and to):
+        return
+    if is_raw_suffix(Path(frm)) or is_raw_suffix(Path(to)):
+        return
+    try:
+        src = (project_root / frm).resolve()
+        dst = (project_root / to).resolve()
+    except OSError:
+        return
+    moves.append((cid, str(raw_sidecar_of(src)), str(raw_sidecar_of(dst))))
 
 
 RETIRED_MANIFESTS_DIR = ".retired-manifests"
@@ -504,6 +545,17 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         str(preview_sidecar_of(Path(k)))
         for k in known
         if is_raw_suffix(Path(k)) and Path(k).is_file()
+    }
+    row_masters = FileIdentities(img.file_path for img in images if img.file_path)
+    known |= {
+        # A JPEG master's `.raw` buffer (a multi-format capture, NEH-261) has
+        # no row; a move or rename carries it to the master's new stem, where
+        # no manifest names it, so it is known through its master in the
+        # same way, through raw_buffer_of: a `.raw` some row has as its own
+        # master is known as that row's, not as a buffer.
+        str(raw_buffer_of(Path(k), row_masters))
+        for k in known
+        if raw_buffer_of(Path(k), row_masters) is not None and Path(k).is_file()
     }
     known |= kept_previews
 
