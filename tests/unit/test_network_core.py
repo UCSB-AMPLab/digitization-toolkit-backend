@@ -1914,6 +1914,22 @@ def test_a_passphrase_with_non_ascii_or_printable_characters_is_allowed(password
 
 
 @pytest.mark.unit
+@pytest.mark.parametrize("password, codes", [
+    ("é" * 4, []),                  # 8 bytes
+    ("é" * 32, ["password_length"]),  # 64 bytes, not hex
+    ("x" * 63, []),
+    ("x" * 64, ["password_length"]),
+    ("x" * 7, ["password_length"]),
+    ("\U0001F600" * 2, []),          # 8 bytes
+    ("\U0001F600" * 16, ["password_length"]),  # 64 bytes
+])
+def test_a_passphrase_is_measured_in_utf8_bytes(password, codes):
+    from app.core.network import join_problems
+    assert join_problems(ssid="Captua Lab", security="password", password=password, identity=None,
+                         method=None, inner_method=None, server_name=None) == codes
+
+
+@pytest.mark.unit
 @pytest.mark.parametrize("password", ["\tTab-lead-pw", "tab\tinside", "trail\t", "del\x7fete"])
 def test_an_8021x_password_may_hold_tabs_and_control_characters(password):
     from app.core.network import join_problems

@@ -670,7 +670,7 @@ def join_problems(*, ssid: str, security: str, password: Optional[str], identity
             problems.append("password_required")
         elif _has_control_character(password):
             problems.append("password_invalid")
-        elif not 8 <= len(password) <= 63:
+        elif not 8 <= len(password.encode("utf-8")) <= 63:
             problems.append("password_length")
     elif security == "enterprise":
         if not password:
