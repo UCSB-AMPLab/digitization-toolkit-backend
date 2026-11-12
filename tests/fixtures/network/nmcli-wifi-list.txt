@@ -1,0 +1,9 @@
+*:Captua Lab:72:WPA2
+ :Captua Lab:40:WPA2
+ :eduroam:65:WPA2 802.1X
+ ::30:WPA2
+ :Library Guest:55:
+ :Old Cafe:20:--
+ :Studio\:5G:48:WPA1 WPA2
+ :eduroam:80:WPA2 802.1X
+ :NewHome:60:WPA3

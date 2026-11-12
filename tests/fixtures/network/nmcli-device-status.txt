@@ -1,0 +1,6 @@
+wlan0:wifi:connected:Captua Lab
+eth0:ethernet:unavailable:
+docker0:bridge:connected (externally):docker0
+lo:loopback:connected (externally):lo
+p2p-dev-wlan0:wifi-p2p:disconnected:
+veth3f2a1b0:veth:connected (externally):veth3f2a1b0

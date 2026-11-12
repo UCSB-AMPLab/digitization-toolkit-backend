@@ -1,0 +1,27 @@
+wlan6: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:00:00 reason=3 locally_generated=1
+wlan6: CTRL-EVENT-DSCP-POLICY clear_all
+wlan6: SME: Trying to authenticate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Trying to associate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Associated with 02:00:00:00:01:00
+wlan6: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0
+wlan6: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:01:00 reason=15
+wlan6: WPA: 4-Way Handshake failed - pre-shared key may be incorrect
+wlan6: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="captua-B" auth_failures=1 duration=10 reason=WRONG_KEY
+wlan6: SME: Trying to authenticate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Trying to associate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Associated with 02:00:00:00:01:00
+wlan6: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0
+wlan6: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:01:00 reason=15
+wlan6: WPA: 4-Way Handshake failed - pre-shared key may be incorrect
+wlan6: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="captua-B" auth_failures=1 duration=10 reason=WRONG_KEY
+wlan6: SME: Trying to authenticate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Trying to associate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Associated with 02:00:00:00:01:00
+wlan6: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0
+wlan6: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:01:00 reason=15
+wlan6: WPA: 4-Way Handshake failed - pre-shared key may be incorrect
+wlan6: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="captua-B" auth_failures=1 duration=10 reason=WRONG_KEY
+wlan6: SME: Trying to authenticate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Trying to associate with 02:00:00:00:01:00 (SSID='captua-B' freq=2412 MHz)
+wlan6: Associated with 02:00:00:00:01:00
+wlan6: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0

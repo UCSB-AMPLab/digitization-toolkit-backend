@@ -191,6 +191,10 @@ class Settings(BaseSettings):
     # production until Fisqua reads it there.
     FISQUA_ROTATE_DEG: bool = Field(default=False, validation_alias=_names("FISQUA_ROTATE_DEG"))
 
+    # The Wi-Fi device the network screen scans, joins and restores on
+    # (app.core.network). Unset: the first `wifi` row of `nmcli device status`.
+    WIFI_DEVICE: Optional[str] = Field(default=None, validation_alias=_names("WIFI_DEVICE"))
+
     # APP_VERSION: overrides the release read from the superproject's VERSION
     # file (app.core.version). Unset on a unit; the file is the source.
     app_version: Optional[str] = None

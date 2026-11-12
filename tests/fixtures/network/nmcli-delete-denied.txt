@@ -1,0 +1,2 @@
+Error: Connection deletion failed: Insufficient privileges
+Error: not all connections deleted.
