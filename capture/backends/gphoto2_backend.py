@@ -631,6 +631,9 @@ class GPhoto2Backend(CameraBackend):
         super().__init__(logger)
         # camera_index -> (model_name, usb_port)
         self._port_map: dict[int, tuple[str, str]] = {}
+        # the map last written to the log (None before the first build), so
+        # only changes are logged; read and written under _map_lock
+        self._logged_port_map: "dict[int, tuple[str, str]] | None" = None
         # camera_index -> body serial, for the life of the process and, via
         # the bindings file, across restarts
         self._pins: dict[int, str] = {}
@@ -938,10 +941,39 @@ class GPhoto2Backend(CameraBackend):
                 while index in port_map or index in pins:
                     index += 1
             port_map[index] = (model, port)
-            self.logger.info(f"[gphoto2] Detected camera {index}: {model} on {port}")
+        self._log_port_map_changes(port_map)
         if not port_map:
             self.logger.warning("[gphoto2] No cameras detected by autodetect().")
         return port_map
+
+    def _log_port_map_changes(self, port_map: dict[int, tuple[str, str]]) -> None:
+        """Log the cameras that were added or moved, and those that went away.
+
+        The map is rebuilt on every preview and capture request, so logging
+        every entry each time fills the log with identical lines. Only the
+        difference from the map last logged is written: an entry is logged as
+        detected when its index is new or now holds another model or port,
+        and an index that left the map is logged as no longer detected. An
+        unchanged map logs nothing. Called from _build_port_map(), whose
+        callers hold _map_lock, which also guards _logged_port_map.
+        """
+        previous = self._logged_port_map
+        for index in sorted(port_map):
+            entry = port_map[index]
+            if previous is None or previous.get(index) != entry:
+                model, port = entry
+                self.logger.info(
+                    f"[gphoto2] Detected camera {index}: {model} on {port}"
+                )
+        if previous:
+            for index in sorted(previous):
+                if index not in port_map:
+                    model, port = previous[index]
+                    self.logger.info(
+                        f"[gphoto2] Camera {index}: {model} on {port} "
+                        "is no longer detected"
+                    )
+        self._logged_port_map = dict(port_map)
 
     def _refresh_port_map(self):
         with self._map_lock:
