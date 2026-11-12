@@ -8,7 +8,7 @@ captures from the bench unit.
 
     python -m pytest tests/unit/test_network_core.py
 
-Version: 0.3.3
+Version: 0.3.4
 """
 
 import logging
@@ -502,6 +502,61 @@ def test_classify_wrong_key_once_decides_only_at_the_end():
     assert classify(lines, "wlan0", "Home") is None
     assert classify(lines, "wlan0", "Home", final=True) == {"code": "wrong_password", "detail": None, "server": None}
     assert classify(lines + lines[1:], "wlan0", "Home") == {"code": "wrong_password", "detail": None, "server": None}
+
+
+_HOME_ANCHOR = "wlan0: SME: Trying to authenticate with 02:00:00:00:01:00 (SSID='Home' freq=2412 MHz)"
+_HOME_WRONG_KEY = ("wlan0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Home\" auth_failures=1 duration=10 "
+                   "reason=WRONG_KEY")
+_HOME_AUTH_FAILED = ("wlan0: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid=\"Home\" auth_failures=1 duration=10 "
+                     "reason=AUTH_FAILED")
+_HOME_CONNECTED = "wlan0: CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:01:00 completed [id=0 id_str=]"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("final", [False, True])
+def test_a_soft_failure_at_the_threshold_is_cleared_by_a_later_connection(final):
+    """Two soft lines then CTRL-EVENT-CONNECTED in one snapshot: authentication
+    recovered, so the join must not be stopped and its profile deleted."""
+    from app.core.network import classify
+    lines = [_HOME_ANCHOR, _HOME_WRONG_KEY, _HOME_WRONG_KEY, _HOME_CONNECTED]
+    assert classify(lines, "wlan0", "Home", final=final) is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("final", [False, True])
+def test_a_soft_failure_at_the_threshold_after_the_connection_is_returned(final):
+    from app.core.network import classify
+    lines = [_HOME_ANCHOR, _HOME_WRONG_KEY, _HOME_WRONG_KEY, _HOME_CONNECTED, _HOME_WRONG_KEY, _HOME_WRONG_KEY]
+    assert classify(lines, "wlan0", "Home", final=final) == {"code": "wrong_password", "detail": None,
+                                                              "server": None}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("final", [False, True])
+def test_a_soft_failure_at_the_threshold_without_a_connection_is_returned(final):
+    from app.core.network import classify
+    lines = [_HOME_ANCHOR, _HOME_WRONG_KEY, _HOME_WRONG_KEY]
+    assert classify(lines, "wlan0", "Home", final=final) == {"code": "wrong_password", "detail": None,
+                                                              "server": None}
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("final", [False, True])
+def test_the_soft_failure_that_reached_the_threshold_first_is_returned(final):
+    from app.core.network import classify
+    lines = [_HOME_ANCHOR, _HOME_AUTH_FAILED, _HOME_WRONG_KEY, _HOME_WRONG_KEY, _HOME_AUTH_FAILED]
+    assert classify(lines, "wlan0", "Home", final=final)["code"] == "wrong_password"
+    lines = [_HOME_ANCHOR, _HOME_WRONG_KEY, _HOME_AUTH_FAILED, _HOME_AUTH_FAILED, _HOME_WRONG_KEY]
+    assert classify(lines, "wlan0", "Home", final=final)["code"] == "wrong_credentials"
+
+
+@pytest.mark.unit
+def test_a_hard_failure_still_returns_at_once_after_a_soft_threshold():
+    from app.core.network import classify
+    lines = [_HOME_ANCHOR, _HOME_WRONG_KEY, _HOME_WRONG_KEY,
+             "wlan0: EAP-MSCHAPV2: failure message: 'E=691 R=1 C=00 V=3 M=bad' (retry allowed) error 691",
+             _HOME_CONNECTED]
+    assert classify(lines, "wlan0", "Home")["code"] == "wrong_credentials"
 
 
 @pytest.mark.unit

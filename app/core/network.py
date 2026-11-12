@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.4
 """The unit's network, through NetworkManager's nmcli (NEH-253).
 
 Status, the Wi-Fi scan, joining a Wi-Fi network (open, password, or
@@ -951,8 +951,12 @@ def classify(lines: list[str], device: str, ssid: str, *, final: bool = False,
     (wrong_password), and for SAE CTRL-EVENT-AUTH-REJECT with auth_type=3
     (wrong_password) decide when the same line occurs a second time. One
     failed PSK attempt prints both of its lines once, so it is not decisive.
-    CTRL-EVENT-CONNECTED clears the count: a failure followed by a
-    connection is a join, not a failure.
+    A weaker line that reaches its second occurrence is not returned at
+    once: the rest of the lines are read first, and CTRL-EVENT-CONNECTED
+    clears the counts and any such outcome: a failure followed by a
+    connection is a join, not a failure. The outcome still standing at the
+    end is returned, with or without `final`; of two, the one that reached
+    its second occurrence first. A definitive line still returns at once.
 
     With `final` (nmcli has ended without joining), a weaker line seen once
     since the last CTRL-EVENT-CONNECTED is the outcome as well.
@@ -962,6 +966,7 @@ def classify(lines: list[str], device: str, ssid: str, *, final: bool = False,
     server: Optional[dict] = None
     counts: dict[str, int] = {}
     first_soft: Optional[str] = None
+    decided: Optional[str] = None
     for body in _this_join(lines, device, since):
         attempt = _ATTEMPT.match(body)
         if not anchored:
@@ -974,6 +979,7 @@ def classify(lines: list[str], device: str, ssid: str, *, final: bool = False,
         if body.startswith("CTRL-EVENT-CONNECTED"):
             counts.clear()
             first_soft = None
+            decided = None
             continue
         disabled = _TEMP_DISABLED_SSID.match(body)
         if disabled and disabled.group(1) != target:
@@ -998,11 +1004,13 @@ def classify(lines: list[str], device: str, ssid: str, *, final: bool = False,
         for marker, required, code in _SOFT:
             if marker in body and (required is None or required in body):
                 counts[marker] = counts.get(marker, 0) + 1
-                if counts[marker] >= 2:
-                    return _problem(code)
+                if counts[marker] >= 2 and decided is None:
+                    decided = code
                 if first_soft is None:
                     first_soft = code
                 break
+    if decided is not None:
+        return _problem(decided)
     if final and first_soft is not None:
         return _problem(first_soft)
     return None
