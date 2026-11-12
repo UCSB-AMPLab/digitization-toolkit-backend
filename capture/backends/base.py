@@ -197,6 +197,8 @@ class CameraBackend(ABC):
 
         Keys:
             live_preview (bool): Can return JPEG frames for frontend polling.
+            continuous_preview (bool): The capture screen may poll preview frames
+                continuously.
             focus_control (bool): Supports `get_focus` / `set_focus`.
             live_controls (bool): Supports `set_camera_controls` (live picamera2 controls).
             zoom (bool): Supports ScalerCrop-based digital zoom.
@@ -207,6 +209,7 @@ class CameraBackend(ABC):
         """
         return {
             "live_preview": False,
+            "continuous_preview": False,
             "focus_control": False,
             "live_controls": False,
             "zoom": False,

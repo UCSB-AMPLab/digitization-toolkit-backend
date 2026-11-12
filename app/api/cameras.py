@@ -553,6 +553,7 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	    {
 	        "backend": "gphoto2",
 	        "live_preview": true,
+	        "continuous_preview": false,
 	        "focus_control": false,
 	        "live_controls": false,
 	        "zoom": false,
