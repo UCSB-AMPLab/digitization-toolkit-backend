@@ -165,9 +165,9 @@ def test_a_body_that_never_reaches_record_mode_does_not_capture(monkeypatch, tmp
     """A body that never arrives must not be shot from playback.
 
     pychdk 0.1.3's switch_mode polls get_mode until its retries run out and
-    then raises, so this reaches the backend as a failed conversation during
-    the mode switch: the capture fails, no page is shot, and the body is
-    dropped like any other.
+    then raises. The backend sends a half-press, which this body ignores, and
+    then fails the mode switch: the capture fails, no page is shot, and the
+    body is dropped like any other.
     """
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True)
     backend = make_backend(monkeypatch, make_pychdk(body))
@@ -176,7 +176,7 @@ def test_a_body_that_never_reaches_record_mode_does_not_capture(monkeypatch, tmp
     with pytest.raises(RuntimeError) as exc:
         backend.capture_image(tmp_path / "page.jpg", _config())
 
-    assert "did not switch to record" in str(exc.value)
+    assert "did not enter shooting mode" in str(exc.value)
     assert body.shots == [], "a page was shot from playback"
     assert body.closes == 1
 
@@ -193,7 +193,7 @@ def test_a_body_that_never_reaches_record_mode_shows_no_live_view(monkeypatch):
     with pytest.raises(RuntimeError) as exc:
         backend.capture_preview(0)
 
-    assert "did not switch to record" in str(exc.value)
+    assert "did not enter shooting mode" in str(exc.value)
     assert body.frames_served == 0
 
 
@@ -239,7 +239,7 @@ def test_the_polarity_of_get_mode_is_true_for_record_and_false_for_play(
     else:
         with pytest.raises(RuntimeError) as exc:
             backend.capture_image(tmp_path / "page.jpg", _config())
-        assert "play mode" in str(exc.value)
+        assert "did not enter shooting mode" in str(exc.value)
         assert body.shots == [], "a page was shot from playback"
 
 
@@ -277,7 +277,9 @@ def test_the_mode_is_confirmed_once_and_then_trusted(monkeypatch, tmp_path):
     backend.capture_image(tmp_path / "two.jpg", _config())
 
     assert body.mode_switches == ["record"]
-    assert len(body.lua_calls) == 1, "the mode was asked for on every capture"
+    assert body.lua_calls == [
+        "enter_alt()", "return get_mode()", "enter_alt()"
+    ], "get_mode is asked once; ALT mode is asserted on every capture"
     assert len(body.shots) == 2
 
 

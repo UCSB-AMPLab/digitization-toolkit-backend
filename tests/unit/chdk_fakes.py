@@ -124,6 +124,7 @@ class Body:
         bus=1,
         address=4,
         serial="1111111",
+        product_id=0x325B,
         product="Canon PowerShot A2500",
         card=None,
         download_error=None,
@@ -137,11 +138,14 @@ class Body:
         version_error=None,
         stuck_in_play=False,
         switch_without_arriving=False,
+        half_press_arrives=False,
+        half_press_reads=1,
         lua_error=None,
     ):
         self.bus = bus
         self.address = address
         self.serial = serial
+        self.product_id = product_id
         self.product = product
         self.card = card
         self.download_error = download_error
@@ -181,9 +185,21 @@ class Body:
         # not take switch_mode's return as proof.
         self.stuck_in_play = stuck_in_play
         self.switch_without_arriving = switch_without_arriving
+        # A body that takes switch_mode_usb(1), extends the lens and stays in
+        # playback; a half-press of the shutter then completes the switch
+        # without taking a picture. With
+        # half_press_arrives, a click("shoot_half") makes get_mode report
+        # record after half_press_reads further reads that still say play.
+        # Without it, the half-press is counted and changes nothing.
+        self.half_press_arrives = half_press_arrives
+        self.half_press_reads = half_press_reads
+        self.half_presses = 0
+        self._reads_until_record = None
         self.mode_value = False
         self.lua_error = lua_error
         self.lua_calls = []
+        # Every switch_mode and lua_execute call, in the order made.
+        self.events = []
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -276,6 +292,7 @@ class FakeChdkDevice:
 
     def switch_mode(self, mode):
         self._body.mode_switches.append(mode)
+        self._body.events.append(("switch", mode))
         self._body._pass("switch_mode")
         if self._body.mode_error is not None:
             raise self._body.mode_error
@@ -294,9 +311,21 @@ class FakeChdkDevice:
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         self._body.lua_calls.append(lua_code)
+        self._body.events.append(("lua", lua_code))
         if self._body.lua_error is not None:
             raise self._body.lua_error
+        if 'click("shoot_half")' in lua_code:
+            self._body.half_presses += 1
+            if self._body.half_press_arrives:
+                self._body._reads_until_record = self._body.half_press_reads
+            return None
         if "get_mode" in lua_code:
+            if self._body._reads_until_record is not None:
+                if self._body._reads_until_record == 0:
+                    self._body._reads_until_record = None
+                    self._body.mode_value = True
+                else:
+                    self._body._reads_until_record -= 1
             return self._body.mode_value
         return None
 
@@ -365,7 +394,7 @@ class FakePychdk:
         return [
             DeviceInfo(
                 vendor_id=0x04A9,
-                product_id=0x325B,
+                product_id=body.product_id,
                 bus_num=body.bus,
                 device_num=body.address,
                 serial_num=body.serial,
@@ -489,6 +518,10 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk"):
 
     monkeypatch.setattr(cb, "pychdk", fake)
     monkeypatch.setattr(cb, "_PYCHDK_AVAILABLE", True)
+    # The backend waits through its module's _sleep; the tests record the
+    # waits on the fake instead of spending them.
+    fake.sleeps = []
+    monkeypatch.setattr(cb, "_sleep", fake.sleeps.append)
     return cb.ChdkBackend(logging.getLogger(logger_name))
 
 

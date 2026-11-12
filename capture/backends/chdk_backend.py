@@ -58,6 +58,7 @@ Version: 0.1.0-beta
 """
 
 import contextlib
+import errno
 import os
 import secrets
 import struct
@@ -162,11 +163,69 @@ _SIDE_INDEX = {"even": 0, "odd": 1}
 # body that has gone wrong and is evicted rather than read as unassigned.
 _PTP_GENERAL_ERROR = 0x2002
 
+# Model names by USB product id, for bodies whose USB product string is
+# generic. The A2500 reports "Canon Digital Camera"; its pictures' EXIF says
+# "Canon PowerShot A2500". Only the A2500 has been verified on hardware, so it
+# is the only entry. Add another model here only after checking its EXIF name
+# on a body.
+_MODEL_BY_PRODUCT_ID = {
+    0x3271: "Canon PowerShot A2500",
+}
+
 # What remote capture returns, and so the only output name this backend can
 # honour. The capture service picks the name and guarantees it is free; a
 # name that would have to be changed here is refused rather than written
 # somewhere nothing checked.
 _CAPTURE_SUFFIXES = (".jpg", ".jpeg")
+
+# Record mode on a body that switch_mode_usb(1) left in playback. On
+# 12 November 2026 two A2500 bodies under CHDK 1.5.1 accepted
+# switch_mode_usb(1), extended the lens and went on reporting playback. A
+# half-press of the shutter, click("shoot_half"), sent by hand completed the
+# switch on those bodies without taking a picture. The condition was not tied
+# to how the body was switched on, and the same bodies later hung and needed
+# their batteries taken out, so it may belong to that fault. The half-press
+# costs nothing on a body already in record mode. After it, get_mode() is
+# polled every _RECORD_MODE_POLL_INTERVAL_S for up to
+# _RECORD_MODE_HALF_PRESS_WAIT_S.
+_RECORD_MODE_HALF_PRESS_WAIT_S = 4.0
+_RECORD_MODE_POLL_INTERVAL_S = 0.5
+_HALF_PRESS_LUA = 'click("shoot_half")'
+
+# ALT mode is entered before the switch to record mode. Spreads, the earlier
+# scanner software (spreadsplug/dev/chdkcamera.py), sends enter_alt() and then
+# switch_mode('record') every time it prepares a camera, with the comment "Try
+# to go into alt mode to prevent weird behaviour", and leaves the camera in
+# ALT mode. CHDK's "Disable LCD Off" setting defaults to "Alt", which blocks
+# the camera's power saving while ALT mode is on. On 12 November 2026 two
+# A2500 bodies outside ALT mode, with Canon's "Auto Power Down" on, switched
+# themselves off about three minutes after the last capture.
+#
+# Measured on the same day: with Canon's "Auto Power Down" on, two A2500
+# bodies freshly put into ALT mode by enter_alt() stayed on through seven idle
+# minutes with no USB traffic and then captured normally. The same bodies,
+# after an operator had gone through the camera menus (which takes a body out
+# of ALT mode; the backend had not sent enter_alt() again because
+# in_record_mode was already set), behaved as follows about three minutes after
+# the last capture: one switched itself off, and the other stayed attached to
+# USB with its lens out and answered nothing until its battery was taken out.
+# So ALT mode is asserted again during a session. Every still capture sends
+# enter_alt() before the shot, except one that _ensure_record_mode has just
+# sent it for. A preview sends it at most every _ALT_REASSERT_INTERVAL_S
+# seconds per body, and a capture counts for that timer.
+_ENTER_ALT_LUA = "enter_alt()"
+_ALT_REASSERT_INTERVAL_S = 30.0
+
+# How pychdk 0.1.3's switch_mode says the camera never reported record mode.
+# It raises a plain RuntimeError, as it does for a script that would not
+# start or one that failed, so the message is the only thing that tells this
+# failure from the others.
+_PYCHDK_DID_NOT_SWITCH = "The camera did not switch to record mode"
+
+# Every wait in this module goes through this name, so a test can record the
+# waits instead of spending them.
+_sleep = time.sleep
+_monotonic = time.monotonic
 
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
@@ -433,6 +492,26 @@ def _name_failure(exc):
     return type(exc).__name__
 
 
+class _BodyGoneError(RuntimeError):
+    """An operation failed because its body has left the bus.
+
+    The body has already been dropped when this is raised. `identity` is the
+    body's hardware id, or None when it had none, so the caller can tell
+    whether the body now at the index is the same camera.
+    """
+
+    identity = None
+
+
+class _IdentityChangedError(RuntimeError):
+    """The body locked for a retry is not the one the retry was meant for."""
+
+
+def _is_gone_from_the_bus(exc):
+    """True for a pyusb error whose errno is ENODEV: the device is not there."""
+    return getattr(exc, "errno", None) == errno.ENODEV
+
+
 def _shutter_seconds(value):
     """Read a CameraConfig shutter speed as seconds, or None if it says nothing.
 
@@ -494,6 +573,9 @@ class _ChdkBody:
         # Record mode is switched once per body: a viewport and a remote
         # capture both need it, and the switch costs seconds.
         self.in_record_mode = False
+        # When ALT mode was last asserted, by _monotonic; None on a body that
+        # has not had it asserted since it was opened.
+        self.alt_asserted_at = None
         # Live view instrumentation. The geometry is logged on the first frame
         # only; the rate every _FRAME_LOG_INTERVAL frames.
         self.geometry_logged = False
@@ -510,7 +592,15 @@ class _ChdkBody:
 
     @property
     def serial(self):
-        return self.info.serial_num or None
+        """The USB serial with NUL characters and surrounding whitespace removed.
+
+        pychdk 0.1.3 returns the A2500's serial with a trailing NUL byte. The
+        raw value cannot be stored in a PostgreSQL text column, so every
+        reader of the serial uses this property and none reads
+        info.serial_num. None means the body reports no serial.
+        """
+        cleaned = (self.info.serial_num or "").replace("\x00", "").strip()
+        return cleaned or None
 
     @property
     def port(self):
@@ -614,10 +704,12 @@ class ChdkBackend(CameraBackend):
             return self._bodies.get(key) if key is not None else None
 
     def camera_model(self, camera_index):
-        """The model of the body holding this index, as read when it opened.
+        """The model of the body holding this index.
 
-        _ChdkBody.model is the USB product string, or the product id label
-        when the body answered none, read once in _open_body. Nothing here
+        _ChdkBody.model starts as the table's name for the product id, else
+        the USB product string, else the product id label, read once in
+        _open_body. The EXIF model of each saved picture replaces it after
+        every capture (_take_model_from_picture). Nothing here
         talks to the camera or scans the bus: an index no open body holds,
         including every index before the first scan, is None.
         """
@@ -686,7 +778,8 @@ class ChdkBackend(CameraBackend):
         return True
 
     def _read_model(self, device, info):
-        """The body's model, from its USB product string if it answers one.
+        """The body's model: the table's name for its product id, else its USB
+        product string if it answers one.
 
         pyusb reads string descriptors over the wire and can fail or answer
         nothing, so the product id stands in. This is for people to read -
@@ -694,12 +787,15 @@ class ChdkBackend(CameraBackend):
         it: the hardware id is built from the product id instead, so a
         failed read costs a name and never an identity.
         """
+        known = _MODEL_BY_PRODUCT_ID.get(info.product_id)
+        if known:
+            return known
         try:
             product = getattr(device._usb_device, "product", None)
         except Exception:
             product = None
         if product:
-            return str(product).strip()
+            return str(product).replace("\x00", "").strip()
         return f"Canon {info.product_id:#06x}"
 
     def _close_body(self, body, reason):
@@ -1170,7 +1266,9 @@ class ChdkBackend(CameraBackend):
             return False
 
     @contextlib.contextmanager
-    def _in_use(self, camera_index, operation, refuse_unusable):
+    def _in_use(
+        self, camera_index, operation, refuse_unusable, expect_identity=None
+    ):
         """Hold the body at this index, having checked it is still that body.
 
         Resolving an index to a body and acquiring that body's lock are two
@@ -1191,6 +1289,9 @@ class ChdkBackend(CameraBackend):
             camera_index: Which body, as the device list numbers them.
             operation: Named in the message when the body has moved.
             refuse_unusable: Apply the capture refusal rules.
+            expect_identity: Set only for a retry. The hardware id the body
+                must have, checked on the body actually locked, after the
+                lock is taken.
 
         Yields:
             The body, with its lock held.
@@ -1223,6 +1324,11 @@ class ChdkBackend(CameraBackend):
                     "waiting, so it was refused rather than run on the wrong "
                     "body. Reload the device list and try again."
                 )
+            if expect_identity is not None and body.hardware_id != expect_identity:
+                raise _IdentityChangedError(
+                    f"Camera {camera_index} is {body.port}, which is not the "
+                    f"body ({expect_identity}) this {operation} was retried for"
+                )
             if not body.device.is_connected:
                 raise RuntimeError(
                     f"Camera {camera_index} ({body.port}) is no longer "
@@ -1236,11 +1342,82 @@ class ChdkBackend(CameraBackend):
                     )
             yield body
 
+    def _retry_once_if_gone(self, camera_index, operation, run):
+        """Run `run(expect_identity)`; if its body had left the bus, retry once.
+
+        A camera that restarts with its USB cable connected leaves the bus
+        and returns at a new device number. The first request after that
+        fails on the old session with ENODEV, after which the body has been
+        dropped. This rescans once, and when the body now at the index has the
+        same hardware identity as the one that failed, runs `run` once more,
+        passing that identity so the retry checks it again on the body it
+        locks (a layout can be published between this check and the lock).
+
+        The first error is raised when there is no identity, when the rescan
+        fails, when the body at the index is not the same one, when the
+        locked body is not the same one, and when the retry fails with
+        another _BodyGoneError. Any other exception from the retry
+        propagates as itself. No lock is held here: the failed body's lock
+        was released when `run` raised.
+        """
+        try:
+            return run(None)
+        except _BodyGoneError as gone:
+            if gone.identity is None:
+                raise
+            self.logger.info(
+                f"[chdk] camera {camera_index}: {operation} failed because "
+                f"the body left the bus; rescanning once for {gone.identity}"
+            )
+            try:
+                self.rescan()
+            except Exception as exc:
+                self.logger.error(
+                    f"[chdk] camera {camera_index}: rescan after a body left "
+                    f"the bus failed: {exc!r}"
+                )
+                raise gone
+            current = self._body_at(camera_index)
+            if current is None or current.hardware_id != gone.identity:
+                self.logger.info(
+                    f"[chdk] camera {camera_index}: not retrying {operation}, "
+                    f"{gone.identity} is not the body at that index now"
+                )
+                raise gone
+            self.logger.info(
+                f"[chdk] camera {camera_index}: retrying {operation} on "
+                f"{current.port}"
+            )
+            try:
+                return run(gone.identity)
+            except (_BodyGoneError, _IdentityChangedError):
+                raise gone
+
     def capture_image(
         self,
         output_path: Path,
         camera_config,
         capture_output: bool = False,
+    ) -> str:
+        """Capture one still over USB; see _capture_image_once.
+
+        A body that has left the bus is replaced and the capture retried
+        once, by _retry_once_if_gone.
+        """
+        camera_index = getattr(camera_config, "camera_index", 0)
+        return self._retry_once_if_gone(
+            camera_index, "capture",
+            lambda expect: self._capture_image_once(
+                output_path, camera_config, capture_output, expect
+            ),
+        )
+
+    def _capture_image_once(
+        self,
+        output_path: Path,
+        camera_config,
+        capture_output: bool = False,
+        expect_identity=None,
     ) -> str:
         """Capture one still over USB and write it to output_path.
 
@@ -1284,7 +1461,10 @@ class ChdkBackend(CameraBackend):
                 "would not have been checked."
             )
 
-        with self._in_use(camera_index, "capture", refuse_unusable=True) as body:
+        with self._in_use(
+            camera_index, "capture", refuse_unusable=True,
+            expect_identity=expect_identity,
+        ) as body:
             started = time.perf_counter()
             # The mode switch is part of the capture and fails the same way:
             # on a cold start it is the likeliest thing to time out, and it
@@ -1292,7 +1472,10 @@ class ChdkBackend(CameraBackend):
             # generic failure.
             stage = "switching to record mode"
             try:
-                self._ensure_record_mode(body)
+                just_sent = self._ensure_record_mode(body)
+                if not just_sent:
+                    stage = "entering ALT mode"
+                    self._assert_alt(body)
                 stage = "remote capture"
                 image = body.device.shoot(
                     stream=True, shutter_speed=shutter, market_iso=iso
@@ -1318,11 +1501,17 @@ class ChdkBackend(CameraBackend):
                 # error, anything else - the conversation broke in the middle
                 # and what the camera is doing now is unknown. The body is
                 # dropped and the next scan opens it again.
+                identity = body.hardware_id
                 self._evict(body, f"{stage} failed with {named}")
-                raise RuntimeError(
+                error = (
+                    _BodyGoneError if _is_gone_from_the_bus(exc) else RuntimeError
+                )(
                     f"CHDK capture failed on {body.port} during {stage} with "
                     f"{named}: {exc}"
-                ) from exc
+                )
+                if isinstance(error, _BodyGoneError):
+                    error.identity = identity
+                raise error from exc
 
             elapsed = time.perf_counter() - started
             if not image:
@@ -1350,9 +1539,62 @@ class ChdkBackend(CameraBackend):
                 f"{len(image)} bytes in {elapsed:.2f}s from shutter to disk, "
                 f"saved as {destination.name}"
             )
+            self._take_model_from_picture(body, destination)
             return str(destination), None
 
+    def _take_model_from_picture(self, body, path):
+        """Set the body's model from the EXIF Model tag of the picture just saved.
+
+        The picture names the camera better than the USB descriptors do: the
+        A2500's USB product string is the generic "Canon Digital Camera". The
+        tag is cleaned and passed through normalise_camera_model; a file with
+        no EXIF, an unreadable file or a placeholder value changes nothing.
+        The capture service reads camera_model after capture_image returns,
+        so the first picture's recorded model is this one. Nothing here may
+        fail the capture.
+        """
+        try:
+            from PIL import Image
+
+            with Image.open(path) as picture:
+                raw = picture.getexif().get(0x0110)
+        except Exception as exc:
+            self.logger.debug(
+                f"[chdk] {body.port}: no EXIF model read from {path.name}: "
+                f"{exc!r}"
+            )
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("ascii", errors="ignore")
+        if not isinstance(raw, str):
+            return
+        model = normalise_camera_model(raw.replace("\x00", "").strip())
+        if model is None:
+            self.logger.debug(
+                f"[chdk] {body.port}: EXIF model of {path.name} names no camera"
+            )
+            return
+        if model != body.model:
+            self.logger.info(
+                f"[chdk] {body.port}: model is {model!r} by the EXIF of "
+                f"{path.name} (was {body.model!r})"
+            )
+            body.model = model
+
     def capture_preview(self, camera_index: int) -> bytes:
+        """Return one live-preview JPEG frame; see _capture_preview_once.
+
+        A body that has left the bus is replaced and the request retried
+        once, by _retry_once_if_gone.
+        """
+        return self._retry_once_if_gone(
+            camera_index, "preview",
+            lambda expect: self._capture_preview_once(camera_index, expect),
+        )
+
+    def _capture_preview_once(
+        self, camera_index: int, expect_identity=None
+    ) -> bytes:
         """Return one live-preview JPEG frame from the body at this index.
 
         The capture service routes every non-picamera2 backend here, so this
@@ -1370,10 +1612,20 @@ class ChdkBackend(CameraBackend):
             RuntimeError: No body at this index, or the frame could not be
                 fetched or decoded.
         """
-        with self._in_use(camera_index, "preview", refuse_unusable=False) as body:
+        with self._in_use(
+            camera_index, "preview", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
             stage = "switching to record mode"
             try:
-                self._ensure_record_mode(body)
+                just_sent = self._ensure_record_mode(body)
+                if not just_sent and (
+                    body.alt_asserted_at is None
+                    or _monotonic() - body.alt_asserted_at
+                    >= _ALT_REASSERT_INTERVAL_S
+                ):
+                    stage = "entering ALT mode"
+                    self._assert_alt(body)
                 stage = "live view"
                 frame = body.device._chdk.get_display_data(LV_TFR_VIEWPORT)
             except Exception as exc:
@@ -1382,11 +1634,17 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] body {camera_index} ({body.port}): {stage} failed "
                     f"with {named}: {exc}"
                 )
+                identity = body.hardware_id
                 self._evict(body, f"{stage} failed with {named}")
-                raise RuntimeError(
+                error = (
+                    _BodyGoneError if _is_gone_from_the_bus(exc) else RuntimeError
+                )(
                     f"CHDK preview failed on {body.port} during {stage} with "
                     f"{named}: {exc}"
-                ) from exc
+                )
+                if isinstance(error, _BodyGoneError):
+                    error.identity = identity
+                raise error from exc
 
             try:
                 jpeg, info = encode_viewport_jpeg(frame)
@@ -1453,29 +1711,57 @@ class ChdkBackend(CameraBackend):
         body.interval_count = 0
         body.interval_worst = 0.0
 
+    def _assert_alt(self, body):
+        """Send enter_alt() and note when. A failure propagates and notes nothing."""
+        body.device.lua_execute(_ENTER_ALT_LUA)
+        body.alt_asserted_at = _monotonic()
+
     def _ensure_record_mode(self, body):
         """Put the body in record mode once, and confirm it got there.
 
         A viewport and a remote capture both need record mode, and the switch
         drives the lens, so it is done once per body rather than per frame -
-        which is exactly why it has to be confirmed. pychdk 0.1.3's
-        switch_mode polls get_mode itself and raises once its retries run
-        out, so a switch that never arrived reaches this method as an
-        exception. pychdk 0.1.2 does not: its loop runs out and reports that
-        the same way it reports success, by returning nothing, which leaves
-        every later capture and live view running from playback with the
-        flag set here suppressing any further attempt. The second read below
-        guards against a library that returns without the camera having
-        arrived.
+        which is exactly why it has to be confirmed.
 
-        So the camera is asked directly. The question is Lua, not uBASIC, and
-        the two read opposite ways round: CHDK's Lua get_mode() returns three
-        values - is_record, is_video, mode - and the first of them is true in
-        record and false in play. The library returns the script's first
-        return value, so what comes back here is is_record, and a truthy
-        answer is the camera confirming it arrived. The flag is set only on
-        that answer, so a switch that did not arrive is tried again by the
-        next capture instead of being remembered as done.
+        On 12 November 2026 two A2500 bodies under CHDK 1.5.1 accepted
+        switch_mode_usb(1), extended the lens and went on reporting playback.
+        A half-press of the shutter (click("shoot_half")) sent by hand
+        completed the switch on those bodies without taking a picture. The
+        condition was not tied to how the body was switched on, and the same
+        bodies later hung and needed their batteries taken out, so it may
+        belong to that fault. A half-press sent to a body already in record
+        mode costs nothing.
+
+        So the switch is asked for first, and a half-press is sent only when
+        it has not arrived. pychdk 0.1.3's switch_mode polls get_mode itself
+        and raises a RuntimeError once its retries run out; that error, and
+        only that one, is taken to mean the switch has not arrived. pychdk
+        0.1.2 does not raise: its loop runs out and returns as it does on
+        success, so the camera is asked directly afterwards as well. Any
+        other failure of the switch - a transport error, a timeout, a script
+        that would not run - propagates unchanged and no half-press is sent.
+
+        After the half-press, get_mode is polled for a bounded time. If the
+        body is still in playback at the end of it, the error tells the
+        operator to switch the camera off and on again, and to take the
+        battery out if it does not respond to its buttons.
+
+        The question is Lua, not uBASIC, and the two read opposite ways
+        round: CHDK's Lua get_mode() returns three values - is_record,
+        is_video, mode - and the first of them is true in record and false in
+        play. The library returns the script's first return value, so what
+        comes back here is is_record, and a truthy answer is the camera
+        confirming it arrived. The flag is set only on that answer, so a
+        switch that did not arrive is tried again by the next capture instead
+        of being remembered as done.
+
+        Before the switch, enter_alt() is sent, as Spreads did (see
+        _ENTER_ALT_LUA). With ALT mode on, two A2500 bodies with Canon's
+        "Auto Power Down" on stayed on through seven idle minutes (measured
+        on 12 November 2026). Returns True when this call sent enter_alt(),
+        and False when the body was already in record mode and nothing was
+        sent; the capture and preview paths use that to avoid sending it
+        twice.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -1483,17 +1769,42 @@ class ChdkBackend(CameraBackend):
         conversation.
         """
         if body.in_record_mode:
-            return
-        body.device.switch_mode("record")
-        is_record = body.device.lua_execute("return get_mode()")
-        if not is_record:
-            raise RuntimeError(
-                f"{body.port}: the camera is still in play mode after being "
-                "switched to record, so it can neither capture nor show a "
-                "live view"
-            )
-        body.in_record_mode = True
-        self.logger.info(f"[chdk] {body.port}: switched to record mode")
+            return False
+        # A failure here propagates like a failure of the switch, and no
+        # switch is attempted after it.
+        self._assert_alt(body)
+        try:
+            body.device.switch_mode("record")
+        except RuntimeError as exc:
+            if not str(exc).startswith(_PYCHDK_DID_NOT_SWITCH):
+                raise
+            not_arrived = exc
+        else:
+            not_arrived = None
+            if body.device.lua_execute("return get_mode()"):
+                body.in_record_mode = True
+                self.logger.info(f"[chdk] {body.port}: switched to record mode")
+                return True
+
+        body.device.lua_execute(_HALF_PRESS_LUA)
+        waited = 0.0
+        while waited < _RECORD_MODE_HALF_PRESS_WAIT_S:
+            _sleep(_RECORD_MODE_POLL_INTERVAL_S)
+            waited += _RECORD_MODE_POLL_INTERVAL_S
+            if body.device.lua_execute("return get_mode()"):
+                body.in_record_mode = True
+                self.logger.info(
+                    f"[chdk] {body.port}: switched to record mode after a "
+                    f"half-press of the shutter ({waited:.1f}s after it)"
+                )
+                return True
+
+        raise RuntimeError(
+            f"{body.port}: the camera did not enter shooting mode, so it can "
+            "neither capture nor show a live view. Switch the camera off "
+            "and on again. If it does not respond to its buttons, take the "
+            "battery out and put it back."
+        ) from not_arrived
 
     def assign_side(self, camera_index: int, side: str) -> list:
         """Write a page parity onto the card of the body at this index.
