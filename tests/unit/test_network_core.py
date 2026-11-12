@@ -1978,3 +1978,56 @@ def test_join_from_the_units_single_reject_capture(nm):
     outcome = _join(ssid="NewHome")
     assert not nm.child(UP_NEW)[0].terminated
     assert outcome.problem["code"] == "wrong_password"
+
+
+# A network literally named "--" ----------------------------------------------
+# On `connection show uuid <uuid>` nmcli prints no 802-11-wireless.ssid line for
+# a profile that is not Wi-Fi, and always prints the SSID of one that is, so
+# "--" there is the name of a network, never a placeholder.
+
+DASH_UUID = "5d2a9c1e-7b3f-4a68-8e0d-1c4b6f9a2d73"
+
+
+def _with_dash_profiles(nm):
+    nm.on(CONNECTIONS, stdout=fixture("nmcli-connection-show.txt")
+          + f"--:{DASH_UUID}:802-11-wireless:no\n"
+          + f"--:{NEW_UUID}:802-11-wireless:yes\n")
+    nm.on(f"{DETAILS} {DASH_UUID}", stdout=details("--", "wpa-psk"))
+    nm.on(f"{DETAILS} {NEW_UUID}", stdout=details("--", "wpa-psk"))
+
+
+@pytest.mark.unit
+def test_saved_profile_named_double_dash_keeps_its_ssid(nm):
+    from app.core import network
+    nm.on(CONNECTIONS, stdout=f"--:{DASH_UUID}:802-11-wireless:no\n")
+    nm.on(f"{DETAILS} {DASH_UUID}", stdout=details("--", "wpa-psk"))
+    assert network.saved_networks() == [
+        {"uuid": DASH_UUID, "name": "--", "ssid": "--", "security": "password", "active": False}]
+
+
+@pytest.mark.unit
+def test_saved_open_profile_named_double_dash_keeps_its_ssid_in_the_fallback_read(nm):
+    from app.core import network
+    nm.on(CONNECTIONS, stdout=f"--:{DASH_UUID}:802-11-wireless:no\n")
+    nm.on(f"{DETAILS} {DASH_UUID}", rc=10, stderr="Error: invalid field '802-11-wireless-security'")
+    nm.on(f"nmcli -t -f 802-11-wireless.ssid connection show uuid {DASH_UUID}",
+          stdout="802-11-wireless.ssid:--\n")
+    assert [(s["ssid"], s["security"]) for s in network.saved_networks()] == [("--", "open")]
+
+
+@pytest.mark.unit
+def test_scan_marks_a_network_named_double_dash_as_saved(nm):
+    from app.core import network
+    nm.on(WIFI_LIST_SCAN, stdout=fixture("nmcli-wifi-list.txt") + " :--:50:WPA2\n")
+    nm.on(CONNECTIONS, stdout=fixture("nmcli-connection-show.txt") + f"--:{DASH_UUID}:802-11-wireless:no\n")
+    nm.on(f"{DETAILS} {DASH_UUID}", stdout=details("--", "wpa-psk"))
+    flags = {n["ssid"]: n["saved"] for n in network.scan()["networks"]}
+    assert flags["--"] is True
+
+
+@pytest.mark.unit
+def test_joining_a_network_named_double_dash_removes_its_older_profile(nm):
+    _join_nm(nm)
+    _with_dash_profiles(nm)
+    assert _join(ssid="--").joined
+    assert [c[-1] for c in nm.ran(DELETE)] == [DASH_UUID]

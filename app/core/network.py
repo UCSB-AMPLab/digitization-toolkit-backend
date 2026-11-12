@@ -343,9 +343,12 @@ def _values(fields: dict, name: str) -> list[str]:
 
 
 def _ssid_value(fields: dict, name: str) -> str:
-    """An SSID field exactly as nmcli wrote it: spaces are part of an SSID."""
-    raw = (fields.get(name) or [""])[0]
-    return "" if raw == "--" else raw
+    """An SSID field exactly as nmcli wrote it: spaces are part of an SSID.
+
+    "--" is kept: `connection show uuid` prints no 802-11-wireless.ssid line
+    for a profile that is not Wi-Fi and always prints the SSID of one that
+    is, so "--" there is a network's name, not a placeholder."""
+    return (fields.get(name) or [""])[0]
 
 
 # ---------------------------------------------------------------------------
