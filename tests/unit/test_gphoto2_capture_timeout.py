@@ -659,3 +659,185 @@ def test_late_file_is_still_accepted(monkeypatch, tmp_path):
     saved = Path(result[0] if isinstance(result, tuple) else result)
     assert saved.read_bytes() == IMAGE_BYTES
     assert script.wait_calls == 2
+
+
+# ----------------------------------------------------------------------
+# (h) NEH-339: a focus check takes one trigger attempt under a 20 s
+# deadline; every other capture keeps the normal policy
+# ----------------------------------------------------------------------
+
+def _cause_chain(exc):
+    chain = []
+    current = exc
+    while current is not None and len(chain) < 5:
+        chain.append(current)
+        current = current.__cause__ or current.__context__
+    return chain
+
+
+def _busy_script(clock, shutterspeed="1/125", events=None):
+    return _Script(
+        settings={"shutterspeed": shutterspeed, "focusmode": "One Shot"},
+        events=events or [(GP_EVENT_TIMEOUT, None, 0.5)],
+        clock=clock,
+    )
+
+
+def test_normal_capture_keeps_the_retry_count_and_deadline(monkeypatch, tmp_path):
+    # Pins the policy a capture without focus_check has always had: three
+    # trigger attempts, each busy attempt but the last followed by a poll of
+    # the full exposure-sized deadline, and the plain trigger error (not a
+    # timeout) once the attempts run out.
+    assert gb._DEFAULT_RETRY == 3
+    assert gb._CAPTURE_TIMEOUT_BASE_S == 15.0
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(clock)
+    backend, fake_gp = _make_backend(monkeypatch, script)
+    error = fake_gp.GPhoto2Error("[-110] I/O in progress")
+    script.triggers = [error, error, error]
+
+    with pytest.raises(RuntimeError, match="DSLR capture failed") as excinfo:
+        backend.capture_image(tmp_path / "normal_busy.jpg", _config())
+
+    assert script.trigger_calls == 3
+    assert not any(
+        isinstance(e, gb.CaptureTimeoutError) for e in _cause_chain(excinfo.value)
+    ), "a busy trigger outside a focus check stays a trigger error"
+    deadline = gb._capture_deadline_s(gb._parse_exposure_seconds("1/125"))
+    assert deadline == pytest.approx(15.0 + 2 / 125)
+    gaps = [b - a for a, b in zip(script.trigger_times, script.trigger_times[1:])]
+    assert all(deadline <= gap < deadline + 0.5 for gap in gaps), gaps
+
+
+def test_normal_capture_waits_the_exposure_sized_deadline(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _Script(
+        settings={"shutterspeed": "30"},
+        events=[(GP_EVENT_TIMEOUT, None, 0.5)],
+        clock=clock,
+    )
+    backend, _ = _make_backend(monkeypatch, script)
+
+    with pytest.raises(RuntimeError, match="no image after"):
+        backend.capture_image(tmp_path / "normal_slow.jpg", _config())
+
+    # 15 + 2 * 30 = 75 s, not the focus-check 20 s.
+    assert 75.0 <= clock.now - 1000.0 < 75.5
+    assert script.trigger_calls == 1
+
+
+def test_focus_check_false_is_the_normal_capture(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(clock)
+    backend, fake_gp = _make_backend(monkeypatch, script)
+    error = fake_gp.GPhoto2Error("[-110] I/O in progress")
+    script.triggers = [error, error, error]
+
+    with pytest.raises(RuntimeError, match="DSLR capture failed"):
+        backend.capture_image(tmp_path / "explicit_false.jpg", _config(), focus_check=False)
+
+    assert script.trigger_calls == 3
+
+
+def test_focus_check_deadline_is_the_module_constant():
+    assert gb._FOCUS_CHECK_DEADLINE_S == 20.0
+
+
+def test_focus_check_returns_the_file(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _Script(
+        events=[(GP_EVENT_TIMEOUT, None, 4.0), (GP_EVENT_FILE_ADDED, _file_path(), 0.0)],
+        clock=clock,
+    )
+    backend, _ = _make_backend(monkeypatch, script)
+
+    result = backend.capture_image(tmp_path / "fc_ok.jpg", _config(), focus_check=True)
+
+    saved = Path(result[0] if isinstance(result, tuple) else result)
+    assert saved.read_bytes() == IMAGE_BYTES
+    assert script.trigger_calls == 1
+    assert script.deleted == [(FOLDER, NAME)]
+    assert 0 in backend._sessions
+
+
+def test_focus_check_times_out_at_20_s_whatever_the_exposure(monkeypatch, tmp_path):
+    # A "30" shutterspeed would size a 75 s deadline; the focus check
+    # gives up at 20 s from the trigger regardless.
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(clock, shutterspeed="30")
+    backend, _ = _make_backend(monkeypatch, script)
+
+    with pytest.raises(RuntimeError) as excinfo:
+        backend.capture_image(tmp_path / "fc_slow.jpg", _config(), focus_check=True)
+
+    assert any(isinstance(e, gb.CaptureTimeoutError) for e in _cause_chain(excinfo.value))
+    assert 20.0 <= clock.now - script.trigger_times[0] < 20.5
+    assert script.trigger_calls == 1
+    message = str(excinfo.value)
+    assert "focus-check deadline" in message
+    assert PORT in message
+    assert "flip the lens barrel switch to MF" not in message, (
+        "a focus check runs on AF by design; the MF hint does not apply"
+    )
+    assert 0 not in backend._sessions, "a timed-out session is closed as before"
+
+
+def test_focus_check_busy_trigger_is_one_attempt_then_a_timeout(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(clock)
+    backend, fake_gp = _make_backend(monkeypatch, script)
+    error = fake_gp.GPhoto2Error("[-110] I/O in progress")
+    script.triggers = [error, error, error]
+
+    with pytest.raises(RuntimeError) as excinfo:
+        backend.capture_image(tmp_path / "fc_busy.jpg", _config(), focus_check=True)
+
+    assert script.trigger_calls == 1, "a focus check never re-triggers"
+    assert any(isinstance(e, gb.CaptureTimeoutError) for e in _cause_chain(excinfo.value))
+    assert 20.0 <= clock.now - script.trigger_times[0] < 20.5
+    message = str(excinfo.value)
+    assert "no picture arrived within the focus-check deadline" in message
+    assert PORT in message
+    assert 0 not in backend._sessions
+    assert script.exit_calls == 1
+
+
+def test_focus_check_busy_trigger_returns_a_file_that_lands_in_time(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(
+        clock,
+        events=[(GP_EVENT_TIMEOUT, None, 6.0), (GP_EVENT_FILE_ADDED, _file_path(), 0.0)],
+    )
+    backend, fake_gp = _make_backend(monkeypatch, script)
+    script.triggers = [fake_gp.GPhoto2Error("[-110] I/O in progress"), None]
+
+    result = backend.capture_image(tmp_path / "fc_busy_ok.jpg", _config(), focus_check=True)
+
+    saved = Path(result[0] if isinstance(result, tuple) else result)
+    assert saved.read_bytes() == IMAGE_BYTES
+    assert script.trigger_calls == 1
+    assert script.deleted == [(FOLDER, NAME)]
+
+
+def test_focus_check_non_busy_trigger_error_is_not_a_timeout(monkeypatch, tmp_path):
+    clock = _Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = _busy_script(clock)
+    backend, fake_gp = _make_backend(monkeypatch, script)
+    script.triggers = [fake_gp.GPhoto2Error("[-7] I/O problem")]
+
+    with pytest.raises(RuntimeError, match="DSLR capture failed") as excinfo:
+        backend.capture_image(tmp_path / "fc_err.jpg", _config(), focus_check=True)
+
+    assert script.trigger_calls == 1
+    assert not any(
+        isinstance(e, gb.CaptureTimeoutError) for e in _cause_chain(excinfo.value)
+    )
+    assert clock.now == 1000.0, "a non-busy trigger error is raised without waiting"

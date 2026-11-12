@@ -134,6 +134,13 @@ _EVENT_STEP_MS = 500
 # a short exposure. Treat both as this many seconds of exposure when sizing
 # the deadline.
 _UNKNOWN_EXPOSURE_S = 30.0
+# Focus check (NEH-339): the Refocus dialog's test picture, taken with the lens
+# on autofocus. A body that cannot find focus on AF does not release the
+# shutter, and under the normal policy (three trigger attempts, each busy one
+# waited out for the full capture deadline) that holds the camera's lock for
+# minutes. A focus check gets one trigger attempt and this many seconds from
+# the trigger to the file, whatever the exposure.
+_FOCUS_CHECK_DEADLINE_S = 20.0
 
 # Where the index -> body bindings are kept between runs, next to cameras.json
 # in the projects root. Owned by this backend alone; the picamera2 path has no
@@ -185,6 +192,12 @@ def _parse_exposure_seconds(shutterspeed) -> float:
         return float(text)
     except (ValueError, ZeroDivisionError):
         return _UNKNOWN_EXPOSURE_S
+
+
+def _is_busy_trigger_error(exc) -> bool:
+    """True for the transient I/O-busy errors trigger_capture() can raise."""
+    err = str(exc).lower()
+    return "-110" in err or "i/o in progress" in err or "busy" in err
 
 
 def _capture_deadline_s(exposure: float) -> float:
@@ -440,13 +453,7 @@ class _PTPSession:
                 self._cam.trigger_capture()
                 return None
             except gp.GPhoto2Error as exc:
-                err = str(exc).lower()
-                retriable = (
-                    "-110" in err
-                    or "i/o in progress" in err
-                    or "busy" in err
-                )
-                if not retriable:
+                if not _is_busy_trigger_error(exc):
                     raise
                 self._logger.warning(
                     f"[gphoto2] {self.port}: trigger busy (attempt {attempt}/{retry}): "
@@ -512,11 +519,56 @@ class _PTPSession:
                     f"{hint}"
                 )
 
+    def _focus_check_timeout(self, reason: str) -> CaptureTimeoutError:
+        return CaptureTimeoutError(
+            f"{self.port}: no picture arrived within the focus-check deadline "
+            f"of {_FOCUS_CHECK_DEADLINE_S:g}s ({reason})"
+        )
+
+    def _trigger_for_focus_check(self, shutterspeed):
+        """Trigger once and collect the file within _FOCUS_CHECK_DEADLINE_S.
+
+        The deadline runs from the trigger call to the file. A busy trigger
+        is never retried: the event queue is polled for whatever is left of
+        the deadline, since a busy error does not prove the shutter stayed
+        shut, and a file seen there is returned. An empty queue at the
+        deadline - after a busy trigger or after a clean one - raises
+        CaptureTimeoutError, which the caller treats like any capture
+        timeout (the session is closed). A non-busy trigger error and an
+        error out of the event wait propagate as they come.
+        """
+        start = time.monotonic()
+        try:
+            self._cam.trigger_capture()
+        except gp.GPhoto2Error as exc:
+            if not _is_busy_trigger_error(exc):
+                raise
+            self._logger.warning(
+                f"[gphoto2] {self.port}: trigger busy on a focus check: "
+                f"waiting what is left of the {_FOCUS_CHECK_DEADLINE_S:g}s "
+                f"deadline for a file, with no retry"
+            )
+            remaining = _FOCUS_CHECK_DEADLINE_S - (time.monotonic() - start)
+            file_path = self._poll_for_file(remaining)
+            if file_path is None:
+                raise self._focus_check_timeout(f"trigger busy: {exc}") from exc
+            return file_path
+        remaining = _FOCUS_CHECK_DEADLINE_S - (time.monotonic() - start)
+        try:
+            return self._wait_for_file_added(remaining, shutterspeed)
+        except CaptureTimeoutError as exc:
+            # Re-worded without the "flip to MF" hint: a focus check runs on
+            # AF by design.
+            raise self._focus_check_timeout(
+                f"shutterspeed={shutterspeed!r}"
+            ) from exc
+
     def capture(
         self,
         outpath: Path,
         retry: int = _DEFAULT_RETRY,
         retry_delay: float = _DEFAULT_SETTLE,
+        focus_check: bool = False,
     ) -> tuple[float, Path]:
         """Capture one image to outpath. Returns (elapsed_seconds, actual_path).
 
@@ -539,15 +591,23 @@ class _PTPSession:
         risks re-triggering (a second photograph) while the first file is
         still on its way. A failure after the shutter has fired is raised
         as it comes.
+
+        focus_check=True replaces that policy for one capture: one trigger
+        attempt and _FOCUS_CHECK_DEADLINE_S from the trigger to the file
+        (see _trigger_for_focus_check); retry and retry_delay are then
+        unused.
         """
         outpath.parent.mkdir(parents=True, exist_ok=True)
         shutterspeed = self._get_config("shutterspeed")
-        deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
 
         t0 = time.perf_counter()
-        file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
-        if file_path is None:
-            file_path = self._wait_for_file_added(deadline_s, shutterspeed)
+        if focus_check:
+            file_path = self._trigger_for_focus_check(shutterspeed)
+        else:
+            deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
+            file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
+            if file_path is None:
+                file_path = self._wait_for_file_added(deadline_s, shutterspeed)
 
         # The captured filename tells us the actual format (.cr2 vs .jpg)
         is_raw = file_path.name.lower().endswith(".cr2")
@@ -1557,11 +1617,16 @@ class GPhoto2Backend(CameraBackend):
             self.logger.error(f"[gphoto2] is_camera_connected({camera_index}): {exc}")
             return False
 
+    # capture_image() takes focus_check (NEH-339); capture.service passes it
+    # only to a backend class that sets this.
+    supports_focus_check = True
+
     def capture_image(
         self,
         output_path: Path,
         camera_config,
         capture_output: bool = False,
+        focus_check: bool = False,
     ) -> str:
         """Capture one image to output_path. Returns (path as str, None).
 
@@ -1574,6 +1639,10 @@ class GPhoto2Backend(CameraBackend):
             output_path: Destination path for the captured JPEG.
             camera_config: CameraConfig (camera_index used for routing).
             capture_output: Unused - kept for interface compatibility.
+            focus_check: One trigger attempt and a _FOCUS_CHECK_DEADLINE_S
+                deadline instead of the normal retry and deadline policy
+                (see _PTPSession.capture). False leaves the capture as it
+                always was.
 
         Returns:
             (path, None): the saved image file's path as a string (`.cr2`
@@ -1589,7 +1658,10 @@ class GPhoto2Backend(CameraBackend):
             session = self._get_or_open_session(camera_index)
             try:
                 session.apply_dslr_config(camera_config)
-                elapsed, actual_path = session.capture(output_path)
+                if focus_check:
+                    elapsed, actual_path = session.capture(output_path, focus_check=True)
+                else:
+                    elapsed, actual_path = session.capture(output_path)
                 self.logger.info(
                     f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"

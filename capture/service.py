@@ -527,7 +527,11 @@ def _unlink_capture_output(path) -> None:
                 pass
 
 
-def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
+def test_capture_bytes(
+    camera_index: int,
+    resolution: str = "medium",
+    focus_check: bool = False,
+) -> tuple[bytes, float]:
     """Take a real still for the dashboard's "Probar camaras" button and return it inline.
 
     Exercises the same shutter/autofocus/backend path as POST /capture -
@@ -542,6 +546,10 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     Args:
         camera_index: The index of the camera to test.
         resolution: Resolution preset (see capture.camera.IMG_SIZES).
+        focus_check: Ask the backend for a focus-check capture (one trigger
+            attempt, a short deadline; NEH-339). Passed only to a backend
+            whose class sets supports_focus_check = True (GPhoto2Backend);
+            every other backend captures as usual.
 
     Returns:
         tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
@@ -566,8 +574,15 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     try:
         output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
 
+        backend = get_backend()
+        # The class, not the instance: getattr on a mock instance is truthy.
+        if focus_check and getattr(type(backend), "supports_focus_check", False) is True:
+            capture_kwargs = {"focus_check": True}
+        else:
+            capture_kwargs = {}
+
         start_time = time.perf_counter()
-        result = get_backend().capture_image(output_path, camera_config)
+        result = backend.capture_image(output_path, camera_config, **capture_kwargs)
         elapsed_time = time.perf_counter() - start_time
 
         # Result is a (path_or_paths, metadata) pair from the picamera2,

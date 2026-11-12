@@ -379,3 +379,187 @@ def test_test_capture_response_exposes_its_headers_across_cors(client, monkeypat
     exposed_names = {h.strip() for h in exposed.split(",")}
     assert "X-Capture-Seconds" in exposed_names
     assert "X-Capture-Bytes" in exposed_names
+
+
+# ----------------------------------------------------------------------
+# NEH-339: ?focus_check=true for the Refocus dialog, and X-Focal-Length
+# ----------------------------------------------------------------------
+
+def _jpeg_with_focal_length(focal_length=None, exif_blob=None):
+    import io
+
+    from PIL import Image, TiffImagePlugin
+
+    buf = io.BytesIO()
+    image = Image.new("RGB", (8, 8))
+    if exif_blob is not None:
+        image.save(buf, "JPEG", exif=exif_blob)
+    elif focal_length is None:
+        image.save(buf, "JPEG")
+    else:
+        numerator, denominator = focal_length
+        exif = Image.Exif()
+        exif.get_ifd(0x8769)[0x920A] = TiffImagePlugin.IFDRational(numerator, denominator)
+        image.save(buf, "JPEG", exif=exif)
+    return buf.getvalue()
+
+
+class _FakeBackendFocusCheck:
+    """A backend that takes the focus-check option, like GPhoto2Backend."""
+
+    supports_focus_check = True
+
+    def __init__(self, recorded, image_bytes=b"\xff\xd8fake"):
+        self.recorded = recorded
+        self.image_bytes = image_bytes
+
+    def capture_image(self, path, camera_config, capture_output=False, **kwargs):
+        self.recorded["kwargs"] = kwargs
+        Path(path).write_bytes(self.image_bytes)
+        return str(path), None
+
+
+class _FakeBackendBytes:
+    """A backend without the option, writing given bytes."""
+
+    def __init__(self, image_bytes):
+        self.image_bytes = image_bytes
+
+    def capture_image(self, path, camera_config, capture_output=False):
+        Path(path).write_bytes(self.image_bytes)
+        return str(path), None
+
+
+@pytest.mark.unit
+def test_test_capture_passes_focus_check_to_a_backend_that_takes_it(client, monkeypatch):
+    recorded = {}
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendFocusCheck(recorded))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?focus_check=true")
+
+    assert resp.status_code == 200, resp.text
+    assert recorded["kwargs"] == {"focus_check": True}
+
+
+@pytest.mark.unit
+def test_test_capture_without_the_flag_passes_no_option(client, monkeypatch):
+    recorded = {}
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendFocusCheck(recorded))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0")
+
+    assert resp.status_code == 200, resp.text
+    assert recorded["kwargs"] == {}, "a test capture without the flag is unchanged"
+
+
+@pytest.mark.unit
+def test_test_capture_ignores_focus_check_on_a_backend_without_it(client, monkeypatch):
+    recorded = {}
+    _install_default_config(monkeypatch)
+    # _FakeBackendSingle.capture_image takes no focus_check keyword: passing
+    # one would raise a TypeError and a 500.
+    _install_backend(monkeypatch, _FakeBackendSingle(recorded))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?focus_check=true")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == b"\xff\xd8fake"
+
+
+@pytest.mark.unit
+def test_focus_check_busy_trigger_on_a_dslr_is_a_504(client, monkeypatch, tmp_path):
+    # End to end through the real GPhoto2Backend with the fake libgphoto2
+    # of test_gphoto2_capture_timeout: the body stays busy, the focus check
+    # gives up after one attempt and 20 s of (fake) clock, and the route
+    # answers 504.
+    import capture.backends.gphoto2_backend as gb
+    from tests.unit import test_gphoto2_capture_timeout as harness
+
+    clock = harness._Clock()
+    monkeypatch.setattr(gb.time, "monotonic", clock)
+    script = harness._Script(
+        events=[(harness.GP_EVENT_TIMEOUT, None, 0.5)], clock=clock
+    )
+    backend, fake_gp = harness._make_backend(monkeypatch, script)
+    script.triggers = [fake_gp.GPhoto2Error("[-110] I/O in progress")]
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, backend)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?focus_check=true")
+
+    assert resp.status_code == 504, resp.text
+    detail = resp.json()["detail"]
+    assert "no picture arrived within the focus-check deadline" in detail
+    assert harness.PORT in detail
+    assert script.trigger_calls == 1
+    assert 20.0 <= clock.now - script.trigger_times[0] < 20.5
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "focal_length, expected",
+    [((27, 1), "27"), ((55, 2), "27.5")],
+)
+def test_test_capture_reports_the_exif_focal_length(client, monkeypatch, focal_length, expected):
+    # FAKE_CONFIG_DICT rotates by 270: the focal length must survive the
+    # Orientation tag being written into the same EXIF block.
+    image_bytes = _jpeg_with_focal_length(focal_length)
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(image_bytes))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?focus_check=true")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.headers["X-Focal-Length"] == expected
+    assert resp.headers["X-Capture-Bytes"] == str(len(resp.content))
+    assert float(resp.headers["X-Capture-Seconds"]) >= 0
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "image_bytes",
+    [
+        pytest.param(_jpeg_with_focal_length(None), id="no-focal-length"),
+        pytest.param(
+            _jpeg_with_focal_length(exif_blob=b"Exif\x00\x00garbagegarbage"),
+            id="garbage-exif",
+        ),
+        pytest.param(b"\xff\xd8fake", id="not-an-image"),
+        pytest.param(_jpeg_with_focal_length((0, 0)), id="zero-over-zero"),
+    ],
+)
+def test_test_capture_omits_the_focal_length_when_it_cannot_be_read(
+    client, monkeypatch, image_bytes
+):
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(image_bytes))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0")
+
+    assert resp.status_code == 200, resp.text
+    assert "X-Focal-Length" not in resp.headers
+    assert resp.content, "the picture is still returned"
+
+
+@pytest.mark.unit
+def test_test_capture_exposes_the_focal_length_across_cors(client, monkeypatch):
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(_jpeg_with_focal_length((27, 1))))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post(
+        "/cameras/test-capture/0",
+        headers={"Origin": "http://localhost:5173"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    exposed = resp.headers.get("access-control-expose-headers", "")
+    assert "X-Focal-Length" in {h.strip() for h in exposed.split(",")}
