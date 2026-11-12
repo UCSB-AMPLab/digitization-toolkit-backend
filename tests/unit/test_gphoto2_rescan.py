@@ -711,3 +711,67 @@ def test_rescan_reconcile_honours_a_refresh_that_lands_before_it_runs(monkeypatc
     assert [d["port"] for d in devices] == [PORT_0], (
         "the returned enumeration does not reflect the newest published map"
     )
+
+
+# ----------------------------------------------------------------------
+# (h) the port map logs only when it changes
+# ----------------------------------------------------------------------
+
+def _info_lines(caplog, fragment):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and fragment in r.getMessage()
+    ]
+
+
+def test_unchanged_port_map_logs_detected_cameras_once(monkeypatch, caplog):
+    backend, _claims, _detector, _cls = _two_body_backend(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 0: {MODEL} on {PORT_0}",
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1}",
+    ]
+
+
+def test_camera_moving_to_another_port_logs_its_new_line_once(monkeypatch, caplog):
+    backend, _claims, detector, _cls = _two_body_backend(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        caplog.clear()
+        detector.results = [(MODEL, PORT_0), (MODEL, PORT_1_NEW)]
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1_NEW}",
+    ]
+    assert _info_lines(caplog, "no longer detected") == []
+
+
+def test_camera_disappearing_logs_one_line_and_reappearing_logs_detected(
+    monkeypatch, caplog
+):
+    backend, _claims, detector, _cls = _two_body_backend(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        caplog.clear()
+        detector.results = [(MODEL, PORT_0)]
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+        assert _info_lines(caplog, "no longer detected") == [
+            f"[gphoto2] Camera 1: {MODEL} on {PORT_1} is no longer detected",
+        ]
+        assert _info_lines(caplog, "Detected camera") == []
+
+        detector.results = [(MODEL, PORT_0), (MODEL, PORT_1)]
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1}",
+    ]
