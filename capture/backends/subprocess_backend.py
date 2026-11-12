@@ -158,6 +158,7 @@ class RpicamBackend(CameraBackend):
     def get_capabilities(self) -> dict:
         return {
             "live_preview": False,
+            "continuous_preview": False,
             "focus_control": False,
             "live_controls": False,
             "zoom": False,

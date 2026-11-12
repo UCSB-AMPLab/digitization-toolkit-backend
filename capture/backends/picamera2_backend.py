@@ -849,6 +849,7 @@ class Picamera2Backend(CameraBackend):
     def get_capabilities(self) -> dict:
         return {
             "live_preview": True,
+            "continuous_preview": True,
             "focus_control": True,
             "live_controls": True,
             "zoom": True,
