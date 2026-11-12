@@ -115,6 +115,30 @@ _IMAGE_FORMAT_DEFAULT = "L"
 # Reverse mapping: PTP widget value -> user-facing label
 _IMAGE_FORMAT_REVERSE_MAP = {v: k for k, v in _IMAGE_FORMAT_MAP.items()}
 
+# Process-wide lock around everything done when a camera connection is opened
+# or closed: the abilities and port list loads, set_abilities, set_port_info,
+# init(), the configuration a session open applies right after init()
+# (capturetarget and the rest of the preset, the focus and flash checks, the
+# serial read), the serial read inside a brief identification read, and
+# exit(). libgphoto2's settings code (gp_setting_get/gp_setting_set) keeps its
+# state in unlocked process-wide statics and parses the settings file with
+# strtok; the ptp2 driver reads a setting in camera_init, reads one again when
+# the config tree is fetched, and writes one when capturetarget is set, so two
+# threads in that code at once can crash the process. The per-camera locks do
+# not prevent that, because dual capture opens both bodies at once, each under
+# its own camera's lock.
+#
+# Lock order: this lock is innermost. It is taken only around libgphoto2 calls,
+# never while acquiring a camera lock, _map_lock, _save_lock or _rescan_lock,
+# and nothing sleeps while holding it.
+# Capture, preview download and config reads and writes on a session that is
+# already open stay outside it, so the two cameras still shoot in parallel.
+# gp.Camera.autodetect() is deliberately not under it: concurrent autodetects,
+# and autodetect alongside opens, did not crash in testing, and autodetect
+# already runs under _map_lock.
+_GPHOTO2_INIT_LOCK = threading.Lock()
+
+
 # Minimum settle time used as retry_delay in capture (seconds).
 # Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
 _DEFAULT_SETTLE = 3.0
@@ -223,6 +247,13 @@ class _PTPSession:
         self._open()
 
     def _open(self):
+        # The whole open, post-init configuration included, runs under
+        # _GPHOTO2_INIT_LOCK.
+        with _GPHOTO2_INIT_LOCK:
+            self._open_locked()
+
+    def _open_locked(self):
+        """The body of _open. Callers must hold _GPHOTO2_INIT_LOCK."""
         abilities_list = gp.CameraAbilitiesList()
         abilities_list.load()
         self._cam = gp.Camera()
@@ -590,7 +621,8 @@ class _PTPSession:
     def close(self):
         if self._cam is not None:
             try:
-                self._cam.exit()
+                with _GPHOTO2_INIT_LOCK:
+                    self._cam.exit()
             except Exception:
                 pass
             self._cam = None
@@ -1378,28 +1410,34 @@ class GPhoto2Backend(CameraBackend):
                     cam = None
                     initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
-                        initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                        # One hold of _GPHOTO2_INIT_LOCK from open through
+                        # exit: the serial read fetches the config tree, which
+                        # reaches libgphoto2's settings code too.
+                        with _GPHOTO2_INIT_LOCK:
+                            try:
+                                al = gp.CameraAbilitiesList()
+                                al.load()
+                                cam = gp.Camera()
+                                cam.set_abilities(al[al.lookup_model(model)])
+                                pil = gp.PortInfoList()
+                                pil.load()
+                                cam.set_port_info(pil[pil.lookup_path(port)])
+                                cam.init()
+                                initialized = True
+                                cfg = cam.get_config()
+                                serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                            finally:
+                                # init() may have succeeded even if the read
+                                # raised; the claim is released either way,
+                                # and only then is anything published from it.
+                                if initialized:
+                                    try:
+                                        cam.exit()
+                                    except Exception:
+                                        pass
                     except Exception:
                         serial = ""
                     finally:
-                        # init() may have succeeded even if the read raised;
-                        # the claim is released either way, and only then is
-                        # anything published from it.
-                        if initialized:
-                            try:
-                                cam.exit()
-                            except Exception:
-                                pass
                         self._release_port(camera_index, port)
                 if serial:
                     learned = self._learn_serial(camera_index, read_port, serial) or learned
@@ -1727,30 +1765,37 @@ class GPhoto2Backend(CameraBackend):
                     cam = None
                     initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model_raw)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
-                        initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                        # One hold of _GPHOTO2_INIT_LOCK from open through
+                        # exit: the serial read fetches the config tree, which
+                        # reaches libgphoto2's settings code too.
+                        with _GPHOTO2_INIT_LOCK:
+                            try:
+                                al = gp.CameraAbilitiesList()
+                                al.load()
+                                cam = gp.Camera()
+                                cam.set_abilities(al[al.lookup_model(model_raw)])
+                                pil = gp.PortInfoList()
+                                pil.load()
+                                cam.set_port_info(pil[pil.lookup_path(port)])
+                                cam.init()
+                                initialized = True
+                                cfg = cam.get_config()
+                                serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                            finally:
+                                # init() may have succeeded even if a later
+                                # step (e.g. get_config() or the serial read)
+                                # raised. Always release the PTP claim in that
+                                # case, or the camera stays claimed by this
+                                # dangling `cam` object while the camera lock
+                                # is dropped and enumeration continues.
+                                if initialized:
+                                    try:
+                                        cam.exit()
+                                    except Exception:
+                                        pass
                     except Exception:
                         pass
                     finally:
-                        # init() may have succeeded even if a later step (e.g.
-                        # get_config() or the serial read) raised. Always
-                        # release the PTP claim in that case, or the camera
-                        # stays claimed by this dangling `cam` object while
-                        # the lock is dropped and enumeration continues.
-                        if initialized:
-                            try:
-                                cam.exit()
-                            except Exception:
-                                pass
                         self._release_port(idx, port)
                     # The claim is gone, so what it read may now be
                     # published.
