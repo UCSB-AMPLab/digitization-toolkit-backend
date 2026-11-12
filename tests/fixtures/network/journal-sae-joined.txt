@@ -1,0 +1,4 @@
+wlan6: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0
+wlan6: WPA: Key negotiation completed with 02:00:00:00:02:00 [PTK=CCMP GTK=CCMP]
+wlan6: CTRL-EVENT-CONNECTED - Connection to 02:00:00:00:02:00 completed [id=0 id_str=]
+wlan6: CTRL-EVENT-SIGNAL-CHANGE above=1 signal=-20 noise=-92 txrate=6000

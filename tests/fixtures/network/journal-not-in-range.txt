@@ -1,0 +1,2 @@
+wlan6: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:00:00 reason=3 locally_generated=1
+wlan6: CTRL-EVENT-DSCP-POLICY clear_all
