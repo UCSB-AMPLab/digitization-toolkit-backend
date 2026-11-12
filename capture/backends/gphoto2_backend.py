@@ -32,6 +32,8 @@ Version: 0.1.0-beta
 """
 
 import json
+import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -147,6 +149,34 @@ _BINDINGS_VERSION = 1
 # above it are parking: somewhere a body that is not one of the two sides can
 # sit, visible and usable, until an explicit rescan gives it a side.
 _SIDE_COUNT = 2
+
+# is_camera_connected() skips the USB bus scan while the published port map is
+# current (every published port's usbfs node still exists), but still scans
+# at least this often, so a body plugged in at an index nobody is asking
+# about is noticed without a rescan or a restart.
+_ROUTINE_SCAN_MIN_S = 10.0
+
+# The clock the routine-scan interval is measured on; a module-level name so
+# tests can drive it.
+_monotonic = time.monotonic
+
+_USB_PORT_RE = re.compile(r"usb:(\d{3}),(\d{3})")
+
+
+def _port_node_exists(port) -> bool:
+    """Does this libgphoto2 port's usbfs device node exist?
+
+    A port `usb:BBB,DDD` is the device node /dev/bus/usb/BBB/DDD. Unplugging,
+    power-cycling or re-enumerating a body removes that node (a re-enumerated
+    body gets a new DDD), so a port whose node exists still names a device on
+    the bus. False for any port not in that form and wherever the node cannot
+    be seen (no usbfs, as on macOS): the caller then scans the bus. No
+    libgphoto2 call is made.
+    """
+    match = _USB_PORT_RE.fullmatch(port) if isinstance(port, str) else None
+    if match is None:
+        return False
+    return os.path.exists(f"/dev/bus/usb/{match.group(1)}/{match.group(2)}")
 
 
 class CameraIdentityError(RuntimeError):
@@ -652,6 +682,9 @@ class GPhoto2Backend(CameraBackend):
         # the last autodetect() result, so the map can be rebuilt against new
         # identity knowledge without a second USB enumeration
         self._last_detected: list[tuple[str, str]] = []
+        # _monotonic() at the last autodetect(), or None before the first;
+        # written by _build_port_map under _map_lock
+        self._last_scan_at: "float | None" = None
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
         # usb port -> the index that currently holds a PTP claim on it. This
@@ -918,6 +951,7 @@ class GPhoto2Backend(CameraBackend):
             raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
             self._last_detected = list(detected)
+            self._last_scan_at = _monotonic()
 
         present = {port for _model, port in detected}
         for port in list(serial_by_port):
@@ -978,6 +1012,26 @@ class GPhoto2Backend(CameraBackend):
     def _refresh_port_map(self):
         with self._map_lock:
             self._port_map = self._build_port_map(self._pins, self._serial_by_port)
+
+    def _port_map_is_current(self, camera_index: int) -> bool:
+        """Can is_camera_connected() answer for this index without a bus scan?
+
+        Only when all of these hold: a scan has run within
+        _ROUTINE_SCAN_MIN_S, the published map has an entry for this index,
+        and every published port's device node still exists (see
+        _port_node_exists). A body that left or re-enumerated has lost its
+        node, so any other answer means the map may be out of date and the
+        caller scans. The map and the scan time are read under _map_lock; the
+        node checks are filesystem lookups made after it is released.
+        """
+        with self._map_lock:
+            port_map = dict(self._port_map)
+            last_scan_at = self._last_scan_at
+        if last_scan_at is None or _monotonic() - last_scan_at >= _ROUTINE_SCAN_MIN_S:
+            return False
+        if camera_index not in port_map:
+            return False
+        return all(_port_node_exists(port) for _model, port in port_map.values())
 
     def _republish_port_map(self):
         """Re-lay the last detection against the pins and cache as they are now.
@@ -1514,8 +1568,12 @@ class GPhoto2Backend(CameraBackend):
     def is_camera_connected(self, camera_index: int = 0) -> bool:
         """Is a body present at this index right now?
 
-        Always re-detects, so a power-cycle since the last call is reflected.
-        A body that came back on a new port is unidentified at that point, so
+        Re-detects unless the published map is current (_port_map_is_current):
+        a scan within the last _ROUTINE_SCAN_MIN_S, an entry for this index,
+        and every published port's device node still present. A body that is
+        unplugged or power-cycled loses its node, so the next call scans and
+        the change is reflected; a body plugged in at another index is found
+        by the next scan the interval allows. A body that came back on a new port is unidentified at that point, so
         the fresh map can only place it provisionally and this index would
         read as disconnected. When - and only when - this index is pinned,
         absent from the fresh map, and at least one published port has no
@@ -1531,9 +1589,11 @@ class GPhoto2Backend(CameraBackend):
         the operator asks for, may do that.
         """
         try:
-            # Always do a fresh detection so this method reflects reality even
-            # if cameras have been power-cycled since last call.
-            self._refresh_port_map()
+            # Detect afresh unless the map still points at live devices, so a
+            # power-cycle since the last call is reflected without scanning
+            # the bus on every preview and capture.
+            if not self._port_map_is_current(camera_index):
+                self._refresh_port_map()
             with self._map_lock:
                 pinned = camera_index in self._pins
                 absent = camera_index not in self._port_map
