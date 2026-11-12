@@ -778,10 +778,40 @@ def _is_capture_timeout(exc: BaseException) -> bool:
 	return False
 
 
+def _focal_length_header(image_bytes: bytes) -> Optional[str]:
+	"""The EXIF FocalLength of a JPEG in millimetres, as "27" or "27.5".
+
+	None when the tag is absent, zero, not a finite number, or the EXIF (or
+	the image) cannot be read: the header is a hint for the Refocus dialog,
+	never a reason to fail the capture.
+	"""
+	import io
+	import math
+
+	try:
+		from PIL import Image
+
+		with Image.open(io.BytesIO(image_bytes)) as img:
+			exif = img.getexif()
+			# FocalLength (0x920A) lives in the Exif sub-IFD (0x8769).
+			value = exif.get_ifd(0x8769).get(0x920A)
+			if value is None:
+				value = exif.get(0x920A)
+		if value is None:
+			return None
+		millimetres = float(value)
+	except Exception:
+		return None
+	if not math.isfinite(millimetres) or millimetres <= 0:
+		return None
+	return f"{round(millimetres, 2):g}"
+
+
 @router.post("/test-capture/{camera_index}")
 def test_capture(
 	camera_index: int,
 	resolution: str = Query("medium"),
+	focus_check: bool = Query(False),
 	current_user: User = Depends(allow_contributor),
 ):
 	"""
@@ -798,6 +828,17 @@ def test_capture(
 	Checks the camera is connected before calling the service, mirroring
 	trigger_capture, rather than sniffing the RuntimeError message for
 	"not connected" after the fact.
+
+	focus_check=true is the Refocus dialog's picture, taken with the lenses
+	on autofocus (NEH-339). On the gphoto2 backend the capture then gets one
+	trigger attempt and _FOCUS_CHECK_DEADLINE_S (20 s) from the trigger to
+	the file instead of the normal retry and deadline policy, and a body
+	that does not deliver in that time - a busy trigger included - is a 504.
+	Every other backend accepts the flag and ignores it.
+
+	On success the response carries X-Capture-Seconds, X-Capture-Bytes and,
+	when the JPEG's EXIF has a usable FocalLength, X-Focal-Length in
+	millimetres ("27", "27.5"); it is left out otherwise.
 	"""
 	from capture.camera import IMG_SIZES
 
@@ -810,7 +851,9 @@ def test_capture(
 		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
 
 	try:
-		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
+		image_bytes, elapsed_time = test_capture_bytes(
+			camera_index, resolution, focus_check=focus_check
+		)
 	except RuntimeError as e:
 		if _is_capture_timeout(e):
 			raise HTTPException(status_code=504, detail=str(e))
@@ -821,13 +864,18 @@ def test_capture(
 		logger.exception("Test capture failed")
 		raise HTTPException(status_code=500, detail="Test capture failed")
 
+	headers = {
+		"X-Capture-Seconds": f"{elapsed_time:.3f}",
+		"X-Capture-Bytes": str(len(image_bytes)),
+	}
+	focal_length = _focal_length_header(image_bytes)
+	if focal_length is not None:
+		headers["X-Focal-Length"] = focal_length
+
 	return Response(
 		content=image_bytes,
 		media_type="image/jpeg",
-		headers={
-			"X-Capture-Seconds": f"{elapsed_time:.3f}",
-			"X-Capture-Bytes": str(len(image_bytes)),
-		},
+		headers=headers,
 	)
 
 

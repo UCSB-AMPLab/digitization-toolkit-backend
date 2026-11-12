@@ -397,7 +397,7 @@ def test_the_camera_test_takes_no_volume_and_no_database():
     from app.api.cameras import test_capture
 
     assert set(inspect.signature(test_capture).parameters) == {
-        "camera_index", "resolution", "current_user"}
+        "camera_index", "resolution", "focus_check", "current_user"}
 
 
 @pytest.mark.unit
@@ -407,7 +407,7 @@ def test_the_camera_test_works_while_a_volume_has_no_stem(client, db_session, te
     _volume(db_session, test_project, "V", None)
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "test_capture_bytes",
-                        lambda idx, res: (b"\xff\xd8fake", 0.1))
+                        lambda idx, res, focus_check=False: (b"\xff\xd8fake", 0.1))
 
     resp = api.post("/cameras/test-capture/0")
 
