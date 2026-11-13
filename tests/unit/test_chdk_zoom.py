@@ -53,6 +53,23 @@ def _store(registry, hardware_id, step):
     registry._mutate(change)
 
 
+def _spy_timeouts(monkeypatch, backend):
+    """Record the timeout the backend gives each Lua script it sends.
+
+    The backend sends Lua itself, through _send_lua, so the timeout is the
+    backend's own wait and never reaches the fake device.
+    """
+    sent = {}
+    real = backend._send_lua
+
+    def send(body, code, timeout=cb._LUA_TIMEOUT_S):
+        sent[code] = timeout
+        return real(body, code, timeout)
+
+    monkeypatch.setattr(backend, "_send_lua", send)
+    return sent
+
+
 def _backend(monkeypatch, body, registry=None):
     fake = make_pychdk(body)
     backend = make_backend(monkeypatch, fake, registry=registry)
@@ -120,14 +137,14 @@ def test_a_stored_step_is_applied_on_entering_record_mode(monkeypatch, tmp_path)
     _store(registry, HW_ID, 20)
     body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, zoom=0)
     backend, _ = _backend(monkeypatch, body, registry)
+    timeouts = _spy_timeouts(monkeypatch, backend)
 
     backend.capture_image(tmp_path / "one.jpg", _config())
 
     assert body.zoom == 20
     assert _zoom_calls(body) == ["set_zoom(20)"]
     assert _after(body, "set_zoom(20)")[0] == GET_ZOOM, "the step was not confirmed"
-    timeout = body.lua_timeouts[body.lua_calls.index("set_zoom(20)")]
-    assert timeout == cb._SET_ZOOM_TIMEOUT_S == 15.0
+    assert timeouts["set_zoom(20)"] == cb._SET_ZOOM_TIMEOUT_S == 15.0
     assert backend._body_at(0).zoom_step == 20
     assert len(body.shots) == 1
 
@@ -252,13 +269,14 @@ def test_set_zoom_step_moves_confirms_and_stores(monkeypatch, tmp_path):
     registry = _registry(tmp_path)
     body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, zoom=0)
     backend, _ = _backend(monkeypatch, body, registry)
+    timeouts = _spy_timeouts(monkeypatch, backend)
 
     assert backend.set_zoom_step(0, 30) == 30
 
     assert body.zoom == 30
     assert backend._body_at(0).in_record_mode is True
     assert body.lua_calls[-2:] == ["set_zoom(30)", GET_ZOOM]
-    assert body.lua_timeouts[-2] == cb._SET_ZOOM_TIMEOUT_S
+    assert timeouts["set_zoom(30)"] == cb._SET_ZOOM_TIMEOUT_S
     assert backend._body_at(0).zoom_step == 30
     stored = _registry(tmp_path).get_camera_by_id(HW_ID)
     assert stored is not None, "an unregistered body was not registered"
