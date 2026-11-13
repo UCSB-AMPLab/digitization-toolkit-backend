@@ -315,3 +315,24 @@ def test_reading_role_keys_writes_nothing(tmp_path):
     registry.get_confirmed_pair()
 
     assert path.read_text() == text
+
+
+@pytest.mark.unit
+def test_two_bodies_with_one_identity_report_the_ambiguity_message(client, monkeypatch):
+    devices = _devices()
+    for device in devices:
+        device["hardware_id"] = A
+        device["identity_ambiguous"] = True
+    _install(monkeypatch, _FakeBackend(devices))
+    _write_registry({A: _record("left", CONFIRMED, "1-1.2")})
+    api = _client_as(client, "op", "operator")
+
+    resp = api.get("/cameras/setup")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["needs_setup"] is True
+    assert resp.json()["reasons"] == [{
+        "code": "identity_ambiguous",
+        "message": "Two connected cameras report the same identity, and Captua cannot store a role for either.",
+        "hardware_ids": [A],
+    }]

@@ -478,6 +478,7 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 # One flat sentence per camera_roles reason code, for the operator.
 CAMERA_SETUP_MESSAGES = {
 	"identity_missing": "Captua cannot identify this camera and cannot store a role for it.",
+	"identity_ambiguous": "Two connected cameras report the same identity, and Captua cannot store a role for either.",
 	"role_unconfirmed": "Captua has no confirmed role for this camera.",
 	"role_conflict": "Two cameras have the same confirmed role, and the operator must confirm which page each one photographs.",
 	"pair_changed": "The connected cameras are not the pair the operator last confirmed, and the operator must confirm their roles again.",

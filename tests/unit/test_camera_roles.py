@@ -221,3 +221,58 @@ def test_records_may_be_none():
     result = evaluate_setup([_device(A, 0)], None, None)
 
     assert _codes(result) == ["role_unconfirmed"]
+
+
+@pytest.mark.unit
+def test_two_bodies_sharing_an_identity_are_reported_as_ambiguous():
+    devices = [
+        _device(A, 0, "1-1.2", identity_ambiguous=True),
+        _device(A, 1, "1-1.3", identity_ambiguous=True),
+    ]
+    records = {A: _confirmed("left", "1-1.2")}
+
+    result = evaluate_setup(devices, records, None)
+
+    assert result["needs_setup"] is True
+    assert _codes(result) == ["identity_ambiguous"]
+    assert _reason(result, "identity_ambiguous")["hardware_ids"] == [A]
+
+
+@pytest.mark.unit
+def test_an_ambiguous_body_does_not_hide_a_healthy_confirmed_one():
+    devices = [
+        _device(A, 0, "1-1.2", identity_ambiguous=True),
+        _device(B, 1, "1-1.4", identity_ambiguous=False),
+    ]
+    records = {A: _confirmed("left", "1-1.2"), B: _confirmed("right", "1-1.3")}
+
+    result = evaluate_setup(devices, records, {"left": A, "right": B})
+
+    assert _codes(result) == ["identity_ambiguous", "pair_changed", "port_changed"]
+    assert _reason(result, "identity_ambiguous")["hardware_ids"] == [A]
+    assert _reason(result, "pair_changed")["hardware_ids"] == [A]
+    assert _reason(result, "port_changed")["hardware_ids"] == [B]
+
+
+@pytest.mark.unit
+def test_a_row_without_the_ambiguity_key_is_unaffected():
+    devices = [_device(A, 0, "1-1.2"), _device(B, 1, "1-1.3")]
+    records = {A: _confirmed("left", "1-1.2"), B: _confirmed("right", "1-1.3")}
+
+    result = evaluate_setup(devices, records, {"left": A, "right": B})
+
+    assert result == {"needs_setup": False, "reasons": []}
+
+
+@pytest.mark.unit
+def test_identity_ambiguous_follows_identity_missing_in_the_order():
+    devices = [
+        _device("canoneosrebelt7_idx0", 0),
+        _device(A, 1, identity_ambiguous=True),
+        _device(A, 2, identity_ambiguous=True),
+        _device(B, 3),
+    ]
+
+    result = evaluate_setup(devices, {}, None)
+
+    assert _codes(result) == ["identity_missing", "identity_ambiguous", "role_unconfirmed"]

@@ -25,6 +25,7 @@ ROLES = ("left", "right")
 
 # The reason codes, in the order evaluate_setup reports them.
 IDENTITY_MISSING = "identity_missing"
+IDENTITY_AMBIGUOUS = "identity_ambiguous"
 ROLE_UNCONFIRMED = "role_unconfirmed"
 ROLE_CONFLICT = "role_conflict"
 PAIR_CHANGED = "pair_changed"
@@ -32,6 +33,7 @@ PORT_CHANGED = "port_changed"
 
 REASON_CODES = (
     IDENTITY_MISSING,
+    IDENTITY_AMBIGUOUS,
     ROLE_UNCONFIRMED,
     ROLE_CONFLICT,
     PAIR_CHANGED,
@@ -71,7 +73,7 @@ def evaluate_setup(devices, records, confirmed_pair):
 
     Args:
         devices: The connected bodies, as backend device rows. Each is read
-            for "hardware_id", "provisional" and "usb_port".
+            for "hardware_id", "provisional", "identity_ambiguous" and "usb_port".
         records: Role records keyed by hardware id, in the shape this
             module's docstring gives. A missing id, or None, means no record.
         confirmed_pair: {"left": hw_id, "right": hw_id}, or None.
@@ -82,8 +84,11 @@ def evaluate_setup(devices, records, confirmed_pair):
         hardware ids sorted. needs_setup is True exactly when a reason is
         given.
 
-    A body without an identity is reported as identity_missing and takes no
-    part in the other checks, because no role can be stored against it.
+    A body without an identity is reported as identity_missing, and a body
+    whose row is flagged identity_ambiguous (it shares its identity with
+    another connected body) as identity_ambiguous. Neither takes part in the
+    other checks, because no role can be stored against it independently.
+    A row without the identity_ambiguous key is read as not ambiguous.
     pair_changed is reported only when a pair has been confirmed; its ids are
     the connected bodies outside the pair and the pair's bodies that are not
     connected. port_changed is skipped for a body when either its current
@@ -94,10 +99,12 @@ def evaluate_setup(devices, records, confirmed_pair):
 
     identified = []
     for device in devices:
-        if has_identity(device):
-            identified.append(device)
-        else:
+        if not has_identity(device):
             found[IDENTITY_MISSING].add(device.get("hardware_id"))
+        elif device.get("identity_ambiguous"):
+            found[IDENTITY_AMBIGUOUS].add(device["hardware_id"])
+        else:
+            identified.append(device)
 
     holders = {role: set() for role in ROLES}
     for device in identified:
