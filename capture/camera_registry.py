@@ -503,9 +503,84 @@ class CameraRegistry:
         return {idx: hw_id for idx, (hw_id, _) in detected.items()}
 
     # The role a body has, and the pair last confirmed together, are read
-    # here and evaluated by capture.camera_roles. Nothing in this class writes
-    # them yet, so every key is optional and a missing one reads as None.
+    # here and evaluated by capture.camera_roles. set_roles writes them; a
+    # record written before NEH-342 has none, so every key is optional and a
+    # missing one reads as None.
     ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+    # Every key set_roles writes on a body's record, and clears from a record
+    # that loses its role.
+    ROLE_WRITE_KEYS = ("role", "role_confirmed_at", "role_confirmed_by", "usb_port_at_confirmation")
+
+    def set_roles(
+        self,
+        left_hardware_id: str,
+        right_hardware_id: str,
+        *,
+        ports: Dict[str, Optional[str]],
+        backend: str,
+        confirmed_by: str,
+    ) -> None:
+        """Store the roles the operator confirmed for a pair of bodies (NEH-342).
+
+        One _mutate, so one replace of cameras.json, does all of this: it
+        writes role "left" on the first body's record and "right" on the
+        second's, each with the time of confirmation (UTC, ISO 8601), the
+        username that confirmed it and the body's USB socket at that time;
+        it removes the role keys from every other record that held "left"
+        or "right", so no two records hold the same role; and it stores the
+        pair under the top-level "confirmed_pair" key. An absent body keeps
+        the rest of its record. No other key of any record changes.
+
+        Args:
+            left_hardware_id: The body that photographs the left page.
+            right_hardware_id: The body that photographs the right page.
+            ports: The USB socket of each body, keyed "left" and "right";
+                a missing or None value is stored as None.
+            backend: The name of the active camera backend.
+            confirmed_by: The username of the operator who confirmed.
+
+        Raises:
+            ValueError: an id is empty or not a string, or both are the same.
+            KeyError: an id is not a camera the registry knows about. The
+                caller registers a new body first.
+        """
+        for hw_id in (left_hardware_id, right_hardware_id):
+            if not isinstance(hw_id, str) or not hw_id:
+                raise ValueError(f"a hardware id must be a non-empty string; got {hw_id!r}")
+        if left_hardware_id == right_hardware_id:
+            raise ValueError(f"one body cannot hold both roles: {left_hardware_id}")
+
+        chosen = {"left": left_hardware_id, "right": right_hardware_id}
+        socket = {role: (ports or {}).get(role) for role in chosen}
+
+        def change(cameras: Dict) -> None:
+            records = cameras["cameras"]
+            for hw_id in chosen.values():
+                if hw_id not in records:
+                    raise KeyError(hw_id)
+            now = datetime.now(timezone.utc).isoformat()
+            for hw_id, record in records.items():
+                if hw_id not in chosen.values() and record.get("role") in chosen:
+                    for key in self.ROLE_WRITE_KEYS:
+                        record.pop(key, None)
+            for role, hw_id in chosen.items():
+                records[hw_id].update({
+                    "role": role,
+                    "role_confirmed_at": now,
+                    "role_confirmed_by": confirmed_by,
+                    "usb_port_at_confirmation": socket[role],
+                })
+            cameras["confirmed_pair"] = {
+                "left": left_hardware_id,
+                "right": right_hardware_id,
+                "ports": dict(socket),
+                "backend": backend,
+                "confirmed_at": now,
+                "confirmed_by": confirmed_by,
+            }
+
+        self._mutate(change)
 
     def get_role_record(self, hardware_id: str) -> Dict:
         """The role fields stored for this body, each None when absent.
