@@ -502,6 +502,37 @@ class CameraRegistry:
         detected = self.detect_cameras()
         return {idx: hw_id for idx, (hw_id, _) in detected.items()}
 
+    # The role a body has, and the pair last confirmed together, are read
+    # here and evaluated by capture.camera_roles. Nothing in this class writes
+    # them yet, so every key is optional and a missing one reads as None.
+    ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+    def get_role_record(self, hardware_id: str) -> Dict:
+        """The role fields stored for this body, each None when absent.
+
+        A body the registry does not know has a record of three Nones.
+        """
+        camera = self.cameras.get("cameras", {}).get(hardware_id) or {}
+        return {key: camera.get(key) for key in self.ROLE_RECORD_KEYS}
+
+    def get_role_records(self, hardware_ids) -> Dict[str, Dict]:
+        """get_role_record for each of these hardware ids, keyed by id."""
+        return {hw_id: self.get_role_record(hw_id) for hw_id in hardware_ids}
+
+    def get_confirmed_pair(self) -> Optional[Dict[str, str]]:
+        """The pair last confirmed together, {"left": hw_id, "right": hw_id}.
+
+        None when the file holds no pair, or holds one that is not two
+        non-empty hardware ids under "left" and "right".
+        """
+        pair = self.cameras.get("confirmed_pair")
+        if not isinstance(pair, dict):
+            return None
+        left, right = pair.get("left"), pair.get("right")
+        if not (isinstance(left, str) and left and isinstance(right, str) and right):
+            return None
+        return {"left": left, "right": right}
+
 
 def initialize_camera_system(run_calibration: bool = True) -> Dict:
     """

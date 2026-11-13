@@ -89,6 +89,7 @@ except ImportError:
 from .base import CameraBackend, normalise_camera_model
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
+from . import usb_topology
 
 
 # --- CHDK live view protocol (core/live_view.h) ----------------------------
@@ -158,6 +159,10 @@ SIDE_FILE = "A/OWN.TXT"
 # Page parity to camera index. Fixed, and not a statement about the table:
 # which parity the operator sees on the left is the kiosk's swap toggle.
 _SIDE_INDEX = {"even": 0, "odd": 1}
+
+# The role each parity suggests to the operator in the device list. Nothing
+# places, gates or files a capture by it.
+_ROLE_GUESS_BY_SIDE = {"even": "left", "odd": "right"}
 
 # PTP_RC_GeneralError. A download of a file the card does not have comes back
 # with this, and only this means "no such file"; any other response code is a
@@ -1272,6 +1277,17 @@ class ChdkBackend(CameraBackend):
             # operator repairs it.
             "identity_ambiguous": body.identity_clash is not None,
             "error": self._row_error(body),
+            # The USB socket the body is plugged into, as a topology path
+            # ("1-1.2"), from pyusb's enumeration record. None where pyusb
+            # cannot say.
+            "usb_port": usb_topology.from_pyusb_device(
+                getattr(body.device, "_usb_device", None)
+            ),
+            # The role the card parity suggests: EVEN shoots the left page
+            # and ODD the right. It is shown to the operator as a starting
+            # point and nothing acts on it.
+            "role_guess": _ROLE_GUESS_BY_SIDE.get(body.side),
+            "role_guess_source": "own_txt" if body.side in _ROLE_GUESS_BY_SIDE else None,
         }
 
     def _enumerate(self, reread):

@@ -168,6 +168,7 @@ class Body:
         zoom=0,
         zoom_follows=True,
         zoom_error=None,
+        port_numbers=None,
         capture_script_reads=0,
         script_reads=None,
         script_reads_after_return=None,
@@ -307,6 +308,9 @@ class Body:
         self.max_live = 0
         self._live_lock = threading.Lock()
         self.gates = {}
+        # The hub ports pyusb reports from the root hub to this body's
+        # socket, as usb.core.Device.port_numbers; None where pyusb cannot say.
+        self.port_numbers = port_numbers
 
     def gate(self, name):
         """Pause the next call to `name` on this body until it is released."""
@@ -441,6 +445,14 @@ class _FakeUsbDevice:
         if self._body.product_error is not None:
             raise self._body.product_error
         return self._body.product
+
+    @property
+    def bus(self):
+        return self._body.bus
+
+    @property
+    def port_numbers(self):
+        return self._body.port_numbers
 
 
 class _FakeChdkPTP:

@@ -224,6 +224,20 @@ class DeviceInfo(BaseModel):
 	# Why this body may not capture, in words for the operator: two bodies on
 	# one parity, or a body with no identity. Null when it is ready.
 	error: Optional[str] = None
+	# The USB socket the body is plugged into, as a topology path ("1-1.2"),
+	# and the body's serial. Null where the backend cannot tell.
+	usb_port: Optional[str] = None
+	serial: Optional[str] = None
+	# The page this body photographs, "left" or "right", as stored in the
+	# camera registry, and whether the operator has confirmed it.
+	role: Optional[str] = None
+	role_confirmed: bool = False
+	usb_port_at_confirmation: Optional[str] = None
+	# The role the backend's current placement suggests ("own_txt" for a
+	# CHDK card parity, "gphoto2_pin" for a bindings pin). It is shown to the
+	# operator and nothing acts on it.
+	role_guess: Optional[str] = None
+	role_guess_source: Optional[str] = None
 
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
@@ -364,6 +378,11 @@ def _get_camera_registry():
 		return None
 
 
+# The role fields a registry record may carry; a device row reads them as None
+# when the registry is unavailable.
+_ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+
 def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	"""Enrich raw backend device dicts with registry calibration data.
 
@@ -371,12 +390,19 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	DeviceInfo shape from the same backend dicts. A registry of None (import or
 	init failure) simply means nothing is enriched; enumeration still works.
 	"""
+	# Function-local, as every capture import in this file is: importing the
+	# capture package starts the camera service module.
+	from capture.camera_roles import confirmed_role
+
 	devices = []
 	for dev in raw_devices:
 		hw_id = dev["hardware_id"]
 		idx = dev["index"]
 
 		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		# The same keys CameraRegistry.get_role_record reads, taken from the
+		# record already fetched, each None when absent.
+		role_record = {key: (camera_data or {}).get(key) for key in _ROLE_RECORD_KEYS}
 		calibrated = False
 		machine_id = None
 		label = None
@@ -415,6 +441,13 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			zoom_step=dev.get("zoom_step"),
 			side=dev.get("side"),
 			error=dev.get("error"),
+			usb_port=dev.get("usb_port"),
+			serial=dev.get("serial"),
+			role=role_record["role"],
+			role_confirmed=confirmed_role(role_record) is not None,
+			usb_port_at_confirmation=role_record["usb_port_at_confirmation"],
+			role_guess=dev.get("role_guess"),
+			role_guess_source=dev.get("role_guess_source"),
 		))
 
 	return devices
@@ -440,6 +473,73 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		return []
 
 	return _device_infos(raw_devices, registry)
+
+
+# One flat sentence per camera_roles reason code, for the operator.
+CAMERA_SETUP_MESSAGES = {
+	"identity_missing": "Captua cannot identify this camera and cannot store a role for it.",
+	"identity_ambiguous": "Two connected cameras report the same identity, and Captua cannot store a role for either.",
+	"role_unconfirmed": "Captua has no confirmed role for this camera.",
+	"role_conflict": "Two cameras have the same confirmed role, and the operator must confirm which page each one photographs.",
+	"pair_changed": "The connected cameras are not the pair the operator last confirmed, and the operator must confirm their roles again.",
+	"port_changed": "This camera is in a different USB socket than when the operator confirmed its role, and the operator must confirm it again.",
+}
+
+
+class CameraSetupReason(BaseModel):
+	"""One reason the camera roles need the operator, with the bodies it concerns."""
+	code: str
+	message: str
+	hardware_ids: List[Optional[str]]
+
+
+class CameraSetupResponse(BaseModel):
+	"""Whether the operator must set or confirm the camera roles, and why."""
+	needs_setup: bool
+	reasons: List[CameraSetupReason]
+	confirmed_pair: Optional[dict] = None
+
+
+@router.get("/setup", response_model=CameraSetupResponse)
+def get_camera_setup(current_user: User = Depends(allow_read_only)):
+	"""
+	Report whether the operator must set or confirm the camera roles.
+
+	A camera's role is the page it photographs, "left" or "right", stored in
+	the camera registry per body. This route compares the stored roles and
+	the pair last confirmed together with the bodies the backend lists now,
+	through capture.camera_roles.evaluate_setup. It reports only: nothing
+	here, and nothing in capture, acts on the result.
+
+	A backend that cannot list its devices is a 503, because an empty list
+	would report that no setup is needed.
+	"""
+	try:
+		from capture.service import get_backend
+		from capture.camera_roles import evaluate_setup
+		raw_devices = get_backend().list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the setup check failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	registry = _get_camera_registry()
+	hardware_ids = [dev.get("hardware_id") for dev in raw_devices if dev.get("hardware_id")]
+	records = registry.get_role_records(hardware_ids) if registry else {}
+	confirmed_pair = registry.get_confirmed_pair() if registry else None
+
+	result = evaluate_setup(raw_devices, records, confirmed_pair)
+	return CameraSetupResponse(
+		needs_setup=result["needs_setup"],
+		reasons=[
+			CameraSetupReason(
+				code=reason["code"],
+				message=CAMERA_SETUP_MESSAGES[reason["code"]],
+				hardware_ids=reason["hardware_ids"],
+			)
+			for reason in result["reasons"]
+		],
+		confirmed_pair=confirmed_pair,
+	)
 
 
 @router.post("/rescan", response_model=List[DeviceInfo])
