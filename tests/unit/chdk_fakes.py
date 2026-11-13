@@ -16,6 +16,7 @@ themselves while disagreeing with the library.
 Version: 0.1.0-beta
 """
 
+import datetime
 import re
 import threading
 from collections import namedtuple
@@ -168,6 +169,11 @@ class Body:
         zoom=0,
         zoom_follows=True,
         zoom_error=None,
+        clock_offset_s=0,
+        clock_ignores_set=False,
+        clock_garbage=False,
+        clock_error=None,
+        set_clock_error=None,
         port_numbers=None,
         capture_script_reads=0,
         script_reads=None,
@@ -244,6 +250,21 @@ class Body:
         self.zoom = zoom
         self.zoom_follows = zoom_follows
         self.zoom_error = zoom_error
+        # The camera's wall clock. clock_offset_s is how far it is from the
+        # unit's time, camera minus unit; the unit's time is
+        # pychdk_module.unit_time, which make_backend sets and the backend
+        # reads through its _now. clock_ignores_set is a camera on which
+        # set_clock changes nothing. clock_garbage makes the read answer text
+        # that is no date. clock_error is raised by the read, and
+        # set_clock_error by set_clock. set_clocks records each set_clock
+        # call's arguments.
+        self.clock_offset_s = clock_offset_s
+        self.clock_ignores_set = clock_ignores_set
+        self.clock_garbage = clock_garbage
+        self.clock_error = clock_error
+        self.set_clock_error = set_clock_error
+        self.set_clocks = []
+        self.pychdk_module = None
         # Every switch_mode and lua_execute call, in the order made.
         self.events = []
         # Scripts and their running state. CHDK runs one script at a time, and
@@ -370,6 +391,28 @@ class Body:
             if self.zoom_follows:
                 self.zoom = int(match.group(1))
             return None
+        if "os.date" in lua_code:
+            if self.clock_error is not None:
+                raise self.clock_error
+            if self.clock_garbage:
+                return "not a date"
+            camera = self._unit_now() + datetime.timedelta(
+                seconds=self.clock_offset_s
+            )
+            return camera.strftime("%Y-%m-%d %H:%M:%S")
+        match = re.fullmatch(
+            r"set_clock\((\d+), (\d+), (\d+), (\d+), (\d+), (\d+)\)",
+            lua_code.strip(),
+        )
+        if match:
+            if self.set_clock_error is not None:
+                raise self.set_clock_error
+            fields = tuple(int(g) for g in match.groups())
+            self.set_clocks.append(fields)
+            if not self.clock_ignores_set:
+                target = datetime.datetime(*fields)
+                self.clock_offset_s = (target - self._unit_now()).total_seconds()
+            return None
         if 'click("shoot_half")' in lua_code:
             self.half_presses += 1
             if self.half_press_arrives:
@@ -384,6 +427,10 @@ class Body:
                     self._reads_until_record -= 1
             return self.mode_value
         return None
+
+    def _unit_now(self):
+        """The unit's local time as the test has set it."""
+        return self.pychdk_module.unit_time
 
     def _reads_for(self, lua_code):
         for fragment, reads in self.script_reads.items():
@@ -497,7 +544,7 @@ class _FakeChdkPTP:
         body._next_script_id += 1
         message = (
             ScriptMessage(MSG_RET, 0, script_id, value)
-            if script.lstrip().startswith("return") else None
+            if re.search(r"\breturn\b", script) else None
         )
         after = next(
             (reads for fragment, reads in body.script_reads_after_return.items()
@@ -667,6 +714,7 @@ class FakePychdk:
 
     def ChdkDevice(self, device_info, _usb_device=None):
         body = self.by_key((device_info.bus_num, device_info.device_num))
+        body.pychdk_module = self
         return FakeChdkDevice(device_info, body)
 
 
@@ -793,6 +841,9 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
     # fake.advance moves the clock without a wait.
     fake.sleeps = []
     fake.now = 1000.0
+    # The unit's local time, which the backend reads through its _now. It
+    # stays where it is until a test changes it.
+    fake.unit_time = datetime.datetime(2026, 11, 12, 15, 30, 0)
 
     def sleep(seconds):
         fake.sleeps.append(seconds)
@@ -804,6 +855,7 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
     fake.advance = advance
     monkeypatch.setattr(cb, "_sleep", sleep)
     monkeypatch.setattr(cb, "_monotonic", lambda: fake.now)
+    monkeypatch.setattr(cb, "_now", lambda: fake.unit_time)
     backend = cb.ChdkBackend(logging.getLogger(logger_name))
     backend._registry_factory = lambda: registry
     return backend

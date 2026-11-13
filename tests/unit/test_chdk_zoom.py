@@ -667,6 +667,47 @@ def test_the_device_list_carries_the_zoom_fields(client, monkeypatch, tmp_path):
 
 
 @pytest.mark.unit
+def test_the_device_list_carries_the_clock_offset(client, monkeypatch, tmp_path):
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    backend.list_devices()
+    backend._body_at(0).clock_offset_s = -0.5
+    _install(monkeypatch, backend)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.get("/cameras/devices")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.json()[0]["clock_offset_s"] == -0.5
+
+
+@pytest.mark.unit
+def test_the_device_list_answers_null_for_a_row_without_a_clock_offset(
+    client, monkeypatch, tmp_path
+):
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    listing = backend.list_devices
+
+    def without_offset():
+        rows = listing()
+        for row in rows:
+            row.pop("clock_offset_s", None)
+        return rows
+
+    monkeypatch.setattr(backend, "list_devices", without_offset)
+    _install(monkeypatch, backend)
+    api = _client_as(client, "op", "operator")
+
+    resp = api.get("/cameras/devices")
+
+    assert resp.status_code == 200, resp.text
+    row = resp.json()[0]
+    assert "clock_offset_s" in row
+    assert row["clock_offset_s"] is None
+
+
+@pytest.mark.unit
 def test_the_capabilities_route_reports_stepped_zoom(client, monkeypatch):
     backend, _ = _backend(monkeypatch, Body(serial="AAA111", card=EVEN_CARD))
     _install(monkeypatch, backend)
