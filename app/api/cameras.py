@@ -242,6 +242,16 @@ class DeviceInfo(BaseModel):
 	# operator and nothing acts on it.
 	role_guess: Optional[str] = None
 	role_guess_source: Optional[str] = None
+	# Focus lock (CHDK backend only). focus_locked is null until the body is
+	# in shooting mode, then true while the camera holds a lock it confirmed.
+	# focus_distance is the distance in mm the camera reported for that lock.
+	# focus_stale is true when the zoom moved after the last lock, and
+	# focus_restore_failed when a stored distance was sent on entering
+	# shooting mode and the camera did not report it back.
+	focus_locked: Optional[bool] = None
+	focus_distance: Optional[int] = None
+	focus_stale: bool = False
+	focus_restore_failed: bool = False
 
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
@@ -453,6 +463,10 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			usb_port_at_confirmation=role_record["usb_port_at_confirmation"],
 			role_guess=dev.get("role_guess"),
 			role_guess_source=dev.get("role_guess_source"),
+			focus_locked=dev.get("focus_locked"),
+			focus_distance=dev.get("focus_distance"),
+			focus_stale=dev.get("focus_stale", False),
+			focus_restore_failed=dev.get("focus_restore_failed", False),
 		))
 
 	return devices
@@ -791,6 +805,7 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	        "live_controls": false,
 	        "zoom": false,
 	        "zoom_steps": false,
+	        "focus_lock": false,
 	        "autofocus_calibration": false,
 	        "dslr_settings": true
 	    }
@@ -921,6 +936,79 @@ def set_focus(
 	except Exception as e:
 		logger.exception(f"set_focus failed for camera {camera_index}: {e}")
 		raise HTTPException(status_code=500, detail="Failed to set focus")
+
+
+@router.post("/focus-lock/{camera_index}")
+def lock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Autofocus a CHDK camera once and lock the focus there.
+
+	The camera focuses with a half-press of the shutter and locks, and the
+	backend reads back the distance it reports and stores it for the body,
+	which has it restored each time it enters shooting mode. A zoom move
+	afterwards releases the lock and clears the stored distance. Answers
+	{"detail": "Focus locked", "focus_distance": <mm>}. A backend without
+	focus lock answers 501, a camera that is not connected 404, and a camera
+	that did not confirm the lock 502 (a timeout, a wire failure, or no
+	distance reported).
+	"""
+	distance = _run_focus_lock(camera_index, lock=True)
+	return {"detail": "Focus locked", "focus_distance": distance}
+
+
+@router.delete("/focus-lock/{camera_index}")
+def unlock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Release a CHDK camera's focus lock and clear its stored distance.
+
+	The camera then autofocuses on every picture. Answers as the lock route
+	does, with {"detail": "Focus unlocked"} on success.
+	"""
+	_run_focus_lock(camera_index, lock=False)
+	return {"detail": "Focus unlocked"}
+
+
+def _run_focus_lock(camera_index: int, lock: bool) -> Optional[int]:
+	"""Lock or unlock a CHDK camera's focus, mapping failures to statuses."""
+	from app.core.storage_override import StorageUnavailableError
+
+	action = "lock_focus" if lock else "unlock_focus"
+	try:
+		from capture.service import get_backend, lock_focus, unlock_focus
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("focus_lock", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no focus lock; "
+				"focus lock applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import FocusFailedError
+
+	try:
+		if lock:
+			return lock_focus(camera_index)
+		unlock_focus(camera_index)
+		return None
+	except StorageUnavailableError:
+		raise
+	except FocusFailedError as e:
+		logger.error(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail=f"Failed to {action.replace('_', ' ')}")
 
 
 # ---------------------------------------------------------------------------

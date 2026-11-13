@@ -275,7 +275,8 @@ def test_set_zoom_step_moves_confirms_and_stores(monkeypatch, tmp_path):
 
     assert body.zoom == 30
     assert backend._body_at(0).in_record_mode is True
-    assert body.lua_calls[-2:] == ["set_zoom(30)", GET_ZOOM]
+    # The lens moved, so any focus lock is released.
+    assert body.lua_calls[-3:] == ["set_zoom(30)", GET_ZOOM, "set_aflock(0)"]
     assert timeouts["set_zoom(30)"] == cb._SET_ZOOM_TIMEOUT_S
     assert backend._body_at(0).zoom_step == 30
     stored = _registry(tmp_path).get_camera_by_id(HW_ID)

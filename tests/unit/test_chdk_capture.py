@@ -317,9 +317,11 @@ def test_the_backend_reports_what_it_can_do(monkeypatch):
     assert capabilities["live_preview"] is True
     # Stepped optical zoom (NEH-231); digital "zoom" stays False.
     assert capabilities["zoom_steps"] is True
+    # Focus lock (NEH-231); "focus_control" stays False.
+    assert capabilities["focus_lock"] is True
     assert not any(
         value for key, value in capabilities.items()
-        if key not in ("live_preview", "zoom_steps")
+        if key not in ("live_preview", "zoom_steps", "focus_lock")
     )
 
 

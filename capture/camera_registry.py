@@ -488,6 +488,77 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_focus(value) -> bool:
+        """True for a value that can be a stored focus.
+
+        A stored focus is a dict holding exactly "distance", a positive int in
+        mm as CHDK's get_focus() answers it, and "zoom_step", a valid zoom
+        step: the step the camera reported when the focus was locked. Bools
+        are refused for both.
+        """
+        return (
+            type(value) is dict
+            and set(value) == {"distance", "zoom_step"}
+            and type(value["distance"]) is int
+            and value["distance"] > 0
+            and CameraRegistry.is_valid_zoom_step(value["zoom_step"])
+        )
+
+    def update_focus(self, hardware_id: str, distance: int, zoom_step: int) -> None:
+        """Persist the locked focus for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as the zoom step. The
+        distance and the zoom step it was taken at are written together, as
+        one value under "focus", so neither is ever stored without the
+        other. The backend restores the distance only when the camera
+        reports that zoom step.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            distance: The focus distance in mm.
+            zoom_step: The zoom step the camera reported for the lock.
+
+        Raises:
+            ValueError: distance is not a positive int, or zoom_step is not
+                a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        focus = {"distance": distance, "zoom_step": zoom_step}
+        if not self.is_valid_focus(focus):
+            raise ValueError(
+                "focus must be a positive integer distance and a non-negative "
+                f"integer zoom step; got {distance!r} at step {zoom_step!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry["focus"] = focus
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    def clear_focus(self, hardware_id: str) -> None:
+        """Remove the stored focus for this camera body (CHDK only).
+
+        The camera then autofocuses on every picture. The time of the change
+        is recorded.
+
+        Raises:
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry.pop("focus", None)
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())
