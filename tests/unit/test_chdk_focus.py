@@ -221,9 +221,10 @@ def test_a_script_that_never_ends_before_the_lock_sends_no_lock(
 
 @pytest.mark.unit
 @pytest.mark.parametrize("answer", [None, 0, -5, True, 1489.0, "1489"])
-def test_a_lock_with_no_positive_distance_fails_and_sends_nothing_further(
+def test_a_lock_with_no_positive_distance_fails_and_releases_the_lock(
     monkeypatch, tmp_path, answer
 ):
+    """The camera answered, so it is sent set_aflock(0) and holds no lock."""
     body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, focus_answer=answer)
     backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
 
@@ -231,9 +232,13 @@ def test_a_lock_with_no_positive_distance_fails_and_sends_nothing_further(
         backend.lock_focus(0)
 
     assert "usb:001,004" in str(exc.value)
-    assert body.lua_calls[-1] == GET_FOCUS, "something was sent after get_focus"
+    assert "released" in str(exc.value)
+    assert "DELETE" not in str(exc.value)
+    assert body.lua_calls[-2:] == [GET_FOCUS, UNLOCK]
+    assert body.aflock is False
+    assert body.closes == 0, "the body was dropped"
     held = backend._body_at(0)
-    assert held.focus_locked is not True
+    assert held.focus_locked is False
     assert held.focus_distance is None
     assert _stored(tmp_path) is None
 
@@ -408,7 +413,8 @@ def test_a_failed_readback_after_a_lock_clears_the_confirmed_lock(
     with pytest.raises(cb.FocusFailedError):
         backend.lock_focus(0)
 
-    assert body.lua_calls[-1] == GET_FOCUS, "something was sent after get_focus"
+    assert body.lua_calls[-2:] == [GET_FOCUS, UNLOCK]
+    assert body.aflock is False
     held = backend._body_at(0)
     assert held.focus_locked is False
     assert held.focus_distance is None
@@ -417,6 +423,24 @@ def test_a_failed_readback_after_a_lock_clears_the_confirmed_lock(
     assert row["focus_locked"] is False
     assert row["focus_distance"] is None
     assert _stored(tmp_path)["focus_distance"] == 1489
+
+
+@pytest.mark.unit
+def test_a_release_after_a_failed_readback_that_fails_drops_the_body(
+    monkeypatch, tmp_path
+):
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, focus_answer=None,
+                aflock_error=TimeoutError("Script did not complete within 10.0s"),
+                aflock_error_after=1)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+
+    with pytest.raises(cb.FocusFailedError):
+        backend.lock_focus(0)
+
+    assert body.lua_calls[-3:] == [LOCK, GET_FOCUS, UNLOCK]
+    assert body.closes == 1, "the body was not dropped"
+    assert backend._body_at(0) is None
+    assert _stored(tmp_path) is None
 
 
 # --- unlocking ---------------------------------------------------------------
@@ -515,14 +539,68 @@ def test_a_zoom_request_to_the_current_step_leaves_the_lock_alone(
 
 
 @pytest.mark.unit
-def test_a_zoom_move_with_no_lock_sends_no_unlock(monkeypatch, tmp_path):
+def test_a_zoom_move_on_a_body_with_no_lock_still_releases_the_lock(
+    monkeypatch, tmp_path
+):
+    """The camera may hold a lock the backend did not take; a body that never
+    had a focus is not reported stale."""
     body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, zoom=0)
     backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    body.aflock = True
 
     backend.set_zoom_step(0, 30)
 
-    assert _focus_calls(body) == []
-    assert backend._body_at(0).focus_stale is False
+    assert _after(body, "set_zoom(30)") == [GET_ZOOM, UNLOCK]
+    assert body.aflock is False
+    held = backend._body_at(0)
+    assert held.focus_locked is False
+    assert held.focus_stale is False
+    assert "focus_distance" not in _stored(tmp_path)
+
+
+@pytest.mark.unit
+def test_a_zoom_move_after_an_unconfirmed_lock_releases_and_clears(
+    monkeypatch, tmp_path
+):
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, zoom=0)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    backend.lock_focus(0)
+    body.focus_answer = None
+    with pytest.raises(cb.FocusFailedError):
+        backend.lock_focus(0)
+    assert backend._body_at(0).focus_locked is False
+
+    backend.set_zoom_step(0, 30)
+
+    assert _after(body, "set_zoom(30)") == [GET_ZOOM, UNLOCK]
+    held = backend._body_at(0)
+    assert held.focus_stale is True
+    stored = _stored(tmp_path)
+    assert stored["zoom_step"] == 30
+    assert "focus_distance" not in stored
+
+
+@pytest.mark.unit
+def test_a_zoom_move_whose_distance_clear_fails_stores_no_step(
+    monkeypatch, tmp_path
+):
+    """The stored distance is cleared before the new step is stored, so a
+    failed clear never leaves a distance paired with another step."""
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, zoom=0)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    backend.lock_focus(0)
+
+    def refuse(self, hardware_id, distance):
+        raise OSError("disk full")
+
+    monkeypatch.setattr(CameraRegistry, "update_focus_distance", refuse)
+
+    with pytest.raises(OSError):
+        backend.set_zoom_step(0, 30)
+
+    stored = _stored(tmp_path)
+    assert "zoom_step" not in stored
+    assert stored["focus_distance"] == 1489
 
 
 @pytest.mark.unit
@@ -801,10 +879,124 @@ def test_a_zoom_move_after_a_failed_restore_clears_the_stored_distance(
 
     backend.set_zoom_step(0, 30)
 
-    assert body.lua_calls.count(UNLOCK) == unlocks, "the lock was dropped twice"
+    # A zoom move always sends set_aflock(0), whatever the flags say.
+    assert body.lua_calls.count(UNLOCK) == unlocks + 1
     held = backend._body_at(0)
     assert held.focus_stale is True
     assert "focus_distance" not in _stored(tmp_path)
+
+
+@pytest.mark.unit
+def test_a_stored_distance_is_restored_once_the_lens_reaches_the_stored_step(
+    monkeypatch, tmp_path
+):
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, zoom_step=20, focus_distance=1500)
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, zoom=0,
+                af_distance=900)
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    assert _after(body, "set_zoom(20)")[:5] == [
+        GET_ZOOM, UNLOCK, RESTORE, "set_focus(1500)", GET_FOCUS,
+    ]
+    held = backend._body_at(0)
+    assert held.focus_locked is True
+    assert held.focus_distance == 1500
+    assert held.focus_stale is False
+    assert _stored(tmp_path)["focus_distance"] == 1500
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "knobs, after_zoom",
+    [({"zoom_follows": False}, [GET_ZOOM]),
+     ({"zoom_lands": 25}, [GET_ZOOM, UNLOCK])],
+    ids=["stays", "lands-elsewhere"],
+)
+def test_a_stored_distance_is_not_restored_when_the_lens_misses_the_stored_step(
+    monkeypatch, tmp_path, knobs, after_zoom
+):
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, zoom_step=20, focus_distance=1500)
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, zoom=3,
+                **knobs)
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    assert RESTORE not in body.lua_calls
+    assert [c for c in _after(body, "set_zoom(20)") if c != "<capture>"][
+        :len(after_zoom)
+    ] == after_zoom
+    assert _focus_calls(body) == after_zoom[1:]
+    assert len(body.shots) == 1
+    held = backend._body_at(0)
+    assert held.focus_locked is False
+    assert held.focus_distance is None
+    assert held.focus_stale is True
+    assert held.focus_restore_failed is False
+    stored = _stored(tmp_path)
+    assert stored["focus_distance"] == 1500
+    assert stored["zoom_step"] == 20
+
+
+@pytest.mark.unit
+def test_a_stored_distance_is_not_restored_on_a_body_that_reports_no_steps(
+    monkeypatch, tmp_path
+):
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, zoom_step=20, focus_distance=1500)
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=None)
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    assert _focus_calls(body) == []
+    held = backend._body_at(0)
+    assert held.focus_locked is False
+    assert held.focus_stale is True
+    assert _stored(tmp_path)["focus_distance"] == 1500
+
+
+@pytest.mark.unit
+def test_a_lock_at_a_step_other_than_the_stored_one_is_not_stored(
+    monkeypatch, tmp_path
+):
+    """The stored distance belongs to the stored step; a lock taken while the
+    lens is elsewhere holds on the camera and is reported, and not stored."""
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, zoom_step=20, focus_distance=1500)
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, zoom=3,
+                zoom_follows=False, af_distance=900)
+    backend, _ = _backend(monkeypatch, body, registry)
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    assert backend.lock_focus(0) == 900
+
+    held = backend._body_at(0)
+    assert held.focus_locked is True
+    assert held.focus_distance == 900
+    assert held.focus_stale is False
+    assert _stored(tmp_path)["focus_distance"] == 1500
+
+
+@pytest.mark.unit
+def test_a_lock_after_an_unconfirmed_zoom_is_not_stored(monkeypatch, tmp_path):
+    body = Body(serial="AAA111", card=EVEN_CARD, zoom_steps=64, zoom=0)
+    backend, _ = _backend(monkeypatch, body, _registry(tmp_path))
+    backend.set_zoom_step(0, 10)
+    body.zoom_lands = 25
+    with pytest.raises(cb.ZoomFailedError):
+        backend.set_zoom_step(0, 30)
+
+    backend.lock_focus(0)
+
+    assert backend._body_at(0).focus_locked is True
+    stored = _stored(tmp_path)
+    assert stored["zoom_step"] == 10
+    assert "focus_distance" not in stored
 
 
 # --- what the backend reports ---------------------------------------------

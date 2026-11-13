@@ -828,6 +828,26 @@ class _ChdkBody:
         # when the zoom moved after the last lock. focus_restore_failed is
         # set when a stored distance was sent on entering record mode and
         # the camera did not report it back.
+        #
+        # The rule these fields keep: the camera holds no focus lock that
+        # focus_locked does not report, and a stored distance is restored
+        # only at the zoom step it was taken at. Every write:
+        #   zoom_step: _read_zoom only, from get_zoom(), called by
+        #     _settle_zoom and _move_zoom.
+        #   focus_locked / focus_distance / focus_restore_failed:
+        #     _settle_focus (record mode), _drop_focus_after_zoom,
+        #     _lock_focus_once (confirmed, or released after an
+        #     unconfirmed readback), _unlock_focus_once.
+        #   focus_stale: _settle_focus (stored step not confirmed),
+        #     _drop_focus_after_zoom, _lock_focus_once and
+        #     _unlock_focus_once (cleared).
+        #   stored distance: _lock_focus_once (only at the stored step, or
+        #     with no stored step), _set_zoom_step_once (cleared on any step
+        #     change, before the step is stored), _unlock_focus_once.
+        # Every set_aflock(1) - the lock and the restore script - is
+        # followed in the same operation by a confirmed get_focus(), by
+        # set_aflock(0), or by eviction; every step change reported by
+        # get_zoom() is followed by set_aflock(0) or eviction.
         self.focus_locked = None
         self.focus_distance = None
         self.focus_stale = False
@@ -2295,7 +2315,8 @@ class ChdkBackend(CameraBackend):
         Once record mode is confirmed, _settle_zoom reads the body's zoom
         steps and current step and moves the lens to its stored step, and
         then _settle_focus restores the body's stored focus distance, if it
-        has one. A failure there is a failure of this method like any other.
+        has one and the camera confirmed the stored step. A failure there is
+        a failure of this method like any other.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -2324,8 +2345,7 @@ class ChdkBackend(CameraBackend):
             if self._send_lua(body, "return get_mode()"):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
-                self._settle_zoom(body)
-                self._settle_focus(body)
+                self._settle_focus(body, self._settle_zoom(body))
                 return True
 
         self._send_lua(body, _HALF_PRESS_LUA)
@@ -2339,8 +2359,7 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] {body.port}: switched to record mode after a "
                     f"half-press of the shutter ({waited:.1f}s after it)"
                 )
-                self._settle_zoom(body)
-                self._settle_focus(body)
+                self._settle_focus(body, self._settle_zoom(body))
                 return True
 
         raise RuntimeError(
@@ -2417,11 +2436,21 @@ class ChdkBackend(CameraBackend):
         that reports another step is logged with a warning and the
         operation carries on. A timeout or a wire failure propagates.
 
-        When the lens moved to the stored step, _drop_focus_after_zoom
-        releases any focus lock the body held. On a body just opened there
-        is none, so nothing is sent; the stored focus distance belongs to
-        the stored step and is restored afterwards by _settle_focus.
+        Whenever the camera reports a step other than the one it reported
+        before the move, set_aflock(0) is sent, so a lock the camera kept
+        across the close does not hold at another step. The body's flags
+        are not touched: the body has just been opened, and _settle_focus
+        sets them. The stored focus distance is not cleared here: it
+        belongs to the stored step, which this move does not change.
+
+        Returns:
+            True when the camera has confirmed the stored step, False when
+            a step is stored and the camera has not confirmed it (no steps,
+            a stored step out of range, or a lens that did not reach it),
+            and None when no step is stored or the registry could not be
+            read.
         """
+        stored = self._stored_zoom_step(body)
         if body.zoom_steps is None:
             answer = self._send_lua(body, _GET_ZOOM_STEPS_LUA)
             if type(answer) is not int or answer <= 0:
@@ -2430,22 +2459,21 @@ class ChdkBackend(CameraBackend):
                     f"{answer!r}, not a positive integer; the zoom is not "
                     "read or set on this body"
                 )
-                return
+                return None if stored is None else False
             body.zoom_steps = answer
             self.logger.info(f"[chdk] {body.port}: {answer} zoom steps")
         current = self._read_zoom(body)
-        stored = self._stored_zoom_step(body)
         if stored is None:
-            return
+            return None
         if type(stored) is not int or not 0 <= stored < body.zoom_steps:
             self.logger.warning(
                 f"[chdk] {body.port}: the stored zoom step {stored!r} is not "
                 f"between 0 and {body.zoom_steps - 1}; it is ignored and the "
                 "lens is left where it is"
             )
-            return
+            return False
         if stored == current:
-            return
+            return True
         try:
             self._move_zoom(body, stored)
         except _ZoomNotConfirmedError:
@@ -2457,11 +2485,11 @@ class ChdkBackend(CameraBackend):
                 f"the camera reports step {body.zoom_step} after set_zoom; "
                 "carrying on at the reported step"
             )
-            return
-        # The lens moved. A focus lock taken at another step no longer
-        # holds; on a body just opened there is none, and nothing is sent.
-        if self._drop_focus_after_zoom(body):
-            self._store_focus_distance(body, None)
+            if body.zoom_step != current:
+                self._send_lua(body, _FOCUS_UNLOCK_LUA)
+            return False
+        self._send_lua(body, _FOCUS_UNLOCK_LUA)
+        return True
 
     def set_zoom_step(self, camera_index: int, step: int) -> int:
         """Move the lens of the body at this index to a zoom step; see
@@ -2498,11 +2526,12 @@ class ChdkBackend(CameraBackend):
 
         When the step the camera reports differs from the step the body had
         before, confirmed or not, _drop_focus_after_zoom sends set_aflock(0)
-        to a locked body and marks its focus stale, and the stored focus
-        distance is cleared. An unconfirmed step is then raised and not
-        stored. A failure of set_aflock(0) is a failure of this method: the
-        body is dropped and neither the step nor the cleared distance is
-        stored.
+        whatever the body's flags say, and the stored focus distance is
+        cleared before the step is stored, so a failed clear never leaves a
+        distance paired with another step. An unconfirmed step is then
+        raised and not stored. A failure of set_aflock(0) is a failure of
+        this method: the body is dropped and neither the step nor the
+        cleared distance is stored.
 
         Args:
             camera_index: Which body, as the device list numbers them.
@@ -2551,19 +2580,17 @@ class ChdkBackend(CameraBackend):
             # whenever the camera reports a step other than the one before,
             # whether or not it is the step asked for. A lens that stayed
             # where it was leaves the lock alone.
-            dropped = False
             if body.zoom_step != previous:
                 try:
-                    dropped = self._drop_focus_after_zoom(body)
+                    self._drop_focus_after_zoom(body)
                 except Exception as exc:
                     self._zoom_failed(
                         body, camera_index, "unlocking the focus after the zoom",
                         exc,
                     )
+                self._store_focus_distance(body, None)
             if not_confirmed is None:
                 self._store_zoom_step(body, camera_index, step)
-            if dropped:
-                self._store_focus_distance(body, None)
             if not_confirmed is not None:
                 raise not_confirmed
             return step
@@ -2658,13 +2685,23 @@ class ChdkBackend(CameraBackend):
             return None
         return entry.get("focus_distance") if entry else None
 
-    def _settle_focus(self, body):
+    def _settle_focus(self, body, zoom_confirmed):
         """Restore the body's stored focus distance, if it has one.
 
         Called by _ensure_record_mode once record mode is confirmed and the
-        zoom settled. With nothing stored no script is sent, and the camera
-        autofocuses on every picture. A stored distance that is not a
-        positive integer is ignored with a warning.
+        zoom settled, with what _settle_zoom returned. With nothing stored no
+        script is sent, and the camera autofocuses on every picture. A
+        stored distance that is not a positive integer is ignored with a
+        warning.
+
+        A stored distance belongs to the stored zoom step. When a step is
+        stored and the camera has not confirmed it (zoom_confirmed False),
+        nothing is sent, the focus is marked stale, and the stored distance
+        is kept for the next opening that reaches the stored step. A freshly
+        opened body is taken to hold no lock, as when nothing is stored; a
+        lock it kept across the close was released by _settle_zoom if the
+        lens moved. With no stored step (zoom_confirmed None) the distance
+        is restored at whatever step the lens is at.
 
         Otherwise the restore script is sent, then set_focus(distance) once
         it has returned, then get_focus(). When the camera reports a distance
@@ -2684,6 +2721,15 @@ class ChdkBackend(CameraBackend):
                 f"[chdk] {body.port}: the stored focus distance {stored!r} is "
                 "not a positive integer; it is ignored and the camera "
                 "autofocuses on every picture"
+            )
+            return
+        if zoom_confirmed is False:
+            body.focus_stale = True
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored focus distance {stored} mm "
+                "was taken at the stored zoom step, which the camera has not "
+                "confirmed; it is not restored and the camera autofocuses on "
+                "every picture"
             )
             return
         self._send_lua(body, _FOCUS_RESTORE_LUA, timeout=_FOCUS_SCRIPT_TIMEOUT_S)
@@ -2714,29 +2760,32 @@ class ChdkBackend(CameraBackend):
         body.focus_restore_failed = True
 
     def _drop_focus_after_zoom(self, body):
-        """Release a focus lock that a zoom move has made wrong.
+        """Release the focus lock after the camera reported a new zoom step.
 
-        Called once the camera has reported a new zoom step. A locked body
-        is sent set_aflock(0), so it does not go on shooting at a focus
-        taken at another step. A body whose restore failed holds no lock,
-        and is sent nothing. On either, the focus is marked stale and True
-        is returned, and the caller clears the stored distance. On any other
-        body nothing happens and False is returned. A failure of
-        set_aflock(0) propagates and changes nothing on the body.
+        Called by _set_zoom_step_once once the camera has reported a step
+        other than the one before. set_aflock(0) is sent whatever the
+        body's flags say, since the camera may hold a lock the backend did
+        not take. The focus is marked stale when the body had a focus to
+        lose: a confirmed lock, a failed restore, a focus already stale, or
+        a stored distance. A body that never had one is not marked stale.
+        The caller clears the stored distance. A failure of set_aflock(0)
+        propagates and changes nothing on the body.
         """
-        if body.focus_locked:
-            self._send_lua(body, _FOCUS_UNLOCK_LUA)
-        elif not body.focus_restore_failed:
-            return False
+        had_focus = (
+            body.focus_locked is True
+            or body.focus_restore_failed
+            or body.focus_stale
+            or self._stored_focus_distance(body) is not None
+        )
+        self._send_lua(body, _FOCUS_UNLOCK_LUA)
         body.focus_locked = False
         body.focus_distance = None
-        body.focus_stale = True
+        body.focus_stale = bool(had_focus)
         body.focus_restore_failed = False
         self.logger.info(
             f"[chdk] {body.port}: the zoom moved, so the focus lock is "
             "released and the stored distance cleared"
         )
-        return True
 
     def lock_focus(self, camera_index: int) -> int:
         """Autofocus the body at this index once and lock it; see
@@ -2767,12 +2816,17 @@ class ChdkBackend(CameraBackend):
         with no identity, or an ambiguous one, is locked and nothing is
         stored.
 
+        The distance is stored only when no zoom step is stored or the
+        stored step is the one the camera last reported: a stored distance
+        belongs to the stored step. Otherwise the lock holds on the camera
+        and is reported, and the stored distance is left as it was.
+
         A timeout or a wire failure drops the body, and nothing more is sent
-        to it. A camera that answers get_focus() with no positive integer is
-        not dropped and is sent nothing more: it ran set_aflock(1), so it may
-        hold a lock at a distance nobody confirmed, and the message says how
-        to release it. The body then reports no lock and no distance, and
-        the stored distance is kept.
+        to it. A camera that answers get_focus() with no positive integer
+        ran set_aflock(1) and answered, so it is sent set_aflock(0) at once
+        and holds no lock; a failure of that release drops the body. The
+        body then reports no lock and no distance, and the stored distance
+        is kept.
 
         Args:
             camera_index: Which body, as the device list numbers them.
@@ -2813,21 +2867,29 @@ class ChdkBackend(CameraBackend):
             except Exception as exc:
                 self._focus_failed(body, camera_index, stage, exc)
             if not _is_focus_distance(reported):
-                # The earlier lock was released above, so it is no longer
-                # confirmed. The stored distance is kept, as when an unlock or
-                # a restore fails, and focus_stale is left as it was.
-                body.focus_locked = False
-                body.focus_distance = None
+                # The lock script ran and the camera answered, so the lock
+                # nobody confirmed is released now. The stored distance is
+                # kept, as when a restore fails, and focus_stale is left as
+                # it was.
                 self.logger.error(
                     f"[chdk] body {camera_index} ({body.port}): get_focus() "
-                    f"answered {reported!r} after the lock script"
+                    f"answered {reported!r} after the lock script; the lock "
+                    "is released"
                 )
+                try:
+                    self._send_lua(body, _FOCUS_UNLOCK_LUA)
+                except Exception as exc:
+                    self._focus_failed(
+                        body, camera_index,
+                        "releasing the unconfirmed focus lock", exc,
+                    )
+                body.focus_locked = False
+                body.focus_distance = None
                 raise FocusFailedError(
                     f"{body.port}: the camera ran the focus lock script and "
                     f"answered get_focus() with {reported!r}, not a distance, "
-                    "so the lock is not confirmed. The camera may hold a lock "
-                    "at an unknown distance; DELETE "
-                    f"/cameras/focus-lock/{camera_index} releases it."
+                    "so the lock was not confirmed and has been released. "
+                    "The camera autofocuses on every picture."
                 )
             body.focus_locked = True
             body.focus_distance = reported
@@ -2836,7 +2898,15 @@ class ChdkBackend(CameraBackend):
             self.logger.info(
                 f"[chdk] {body.port}: focus locked at {reported} mm"
             )
-            self._store_focus_distance(body, reported, camera_index)
+            stored_step = self._stored_zoom_step(body)
+            if stored_step is None or stored_step == body.zoom_step:
+                self._store_focus_distance(body, reported, camera_index)
+            else:
+                self.logger.info(
+                    f"[chdk] {body.port}: focus distance {reported} not "
+                    f"stored; the camera reports zoom step {body.zoom_step} "
+                    f"and the stored step is {stored_step!r}"
+                )
             return reported
 
     def unlock_focus(self, camera_index: int) -> None:

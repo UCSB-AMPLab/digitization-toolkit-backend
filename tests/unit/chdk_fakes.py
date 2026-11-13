@@ -187,6 +187,7 @@ class Body:
         focus_error=None,
         set_focus_error=None,
         aflock_error=None,
+        aflock_error_after=0,
     ):
         self.bus = bus
         self.address = address
@@ -269,7 +270,8 @@ class Body:
         # distance). With focus_follows, set_focus(d) moves the focus to d;
         # without it the focus stays where it is, which is a camera that does
         # not confirm the distance. focus_error is raised by the half-press
-        # scripts, set_focus_error by set_focus, aflock_error by set_aflock.
+        # scripts, set_focus_error by set_focus, aflock_error by set_aflock
+        # once aflock_error_after calls of set_aflock have succeeded.
         # aflock is the lock as the camera holds it. A half-press while the
         # lock is held does not focus again: the focus stays where it is.
         self.af_distance = af_distance
@@ -279,6 +281,8 @@ class Body:
         self.focus_error = focus_error
         self.set_focus_error = set_focus_error
         self.aflock_error = aflock_error
+        self.aflock_error_after = aflock_error_after
+        self.aflock_calls = 0
         self.aflock = False
         # Every switch_mode and lua_execute call, in the order made.
         self.events = []
@@ -405,7 +409,11 @@ class Body:
             return None
         match = re.fullmatch(r"set_aflock\(([01])\)", code)
         if match:
-            if self.aflock_error is not None:
+            self.aflock_calls += 1
+            if (
+                self.aflock_error is not None
+                and self.aflock_calls > self.aflock_error_after
+            ):
                 raise self.aflock_error
             self.aflock = match.group(1) == "1"
             return None
