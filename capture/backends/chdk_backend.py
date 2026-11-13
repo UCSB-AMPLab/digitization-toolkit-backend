@@ -2496,11 +2496,13 @@ class ChdkBackend(CameraBackend):
         it. A camera that answers with another step is not dropped; the step
         it reports is recorded on the body.
 
-        When the confirmed step differs from the step the body had before,
-        _drop_focus_after_zoom sends set_aflock(0) to a locked body and marks
-        its focus stale, and the stored focus distance is cleared. A failure
-        of set_aflock(0) is a failure of this method: the body is dropped and
-        neither the step nor the cleared distance is stored.
+        When the step the camera reports differs from the step the body had
+        before, confirmed or not, _drop_focus_after_zoom sends set_aflock(0)
+        to a locked body and marks its focus stale, and the stored focus
+        distance is cleared. An unconfirmed step is then raised and not
+        stored. A failure of set_aflock(0) is a failure of this method: the
+        body is dropped and neither the step nor the cleared distance is
+        stored.
 
         Args:
             camera_index: Which body, as the device list numbers them.
@@ -2537,17 +2539,20 @@ class ChdkBackend(CameraBackend):
                     f"zoom step must be an integer from 0 to {steps - 1} on "
                     f"camera {camera_index}; got {step!r}"
                 )
-            moved = body.zoom_step != step
+            previous = body.zoom_step
+            not_confirmed = None
             try:
                 self._move_zoom(body, step)
-            except _ZoomNotConfirmedError:
-                raise
+            except _ZoomNotConfirmedError as exc:
+                not_confirmed = exc
             except Exception as exc:
                 self._zoom_failed(body, camera_index, "setting the zoom", exc)
-            # A focus lock taken at another step no longer holds. A request
-            # for the step the lens was already at leaves it alone.
+            # A focus lock taken at another step no longer holds. That is so
+            # whenever the camera reports a step other than the one before,
+            # whether or not it is the step asked for. A lens that stayed
+            # where it was leaves the lock alone.
             dropped = False
-            if moved:
+            if body.zoom_step != previous:
                 try:
                     dropped = self._drop_focus_after_zoom(body)
                 except Exception as exc:
@@ -2555,9 +2560,12 @@ class ChdkBackend(CameraBackend):
                         body, camera_index, "unlocking the focus after the zoom",
                         exc,
                     )
-            self._store_zoom_step(body, camera_index, step)
+            if not_confirmed is None:
+                self._store_zoom_step(body, camera_index, step)
             if dropped:
                 self._store_focus_distance(body, None)
+            if not_confirmed is not None:
+                raise not_confirmed
             return step
 
     def _zoom_failed(self, body, camera_index, stage, exc):
@@ -2708,7 +2716,7 @@ class ChdkBackend(CameraBackend):
     def _drop_focus_after_zoom(self, body):
         """Release a focus lock that a zoom move has made wrong.
 
-        Called once the camera has confirmed a new zoom step. A locked body
+        Called once the camera has reported a new zoom step. A locked body
         is sent set_aflock(0), so it does not go on shooting at a focus
         taken at another step. A body whose restore failed holds no lock,
         and is sent nothing. On either, the focus is marked stale and True
@@ -2752,7 +2760,8 @@ class ChdkBackend(CameraBackend):
 
         The body is put in record mode first, which settles its zoom and
         restores any stored focus. ALT mode is then asserted as a capture
-        asserts it, the lock script is sent, and get_focus() is read. The
+        asserts it, set_aflock(0) is sent, then the lock script, and
+        get_focus() is read. The
         lock counts only when the camera answers a positive integer. The
         registry stores the distance under the body's hardware id; a body
         with no identity, or an ambiguous one, is locked and nothing is
@@ -2762,7 +2771,8 @@ class ChdkBackend(CameraBackend):
         to it. A camera that answers get_focus() with no positive integer is
         not dropped and is sent nothing more: it ran set_aflock(1), so it may
         hold a lock at a distance nobody confirmed, and the message says how
-        to release it.
+        to release it. The body then reports no lock and no distance, and
+        the stored distance is kept.
 
         Args:
             camera_index: Which body, as the device list numbers them.
@@ -2787,6 +2797,13 @@ class ChdkBackend(CameraBackend):
                 if not just_sent:
                     stage = "entering ALT mode"
                     self._assert_alt(body)
+                # A half-press while the lock is held does not focus again,
+                # so any lock is released first. The backend cannot tell
+                # whether the camera holds one: a body opened again, or one
+                # whose last lock was not confirmed, may hold a lock its
+                # flags do not show. So set_aflock(0) is always sent.
+                stage = "releasing the focus lock"
+                self._send_lua(body, _FOCUS_UNLOCK_LUA)
                 stage = "locking the focus"
                 self._send_lua(
                     body, _FOCUS_LOCK_LUA, timeout=_FOCUS_SCRIPT_TIMEOUT_S
@@ -2796,6 +2813,11 @@ class ChdkBackend(CameraBackend):
             except Exception as exc:
                 self._focus_failed(body, camera_index, stage, exc)
             if not _is_focus_distance(reported):
+                # The earlier lock was released above, so it is no longer
+                # confirmed. The stored distance is kept, as when an unlock or
+                # a restore fails, and focus_stale is left as it was.
+                body.focus_locked = False
+                body.focus_distance = None
                 self.logger.error(
                     f"[chdk] body {camera_index} ({body.port}): get_focus() "
                     f"answered {reported!r} after the lock script"

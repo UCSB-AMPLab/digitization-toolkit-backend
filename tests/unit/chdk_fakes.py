@@ -171,6 +171,7 @@ class Body:
         zoom_steps=None,
         zoom=0,
         zoom_follows=True,
+        zoom_lands=None,
         zoom_error=None,
         port_numbers=None,
         capture_script_reads=0,
@@ -250,10 +251,13 @@ class Body:
         # zoom was added, and 64 on an A2500 under CHDK 1.5.1. zoom is the
         # step get_zoom() reports. With zoom_follows, set_zoom(n) moves the
         # lens to n; without it the lens stays where it is, which is a camera
-        # that does not confirm the step. zoom_error is raised by set_zoom.
+        # that does not confirm the step. zoom_lands, when given, is the step
+        # the lens stops at for any set_zoom: a lens that moved but not to
+        # the step asked for. zoom_error is raised by set_zoom.
         self.zoom_steps = zoom_steps
         self.zoom = zoom
         self.zoom_follows = zoom_follows
+        self.zoom_lands = zoom_lands
         self.zoom_error = zoom_error
         # Focus lock. af_distance is the distance in mm the camera's
         # autofocus finds on a half-press; 1489 and 1557 were the answers of
@@ -266,7 +270,8 @@ class Body:
         # without it the focus stays where it is, which is a camera that does
         # not confirm the distance. focus_error is raised by the half-press
         # scripts, set_focus_error by set_focus, aflock_error by set_aflock.
-        # aflock is the lock as the camera holds it.
+        # aflock is the lock as the camera holds it. A half-press while the
+        # lock is held does not focus again: the focus stays where it is.
         self.af_distance = af_distance
         self.focus = af_distance if focus is None else focus
         self.focus_answer = focus_answer
@@ -394,7 +399,8 @@ class Body:
         if code.startswith("press('shoot_half')"):
             if self.focus_error is not None:
                 raise self.focus_error
-            self.focus = self.af_distance
+            if not self.aflock:
+                self.focus = self.af_distance
             self.aflock = True
             return None
         match = re.fullmatch(r"set_aflock\(([01])\)", code)
@@ -422,7 +428,9 @@ class Body:
         if match:
             if self.zoom_error is not None:
                 raise self.zoom_error
-            if self.zoom_follows:
+            if self.zoom_lands is not None:
+                self.zoom = self.zoom_lands
+            elif self.zoom_follows:
                 self.zoom = int(match.group(1))
             return None
         if 'click("shoot_half")' in lua_code:
