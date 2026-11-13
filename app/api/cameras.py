@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -500,29 +500,14 @@ class CameraSetupResponse(BaseModel):
 	confirmed_pair: Optional[dict] = None
 
 
-@router.get("/setup", response_model=CameraSetupResponse)
-def get_camera_setup(current_user: User = Depends(allow_read_only)):
+def _setup_report(raw_devices, registry) -> CameraSetupResponse:
+	"""Evaluate the stored roles against these device rows, for the operator.
+
+	GET /cameras/setup and PUT /cameras/roles both answer with this. A
+	registry of None reads as one with no roles and no confirmed pair.
 	"""
-	Report whether the operator must set or confirm the camera roles.
+	from capture.camera_roles import evaluate_setup
 
-	A camera's role is the page it photographs, "left" or "right", stored in
-	the camera registry per body. This route compares the stored roles and
-	the pair last confirmed together with the bodies the backend lists now,
-	through capture.camera_roles.evaluate_setup. It reports only: nothing
-	here, and nothing in capture, acts on the result.
-
-	A backend that cannot list its devices is a 503, because an empty list
-	would report that no setup is needed.
-	"""
-	try:
-		from capture.service import get_backend
-		from capture.camera_roles import evaluate_setup
-		raw_devices = get_backend().list_devices()
-	except Exception as exc:
-		logger.exception(f"Listing cameras for the setup check failed: {exc}")
-		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
-
-	registry = _get_camera_registry()
 	hardware_ids = [dev.get("hardware_id") for dev in raw_devices if dev.get("hardware_id")]
 	records = registry.get_role_records(hardware_ids) if registry else {}
 	confirmed_pair = registry.get_confirmed_pair() if registry else None
@@ -539,6 +524,142 @@ def get_camera_setup(current_user: User = Depends(allow_read_only)):
 			for reason in result["reasons"]
 		],
 		confirmed_pair=confirmed_pair,
+	)
+
+
+@router.get("/setup", response_model=CameraSetupResponse)
+def get_camera_setup(current_user: User = Depends(allow_read_only)):
+	"""
+	Report whether the operator must set or confirm the camera roles.
+
+	A camera's role is the page it photographs, "left" or "right", stored in
+	the camera registry per body. This route compares the stored roles and
+	the pair last confirmed together with the bodies the backend lists now,
+	through capture.camera_roles.evaluate_setup. It reports only: nothing
+	here, and nothing in capture, acts on the result.
+
+	A backend that cannot list its devices is a 503, because an empty list
+	would report that no setup is needed.
+	"""
+	try:
+		from capture.service import get_backend
+		raw_devices = get_backend().list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the setup check failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	return _setup_report(raw_devices, _get_camera_registry())
+
+
+# The catalogued refusals of PUT /cameras/roles, each a flat sentence that
+# says who must do what.
+CAMERA_ROLES_REFUSALS = {
+	"camera_not_connected": "A camera in the request is not connected, and the operator must reload the camera list and choose the cameras again.",
+	"camera_identity_unusable": "Captua cannot identify a camera in the request, and the operator must give it an identity before setting its role.",
+}
+
+
+def _roles_refusal(code: str) -> HTTPException:
+	return HTTPException(status_code=409, detail={"code": code, "message": CAMERA_ROLES_REFUSALS[code]})
+
+
+class RoleBody(BaseModel):
+	"""One body named in a roles request, by the hardware id the client listed."""
+	hardware_id: str = Field(min_length=1)
+
+
+class CameraRolesRequest(BaseModel):
+	"""Request body for PUT /cameras/roles: the body for each page (NEH-342)."""
+	left: RoleBody
+	right: RoleBody
+
+	@model_validator(mode="after")
+	def _two_bodies(self):
+		if self.left.hardware_id == self.right.hardware_id:
+			raise ValueError("left and right must be two different cameras")
+		return self
+
+
+class CameraRolesResponse(BaseModel):
+	"""The device rows and the setup report after a roles write."""
+	devices: List[DeviceInfo]
+	setup: CameraSetupResponse
+
+
+@router.put("/roles", response_model=CameraRolesResponse)
+def set_camera_roles(
+	request: CameraRolesRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Store which page each of two connected cameras photographs (NEH-342).
+
+	The operator names the body for the left page and the body for the right
+	page by hardware id. Both must be among the bodies the backend lists
+	now, each with an identity of its own: a body that is not listed is a
+	409 camera_not_connected, and a provisional body, a body with the
+	per-index placeholder id or a body whose identity another body shares
+	is a 409 camera_identity_unusable. A body the registry does not know is
+	registered first, as the orientation route registers one.
+
+	CameraRegistry.set_roles then writes both roles and the pair in one
+	replace of cameras.json, with each body's USB socket, the backend's name
+	and the operator's username. Two bodies that hold each other's roles
+	exchange them in one request. A registry that cannot be written raises
+	StorageUnavailableError, which the app answers with 503.
+
+	The answer is the device rows and the setup report, read from the
+	registry after the write, for the rows listed before it. Nothing in
+	capture reads a stored role yet: indexes, pins, card files and capture
+	are unchanged.
+	"""
+	try:
+		from capture.camera_registry import CameraRegistry
+		from capture.camera_roles import has_identity
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the roles write failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	chosen = {"left": request.left.hardware_id, "right": request.right.hardware_id}
+	rows = {}
+	for role, hw_id in chosen.items():
+		matches = [dev for dev in raw_devices if dev.get("hardware_id") == hw_id]
+		if not matches:
+			raise _roles_refusal("camera_not_connected")
+		if len(matches) > 1 or not has_identity(matches[0]) or matches[0].get("identity_ambiguous"):
+			raise _roles_refusal("camera_identity_unusable")
+		rows[role] = matches[0]
+
+	registry = CameraRegistry()
+	for row in rows.values():
+		if registry.get_camera_by_id(row["hardware_id"]) is None:
+			# Registered under the identity checked above, with the info the
+			# backend reports for it, as the orientation route does.
+			info = {
+				"model": row.get("model"),
+				"serial": row.get("serial"),
+				"location": row.get("location"),
+			}
+			registry.register_resolved(row["hardware_id"], info, row["index"])
+
+	registry.set_roles(
+		chosen["left"],
+		chosen["right"],
+		ports={role: row.get("usb_port") for role, row in rows.items()},
+		backend=backend.get_backend_name(),
+		confirmed_by=current_user.username,
+	)
+
+	return CameraRolesResponse(
+		devices=_device_infos(raw_devices, registry),
+		setup=_setup_report(raw_devices, registry),
 	)
 
 
