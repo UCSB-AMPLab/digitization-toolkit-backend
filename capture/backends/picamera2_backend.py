@@ -853,6 +853,7 @@ class Picamera2Backend(CameraBackend):
             "focus_control": True,
             "live_controls": True,
             "zoom": True,
+            "zoom_steps": False,
             "autofocus_calibration": True,
             "dslr_settings": False,
         }

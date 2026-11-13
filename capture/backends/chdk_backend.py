@@ -216,6 +216,24 @@ _HALF_PRESS_LUA = 'click("shoot_half")'
 _ENTER_ALT_LUA = "enter_alt()"
 _ALT_REASSERT_INTERVAL_S = 30.0
 
+# Optical zoom. Measured on 12 November 2026 on an A2500 under CHDK 1.5.1:
+# get_zoom_steps() returns 64, get_zoom() returns 0 at the widest, and
+# set_zoom(n) moves the lens and takes one to a few seconds. Spreads, the
+# earlier scanner software (spreadsplug/dev/chdkcamera.py, _set_zoom), set the
+# zoom once per start with set_zoom(level) after the switch to record mode and
+# refused a level at or above get_zoom_steps(). Here the step is stored per
+# body in the camera registry and applied each time a body enters record mode.
+#
+# On the same day a second Lua script sent while an earlier one was still
+# running, and commands sent to a body that had just timed out, knocked a
+# camera off USB. Every zoom script runs under the body's lock and waits for
+# its result before the next is sent, set_zoom has a timeout long enough for
+# the lens to travel, and after a timeout or an error nothing more is sent to
+# that body in the same operation.
+_GET_ZOOM_STEPS_LUA = "return get_zoom_steps()"
+_GET_ZOOM_LUA = "return get_zoom()"
+_SET_ZOOM_TIMEOUT_S = 15.0
+
 # How pychdk 0.1.3's switch_mode says the camera never reported record mode.
 # It raises a plain RuntimeError, as it does for a script that would not
 # start or one that failed, so the message is the only thing that tells this
@@ -507,6 +525,36 @@ class _IdentityChangedError(RuntimeError):
     """The body locked for a retry is not the one the retry was meant for."""
 
 
+class ZoomFailedError(RuntimeError):
+    """The camera did not take a requested zoom step.
+
+    Raised by set_zoom_step for a wire failure, a timeout, a camera that
+    reports another step afterwards, and a camera that reported no zoom
+    steps. Its own class because the route answers it with a 502, and a
+    camera that is not connected with a 404.
+    """
+
+
+class _ZoomNotConfirmedError(ZoomFailedError):
+    """The camera answered after set_zoom and reported another step.
+
+    The conversation completed, so the body is in a known state and need not
+    be dropped for this alone; the step it reports is recorded on the body.
+    """
+
+
+def _open_camera_registry():
+    """Open the camera registry at its default path.
+
+    An error opening it propagates; _stored_zoom_step catches it and
+    _store_zoom_step does not. Function-local import: capture.camera_registry reaches capture.service,
+    which builds this backend, so a module-level import would be circular.
+    """
+    from capture.camera_registry import CameraRegistry
+
+    return CameraRegistry()
+
+
 def _is_gone_from_the_bus(exc):
     """True for a pyusb error whose errno is ENODEV: the device is not there."""
     return getattr(exc, "errno", None) == errno.ENODEV
@@ -576,6 +624,12 @@ class _ChdkBody:
         # When ALT mode was last asserted, by _monotonic; None on a body that
         # has not had it asserted since it was opened.
         self.alt_asserted_at = None
+        # Optical zoom. zoom_steps is get_zoom_steps(), read once after the
+        # body first reaches record mode; None until then, or when the camera
+        # does not answer a positive integer. zoom_step is the step the
+        # backend last read back with get_zoom(); None until known.
+        self.zoom_steps = None
+        self.zoom_step = None
         # Live view instrumentation. The geometry is logged on the first frame
         # only; the rate every _FRAME_LOG_INTERVAL frames.
         self.geometry_logged = False
@@ -692,6 +746,10 @@ class ChdkBackend(CameraBackend):
         # Re-entrant so an assignment can republish through rescan() without
         # handing the lock over in between.
         self._layout_lock = threading.RLock()
+        # Opens the camera registry, where a body's stored zoom step lives.
+        # A test replaces it; a factory that returns None means no registry,
+        # so nothing is read or stored.
+        self._registry_factory = _open_camera_registry
 
     # ------------------------------------------------------------------
     # Bodies
@@ -1072,7 +1130,11 @@ class ChdkBackend(CameraBackend):
             "location": f"USB {body.port}",
             "port": body.port,
             "has_aperture_control": False,
+            # supports_zoom is the Pi cameras' digital ScalerCrop zoom. A CHDK
+            # body has stepped optical zoom instead, reported by these two.
             "supports_zoom": False,
+            "zoom_steps": body.zoom_steps,
+            "zoom_step": body.zoom_step,
             "side": body.side,
             "provisional": provisional,
             # Another connected body answers to this one's hardware id, so
@@ -1763,6 +1825,10 @@ class ChdkBackend(CameraBackend):
         sent; the capture and preview paths use that to avoid sending it
         twice.
 
+        Once record mode is confirmed, _settle_zoom reads the body's zoom
+        steps and current step and moves the lens to its stored step. A
+        failure there is a failure of this method like any other.
+
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
         that fails on the wire drops the body like any other failed
@@ -1784,6 +1850,7 @@ class ChdkBackend(CameraBackend):
             if body.device.lua_execute("return get_mode()"):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
+                self._settle_zoom(body)
                 return True
 
         body.device.lua_execute(_HALF_PRESS_LUA)
@@ -1797,6 +1864,7 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] {body.port}: switched to record mode after a "
                     f"half-press of the shutter ({waited:.1f}s after it)"
                 )
+                self._settle_zoom(body)
                 return True
 
         raise RuntimeError(
@@ -1805,6 +1873,245 @@ class ChdkBackend(CameraBackend):
             "and on again. If it does not respond to its buttons, take the "
             "battery out and put it back."
         ) from not_arrived
+
+    # ------------------------------------------------------------------
+    # Optical zoom
+    # ------------------------------------------------------------------
+
+    def _read_zoom(self, body):
+        """Ask the camera for its zoom step; record and return it.
+
+        The answer is recorded as body.zoom_step when it is an int, and as
+        None otherwise. Callers hold the body's lock.
+        """
+        answer = body.device.lua_execute(_GET_ZOOM_LUA)
+        body.zoom_step = answer if type(answer) is int else None
+        return body.zoom_step
+
+    def _move_zoom(self, body, step):
+        """Send set_zoom(step), then read the step back.
+
+        lua_execute waits for set_zoom to finish before it returns, so the
+        read-back is never sent while set_zoom is still running. A timeout
+        or an error from either script propagates and nothing more is sent.
+
+        Raises:
+            _ZoomNotConfirmedError: The camera reports another step.
+        """
+        body.device.lua_execute(f"set_zoom({step})", timeout=_SET_ZOOM_TIMEOUT_S)
+        reported = self._read_zoom(body)
+        if reported != step:
+            raise _ZoomNotConfirmedError(
+                f"{body.port}: the lens was sent to zoom step {step} and the "
+                f"camera reports step {reported}"
+            )
+        self.logger.info(f"[chdk] {body.port}: zoom step {step} confirmed")
+
+    def _stored_zoom_step(self, body):
+        """The zoom step stored for this body, or None.
+
+        A body with no identity has nothing stored, and an ambiguous one has
+        an identity that another body answers to, so neither is looked up. A
+        registry that cannot be opened or read is logged and treated as
+        holding nothing: the camera is left where its lens is.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            return None
+        try:
+            registry = self._registry_factory()
+            entry = registry.get_camera_by_id(hardware_id) if registry else None
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: could not read the stored zoom step "
+                f"({exc!r}); the lens is left where it is"
+            )
+            return None
+        return entry.get("zoom_step") if entry else None
+
+    def _settle_zoom(self, body):
+        """Read the zoom steps and step, and apply the stored step if any.
+
+        Called by _ensure_record_mode once record mode is confirmed. The
+        number of steps is read once per body. A camera that does not answer
+        it with a positive integer gets no further zoom scripts. A stored
+        step outside 0..steps-1 is ignored with a warning. A stored step
+        that differs from the current one is sent and read back; a camera
+        that reports another step is logged with a warning and the
+        operation carries on. A timeout or a wire failure propagates.
+        """
+        if body.zoom_steps is None:
+            answer = body.device.lua_execute(_GET_ZOOM_STEPS_LUA)
+            if type(answer) is not int or answer <= 0:
+                self.logger.warning(
+                    f"[chdk] {body.port}: get_zoom_steps() answered "
+                    f"{answer!r}, not a positive integer; the zoom is not "
+                    "read or set on this body"
+                )
+                return
+            body.zoom_steps = answer
+            self.logger.info(f"[chdk] {body.port}: {answer} zoom steps")
+        current = self._read_zoom(body)
+        stored = self._stored_zoom_step(body)
+        if stored is None:
+            return
+        if type(stored) is not int or not 0 <= stored < body.zoom_steps:
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored zoom step {stored!r} is not "
+                f"between 0 and {body.zoom_steps - 1}; it is ignored and the "
+                "lens is left where it is"
+            )
+            return
+        if stored == current:
+            return
+        try:
+            self._move_zoom(body, stored)
+        except _ZoomNotConfirmedError:
+            # The camera answered, so the body is in a known state; the
+            # capture or preview goes on at the step it reports. A wire
+            # failure or a timeout is not caught here.
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored zoom step is {stored} and "
+                f"the camera reports step {body.zoom_step} after set_zoom; "
+                "carrying on at the reported step"
+            )
+
+    def set_zoom_step(self, camera_index: int, step: int) -> int:
+        """Move the lens of the body at this index to a zoom step; see
+        _set_zoom_step_once.
+
+        A body that has left the bus is replaced and the request retried
+        once, by _retry_once_if_gone, as for a capture and a preview: a
+        camera that has just restarted is when an operator adjusts its zoom.
+        A body that left the bus and was not retried, or failed again, is
+        reported as a ZoomFailedError like any other failed conversation.
+        """
+        try:
+            return self._retry_once_if_gone(
+                camera_index, "zoom",
+                lambda expect: self._set_zoom_step_once(camera_index, step, expect),
+            )
+        except _BodyGoneError as gone:
+            raise ZoomFailedError(str(gone)) from gone
+
+    def _set_zoom_step_once(self, camera_index, step, expect_identity=None):
+        """Move the lens of the body at this index to a zoom step, and store it.
+
+        The body is put in record mode first, which reads its zoom steps and
+        applies any step already stored. The step is then checked against
+        the range the camera reported, sent, and read back. The registry
+        stores it under the body's hardware id only after the camera has
+        confirmed it. A body with no identity, or an ambiguous one, is
+        zoomed and nothing is stored.
+
+        A failure on the wire - a timeout, a transport error, a script error
+        - drops the body like a failed capture, and nothing more is sent to
+        it. A camera that answers with another step is not dropped; the step
+        it reports is recorded on the body.
+
+        Args:
+            camera_index: Which body, as the device list numbers them.
+            step: The zoom step, 0 at the widest.
+            expect_identity: Set only for a retry; see _in_use.
+
+        Returns:
+            The step the camera confirmed.
+
+        Raises:
+            ValueError: The step is not an int in 0..zoom_steps-1. The
+                message names the valid range.
+            ZoomFailedError: The body has no zoom steps, the conversation
+                failed, or the camera did not confirm.
+            _BodyGoneError: The body left the bus; set_zoom_step retries.
+            RuntimeError: No body at the index.
+        """
+        with self._in_use(
+            camera_index, "zoom", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
+            try:
+                self._ensure_record_mode(body)
+            except Exception as exc:
+                self._zoom_failed(body, camera_index, "switching to record mode", exc)
+            steps = body.zoom_steps
+            if steps is None:
+                raise ZoomFailedError(
+                    f"Camera {camera_index} ({body.port}) did not report how "
+                    "many zoom steps it has, so no zoom step can be set on it"
+                )
+            if type(step) is not int or not 0 <= step < steps:
+                raise ValueError(
+                    f"zoom step must be an integer from 0 to {steps - 1} on "
+                    f"camera {camera_index}; got {step!r}"
+                )
+            try:
+                self._move_zoom(body, step)
+            except _ZoomNotConfirmedError:
+                raise
+            except Exception as exc:
+                self._zoom_failed(body, camera_index, "setting the zoom", exc)
+            self._store_zoom_step(body, camera_index, step)
+            return step
+
+    def _zoom_failed(self, body, camera_index, stage, exc):
+        """Log a failed zoom conversation, drop the body, and raise.
+
+        The conversation broke and the camera's state is unknown, so the body
+        is evicted and the next scan opens it again; nothing more is sent to
+        it here.
+        """
+        named = _name_failure(exc)
+        self.logger.error(
+            f"[chdk] body {camera_index} ({body.port}): {stage} failed with "
+            f"{named}: {exc}"
+        )
+        identity = body.hardware_id
+        self._evict(body, f"{stage} failed with {named}")
+        error = (
+            _BodyGoneError if _is_gone_from_the_bus(exc) else ZoomFailedError
+        )(
+            f"CHDK zoom failed on {body.port} during {stage} with {named}: {exc}"
+        )
+        if isinstance(error, _BodyGoneError):
+            error.identity = identity
+        raise error from exc
+
+    def _store_zoom_step(self, body, camera_index, step):
+        """Write a confirmed step to the registry under the body's identity.
+
+        A body that is not yet registered is registered first, as the
+        orientation route does. A registry write that fails propagates.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            self.logger.info(
+                f"[chdk] {body.port}: zoom step {step} set and not stored; "
+                "this body has no identity of its own to store it under"
+            )
+            return
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: zoom step {step} set and not stored; "
+                "the camera registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            registry.register_resolved(
+                hardware_id,
+                {
+                    "model": body.model,
+                    "serial": body.serial,
+                    "location": f"USB {body.port}",
+                    "id": body.port,
+                    "index": camera_index,
+                },
+                camera_index,
+            )
+        registry.update_zoom_step(hardware_id, step)
+        self.logger.info(
+            f"[chdk] {body.port}: zoom step {step} stored for {hardware_id}"
+        )
 
     def assign_side(self, camera_index: int, side: str) -> list:
         """Write a page parity onto the card of the body at this index.
@@ -1998,6 +2305,7 @@ class ChdkBackend(CameraBackend):
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": True,
             "autofocus_calibration": False,
             "dslr_settings": False,
         }

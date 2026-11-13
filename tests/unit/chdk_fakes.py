@@ -141,6 +141,10 @@ class Body:
         half_press_arrives=False,
         half_press_reads=1,
         lua_error=None,
+        zoom_steps=None,
+        zoom=0,
+        zoom_follows=True,
+        zoom_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -198,6 +202,18 @@ class Body:
         self.mode_value = False
         self.lua_error = lua_error
         self.lua_calls = []
+        # The timeout each lua_execute call was given, in the order made.
+        self.lua_timeouts = []
+        # Optical zoom. zoom_steps is what get_zoom_steps() answers: None by
+        # default, which is what this fake answered for every script before
+        # zoom was added, and 64 on an A2500 under CHDK 1.5.1. zoom is the
+        # step get_zoom() reports. With zoom_follows, set_zoom(n) moves the
+        # lens to n; without it the lens stays where it is, which is a camera
+        # that does not confirm the step. zoom_error is raised by set_zoom.
+        self.zoom_steps = zoom_steps
+        self.zoom = zoom
+        self.zoom_follows = zoom_follows
+        self.zoom_error = zoom_error
         # Every switch_mode and lua_execute call, in the order made.
         self.events = []
         # what happened to it
@@ -311,9 +327,21 @@ class FakeChdkDevice:
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
         self._body.lua_calls.append(lua_code)
+        self._body.lua_timeouts.append(timeout)
         self._body.events.append(("lua", lua_code))
         if self._body.lua_error is not None:
             raise self._body.lua_error
+        if "get_zoom_steps" in lua_code:
+            return self._body.zoom_steps
+        if "get_zoom()" in lua_code:
+            return self._body.zoom
+        match = re.fullmatch(r"set_zoom\((-?\d+)\)", lua_code.strip())
+        if match:
+            if self._body.zoom_error is not None:
+                raise self._body.zoom_error
+            if self._body.zoom_follows:
+                self._body.zoom = int(match.group(1))
+            return None
         if 'click("shoot_half")' in lua_code:
             self._body.half_presses += 1
             if self._body.half_press_arrives:
@@ -510,8 +538,14 @@ def make_pychdk(*bodies):
     return FakePychdk(bodies)
 
 
-def make_backend(monkeypatch, fake, logger_name="test-chdk"):
-    """Install the fake and return a ChdkBackend built on it."""
+def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
+    """Install the fake and return a ChdkBackend built on it.
+
+    The backend reads and writes stored zoom steps through its
+    _registry_factory. A test that passes no registry gets a backend with
+    none, so nothing is read from or written to a real cameras.json; a test
+    about stored steps passes a CameraRegistry on a temporary path.
+    """
     import logging
 
     import capture.backends.chdk_backend as cb
@@ -522,7 +556,9 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk"):
     # waits on the fake instead of spending them.
     fake.sleeps = []
     monkeypatch.setattr(cb, "_sleep", fake.sleeps.append)
-    return cb.ChdkBackend(logging.getLogger(logger_name))
+    backend = cb.ChdkBackend(logging.getLogger(logger_name))
+    backend._registry_factory = lambda: registry
+    return backend
 
 
 def viewport_frame(

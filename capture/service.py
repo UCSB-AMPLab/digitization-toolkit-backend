@@ -1015,6 +1015,31 @@ def apply_zoom(camera_index: int, zoom_factor: float) -> None:
     backend.apply_zoom(camera_index, zoom_factor)
 
 
+def apply_zoom_step(camera_index: int, step: int) -> int:
+    """Move the optical zoom of *camera_index* to *step*, and store it.
+
+    Only a backend that reports the "zoom_steps" capability (CHDK) has
+    stepped optical zoom; it validates the step against the camera's own
+    range, confirms it, and stores it per body.
+
+    Returns the step the camera confirmed.
+
+    Raises ValueError for a step outside the camera's range, and
+    RuntimeError if the camera is unavailable, the backend has no stepped
+    zoom, or the camera did not confirm the step.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("zoom_steps", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support stepped optical zoom"
+        )
+
+    return backend.set_zoom_step(camera_index, step)
+
+
 def main():
     """
     Main entry point for testing the camera connectivity.
