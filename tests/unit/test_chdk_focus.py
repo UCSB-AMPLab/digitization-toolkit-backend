@@ -501,6 +501,117 @@ def test_an_unlock_that_fails_drops_the_body_and_keeps_the_stored_distance(
     assert _stored(tmp_path)["focus"] == _focus(1489)
 
 
+_RESTORE_FAILS = pytest.mark.parametrize(
+    "knobs",
+    [{"focus_error": TimeoutError("Script did not complete within 15.0s")},
+     {"set_focus_error": TimeoutError("Script did not complete within 15.0s")},
+     {"set_focus_error": RuntimeError("Script did not start: busy")}],
+    ids=["restore-script-times-out", "set-focus-times-out", "set-focus-fails"],
+)
+
+
+@pytest.mark.unit
+@_RESTORE_FAILS
+def test_an_unlock_on_an_opened_body_does_not_restore_the_stored_focus(
+    monkeypatch, tmp_path, knobs
+):
+    """A restore that fails drops the body and keeps the stored focus, so an
+    unlock that restored first would fail the same way every time."""
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, focus=_focus(1500))
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, **knobs)
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    backend.unlock_focus(0)
+
+    assert RESTORE not in body.lua_calls
+    assert "set_focus(1500)" not in body.lua_calls
+    assert _focus_calls(body) == [UNLOCK, UNLOCK]
+    assert body.lua_calls.index(UNLOCK) < body.lua_calls.index(GET_ZOOM), (
+        "the release on opening did not come before the zoom"
+    )
+    assert body.closes == 0, "the body was dropped"
+    held = backend._body_at(0)
+    assert held.in_record_mode is True
+    assert held.focus_locked is False
+    assert held.focus_restore_failed is False
+    assert "focus" not in _stored(tmp_path)
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    after = _after(body, UNLOCK)
+    assert RESTORE not in after
+    assert GET_ZOOM not in after and "return get_mode()" not in after, (
+        "the opening steps ran again"
+    )
+    assert len(body.shots) == 1
+
+
+@pytest.mark.unit
+@_RESTORE_FAILS
+def test_a_capture_whose_restore_fails_still_fails_and_the_unlock_clears_it(
+    monkeypatch, tmp_path, knobs
+):
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, focus=_focus(1500))
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64, **knobs)
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    with pytest.raises((CaptureTimeoutError, RuntimeError)):
+        backend.capture_image(tmp_path / "one.jpg", _config())
+    assert body.shots == []
+    assert body.closes == 1
+    assert _stored(tmp_path)["focus"] == _focus(1500)
+
+    body.mode_value = False
+    backend.list_devices()
+    with pytest.raises((CaptureTimeoutError, RuntimeError)):
+        backend.capture_image(tmp_path / "two.jpg", _config())
+    assert body.shots == [], "a capture went ahead without the stored focus"
+    assert body.closes == 2
+
+    body.mode_value = False
+    backend.list_devices()
+    restores = body.lua_calls.count(RESTORE)
+    backend.unlock_focus(0)
+    assert body.lua_calls.count(RESTORE) == restores
+    assert "focus" not in _stored(tmp_path)
+
+    backend.capture_image(tmp_path / "three.jpg", _config())
+    assert body.lua_calls.count(RESTORE) == restores
+    assert len(body.shots) == 1
+
+
+@pytest.mark.unit
+def test_a_lock_on_an_opened_body_does_not_restore_the_stored_focus(
+    monkeypatch, tmp_path
+):
+    """The lock replaces the stored focus, so a restore before it is not sent."""
+    registry = _registry(tmp_path)
+    _store(registry, HW_ID, focus=_focus(1500))
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG, zoom_steps=64,
+                af_distance=900,
+                set_focus_error=TimeoutError("Script did not complete within 15.0s"))
+    backend, _ = _backend(monkeypatch, body, registry)
+
+    assert backend.lock_focus(0) == 900
+
+    assert RESTORE not in body.lua_calls
+    assert "set_focus(1500)" not in body.lua_calls
+    assert _focus_calls(body) == [UNLOCK, UNLOCK, LOCK, GET_FOCUS]
+    assert body.closes == 0
+    held = backend._body_at(0)
+    assert held.focus_locked is True
+    assert held.focus_distance == 900
+    assert _stored(tmp_path)["focus"] == _focus(900)
+
+    backend.capture_image(tmp_path / "one.jpg", _config())
+
+    assert RESTORE not in body.lua_calls
+    assert GET_ZOOM not in _after(body, LOCK)
+    assert len(body.shots) == 1
+
+
 # --- zoom after a lock ---------------------------------------------------------
 
 

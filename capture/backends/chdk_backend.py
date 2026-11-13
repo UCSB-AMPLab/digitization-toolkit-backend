@@ -867,7 +867,9 @@ class _ChdkBody:
         #     step changed) and _unlock_focus_once.
         # set_aflock(0) is sent when the body first reaches record mode,
         # before any other zoom or focus script, so the camera's lock is
-        # known after opening. Every set_aflock(1) - the lock and the
+        # known after opening. A body opened by a focus lock or unlock
+        # request has no stored focus restored, since the request replaces
+        # or removes it. Every set_aflock(1) - the lock and the
         # restore script - is followed in the same operation by a confirmed
         # get_focus(), by set_aflock(0), or by eviction; every step change
         # reported by get_zoom() in a zoom request is followed by
@@ -2291,7 +2293,7 @@ class ChdkBackend(CameraBackend):
         self._send_lua(body, _ENTER_ALT_LUA)
         body.alt_asserted_at = _monotonic()
 
-    def _ensure_record_mode(self, body):
+    def _ensure_record_mode(self, body, restore_focus=True):
         """Put the body in record mode once, and confirm it got there.
 
         A viewport and a remote capture both need record mode, and the switch
@@ -2341,6 +2343,11 @@ class ChdkBackend(CameraBackend):
         Once record mode is confirmed, _settle_opened_body releases any
         focus lock, settles the zoom and restores the stored focus if it
         applies. A failure there is a failure of this method like any other.
+        With restore_focus False the stored focus is not restored; a focus
+        lock or unlock request passes it, since it replaces or removes the
+        stored focus, and a restore that fails would drop the body before
+        the request is sent. The body is in record mode afterwards either
+        way, so the opening steps do not run again for it.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -2369,7 +2376,7 @@ class ChdkBackend(CameraBackend):
             if self._send_lua(body, "return get_mode()"):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
-                self._settle_opened_body(body)
+                self._settle_opened_body(body, restore_focus)
                 return True
 
         self._send_lua(body, _HALF_PRESS_LUA)
@@ -2383,7 +2390,7 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] {body.port}: switched to record mode after a "
                     f"half-press of the shutter ({waited:.1f}s after it)"
                 )
-                self._settle_opened_body(body)
+                self._settle_opened_body(body, restore_focus)
                 return True
 
         raise RuntimeError(
@@ -2393,7 +2400,7 @@ class ChdkBackend(CameraBackend):
             "battery out and put it back."
         ) from not_arrived
 
-    def _settle_opened_body(self, body):
+    def _settle_opened_body(self, body, restore_focus=True):
         """Release the focus lock, then settle the zoom and the focus.
 
         Called by _ensure_record_mode once, when the body first reaches
@@ -2402,13 +2409,16 @@ class ChdkBackend(CameraBackend):
         the close is gone and focus_locked False is true of the camera.
         Then _settle_zoom moves the lens to its stored step and
         _settle_focus restores the stored focus if it was taken at the step
-        the camera now reports. A failure of set_aflock(0) propagates before
-        anything else is sent, and the caller drops the body.
+        the camera now reports; with restore_focus False, _settle_focus is
+        not called and no focus script is sent after set_aflock(0). A
+        failure of set_aflock(0) propagates before anything else is sent,
+        and the caller drops the body.
         """
         self._send_lua(body, _FOCUS_UNLOCK_LUA)
         body.focus_locked = False
         self._settle_zoom(body)
-        self._settle_focus(body)
+        if restore_focus:
+            self._settle_focus(body)
 
     # ------------------------------------------------------------------
     # Optical zoom
@@ -2836,8 +2846,8 @@ class ChdkBackend(CameraBackend):
     def _lock_focus_once(self, camera_index, expect_identity=None):
         """Autofocus the body at this index once, lock it, and store the distance.
 
-        The body is put in record mode first, which settles its zoom and
-        restores any stored focus. ALT mode is then asserted as a capture
+        The body is put in record mode first, which settles its zoom; the
+        stored focus is not restored, since this lock replaces it. ALT mode is then asserted as a capture
         asserts it, set_aflock(0) is sent, then the lock script, and
         get_focus() is read. The lock counts only when the camera answers a
         positive integer. The registry stores the distance together with
@@ -2873,13 +2883,13 @@ class ChdkBackend(CameraBackend):
         ) as body:
             stage = "switching to record mode"
             try:
-                just_sent = self._ensure_record_mode(body)
+                just_sent = self._ensure_record_mode(body, restore_focus=False)
                 if not just_sent:
                     stage = "entering ALT mode"
                     self._assert_alt(body)
                 # A half-press while the lock is held does not focus again,
-                # so any lock is released first: an earlier lock, a restored
-                # one, or one left by a readback that failed on the wire. It
+                # so any lock is released first: an earlier lock, one
+                # restored by an earlier operation, or one left by a readback that failed on the wire. It
                 # is sent whatever the flags say.
                 stage = "releasing the focus lock"
                 self._send_lua(body, _FOCUS_UNLOCK_LUA)
@@ -2949,7 +2959,10 @@ class ChdkBackend(CameraBackend):
     def _unlock_focus_once(self, camera_index, expect_identity=None):
         """Send set_aflock(0) to the body at this index and clear its focus.
 
-        The body is put in record mode first, as for a lock. Afterwards the
+        The body is put in record mode first, as for a lock, without
+        restoring the stored focus. A restore that fails drops the body and
+        keeps the stored focus, and a capture on that body fails the same
+        way, so the unlock is how the operator removes it. Afterwards the
         camera autofocuses on every picture. The flags are cleared and the
         stored focus removed once the camera has taken set_aflock(0). A
         timeout or a wire failure drops the body and keeps the stored
@@ -2966,7 +2979,7 @@ class ChdkBackend(CameraBackend):
         ) as body:
             stage = "switching to record mode"
             try:
-                self._ensure_record_mode(body)
+                self._ensure_record_mode(body, restore_focus=False)
                 stage = "unlocking the focus"
                 self._send_lua(body, _FOCUS_UNLOCK_LUA)
             except Exception as exc:
