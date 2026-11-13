@@ -488,6 +488,49 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_focus_distance(value) -> bool:
+        """True for a value that can be a stored focus distance.
+
+        A distance is a positive int in mm, as CHDK's get_focus() answers it,
+        and not a bool.
+        """
+        return type(value) is int and value > 0
+
+    def update_focus_distance(self, hardware_id: str, distance: Optional[int]) -> None:
+        """Persist, or clear, the locked focus distance for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as the zoom step. The
+        backend stores the distance the camera reported after a focus lock,
+        and sends it again each time the body enters record mode. None
+        removes the "focus_distance" key, and the camera then autofocuses on
+        every picture. The time of the change is recorded in either case.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            distance: The focus distance in mm, or None to clear it.
+
+        Raises:
+            ValueError: distance is neither None nor a positive int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        if distance is not None and not self.is_valid_focus_distance(distance):
+            raise ValueError(
+                f"focus distance must be a positive integer or None; got {distance!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            if distance is None:
+                entry.pop("focus_distance", None)
+            else:
+                entry["focus_distance"] = distance
+            entry["focus_distance_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())
