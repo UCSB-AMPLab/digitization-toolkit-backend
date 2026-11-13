@@ -397,7 +397,7 @@ def test_the_camera_test_takes_no_volume_and_no_database():
     from app.api.cameras import test_capture
 
     assert set(inspect.signature(test_capture).parameters) == {
-        "camera_index", "resolution", "focus_check", "current_user"}
+        "camera_index", "resolution", "focus_check", "layout", "page_side", "current_user"}
 
 
 @pytest.mark.unit
