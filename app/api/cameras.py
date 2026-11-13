@@ -217,6 +217,10 @@ class DeviceInfo(BaseModel):
 	# camera has reported them, and always null on other backends.
 	zoom_steps: Optional[int] = None
 	zoom_step: Optional[int] = None
+	# Seconds the camera's clock differs from the unit's at the last check,
+	# negative when the camera is behind. Null when not measured or not a CHDK
+	# camera. A live measurement: it is not stored.
+	clock_offset_s: Optional[float] = None
 	# Which pages this body shoots: "odd", "even", or null when it has no
 	# parity (CHDK backend only; the file that carries it lives on the card).
 	# Not a side of the table - left and right are the kiosk's swap toggle.
@@ -449,6 +453,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			supports_zoom=dev.get("supports_zoom", False),
 			zoom_steps=dev.get("zoom_steps"),
 			zoom_step=dev.get("zoom_step"),
+			clock_offset_s=dev.get("clock_offset_s"),
 			side=dev.get("side"),
 			error=dev.get("error"),
 			usb_port=dev.get("usb_port"),

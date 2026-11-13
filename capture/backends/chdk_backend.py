@@ -58,6 +58,7 @@ Version: 0.1.0-beta
 """
 
 import contextlib
+import datetime
 import errno
 import io
 import os
@@ -240,6 +241,21 @@ _GET_ZOOM_STEPS_LUA = "return get_zoom_steps()"
 _GET_ZOOM_LUA = "return get_zoom()"
 _SET_ZOOM_TIMEOUT_S = 15.0
 
+# The camera's clock. A CHDK camera writes its own clock into each picture's
+# EXIF, and on 12 November 2026 two A2500 bodies under CHDK 1.5.1 were about
+# two minutes behind the unit. After record mode is confirmed the backend
+# reads the clock with one script that returns one string, and sets it when
+# it differs from the unit's local time by more than this many seconds.
+# set_clock(year, month, day, hour, minute, second) is CHDK's documented
+# signature; its duration and precision on this build have not been measured.
+_CLOCK_TOLERANCE_S = 5.0
+_READ_CLOCK_LUA = (
+    'local t=os.date("*t"); '
+    'return string.format("%04d-%02d-%02d %02d:%02d:%02d", '
+    "t.year,t.month,t.day,t.hour,t.min,t.sec)"
+)
+_CLOCK_FORMAT = "%Y-%m-%d %H:%M:%S"
+
 # One script at a time. CHDK runs one script at a time, and its ExecuteScript
 # kills a running script unless the request carries PTP_CHDK_SCRIPT_FL_NOKILL
 # (0x100 in CHDK's core/ptp.h; pychdk 0.1.3 names it ScriptFlag.NOKILL), in
@@ -360,6 +376,9 @@ _PYCHDK_DID_NOT_SWITCH = "The camera did not switch to record mode"
 # waits instead of spending them.
 _sleep = time.sleep
 _monotonic = time.monotonic
+# The unit's local wall-clock time. The camera keeps local time with no zone,
+# so this is what its clock is compared with and set to. A test replaces it.
+_now = datetime.datetime.now
 
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
@@ -833,6 +852,11 @@ class _ChdkBody:
         # backend last read back with get_zoom(); None until known.
         self.zoom_steps = None
         self.zoom_step = None
+        # The camera's clock, minus the unit's, in seconds, as last measured;
+        # None until measured. clock_checked is True once the clock has been
+        # read on this open body, so it is read once per open.
+        self.clock_offset_s = None
+        self.clock_checked = False
         # The Canon image file number of the last picture saved from this
         # body, when its EXIF carried one; None otherwise.
         self.last_file_number = None
@@ -1408,6 +1432,7 @@ class ChdkBackend(CameraBackend):
             "focus_distance": body.focus_distance,
             "focus_stale": body.focus_stale,
             "focus_restore_failed": body.focus_restore_failed,
+            "clock_offset_s": body.clock_offset_s,
         }
 
     def _enumerate(self, reread):
@@ -2348,6 +2373,9 @@ class ChdkBackend(CameraBackend):
         stored focus, and a restore that fails would drop the body before
         the request is sent. The body is in record mode afterwards either
         way, so the opening steps do not run again for it.
+        _settle_clock then reads the camera's clock and sets it from the
+        unit's when they differ by more than _CLOCK_TOLERANCE_S; a timeout or
+        a wire failure there fails this method in the same way.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -2377,6 +2405,7 @@ class ChdkBackend(CameraBackend):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
                 self._settle_opened_body(body, restore_focus)
+                self._settle_clock(body)
                 return True
 
         self._send_lua(body, _HALF_PRESS_LUA)
@@ -2391,6 +2420,7 @@ class ChdkBackend(CameraBackend):
                     f"half-press of the shutter ({waited:.1f}s after it)"
                 )
                 self._settle_opened_body(body, restore_focus)
+                self._settle_clock(body)
                 return True
 
         raise RuntimeError(
@@ -2527,6 +2557,84 @@ class ChdkBackend(CameraBackend):
                 f"[chdk] {body.port}: the stored zoom step is {stored} and "
                 f"the camera reports step {body.zoom_step} after set_zoom; "
                 "carrying on at the reported step"
+            )
+
+    # ------------------------------------------------------------------
+    # The camera's clock
+    # ------------------------------------------------------------------
+
+    def _read_camera_clock(self, body):
+        """Read the camera's clock; return (raw answer, datetime or None).
+
+        The datetime is None when the answer is not a string in the format
+        _READ_CLOCK_LUA returns, or names a date that does not exist.
+        """
+        raw = self._send_lua(body, _READ_CLOCK_LUA)
+        if not isinstance(raw, str):
+            return raw, None
+        try:
+            return raw, datetime.datetime.strptime(raw.strip(), _CLOCK_FORMAT)
+        except ValueError:
+            return raw, None
+
+    def _settle_clock(self, body):
+        """Read the camera's clock once per open body; set it when it is off.
+
+        Called by _ensure_record_mode after the zoom is settled. The clock is
+        read with one script and compared with the unit's local time taken
+        as the answer arrives. A difference above _CLOCK_TOLERANCE_S is
+        corrected with set_clock, using the unit's local time taken just
+        before sending, and the clock is read back once. If the difference
+        after setting is still above the tolerance, a warning gives both
+        times; there is no retry. An answer that cannot be read as a date is
+        logged with a warning, nothing is set, and the operation carries on.
+        A timeout or a wire failure in either script propagates, as it does
+        for the zoom. body.clock_offset_s holds the last difference measured.
+        """
+        if body.clock_checked:
+            return
+        raw, camera = self._read_camera_clock(body)
+        unit = _now()
+        body.clock_checked = True
+        if camera is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: the camera's clock answered {raw!r}, "
+                "which is not a date; the clock is not set"
+            )
+            return
+        offset = (camera - unit).total_seconds()
+        body.clock_offset_s = offset
+        if abs(offset) <= _CLOCK_TOLERANCE_S:
+            return
+        sent = _now()
+        self._send_lua(
+            body,
+            f"set_clock({sent.year}, {sent.month}, {sent.day}, "
+            f"{sent.hour}, {sent.minute}, {sent.second})",
+        )
+        raw_after, camera_after = self._read_camera_clock(body)
+        unit_after = _now()
+        if camera_after is None:
+            body.clock_offset_s = None
+            self.logger.warning(
+                f"[chdk] {body.port}: the clock was {camera:%Y-%m-%d %H:%M:%S}, "
+                f"{offset:+.1f}s from the unit, and was sent set_clock; the "
+                f"read-back answered {raw_after!r}, which is not a date"
+            )
+            return
+        after = (camera_after - unit_after).total_seconds()
+        body.clock_offset_s = after
+        self.logger.info(
+            f"[chdk] {body.port}: the clock was {camera:%Y-%m-%d %H:%M:%S}, "
+            f"{offset:+.1f}s from the unit; after set_clock it is "
+            f"{after:+.1f}s from the unit"
+        )
+        if abs(after) > _CLOCK_TOLERANCE_S:
+            self.logger.warning(
+                f"[chdk] {body.port}: the clock reads "
+                f"{camera_after:%Y-%m-%d %H:%M:%S} after set_clock, and the "
+                f"unit's time is {unit_after:%Y-%m-%d %H:%M:%S}; the camera "
+                "did not take the new time"
             )
 
     def set_zoom_step(self, camera_index: int, step: int) -> int:

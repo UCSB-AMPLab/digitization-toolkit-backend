@@ -150,13 +150,13 @@ def test_the_capture_script_waits_for_a_script_still_running(
 ):
     """The capture script is a script too.
 
-    On a first capture the last Lua before the shot is get_zoom_steps(). This
+    On a first capture the last Lua before the shot is the clock read. This
     fake posts its answer at once and goes on running, so the capture script
     is what waits.
     """
     body = Body(
         serial="AAA111", card=EVEN_CARD, image=JPEG,
-        script_reads_after_return={"get_zoom_steps": 3},
+        script_reads_after_return={"os.date": 3},
     )
     backend, _ = _backend(monkeypatch, body)
 
