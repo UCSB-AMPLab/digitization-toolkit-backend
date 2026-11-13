@@ -144,6 +144,16 @@ class CameraBackend(ABC):
             zoom_step (int | None): The step the backend last confirmed by
                 reading it back from the camera, or None until known.
 
+        A backend with focus lock (capabilities "focus_lock") adds:
+            focus_locked (bool | None): True while the camera holds a focus
+                lock it confirmed, False otherwise, and None until the body
+                is in shooting mode.
+            focus_distance (int | None): The distance in mm the camera
+                reported for that lock, or None.
+            focus_stale (bool): The zoom moved after the last lock.
+            focus_restore_failed (bool): A stored distance was sent on
+                entering shooting mode and the camera did not report it back.
+
         The default implementation returns an empty list. Backends should
         override to provide accurate enumeration for their hardware type.
         """
@@ -211,6 +221,8 @@ class CameraBackend(ABC):
             zoom_steps (bool): Supports stepped optical zoom, set by step
                 number through `set_zoom_step` (CHDK compacts). Not the same
                 thing as `zoom`, which is digital.
+            focus_lock (bool): Supports `lock_focus` / `unlock_focus`, an
+                autofocus taken once and held (CHDK compacts).
             autofocus_calibration (bool): Can run AF + WB calibration routines.
             dslr_settings (bool): Exposes ISO / shutter speed / aperture via PTP.
 
@@ -223,6 +235,7 @@ class CameraBackend(ABC):
             "live_controls": False,
             "zoom": False,
             "zoom_steps": False,
+            "focus_lock": False,
             "autofocus_calibration": False,
             "dslr_settings": False,
         }

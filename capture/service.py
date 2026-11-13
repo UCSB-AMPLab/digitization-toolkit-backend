@@ -1040,6 +1040,41 @@ def apply_zoom_step(camera_index: int, step: int) -> int:
     return backend.set_zoom_step(camera_index, step)
 
 
+def _focus_lock_backend(camera_index: int):
+    """The backend, once the camera is connected and the backend can lock focus."""
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("focus_lock", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support focus lock"
+        )
+    return backend
+
+
+def lock_focus(camera_index: int) -> int:
+    """Autofocus *camera_index* once, lock the focus, and store the distance.
+
+    Only a backend that reports the "focus_lock" capability (CHDK) can do
+    this; it reads the distance back from the camera and stores it per body.
+
+    Returns the distance in mm the camera reported.
+
+    Raises RuntimeError if the camera is unavailable, the backend has no
+    focus lock, or the camera did not confirm the lock.
+    """
+    return _focus_lock_backend(camera_index).lock_focus(camera_index)
+
+
+def unlock_focus(camera_index: int) -> None:
+    """Release the focus lock of *camera_index* and clear its stored distance.
+
+    The camera then autofocuses on every picture. Raises as lock_focus does.
+    """
+    _focus_lock_backend(camera_index).unlock_focus(camera_index)
+
+
 def main():
     """
     Main entry point for testing the camera connectivity.

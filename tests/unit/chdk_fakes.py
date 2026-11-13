@@ -21,6 +21,10 @@ import threading
 from collections import namedtuple
 
 
+# Stands for a keyword argument the test did not pass.
+_UNSET = object()
+
+
 DeviceInfo = namedtuple("DeviceInfo", [
     "vendor_id", "product_id", "bus_num", "device_num", "serial_num",
 ])
@@ -167,6 +171,7 @@ class Body:
         zoom_steps=None,
         zoom=0,
         zoom_follows=True,
+        zoom_lands=None,
         zoom_error=None,
         port_numbers=None,
         capture_script_reads=0,
@@ -175,6 +180,14 @@ class Body:
         shot_chunks=None,
         always_ready=False,
         strict_scripts=True,
+        af_distance=1489,
+        focus=None,
+        focus_answer=_UNSET,
+        focus_follows=True,
+        focus_error=None,
+        set_focus_error=None,
+        aflock_error=None,
+        aflock_error_after=0,
     ):
         self.bus = bus
         self.address = address
@@ -239,11 +252,38 @@ class Body:
         # zoom was added, and 64 on an A2500 under CHDK 1.5.1. zoom is the
         # step get_zoom() reports. With zoom_follows, set_zoom(n) moves the
         # lens to n; without it the lens stays where it is, which is a camera
-        # that does not confirm the step. zoom_error is raised by set_zoom.
+        # that does not confirm the step. zoom_lands, when given, is the step
+        # the lens stops at for any set_zoom: a lens that moved but not to
+        # the step asked for. zoom_error is raised by set_zoom.
         self.zoom_steps = zoom_steps
         self.zoom = zoom
         self.zoom_follows = zoom_follows
+        self.zoom_lands = zoom_lands
         self.zoom_error = zoom_error
+        # Focus lock. af_distance is the distance in mm the camera's
+        # autofocus finds on a half-press; 1489 and 1557 were the answers of
+        # get_focus() on an A2500 on 12 November 2026. A script that starts
+        # with press('shoot_half') - the lock and the restore script -
+        # focuses at af_distance and sets the lock. focus is the distance
+        # get_focus() reports; focus_answer, when given, replaces every
+        # answer of get_focus() (None or 0 is a camera that reports no
+        # distance). With focus_follows, set_focus(d) moves the focus to d;
+        # without it the focus stays where it is, which is a camera that does
+        # not confirm the distance. focus_error is raised by the half-press
+        # scripts, set_focus_error by set_focus, aflock_error by set_aflock
+        # once aflock_error_after calls of set_aflock have succeeded.
+        # aflock is the lock as the camera holds it. A half-press while the
+        # lock is held does not focus again: the focus stays where it is.
+        self.af_distance = af_distance
+        self.focus = af_distance if focus is None else focus
+        self.focus_answer = focus_answer
+        self.focus_follows = focus_follows
+        self.focus_error = focus_error
+        self.set_focus_error = set_focus_error
+        self.aflock_error = aflock_error
+        self.aflock_error_after = aflock_error_after
+        self.aflock_calls = 0
+        self.aflock = False
         # Every switch_mode and lua_execute call, in the order made.
         self.events = []
         # Scripts and their running state. CHDK runs one script at a time, and
@@ -359,6 +399,35 @@ class Body:
 
     def _answer(self, lua_code):
         """What a Lua script returns on this body; may raise a scripted error."""
+        code = lua_code.strip()
+        if code.startswith("press('shoot_half')"):
+            if self.focus_error is not None:
+                raise self.focus_error
+            if not self.aflock:
+                self.focus = self.af_distance
+            self.aflock = True
+            return None
+        match = re.fullmatch(r"set_aflock\(([01])\)", code)
+        if match:
+            self.aflock_calls += 1
+            if (
+                self.aflock_error is not None
+                and self.aflock_calls > self.aflock_error_after
+            ):
+                raise self.aflock_error
+            self.aflock = match.group(1) == "1"
+            return None
+        match = re.fullmatch(r"set_focus\((-?\d+)\)", code)
+        if match:
+            if self.set_focus_error is not None:
+                raise self.set_focus_error
+            if self.focus_follows:
+                self.focus = int(match.group(1))
+            return None
+        if "get_focus()" in lua_code:
+            if self.focus_answer is not _UNSET:
+                return self.focus_answer
+            return self.focus
         if "get_zoom_steps" in lua_code:
             return self.zoom_steps
         if "get_zoom()" in lua_code:
@@ -367,7 +436,9 @@ class Body:
         if match:
             if self.zoom_error is not None:
                 raise self.zoom_error
-            if self.zoom_follows:
+            if self.zoom_lands is not None:
+                self.zoom = self.zoom_lands
+            elif self.zoom_follows:
                 self.zoom = int(match.group(1))
             return None
         if 'click("shoot_half")' in lua_code:
