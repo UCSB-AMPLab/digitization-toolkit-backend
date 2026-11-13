@@ -315,8 +315,11 @@ def test_the_backend_reports_what_it_can_do(monkeypatch):
     assert backend.supports_live_adjustment() is False
     capabilities = backend.get_capabilities()
     assert capabilities["live_preview"] is True
+    # Stepped optical zoom (NEH-231); digital "zoom" stays False.
+    assert capabilities["zoom_steps"] is True
     assert not any(
-        value for key, value in capabilities.items() if key != "live_preview"
+        value for key, value in capabilities.items()
+        if key not in ("live_preview", "zoom_steps")
     )
 
 

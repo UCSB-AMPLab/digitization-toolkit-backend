@@ -2155,6 +2155,7 @@ class GPhoto2Backend(CameraBackend):
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": False,
             "autofocus_calibration": False,
             "dslr_settings": True,
         }

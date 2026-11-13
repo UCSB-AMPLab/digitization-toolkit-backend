@@ -449,6 +449,45 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_zoom_step(value) -> bool:
+        """True for a value that can be a stored optical zoom step.
+
+        A step is a non-negative int, and not a bool. The upper bound is the
+        body's own get_zoom_steps() answer, which the registry does not hold;
+        the backend checks it against the camera.
+        """
+        return type(value) is int and value >= 0
+
+    def update_zoom_step(self, hardware_id: str, step: int) -> None:
+        """Persist the optical zoom step for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as orientation: the step is
+        a property of the physical body and its mounting, and has to follow
+        the body if it re-enumerates onto a different index. A body with no
+        "zoom_step" key has never had one set, and the backend leaves its
+        lens where it is.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            step: The zoom step, 0 at the widest.
+
+        Raises:
+            ValueError: step is not a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        if not self.is_valid_zoom_step(step):
+            raise ValueError(f"zoom step must be a non-negative integer; got {step!r}")
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            cameras["cameras"][hardware_id]["zoom_step"] = step
+            cameras["cameras"][hardware_id]["zoom_step_updated_at"] = \
+                datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())

@@ -277,8 +277,11 @@ def test_the_mode_is_confirmed_once_and_then_trusted(monkeypatch, tmp_path):
     backend.capture_image(tmp_path / "two.jpg", _config())
 
     assert body.mode_switches == ["record"]
+    # get_zoom_steps() is asked once on entering record mode. The fake body
+    # answers it with None by default, so no other zoom script follows.
     assert body.lua_calls == [
-        "enter_alt()", "return get_mode()", "enter_alt()"
+        "enter_alt()", "return get_mode()", "return get_zoom_steps()",
+        "enter_alt()",
     ], "get_mode is asked once; ALT mode is asserted on every capture"
     assert len(body.shots) == 2
 

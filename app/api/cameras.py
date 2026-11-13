@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -212,6 +212,11 @@ class DeviceInfo(BaseModel):
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+	# Stepped optical zoom (CHDK backend only): how many steps the lens has,
+	# and the step the backend last confirmed on the camera. Null until the
+	# camera has reported them, and always null on other backends.
+	zoom_steps: Optional[int] = None
+	zoom_step: Optional[int] = None
 	# Which pages this body shoots: "odd", "even", or null when it has no
 	# parity (CHDK backend only; the file that carries it lives on the card).
 	# Not a side of the table - left and right are the kiosk's swap toggle.
@@ -406,6 +411,8 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			orientation=orientation,
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
+			zoom_steps=dev.get("zoom_steps"),
+			zoom_step=dev.get("zoom_step"),
 			side=dev.get("side"),
 			error=dev.get("error"),
 		))
@@ -557,6 +564,7 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	        "focus_control": false,
 	        "live_controls": false,
 	        "zoom": false,
+	        "zoom_steps": false,
 	        "autofocus_calibration": false,
 	        "dslr_settings": true
 	    }
@@ -702,6 +710,7 @@ class CameraSettingsRequest(BaseModel):
 	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ~ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
 	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
+	zoom_step: Optional[StrictInt] = None     # Stepped optical zoom, 0 = widest (CHDK backend); a bool or a float is refused
 
 
 @router.post("/settings/{camera_index}")
@@ -710,7 +719,16 @@ def apply_camera_settings(
 	request: CameraSettingsRequest,
 	current_user: User = Depends(allow_contributor),
 ):
-	"""Apply live camera controls without triggering a capture."""
+	"""Apply live camera controls without triggering a capture.
+
+	zoom_step moves a CHDK body's optical zoom to that step and stores it for
+	the body, which applies it again each time the body enters record mode.
+	A backend without stepped zoom answers 501, a step outside the camera's
+	range 422 with the range in the detail, a camera that is not connected
+	404, and a camera that did not take the step 502 (a timeout, a wire
+	failure, a lens that reports another step, or no zoom steps reported). The response carries the step the camera
+	confirmed as "zoom_step".
+	"""
 	try:
 		from capture.service import set_camera_controls
 	except ImportError as e:
@@ -742,17 +760,62 @@ def apply_camera_settings(
 			logger.exception(f"apply_zoom failed for camera {camera_index}: {e}")
 			raise HTTPException(status_code=500, detail="Failed to apply zoom")
 
+	# Stepped optical zoom is a CHDK body's own lens, set by step number; it
+	# is not the ScalerCrop zoom above.
+	applied: dict = {}
+	if request.zoom_step is not None:
+		applied["zoom_step"] = _apply_zoom_step(camera_index, request.zoom_step)
+
 	if not controls and request.zoom_factor is None:
+		if applied:
+			return {"detail": "Zoom step applied", **applied}
 		return {"detail": "No controls specified"}
 
 	try:
 		set_camera_controls(camera_index, controls)
-		return {"detail": "Controls applied", "controls": list(controls.keys())}
+		return {"detail": "Controls applied", "controls": list(controls.keys()), **applied}
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
 		logger.exception(f"apply_camera_settings failed for camera {camera_index}: {e}")
 		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
+
+
+def _apply_zoom_step(camera_index: int, step: int) -> int:
+	"""Set a stepped optical zoom step and return the step the camera confirmed."""
+	from app.core.storage_override import StorageUnavailableError
+
+	try:
+		from capture.service import apply_zoom_step, get_backend
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("zoom_steps", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no stepped optical "
+				"zoom; zoom_step applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import ZoomFailedError
+
+	try:
+		return apply_zoom_step(camera_index, step)
+	except ValueError as e:
+		raise HTTPException(status_code=422, detail=str(e))
+	except StorageUnavailableError:
+		raise
+	except ZoomFailedError as e:
+		logger.error(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to apply zoom step")
 
 
 def _is_capture_timeout(exc: BaseException) -> bool:
