@@ -34,6 +34,29 @@ class PTPError(Exception):
         super().__init__(message or f"PTP error 0x{code:04x}")
 
 
+class ScriptSentWhileRunning(BaseException):
+    """A script reached a fake body while another script was still running on it.
+
+    CHDK's ExecuteScript kills a running script unless the request carries
+    the NOKILL flag. On 12 November 2026 the backend sent enter_alt() 0.2 s
+    after a capture's last chunk, while that capture script was still running,
+    and the next picture was delivered without its first 17920 bytes. The fake
+    raises this whenever a script arrives over a running one. It derives from
+    BaseException so that the backend's own `except Exception` handlers cannot
+    turn it into an ordinary failed capture: the test fails instead.
+    """
+
+
+# CHDK's script message types (core/ptp.h), as pychdk's MessageType has them.
+MSG_NONE = 0
+MSG_ERR = 1
+MSG_RET = 2
+
+ScriptMessage = namedtuple(
+    "ScriptMessage", ["msg_type", "data_type", "script_id", "value"]
+)
+
+
 class TransportError(Exception):
     """Stands in for usb.core.USBError, which is not a PTPError.
 
@@ -146,6 +169,12 @@ class Body:
         zoom_follows=True,
         zoom_error=None,
         port_numbers=None,
+        capture_script_reads=0,
+        script_reads=None,
+        script_reads_after_return=None,
+        shot_chunks=None,
+        always_ready=False,
+        strict_scripts=True,
     ):
         self.bus = bus
         self.address = address
@@ -217,6 +246,54 @@ class Body:
         self.zoom_error = zoom_error
         # Every switch_mode and lua_execute call, in the order made.
         self.events = []
+        # Scripts and their running state. CHDK runs one script at a time, and
+        # ScriptStatus reports whether one is running. Here a running script
+        # is a countdown: running_reads is how many more status reads report
+        # it running; the read that brings it to zero still reports running,
+        # and the next one does not. capture_script_reads is the countdown a
+        # capture leaves behind once its last chunk has been delivered: on
+        # 12 November 2026 the capture script was still running for a short
+        # while after the host had the picture. script_reads maps a substring
+        # of a Lua script to the countdown that script starts, so a set_zoom
+        # can be made to keep running while the lens travels.
+        self.capture_script_reads = capture_script_reads
+        self.script_reads = dict(script_reads or {})
+        # The same, for a script whose RET message is posted at once and
+        # which goes on running afterwards: a host that returns on the RET
+        # finds it still running.
+        self.script_reads_after_return = dict(script_reads_after_return or {})
+        self.running_reads = 0
+        self.running_script = None
+        self.status_reads = 0
+        # Every script that reached the body, in order: its text (or
+        # "<capture>" and "switch_mode_usb(...)" for the two the library
+        # sends itself), the ExecuteScript flags when the backend sent it
+        # (None when the library did), and whether a script was running when
+        # it arrived. With strict_scripts, a script arriving over a running
+        # one raises ScriptSentWhileRunning instead of being recorded.
+        self.scripts = []
+        self.strict_scripts = strict_scripts
+        self.messages = []
+        self._pending_message = None
+        self._next_script_id = 1
+        # Remote capture, chunk by chunk. Each chunk is (bytes, more,
+        # position) as PTP_CHDK_RemoteCaptureGetData describes it: more is
+        # False on the chunk the camera flags last, and position is the seek
+        # (-1 for none). shot_chunks holds one chunk list per shot; when it is
+        # used up, a shot is the whole of `image` in one chunk. The fake's
+        # shoot assembles a picture the way pychdk 0.1.3's
+        # remote_capture_get_data does: it stops at the first chunk flagged
+        # last, zero-fills anything a seek skips over, and leaves the chunks
+        # after that one ready on the camera, where the next shot picks them
+        # up first. ready_chunks is what the camera still offers;
+        # discarded_chunks what a drain read and threw away. always_ready is
+        # a camera that never stops offering data.
+        self.shot_chunks = [list(chunks) for chunks in (shot_chunks or [])]
+        self.ready_chunks = []
+        self.discarded_chunks = []
+        self.always_ready = always_ready
+        self.last_chunks = 0
+        self.last_shot_chunks = []
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -245,6 +322,103 @@ class Body:
         gate = self.gates.pop(name, None)
         if gate is not None:
             gate.arrive()
+
+    def _script_arrives(self, script, flags):
+        """Record a script reaching the camera; refuse one sent over another."""
+        running = self.running_reads > 0
+        if running and self.strict_scripts:
+            raise ScriptSentWhileRunning(
+                f"{script!r} was sent while {self.running_script!r} was still "
+                "running on the camera"
+            )
+        self.scripts.append(
+            {"script": script, "flags": flags, "while_running": running}
+        )
+
+    def _start_running(self, script, reads, message=None):
+        """Leave a script running for `reads` status reads, then post `message`."""
+        if reads > 0:
+            self.running_reads = reads
+            self.running_script = script
+            self._pending_message = message
+        elif message is not None:
+            self.messages.append(message)
+
+    def _status(self):
+        """One ScriptStatus read: (running, has_messages)."""
+        self.status_reads += 1
+        running = self.running_reads > 0
+        if running:
+            self.running_reads -= 1
+            if self.running_reads == 0:
+                self.running_script = None
+                if self._pending_message is not None:
+                    self.messages.append(self._pending_message)
+                    self._pending_message = None
+        return running, bool(self.messages)
+
+    def _answer(self, lua_code):
+        """What a Lua script returns on this body; may raise a scripted error."""
+        if "get_zoom_steps" in lua_code:
+            return self.zoom_steps
+        if "get_zoom()" in lua_code:
+            return self.zoom
+        match = re.fullmatch(r"set_zoom\((-?\d+)\)", lua_code.strip())
+        if match:
+            if self.zoom_error is not None:
+                raise self.zoom_error
+            if self.zoom_follows:
+                self.zoom = int(match.group(1))
+            return None
+        if 'click("shoot_half")' in lua_code:
+            self.half_presses += 1
+            if self.half_press_arrives:
+                self._reads_until_record = self.half_press_reads
+            return None
+        if "get_mode" in lua_code:
+            if self._reads_until_record is not None:
+                if self._reads_until_record == 0:
+                    self._reads_until_record = None
+                    self.mode_value = True
+                else:
+                    self._reads_until_record -= 1
+            return self.mode_value
+        return None
+
+    def _reads_for(self, lua_code):
+        for fragment, reads in self.script_reads.items():
+            if fragment in lua_code:
+                return reads
+        return 0
+
+    def _take_picture(self):
+        """Assemble one shot the way pychdk 0.1.3 does, and leave the rest ready."""
+        if self.shot_chunks:
+            planned = self.shot_chunks.pop(0)
+        elif self.image:
+            planned = [(self.image, False, -1)]
+        else:
+            planned = []
+        chunks = self.ready_chunks + planned
+        self.ready_chunks = []
+        picture = bytearray()
+        cursor = 0
+        used = []
+        for number, (data, more, position) in enumerate(chunks):
+            used.append((len(data), more, position))
+            if position >= 0:
+                cursor = position
+            end = cursor + len(data)
+            if len(picture) < end:
+                picture.extend(bytes(end - len(picture)))
+            picture[cursor:end] = data
+            cursor = end
+            if not more:
+                self.ready_chunks = chunks[number + 1:]
+                break
+        self.last_chunks = len(used)
+        self.last_shot_chunks = used
+        return bytes(picture)
 
     def _opened(self):
         with self._live_lock:
@@ -294,6 +468,66 @@ class _FakeChdkPTP:
             raise self._body.version_error
         return (2, 9)
 
+    @property
+    def last_capture_chunks(self):
+        """pychdk 0.1.3 keeps only the count of the last capture's chunks."""
+        return self._body.last_chunks
+
+    def get_script_status(self):
+        return self._body._status()
+
+    def read_script_message(self):
+        if self._body.messages:
+            return self._body.messages.pop(0)
+        return ScriptMessage(MSG_NONE, 1, 0, None)
+
+    def drain_messages(self):
+        self._body.messages.clear()
+
+    def execute_script(self, script, language=0, flags=0):
+        """Start a script. A Lua `return` posts a RET message when it ends."""
+        body = self._body
+        body._script_arrives(script, flags)
+        body.lua_calls.append(script)
+        body.events.append(("lua", script))
+        if body.lua_error is not None:
+            raise body.lua_error
+        value = body._answer(script)
+        script_id = body._next_script_id
+        body._next_script_id += 1
+        message = (
+            ScriptMessage(MSG_RET, 0, script_id, value)
+            if script.lstrip().startswith("return") else None
+        )
+        after = next(
+            (reads for fragment, reads in body.script_reads_after_return.items()
+             if fragment in script),
+            0,
+        )
+        if after:
+            if message is not None:
+                body.messages.append(message)
+            body._start_running(script, after)
+        else:
+            body._start_running(script, body._reads_for(script), message)
+        return script_id
+
+    def remote_capture_is_ready(self):
+        if self._body.always_ready or self._body.ready_chunks:
+            return True, 0x01
+        return False, 0
+
+    def remote_capture_get_chunk(self, format_flag):
+        body = self._body
+        if body.ready_chunks:
+            chunk = body.ready_chunks.pop(0)
+        elif body.always_ready:
+            chunk = (b"\x00" * 16, True, -1)
+        else:
+            raise PTPError(0x2002, "no remote capture data")
+        body.discarded_chunks.append((len(chunk[0]), chunk[1], chunk[2]))
+        return chunk
+
     def get_display_data(self, flags=0):
         self._body.frames_served += 1
         self._body._pass("frame")
@@ -318,7 +552,14 @@ class FakeChdkDevice:
     def is_connected(self):
         return self._connected
 
+    @property
+    def last_capture_chunks(self):
+        return self._chdk.last_capture_chunks
+
     def switch_mode(self, mode):
+        self._body._script_arrives(
+            f"switch_mode_usb({1 if mode == 'record' else 0})", None
+        )
         self._body.mode_switches.append(mode)
         self._body.events.append(("switch", mode))
         self._body._pass("switch_mode")
@@ -338,36 +579,14 @@ class FakeChdkDevice:
         self._body.mode_value = mode == "record"
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
+        """pychdk's lua_execute: one script, waited on until it returns."""
+        self._body._script_arrives(lua_code, None)
         self._body.lua_calls.append(lua_code)
         self._body.lua_timeouts.append(timeout)
         self._body.events.append(("lua", lua_code))
         if self._body.lua_error is not None:
             raise self._body.lua_error
-        if "get_zoom_steps" in lua_code:
-            return self._body.zoom_steps
-        if "get_zoom()" in lua_code:
-            return self._body.zoom
-        match = re.fullmatch(r"set_zoom\((-?\d+)\)", lua_code.strip())
-        if match:
-            if self._body.zoom_error is not None:
-                raise self._body.zoom_error
-            if self._body.zoom_follows:
-                self._body.zoom = int(match.group(1))
-            return None
-        if 'click("shoot_half")' in lua_code:
-            self._body.half_presses += 1
-            if self._body.half_press_arrives:
-                self._body._reads_until_record = self._body.half_press_reads
-            return None
-        if "get_mode" in lua_code:
-            if self._body._reads_until_record is not None:
-                if self._body._reads_until_record == 0:
-                    self._body._reads_until_record = None
-                    self._body.mode_value = True
-                else:
-                    self._body._reads_until_record -= 1
-            return self._body.mode_value
-        return None
+        return self._body._answer(lua_code)
 
     def download_file(self, remote_path):
         self._body._pass("download")
@@ -386,11 +605,15 @@ class FakeChdkDevice:
         self._body.card = payload
 
     def shoot(self, **kwargs):
+        """pychdk's shoot(stream=True): it sends the capture script itself."""
+        self._body._script_arrives("<capture>", None)
         self._body.shots.append(kwargs)
         self._body._pass("shoot")
         if self._body.shoot_error is not None:
             raise self._body.shoot_error
-        return self._body.image
+        picture = self._body._take_picture()
+        self._body._start_running("<capture>", self._body.capture_script_reads)
+        return picture
 
     def close(self):
         self._connected = False
@@ -564,10 +787,23 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
 
     monkeypatch.setattr(cb, "pychdk", fake)
     monkeypatch.setattr(cb, "_PYCHDK_AVAILABLE", True)
-    # The backend waits through its module's _sleep; the tests record the
-    # waits on the fake instead of spending them.
+    # The backend waits through its module's _sleep and reads time through
+    # its _monotonic; the tests record the waits on the fake instead of
+    # spending them, and a wait moves the fake's clock on by its length.
+    # fake.advance moves the clock without a wait.
     fake.sleeps = []
-    monkeypatch.setattr(cb, "_sleep", fake.sleeps.append)
+    fake.now = 1000.0
+
+    def sleep(seconds):
+        fake.sleeps.append(seconds)
+        fake.now += seconds
+
+    def advance(seconds):
+        fake.now += seconds
+
+    fake.advance = advance
+    monkeypatch.setattr(cb, "_sleep", sleep)
+    monkeypatch.setattr(cb, "_monotonic", lambda: fake.now)
     backend = cb.ChdkBackend(logging.getLogger(logger_name))
     backend._registry_factory = lambda: registry
     return backend

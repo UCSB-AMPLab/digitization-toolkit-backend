@@ -59,6 +59,7 @@ Version: 0.1.0-beta
 
 import contextlib
 import errno
+import io
 import os
 import secrets
 import struct
@@ -238,6 +239,75 @@ _ALT_REASSERT_INTERVAL_S = 30.0
 _GET_ZOOM_STEPS_LUA = "return get_zoom_steps()"
 _GET_ZOOM_LUA = "return get_zoom()"
 _SET_ZOOM_TIMEOUT_S = 15.0
+
+# One script at a time. CHDK runs one script at a time, and its ExecuteScript
+# kills a running script unless the request carries PTP_CHDK_SCRIPT_FL_NOKILL
+# (0x100 in CHDK's core/ptp.h; pychdk 0.1.3 names it ScriptFlag.NOKILL), in
+# which case the camera refuses the new script instead.
+#
+# What happened on 12 November 2026, from a USB recording of an A2500 under
+# CHDK 1.5.1 driven through pychdk 0.1.3: the capture script
+# (init_usb_capture(1) ... shoot()) was still running on the camera for a
+# short while after the host had received the picture's last chunk, and
+# pychdk's shoot() returns as soon as the data is in. The backend sent its
+# next script, enter_alt(), 0.2 s after the last chunk, while that capture
+# script was still running, and CHDK killed it. The next shot's picture then
+# arrived with the camera's per-shot remote-capture state not reset: its first
+# chunk came flagged last (response parameters 1461760/0/17920, that is
+# more=0 with a seek to offset 17920). pychdk stopped there, zero-filled the
+# first 17920 bytes and returned 1,479,680 bytes, and the backend logged
+# "remote capture ok". The next three captures each received one leftover
+# chunk of that picture within 0.3 s, with no exposure, and were logged as ok
+# too. Of 257 captures that day, the only ones affected were those where a
+# running script was killed right after capture data; every healthy capture
+# had at least 2.5 s before the next script.
+#
+# So every script the backend sends goes through _script, which reads the
+# script status first and waits while a script is running, for up to
+# _SCRIPT_END_WAIT_S. That check is the only place a script is waited for
+# before another is sent. A whole capture returns as soon as its picture has
+# passed the completeness check, without waiting for its script to end: on
+# two A2500 bodies one camera's capture script ended about 0.5 s after its
+# data and the other's at once, and waiting there made every pair about
+# 0.5 s slower even when pairs were seconds apart. The next script sent to
+# that body waits instead. Status reads are not scripts and are always
+# allowed, as are RemoteCaptureIsReady and RemoteCaptureGetData.
+_SCRIPT_NOKILL = 0x100
+_SCRIPT_POLL_INTERVAL_S = 0.1
+_SCRIPT_END_WAIT_S = 10.0
+# A wait for a running script longer than this is logged as a warning.
+_SCRIPT_SLOW_WAIT_S = 2.0
+# How long a Lua script the backend sends is waited on, and how often its
+# status is read meanwhile. These are pychdk 0.1.3's execute_lua_wait
+# defaults, which the backend used before it sent scripts itself.
+_LUA_TIMEOUT_S = 10.0
+_LUA_POLL_INTERVAL_S = 0.05
+# CHDK's script message types (ptp_chdk_script_msg_type, core/ptp.h).
+_MSG_ERR = 1
+_MSG_RET = 2
+
+# A refused picture leaves the camera's capture state unknown, so before the
+# body is used again the backend drains it: it waits for any script to end,
+# reads and discards remote-capture data while the camera offers any (at most
+# _DRAIN_MAX_CHUNKS chunks and _DRAIN_WAIT_S seconds), and then sends
+# init_usb_capture(0) to clear the camera's capture state. A body that cannot
+# be drained is dropped.
+_DRAIN_MAX_CHUNKS = 8
+_DRAIN_WAIT_S = 10.0
+_REMOTE_CAP_JPEG = 0x01
+_CLEAR_CAPTURE_LUA = "init_usb_capture(0)"
+
+# A JPEG begins with the start-of-image marker and ends with the end-of-image
+# marker. The 16:53 picture began with 17920 zero bytes.
+_JPEG_START = b"\xff\xd8"
+_JPEG_END = b"\xff\xd9"
+# The Canon maker note (EXIF tag 0x927C) carries the image file number as tag
+# 0x0008, a LONG; on 12 November 2026 two consecutive A2500 pictures carried
+# 1490830 and 1490831.
+_EXIF_IFD = 0x8769
+_EXIF_MAKE = 0x010F
+_EXIF_MAKER_NOTE = 0x927C
+_CANON_FILE_NUMBER = 0x0008
 
 # How pychdk 0.1.3's switch_mode says the camera never reported record mode.
 # It raises a plain RuntimeError, as it does for a script that would not
@@ -530,6 +600,62 @@ class _IdentityChangedError(RuntimeError):
     """The body locked for a retry is not the one the retry was meant for."""
 
 
+class IncompleteCaptureError(RuntimeError):
+    """The camera delivered a picture that is not whole, and it was not saved.
+
+    The message says what was wrong and names the port. The capture is not
+    retried: the operator has to see that it failed and take it again.
+    """
+
+
+class _ScriptStillRunningError(TimeoutError):
+    """A script was still running on the camera when the wait for it ran out.
+
+    A TimeoutError, so a capture reports it as a capture timeout and every
+    operation evicts the body as it does for any other timeout.
+    """
+
+
+def _canon_file_number(image):
+    """The Canon image file number in a JPEG's EXIF maker note, or None.
+
+    Pillow opens the JPEG lazily and reads only its header segments, so this
+    does not decode the picture. A picture with no EXIF, one that is not from
+    a Canon camera, or one whose maker note has no tag 0x0008 of type LONG
+    gives None.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image)) as picture:
+            exif = picture.getexif()
+            make = exif.get(_EXIF_MAKE)
+            note = exif.get_ifd(_EXIF_IFD).get(_EXIF_MAKER_NOTE)
+            endian = getattr(exif, "endian", None) or "<"
+    except Exception:
+        return None
+    if isinstance(make, bytes):
+        make = make.decode("ascii", errors="ignore")
+    if not isinstance(make, str) or not make.strip().lower().startswith("canon"):
+        return None
+    if not isinstance(note, bytes) or len(note) < 2:
+        return None
+    try:
+        (count,) = struct.unpack_from(endian + "H", note, 0)
+        for entry in range(count):
+            offset = 2 + 12 * entry
+            if offset + 12 > len(note):
+                return None
+            tag, kind, number, value = struct.unpack_from(
+                endian + "HHII", note, offset
+            )
+            if tag == _CANON_FILE_NUMBER and kind == 4 and number == 1:
+                return value
+    except struct.error:
+        return None
+    return None
+
+
 class ZoomFailedError(RuntimeError):
     """The camera did not take a requested zoom step.
 
@@ -635,6 +761,9 @@ class _ChdkBody:
         # backend last read back with get_zoom(); None until known.
         self.zoom_steps = None
         self.zoom_step = None
+        # The Canon image file number of the last picture saved from this
+        # body, when its EXIF carried one; None otherwise.
+        self.last_file_number = None
         # Live view instrumentation. The geometry is logged on the first frame
         # only; the rate every _FRAME_LOG_INTERVAL frames.
         self.geometry_logged = False
@@ -1555,8 +1684,16 @@ class ChdkBackend(CameraBackend):
                     stage = "entering ALT mode"
                     self._assert_alt(body)
                 stage = "remote capture"
-                image = body.device.shoot(
-                    stream=True, shutter_speed=shutter, market_iso=iso
+                # pychdk's shoot() sends the capture script itself, without
+                # the NOKILL flag, so the status check in _script is the only
+                # guard on it. shoot() returns once the data is in, and the
+                # capture script can still be running then; the next script
+                # sent to this body waits for it in _script.
+                image = self._script(
+                    body, "the capture script",
+                    lambda: body.device.shoot(
+                        stream=True, shutter_speed=shutter, market_iso=iso
+                    ),
                 )
             except TimeoutError as exc:
                 elapsed = time.perf_counter() - started
@@ -1609,6 +1746,10 @@ class ChdkBackend(CameraBackend):
                     f"CHDK capture on {body.port} returned no image data"
                 )
 
+            problem, file_number = self._picture_problem(body, image)
+            if problem is not None:
+                self._refuse_picture(camera_index, body, image, problem)
+
             atomic_write(
                 destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
             )
@@ -1617,8 +1758,246 @@ class ChdkBackend(CameraBackend):
                 f"{len(image)} bytes in {elapsed:.2f}s from shutter to disk, "
                 f"saved as {destination.name}"
             )
+            body.last_file_number = file_number
             self._take_model_from_picture(body, destination)
             return str(destination), None
+
+    def _picture_problem(self, body, image):
+        """Say what is wrong with a picture, or None when it is whole.
+
+        Returns (problem, file_number). problem is a plain sentence fragment
+        or None; file_number is the Canon image file number read from the
+        picture's EXIF, or None when it cannot be read.
+
+        pychdk 0.1.3 keeps only a count of the chunks a capture arrived in
+        (last_capture_chunks), not their sizes, seek positions or "more"
+        flags, so the backend cannot check that the chunks covered the whole
+        file. A picture assembled around a hole at its start begins with the
+        zero bytes pychdk filled the hole with, so the start marker check
+        refuses it. A hole further in, between a whole header and a whole
+        tail, is not detected here.
+        """
+        if image[:2] != _JPEG_START:
+            return (
+                "it does not begin with the JPEG start marker FF D8 (it "
+                f"begins with {image[:2].hex(' ').upper()}), so the camera "
+                "sent it without its beginning",
+                None,
+            )
+        if image[-2:] != _JPEG_END:
+            return (
+                "it does not end with the JPEG end marker FF D9, so the "
+                "camera sent it without its end",
+                None,
+            )
+        file_number = _canon_file_number(image)
+        if (
+            file_number is not None
+            and body.last_file_number is not None
+            and file_number == body.last_file_number
+        ):
+            return (
+                f"it carries the same image file number, {file_number}, as "
+                "the previous picture from this camera",
+                file_number,
+            )
+        return None, file_number
+
+    def _refuse_picture(self, camera_index, body, image, problem):
+        """Log a picture that is not whole, drain the body, and raise.
+
+        Nothing is written. The body is drained so that the next capture
+        starts clean, or dropped when it cannot be drained. The capture is
+        not retried.
+
+        Raises:
+            IncompleteCaptureError: Always.
+        """
+        chunks = getattr(body.device, "last_capture_chunks", None)
+        self.logger.error(
+            f"[chdk] body {camera_index} ({body.port}): remote capture "
+            f"refused, {problem}: {len(image)} bytes in {chunks} chunk(s) "
+            "(pychdk 0.1.3 reports only the number of chunks); nothing was "
+            "saved"
+        )
+        drained = self._drain_capture(camera_index, body)
+        message = (
+            f"The picture from {body.port} is not whole: {problem}. It was "
+            "not saved. Take the picture again."
+        )
+        if not drained:
+            message += (
+                " The camera's capture state could not be cleared, so the "
+                "camera was disconnected; it is opened again on the next scan."
+            )
+        raise IncompleteCaptureError(message)
+
+    def _drain_capture(self, camera_index, body):
+        """Clear what a refused capture left on the camera. False if it could not.
+
+        Only requests that are not scripts are used until no script is
+        running: the script status is read until no script runs (for up to
+        _SCRIPT_END_WAIT_S), and remote-capture data is read and discarded
+        while the camera reports any ready, at most _DRAIN_MAX_CHUNKS chunks
+        and for at most _DRAIN_WAIT_S seconds. Then init_usb_capture(0) is sent through
+        _script to clear the camera's capture state. A failure of any step
+        drops the body.
+        """
+        discarded = []
+        try:
+            self._wait_for_no_script(body)
+            chdk = body.device._chdk
+            started = _monotonic()
+            while True:
+                ready, status = chdk.remote_capture_is_ready()
+                if not ready:
+                    break
+                if (
+                    len(discarded) >= _DRAIN_MAX_CHUNKS
+                    or _monotonic() - started >= _DRAIN_WAIT_S
+                ):
+                    raise RuntimeError(
+                        "the camera still offered capture data after "
+                        f"{len(discarded)} chunks had been discarded"
+                    )
+                wanted = (
+                    _REMOTE_CAP_JPEG if status & _REMOTE_CAP_JPEG
+                    else status & -status
+                )
+                data, more, position = chdk.remote_capture_get_chunk(wanted)
+                discarded.append((len(data), more, position))
+            self._send_lua(body, _CLEAR_CAPTURE_LUA)
+        except Exception as exc:
+            named = _name_failure(exc)
+            self.logger.error(
+                f"[chdk] body {camera_index} ({body.port}): clearing the "
+                f"camera's capture state failed with {named}: {exc}; "
+                f"discarded chunks (size, more, seek): {discarded}"
+            )
+            self._evict(body, f"clearing the capture state failed with {named}")
+            return False
+        self.logger.warning(
+            f"[chdk] body {camera_index} ({body.port}): capture state cleared; "
+            f"discarded chunks (size, more, seek): {discarded}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Scripts
+    # ------------------------------------------------------------------
+
+    def _wait_for_no_script(self, body, limit=_SCRIPT_END_WAIT_S):
+        """Read the script status until no script is running on the body.
+
+        The status is read every _SCRIPT_POLL_INTERVAL_S for up to `limit`
+        seconds. A read is not a script, so it never disturbs one. Callers
+        hold the body's lock.
+
+        Returns:
+            (reads, seconds): how many status reads it took, and how long.
+
+        Raises:
+            _ScriptStillRunningError: A script is still running at the end.
+        """
+        chdk = body.device._chdk
+        started = _monotonic()
+        deadline = started + limit
+        most = int(round(limit / _SCRIPT_POLL_INTERVAL_S)) + 1
+        reads = 0
+        while True:
+            running, _ = chdk.get_script_status()
+            reads += 1
+            if not running:
+                return reads, _monotonic() - started
+            if reads >= most or _monotonic() >= deadline:
+                raise _ScriptStillRunningError(
+                    f"a script was still running on the camera after "
+                    f"{limit:.1f}s"
+                )
+            _sleep(_SCRIPT_POLL_INTERVAL_S)
+
+    def _script(self, body, what, send):
+        """Send one script to the body, once no script is running on it.
+
+        Every script the backend sends goes through here: the Lua it sends
+        itself (by way of _send_lua) and the scripts pychdk's shoot() and
+        switch_mode() send. `what` names the script for the log. The script
+        status is read once, and while a script is running it is read again
+        every _SCRIPT_POLL_INTERVAL_S for up to _SCRIPT_END_WAIT_S. A wait is
+        logged at debug, or at warning when it took more than
+        _SCRIPT_SLOW_WAIT_S. A script still running at the end fails the
+        operation as a timeout does, and `send` is not called.
+
+        This is where the capture script that a previous capture left
+        running is waited for: a capture returns as soon as its picture is
+        whole.
+
+        Returns:
+            Whatever `send` returns.
+        """
+        reads, waited = self._wait_for_no_script(body)
+        if reads > 1:
+            line = (
+                f"[chdk] {body.port}: waited {waited:.2f}s ({reads} status "
+                f"reads) for a running script to end before sending {what}"
+            )
+            if waited > _SCRIPT_SLOW_WAIT_S:
+                self.logger.warning(line)
+            else:
+                self.logger.debug(line)
+        return send()
+
+    def _send_lua(self, body, code, timeout=_LUA_TIMEOUT_S):
+        """Run one Lua script with the NOKILL flag and return its result.
+
+        This does what pychdk 0.1.3's lua_execute does (execute_lua_wait:
+        clear stale messages, start the script, wait for its RET message),
+        with two differences: the script is started with NOKILL, so a camera
+        that is still running a script refuses this one instead of killing
+        the other, and the waits go through _sleep and _monotonic.
+
+        Returns:
+            The script's first return value, or None when it ended without
+            one.
+
+        Raises:
+            _ScriptStillRunningError: A script was running and did not end.
+            RuntimeError: The camera refused the script or reported an error.
+            TimeoutError: The script did not finish within `timeout`.
+        """
+        return self._script(
+            body, code, lambda: self._run_lua(body, code, timeout)
+        )
+
+    def _run_lua(self, body, code, timeout):
+        chdk = body.device._chdk
+        chdk.drain_messages()
+        script_id = chdk.execute_script(code, flags=_SCRIPT_NOKILL)
+        deadline = _monotonic() + timeout
+        # A bound on reads as well as on time, so a clock that does not move
+        # cannot keep this loop going.
+        most = int(round(timeout / _LUA_POLL_INTERVAL_S)) + 1
+        reads = 0
+        while True:
+            running, has_messages = chdk.get_script_status()
+            reads += 1
+            if has_messages:
+                message = chdk.read_script_message()
+                if message.script_id == script_id:
+                    if message.msg_type == _MSG_RET:
+                        return message.value
+                    if message.msg_type == _MSG_ERR:
+                        raise RuntimeError(
+                            f"Script error in {code!r}: {message.value}"
+                        )
+            elif not running:
+                return None
+            if reads >= most or _monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Script {code!r} did not complete within {timeout}s"
+                )
+            if not has_messages:
+                _sleep(_LUA_POLL_INTERVAL_S)
 
     def _take_model_from_picture(self, body, path):
         """Set the body's model from the EXIF Model tag of the picture just saved.
@@ -1791,7 +2170,7 @@ class ChdkBackend(CameraBackend):
 
     def _assert_alt(self, body):
         """Send enter_alt() and note when. A failure propagates and notes nothing."""
-        body.device.lua_execute(_ENTER_ALT_LUA)
+        self._send_lua(body, _ENTER_ALT_LUA)
         body.alt_asserted_at = _monotonic()
 
     def _ensure_record_mode(self, body):
@@ -1856,25 +2235,31 @@ class ChdkBackend(CameraBackend):
         # switch is attempted after it.
         self._assert_alt(body)
         try:
-            body.device.switch_mode("record")
+            # pychdk's switch_mode() sends switch_mode_usb itself, without
+            # the NOKILL flag, so the status check in _script is the only
+            # guard on it.
+            self._script(
+                body, "switch_mode_usb(1)",
+                lambda: body.device.switch_mode("record"),
+            )
         except RuntimeError as exc:
             if not str(exc).startswith(_PYCHDK_DID_NOT_SWITCH):
                 raise
             not_arrived = exc
         else:
             not_arrived = None
-            if body.device.lua_execute("return get_mode()"):
+            if self._send_lua(body, "return get_mode()"):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
                 self._settle_zoom(body)
                 return True
 
-        body.device.lua_execute(_HALF_PRESS_LUA)
+        self._send_lua(body, _HALF_PRESS_LUA)
         waited = 0.0
         while waited < _RECORD_MODE_HALF_PRESS_WAIT_S:
             _sleep(_RECORD_MODE_POLL_INTERVAL_S)
             waited += _RECORD_MODE_POLL_INTERVAL_S
-            if body.device.lua_execute("return get_mode()"):
+            if self._send_lua(body, "return get_mode()"):
                 body.in_record_mode = True
                 self.logger.info(
                     f"[chdk] {body.port}: switched to record mode after a "
@@ -1900,21 +2285,22 @@ class ChdkBackend(CameraBackend):
         The answer is recorded as body.zoom_step when it is an int, and as
         None otherwise. Callers hold the body's lock.
         """
-        answer = body.device.lua_execute(_GET_ZOOM_LUA)
+        answer = self._send_lua(body, _GET_ZOOM_LUA)
         body.zoom_step = answer if type(answer) is int else None
         return body.zoom_step
 
     def _move_zoom(self, body, step):
         """Send set_zoom(step), then read the step back.
 
-        lua_execute waits for set_zoom to finish before it returns, so the
-        read-back is never sent while set_zoom is still running. A timeout
+        _send_lua waits for set_zoom to finish before it returns, and _script
+        reads the script status before the read-back, so the read-back is
+        never sent while set_zoom is still running. A timeout
         or an error from either script propagates and nothing more is sent.
 
         Raises:
             _ZoomNotConfirmedError: The camera reports another step.
         """
-        body.device.lua_execute(f"set_zoom({step})", timeout=_SET_ZOOM_TIMEOUT_S)
+        self._send_lua(body, f"set_zoom({step})", timeout=_SET_ZOOM_TIMEOUT_S)
         reported = self._read_zoom(body)
         if reported != step:
             raise _ZoomNotConfirmedError(
@@ -1957,7 +2343,7 @@ class ChdkBackend(CameraBackend):
         operation carries on. A timeout or a wire failure propagates.
         """
         if body.zoom_steps is None:
-            answer = body.device.lua_execute(_GET_ZOOM_STEPS_LUA)
+            answer = self._send_lua(body, _GET_ZOOM_STEPS_LUA)
             if type(answer) is not int or answer <= 0:
                 self.logger.warning(
                     f"[chdk] {body.port}: get_zoom_steps() answered "
