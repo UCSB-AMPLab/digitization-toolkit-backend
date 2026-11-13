@@ -489,45 +489,73 @@ class CameraRegistry:
         self._mutate(change)
 
     @staticmethod
-    def is_valid_focus_distance(value) -> bool:
-        """True for a value that can be a stored focus distance.
+    def is_valid_focus(value) -> bool:
+        """True for a value that can be a stored focus.
 
-        A distance is a positive int in mm, as CHDK's get_focus() answers it,
-        and not a bool.
+        A stored focus is a dict holding exactly "distance", a positive int in
+        mm as CHDK's get_focus() answers it, and "zoom_step", a valid zoom
+        step: the step the camera reported when the focus was locked. Bools
+        are refused for both.
         """
-        return type(value) is int and value > 0
+        return (
+            type(value) is dict
+            and set(value) == {"distance", "zoom_step"}
+            and type(value["distance"]) is int
+            and value["distance"] > 0
+            and CameraRegistry.is_valid_zoom_step(value["zoom_step"])
+        )
 
-    def update_focus_distance(self, hardware_id: str, distance: Optional[int]) -> None:
-        """Persist, or clear, the locked focus distance for this camera body (CHDK only).
+    def update_focus(self, hardware_id: str, distance: int, zoom_step: int) -> None:
+        """Persist the locked focus for this camera body (CHDK only).
 
         Keyed by hardware id for the same reason as the zoom step. The
-        backend stores the distance the camera reported after a focus lock,
-        and sends it again each time the body enters record mode. None
-        removes the "focus_distance" key, and the camera then autofocuses on
-        every picture. The time of the change is recorded in either case.
+        distance and the zoom step it was taken at are written together, as
+        one value under "focus", so neither is ever stored without the
+        other. The backend restores the distance only when the camera
+        reports that zoom step.
 
         Args:
             hardware_id: Hardware ID of the camera.
-            distance: The focus distance in mm, or None to clear it.
+            distance: The focus distance in mm.
+            zoom_step: The zoom step the camera reported for the lock.
 
         Raises:
-            ValueError: distance is neither None nor a positive int.
+            ValueError: distance is not a positive int, or zoom_step is not
+                a non-negative int.
             KeyError: hardware_id is not a camera the registry knows about.
         """
-        if distance is not None and not self.is_valid_focus_distance(distance):
+        focus = {"distance": distance, "zoom_step": zoom_step}
+        if not self.is_valid_focus(focus):
             raise ValueError(
-                f"focus distance must be a positive integer or None; got {distance!r}"
+                "focus must be a positive integer distance and a non-negative "
+                f"integer zoom step; got {distance!r} at step {zoom_step!r}"
             )
 
         def change(cameras: Dict) -> None:
             if hardware_id not in cameras["cameras"]:
                 raise KeyError(hardware_id)
             entry = cameras["cameras"][hardware_id]
-            if distance is None:
-                entry.pop("focus_distance", None)
-            else:
-                entry["focus_distance"] = distance
-            entry["focus_distance_updated_at"] = datetime.now(timezone.utc).isoformat()
+            entry["focus"] = focus
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    def clear_focus(self, hardware_id: str) -> None:
+        """Remove the stored focus for this camera body (CHDK only).
+
+        The camera then autofocuses on every picture. The time of the change
+        is recorded.
+
+        Raises:
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry.pop("focus", None)
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
 
         self._mutate(change)
 
