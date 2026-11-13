@@ -1091,11 +1091,55 @@ def _focal_length_header(image_bytes: bytes) -> Optional[str]:
 	return f"{round(millimetres, 2):g}"
 
 
+def _round_fractions(value):
+	"""The value with every float rounded to 4 decimals, for a compact header."""
+	if isinstance(value, float):
+		return round(value, 4)
+	if isinstance(value, dict):
+		return {key: _round_fractions(item) for key, item in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_round_fractions(item) for item in value]
+	return value
+
+
+def _page_layout_header(
+	image_bytes: bytes, camera_index: int, resolution: str, page_side: str
+) -> Optional[str]:
+	"""The page layout of a test capture as compact JSON, for X-Page-Layout (NEH-343).
+
+	The rotation is the camera's saved orientation, read from the registry
+	the same way test_capture_bytes reads it (0 when none is saved): the
+	capture path records it only in the EXIF Orientation tag, so the pixels
+	are as the sensor delivered them. None when anything fails: the header
+	is a guide for the camera check screen, never a reason to fail the
+	capture, so the failure is logged as a warning and the header left out.
+	"""
+	import json
+
+	try:
+		from capture import page_layout
+		from capture.project_manager import default_camera_config_from_registry
+
+		config, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+		rotation = config.get("rotate_deg", 0) or 0
+		result = page_layout.analyse_page(image_bytes, rotation_deg=rotation, page_side=page_side)
+		# allow_nan=False: NaN and Infinity are not JSON, and JSON.parse refuses them.
+		return json.dumps(_round_fractions(result), separators=(",", ":"), allow_nan=False)
+	except Exception as exc:
+		logger.warning(
+			"Page layout analysis failed for test capture on camera %s: %s: %s",
+			camera_index, type(exc).__name__, exc,
+		)
+		return None
+
+
 @router.post("/test-capture/{camera_index}")
 def test_capture(
 	camera_index: int,
 	resolution: str = Query("medium"),
 	focus_check: bool = Query(False),
+	layout: bool = Query(False),
+	page_side: Optional[Literal["left", "right"]] = Query(None),
 	current_user: User = Depends(allow_contributor),
 ):
 	"""
@@ -1123,11 +1167,23 @@ def test_capture(
 	On success the response carries X-Capture-Seconds, X-Capture-Bytes and,
 	when the JPEG's EXIF has a usable FocalLength, X-Focal-Length in
 	millimetres ("27", "27.5"); it is left out otherwise.
+
+	layout=true with page_side ("left" or "right": which page of the open
+	book this camera photographs) adds X-Page-Layout, the result of
+	capture.page_layout.analyse_page on the returned picture as compact JSON
+	with fractions rounded to 4 decimals (NEH-343). layout=true without
+	page_side is a 422, refused before the camera is touched. The analysis
+	only reads the JPEG, so it works on every camera backend; when it fails
+	the header is left out and the capture is returned as usual. This route
+	is a plain def, so FastAPI runs it, the analysis included, in its
+	threadpool rather than on the event loop.
 	"""
 	from capture.camera import IMG_SIZES
 
 	if resolution not in IMG_SIZES:
 		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
+	if layout and page_side is None:
+		raise HTTPException(status_code=422, detail="layout=true needs page_side=left or page_side=right")
 
 	from capture.service import test_capture_bytes, is_camera_connected
 
@@ -1155,6 +1211,10 @@ def test_capture(
 	focal_length = _focal_length_header(image_bytes)
 	if focal_length is not None:
 		headers["X-Focal-Length"] = focal_length
+	if layout:
+		page_layout = _page_layout_header(image_bytes, camera_index, resolution, page_side)
+		if page_layout is not None:
+			headers["X-Page-Layout"] = page_layout
 
 	return Response(
 		content=image_bytes,

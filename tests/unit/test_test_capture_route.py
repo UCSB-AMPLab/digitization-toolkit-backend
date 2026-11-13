@@ -563,3 +563,201 @@ def test_test_capture_exposes_the_focal_length_across_cors(client, monkeypatch):
     assert resp.status_code == 200, resp.text
     exposed = resp.headers.get("access-control-expose-headers", "")
     assert "X-Focal-Length" in {h.strip() for h in exposed.split(",")}
+
+
+# ----------------------------------------------------------------------
+# NEH-343: ?layout=true&page_side=... and X-Page-Layout
+# ----------------------------------------------------------------------
+
+def _layout_scene(rotation_deg=270):
+    from tests.unit.page_scenes import make_scene
+
+    jpeg, corners = make_scene((0.25, 0.10, 0.98, 0.90), page_side="left", rotation_deg=rotation_deg)
+    return jpeg, corners
+
+
+def _record_analyser(monkeypatch, result=None, error=None):
+    import capture.page_layout as page_layout
+
+    calls = []
+
+    def fake_analyse_page(jpeg_bytes, *, rotation_deg, page_side):
+        calls.append({"bytes": jpeg_bytes, "rotation_deg": rotation_deg, "page_side": page_side})
+        if error is not None:
+            raise error
+        return result if result is not None else {"found": False, "reason": "no_page_sized_region", "analysis_ms": 1.0}
+
+    monkeypatch.setattr(page_layout, "analyse_page", fake_analyse_page)
+    return calls
+
+
+@pytest.mark.unit
+def test_test_capture_reports_the_page_layout_when_asked(client, monkeypatch):
+    import json
+
+    image_bytes, corners = _layout_scene(rotation_deg=270)
+    _install_default_config(monkeypatch)  # saved orientation 270
+    _install_backend(monkeypatch, _FakeBackendBytes(image_bytes))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true&page_side=left")
+
+    assert resp.status_code == 200, resp.text
+    layout = json.loads(resp.headers["X-Page-Layout"])
+    assert layout["found"] is True, layout
+    for got, want in zip(layout["corners"], corners):
+        assert got[0] == pytest.approx(want[0], abs=0.01)
+        assert got[1] == pytest.approx(want[1], abs=0.01)
+    assert layout["verdict"] == "good", layout
+    assert layout["gutter_state"] == "located"
+    assert layout["gutter_margin"] == pytest.approx(0.02, abs=0.01)
+    assert len(resp.headers["X-Page-Layout"].encode()) < 2048
+    # Fractions are rounded to four decimals.
+    for x, y in layout["corners"]:
+        assert round(x, 4) == x and round(y, 4) == y
+    # The picture and the existing headers are unchanged.
+    assert resp.headers["content-type"] == "image/jpeg"
+    assert resp.headers["X-Capture-Bytes"] == str(len(resp.content))
+    assert float(resp.headers["X-Capture-Seconds"]) >= 0
+
+
+@pytest.mark.unit
+def test_test_capture_without_layout_runs_no_analysis(client, monkeypatch):
+    calls = _record_analyser(monkeypatch)
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(_layout_scene()[0]))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?page_side=left")
+
+    assert resp.status_code == 200, resp.text
+    assert "X-Page-Layout" not in resp.headers
+    assert calls == []
+
+
+@pytest.mark.unit
+def test_test_capture_layout_without_a_page_side_is_a_422(client, monkeypatch):
+    calls = _record_analyser(monkeypatch)
+    recorded = {}
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendSingle(recorded))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true")
+
+    assert resp.status_code == 422, resp.text
+    assert calls == []
+    assert "camera_config" not in recorded, "no picture is taken for a request that is refused"
+
+
+@pytest.mark.unit
+def test_test_capture_refuses_an_unknown_page_side(client, monkeypatch):
+    _record_analyser(monkeypatch)
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendSingle({}))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true&page_side=middle")
+
+    assert resp.status_code == 422, resp.text
+
+
+@pytest.mark.unit
+def test_a_failing_analysis_never_fails_the_capture(client, monkeypatch, caplog):
+    import logging
+
+    _record_analyser(monkeypatch, error=RuntimeError("analyser broke"))
+    image_bytes = _layout_scene()[0]
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(image_bytes))
+    api = _client_as(client, "op", "operator")
+
+    with caplog.at_level(logging.WARNING):
+        resp = api.post("/cameras/test-capture/0?layout=true&page_side=left")
+
+    assert resp.status_code == 200, resp.text
+    assert "X-Page-Layout" not in resp.headers
+    assert resp.content
+    assert resp.headers["X-Capture-Bytes"] == str(len(resp.content))
+    assert any("layout" in r.getMessage().lower() for r in caplog.records if r.levelno >= logging.WARNING)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "config, expected_rotation",
+    [
+        ({"camera_index": 0, "rotate_deg": 270}, 270),
+        ({"camera_index": 0, "rotate_deg": 90}, 90),
+        ({"camera_index": 0}, 0),
+    ],
+)
+def test_the_saved_orientation_is_the_analysis_rotation(client, monkeypatch, config, expected_rotation):
+    calls = _record_analyser(monkeypatch)
+    _install_default_config(monkeypatch, config)
+    _install_backend(monkeypatch, _FakeBackendBytes(_layout_scene()[0]))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true&page_side=right")
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["rotation_deg"] == expected_rotation
+    assert calls[0]["page_side"] == "right"
+    assert calls[0]["bytes"] == resp.content, "the analyser sees the bytes the route returns"
+
+
+@pytest.mark.unit
+def test_the_layout_header_stays_small_for_a_full_result(client, monkeypatch):
+    import json
+
+    full = {
+        "found": True,
+        "corners": [[0.123456789, 0.987654321]] * 4,
+        "margins": {k: 0.123456789 for k in ("left", "right", "top", "bottom")},
+        "gutter_margin": None,
+        "fore_edge_margin": 0.123456789,
+        "gutter_state": "at_or_beyond_edge",
+        "verdict": "cut_off",
+        "conditions": ["cut_off", "too_close", "too_small", "gutter_inside", "gutter_unknown"],
+        "sides": {"left": "cut_off", "top": "too_close", "bottom": "cut_off"},
+        "offset": {"along_gutter": -0.123456789},
+        "fill": 0.987654321,
+        "magnification_to_target": 1.23456789,
+        "empty_space": 0.87654321,
+        "gutter_uncertainty": 0.0123456789,
+        "confidence": 0.87654321,
+        "analysis_ms": 123.456789,
+    }
+    _record_analyser(monkeypatch, result=full)
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(_layout_scene()[0]))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true&page_side=left")
+
+    header = resp.headers["X-Page-Layout"]
+    assert len(header.encode()) < 2048
+    assert " " not in header, "compact JSON"
+    layout = json.loads(header)
+    assert layout["corners"][0] == [0.1235, 0.9877]
+    assert layout["offset"]["along_gutter"] == -0.1235
+    assert layout["gutter_margin"] is None
+    assert layout["conditions"] == full["conditions"]
+    assert layout["sides"] == full["sides"]
+
+
+@pytest.mark.unit
+def test_test_capture_exposes_the_page_layout_across_cors(client, monkeypatch):
+    _record_analyser(monkeypatch)
+    _install_default_config(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(_layout_scene()[0]))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post(
+        "/cameras/test-capture/0?layout=true&page_side=left",
+        headers={"Origin": "http://localhost:5173"},
+    )
+
+    assert resp.status_code == 200, resp.text
+    exposed = resp.headers.get("access-control-expose-headers", "")
+    assert "X-Page-Layout" in {h.strip() for h in exposed.split(",")}

@@ -105,7 +105,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token", "X-Requested-With"],
-    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "Retry-After"],
+    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "X-Page-Layout", "Retry-After"],
 )
 
 app.include_router(records_router, prefix="/records", tags=["records"])
