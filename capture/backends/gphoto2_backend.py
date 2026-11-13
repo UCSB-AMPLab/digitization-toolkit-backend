@@ -57,6 +57,7 @@ from .base import CameraBackend, normalise_camera_model
 # timeout and a DSLR timeout are one class and take the same route out.
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
+from . import usb_topology
 
 
 def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
@@ -168,6 +169,15 @@ _ROUTINE_SCAN_MIN_S = 10.0
 _monotonic = time.monotonic
 
 _USB_PORT_RE = re.compile(r"usb:(\d{3}),(\d{3})")
+
+# Where the USB topology path of a port is looked up; a module-level name so
+# tests can point it at a directory of their own.
+_SYSFS_USB_DEVICES = usb_topology.SYSFS_USB_DEVICES
+
+# The role a bindings pin suggests to the operator in the device list: index 0
+# shoots the left page and index 1 the right. Nothing places, gates or files a
+# capture by it.
+_ROLE_GUESS_BY_PIN_INDEX = {0: "left", 1: "right"}
 
 
 def _port_node_exists(port) -> bool:
@@ -1935,6 +1945,16 @@ class GPhoto2Backend(CameraBackend):
                 )
                 continue
 
+            # The role the pin suggests, shown to the operator and acted on
+            # by nothing: only a body whose serial is pinned at index 0 or 1
+            # has one.
+            role_guess = None
+            if serial:
+                with self._map_lock:
+                    pinned_here = self._pins.get(idx) == serial
+                if pinned_here:
+                    role_guess = _ROLE_GUESS_BY_PIN_INDEX.get(idx)
+
             model_slug = re.sub(r"[^a-z0-9]", "", row_model.lower())
             hw_id = (
                 f"{model_slug}_{serial}" if serial
@@ -1949,6 +1969,14 @@ class GPhoto2Backend(CameraBackend):
                 "port": row_port,                # raw USB port, e.g. "usb:001,005"
                 "has_aperture_control": True,   # DSLRs always expose aperture via PTP
                 "supports_zoom": False,          # No digital zoom for DSLRs
+                # The USB socket the body is plugged into, as a topology
+                # path ("1-1.2"), looked up in sysfs from the port's bus and
+                # device numbers. No claim is made on the device for it.
+                "usb_port": usb_topology.from_gphoto2_port(
+                    row_port, sysfs_root=_SYSFS_USB_DEVICES
+                ),
+                "role_guess": role_guess,
+                "role_guess_source": "gphoto2_pin" if role_guess else None,
             })
 
         return result, learned
