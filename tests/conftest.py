@@ -357,3 +357,18 @@ def test_project(db_session, test_user):
     db_session.refresh(project)
     
     return project
+
+
+
+@pytest.fixture(autouse=True)
+def _clean_process_state():
+    """Every test starts and ends with no unit work counted, no restart pending, no offsite block,
+    a clear restart latch and no shutdown begun: these are process-wide (app.core.unit_activity,
+    app.core.restart_latch), so one test's leftovers would otherwise reach the next."""
+    from app.core import restart_latch, unit_activity
+
+    unit_activity._reset_for_tests()
+    restart_latch._reset_for_tests()
+    yield
+    unit_activity._reset_for_tests()
+    restart_latch._reset_for_tests()

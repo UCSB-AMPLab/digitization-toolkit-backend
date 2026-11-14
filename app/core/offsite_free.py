@@ -100,6 +100,7 @@ from sqlalchemy.orm import Session
 
 from app.core import config
 from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1, transfer_lock
+from app.core import unit_activity
 from app.core.paths import METADATA_DIR
 from app.core.storage_override import StorageUnavailableError
 
@@ -167,11 +168,13 @@ FREED_EXPORT_MESSAGE = (
 class FreeRefused(Exception):
     """A free, a dry run or a restore that cannot start; the route answers status_code with message."""
 
-    def __init__(self, message: str, status_code: int = 409, detail: Optional[dict] = None):
+    def __init__(self, message: str, status_code: int = 409, detail: Optional[dict] = None,
+                 headers: Optional[dict] = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.detail = detail or {}
+        self.headers = headers
 
     def as_detail(self) -> dict:
         return {"message": self.message, **self.detail}
@@ -940,6 +943,9 @@ class OffsiteJob:
         self.error: Optional[str] = None
         self.created_at = time.time()
         self.finished_at: Optional[float] = None
+        # Counted as offsite work in progress (app.core.unit_activity) from
+        # its reservation until its thread ends or it is discarded.
+        self.counted = False
 
     def to_dict(self) -> dict:
         return {"job_id": self.id, "collection_id": self.collection_id, "action": self.action,
@@ -961,6 +967,12 @@ class OffsiteJobRegistry:
 
     Finished jobs are dropped FINISHED_JOB_TTL after they end, when the next
     job is reserved; a queued or running job is never dropped.
+
+    Each job is counted as offsite work in progress (app.core.unit_activity)
+    from its reservation until its thread ends, so a running job prevents a
+    restart and pairing waits for it; a reservation is refused with 503
+    `backend_restarting` while a restart is pending or pairing is applying
+    a link.
     """
 
     def __init__(self):
@@ -983,16 +995,30 @@ class OffsiteJobRegistry:
             active = self._jobs.get(self._active.get(collection_id))
             if active is not None and active.state in ("queued", "running"):
                 raise FreeRefused(JOB_RUNNING_MESSAGE, detail={"job_id": active.id})
+            try:
+                unit_activity.enter(unit_activity.OFFSITE_JOB)
+            except unit_activity.Refused:
+                raise FreeRefused(unit_activity.REFUSAL_MESSAGE, status_code=503,
+                                  detail={"code": unit_activity.BACKEND_RESTARTING},
+                                  headers={"Retry-After": str(unit_activity.RETRY_AFTER_SECONDS)}) from None
             job = OffsiteJob(collection_id, action)
+            job.counted = True
             self._jobs[job.id] = job
             self._active[collection_id] = job.id
             return job
+
+    def _uncount(self, job: OffsiteJob) -> None:
+        with self._lock:
+            counted, job.counted = job.counted, False
+        if counted:
+            unit_activity.leave(unit_activity.OFFSITE_JOB)
 
     def discard(self, job: OffsiteJob) -> None:
         with self._lock:
             self._jobs.pop(job.id, None)
             if self._active.get(job.collection_id) == job.id:
                 del self._active[job.collection_id]
+        self._uncount(job)
 
     def get(self, job_id: str) -> Optional[OffsiteJob]:
         with self._lock:
@@ -1023,6 +1049,7 @@ class OffsiteJobRegistry:
                 with self._lock:
                     if self._active.get(job.collection_id) == job.id:
                         del self._active[job.collection_id]
+                self._uncount(job)
 
         try:
             threading.Thread(target=target, name=f"offsite-{job.action}", daemon=True).start()
@@ -1050,24 +1077,30 @@ def _in_own_session(fn: Callable[[Session], dict]) -> Callable[[], dict]:
 def start_free(db: Session, collection_id: int, actor: Optional[str]) -> OffsiteJob:
     """Check what can be refused now, then free in the background. Raises FreeRefused."""
     job = offsite_jobs.reserve(collection_id, "free")
+    # Every exit after the reservation releases it: a refusal or any error
+    # here discards the job, and run() releases it when its thread ends (or
+    # discards it when the thread cannot be started).
     try:
         collection, hold = _prepare_free(db, collection_id)
+        stem = collection.filename_stem
     except BaseException:
         offsite_jobs.discard(job)
         raise
-    stem = collection.filename_stem
     offsite_jobs.run(job, _in_own_session(lambda s: _free_work(s, collection_id, stem, actor)), hold)
     return job
 
 
 def start_restore(db: Session, collection_id: int, actor: Optional[str]) -> OffsiteJob:
     job = offsite_jobs.reserve(collection_id, "restore")
+    # Every exit after the reservation releases it: a refusal or any error
+    # here discards the job, and run() releases it when its thread ends (or
+    # discards it when the thread cannot be started).
     try:
         collection, hold = _prepare_restore(db, collection_id)
+        stem = collection.filename_stem
     except BaseException:
         offsite_jobs.discard(job)
         raise
-    stem = collection.filename_stem
     offsite_jobs.run(job, _in_own_session(lambda s: _restore_work(s, collection_id, stem, actor)), hold)
     return job
 
