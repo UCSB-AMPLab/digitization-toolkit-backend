@@ -6,7 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
-from pydantic import BaseModel, ConfigDict, Field, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 import logging
 
 from app.api.deps import get_db_dependency
@@ -212,6 +212,15 @@ class DeviceInfo(BaseModel):
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+	# Stepped optical zoom (CHDK backend only): how many steps the lens has,
+	# and the step the backend last confirmed on the camera. Null until the
+	# camera has reported them, and always null on other backends.
+	zoom_steps: Optional[int] = None
+	zoom_step: Optional[int] = None
+	# Seconds the camera's clock differs from the unit's at the last check,
+	# negative when the camera is behind. Null when not measured or not a CHDK
+	# camera. A live measurement: it is not stored.
+	clock_offset_s: Optional[float] = None
 	# Which pages this body shoots: "odd", "even", or null when it has no
 	# parity (CHDK backend only; the file that carries it lives on the card).
 	# Not a side of the table - left and right are the kiosk's swap toggle.
@@ -219,6 +228,30 @@ class DeviceInfo(BaseModel):
 	# Why this body may not capture, in words for the operator: two bodies on
 	# one parity, or a body with no identity. Null when it is ready.
 	error: Optional[str] = None
+	# The USB socket the body is plugged into, as a topology path ("1-1.2"),
+	# and the body's serial. Null where the backend cannot tell.
+	usb_port: Optional[str] = None
+	serial: Optional[str] = None
+	# The page this body photographs, "left" or "right", as stored in the
+	# camera registry, and whether the operator has confirmed it.
+	role: Optional[str] = None
+	role_confirmed: bool = False
+	usb_port_at_confirmation: Optional[str] = None
+	# The role the backend's current placement suggests ("own_txt" for a
+	# CHDK card parity, "gphoto2_pin" for a bindings pin). It is shown to the
+	# operator and nothing acts on it.
+	role_guess: Optional[str] = None
+	role_guess_source: Optional[str] = None
+	# Focus lock (CHDK backend only). focus_locked is null until the body is
+	# in shooting mode, then true while the camera holds a lock it confirmed.
+	# focus_distance is the distance in mm the camera reported for that lock.
+	# focus_stale is true when the zoom moved after the last lock, and
+	# focus_restore_failed when a stored distance was sent on entering
+	# shooting mode and the camera did not report it back.
+	focus_locked: Optional[bool] = None
+	focus_distance: Optional[int] = None
+	focus_stale: bool = False
+	focus_restore_failed: bool = False
 
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
@@ -359,6 +392,11 @@ def _get_camera_registry():
 		return None
 
 
+# The role fields a registry record may carry; a device row reads them as None
+# when the registry is unavailable.
+_ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+
 def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	"""Enrich raw backend device dicts with registry calibration data.
 
@@ -366,12 +404,19 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	DeviceInfo shape from the same backend dicts. A registry of None (import or
 	init failure) simply means nothing is enriched; enumeration still works.
 	"""
+	# Function-local, as every capture import in this file is: importing the
+	# capture package starts the camera service module.
+	from capture.camera_roles import confirmed_role
+
 	devices = []
 	for dev in raw_devices:
 		hw_id = dev["hardware_id"]
 		idx = dev["index"]
 
 		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		# The same keys CameraRegistry.get_role_record reads, taken from the
+		# record already fetched, each None when absent.
+		role_record = {key: (camera_data or {}).get(key) for key in _ROLE_RECORD_KEYS}
 		calibrated = False
 		machine_id = None
 		label = None
@@ -406,8 +451,22 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			orientation=orientation,
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
+			zoom_steps=dev.get("zoom_steps"),
+			zoom_step=dev.get("zoom_step"),
+			clock_offset_s=dev.get("clock_offset_s"),
 			side=dev.get("side"),
 			error=dev.get("error"),
+			usb_port=dev.get("usb_port"),
+			serial=dev.get("serial"),
+			role=role_record["role"],
+			role_confirmed=confirmed_role(role_record) is not None,
+			usb_port_at_confirmation=role_record["usb_port_at_confirmation"],
+			role_guess=dev.get("role_guess"),
+			role_guess_source=dev.get("role_guess_source"),
+			focus_locked=dev.get("focus_locked"),
+			focus_distance=dev.get("focus_distance"),
+			focus_stale=dev.get("focus_stale", False),
+			focus_restore_failed=dev.get("focus_restore_failed", False),
 		))
 
 	return devices
@@ -433,6 +492,194 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 		return []
 
 	return _device_infos(raw_devices, registry)
+
+
+# One flat sentence per camera_roles reason code, for the operator.
+CAMERA_SETUP_MESSAGES = {
+	"identity_missing": "Captua cannot identify this camera and cannot store a role for it.",
+	"identity_ambiguous": "Two connected cameras report the same identity, and Captua cannot store a role for either.",
+	"role_unconfirmed": "Captua has no confirmed role for this camera.",
+	"role_conflict": "Two cameras have the same confirmed role, and the operator must confirm which page each one photographs.",
+	"pair_changed": "The connected cameras are not the pair the operator last confirmed, and the operator must confirm their roles again.",
+	"port_changed": "This camera is in a different USB socket than when the operator confirmed its role, and the operator must confirm it again.",
+}
+
+
+class CameraSetupReason(BaseModel):
+	"""One reason the camera roles need the operator, with the bodies it concerns."""
+	code: str
+	message: str
+	hardware_ids: List[Optional[str]]
+
+
+class CameraSetupResponse(BaseModel):
+	"""Whether the operator must set or confirm the camera roles, and why."""
+	needs_setup: bool
+	reasons: List[CameraSetupReason]
+	confirmed_pair: Optional[dict] = None
+
+
+def _setup_report(raw_devices, registry) -> CameraSetupResponse:
+	"""Evaluate the stored roles against these device rows, for the operator.
+
+	GET /cameras/setup and PUT /cameras/roles both answer with this. A
+	registry of None reads as one with no roles and no confirmed pair.
+	"""
+	from capture.camera_roles import evaluate_setup
+
+	hardware_ids = [dev.get("hardware_id") for dev in raw_devices if dev.get("hardware_id")]
+	records = registry.get_role_records(hardware_ids) if registry else {}
+	confirmed_pair = registry.get_confirmed_pair() if registry else None
+
+	result = evaluate_setup(raw_devices, records, confirmed_pair)
+	return CameraSetupResponse(
+		needs_setup=result["needs_setup"],
+		reasons=[
+			CameraSetupReason(
+				code=reason["code"],
+				message=CAMERA_SETUP_MESSAGES[reason["code"]],
+				hardware_ids=reason["hardware_ids"],
+			)
+			for reason in result["reasons"]
+		],
+		confirmed_pair=confirmed_pair,
+	)
+
+
+@router.get("/setup", response_model=CameraSetupResponse)
+def get_camera_setup(current_user: User = Depends(allow_read_only)):
+	"""
+	Report whether the operator must set or confirm the camera roles.
+
+	A camera's role is the page it photographs, "left" or "right", stored in
+	the camera registry per body. This route compares the stored roles and
+	the pair last confirmed together with the bodies the backend lists now,
+	through capture.camera_roles.evaluate_setup. It reports only: nothing
+	here, and nothing in capture, acts on the result.
+
+	A backend that cannot list its devices is a 503, because an empty list
+	would report that no setup is needed.
+	"""
+	try:
+		from capture.service import get_backend
+		raw_devices = get_backend().list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the setup check failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	return _setup_report(raw_devices, _get_camera_registry())
+
+
+# The catalogued refusals of PUT /cameras/roles, each a flat sentence that
+# says who must do what.
+CAMERA_ROLES_REFUSALS = {
+	"camera_not_connected": "A camera in the request is not connected, and the operator must reload the camera list and choose the cameras again.",
+	"camera_identity_unusable": "Captua cannot identify a camera in the request, and the operator must give it an identity before setting its role.",
+}
+
+
+def _roles_refusal(code: str) -> HTTPException:
+	return HTTPException(status_code=409, detail={"code": code, "message": CAMERA_ROLES_REFUSALS[code]})
+
+
+class RoleBody(BaseModel):
+	"""One body named in a roles request, by the hardware id the client listed."""
+	hardware_id: str = Field(min_length=1)
+
+
+class CameraRolesRequest(BaseModel):
+	"""Request body for PUT /cameras/roles: the body for each page (NEH-342)."""
+	left: RoleBody
+	right: RoleBody
+
+	@model_validator(mode="after")
+	def _two_bodies(self):
+		if self.left.hardware_id == self.right.hardware_id:
+			raise ValueError("left and right must be two different cameras")
+		return self
+
+
+class CameraRolesResponse(BaseModel):
+	"""The device rows and the setup report after a roles write."""
+	devices: List[DeviceInfo]
+	setup: CameraSetupResponse
+
+
+@router.put("/roles", response_model=CameraRolesResponse)
+def set_camera_roles(
+	request: CameraRolesRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Store which page each of two connected cameras photographs (NEH-342).
+
+	The operator names the body for the left page and the body for the right
+	page by hardware id. Both must be among the bodies the backend lists
+	now, each with an identity of its own: a body that is not listed is a
+	409 camera_not_connected, and a provisional body, a body with the
+	per-index placeholder id or a body whose identity another body shares
+	is a 409 camera_identity_unusable. A body the registry does not know is
+	registered first, as the orientation route registers one.
+
+	CameraRegistry.set_roles then writes both roles and the pair in one
+	replace of cameras.json, with each body's USB socket, the backend's name
+	and the operator's username. Two bodies that hold each other's roles
+	exchange them in one request. A registry that cannot be written raises
+	StorageUnavailableError, which the app answers with 503.
+
+	The answer is the device rows and the setup report, read from the
+	registry after the write, for the rows listed before it. Nothing in
+	capture reads a stored role yet: indexes, pins, card files and capture
+	are unchanged.
+	"""
+	try:
+		from capture.camera_registry import CameraRegistry
+		from capture.camera_roles import has_identity
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the roles write failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	chosen = {"left": request.left.hardware_id, "right": request.right.hardware_id}
+	rows = {}
+	for role, hw_id in chosen.items():
+		matches = [dev for dev in raw_devices if dev.get("hardware_id") == hw_id]
+		if not matches:
+			raise _roles_refusal("camera_not_connected")
+		if len(matches) > 1 or not has_identity(matches[0]) or matches[0].get("identity_ambiguous"):
+			raise _roles_refusal("camera_identity_unusable")
+		rows[role] = matches[0]
+
+	registry = CameraRegistry()
+	for row in rows.values():
+		if registry.get_camera_by_id(row["hardware_id"]) is None:
+			# Registered under the identity checked above, with the info the
+			# backend reports for it, as the orientation route does.
+			info = {
+				"model": row.get("model"),
+				"serial": row.get("serial"),
+				"location": row.get("location"),
+			}
+			registry.register_resolved(row["hardware_id"], info, row["index"])
+
+	registry.set_roles(
+		chosen["left"],
+		chosen["right"],
+		ports={role: row.get("usb_port") for role, row in rows.items()},
+		backend=backend.get_backend_name(),
+		confirmed_by=current_user.username,
+	)
+
+	return CameraRolesResponse(
+		devices=_device_infos(raw_devices, registry),
+		setup=_setup_report(raw_devices, registry),
+	)
 
 
 @router.post("/rescan", response_model=List[DeviceInfo])
@@ -557,6 +804,8 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	        "focus_control": false,
 	        "live_controls": false,
 	        "zoom": false,
+	        "zoom_steps": false,
+	        "focus_lock": false,
 	        "autofocus_calibration": false,
 	        "dslr_settings": true
 	    }
@@ -689,6 +938,79 @@ def set_focus(
 		raise HTTPException(status_code=500, detail="Failed to set focus")
 
 
+@router.post("/focus-lock/{camera_index}")
+def lock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Autofocus a CHDK camera once and lock the focus there.
+
+	The camera focuses with a half-press of the shutter and locks, and the
+	backend reads back the distance it reports and stores it for the body,
+	which has it restored each time it enters shooting mode. A zoom move
+	afterwards releases the lock and clears the stored distance. Answers
+	{"detail": "Focus locked", "focus_distance": <mm>}. A backend without
+	focus lock answers 501, a camera that is not connected 404, and a camera
+	that did not confirm the lock 502 (a timeout, a wire failure, or no
+	distance reported).
+	"""
+	distance = _run_focus_lock(camera_index, lock=True)
+	return {"detail": "Focus locked", "focus_distance": distance}
+
+
+@router.delete("/focus-lock/{camera_index}")
+def unlock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Release a CHDK camera's focus lock and clear its stored distance.
+
+	The camera then autofocuses on every picture. Answers as the lock route
+	does, with {"detail": "Focus unlocked"} on success.
+	"""
+	_run_focus_lock(camera_index, lock=False)
+	return {"detail": "Focus unlocked"}
+
+
+def _run_focus_lock(camera_index: int, lock: bool) -> Optional[int]:
+	"""Lock or unlock a CHDK camera's focus, mapping failures to statuses."""
+	from app.core.storage_override import StorageUnavailableError
+
+	action = "lock_focus" if lock else "unlock_focus"
+	try:
+		from capture.service import get_backend, lock_focus, unlock_focus
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("focus_lock", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no focus lock; "
+				"focus lock applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import FocusFailedError
+
+	try:
+		if lock:
+			return lock_focus(camera_index)
+		unlock_focus(camera_index)
+		return None
+	except StorageUnavailableError:
+		raise
+	except FocusFailedError as e:
+		logger.error(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail=f"Failed to {action.replace('_', ' ')}")
+
+
 # ---------------------------------------------------------------------------
 # Camera settings / controls endpoint
 # ---------------------------------------------------------------------------
@@ -702,6 +1024,7 @@ class CameraSettingsRequest(BaseModel):
 	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ~ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
 	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
+	zoom_step: Optional[StrictInt] = None     # Stepped optical zoom, 0 = widest (CHDK backend); a bool or a float is refused
 
 
 @router.post("/settings/{camera_index}")
@@ -710,7 +1033,16 @@ def apply_camera_settings(
 	request: CameraSettingsRequest,
 	current_user: User = Depends(allow_contributor),
 ):
-	"""Apply live camera controls without triggering a capture."""
+	"""Apply live camera controls without triggering a capture.
+
+	zoom_step moves a CHDK body's optical zoom to that step and stores it for
+	the body, which applies it again each time the body enters record mode.
+	A backend without stepped zoom answers 501, a step outside the camera's
+	range 422 with the range in the detail, a camera that is not connected
+	404, and a camera that did not take the step 502 (a timeout, a wire
+	failure, a lens that reports another step, or no zoom steps reported). The response carries the step the camera
+	confirmed as "zoom_step".
+	"""
 	try:
 		from capture.service import set_camera_controls
 	except ImportError as e:
@@ -742,17 +1074,62 @@ def apply_camera_settings(
 			logger.exception(f"apply_zoom failed for camera {camera_index}: {e}")
 			raise HTTPException(status_code=500, detail="Failed to apply zoom")
 
+	# Stepped optical zoom is a CHDK body's own lens, set by step number; it
+	# is not the ScalerCrop zoom above.
+	applied: dict = {}
+	if request.zoom_step is not None:
+		applied["zoom_step"] = _apply_zoom_step(camera_index, request.zoom_step)
+
 	if not controls and request.zoom_factor is None:
+		if applied:
+			return {"detail": "Zoom step applied", **applied}
 		return {"detail": "No controls specified"}
 
 	try:
 		set_camera_controls(camera_index, controls)
-		return {"detail": "Controls applied", "controls": list(controls.keys())}
+		return {"detail": "Controls applied", "controls": list(controls.keys()), **applied}
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
 		logger.exception(f"apply_camera_settings failed for camera {camera_index}: {e}")
 		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
+
+
+def _apply_zoom_step(camera_index: int, step: int) -> int:
+	"""Set a stepped optical zoom step and return the step the camera confirmed."""
+	from app.core.storage_override import StorageUnavailableError
+
+	try:
+		from capture.service import apply_zoom_step, get_backend
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("zoom_steps", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no stepped optical "
+				"zoom; zoom_step applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import ZoomFailedError
+
+	try:
+		return apply_zoom_step(camera_index, step)
+	except ValueError as e:
+		raise HTTPException(status_code=422, detail=str(e))
+	except StorageUnavailableError:
+		raise
+	except ZoomFailedError as e:
+		logger.error(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to apply zoom step")
 
 
 def _is_capture_timeout(exc: BaseException) -> bool:
@@ -778,10 +1155,84 @@ def _is_capture_timeout(exc: BaseException) -> bool:
 	return False
 
 
+def _focal_length_header(image_bytes: bytes) -> Optional[str]:
+	"""The EXIF FocalLength of a JPEG in millimetres, as "27" or "27.5".
+
+	None when the tag is absent, zero, not a finite number, or the EXIF (or
+	the image) cannot be read: the header is a hint for the Refocus dialog,
+	never a reason to fail the capture.
+	"""
+	import io
+	import math
+
+	try:
+		from PIL import Image
+
+		with Image.open(io.BytesIO(image_bytes)) as img:
+			exif = img.getexif()
+			# FocalLength (0x920A) lives in the Exif sub-IFD (0x8769).
+			value = exif.get_ifd(0x8769).get(0x920A)
+			if value is None:
+				value = exif.get(0x920A)
+		if value is None:
+			return None
+		millimetres = float(value)
+	except Exception:
+		return None
+	if not math.isfinite(millimetres) or millimetres <= 0:
+		return None
+	return f"{round(millimetres, 2):g}"
+
+
+def _round_fractions(value):
+	"""The value with every float rounded to 4 decimals, for a compact header."""
+	if isinstance(value, float):
+		return round(value, 4)
+	if isinstance(value, dict):
+		return {key: _round_fractions(item) for key, item in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_round_fractions(item) for item in value]
+	return value
+
+
+def _page_layout_header(
+	image_bytes: bytes, camera_index: int, resolution: str, page_side: str
+) -> Optional[str]:
+	"""The page layout of a test capture as compact JSON, for X-Page-Layout (NEH-343).
+
+	The rotation is the camera's saved orientation, read from the registry
+	the same way test_capture_bytes reads it (0 when none is saved): the
+	capture path records it only in the EXIF Orientation tag, so the pixels
+	are as the sensor delivered them. None when anything fails: the header
+	is a guide for the camera check screen, never a reason to fail the
+	capture, so the failure is logged as a warning and the header left out.
+	"""
+	import json
+
+	try:
+		from capture import page_layout
+		from capture.project_manager import default_camera_config_from_registry
+
+		config, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+		rotation = config.get("rotate_deg", 0) or 0
+		result = page_layout.analyse_page(image_bytes, rotation_deg=rotation, page_side=page_side)
+		# allow_nan=False: NaN and Infinity are not JSON, and JSON.parse refuses them.
+		return json.dumps(_round_fractions(result), separators=(",", ":"), allow_nan=False)
+	except Exception as exc:
+		logger.warning(
+			"Page layout analysis failed for test capture on camera %s: %s: %s",
+			camera_index, type(exc).__name__, exc,
+		)
+		return None
+
+
 @router.post("/test-capture/{camera_index}")
 def test_capture(
 	camera_index: int,
 	resolution: str = Query("medium"),
+	focus_check: bool = Query(False),
+	layout: bool = Query(False),
+	page_side: Optional[Literal["left", "right"]] = Query(None),
 	current_user: User = Depends(allow_contributor),
 ):
 	"""
@@ -798,11 +1249,34 @@ def test_capture(
 	Checks the camera is connected before calling the service, mirroring
 	trigger_capture, rather than sniffing the RuntimeError message for
 	"not connected" after the fact.
+
+	focus_check=true is the Refocus dialog's picture, taken with the lenses
+	on autofocus (NEH-339). On the gphoto2 backend the capture then gets one
+	trigger attempt and _FOCUS_CHECK_DEADLINE_S (20 s) from the trigger to
+	the file instead of the normal retry and deadline policy, and a body
+	that does not deliver in that time - a busy trigger included - is a 504.
+	Every other backend accepts the flag and ignores it.
+
+	On success the response carries X-Capture-Seconds, X-Capture-Bytes and,
+	when the JPEG's EXIF has a usable FocalLength, X-Focal-Length in
+	millimetres ("27", "27.5"); it is left out otherwise.
+
+	layout=true with page_side ("left" or "right": which page of the open
+	book this camera photographs) adds X-Page-Layout, the result of
+	capture.page_layout.analyse_page on the returned picture as compact JSON
+	with fractions rounded to 4 decimals (NEH-343). layout=true without
+	page_side is a 422, refused before the camera is touched. The analysis
+	only reads the JPEG, so it works on every camera backend; when it fails
+	the header is left out and the capture is returned as usual. This route
+	is a plain def, so FastAPI runs it, the analysis included, in its
+	threadpool rather than on the event loop.
 	"""
 	from capture.camera import IMG_SIZES
 
 	if resolution not in IMG_SIZES:
 		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
+	if layout and page_side is None:
+		raise HTTPException(status_code=422, detail="layout=true needs page_side=left or page_side=right")
 
 	from capture.service import test_capture_bytes, is_camera_connected
 
@@ -810,7 +1284,9 @@ def test_capture(
 		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
 
 	try:
-		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
+		image_bytes, elapsed_time = test_capture_bytes(
+			camera_index, resolution, focus_check=focus_check
+		)
 	except RuntimeError as e:
 		if _is_capture_timeout(e):
 			raise HTTPException(status_code=504, detail=str(e))
@@ -821,13 +1297,22 @@ def test_capture(
 		logger.exception("Test capture failed")
 		raise HTTPException(status_code=500, detail="Test capture failed")
 
+	headers = {
+		"X-Capture-Seconds": f"{elapsed_time:.3f}",
+		"X-Capture-Bytes": str(len(image_bytes)),
+	}
+	focal_length = _focal_length_header(image_bytes)
+	if focal_length is not None:
+		headers["X-Focal-Length"] = focal_length
+	if layout:
+		page_layout = _page_layout_header(image_bytes, camera_index, resolution, page_side)
+		if page_layout is not None:
+			headers["X-Page-Layout"] = page_layout
+
 	return Response(
 		content=image_bytes,
 		media_type="image/jpeg",
-		headers={
-			"X-Capture-Seconds": f"{elapsed_time:.3f}",
-			"X-Capture-Bytes": str(len(image_bytes)),
-		},
+		headers=headers,
 	)
 
 

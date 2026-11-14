@@ -138,6 +138,22 @@ class CameraBackend(ABC):
             has_aperture_control (bool): True if aperture can be set via API.
             supports_zoom (bool): True if digital/ScalerCrop zoom is available.
 
+        A backend with stepped optical zoom (capabilities "zoom_steps") adds:
+            zoom_steps (int | None): How many zoom steps the lens has, or None
+                until the camera has reported it.
+            zoom_step (int | None): The step the backend last confirmed by
+                reading it back from the camera, or None until known.
+
+        A backend with focus lock (capabilities "focus_lock") adds:
+            focus_locked (bool | None): True while the camera holds a focus
+                lock it confirmed, False otherwise, and None until the body
+                is in shooting mode.
+            focus_distance (int | None): The distance in mm the camera
+                reported for that lock, or None.
+            focus_stale (bool): The zoom moved after the last lock.
+            focus_restore_failed (bool): A stored distance was sent on
+                entering shooting mode and the camera did not report it back.
+
         The default implementation returns an empty list. Backends should
         override to provide accurate enumeration for their hardware type.
         """
@@ -202,6 +218,11 @@ class CameraBackend(ABC):
             focus_control (bool): Supports `get_focus` / `set_focus`.
             live_controls (bool): Supports `set_camera_controls` (live picamera2 controls).
             zoom (bool): Supports ScalerCrop-based digital zoom.
+            zoom_steps (bool): Supports stepped optical zoom, set by step
+                number through `set_zoom_step` (CHDK compacts). Not the same
+                thing as `zoom`, which is digital.
+            focus_lock (bool): Supports `lock_focus` / `unlock_focus`, an
+                autofocus taken once and held (CHDK compacts).
             autofocus_calibration (bool): Can run AF + WB calibration routines.
             dslr_settings (bool): Exposes ISO / shutter speed / aperture via PTP.
 
@@ -213,6 +234,8 @@ class CameraBackend(ABC):
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": False,
+            "focus_lock": False,
             "autofocus_calibration": False,
             "dslr_settings": False,
         }

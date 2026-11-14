@@ -59,6 +59,7 @@ from .base import CameraBackend, normalise_camera_model
 # timeout and a DSLR timeout are one class and take the same route out.
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
+from . import usb_topology
 
 
 def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
@@ -138,6 +139,13 @@ _EVENT_STEP_MS = 500
 # a short exposure. Treat both as this many seconds of exposure when sizing
 # the deadline.
 _UNKNOWN_EXPOSURE_S = 30.0
+# Focus check (NEH-339): the Refocus dialog's test picture, taken with the lens
+# on autofocus. A body that cannot find focus on AF does not release the
+# shutter, and under the normal policy (three trigger attempts, each busy one
+# waited out for the full capture deadline) that holds the camera's lock for
+# minutes. A focus check gets one trigger attempt and this many seconds from
+# the trigger to the file, whatever the exposure.
+_FOCUS_CHECK_DEADLINE_S = 20.0
 
 # Where the index -> body bindings are kept between runs, next to cameras.json
 # in the projects root. Owned by this backend alone; the picamera2 path has no
@@ -152,7 +160,6 @@ _BINDINGS_VERSION = 1
 # this: that is evidence the map is out of date, and the scan it causes
 # removes the port, so it cannot repeat.
 _LISTING_REDETECT_MIN_S = 5.0
-_monotonic = time.monotonic
 
 # How many camera indices are sides of the rig. Indices below this are the
 # operator's left and right - a dual capture asks for exactly 0 and 1 (see
@@ -160,6 +167,46 @@ _monotonic = time.monotonic
 # above it are parking: somewhere a body that is not one of the two sides can
 # sit, visible and usable, until an explicit rescan gives it a side.
 _SIDE_COUNT = 2
+
+# is_camera_connected() skips the USB bus scan while the published port map is
+# current (every published port's usbfs node still exists), but still scans
+# at least this often, so a body plugged in at an index nobody is asking
+# about is noticed without a rescan or a restart.
+_ROUTINE_SCAN_MIN_S = 10.0
+
+# The clock the routine-scan interval is measured on; a module-level name so
+# tests can drive it.
+_monotonic = time.monotonic
+
+# A gphoto2 USB port is "usb:BBB,DDD": bus and device number, three decimal
+# digits each. ASCII digits only, so nothing but a usbfs node path can come of
+# it (used by _port_node_exists and the USB reset below).
+_USB_PORT_RE = re.compile(r"usb:([0-9]{3}),([0-9]{3})")
+
+# Where the USB topology path of a port is looked up; a module-level name so
+# tests can point it at a directory of their own.
+_SYSFS_USB_DEVICES = usb_topology.SYSFS_USB_DEVICES
+
+# The role a bindings pin suggests to the operator in the device list: index 0
+# shoots the left page and index 1 the right. Nothing places, gates or files a
+# capture by it.
+_ROLE_GUESS_BY_PIN_INDEX = {0: "left", 1: "right"}
+
+
+def _port_node_exists(port) -> bool:
+    """Does this libgphoto2 port's usbfs device node exist?
+
+    A port `usb:BBB,DDD` is the device node /dev/bus/usb/BBB/DDD. Unplugging,
+    power-cycling or re-enumerating a body removes that node (a re-enumerated
+    body gets a new DDD), so a port whose node exists still names a device on
+    the bus. False for any port not in that form and wherever the node cannot
+    be seen (no usbfs, as on macOS): the caller then scans the bus. No
+    libgphoto2 call is made.
+    """
+    match = _USB_PORT_RE.fullmatch(port) if isinstance(port, str) else None
+    if match is None:
+        return False
+    return os.path.exists(f"/dev/bus/usb/{match.group(1)}/{match.group(2)}")
 
 
 class CameraIdentityError(RuntimeError):
@@ -200,6 +247,12 @@ def _parse_exposure_seconds(shutterspeed) -> float:
         return _UNKNOWN_EXPOSURE_S
 
 
+def _is_busy_trigger_error(exc) -> bool:
+    """True for the transient I/O-busy errors trigger_capture() can raise."""
+    err = str(exc).lower()
+    return "-110" in err or "i/o in progress" in err or "busy" in err
+
+
 def _capture_deadline_s(exposure: float) -> float:
     """Deadline in seconds for one capture at the given exposure.
 
@@ -234,15 +287,9 @@ def _IO(type_char: str, nr: int) -> int:
 # <linux/usbdevice_fs.h>: #define USBDEVFS_RESET _IO('U', 20)
 _USBDEVFS_RESET = _IO("U", 20)
 
-# A gphoto2 USB port is "usb:BBB,DDD": bus and device number, both decimal.
-# ASCII digits only, and at most three of each (the kernel numbers buses and
-# devices well below 1000), so nothing but a usbfs node path can come of it.
-_USB_PORT_RE = re.compile(r"usb:([0-9]{1,3}),([0-9]{1,3})")
-
-# Where the kernel publishes USB devices: usbfs nodes, and the sysfs entries
-# that say which vendor each one is.
+# Where the kernel publishes usbfs nodes. The sysfs entries that say which
+# vendor each device is are read from _SYSFS_USB_DEVICES, defined above.
 _USBFS_ROOT = "/dev/bus/usb"
-_SYSFS_USB_DEVICES = "/sys/bus/usb/devices"
 _CANON_VENDOR_ID = "04a9"
 
 # The usbfs calls, as module attributes so tests can stand in for them.
@@ -795,13 +842,7 @@ class _PTPSession:
                 self._cam.trigger_capture()
                 return None
             except gp.GPhoto2Error as exc:
-                err = str(exc).lower()
-                retriable = (
-                    "-110" in err
-                    or "i/o in progress" in err
-                    or "busy" in err
-                )
-                if not retriable:
+                if not _is_busy_trigger_error(exc):
                     raise
                 self._logger.warning(
                     f"[gphoto2] {self.port}: trigger busy (attempt {attempt}/{retry}): "
@@ -867,11 +908,56 @@ class _PTPSession:
                     f"{hint}"
                 )
 
+    def _focus_check_timeout(self, reason: str) -> CaptureTimeoutError:
+        return CaptureTimeoutError(
+            f"{self.port}: no picture arrived within the focus-check deadline "
+            f"of {_FOCUS_CHECK_DEADLINE_S:g}s ({reason})"
+        )
+
+    def _trigger_for_focus_check(self, shutterspeed):
+        """Trigger once and collect the file within _FOCUS_CHECK_DEADLINE_S.
+
+        The deadline runs from the trigger call to the file. A busy trigger
+        is never retried: the event queue is polled for whatever is left of
+        the deadline, since a busy error does not prove the shutter stayed
+        shut, and a file seen there is returned. An empty queue at the
+        deadline - after a busy trigger or after a clean one - raises
+        CaptureTimeoutError, which the caller treats like any capture
+        timeout (the session is closed). A non-busy trigger error and an
+        error out of the event wait propagate as they come.
+        """
+        start = time.monotonic()
+        try:
+            self._cam.trigger_capture()
+        except gp.GPhoto2Error as exc:
+            if not _is_busy_trigger_error(exc):
+                raise
+            self._logger.warning(
+                f"[gphoto2] {self.port}: trigger busy on a focus check: "
+                f"waiting what is left of the {_FOCUS_CHECK_DEADLINE_S:g}s "
+                f"deadline for a file, with no retry"
+            )
+            remaining = _FOCUS_CHECK_DEADLINE_S - (time.monotonic() - start)
+            file_path = self._poll_for_file(remaining)
+            if file_path is None:
+                raise self._focus_check_timeout(f"trigger busy: {exc}") from exc
+            return file_path
+        remaining = _FOCUS_CHECK_DEADLINE_S - (time.monotonic() - start)
+        try:
+            return self._wait_for_file_added(remaining, shutterspeed)
+        except CaptureTimeoutError as exc:
+            # Re-worded without the "flip to MF" hint: a focus check runs on
+            # AF by design.
+            raise self._focus_check_timeout(
+                f"shutterspeed={shutterspeed!r}"
+            ) from exc
+
     def capture(
         self,
         outpath: Path,
         retry: int = _DEFAULT_RETRY,
         retry_delay: float = _DEFAULT_SETTLE,
+        focus_check: bool = False,
     ) -> tuple[float, Path]:
         """Capture one image to outpath. Returns (elapsed_seconds, actual_path).
 
@@ -894,15 +980,23 @@ class _PTPSession:
         risks re-triggering (a second photograph) while the first file is
         still on its way. A failure after the shutter has fired is raised
         as it comes.
+
+        focus_check=True replaces that policy for one capture: one trigger
+        attempt and _FOCUS_CHECK_DEADLINE_S from the trigger to the file
+        (see _trigger_for_focus_check); retry and retry_delay are then
+        unused.
         """
         outpath.parent.mkdir(parents=True, exist_ok=True)
         shutterspeed = self._get_config("shutterspeed")
-        deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
 
         t0 = time.perf_counter()
-        file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
-        if file_path is None:
-            file_path = self._wait_for_file_added(deadline_s, shutterspeed)
+        if focus_check:
+            file_path = self._trigger_for_focus_check(shutterspeed)
+        else:
+            deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
+            file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
+            if file_path is None:
+                file_path = self._wait_for_file_added(deadline_s, shutterspeed)
 
         # The captured filename tells us the actual format (.cr2 vs .jpg)
         is_raw = file_path.name.lower().endswith(".cr2")
@@ -986,6 +1080,9 @@ class GPhoto2Backend(CameraBackend):
         super().__init__(logger)
         # camera_index -> (model_name, usb_port)
         self._port_map: dict[int, tuple[str, str]] = {}
+        # the map last written to the log (None before the first build), so
+        # only changes are logged; read and written under _map_lock
+        self._logged_port_map: "dict[int, tuple[str, str]] | None" = None
         # camera_index -> body serial, for the life of the process and, via
         # the bindings file, across restarts
         self._pins: dict[int, str] = {}
@@ -1004,9 +1101,9 @@ class GPhoto2Backend(CameraBackend):
         # the last autodetect() result, so the map can be rebuilt against new
         # identity knowledge without a second USB enumeration
         self._last_detected: list[tuple[str, str]] = []
-        # when autodetect() last ran, on _monotonic(); None before the first.
-        # Guarded by _map_lock, like _last_detected.
-        self._last_scanned_at: "float | None" = None
+        # _monotonic() at the last autodetect(), or None before the first;
+        # written by _build_port_map under _map_lock
+        self._last_scan_at: "float | None" = None
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
         # usb port -> the index that currently holds a PTP claim on it. This
@@ -1273,7 +1370,7 @@ class GPhoto2Backend(CameraBackend):
             raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
             self._last_detected = list(detected)
-            self._last_scanned_at = _monotonic()
+            self._last_scan_at = _monotonic()
 
         present = {port for _model, port in detected}
         for port in list(serial_by_port):
@@ -1297,14 +1394,63 @@ class GPhoto2Backend(CameraBackend):
                 while index in port_map or index in pins:
                     index += 1
             port_map[index] = (model, port)
-            self.logger.info(f"[gphoto2] Detected camera {index}: {model} on {port}")
+        self._log_port_map_changes(port_map)
         if not port_map:
             self.logger.warning("[gphoto2] No cameras detected by autodetect().")
         return port_map
 
+    def _log_port_map_changes(self, port_map: dict[int, tuple[str, str]]) -> None:
+        """Log the cameras that were added or moved, and those that went away.
+
+        The map is rebuilt on every preview and capture request, so logging
+        every entry each time fills the log with identical lines. Only the
+        difference from the map last logged is written: an entry is logged as
+        detected when its index is new or now holds another model or port,
+        and an index that left the map is logged as no longer detected. An
+        unchanged map logs nothing. Called from _build_port_map(), whose
+        callers hold _map_lock, which also guards _logged_port_map.
+        """
+        previous = self._logged_port_map
+        for index in sorted(port_map):
+            entry = port_map[index]
+            if previous is None or previous.get(index) != entry:
+                model, port = entry
+                self.logger.info(
+                    f"[gphoto2] Detected camera {index}: {model} on {port}"
+                )
+        if previous:
+            for index in sorted(previous):
+                if index not in port_map:
+                    model, port = previous[index]
+                    self.logger.info(
+                        f"[gphoto2] Camera {index}: {model} on {port} "
+                        "is no longer detected"
+                    )
+        self._logged_port_map = dict(port_map)
+
     def _refresh_port_map(self):
         with self._map_lock:
             self._port_map = self._build_port_map(self._pins, self._serial_by_port)
+
+    def _port_map_is_current(self, camera_index: int) -> bool:
+        """Can is_camera_connected() answer for this index without a bus scan?
+
+        Only when all of these hold: a scan has run within
+        _ROUTINE_SCAN_MIN_S, the published map has an entry for this index,
+        and every published port's device node still exists (see
+        _port_node_exists). A body that left or re-enumerated has lost its
+        node, so any other answer means the map may be out of date and the
+        caller scans. The map and the scan time are read under _map_lock; the
+        node checks are filesystem lookups made after it is released.
+        """
+        with self._map_lock:
+            port_map = dict(self._port_map)
+            last_scan_at = self._last_scan_at
+        if last_scan_at is None or _monotonic() - last_scan_at >= _ROUTINE_SCAN_MIN_S:
+            return False
+        if camera_index not in port_map:
+            return False
+        return all(_port_node_exists(port) for _model, port in port_map.values())
 
     def _republish_port_map(self):
         """Re-lay the last detection against the pins and cache as they are now.
@@ -1963,8 +2109,12 @@ class GPhoto2Backend(CameraBackend):
     def is_camera_connected(self, camera_index: int = 0) -> bool:
         """Is a body present at this index right now?
 
-        Always re-detects, so a power-cycle since the last call is reflected.
-        A body that came back on a new port is unidentified at that point, so
+        Re-detects unless the published map is current (_port_map_is_current):
+        a scan within the last _ROUTINE_SCAN_MIN_S, an entry for this index,
+        and every published port's device node still present. A body that is
+        unplugged or power-cycled loses its node, so the next call scans and
+        the change is reflected; a body plugged in at another index is found
+        by the next scan the interval allows. A body that came back on a new port is unidentified at that point, so
         the fresh map can only place it provisionally and this index would
         read as disconnected. When - and only when - this index is pinned,
         absent from the fresh map, and at least one published port has no
@@ -1980,9 +2130,11 @@ class GPhoto2Backend(CameraBackend):
         the operator asks for, may do that.
         """
         try:
-            # Always do a fresh detection so this method reflects reality even
-            # if cameras have been power-cycled since last call.
-            self._refresh_port_map()
+            # Detect afresh unless the map still points at live devices, so a
+            # power-cycle since the last call is reflected without scanning
+            # the bus on every preview and capture.
+            if not self._port_map_is_current(camera_index):
+                self._refresh_port_map()
             with self._map_lock:
                 pinned = camera_index in self._pins
                 absent = camera_index not in self._port_map
@@ -2006,11 +2158,16 @@ class GPhoto2Backend(CameraBackend):
             self.logger.error(f"[gphoto2] is_camera_connected({camera_index}): {exc}")
             return False
 
+    # capture_image() takes focus_check (NEH-339); capture.service passes it
+    # only to a backend class that sets this.
+    supports_focus_check = True
+
     def capture_image(
         self,
         output_path: Path,
         camera_config,
         capture_output: bool = False,
+        focus_check: bool = False,
     ) -> str:
         """Capture one image to output_path. Returns (path as str, None).
 
@@ -2023,6 +2180,10 @@ class GPhoto2Backend(CameraBackend):
             output_path: Destination path for the captured JPEG.
             camera_config: CameraConfig (camera_index used for routing).
             capture_output: Unused - kept for interface compatibility.
+            focus_check: One trigger attempt and a _FOCUS_CHECK_DEADLINE_S
+                deadline instead of the normal retry and deadline policy
+                (see _PTPSession.capture). False leaves the capture as it
+                always was.
 
         Returns:
             (path, None): the saved image file's path as a string (`.cr2`
@@ -2038,7 +2199,10 @@ class GPhoto2Backend(CameraBackend):
             session = self._get_or_open_session(camera_index)
             try:
                 session.apply_dslr_config(camera_config)
-                elapsed, actual_path = session.capture(output_path)
+                if focus_check:
+                    elapsed, actual_path = session.capture(output_path, focus_check=True)
+                else:
+                    elapsed, actual_path = session.capture(output_path)
                 self.logger.info(
                     f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"
@@ -2179,7 +2343,7 @@ class GPhoto2Backend(CameraBackend):
         self._republish_port_map()
         with self._map_lock:
             absent = [i for i in self._pins if i not in self._port_map]
-            last = self._last_scanned_at
+            last = self._last_scan_at
         if not absent:
             return
         if last is not None and _monotonic() - last < _LISTING_REDETECT_MIN_S:
@@ -2286,6 +2450,16 @@ class GPhoto2Backend(CameraBackend):
                 )
                 continue
 
+            # The role the pin suggests, shown to the operator and acted on
+            # by nothing: only a body whose serial is pinned at index 0 or 1
+            # has one.
+            role_guess = None
+            if serial:
+                with self._map_lock:
+                    pinned_here = self._pins.get(idx) == serial
+                if pinned_here:
+                    role_guess = _ROLE_GUESS_BY_PIN_INDEX.get(idx)
+
             model_slug = re.sub(r"[^a-z0-9]", "", row_model.lower())
             hw_id = (
                 f"{model_slug}_{serial}" if serial
@@ -2300,6 +2474,14 @@ class GPhoto2Backend(CameraBackend):
                 "port": row_port,                # raw USB port, e.g. "usb:001,005"
                 "has_aperture_control": True,   # DSLRs always expose aperture via PTP
                 "supports_zoom": False,          # No digital zoom for DSLRs
+                # The USB socket the body is plugged into, as a topology
+                # path ("1-1.2"), looked up in sysfs from the port's bus and
+                # device numbers. No claim is made on the device for it.
+                "usb_port": usb_topology.from_gphoto2_port(
+                    row_port, sysfs_root=_SYSFS_USB_DEVICES
+                ),
+                "role_guess": role_guess,
+                "role_guess_source": "gphoto2_pin" if role_guess else None,
             })
 
         return result, learned
@@ -2506,6 +2688,8 @@ class GPhoto2Backend(CameraBackend):
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": False,
+            "focus_lock": False,
             "autofocus_calibration": False,
             "dslr_settings": True,
         }

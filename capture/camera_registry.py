@@ -449,6 +449,116 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_zoom_step(value) -> bool:
+        """True for a value that can be a stored optical zoom step.
+
+        A step is a non-negative int, and not a bool. The upper bound is the
+        body's own get_zoom_steps() answer, which the registry does not hold;
+        the backend checks it against the camera.
+        """
+        return type(value) is int and value >= 0
+
+    def update_zoom_step(self, hardware_id: str, step: int) -> None:
+        """Persist the optical zoom step for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as orientation: the step is
+        a property of the physical body and its mounting, and has to follow
+        the body if it re-enumerates onto a different index. A body with no
+        "zoom_step" key has never had one set, and the backend leaves its
+        lens where it is.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            step: The zoom step, 0 at the widest.
+
+        Raises:
+            ValueError: step is not a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        if not self.is_valid_zoom_step(step):
+            raise ValueError(f"zoom step must be a non-negative integer; got {step!r}")
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            cameras["cameras"][hardware_id]["zoom_step"] = step
+            cameras["cameras"][hardware_id]["zoom_step_updated_at"] = \
+                datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    @staticmethod
+    def is_valid_focus(value) -> bool:
+        """True for a value that can be a stored focus.
+
+        A stored focus is a dict holding exactly "distance", a positive int in
+        mm as CHDK's get_focus() answers it, and "zoom_step", a valid zoom
+        step: the step the camera reported when the focus was locked. Bools
+        are refused for both.
+        """
+        return (
+            type(value) is dict
+            and set(value) == {"distance", "zoom_step"}
+            and type(value["distance"]) is int
+            and value["distance"] > 0
+            and CameraRegistry.is_valid_zoom_step(value["zoom_step"])
+        )
+
+    def update_focus(self, hardware_id: str, distance: int, zoom_step: int) -> None:
+        """Persist the locked focus for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as the zoom step. The
+        distance and the zoom step it was taken at are written together, as
+        one value under "focus", so neither is ever stored without the
+        other. The backend restores the distance only when the camera
+        reports that zoom step.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            distance: The focus distance in mm.
+            zoom_step: The zoom step the camera reported for the lock.
+
+        Raises:
+            ValueError: distance is not a positive int, or zoom_step is not
+                a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        focus = {"distance": distance, "zoom_step": zoom_step}
+        if not self.is_valid_focus(focus):
+            raise ValueError(
+                "focus must be a positive integer distance and a non-negative "
+                f"integer zoom step; got {distance!r} at step {zoom_step!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry["focus"] = focus
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    def clear_focus(self, hardware_id: str) -> None:
+        """Remove the stored focus for this camera body (CHDK only).
+
+        The camera then autofocuses on every picture. The time of the change
+        is recorded.
+
+        Raises:
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry.pop("focus", None)
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())
@@ -462,6 +572,112 @@ class CameraRegistry:
         """
         detected = self.detect_cameras()
         return {idx: hw_id for idx, (hw_id, _) in detected.items()}
+
+    # The role a body has, and the pair last confirmed together, are read
+    # here and evaluated by capture.camera_roles. set_roles writes them; a
+    # record written before NEH-342 has none, so every key is optional and a
+    # missing one reads as None.
+    ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+    # Every key set_roles writes on a body's record, and clears from a record
+    # that loses its role.
+    ROLE_WRITE_KEYS = ("role", "role_confirmed_at", "role_confirmed_by", "usb_port_at_confirmation")
+
+    def set_roles(
+        self,
+        left_hardware_id: str,
+        right_hardware_id: str,
+        *,
+        ports: Dict[str, Optional[str]],
+        backend: str,
+        confirmed_by: str,
+    ) -> None:
+        """Store the roles the operator confirmed for a pair of bodies (NEH-342).
+
+        One _mutate, so one replace of cameras.json, does all of this: it
+        writes role "left" on the first body's record and "right" on the
+        second's, each with the time of confirmation (UTC, ISO 8601), the
+        username that confirmed it and the body's USB socket at that time;
+        it removes the role keys from every other record that held "left"
+        or "right", so no two records hold the same role; and it stores the
+        pair under the top-level "confirmed_pair" key. An absent body keeps
+        the rest of its record. No other key of any record changes.
+
+        Args:
+            left_hardware_id: The body that photographs the left page.
+            right_hardware_id: The body that photographs the right page.
+            ports: The USB socket of each body, keyed "left" and "right";
+                a missing or None value is stored as None.
+            backend: The name of the active camera backend.
+            confirmed_by: The username of the operator who confirmed.
+
+        Raises:
+            ValueError: an id is empty or not a string, or both are the same.
+            KeyError: an id is not a camera the registry knows about. The
+                caller registers a new body first.
+        """
+        for hw_id in (left_hardware_id, right_hardware_id):
+            if not isinstance(hw_id, str) or not hw_id:
+                raise ValueError(f"a hardware id must be a non-empty string; got {hw_id!r}")
+        if left_hardware_id == right_hardware_id:
+            raise ValueError(f"one body cannot hold both roles: {left_hardware_id}")
+
+        chosen = {"left": left_hardware_id, "right": right_hardware_id}
+        socket = {role: (ports or {}).get(role) for role in chosen}
+
+        def change(cameras: Dict) -> None:
+            records = cameras["cameras"]
+            for hw_id in chosen.values():
+                if hw_id not in records:
+                    raise KeyError(hw_id)
+            now = datetime.now(timezone.utc).isoformat()
+            for hw_id, record in records.items():
+                if hw_id not in chosen.values() and record.get("role") in chosen:
+                    for key in self.ROLE_WRITE_KEYS:
+                        record.pop(key, None)
+            for role, hw_id in chosen.items():
+                records[hw_id].update({
+                    "role": role,
+                    "role_confirmed_at": now,
+                    "role_confirmed_by": confirmed_by,
+                    "usb_port_at_confirmation": socket[role],
+                })
+            cameras["confirmed_pair"] = {
+                "left": left_hardware_id,
+                "right": right_hardware_id,
+                "ports": dict(socket),
+                "backend": backend,
+                "confirmed_at": now,
+                "confirmed_by": confirmed_by,
+            }
+
+        self._mutate(change)
+
+    def get_role_record(self, hardware_id: str) -> Dict:
+        """The role fields stored for this body, each None when absent.
+
+        A body the registry does not know has a record of three Nones.
+        """
+        camera = self.cameras.get("cameras", {}).get(hardware_id) or {}
+        return {key: camera.get(key) for key in self.ROLE_RECORD_KEYS}
+
+    def get_role_records(self, hardware_ids) -> Dict[str, Dict]:
+        """get_role_record for each of these hardware ids, keyed by id."""
+        return {hw_id: self.get_role_record(hw_id) for hw_id in hardware_ids}
+
+    def get_confirmed_pair(self) -> Optional[Dict[str, str]]:
+        """The pair last confirmed together, {"left": hw_id, "right": hw_id}.
+
+        None when the file holds no pair, or holds one that is not two
+        non-empty hardware ids under "left" and "right".
+        """
+        pair = self.cameras.get("confirmed_pair")
+        if not isinstance(pair, dict):
+            return None
+        left, right = pair.get("left"), pair.get("right")
+        if not (isinstance(left, str) and left and isinstance(right, str) and right):
+            return None
+        return {"left": left, "right": right}
 
 
 def initialize_camera_system(run_calibration: bool = True) -> Dict:
