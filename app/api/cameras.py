@@ -208,7 +208,12 @@ class DeviceInfo(BaseModel):
 	# Calibration data (populated when calibrated=True)
 	lens_position: Optional[float] = None
 	awb_gains: Optional[List[float]] = None
-	orientation: Optional[int] = None  # Saved rotation for this body, if ever set (NEH-71)
+	# The body's effective clockwise rotation: the saved one, or 90 when none
+	# was ever saved (CameraRegistry.effective_orientation). Never null.
+	orientation: int = 90
+	# True when an orientation was saved for this body; False when
+	# `orientation` is the default.
+	orientation_saved: bool = False
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
@@ -270,7 +275,7 @@ class CaptureRequest(BaseModel):
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
-	# None (the default) leaves the registry's saved orientation from
+	# None (the default) leaves the body's effective orientation from
 	# default_camera_config_from_registry in place; an explicit value,
 	# including 0, overrides it (NEH-71).
 	rotate_deg: Optional[int] = None
@@ -291,7 +296,7 @@ class DualCaptureRequest(BaseModel):
 	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	stagger_ms: int = 20
 	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
-	# registry's saved orientation in place; an explicit value, including 0,
+	# body's effective orientation in place; an explicit value, including 0,
 	# overrides it (NEH-71 - see CaptureRequest.rotate_deg).
 	rotate_deg_cam0: Optional[int] = None
 	rotate_deg_cam1: Optional[int] = None
@@ -407,6 +412,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	# Function-local, as every capture import in this file is: importing the
 	# capture package starts the camera service module.
 	from capture.camera_roles import confirmed_role
+	from capture.camera_registry import CameraRegistry
 
 	devices = []
 	for dev in raw_devices:
@@ -422,7 +428,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 		label = None
 		lens_position = None
 		awb_gains = None
-		orientation = None
+		stored_orientation = None
 
 		if camera_data:
 			focus_cal = camera_data.get("calibration", {}).get("focus", {})
@@ -433,10 +439,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
 			if awb_raw:
 				awb_gains = list(awb_raw)
-			# Report only a supported angle; a malformed stored value is
-			# shown as unset so the UI never receives an angle it cannot use.
-			stored = camera_data.get("orientation")
-			orientation = stored if type(stored) is int and stored in _VALID_ROTATIONS else None
+			stored_orientation = camera_data.get("orientation")
 
 		devices.append(DeviceInfo(
 			hardware_id=hw_id,
@@ -448,7 +451,10 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			calibrated=calibrated,
 			lens_position=lens_position,
 			awb_gains=awb_gains,
-			orientation=orientation,
+			# Always the effective angle; a malformed stored value reads as
+			# the default and counts as not saved.
+			orientation=CameraRegistry.effective_orientation(stored_orientation),
+			orientation_saved=CameraRegistry.is_valid_orientation(stored_orientation),
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
 			zoom_steps=dev.get("zoom_steps"),
@@ -1200,8 +1206,9 @@ def _page_layout_header(
 ) -> Optional[str]:
 	"""The page layout of a test capture as compact JSON, for X-Page-Layout (NEH-343).
 
-	The rotation is the camera's saved orientation, read from the registry
-	the same way test_capture_bytes reads it (0 when none is saved): the
+	The rotation is the camera's effective orientation, read from the
+	registry the same way test_capture_bytes reads it (90 when none is
+	saved; CameraRegistry.effective_orientation): the
 	capture path records it only in the EXIF Orientation tag, so the pixels
 	are as the sensor delivered them. None when anything fails: the header
 	is a guide for the camera check screen, never a reason to fail the
@@ -1211,10 +1218,11 @@ def _page_layout_header(
 
 	try:
 		from capture import page_layout
+		from capture.camera_registry import CameraRegistry
 		from capture.project_manager import default_camera_config_from_registry
 
 		config, _hw_id = default_camera_config_from_registry(camera_index, resolution)
-		rotation = config.get("rotate_deg", 0) or 0
+		rotation = CameraRegistry.effective_orientation(config.get("rotate_deg"))
 		result = page_layout.analyse_page(image_bytes, rotation_deg=rotation, page_side=page_side)
 		# allow_nan=False: NaN and Infinity are not JSON, and JSON.parse refuses them.
 		return json.dumps(_round_fractions(result), separators=(",", ":"), allow_nan=False)
@@ -1379,7 +1387,7 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
-		# NEH-71: omitted (None) leaves the registry's saved orientation from
+		# NEH-71: omitted (None) leaves the body's effective orientation from
 		# default_camera_config_from_registry in place; an explicit value,
 		# including 0, overrides it.
 		if request.rotate_deg is not None:
@@ -1635,7 +1643,7 @@ def trigger_dual_capture(
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
 
 		# NEH-71: see trigger_capture - omitted (None) leaves the registry's
-		# saved orientation in place; an explicit value, including 0, overrides it.
+		# effective orientation in place; an explicit value, including 0, overrides it.
 		if request.rotate_deg_cam0 is not None:
 			config0_dict["rotate_deg"] = request.rotate_deg_cam0
 		if request.rotate_deg_cam1 is not None:

@@ -848,7 +848,7 @@ def analyse_page(jpeg_bytes: bytes, *, rotation_deg: int, page_side: str) -> dic
     """Find the page in a test capture and judge its framing.
 
     rotation_deg is the clockwise turn (0, 90, 180 or 270) that makes the
-    picture upright, normally the camera's saved orientation. page_side is
+    picture upright, normally the camera's effective orientation. page_side is
     "left" or "right": which page of the open book this camera photographs
     (for "left" the gutter is on the picture's right, for "right" on its
     left). All positions are fractions 0-1 of the upright picture.
