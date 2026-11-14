@@ -5,7 +5,9 @@ the gutter and none of the facing page shows. The scenes are drawn by
 tests/unit/page_scenes.py, so the page's corners are known exactly. Two
 tests also run over the real A2500 samples the method was tuned on, and
 over crops of them made on the gutter side, when the samples are present on
-this machine; they are skipped otherwise.
+this machine; they are skipped otherwise. Four pictures from the zoom
+sweep of 13 November 2026, reduced to the analysis size, are kept under
+tests/unit/data/page_layout/ and always run.
 """
 
 import io
@@ -135,9 +137,25 @@ def test_a_wide_fore_edge_margin_is_accepted():
     assert out["verdict"] == "good"
 
 
-def test_a_head_margin_above_the_band_is_too_small():
-    out = _judge(_margins(0.30, 0.01, 0.10, 0.16))
+def test_a_page_shorter_than_the_band_allows_is_too_small():
+    out = _judge(_margins(0.30, 0.01, 0.15, 0.15))
     assert out["conditions"] == ["too_small"]
+
+
+def test_a_page_tall_enough_but_off_centre_along_the_gutter_is_not_too_small():
+    # Head 3% from the top, foot 20% from the bottom: 77% of the height is
+    # page, so the page is large enough, and the head is too close.
+    out = _judge(_margins(0.30, 0.01, 0.03, 0.20))
+    assert out["conditions"] == ["too_close"]
+    assert out["sides"] == {"top": "too_close"}
+    out = _judge(_margins(0.30, 0.01, 0.10, 0.16))
+    assert out["conditions"] == []
+
+
+def test_the_too_small_limit_is_the_page_height_the_band_leaves():
+    limit = 1 - 2 * MARGIN_MAX
+    assert "too_small" not in _judge(_margins(0.30, 0.01, 0.10, 0.90 - limit - 0.005))["conditions"]
+    assert "too_small" in _judge(_margins(0.30, 0.01, 0.10, 0.90 - limit + 0.005))["conditions"]
 
 
 @pytest.mark.parametrize(
@@ -156,7 +174,7 @@ def test_a_margin_below_six_percent_off_the_gutter_side_is_too_close(margins, si
 
 def test_touching_the_edge_is_cut_off_and_every_condition_is_listed():
     touching = dict(NO_TOUCH, top=True)
-    out = _judge(_margins(0.03, 0.08, 0.0, 0.20), touching)
+    out = _judge(_margins(0.03, 0.08, 0.0, 0.30), touching)
     assert out["conditions"] == ["cut_off", "too_close", "too_small", "gutter_inside"]
     assert out["verdict"] == "cut_off"
     assert out["sides"] == {"top": "cut_off", "left": "too_close"}
@@ -303,6 +321,110 @@ def test_a_right_page_running_off_its_fore_edge_is_cut_off_there():
     assert result["verdict"] == "cut_off", result
     assert result["sides"] == {"right": "cut_off"}
     assert "gutter_inside" in result["conditions"]
+
+
+# ----------------------------------------------------------------------
+# Pages carrying dark illustrations
+# ----------------------------------------------------------------------
+
+@pytest.mark.parametrize("page_side, page", [("left", LEFT_GOOD), ("right", RIGHT_GOOD)])
+@pytest.mark.parametrize(
+    "illustration",
+    [
+        pytest.param((0.12, 0.15, 0.88, 0.55), id="plate-30pc"),
+        pytest.param((0.10, 0.10, 0.90, 0.75), id="plate-52pc"),
+    ],
+)
+def test_a_page_with_a_large_dark_plate_is_found(page_side, page, illustration):
+    # The plate leaves a hole in the paper mask; with it unfilled the page
+    # filled less than MIN_BOX_FILL of its bounding box and was refused as
+    # not page-shaped.
+    jpeg, corners = make_scene(page, page_side=page_side, illustration=illustration)
+    result = analyse_page(jpeg, rotation_deg=0, page_side=page_side)
+    _assert_corners_close(result, corners)
+    assert result["gutter_state"] == "located", result
+    assert result["verdict"] == "good", result
+    assert result["confidence"] > 0.5, result
+
+
+# ----------------------------------------------------------------------
+# Downscaled pictures from the zoom sweep of 13 November 2026
+# ----------------------------------------------------------------------
+
+# Each file is a picture from a Canon PowerShot A2500 on the bench unit,
+# an open bound book under the lowered glass, reduced to the analysis size
+# (576 x 432, as the sensor delivered it, not turned upright) the way
+# decode_upright reduces it, and saved as a greyscale JPEG.
+# - sweep_c0_s28: camera 0, the left page (text), zoom step 28: the whole
+#   page in the picture, the gutter just inside the right edge, the head
+#   near the top because the camera is aimed lower along the gutter than
+#   the page's centre.
+# - sweep_c0_s36: camera 0, step 36: the gutter beyond the right edge and
+#   the head running off the top.
+# - sweep_c1_s20: camera 1, the right page (a plate: a photograph of a
+#   document with a dark band and a seal), step 20: the facing page shows
+#   at the left, and the dark band between it and the page is 12-15 px
+#   across with two minima.
+# - sweep_c1_s60: camera 1, step 60: the gutter beyond the left edge, the
+#   photograph's dark frame line running down the page.
+SWEEP = Path(__file__).parent / "data" / "page_layout"
+SWEEP_CAMERA = {"c0": (270, "left"), "c1": (90, "right")}
+
+
+def _analyse_sweep(name, rotation=None):
+    saved, side = SWEEP_CAMERA[name.split("_")[1]]
+    jpeg = (SWEEP / f"{name}.jpg").read_bytes()
+    return analyse_page(jpeg, rotation_deg=saved if rotation is None else rotation, page_side=side)
+
+
+@pytest.mark.parametrize("name", ["sweep_c1_s20", "sweep_c1_s60"])
+def test_a_plate_page_is_found_only_when_turned_upright(name):
+    # Analysed as the sensor delivered it, the page lies on its side and is
+    # wider than it is tall.
+    sideways = _analyse_sweep(name, rotation=0)
+    assert sideways["found"] is False
+    assert sideways["reason"] == "not_page_shaped"
+    assert _analyse_sweep(name)["found"], _analyse_sweep(name)
+
+
+def test_a_wide_dark_band_at_the_gutter_is_located_as_the_gutter():
+    result = _analyse_sweep("sweep_c1_s20")
+    assert result["found"], result
+    assert result["gutter_state"] == "inside", result
+    assert result["gutter_margin"] == pytest.approx(0.09, abs=0.015), result
+    assert "gutter_unknown" not in result["conditions"]
+    assert "gutter_inside" in result["conditions"]
+
+
+def test_the_frame_line_of_a_photograph_is_not_taken_for_the_gutter():
+    result = _analyse_sweep("sweep_c1_s60")
+    assert result["found"], result
+    assert result["gutter_state"] == "at_or_beyond_edge", result
+    # The page runs from the left edge to its fore edge, 27% from the right.
+    assert result["margins"]["left"] == pytest.approx(0.0, abs=0.01), result
+    assert result["fore_edge_margin"] == pytest.approx(0.27, abs=0.02), result
+    assert result["verdict"] == "cut_off"
+    assert "gutter_unknown" in result["conditions"]
+
+
+def test_the_best_framing_of_the_left_page_reports_the_offset_along_the_gutter():
+    result = _analyse_sweep("sweep_c0_s28")
+    assert result["found"], result
+    assert result["gutter_state"] == "located", result
+    assert result["gutter_margin"] == pytest.approx(0.039, abs=0.008), result
+    # The head is 2% from the top and the foot 28% from the bottom: the
+    # camera is aimed 13% of the height below the page's centre.
+    assert result["sides"] == {"top": "too_close"}, result
+    assert result["offset"]["along_gutter"] == pytest.approx(0.13, abs=0.01), result
+    assert result["fill"] == pytest.approx(0.70, abs=0.01), result
+
+
+def test_a_page_cut_off_at_the_head_with_the_gutter_beyond_the_edge_is_not_too_small():
+    result = _analyse_sweep("sweep_c0_s36")
+    assert result["found"], result
+    assert result["fill"] > 1 - 2 * MARGIN_MAX, result
+    assert result["conditions"] == ["cut_off", "gutter_unknown"], result
+    assert result["sides"] == {"top": "cut_off"}
 
 
 # ----------------------------------------------------------------------

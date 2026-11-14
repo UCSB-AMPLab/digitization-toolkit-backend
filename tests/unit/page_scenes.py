@@ -28,6 +28,8 @@ GLASS_EDGE = (236, 246, 236)
 TUBE = (255, 255, 252)
 SHADOW_EDGE = (170, 164, 150)
 SHADOW = (118, 113, 104)
+PLATE = (64, 62, 60)
+PLATE_FRAME = (30, 30, 30)
 
 
 def _background(width, height, seed):
@@ -71,6 +73,7 @@ def make_scene(
     quality=90,
     paper=PAPER,
     glass=True,
+    illustration=None,
 ):
     """Draw a scene and return (jpeg_bytes, corners).
 
@@ -78,7 +81,10 @@ def make_scene(
     partly outside it. page_side says which page of the opening the camera
     photographs: for "left" the gutter is on the page's right, for "right"
     on its left. paper is the colour of both pages. glass=False leaves out
-    the cut edge of the glass at the gutter. corners are the true
+    the cut edge of the glass at the gutter. illustration, when given, is
+    (x0, y0, x1, y1) as fractions of the page's width and height: a dark
+    plate printed there, with a thin darker frame line round it, as on a
+    page carrying a photograph. corners are the true
     corners in the upright picture, in the order top-left, top-right,
     bottom-right, bottom-left (None when with_page is False).
     """
@@ -128,6 +134,11 @@ def make_scene(
                 width=line_w,
             )
             ty += 0.035 * (y1 - y0)
+        if illustration is not None:
+            ix0, iy0, ix1, iy1 = illustration
+            box = px([(x0 + ix0 * page_w, y0 + iy0 * (y1 - y0)),
+                      (x0 + ix1 * page_w, y0 + iy1 * (y1 - y0))])
+            draw.rectangle(box, fill=PLATE, outline=PLATE_FRAME, width=max(1, round(3 * scale)))
         # The fold at the gutter: a shadow 2% of the width across, darkest
         # in the middle, along the page's height.
         for half, colour in ((0.010, SHADOW_EDGE), (0.005, SHADOW)):
