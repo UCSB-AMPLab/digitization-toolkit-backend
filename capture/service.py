@@ -536,7 +536,7 @@ def test_capture_bytes(
 
     Exercises the same shutter/autofocus/backend path as POST /capture -
     same registry-driven CameraConfig (default_camera_config_from_registry,
-    so a saved orientation still applies) and the same
+    so the body's effective orientation applies) and the same
     get_backend().capture_image() call - but the file never lands under the
     projects root: it is written to a throwaway temp directory that is
     always removed before returning, and no manifest record is ever
