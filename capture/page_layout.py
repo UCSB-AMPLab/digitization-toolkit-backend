@@ -17,9 +17,15 @@ better. page_side says which page the camera photographs
   and the page runs to that edge, whether the page's inner margin is cut
   cannot be told (gutter_unknown), and the page is not called good.
 - Head and foot: each margin between MARGIN_MIN and MARGIN_MAX (6-14%) of
-  the picture's height. Below, too_close; above, too_small. This is the
-  direction that judges the page's size, so fill and
-  magnification_to_target come from the page's height.
+  the picture's height. Below, too_close. This is the direction that
+  judges the page's size, so fill and magnification_to_target come from
+  the page's height, and too_small means the page's height is below
+  1 - 2 x MARGIN_MAX (72%) of the picture's. A page tall enough but off
+  centre along the gutter is reported by offset and by too_close or cut_off
+  on its near side, not as too small: on the zoom sweep of 13 November
+  2026, from zoom step 32 to 44, the left page filled 75-83% of the
+  picture's height, its head ran off the top and 17-25% of the height lay
+  clear below its foot.
 - Fore edge: a margin of at least MARGIN_MIN of the width, with no upper
   limit. Below, too_close.
 - A head, foot or fore edge touching the picture's edge is cut_off.
@@ -65,12 +71,28 @@ pictures it found all ten pages and none in the four empty pictures; on the
 crops it located the gutter in all ten 2% crops and reported the gutter as
 unknown in all twenty others.
 
-It has not been shown to handle pictures taken in the designed position,
+The fold walls, the filling of holes, the check of the cut at the gutter and
+the too_small rule were then set on a zoom sweep of 13 November 2026: 34
+pictures from the same two A2500 bodies on the bench unit, an open bound
+book under the lowered glass, zoom steps 0 to 63, the left page text and
+the right page a plate (a photograph of a document with a dark band across
+it). On all 34 it found the page. The gutter was reported inside up to step
+24, located at step 28 and at or beyond the edge from step 32 on the left
+page, as seen in the pictures. On the right page it was reported inside up
+to step 24 and at or beyond the edge from step 28; at step 28 the dark band
+at the gutter lies 1-2% of the width inside the edge, and its outer wall is
+too faint for the fold to be confirmed, so the gutter is reported as
+unknown rather than located.
+Where the plate's dark band runs off the foot of the picture, the foot is
+reported as cut off, but the foot margin is measured to the top of the
+band (3-7% of the height at steps 52-60 on the right page).
+
+It has not been shown to handle more than one book in the designed position,
 dark, coloured, glossy or damaged pages, blank pages with show-through,
 fold-outs, a page with text or illustration running into the gutter, a
-tight binding with no visible fold, a different platen or backdrop, other
-lighting, or any zoom other than 5.0 mm. Its thresholds were set on those
-fourteen pictures and their crops.
+tight binding with no visible fold, a different platen or backdrop, or other
+lighting. Its thresholds were set on those fourteen pictures, their crops
+and the 34 pictures of the zoom sweep.
 
 A gutter can be located only when the fold's outer wall lies inside the
 picture. On crops of the ten pictures the gutter was located from 0.5% of
@@ -115,7 +137,12 @@ MIN_BOX_FILL = 0.75        # the page must fill this share of its bounding box
 GUTTER_WINDOW = 6          # per-row fold search, +/- px around the gutter column
 GUTTER_SMOOTH_ROWS = 9     # luminance is averaged over this many rows before the fold search
 END_ZONE = 0.06            # share of the width, at the component's gutter-side end, searched second
-FOLD_WALL = (2, 8)         # each wall of the fold is looked for 2-8 px from its bottom
+# Each wall of the fold is looked for 2-14 px from its bottom. On the right
+# page of the 13 November 2026 zoom sweep, from zoom step 12 to 24, the dark
+# band between the facing page and the page was 12-15 px across with two
+# minima, and the far wall lay 9-14 px from the deeper one; with walls
+# looked for only up to 8 px away the gutter was not located on any of them.
+FOLD_WALL = (2, 14)
 FOLD_DEPTH = 30.0          # both walls this many grey levels above the bottom
 FOLD_MIN_ROWS = 0.8        # share of the page's rows that must show the fold
 BIMODAL_MIN_SEPARATION = 3.0  # px between the two groups of gutter positions
@@ -357,12 +384,35 @@ def choose_component(labels: np.ndarray, n: int, gutter_side: str) -> Optional[i
     return int(np.argmax(np.where(eligible, score, -np.inf)))
 
 
-def ring_contrast(lum: np.ndarray, region: np.ndarray) -> float:
-    """Mean luminance of the region minus that of a ring 2-4 px outside it."""
+def fill_holes(region: np.ndarray) -> np.ndarray:
+    """The region with every enclosed hole filled.
+
+    A hole is a part of the picture outside the region that the region
+    surrounds and that does not reach the picture's border: on a page, a
+    dark illustration or photograph. It belongs to the page's outline, so
+    it counts in the page's area and bounding-box fill.
+    """
+    labels, n = label_components(~region)
+    if n == 0:
+        return region
+    outside = np.unique(np.concatenate([labels[0], labels[-1], labels[:, 0], labels[:, -1]]))
+    hole = np.ones(n + 1, bool)
+    hole[outside] = False
+    hole[0] = False
+    return region | hole[labels]
+
+
+def ring_contrast(lum: np.ndarray, region: np.ndarray, paper: Optional[np.ndarray] = None) -> float:
+    """Mean luminance of the region minus that of a ring 2-4 px outside it.
+
+    When paper is given, the region's mean is taken over its paper pixels
+    only, so that a dark illustration inside the page does not lower it.
+    """
     ring = dilate(region, 4) & ~dilate(region, 1)
-    if not ring.any() or not region.any():
+    inner = region if paper is None else region & paper
+    if not ring.any() or not inner.any():
         return 0.0
-    return float(lum[region].mean() - lum[ring].mean())
+    return float(lum[inner].mean() - lum[ring].mean())
 
 
 def ridge_response(lum_blur: np.ndarray) -> np.ndarray:
@@ -512,11 +562,13 @@ def fit_fold(lum_blur: np.ndarray, gutter_x: int, rows: np.ndarray) -> Optional[
     return fit, bimodal_separation(v - (fit[0] * t + fit[1]))
 
 
-def check_page(page: np.ndarray, lum: np.ndarray, gutter_side: str) -> None:
+def check_page(page: np.ndarray, lum: np.ndarray, gutter_side: str,
+               paper: Optional[np.ndarray] = None) -> None:
     """Raise _NotFound unless the region is plausibly a page.
 
     Contact with the gutter-side edge is not counted among the edges the
-    region runs off.
+    region runs off. paper, when given, is the paper mask, over which the
+    region's luminance is taken for the contrast test.
     """
     h, w = page.shape
     area = page.sum()
@@ -532,7 +584,7 @@ def check_page(page: np.ndarray, lum: np.ndarray, gutter_side: str) -> None:
                + int(page[:, -1].any() and gutter_side != "right"))
     if touched >= 3:
         raise _NotFound("runs_off_edges")
-    if ring_contrast(lum, page) < MIN_CONTRAST:
+    if ring_contrast(lum, page, paper) < MIN_CONTRAST:
         raise _NotFound("low_contrast")
     if area / (bh * bw) < MIN_BOX_FILL:
         raise _NotFound("not_page_shaped")
@@ -590,7 +642,11 @@ def assess_framing(margins: dict, touching: dict, *, page_side: str, gutter_loca
     - cut_off: the head, foot or fore edge touches the picture's edge or has
       a negative margin;
     - too_close: one of those margins is below MARGIN_MIN;
-    - too_small: the head or foot margin is above MARGIN_MAX;
+    - too_small: the page's height leaves less than 1 - 2 x MARGIN_MAX of
+      the picture's height to the page, so that centred along the gutter
+      both head and foot margins would be above MARGIN_MAX. A page that is
+      tall enough but off centre along the gutter is not too small: its near
+      side is too_close or cut_off, and offset says by how much it is off;
     - gutter_inside: the gutter is located more than GUTTER_MAX inside the
       gutter-side edge, so the facing page shows;
     - gutter_unknown: the gutter is not located, so whether the page's inner
@@ -601,6 +657,7 @@ def assess_framing(margins: dict, touching: dict, *, page_side: str, gutter_loca
     """
     gutter_side = "right" if page_side == "left" else "left"
     fore_side = "left" if page_side == "left" else "right"
+    fill = 1 - margins["top"] - margins["bottom"]
     sides = {}
     for side in ("top", "bottom", fore_side):
         if touching.get(side) or margins[side] < 0:
@@ -621,14 +678,13 @@ def assess_framing(margins: dict, touching: dict, *, page_side: str, gutter_loca
         conditions.append("cut_off")
     if "too_close" in sides.values():
         conditions.append("too_close")
-    if margins["top"] > MARGIN_MAX or margins["bottom"] > MARGIN_MAX:
+    if fill < 1 - 2 * MARGIN_MAX:
         conditions.append("too_small")
     if gutter_state == "inside":
         conditions.append("gutter_inside")
     if not gutter_located:
         conditions.append("gutter_unknown")
 
-    fill = 1 - margins["top"] - margins["bottom"]
     return {
         "gutter_margin": gutter_margin,
         "fore_edge_margin": margins[fore_side],
@@ -691,35 +747,55 @@ def _locate(lum_img: Image.Image, page_side: str) -> dict:
     h, w = lum.shape
 
     gutter_side = "right" if page_side == "left" else "left"
-    labels, n = label_components(paper_mask(lum_blur))
+    paper = paper_mask(lum_blur)
+    labels, n = label_components(paper)
     best = choose_component(labels, n, gutter_side)
     if best is None:
         raise _NotFound("no_page_sized_region")
-    comp = labels == best
+    # A dark illustration leaves a hole in the paper mask. On the plate page
+    # of the 13 November 2026 zoom sweep (a photograph of a document with a
+    # dark band across its lower third) the hole took up to 11% of the
+    # region's bounding box; a plate with a larger dark illustration leaves
+    # less than MIN_BOX_FILL. The hole is filled, so that it counts as page in the
+    # bounding-box fill and the outline, and the photograph's edges are not
+    # treated as background beside the paper.
+    comp = fill_holes(labels == best)
     del labels
     if comp.sum() < MIN_CANDIDATE_AREA * h * w:
         raise _NotFound("no_page_sized_region")
-    if ring_contrast(lum, comp) < MIN_CONTRAST:
+    if ring_contrast(lum, comp, paper) < MIN_CONTRAST:
         raise _NotFound("low_contrast")
 
     # The fold is looked for on the central 70% of the component's rows,
     # away from the head and foot, where the facing page can stand taller.
+    # A fold is accepted only when cutting the component there leaves a
+    # page-shaped region: the dark frame line of a photograph printed on
+    # the page, with paper on both sides, has the profile of a fold. On the
+    # plate page at zoom step 60 the frame line was taken for the gutter and
+    # the cut left a strip five times as tall as it was wide.
     present = np.flatnonzero(comp.any(1))
     margin = int(0.15 * (present[-1] - present[0]))
     rows = np.arange(present[0] + margin, present[-1] - margin + 1)
-    gutter_fit, separation = None, 0.0
+    gutter_fit, separation, page = None, 0.0, comp
     for x in gutter_columns(comp, ridge_response(lum_blur), page_side):
         fold = fit_fold(lum_blur, x, rows)
-        if fold is not None:
-            gutter_fit, separation = fold
-            break
-    gutter_located = gutter_fit is not None
-    page = comp
-    if gutter_located:
-        line_x = gutter_fit[0] * np.arange(h)[:, None] + gutter_fit[1]
+        if fold is None:
+            continue
+        line_x = fold[0][0] * np.arange(h)[:, None] + fold[0][1]
         cols = np.arange(w)[None, :]
-        page = comp & ((cols < line_x - 1) if page_side == "left" else (cols > line_x + 1))
-    check_page(page, lum, gutter_side)
+        cut = comp & ((cols < line_x - 1) if page_side == "left" else (cols > line_x + 1))
+        try:
+            check_page(cut, lum, gutter_side, paper)
+        except _NotFound as nf:
+            if nf.reason in ("not_page_shaped", "no_page_sized_region"):
+                continue
+            raise
+        gutter_fit, separation = fold
+        page = cut
+        break
+    gutter_located = gutter_fit is not None
+    if not gutter_located:
+        check_page(page, lum, gutter_side, paper)
 
     fits = fit_edges(page)
     if gutter_fit is not None:
