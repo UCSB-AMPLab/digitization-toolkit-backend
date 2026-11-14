@@ -357,3 +357,27 @@ def test_project(db_session, test_user):
     db_session.refresh(project)
     
     return project
+
+
+@pytest.fixture(autouse=True)
+def _no_host_usb_devices(request, monkeypatch):
+    """Keep the gphoto2 backend away from this machine's USB devices.
+
+    The backend stats usbfs nodes to notice a body that has left the bus,
+    reads sysfs to find one that has come back, and can open a node to reset
+    it (NEH-338). Unit tests fake the bodies on ports such as usb:001,004,
+    which on a Linux machine can name a real device. Here the backend sees no
+    usbfs, no Canon devices, and may not open any node; tests that exercise
+    those paths replace these attributes themselves. Tests marked `camera`
+    run against real hardware and keep the real calls.
+    """
+    if request.node.get_closest_marker("camera") is not None:
+        return
+    import capture.backends.gphoto2_backend as gb
+
+    def _no_node(path, flags):
+        raise PermissionError(f"unit tests may not open {path}")
+
+    monkeypatch.setattr(gb, "_usb_node_exists", lambda path: False)
+    monkeypatch.setattr(gb, "_list_canon_devices_on_bus", lambda bus: set())
+    monkeypatch.setattr(gb, "_usbfs_open", _no_node)

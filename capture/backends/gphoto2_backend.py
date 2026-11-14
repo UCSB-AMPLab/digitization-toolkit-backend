@@ -31,7 +31,11 @@ before each capture, through the `iso`, `shutterspeed`, `aperture` and
 Version: 0.1.0-beta
 """
 
+import contextvars
+import fcntl
 import json
+import os
+import re
 import threading
 import time
 from pathlib import Path
@@ -141,6 +145,15 @@ _UNKNOWN_EXPOSURE_S = 30.0
 _BINDINGS_FILENAME = "camera-bindings.json"
 _BINDINGS_VERSION = 1
 
+# How long after the last bus scan a device listing that finds a pinned index
+# missing from the map may scan again. A pinned body that is unplugged keeps
+# its index absent, and the listing must not turn that into one scan per call
+# (NEH-250). A published port whose usbfs node has gone is not limited by
+# this: that is evidence the map is out of date, and the scan it causes
+# removes the port, so it cannot repeat.
+_LISTING_REDETECT_MIN_S = 5.0
+_monotonic = time.monotonic
+
 # How many camera indices are sides of the rig. Indices below this are the
 # operator's left and right - a dual capture asks for exactly 0 and 1 (see
 # app/api/cameras.py, which refuses unless both are connected). Indices at or
@@ -197,6 +210,356 @@ def _capture_deadline_s(exposure: float) -> float:
     return _CAPTURE_TIMEOUT_BASE_S + 2 * exposure
 
 
+# ----------------------------------------------------------------------
+# USB device reset (NEH-338)
+# ----------------------------------------------------------------------
+#
+# A process that dies in the middle of a PTP transfer can leave a Canon body
+# unable to accept a new PTP session: every later open times out in
+# ptp_opensession until the device is reset on the bus. The reset is the
+# USBDEVFS_RESET ioctl on the device's usbfs node, which is what
+# `usbreset BBB/DDD` issues.
+
+# Linux <asm-generic/ioctl.h>: _IOC(dir, type, nr, size) packs the direction
+# into bits 30-31, the argument size into bits 16-29, the type into bits 8-15
+# and the number into bits 0-7. _IO(type, nr) is _IOC(_IOC_NONE, type, nr, 0),
+# and _IOC_NONE is 0 on the generic layout ARM and x86 use.
+_IOC_NONE = 0
+
+
+def _IO(type_char: str, nr: int) -> int:
+    return (_IOC_NONE << 30) | (ord(type_char) << 8) | nr
+
+
+# <linux/usbdevice_fs.h>: #define USBDEVFS_RESET _IO('U', 20)
+_USBDEVFS_RESET = _IO("U", 20)
+
+# A gphoto2 USB port is "usb:BBB,DDD": bus and device number, both decimal.
+# ASCII digits only, and at most three of each (the kernel numbers buses and
+# devices well below 1000), so nothing but a usbfs node path can come of it.
+_USB_PORT_RE = re.compile(r"usb:([0-9]{1,3}),([0-9]{1,3})")
+
+# Where the kernel publishes USB devices: usbfs nodes, and the sysfs entries
+# that say which vendor each one is.
+_USBFS_ROOT = "/dev/bus/usb"
+_SYSFS_USB_DEVICES = "/sys/bus/usb/devices"
+_CANON_VENDOR_ID = "04a9"
+
+# The usbfs calls, as module attributes so tests can stand in for them.
+_usbfs_open = os.open
+_usbfs_ioctl = fcntl.ioctl
+_usbfs_close = os.close
+_usb_node_exists = os.path.exists
+
+# How long to let a body settle after the reset ioctl returns before the open
+# is retried on the same port. The ioctl returning does not mean the body
+# stays where it was: on a Canon EOS Rebel T7 the device has been seen to
+# disconnect two to three seconds after the reset and re-enumerate about two
+# seconds later under a new device number. 2.0 s is long enough for a reset
+# that keeps the device in place (measured on the unit, 4 of 6 wedges).
+_USB_RESET_SETTLE_S = 2.0
+_usb_reset_sleep = time.sleep
+# When the retry fails, or the node is gone by the end of the settle, how long
+# to watch the bus for the body to come back under a new device number, and
+# how often to look. A guess, to be measured on the unit: the bench saw the
+# new device about four to five seconds after the reset.
+_USB_REENUMERATE_WAIT_S = 8.0
+_USB_REENUMERATE_STEP_S = 0.5
+
+# Whether the open in progress may reset a wedged device. Each thread has its
+# own value, so an open made while following a body that a reset has already
+# moved cannot reset it a second time (see _usb_reset_suppressed).
+_USB_RESET_ALLOWED = contextvars.ContextVar("usb_reset_allowed", default=True)
+
+# libgphoto2 result codes that mean the transport to the body failed, which is
+# what a body wedged by an interrupted transfer reports: GP_ERROR_TIMEOUT
+# (-10), libgphoto2's result for a PTP timeout such as the "PTP Timeout
+# (0x02fa)" ptp_opensession reports, and GP_ERROR_IO (-7), its result for a
+# PTP I/O failure on the USB pipe. Every other code means
+# something a reset does not fix and that a reset could make worse: a busy
+# body (-110), a device claimed by another process (-53), a device that is not
+# there (-52) or not recognised (-105).
+_RESETTABLE_GP_ERRORS = frozenset({-7, -10})
+
+# python-gphoto2 formats a GPhoto2Error as "[code] text". An error that
+# carries only its text is read from a leading "[code]" or "code:"; a number
+# anywhere else in the message is not a code.
+_GP_ERROR_TEXT_CODE_RE = re.compile(r"\s*\[?(-[0-9]+)\]?")
+
+
+def _gp_error_code(exc) -> "int | None":
+    """The libgphoto2 result code an exception carries, or None.
+
+    python-gphoto2 sets GPhoto2Error.code; when it is absent the code is read
+    from the start of the message.
+    """
+    code = getattr(exc, "code", None)
+    if isinstance(code, int) and not isinstance(code, bool):
+        return code
+    match = _GP_ERROR_TEXT_CODE_RE.match(str(exc))
+    return int(match.group(1)) if match else None
+
+
+def _usb_bus_and_device(port) -> "tuple[int, int] | None":
+    """(bus, device) for a gphoto2 port "usb:BBB,DDD", or None for anything else."""
+    if not isinstance(port, str):
+        return None
+    match = _USB_PORT_RE.fullmatch(port)
+    if match is None:
+        return None
+    bus, dev = (int(group) for group in match.groups())
+    return bus, dev
+
+
+def _usb_device_node(port) -> "str | None":
+    """The usbfs node for a gphoto2 port "usb:BBB,DDD", or None for anything else."""
+    numbers = _usb_bus_and_device(port)
+    if numbers is None:
+        return None
+    return f"{_USBFS_ROOT}/{numbers[0]:03d}/{numbers[1]:03d}"
+
+
+def _usb_port_has_left_the_bus(port) -> bool:
+    """True when `port` is a USB port whose usbfs node no longer exists.
+
+    A stat, not a bus scan. False for anything that is not a usb:BBB,DDD
+    port, and on a system without usbfs at all, where a missing node says
+    nothing.
+    """
+    node = _usb_device_node(port)
+    if node is None or not _usb_node_exists(_USBFS_ROOT):
+        return False
+    return not _usb_node_exists(node)
+
+
+def _canon_devices_on_bus(bus: int) -> "set[int]":
+    """Device numbers of the Canon devices on USB bus `bus` that are ready to open.
+
+    Read from sysfs, so it costs a few small file reads and touches no
+    device. A device counts once its usbfs node exists and this process may
+    read and write it, which is when udev has finished applying the node's
+    permissions. Any error reading sysfs gives an empty set.
+    """
+    found: set[int] = set()
+    try:
+        entries = os.listdir(_SYSFS_USB_DEVICES)
+    except OSError:
+        return found
+    for name in entries:
+        if ":" in name:
+            # "1-1:1.0" is an interface of device "1-1", not a device.
+            continue
+        base = os.path.join(_SYSFS_USB_DEVICES, name)
+        try:
+            with open(os.path.join(base, "idVendor")) as f:
+                vendor = f.read().strip()
+            with open(os.path.join(base, "busnum")) as f:
+                busnum = int(f.read().strip())
+            with open(os.path.join(base, "devnum")) as f:
+                devnum = int(f.read().strip())
+        except (OSError, ValueError):
+            continue
+        if vendor != _CANON_VENDOR_ID or busnum != bus:
+            continue
+        node = f"{_USBFS_ROOT}/{busnum:03d}/{devnum:03d}"
+        if os.access(node, os.R_OK | os.W_OK):
+            found.add(devnum)
+    return found
+
+
+# As a module attribute so tests can stand in for the bus.
+_list_canon_devices_on_bus = _canon_devices_on_bus
+
+
+class _BodyMovedError(RuntimeError):
+    """A reset made the body leave its port; `new_port` is where it came back.
+
+    `new_port` is None when no new Canon device appeared on the bus within
+    _USB_REENUMERATE_WAIT_S, or when more than one did and which one is the
+    body cannot be told. Either way the port the open was made on is gone,
+    so the caller must re-detect before it opens anything else.
+    """
+
+    def __init__(self, port: str, new_port: "str | None", cause):
+        self.port = port
+        self.new_port = new_port
+        self.cause = cause
+        where = f"came back as {new_port}" if new_port else "did not come back"
+        super().__init__(
+            f"the body on {port} left the bus after a USB reset and {where}"
+        )
+
+
+class _usb_reset_suppressed:
+    """Within this block, a wedged open on this thread raises instead of resetting."""
+
+    def __enter__(self):
+        self._token = _USB_RESET_ALLOWED.set(False)
+        return self
+
+    def __exit__(self, *exc_info):
+        _USB_RESET_ALLOWED.reset(self._token)
+        return False
+
+
+def _wait_for_reenumerated_port(bus: int, before: "set[int]", old_dev: int):
+    """Watch bus `bus` for a Canon device that was not on it before the reset.
+
+    Looks once at once, then every _USB_REENUMERATE_STEP_S, for at most
+    _USB_REENUMERATE_WAIT_S. Returns (new_port, count): the port of the one
+    new device, or None with the number of new devices seen (0 when none came
+    within the wait, more than 1 when the body cannot be told apart).
+    """
+    steps = int(round(_USB_REENUMERATE_WAIT_S / _USB_REENUMERATE_STEP_S))
+    for step in range(steps + 1):
+        new = _list_canon_devices_on_bus(bus) - before - {old_dev}
+        if len(new) == 1:
+            return f"usb:{bus:03d},{next(iter(new)):03d}", 1
+        if new:
+            return None, len(new)
+        if step < steps:
+            _usb_reset_sleep(_USB_REENUMERATE_STEP_S)
+    return None, 0
+
+
+def _reset_usb_device(port, logger) -> bool:
+    """Reset the USB device behind a gphoto2 port with the USBDEVFS_RESET ioctl.
+
+    Returns True once the kernel has reset the device, False otherwise: a port
+    that is not exactly "usb:BBB,DDD", or any OSError opening the node or
+    issuing the ioctl (a node that is gone, or one the process may not
+    write). A False is logged once at WARNING; nothing is raised, and nothing
+    is run in a shell.
+    """
+    node = _usb_device_node(port)
+    if node is None:
+        logger.warning(
+            f"[gphoto2] {port!r}: not a usb:BBB,DDD port; USB reset refused"
+        )
+        return False
+    try:
+        fd = _usbfs_open(node, os.O_WRONLY)
+    except OSError as exc:
+        logger.warning(f"[gphoto2] {port}: USB reset refused, cannot open {node}: {exc}")
+        return False
+    try:
+        _usbfs_ioctl(fd, _USBDEVFS_RESET, 0)
+    except OSError as exc:
+        logger.warning(f"[gphoto2] {port}: USB reset refused on {node}: {exc}")
+        return False
+    finally:
+        try:
+            _usbfs_close(fd)
+        except OSError:
+            pass
+    return True
+
+
+def _new_camera(model: str, port: str):
+    """A gp.Camera set up for `model` on `port`, not yet initialised."""
+    abilities_list = gp.CameraAbilitiesList()
+    abilities_list.load()
+    cam = gp.Camera()
+    cam.set_abilities(abilities_list[abilities_list.lookup_model(model)])
+    port_info_list = gp.PortInfoList()
+    port_info_list.load()
+    cam.set_port_info(port_info_list[port_info_list.lookup_path(port)])
+    return cam
+
+
+def _init_camera(model: str, port: str, logger):
+    """Open a PTP session to the body on `port`, resetting it once if it is wedged.
+
+    When init() fails with a transport timeout or I/O error
+    (_RESETTABLE_GP_ERRORS), and resets are allowed on this thread (see
+    _usb_reset_suppressed), the device behind the port is reset once:
+
+      - After _USB_RESET_SETTLE_S, if the port's node still exists, init() is
+        tried once more on a fresh gp.Camera on the same port. Success is
+        logged at INFO and the camera is returned.
+      - If that retry fails, or the node is gone, the bus is watched for the
+        body to come back under a new device number (see
+        _wait_for_reenumerated_port), and one WARNING names the port, the
+        error and what appeared. A body that came back, or a node that is
+        gone, raises _BodyMovedError so the caller re-detects; a body still
+        on its port that never came back on a new one re-raises the retry's
+        error, as the open failed before.
+
+    There is never a second reset for one failed open. A reset that is refused
+    leaves the original error to propagate, so the open fails exactly as it
+    did without one. Any other error propagates at once.
+
+    A failed init() has already closed the port, so nothing is claimed while
+    the device is reset. The caller must hold the camera lock for the index
+    this port is published at and the claim on the port (see
+    GPhoto2Backend._claim_port): that is what guarantees no capture, preview
+    or other open is using the body when it is reset. The caller holds the
+    lock through the settle and the wait, up to about
+    _USB_RESET_SETTLE_S + _USB_REENUMERATE_WAIT_S plus two init() attempts.
+
+    Returns the initialised gp.Camera.
+    """
+    cam = _new_camera(model, port)
+    try:
+        cam.init()
+        return cam
+    except gp.GPhoto2Error as exc:
+        if (
+            _gp_error_code(exc) not in _RESETTABLE_GP_ERRORS
+            or not _USB_RESET_ALLOWED.get()
+        ):
+            raise
+        first_error = exc
+    numbers = _usb_bus_and_device(port)
+    before = _list_canon_devices_on_bus(numbers[0]) if numbers else set()
+    if not _reset_usb_device(port, logger):
+        raise first_error
+    bus, dev = numbers
+    node = _usb_device_node(port)
+    logger.info(
+        f"[gphoto2] {port}: session open failed ({first_error}); "
+        "USB device reset, retrying the open once"
+    )
+    _usb_reset_sleep(_USB_RESET_SETTLE_S)
+
+    retry_error = None
+    if _usb_node_exists(node):
+        cam = _new_camera(model, port)
+        try:
+            cam.init()
+        except gp.GPhoto2Error as exc:
+            retry_error = exc
+        else:
+            logger.info(
+                f"[gphoto2] {port}: USB reset recovered the body; "
+                "the session open succeeded on the retry"
+            )
+            return cam
+
+    new_port, count = _wait_for_reenumerated_port(bus, before, dev)
+    node_gone = not _usb_node_exists(node)
+    what = (
+        f"the retry failed ({retry_error})" if retry_error is not None
+        else f"the device left the bus (the open had failed with {first_error})"
+    )
+    if new_port is not None:
+        seen = f"a new Canon device appeared on bus {bus:03d} as {new_port}"
+    elif count:
+        seen = (
+            f"{count} new Canon devices appeared on bus {bus:03d}, so which one "
+            "is this body is not known"
+        )
+    else:
+        seen = (
+            f"no new Canon device appeared on bus {bus:03d} within "
+            f"{_USB_REENUMERATE_WAIT_S:g} s"
+        )
+    logger.warning(f"[gphoto2] {port}: after the USB reset {what}; {seen}")
+    if new_port is not None or node_gone or count:
+        raise _BodyMovedError(port, new_port, retry_error or first_error)
+    raise retry_error
+
+
 class _PTPSession:
     """
     An open PTP/USB session to one DSLR camera.
@@ -223,18 +586,10 @@ class _PTPSession:
         self._open()
 
     def _open(self):
-        abilities_list = gp.CameraAbilitiesList()
-        abilities_list.load()
-        self._cam = gp.Camera()
-        abilities_idx = abilities_list.lookup_model(self.model)
-        self._cam.set_abilities(abilities_list[abilities_idx])
-
-        port_info_list = gp.PortInfoList()
-        port_info_list.load()
-        port_idx = port_info_list.lookup_path(self.port)
-        self._cam.set_port_info(port_info_list[port_idx])
-
-        self._cam.init()
+        # A body wedged by an interrupted transfer is reset and retried once
+        # here (see _init_camera); the caller holds this index's camera lock
+        # and the claim on the port.
+        self._cam = _init_camera(self.model, self.port, self._logger)
         self._logger.info(f"[gphoto2] Opened session: {self.model} on {self.port}")
         # Run post-init config; on any error release the USB claim so the
         # next attempt isn't blocked by a half-open session.
@@ -649,6 +1004,9 @@ class GPhoto2Backend(CameraBackend):
         # the last autodetect() result, so the map can be rebuilt against new
         # identity knowledge without a second USB enumeration
         self._last_detected: list[tuple[str, str]] = []
+        # when autodetect() last ran, on _monotonic(); None before the first.
+        # Guarded by _map_lock, like _last_detected.
+        self._last_scanned_at: "float | None" = None
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
         # usb port -> the index that currently holds a PTP claim on it. This
@@ -915,6 +1273,7 @@ class GPhoto2Backend(CameraBackend):
             raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
             self._last_detected = list(detected)
+            self._last_scanned_at = _monotonic()
 
         present = {port for _model, port in detected}
         for port in list(serial_by_port):
@@ -1328,12 +1687,26 @@ class GPhoto2Backend(CameraBackend):
         A read that fails is not an answer: nothing is cached, no pin moves,
         the port is named in the log and stays provisional. Never raises.
         Returns True if anything was learned.
+
+        A read whose reset made the body re-enumerate is followed to the new
+        port at once (see _follow_moved_body). That re-detection changes the
+        map under the rest of the pass, whose rows are then skipped as stale,
+        so the pass is run once more over the fresh map; ports already known
+        are not read again, and the body that moved is never reset twice.
         """
+        learned, followed = self._identify_unknown_ports_once()
+        if followed:
+            learned = self._identify_unknown_ports_once()[0] or learned
+        return learned
+
+    def _identify_unknown_ports_once(self) -> "tuple[bool, bool]":
+        """One pass of _identify_unknown_ports; returns (learned, followed_a_move)."""
         with self._map_lock:
             snapshot = dict(self._port_map)
             known = set(self._serial_by_port)
 
         learned = False
+        followed = False
         for camera_index, (model, port) in sorted(snapshot.items()):
             if port in known:
                 continue
@@ -1375,32 +1748,14 @@ class GPhoto2Backend(CameraBackend):
                             "unidentified for now"
                         )
                         continue
-                    cam = None
-                    initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
-                        initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-                    except Exception:
-                        serial = ""
-                    finally:
-                        # init() may have succeeded even if the read raised;
-                        # the claim is released either way, and only then is
-                        # anything published from it.
-                        if initialized:
-                            try:
-                                cam.exit()
-                            except Exception:
-                                pass
-                        self._release_port(camera_index, port)
+                        serial = self._read_serial_briefly(camera_index, model, port)
+                    except _BodyMovedError as moved:
+                        # A reset made the body leave this port. Follow it to
+                        # its new one now, still under this index's lock.
+                        learned = self._follow_moved_body(camera_index, moved) or learned
+                        followed = True
+                        continue
                 if serial:
                     learned = self._learn_serial(camera_index, read_port, serial) or learned
                 else:
@@ -1408,7 +1763,97 @@ class GPhoto2Backend(CameraBackend):
                         f"[gphoto2] Camera {camera_index}: no serial could be "
                         f"read from {port}; it stays provisional"
                     )
-        return learned
+        return learned, followed
+
+    def _read_serial_briefly(self, camera_index: int, model: str, port: str) -> str:
+        """Open `port` just long enough to read the body's serial; "" if it cannot.
+
+        The caller holds `camera_index`'s camera lock and has taken the claim
+        on `port`; the claim is released here, after cam.exit() has returned,
+        whatever happens. Any failure to open or read gives "", except a
+        _BodyMovedError from _init_camera, which is raised (after the claim
+        is released) so the caller can follow the body to its new port.
+        """
+        cam = None
+        initialized = False
+        try:
+            # The camera lock and the claim are held, so a reset of a wedged
+            # body inside _init_camera cannot cut into anyone else's transfer.
+            cam = _init_camera(model, port, self.logger)
+            initialized = True
+            cfg = cam.get_config()
+            return cfg.get_child_by_name("serialnumber").get_value().strip()
+        except _BodyMovedError:
+            raise
+        except Exception:
+            return ""
+        finally:
+            # init() may have succeeded even if a later step (get_config() or
+            # the serial read) raised. Always release the PTP claim then, or
+            # the camera stays claimed by a dangling `cam` once the lock is
+            # dropped; only after that may anything read be published.
+            if initialized:
+                try:
+                    cam.exit()
+                except Exception:
+                    pass
+            self._release_port(camera_index, port)
+
+    def _follow_moved_body(self, camera_index: int, moved: "_BodyMovedError") -> bool:
+        """Re-detect after a reset moved a body, and read its serial on the new port.
+
+        Called with `camera_index`'s camera lock held and no claim on either
+        port. The bus is scanned once (_refresh_port_map, which takes
+        _map_lock: camera lock, then _map_lock). When the new port is in the
+        fresh detection, its serial is read with resets suppressed, under the
+        same camera lock and a claim on the new port taken through the
+        ownership rule; a port another index already holds is left for the
+        next pass. A serial read is learned against the index the fresh map
+        gives the new port, so the caller's republish lays the body on its
+        pinned index. Never resets, never raises. Returns True if a serial
+        was learned.
+        """
+        self._refresh_port_map()
+        new_port = moved.new_port
+        if new_port is None:
+            return False
+        with self._map_lock:
+            detected = {port: model for model, port in self._last_detected}
+            new_index = next(
+                (i for i, (_m, p) in self._port_map.items() if p == new_port),
+                None,
+            )
+        if new_port not in detected or new_index is None:
+            self.logger.info(
+                f"[gphoto2] Camera {camera_index}: {new_port} is not in the "
+                "fresh detection; the next pass reads it"
+            )
+            return False
+        held_by = self._take_port(camera_index, new_port)
+        if held_by is not None:
+            self.logger.info(
+                f"[gphoto2] Camera {camera_index}: {new_port} is held by index "
+                f"{held_by}; the next pass reads it"
+            )
+            return False
+        with _usb_reset_suppressed():
+            try:
+                serial = self._read_serial_briefly(
+                    camera_index, detected[new_port], new_port
+                )
+            except _BodyMovedError:
+                serial = ""
+        if not serial:
+            self.logger.info(
+                f"[gphoto2] Camera {new_index}: no serial could be read from "
+                f"{new_port}; it stays provisional"
+            )
+            return False
+        self.logger.info(
+            f"[gphoto2] {moved.port}: the body is back on {new_port} as "
+            f"{serial!r}"
+        )
+        return self._learn_serial(new_index, new_port, serial)
 
     def _get_or_open_session(self, camera_index: int) -> _PTPSession:
         """Return an existing open session, or open a new one.
@@ -1443,6 +1888,8 @@ class GPhoto2Backend(CameraBackend):
             session = self._open_identified_session(camera_index, model, port)
             self._sessions[camera_index] = session
             return session
+        except _BodyMovedError as moved:
+            return self._open_after_move(camera_index, moved)
         except gp.GPhoto2Error as exc:
             # -105 Unknown model usually means ports changed (USB re-enumeration
             # after a power-cycle). Refresh the port map once and retry.
@@ -1462,6 +1909,40 @@ class GPhoto2Backend(CameraBackend):
                 self._sessions[camera_index] = session
                 return session
             raise
+
+    def _open_after_move(self, camera_index: int, moved: "_BodyMovedError") -> _PTPSession:
+        """Open `camera_index` once more after a reset moved its body off its port.
+
+        The caller holds `camera_index`'s camera lock; the claim on the old
+        port has already been released by _open_identified_session. The bus
+        is scanned once (camera lock, then _map_lock). The open goes to the
+        body's new port when the reset reported one and the scan found it,
+        otherwise to whatever the fresh map now publishes at this index on a
+        different port; with neither, the index is reported not connected.
+        The open runs with resets suppressed, so one failed open never earns
+        a second reset, and through _open_identified_session, so a body that
+        is not the one pinned here is refused as usual. After the session is
+        stored the map is laid out again, which puts the new port at this
+        index once its serial has been learned.
+        """
+        self._refresh_port_map()
+        with self._map_lock:
+            detected = {port: model for model, port in self._last_detected}
+            entry = self._port_map.get(camera_index)
+        if moved.new_port is not None and moved.new_port in detected:
+            target = (detected[moved.new_port], moved.new_port)
+        elif entry is not None and entry[1] != moved.port:
+            target = entry
+        else:
+            raise RuntimeError(
+                f"Camera {camera_index}: {moved}; ensure the camera is on and "
+                "USB is connected, then try again"
+            ) from moved
+        with _usb_reset_suppressed():
+            session = self._open_identified_session(camera_index, *target)
+        self._sessions[camera_index] = session
+        self._republish_port_map()
+        return session
 
     def _close_session(self, camera_index: int):
         session = self._sessions.pop(camera_index, None)
@@ -1628,6 +2109,7 @@ class GPhoto2Backend(CameraBackend):
         enumeration is run once more - at most once - so the rows come out at
         the indices the pins give them.
         """
+        self._redetect_if_listing_is_stale()
         port_map = self._get_port_map()
         if not port_map:
             return []
@@ -1653,8 +2135,59 @@ class GPhoto2Backend(CameraBackend):
             if differs:
                 self._port_map = rebuilt
         if differs:
-            result, _ = self._enumerate_port_map(rebuilt)
+            result, learned_again = self._enumerate_port_map(rebuilt)
+            if learned_again:
+                # The second pass identified a body the first one could not
+                # reach (a move interrupted its row). Lay the map out once
+                # more, without a scan, so the next call reports it in place.
+                self._republish_port_map()
         return result
+
+    def _redetect_if_listing_is_stale(self):
+        """Scan the bus before a listing when the published map is out of date.
+
+        A listing otherwise serves the map as published, and nothing else
+        re-detects on a unit whose frontend does not poll previews, so a body
+        that re-enumerated stays on its old port. Two signs say the map is
+        stale, both checked without touching the bus:
+
+          - a published port whose usbfs node no longer exists (a stat per
+            published port): always scans, since the scan drops that port;
+          - a pinned index absent from the map: the map is first laid out
+            again from what is already known, which needs no scan; if the
+            index is still absent, the bus is scanned only when the last scan
+            is at least _LISTING_REDETECT_MIN_S old.
+
+        With every pinned body on a published port that still exists, nothing
+        is scanned. Takes _map_lock only; the caller holds no camera lock.
+        """
+        with self._map_lock:
+            ports = [port for _model, port in self._port_map.values()]
+            if not self._port_map:
+                # The first listing builds the map in _get_port_map.
+                return
+        if any(_usb_port_has_left_the_bus(port) for port in ports):
+            self.logger.info(
+                "[gphoto2] a published port has left the bus; re-detecting"
+            )
+            self._refresh_port_map()
+            return
+        with self._map_lock:
+            absent = [i for i in self._pins if i not in self._port_map]
+        if not absent:
+            return
+        self._republish_port_map()
+        with self._map_lock:
+            absent = [i for i in self._pins if i not in self._port_map]
+            last = self._last_scanned_at
+        if not absent:
+            return
+        if last is not None and _monotonic() - last < _LISTING_REDETECT_MIN_S:
+            return
+        self.logger.info(
+            f"[gphoto2] pinned indices {absent} are not on the map; re-detecting"
+        )
+        self._refresh_port_map()
 
     def _enumerate_port_map(self, port_map) -> tuple[list, bool]:
         """One enumeration pass over `port_map`; returns (rows, learned_anything)."""
@@ -1724,34 +2257,16 @@ class GPhoto2Backend(CameraBackend):
                         continue
                     # Nobody holds this camera, so a brief PTP connection just
                     # to read the serial number is not a competing claim.
-                    cam = None
-                    initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model_raw)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
-                        initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
-                    except Exception:
-                        pass
-                    finally:
-                        # init() may have succeeded even if a later step (e.g.
-                        # get_config() or the serial read) raised. Always
-                        # release the PTP claim in that case, or the camera
-                        # stays claimed by this dangling `cam` object while
-                        # the lock is dropped and enumeration continues.
-                        if initialized:
-                            try:
-                                cam.exit()
-                            except Exception:
-                                pass
-                        self._release_port(idx, port)
+                        serial = self._read_serial_briefly(idx, model_raw, port)
+                    except _BodyMovedError as moved:
+                        # A reset made the body leave this port. Follow it to
+                        # its new one now, still under this index's lock; the
+                        # row is left out, and list_devices() enumerates again
+                        # against the map the move produced.
+                        self._follow_moved_body(idx, moved)
+                        learned = True
+                        continue
                     # The claim is gone, so what it read may now be
                     # published.
                     if serial:
