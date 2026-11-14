@@ -120,6 +120,8 @@ from sqlalchemy.orm import Session
 from app.core import config, offsite_hold
 from app.core import fisqua_contract as fc
 
+from app.core.scheduler_control import StoppableWorker
+
 logger = logging.getLogger(__name__)
 
 UNSENT = ("waiting_for_upload", "ready", "failed")
@@ -187,8 +189,8 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _warned_overrides: set = set()
 
 
-def _usable_override(value: str) -> Optional[str]:
-    """CAPTUA_FISQUA_BASE_URL when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
+def _usable_override(value: str, name: str = "CAPTUA_FISQUA_BASE_URL") -> Optional[str]:
+    """The override `name` when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
     from urllib.parse import urlsplit
 
     try:
@@ -202,8 +204,8 @@ def _usable_override(value: str) -> Optional[str]:
         return value.rstrip("/")
     if value not in _warned_overrides:
         _warned_overrides.add(value)
-        logger.warning("CAPTUA_FISQUA_BASE_URL %r is ignored: it must be https://, or http:// to 127.0.0.1, "
-                       "localhost or [::1] for tests; the environment's host is used", value)
+        logger.warning("%s %r is ignored: it must be https://, or http:// to 127.0.0.1, "
+                       "localhost or [::1] for tests; the environment's host is used", name, value)
     return None
 
 
@@ -1751,7 +1753,7 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     return True
 
 
-class FisquaStatusScheduler:
+class FisquaStatusScheduler(StoppableWorker):
     """Polls Fisqua every FISQUA_POLL_INTERVAL_SECONDS (ten minutes), in a thread of its own.
 
     A tick's status poll with no volume to ask for makes no call, so it
@@ -1779,9 +1781,13 @@ class FisquaStatusScheduler:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        # A worker still alive is kept, so worker_alive() and wait_stopped()
+        # never report a live thread as gone.
+        if thread is not None and not thread.is_alive() and self._thread is thread:
+            self._thread = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()

@@ -31,6 +31,10 @@ except (ImportError, ValueError):
 
 logger = logging.getLogger(__name__)
 
+# The clockwise rotation, in degrees, of a body whose orientation was never
+# saved. See CameraRegistry.effective_orientation.
+DEFAULT_ORIENTATION = 90
+
 class CameraRegistry:
     """
     Manages global camera registry with hardware identification.
@@ -348,7 +352,7 @@ class CameraRegistry:
                     "first_registered_at": now,
                     "last_seen_at": now,
                     "calibration": calibration_data or {},
-                    "orientation": None,  # Never set; the frontend keeps its own default (NEH-71)
+                    "orientation": None,  # Never set; reads as DEFAULT_ORIENTATION (effective_orientation)
                 }
 
         self._mutate(change)
@@ -415,6 +419,29 @@ class CameraRegistry:
         """
         return type(value) is int and value in CameraRegistry.VALID_ORIENTATIONS
 
+    @staticmethod
+    def effective_orientation(stored) -> int:
+        """The clockwise rotation, in degrees, that applies to a body.
+
+        A saved orientation (one of 0, 90, 180, 270) applies as saved. A body
+        whose orientation was never saved - None, a missing key, or a stored
+        value outside the four (a hand edit, a bool, 45) - has
+        DEFAULT_ORIENTATION, 90. Every backend read of a stored orientation
+        goes through this function: the default config used for captures
+        and test captures, the page layout analysis of a test capture, and
+        the device rows the API reports.
+
+        The frontend showed and sent 90 for a never-set body from before
+        orientations were saved per body (NEH-71), because most digitisation
+        rigs mount their cameras vertically, so captures of such a body are
+        already stored turned 90. Backend reads that took None as "no
+        rotation" analysed those pictures unturned. The default now belongs
+        to the backend, at the same 90, so stored captures do not change.
+        """
+        if CameraRegistry.is_valid_orientation(stored):
+            return stored
+        return DEFAULT_ORIENTATION
+
     def update_orientation(self, hardware_id: str, degrees: int) -> None:
         """Persist the clockwise rotation to apply for this camera body.
 
@@ -425,9 +452,9 @@ class CameraRegistry:
         body if it re-enumerates onto a different index.
 
         A value of None (set at registration, see register_resolved) means
-        orientation was never set for this body; the frontend falls back to
-        its own default rather than treating a missing value as an explicit
-        "no rotation".
+        orientation was never set for this body; it reads as
+        DEFAULT_ORIENTATION (90), not as "no rotation". See
+        effective_orientation.
 
         Args:
             hardware_id: Hardware ID of the camera.

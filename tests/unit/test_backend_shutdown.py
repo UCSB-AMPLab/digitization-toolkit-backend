@@ -96,6 +96,9 @@ def test_the_application_lifespan_closes_the_backend_on_the_way_out(monkeypatch)
     # The unit's mode is written on a database these stubs do not have.
     import app.core.unit_mode as unit_mode
     monkeypatch.setattr(unit_mode, "initialise", lambda: None)
+    # The device id is written in the data directory, which these tests do not own.
+    import app.core.device_id as device_id
+    monkeypatch.setattr(device_id, "initialise", lambda: None)
 
     closed = []
     monkeypatch.setattr(

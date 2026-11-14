@@ -170,7 +170,7 @@ def test_default_device_config_applies_the_saved_orientation():
 
 
 @pytest.mark.unit
-def test_default_device_config_leaves_rotate_deg_absent_when_never_set():
+def test_default_device_config_uses_90_when_never_set():
     from capture.project_manager import default_camera_config_from_registry
 
     class _FakeRegistry:
@@ -179,14 +179,28 @@ def test_default_device_config_leaves_rotate_deg_absent_when_never_set():
 
     config, hw_id = default_camera_config_from_registry(0, registry=_FakeRegistry())
 
-    assert "rotate_deg" not in config
+    assert config["rotate_deg"] == 90
     assert hw_id == "hw"
 
 
 @pytest.mark.unit
-@pytest.mark.parametrize("stored", [45, True, "90", 90.0, None])
-def test_a_stored_angle_outside_the_four_is_treated_as_unset(monkeypatch, stored):
-    """A hand-edited or corrupt registry value must never reach the capture path."""
+def test_default_device_config_uses_90_for_a_body_the_registry_does_not_know():
+    from capture.project_manager import default_camera_config_from_registry
+
+    class _FakeRegistry:
+        def get_camera_by_index(self, camera_index):
+            return None, None
+
+    config, hw_id = default_camera_config_from_registry(0, registry=_FakeRegistry())
+
+    assert config["rotate_deg"] == 90
+    assert hw_id is None
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stored", [45, True, "90", 90.0, None, -90, 360])
+def test_a_stored_angle_outside_the_four_reads_as_90(stored):
+    """A hand-edited or corrupt registry value never reaches the capture path as itself."""
     from capture import project_manager
 
     assert CameraRegistry.is_valid_orientation(stored) is False
@@ -194,21 +208,52 @@ def test_a_stored_angle_outside_the_four_is_treated_as_unset(monkeypatch, stored
         get_camera_by_index=lambda idx: ("hw", {"orientation": stored, "calibration": {}})
     )
     config, hw_id = project_manager.default_camera_config_from_registry(0, registry=fake)
-    assert "rotate_deg" not in config
+    assert config["rotate_deg"] == 90
 
 
 @pytest.mark.unit
-def test_device_rows_report_only_a_supported_angle():
+@pytest.mark.parametrize("stored", [0, 90, 180, 270])
+def test_effective_orientation_is_a_saved_angle(stored):
+    assert CameraRegistry.effective_orientation(stored) == stored
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stored", [None, 45, True, False, "90", 90.0, -90, 360, [90]])
+def test_effective_orientation_is_90_when_nothing_usable_was_saved(stored):
+    from capture.camera_registry import DEFAULT_ORIENTATION
+
+    assert DEFAULT_ORIENTATION == 90
+    result = CameraRegistry.effective_orientation(stored)
+    assert result == 90
+    assert type(result) is int
+
+
+@pytest.mark.unit
+def test_device_rows_report_the_effective_angle_and_whether_it_was_saved():
     from app.api.cameras import _device_infos
 
     class _Reg:
-        def __init__(self, stored):
-            self.stored = stored
+        def __init__(self, record):
+            self.record = record
 
         def get_camera_by_id(self, hw_id):
-            return {"orientation": self.stored, "calibration": {}}
+            return self.record
 
     row = {"hardware_id": "hw", "index": 0, "model": "m"}
-    assert _device_infos([row], _Reg(270))[0].orientation == 270
-    assert _device_infos([row], _Reg(45))[0].orientation is None
-    assert _device_infos([row], _Reg(True))[0].orientation is None
+
+    saved = _device_infos([row], _Reg({"orientation": 270, "calibration": {}}))[0]
+    assert (saved.orientation, saved.orientation_saved) == (270, True)
+
+    saved_zero = _device_infos([row], _Reg({"orientation": 0, "calibration": {}}))[0]
+    assert (saved_zero.orientation, saved_zero.orientation_saved) == (0, True)
+
+    for record in ({"orientation": None, "calibration": {}},
+                   {"orientation": 45, "calibration": {}},
+                   {"orientation": True, "calibration": {}},
+                   {"calibration": {}},
+                   None):
+        info = _device_infos([row], _Reg(record))[0]
+        assert (info.orientation, info.orientation_saved) == (90, False), record
+        dumped = info.model_dump()
+        assert dumped["orientation"] == 90
+        assert dumped["orientation_saved"] is False
