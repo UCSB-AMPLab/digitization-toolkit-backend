@@ -62,6 +62,21 @@ ScriptMessage = namedtuple(
 )
 
 
+class DngError(ValueError):
+    """Stands in for pychdk.dng.DngError: the DNG parts could not be assembled.
+
+    The library raises it from shoot(dng=True) once every part has arrived,
+    when the header and the raw data do not make a DNG (a raw length that
+    differs from the header's byte count, offsets that do not lay the parts
+    end to end).
+    """
+
+
+# What pychdk's shoot(stream=True, dng=True, jpeg=True) returns: the DNG
+# and the camera's JPEG of the same exposure, both as bytes.
+DngCapture = namedtuple("DngCapture", ["dng", "jpeg"])
+
+
 class TransportError(Exception):
     """Stands in for usb.core.USBError, which is not a PTPError.
 
@@ -194,6 +209,8 @@ class Body:
         set_focus_error=None,
         aflock_error=None,
         aflock_error_after=0,
+        dng=b"",
+        old_library=False,
     ):
         self.bus = bus
         self.address = address
@@ -205,6 +222,12 @@ class Body:
         self.upload_error = upload_error
         self.frame = frame
         self.image = image
+        # The DNG a shoot(dng=True) returns, as the library assembles it. The
+        # JPEG of the same exposure is assembled from `image` or shot_chunks,
+        # as for a JPEG-only shot. old_library makes the body's device the
+        # pinned pychdk 0.1.3's, whose shoot() has no jpeg argument.
+        self.dng = dng
+        self.old_library = old_library
         self.shoot_error = shoot_error
         self.preview_error = preview_error
         self.mode_error = mode_error
@@ -722,8 +745,21 @@ class FakeChdkDevice:
         self._body.uploads.append((remote_path, payload))
         self._body.card = payload
 
-    def shoot(self, **kwargs):
-        """pychdk's shoot(stream=True): it sends the capture script itself."""
+    def shoot(self, shutter_speed=_UNSET, market_iso=_UNSET, dng=_UNSET,
+              stream=_UNSET, jpeg=_UNSET):
+        """pychdk's shoot(stream=True): it sends the capture script itself.
+
+        The signature is the library's from the release that added jpeg.
+        Only the arguments the caller passed are recorded in shots. With
+        dng and jpeg it returns a DngCapture of the body's DNG and the JPEG
+        assembled as for a JPEG-only shot; with dng alone, the DNG.
+        """
+        kwargs = {
+            name: value for name, value in (
+                ("shutter_speed", shutter_speed), ("market_iso", market_iso),
+                ("dng", dng), ("stream", stream), ("jpeg", jpeg),
+            ) if value is not _UNSET
+        }
         self._body._script_arrives("<capture>", None)
         self._body.shots.append(kwargs)
         self._body._pass("shoot")
@@ -731,6 +767,10 @@ class FakeChdkDevice:
             raise self._body.shoot_error
         picture = self._body._take_picture()
         self._body._start_running("<capture>", self._body.capture_script_reads)
+        if kwargs.get("dng"):
+            if kwargs.get("jpeg"):
+                return DngCapture(dng=self._body.dng, jpeg=picture)
+            return self._body.dng
         return picture
 
     def close(self):
@@ -740,10 +780,22 @@ class FakeChdkDevice:
         self._body._closed()
 
 
+class FakeChdkDevice013(FakeChdkDevice):
+    """A device from the pinned pychdk 0.1.3, whose shoot() takes no jpeg."""
+
+    def shoot(self, shutter_speed=_UNSET, market_iso=_UNSET, dng=_UNSET,
+              stream=_UNSET):
+        return super().shoot(
+            shutter_speed=shutter_speed, market_iso=market_iso, dng=dng,
+            stream=stream,
+        )
+
+
 class FakePychdk:
     """The module object the backend is given in place of pychdk."""
 
     PTPError = PTPError
+    DngError = DngError
     DeviceInfo = DeviceInfo
     parse_own_txt = staticmethod(parse_own_txt)
     format_own_txt = staticmethod(format_own_txt)
@@ -786,6 +838,8 @@ class FakePychdk:
     def ChdkDevice(self, device_info, _usb_device=None):
         body = self.by_key((device_info.bus_num, device_info.device_num))
         body.pychdk_module = self
+        if body.old_library:
+            return FakeChdkDevice013(device_info, body)
         return FakeChdkDevice(device_info, body)
 
 
