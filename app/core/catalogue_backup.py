@@ -82,6 +82,8 @@ from sqlalchemy.orm import Session
 # stale. Every read below goes through config.settings.
 from app.core import config, offsite_hold
 
+from app.core.scheduler_control import StoppableWorker
+
 logger = logging.getLogger(__name__)
 
 # system_logs.category carries a CHECK constraint
@@ -224,11 +226,27 @@ def dump_argv() -> list[str]:
     return argv
 
 
+def absolute_from_backend(path) -> Path:
+    """A path as rclone and the backend read it: relative paths against the backend's working directory."""
+    return Path(path).absolute()
+
+
+def rclone_config_file() -> Optional[Path]:
+    """CAPTUA_RCLONE_CONFIG as an absolute path, resolved against the backend's working directory as rclone would; None when unset.
+
+    Every rclone call takes it from here (_rclone_argv), and so does
+    pairing (fisqua_pairing_apply.rclone_config_path), whose script runs in
+    another directory.
+    """
+    configured = config.settings.RCLONE_CONFIG.strip()
+    return absolute_from_backend(configured) if configured else None
+
+
 def _rclone_argv(*args: str) -> list[str]:
     argv = [config.settings.RCLONE_BIN, *args]
-    config_path = config.settings.RCLONE_CONFIG.strip()
-    if config_path:
-        argv += ["--config", config_path]
+    config_path = rclone_config_file()
+    if config_path is not None:
+        argv += ["--config", str(config_path)]
     return argv
 
 
@@ -834,7 +852,7 @@ def run_catalogue_backup(db: Session, today: Optional[date] = None) -> dict:
 # Schedule
 # ---------------------------------------------------------------------------
 
-class CatalogueBackupScheduler:
+class CatalogueBackupScheduler(StoppableWorker):
     """In-process schedule for the catalogue dump.
 
     In-process rather than a systemd timer because the run's state has to reach
@@ -893,9 +911,13 @@ class CatalogueBackupScheduler:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        # A worker still alive is kept, so worker_alive() and wait_stopped()
+        # never report a live thread as gone.
+        if thread is not None and not thread.is_alive() and self._thread is thread:
+            self._thread = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()

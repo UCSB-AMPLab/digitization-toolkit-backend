@@ -59,6 +59,12 @@ async def lifespan(app: FastAPI):
     from app.core import unit_mode
 
     unit_mode.initialise()
+    # Write the unit's device id on first start (app.core.device_id); a
+    # no-op once written. A file that does not hold one is logged and kept,
+    # and the unit cannot ask Fisqua for a pairing code until it is repaired.
+    from app.core import device_id
+
+    device_id.initialise()
     # Schedule the offsite catalogue dump (NEH-249). A no-op on a unit with no
     # offsite remote configured.
     from app.core.catalogue_backup import catalogue_backup_scheduler
@@ -75,6 +81,16 @@ async def lifespan(app: FastAPI):
 
     fisqua_status_scheduler.start()
     yield
+    # First: from here no provisioning run starts and pairing starts no
+    # scheduler (app.core.restart_latch).
+    from app.core import restart_latch
+
+    restart_latch.begin_shutdown()
+    # End any pairing session (app.core.fisqua_pairing_service): its secret
+    # is dropped and its thread joined.
+    from app.core.fisqua_pairing_service import pairing_registry
+
+    pairing_registry.shutdown()
     fisqua_status_scheduler.stop()
     image_upload_scheduler.stop()
     catalogue_backup_scheduler.stop()

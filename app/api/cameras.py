@@ -25,12 +25,17 @@ from app.core.db_errors import integrity_conflict
 from app.core.record_sequence import VOLUME_CHANGED_MESSAGE, VolumeChangedError, insert_after, lock_volume_records, next_sequences
 from app.core.record_status import change_record_status
 from app.core import recapture_turn
+from app.core import unit_activity
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
+# Routes that take a picture or hold a camera busy carry this, so the
+# backend knows a camera is in use (app.core.unit_activity). A route
+# dependency rather than a parameter: the routes' signatures stay as they are.
+_CAMERA_BUSY = [Depends(unit_activity.tracked)]
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
@@ -688,7 +693,7 @@ def set_camera_roles(
 	)
 
 
-@router.post("/rescan", response_model=List[DeviceInfo])
+@router.post("/rescan", response_model=List[DeviceInfo], dependencies=_CAMERA_BUSY)
 def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
 	"""
 	Re-detect the attached cameras and drop any stale device sessions.
@@ -922,7 +927,7 @@ def get_focus(
 		raise HTTPException(status_code=500, detail="Failed to get focus")
 
 
-@router.post("/focus/{camera_index}", response_model=FocusResponse)
+@router.post("/focus/{camera_index}", response_model=FocusResponse, dependencies=_CAMERA_BUSY)
 def set_focus(
 	camera_index: int,
 	request: FocusRequest,
@@ -944,7 +949,7 @@ def set_focus(
 		raise HTTPException(status_code=500, detail="Failed to set focus")
 
 
-@router.post("/focus-lock/{camera_index}")
+@router.post("/focus-lock/{camera_index}", dependencies=_CAMERA_BUSY)
 def lock_camera_focus(
 	camera_index: int,
 	current_user: User = Depends(allow_contributor),
@@ -1033,7 +1038,7 @@ class CameraSettingsRequest(BaseModel):
 	zoom_step: Optional[StrictInt] = None     # Stepped optical zoom, 0 = widest (CHDK backend); a bool or a float is refused
 
 
-@router.post("/settings/{camera_index}")
+@router.post("/settings/{camera_index}", dependencies=_CAMERA_BUSY)
 def apply_camera_settings(
 	camera_index: int,
 	request: CameraSettingsRequest,
@@ -1234,7 +1239,7 @@ def _page_layout_header(
 		return None
 
 
-@router.post("/test-capture/{camera_index}")
+@router.post("/test-capture/{camera_index}", dependencies=_CAMERA_BUSY)
 def test_capture(
 	camera_index: int,
 	resolution: str = Query("medium"),
@@ -1324,7 +1329,7 @@ def test_capture(
 	)
 
 
-@router.post("/capture", response_model=CaptureResponse)
+@router.post("/capture", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
 def trigger_capture(
 	request: CaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -1557,7 +1562,7 @@ def trigger_capture(
 		return CaptureResponse(success=False, error=str(e))
 
 
-@router.post("/capture/dual", response_model=CaptureResponse)
+@router.post("/capture/dual", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
 def trigger_dual_capture(
 	request: DualCaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -1842,7 +1847,7 @@ def trigger_dual_capture(
 		return CaptureResponse(success=False, error=str(e))
 
 
-@router.post("/calibrate", response_model=CalibrationResponse)
+@router.post("/calibrate", response_model=CalibrationResponse, dependencies=_CAMERA_BUSY)
 def calibrate_camera(
 	request: CalibrationRequest,
 	current_user: User = Depends(allow_contributor)
@@ -1913,7 +1918,7 @@ def calibrate_camera(
 		return CalibrationResponse(success=False, error=str(e))
 
 
-@router.post("/calibrate/white-balance", response_model=WhiteBalanceCalibrationResponse)
+@router.post("/calibrate/white-balance", response_model=WhiteBalanceCalibrationResponse, dependencies=_CAMERA_BUSY)
 def calibrate_white_balance(
 	request: WhiteBalanceCalibrationRequest,
 	current_user: User = Depends(allow_contributor)
@@ -2060,7 +2065,7 @@ def get_dslr_settings(
 		raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse, dependencies=_CAMERA_BUSY)
 def apply_dslr_settings(
 	camera_index: int,
 	request: DSLRSettingsUpdate,
