@@ -50,8 +50,10 @@ class CameraConfig:
     # 0 = landscape (default), 90 = portrait CW, 180 = upside-down, 270 = portrait CCW.
     rotate_deg: int = 0
     # Exposure and format fields for the camera-controlled backends.
-    # gphoto2 uses all four; the CHDK backend reads iso and shutter_speed and
-    # ignores aperture and image_format; picamera2/subprocess ignore all four.
+    # gphoto2 uses all four; the CHDK backend reads iso, shutter_speed and
+    # image_format ("JPEG" or "RAW", where RAW saves a .dng with the camera's
+    # JPEG as its _preview.jpg; "RAW+JPEG" is refused) and ignores aperture;
+    # picamera2/subprocess ignore all four.
     #
     # iso is the number printed in the camera's own ISO menu, not a real
     # sensitivity: gphoto2 writes it straight to the camera's iso PTP widget,
@@ -61,7 +63,7 @@ class CameraConfig:
     iso: Optional[int] = None            # e.g. 400; None = camera default
     shutter_speed: Optional[str] = None  # e.g. "1/250" (PTP shutterspeed string)
     aperture: Optional[str] = None       # e.g. "5.6" (PTP aperture string)
-    image_format: Optional[str] = None   # "JPEG" (default), "RAW" (.cr2), "RAW+JPEG"
+    image_format: Optional[str] = None   # "JPEG" (default), "RAW" (.cr2, or .dng on CHDK), "RAW+JPEG"
 
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""

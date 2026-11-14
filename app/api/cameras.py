@@ -379,6 +379,72 @@ class DSLRSettingsUpdate(BaseModel):
 	image_format: Optional[str] = None   # "JPEG", "RAW", or "RAW+JPEG"
 
 
+def _takes_camera_settings(caps: dict) -> bool:
+	"""True when the settings route serves this backend.
+
+	A DSLR (dslr_settings) takes ISO, shutter speed, aperture and format; a
+	backend that reports image_formats without dslr_settings (CHDK) takes
+	the capture format alone.
+	"""
+	return bool(caps.get("dslr_settings") or caps.get("image_formats"))
+
+
+def _put_stored_image_format(config_dict: dict, camera_index: int) -> None:
+	"""Put the capture format the backend stores for this camera into config_dict.
+
+	On CHDK the format is a choice per capture, stored per body by the
+	settings route, so a record capture carries it in its CameraConfig. A
+	gphoto2 DSLR holds its format as a camera setting and stores nothing
+	here, so config_dict is left as it is. Test captures, the focus check
+	and the live preview build their own configuration and do not call
+	this, so they capture JPEG.
+
+	The backend is read as it stands, never constructed, as
+	capture.service.camera_model reads it: the format is stored on the
+	backend instance, so a backend not yet built holds none.
+	"""
+	import capture.service as capture_service
+	stored = getattr(capture_service._backend, "capture_image_format", None)
+	image_format = stored(camera_index) if callable(stored) else None
+	if isinstance(image_format, str):
+		config_dict["image_format"] = image_format
+
+
+def _image_size_and_exif(master):
+	"""The size and EXIF to record for a captured master: (width, height, exif_dict).
+
+	Read with PIL from the master itself, except for a `.dng`, which is read
+	from its `_preview.jpg` (preview_sidecar_of). PIL opens a DNG as a TIFF
+	and reports its first directory, which in a CHDK DNG is the 128x96
+	thumbnail; the preview is the camera's JPEG of the same exposure, with
+	its full size and EXIF. A `.cr2` is read from the master, as before: PIL
+	reports a CR2's real size and its EXIF, while its preview is extracted
+	from the CR2 and may carry no EXIF. When the file cannot be read, a DNG's
+	preview included, nothing is recorded: (None, None, {}).
+	"""
+	from pathlib import Path
+	from PIL import Image
+	from PIL.ExifTags import TAGS
+
+	master = Path(master)
+	source = preview_sidecar_of(master) if master.suffix.lower() == ".dng" else master
+	exif_dict = {}
+	try:
+		with Image.open(source) as img:
+			width, height = img.size
+			try:
+				exif_data = img._getexif()
+				if exif_data:
+					for tag_id, value in exif_data.items():
+						exif_dict[TAGS.get(tag_id, tag_id)] = str(value)
+			except Exception:
+				pass  # No EXIF data or error reading
+	except Exception as e:
+		logger.warning(f"Could not extract image metadata for {master.name} from {source.name}: {e}")
+		return None, None, {}
+	return width, height, exif_dict
+
+
 def _get_camera_registry():
 	"""Get or create camera registry. Handles import errors gracefully."""
 	try:
@@ -1384,6 +1450,7 @@ def trigger_capture(
 		# including 0, overrides it.
 		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
+		_put_stored_image_format(config_dict, request.camera_index)
 		camera_config = CameraConfig(**config_dict)
 		
 		# Resolve the path from collection_id via the DB
@@ -1410,24 +1477,7 @@ def trigger_capture(
 		from pathlib import Path
 		file_path = Path(output_path)
 		file_size = file_path.stat().st_size if file_path.exists() else 0
-		resolution_width = None
-		resolution_height = None
-		exif_dict = {}
-		
-		try:
-			with Image.open(output_path) as img:
-				resolution_width, resolution_height = img.size
-				# Extract EXIF data if available
-				try:
-					exif_data = img._getexif()
-					if exif_data:
-						for tag_id, value in exif_data.items():
-							tag_name = TAGS.get(tag_id, tag_id)
-							exif_dict[tag_name] = str(value)
-				except:
-					pass  # No EXIF data or error reading
-		except Exception as e:
-			logger.warning(f"Could not extract image metadata: {e}")
+		resolution_width, resolution_height, exif_dict = _image_size_and_exif(file_path)
 		
 		# Reuse the resolved project name so the DB record matches the on-disk tree
 		project = db.query(Project).filter(Project.name == project_name).first()
@@ -1641,6 +1691,8 @@ def trigger_dual_capture(
 		if request.rotate_deg_cam1 is not None:
 			config1_dict["rotate_deg"] = request.rotate_deg_cam1
 
+		_put_stored_image_format(config0_dict, 0)
+		_put_stored_image_format(config1_dict, 1)
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
@@ -1715,23 +1767,7 @@ def trigger_dual_capture(
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
-			resolution_width = None
-			resolution_height = None
-			exif_dict = {}
-			
-			try:
-				with Image.open(file_path_str) as img:
-					resolution_width, resolution_height = img.size
-					try:
-						exif_data = img._getexif()
-						if exif_data:
-							for tag_id, value in exif_data.items():
-								tag_name = TAGS.get(tag_id, tag_id)
-								exif_dict[tag_name] = str(value)
-					except:
-						pass
-			except Exception as e:
-				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
+			resolution_width, resolution_height, exif_dict = _image_size_and_exif(file_path)
 			
 			# Generate thumbnail alongside the captured images
 			# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
@@ -2040,7 +2076,7 @@ def get_dslr_settings(
 	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
-	if not caps.get("dslr_settings"):
+	if not _takes_camera_settings(caps):
 		raise HTTPException(
 			status_code=501,
 			detail="Active camera backend does not support DSLR settings.",
@@ -2068,21 +2104,32 @@ def apply_dslr_settings(
 	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
-	if not caps.get("dslr_settings"):
+	if not _takes_camera_settings(caps):
 		raise HTTPException(
 			status_code=501,
 			detail="Active camera backend does not support DSLR settings.",
 		)
-	if request.image_format is not None and request.image_format not in ("JPEG", "RAW", "RAW+JPEG"):
-		raise HTTPException(
-			status_code=422,
-			detail=f"image_format must be one of JPEG, RAW, RAW+JPEG; got {request.image_format!r}",
-		)
+	from capture.backends.base import IMAGE_FORMATS, normalise_image_format
+	settings = request.model_dump(exclude_none=True)
+	offered = caps.get("image_formats") or IMAGE_FORMATS
+	if request.image_format is not None:
+		# The old name RAW is taken as RAW+JPEG (capture.backends.base).
+		image_format = normalise_image_format(request.image_format)
+		if image_format is None or image_format not in offered:
+			raise HTTPException(
+				status_code=422,
+				detail=f"image_format must be one of {', '.join(offered)}; got {request.image_format!r}",
+			)
+		settings["image_format"] = image_format
+	if not caps.get("dslr_settings"):
+		others = sorted(name for name in settings if name != "image_format")
+		if others:
+			raise HTTPException(
+				status_code=422,
+				detail=f"This camera takes only image_format here, not {', '.join(others)}",
+			)
 	try:
-		updated = backend.apply_dslr_settings(
-			camera_index,
-			request.model_dump(exclude_none=True),
-		)
+		updated = backend.apply_dslr_settings(camera_index, settings)
 		return DSLRSettingsResponse(**updated)
 	except RuntimeError as e:
 		raise HTTPException(status_code=502, detail=str(e))

@@ -559,6 +559,48 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_image_format(value) -> bool:
+        """True for a value that can be stored as a capture format.
+
+        The formats and their old name RAW are capture.backends.base's
+        (IMAGE_FORMATS, normalise_image_format). Imported here, not at the
+        top, so opening the registry does not load the backends.
+        """
+        from .backends.base import normalise_image_format
+        return normalise_image_format(value) is not None
+
+    def update_image_format(self, hardware_id: str, image_format: str) -> None:
+        """Persist the capture format chosen for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as the zoom step. The value
+        is stored under its current name, so the old name RAW is written as
+        RAW+JPEG. A body with no "image_format" key has never had one chosen,
+        and captures JPEG. A gphoto2 DSLR holds its format on the camera, and
+        nothing is stored for it here. The time of the change is recorded.
+
+        Raises:
+            ValueError: image_format is not a capture format.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        from .backends.base import IMAGE_FORMATS, normalise_image_format
+
+        stored = normalise_image_format(image_format)
+        if stored is None:
+            raise ValueError(
+                f"image format must be one of {', '.join(IMAGE_FORMATS)}; "
+                f"got {image_format!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry["image_format"] = stored
+            entry["image_format_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())
