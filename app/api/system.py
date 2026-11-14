@@ -27,7 +27,8 @@ allow_admin     = RoleChecker(["admin"])
 # Single root-privileged entry point installed (root-owned, sudoers-whitelisted)
 # by the superproject setup. All privileged shell-outs go through this helper
 # rather than raw mount/umount/mkdir/chown; see /etc/sudoers.d/dtk-system-helper.
-HELPER = "/usr/local/bin/dtk-system-helper"
+# The path is app.core.system_helper's, which the pairing restart also uses.
+from app.core.system_helper import HELPER  # noqa: E402
 
 router = APIRouter()
 
@@ -234,6 +235,112 @@ def put_unit(
     except unit_mode.ModeRefused as exc:
         raise HTTPException(status_code=409, detail=exc.detail())
     return unit_mode.as_api(db)
+
+
+# ---------------------------------------------------------------------------
+# Pairing with Fisqua by a code (NEH-345, contract 1.11 §12)
+# ---------------------------------------------------------------------------
+
+class PairingStart(BaseModel):
+    unitName: str = ""
+
+
+_PAIRING_REFUSALS = {
+    "mode_not_eligible": "Only a unit in Fisqua mode, or one in offline mode that is not yet linked, can be linked by a code.",
+    "busy_capturing": "A capture is in progress; try again when it ends.",
+    "offsite_held": "The offsite hold is in place; try again once it is removed.",
+    "rclone_missing": "This unit lacks the program that uploads to the bucket; it must be linked by hand.",
+    "script_missing": "The unit's provisioning script was not found; the unit must be updated.",
+    "script_too_old": "The unit's provisioning script cannot replace its storage credential; the unit must be updated.",
+    "not_renewable": "There is no lapsed code to replace.",
+    "restart_required": "A link was written or may have been; restart the unit before asking for a new code.",
+    "unit_name": "The unit name must be 1 to 64 characters.",
+}
+
+
+def _pairing_refused(reason: str, status: int = 409) -> HTTPException:
+    message = _PAIRING_REFUSALS.get(reason, "This unit cannot ask for a pairing code now.")
+    return HTTPException(status_code=status, detail={"code": reason, "message": message})
+
+
+@router.get("/pairing")
+def get_pairing(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """The pairing card's state. Admin only. Reading it is the session's heartbeat.
+
+    {state, reason, trouble, retryAfterSeconds, code, expiresInSeconds,
+    renewalSecondsLeft, environment, deviceId, deviceIdError, unitName,
+    currentTenant, linked: {configured, tenant, environment},
+    eligible: {ok, reason}, result: {tenant, environment, at, by} | null,
+    restartRequired, lastOutcome}. `restartRequired` is true once a
+    provisioning run may have changed this process's settings, until the
+    backend restarts (app.core.restart_latch); `lastOutcome` is the final
+    state of the last session, or null.
+    `state` is `idle` with no session, else the session's
+    (app.core.fisqua_pairing). The collect secret, the token and the keys
+    are never part of it.
+    """
+    from app.core import fisqua_pairing_service
+
+    return fisqua_pairing_service.as_api(db)
+
+
+@router.post("/pairing")
+def start_pairing(
+    body: PairingStart,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Ask Fisqua for a code. Admin only. Returns the GET body.
+
+    422 `unit_name` for a name that is not 1 to 64 characters. 409 with
+    {code, message} when the unit may not pair now: `mode_not_eligible`,
+    `busy_capturing`, `offsite_held`, `rclone_missing`, `script_missing`,
+    `script_too_old`, `restart_required`, `device_id_missing`, `device_id_invalid`,
+    `device_id_unreadable`. A session already running is returned as it is.
+    """
+    from app.core import fisqua_pairing, fisqua_pairing_service
+
+    name = body.unitName
+    if not 1 <= len(name) <= 64:
+        raise _pairing_refused("unit_name", status=422)
+    try:
+        fisqua_pairing_service.pairing_registry.begin(name, actor=current_user.username)
+    except fisqua_pairing.PairingRefused as exc:
+        raise _pairing_refused(exc.reason)
+    return fisqua_pairing_service.as_api(db)
+
+
+@router.post("/pairing/renew")
+def renew_pairing(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """A new code after `lapsed`, `lost_answer` or `unknown`, with the same unit name. Admin only.
+
+    409 `not_renewable` otherwise, or any refusal of POST /system/pairing.
+    """
+    from app.core import fisqua_pairing, fisqua_pairing_service
+
+    try:
+        fisqua_pairing_service.pairing_registry.renew(actor=current_user.username)
+    except fisqua_pairing.PairingRefused as exc:
+        raise _pairing_refused(exc.reason)
+    return fisqua_pairing_service.as_api(db)
+
+
+@router.delete("/pairing")
+def cancel_pairing(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Cancel the session, unless it is applying. Admin only. Returns the GET body."""
+    from app.core import fisqua_pairing_service
+
+    fisqua_pairing_service.pairing_registry.cancel()
+    return fisqua_pairing_service.as_api(db)
 
 
 # ---------------------------------------------------------------------------

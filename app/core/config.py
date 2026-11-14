@@ -171,6 +171,13 @@ class Settings(BaseSettings):
     FISQUA_ENV: str = Field(default="", validation_alias=_names("FISQUA_ENV"))
     FISQUA_BASE_URL: str = Field(default="", validation_alias=_names("FISQUA_BASE_URL"))
     FISQUA_TOKEN: SecretStr = Field(default=SecretStr(""), validation_alias=_names("FISQUA_TOKEN"))
+    # Pairing by a code (contract 1.11, app.core.fisqua_pairing) asks the
+    # environment's main address, https://fisqua.org or
+    # https://staging.fisqua.org, never the tenant's host.
+    # FISQUA_PAIRING_BASE_URL replaces that address, for tests and
+    # development only, under the same rule as FISQUA_BASE_URL: https://, or
+    # http:// to a loopback host.
+    FISQUA_PAIRING_BASE_URL: str = Field(default="", validation_alias=_names("FISQUA_PAIRING_BASE_URL"))
     # A send that fails is retried after FISQUA_RETRY_BASE_SECONDS, then
     # twice as long after each further failure, never longer than
     # FISQUA_RETRY_MAX_SECONDS; a Retry-After from Fisqua is a floor. Sends
