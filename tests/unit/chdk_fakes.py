@@ -211,6 +211,7 @@ class Body:
         aflock_error_after=0,
         dng=b"",
         old_library=False,
+        open_error=None,
     ):
         self.bus = bus
         self.address = address
@@ -228,6 +229,10 @@ class Body:
         # pinned pychdk 0.1.3's, whose shoot() has no jpeg argument.
         self.dng = dng
         self.old_library = old_library
+        # Raised by the library's ChdkDevice(): a body that is attached and
+        # cannot be opened. open_attempts counts every try, failed or not.
+        self.open_error = open_error
+        self.open_attempts = 0
         self.shoot_error = shoot_error
         self.preview_error = preview_error
         self.mode_error = mode_error
@@ -805,6 +810,7 @@ class FakePychdk:
         self.list_calls = 0
         self.list_error = None
         self.list_gate = None
+        self.presence_calls = 0
 
     def gate_list(self):
         """Pause the next bus scan, which holds the backend's layout lock."""
@@ -835,9 +841,21 @@ class FakePychdk:
             for body in self.bodies
         ]
 
+    def attached_keys(self):
+        """The presence scan: (bus, address) of every attached body.
+
+        It stands for a read of the USB descriptors the host already holds,
+        so nothing is recorded on any body.
+        """
+        self.presence_calls += 1
+        return [body.key for body in self.bodies]
+
     def ChdkDevice(self, device_info, _usb_device=None):
         body = self.by_key((device_info.bus_num, device_info.device_num))
         body.pychdk_module = self
+        body.open_attempts += 1
+        if body.open_error is not None:
+            raise body.open_error
         if body.old_library:
             return FakeChdkDevice013(device_info, body)
         return FakeChdkDevice(device_info, body)
@@ -941,6 +959,79 @@ def park_at_lock(backend, camera_index):
     return held
 
 
+class BusyLock:
+    """A body's lock that another thread is holding.
+
+    A non-blocking acquire fails, as it would while a capture holds the
+    body. A blocking acquire fails the test: it is a thread about to wait on
+    a body it was meant to skip.
+    """
+
+    def __init__(self):
+        self.attempts = []
+
+    def acquire(self, blocking=True, timeout=-1):
+        self.attempts.append(blocking)
+        if blocking:
+            raise AssertionError("waited on a body lock another thread holds")
+        return False
+
+    def release(self):
+        raise AssertionError("released a body lock that was never acquired")
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+class NotStartedThread:
+    """What make_backend's _start_thread returns: a thread that never ran.
+
+    The keep-alive loop is driven by the tests themselves, through
+    _keepalive_loop and _keepalive_tick, so no real thread outlives a test.
+    join records the bound it was given.
+    """
+
+    def __init__(self, target, name):
+        self.target = target
+        self.name = name
+        self.joins = []
+
+    def join(self, timeout=None):
+        self.joins.append(timeout)
+
+    def is_alive(self):
+        return False
+
+
+class ScriptedStop:
+    """Stands in for the keep-alive's stop event.
+
+    wait() answers False - keep going - `ticks` times and True after that,
+    and records each timeout it was given.
+    """
+
+    def __init__(self, ticks):
+        self.ticks = ticks
+        self.waits = []
+        self._set = False
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self._set or len(self.waits) > self.ticks:
+            return True
+        return False
+
+    def set(self):
+        self._set = True
+
+    def is_set(self):
+        return self._set
+
+
 def make_pychdk(*bodies):
     """Build the fake module for these bodies, in the USB order given."""
     return FakePychdk(bodies)
@@ -981,8 +1072,22 @@ def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
     monkeypatch.setattr(cb, "_sleep", sleep)
     monkeypatch.setattr(cb, "_monotonic", lambda: fake.now)
     monkeypatch.setattr(cb, "_now", lambda: fake.unit_time)
+    # The backend starts its keep-alive thread through _start_thread. No
+    # real thread is started here: fake.threads records what would have
+    # run, and a test drives the loop itself.
+    fake.threads = []
+
+    def start_thread(target, name):
+        thread = NotStartedThread(target, name)
+        fake.threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(cb, "_start_thread", start_thread)
     backend = cb.ChdkBackend(logging.getLogger(logger_name))
     backend._registry_factory = lambda: registry
+    # The keep-alive's presence scan reads USB descriptors through pyusb; the
+    # fake answers it from its scripted bodies.
+    backend._presence_scan = fake.attached_keys
     return backend
 
 
