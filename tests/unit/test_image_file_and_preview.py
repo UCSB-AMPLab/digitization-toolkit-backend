@@ -81,8 +81,8 @@ def _image(db_session, master, thumb=None):
     return img
 
 
-def _raw(capture_dir, stem="IMG_0001", sidecar=True):
-    master = capture_dir / f"{stem}.CR2"
+def _raw(capture_dir, stem="IMG_0001", sidecar=True, suffix=".CR2"):
+    master = capture_dir / f"{stem}{suffix}"
     master.write_bytes(RAW_BYTES)
     preview = capture_dir / f"{stem}_preview.jpg"
     if sidecar:
@@ -113,6 +113,19 @@ def test_file_sends_the_raw_master_not_its_sidecar(client, db_session, capture_d
     assert resp.content == RAW_BYTES
     assert 'filename="IMG_0001.CR2"' in resp.headers["content-disposition"]
     assert resp.headers["content-type"] == "image/x-canon-cr2"
+
+
+@pytest.mark.unit
+def test_file_sends_a_dng_master_with_its_media_type(client, db_session, capture_dir):
+    master, _ = _raw(capture_dir, sidecar=True, suffix=".dng")
+    img = _image(db_session, master)
+
+    resp = _client_as(client, "rev", "reviewer").get(f"/records/images/{img.id}/file")
+
+    assert resp.status_code == 200, resp.text
+    assert resp.content == RAW_BYTES
+    assert 'filename="IMG_0001.dng"' in resp.headers["content-disposition"]
+    assert resp.headers["content-type"] == "image/x-adobe-dng"
 
 
 @pytest.mark.unit

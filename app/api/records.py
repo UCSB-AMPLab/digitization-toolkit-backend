@@ -988,10 +988,10 @@ def delete_image(
 # Masters a browser displays as they are, so they are their own preview.
 _BROWSER_DISPLAYABLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
-# Content-Type for the stored master. Capture only writes .cr2 among the RAW
-# formats, so that one carries its conventional type; the other RAW suffixes
-# have no registered type and go out as application/octet-stream, which every
-# client saves as a file.
+# Content-Type for the stored master. Capture writes .cr2 (gphoto2) and .dng
+# (CHDK) among the RAW formats, so those carry their conventional types; the
+# other RAW suffixes have no registered type and go out as
+# application/octet-stream, which every client saves as a file.
 _MASTER_MEDIA_TYPES = {
 	"jpg": "image/jpeg",
 	"jpeg": "image/jpeg",
@@ -1000,6 +1000,7 @@ _MASTER_MEDIA_TYPES = {
 	"tif": "image/tiff",
 	"webp": "image/webp",
 	"cr2": "image/x-canon-cr2",
+	"dng": "image/x-adobe-dng",
 }
 
 

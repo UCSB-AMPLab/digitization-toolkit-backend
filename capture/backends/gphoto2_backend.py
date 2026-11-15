@@ -51,7 +51,9 @@ except ImportError:
     gp = None  # type: ignore[assignment]
     _GP_AVAILABLE = False
 
-from .base import CameraBackend, normalise_camera_model
+from .base import (
+    IMAGE_FORMATS, CameraBackend, normalise_camera_model, normalise_image_format,
+)
 # Re-exported below for the callers that import it from here (app/api/cameras.py,
 # tests/unit/test_test_capture_route.py). The class itself is shared, so a CHDK
 # timeout and a DSLR timeout are one class and take the same route out.
@@ -107,16 +109,32 @@ def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
         return False
 
 
-# Image format mapping: CameraConfig.image_format -> PTP imageformat widget value
+# Capture format (base.IMAGE_FORMATS, where the rule is stated) -> the PTP
+# imageformat widget value. RAW+JPEG is the camera's "RAW": one .cr2, whose
+# embedded JPEG is extracted as the preview. "RAW + L" is never set, because
+# the camera then writes two files and capture collects one. The old name RAW
+# reaches this map through normalise_image_format.
 _IMAGE_FORMAT_MAP = {
     "JPEG":     "L",
-    "RAW":      "RAW",
-    "RAW+JPEG": "RAW + L",
+    "RAW+JPEG": "RAW",
 }
-# Default when image_format is None
+# The widget value for a format the map does not hold.
 _IMAGE_FORMAT_DEFAULT = "L"
-# Reverse mapping: PTP widget value -> user-facing label
-_IMAGE_FORMAT_REVERSE_MAP = {v: k for k, v in _IMAGE_FORMAT_MAP.items()}
+# The camera's widget value -> the format reported for it. A camera left in
+# "RAW + L" (set on the body, or by an earlier build) is reported as RAW+JPEG,
+# the format that keeps a raw master.
+_IMAGE_FORMAT_REVERSE_MAP = {
+    "L":       "JPEG",
+    "RAW":     "RAW+JPEG",
+    "RAW + L": "RAW+JPEG",
+}
+
+
+def _ptp_image_format(image_format):
+    """The imageformat widget value for a capture format, old name included."""
+    return _IMAGE_FORMAT_MAP.get(
+        normalise_image_format(image_format), _IMAGE_FORMAT_DEFAULT
+    )
 
 # Minimum settle time used as retry_delay in capture (seconds).
 # Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
@@ -369,8 +387,7 @@ class _PTPSession:
 
         fmt = getattr(camera_config, "image_format", None)
         if fmt is not None:
-            ptp_fmt = _IMAGE_FORMAT_MAP.get(fmt, _IMAGE_FORMAT_DEFAULT)
-            self._set_config("imageformat", ptp_fmt)
+            self._set_config("imageformat", _ptp_image_format(fmt))
         # If fmt is None, leave the camera's current imageformat unchanged
 
         iso = getattr(camera_config, "iso", None)
@@ -2133,7 +2150,8 @@ class GPhoto2Backend(CameraBackend):
             iso (str): PTP iso value e.g. "400"
             shutter_speed (str): PTP shutterspeed e.g. "1/125"
             aperture (str): PTP aperture e.g. "5.6"
-            image_format (str): "JPEG", "RAW", or "RAW+JPEG"
+            image_format (str): "JPEG" or "RAW+JPEG" ("RAW", the old name,
+                is taken as "RAW+JPEG")
 
         Returns the full settings dict (same shape as get_dslr_settings) after
         applying the requested changes.
@@ -2149,10 +2167,9 @@ class GPhoto2Backend(CameraBackend):
                 if settings.get("aperture") is not None:
                     session._set_config("aperture", settings["aperture"])
                 if settings.get("image_format") is not None:
-                    ptp_fmt = _IMAGE_FORMAT_MAP.get(
-                        settings["image_format"], _IMAGE_FORMAT_DEFAULT
+                    session._set_config(
+                        "imageformat", _ptp_image_format(settings["image_format"])
                     )
-                    session._set_config("imageformat", ptp_fmt)
                 raw = session.get_info()
                 return {
                     "iso": raw.get("iso"),
@@ -2187,6 +2204,7 @@ class GPhoto2Backend(CameraBackend):
             "focus_lock": False,
             "autofocus_calibration": False,
             "dslr_settings": True,
+            "image_formats": list(IMAGE_FORMATS),
         }
 
     def get_backend_name(self) -> str:

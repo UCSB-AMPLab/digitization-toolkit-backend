@@ -60,6 +60,7 @@ Version: 0.1.0-beta
 import contextlib
 import datetime
 import errno
+import inspect
 import io
 import os
 import secrets
@@ -87,7 +88,9 @@ except ImportError:
     pychdk = None  # type: ignore[assignment]
     _PYCHDK_AVAILABLE = False
 
-from .base import CameraBackend, normalise_camera_model
+from .base import (
+    IMAGE_FORMATS, CameraBackend, normalise_camera_model, normalise_image_format,
+)
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
 from . import usb_topology
@@ -184,6 +187,38 @@ _MODEL_BY_PRODUCT_ID = {
 # name that would have to be changed here is refused rather than written
 # somewhere nothing checked.
 _CAPTURE_SUFFIXES = (".jpg", ".jpeg")
+
+# The capture formats are base.IMAGE_FORMATS, where the rule is stated. On a
+# CHDK body JPEG is remote capture's JPEG, and RAW+JPEG (or its old name RAW)
+# is the DNG pychdk assembles from the camera's DNG header and raw data,
+# saved as `<name>.dng` in place of the `.jpg` name the capture service chose
+# (as the gphoto2 backend saves a `.cr2`), with the camera's own JPEG of the
+# same exposure as its `_preview.jpg`. A CHDK DNG carries only a 128x96
+# thumbnail, so the preview cannot come from the DNG. Any other value is
+# refused, never taken as one of the two.
+#
+# The format is a choice per capture, not a setting on the camera. The
+# settings route stores it per body here (apply_dslr_settings), and the record
+# capture routes put it in the capture's CameraConfig. A CameraConfig without
+# one captures a JPEG.
+_IMAGE_FORMATS = IMAGE_FORMATS
+_DNG_SUFFIX = ".dng"
+
+# The first pychdk release whose shoot() takes jpeg=True, which returns the
+# DNG and the JPEG of one exposure from one capture script. 0.1.3 has dng
+# but not jpeg, and a unit not yet updated may still have it. Whether the installed library has it is read from the
+# signature of shoot() on the body's device, which costs nothing on the wire.
+_PYCHDK_DNG_VERSION = "0.1.4"
+
+# A DNG is a TIFF file and begins with a TIFF byte-order mark and the number
+# 42. pychdk refuses raw data whose length differs from the header's byte
+# count; a file under _DNG_MIN_BYTES is refused here as well. A CHDK DNG
+# header (1,344 bytes on an A2500) and its 128x96 RGB thumbnail come to about
+# 38 KB, and the raw data of an A2500 is 24,724,224 bytes, so the limit
+# refuses a file that is little more than a header and is far below any raw
+# data.
+_TIFF_SIGNATURES = (b"II*\x00", b"MM\x00*")
+_DNG_MIN_BYTES = 1024 * 1024
 
 # Record mode on a body that switch_mode_usb(1) left in playback. On
 # 12 November 2026 two A2500 bodies under CHDK 1.5.1 accepted
@@ -645,6 +680,39 @@ def _name_failure(exc):
     return type(exc).__name__
 
 
+def _shoot_takes_jpeg(shoot):
+    """True when this shoot() takes dng and jpeg, as pychdk 0.1.4 and later do."""
+    try:
+        parameters = inspect.signature(shoot).parameters
+    except (TypeError, ValueError):
+        return False
+    return "dng" in parameters and "jpeg" in parameters
+
+
+def _is_dng_error(exc):
+    """True when exc is pychdk's DngError: the DNG parts could not be assembled.
+
+    Looked up on the module at the time of the call, because pychdk 0.1.3 has
+    no such class and the backend imports no name from the library.
+    """
+    dng_error = getattr(pychdk, "DngError", None)
+    return isinstance(dng_error, type) and isinstance(exc, dng_error)
+
+
+def _dng_problem(dng):
+    """Say what is wrong with a DNG from the camera, or None when it is whole."""
+    if dng[:4] not in _TIFF_SIGNATURES:
+        return (
+            "the DNG does not begin with a TIFF signature (it begins with "
+            f"{bytes(dng[:4]).hex(' ').upper()})"
+        )
+    if len(dng) < _DNG_MIN_BYTES:
+        return (
+            f"the DNG is {len(dng)} bytes, too small to hold raw data"
+        )
+    return None
+
+
 class _BodyGoneError(RuntimeError):
     """An operation failed because its body has left the bus.
 
@@ -1024,6 +1092,22 @@ class ChdkBackend(CameraBackend):
         # A test replaces it; a factory that returns None means no registry,
         # so nothing is read or stored.
         self._registry_factory = _open_camera_registry
+        # hardware id -> the capture format chosen for that body (one of
+        # _IMAGE_FORMATS, or None for none), guarded by _map_lock. The
+        # registry holds the choice; this is its cache, filled from the
+        # registry the first time an enumeration finds the body and written
+        # through by apply_dslr_settings. Keyed by identity, so a rescan that
+        # moves a body to another index, or drops and reopens it, keeps its
+        # choice. Nothing is sent to the camera.
+        self._image_formats: dict = {}
+        # Held across a capture format's registry read or write and the cache
+        # update that goes with it, so the last request to write the registry
+        # is the last to set the cache, and a load never caches a value older
+        # than one a request has set. Its own lock rather than the body's: the
+        # body's lock is held through a capture, and a settings request must
+        # not wait for one. Taken before _map_lock, never while holding a
+        # body's lock or _map_lock.
+        self._image_format_lock = threading.Lock()
 
     # ------------------------------------------------------------------
     # Bodies
@@ -1547,6 +1631,7 @@ class ChdkBackend(CameraBackend):
                 self._evicted &= set(present)
                 self._scanned = True
 
+            self._load_image_formats()
             self._log_enumeration(rows)
             return rows
 
@@ -1778,29 +1863,47 @@ class ChdkBackend(CameraBackend):
         both faster and one less thing to go wrong in the field. The body has
         to be in record mode for that, which is done once and remembered.
 
-        Only the two DSLR-ish fields of CameraConfig mean anything here -
-        shutter speed and ISO - and either may be left alone. Everything else
-        is picamera2's and is ignored.
+        Three fields of CameraConfig mean anything here: shutter speed and
+        ISO, either of which may be left alone, and image_format (see
+        _IMAGE_FORMATS). Everything else is picamera2's and is ignored.
+
+        With image_format "RAW+JPEG" the DNG is written as `<name>.dng` beside the
+        name given, and the camera's JPEG of the same exposure as its
+        `_preview.jpg` (app.core.paths.preview_sidecar_of), preview first;
+        see _write_raw_capture.
 
         Args:
-            output_path: Destination for the JPEG, written exactly as given.
-                A name that is not a JPEG is refused: remote capture returns
-                nothing else, and renaming it here would put the file where
-                the capture service never checked for a collision.
+            output_path: Destination for the JPEG, written exactly as given,
+                or the name whose suffix a DNG replaces. A name that is not
+                a JPEG is refused: the capture service names a capture
+                `.jpg`, and checks that name for a collision under every
+                suffix (capture_name_taken).
             camera_config: CameraConfig; camera_index routes it.
             capture_output: Unused - kept for interface compatibility.
 
         Returns:
-            Tuple of (path string, None), the shape the capture service reads.
+            Tuple of (path string, None), the shape the capture service
+            reads. The path is the DNG's for a RAW capture.
 
         Raises:
             CaptureTimeoutError: The camera never delivered the bytes.
-            RuntimeError: Anything else - a body that is refused, or an
-                output name this backend cannot honour.
+            IncompleteCaptureError: The camera delivered a picture, or a DNG
+                and its JPEG, that is not whole; nothing was written.
+            RuntimeError: Anything else - a body that is refused, an output
+                name or a format this backend cannot honour, or RAW asked of
+                a pychdk older than _PYCHDK_DNG_VERSION.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
         shutter = _shutter_seconds(getattr(camera_config, "shutter_speed", None))
         iso = getattr(camera_config, "iso", None)
+        asked = getattr(camera_config, "image_format", None)
+        image_format = normalise_image_format(asked)
+        if asked is not None and image_format is None:
+            raise RuntimeError(
+                f"A CHDK camera captures {' or '.join(_IMAGE_FORMATS)}, not "
+                f"{asked}. Choose one of those for this camera."
+            )
+        raw = image_format == "RAW+JPEG"
         destination = Path(output_path)
         if destination.suffix.lower() not in _CAPTURE_SUFFIXES:
             raise RuntimeError(
@@ -1817,6 +1920,16 @@ class ChdkBackend(CameraBackend):
             camera_index, "capture", refuse_unusable=True,
             expect_identity=expect_identity,
         ) as body:
+            if raw and not _shoot_takes_jpeg(body.device.shoot):
+                # Refused before anything is sent: the body is untouched and
+                # stays open for a JPEG capture.
+                raise RuntimeError(
+                    f"RAW capture on {body.port} needs pychdk "
+                    f"{_PYCHDK_DNG_VERSION} or later, whose shoot() returns "
+                    "the DNG and the JPEG of one exposure. The installed "
+                    "pychdk does not have it. Capture in JPEG, or update "
+                    "pychdk."
+                )
             started = time.perf_counter()
             # The mode switch is part of the capture and fails the same way:
             # on a cold start it is the likeliest thing to time out, and it
@@ -1834,12 +1947,25 @@ class ChdkBackend(CameraBackend):
                 # guard on it. shoot() returns once the data is in, and the
                 # capture script can still be running then; the next script
                 # sent to this body waits for it in _script.
-                image = self._script(
-                    body, "the capture script",
-                    lambda: body.device.shoot(
-                        stream=True, shutter_speed=shutter, market_iso=iso
-                    ),
-                )
+                # A RAW capture returns a DngCapture of two bytes objects;
+                # it is read by attribute, so no pychdk name is imported.
+                if raw:
+                    shot = self._script(
+                        body, "the capture script",
+                        lambda: body.device.shoot(
+                            stream=True, dng=True, jpeg=True,
+                            shutter_speed=shutter, market_iso=iso,
+                        ),
+                    )
+                    dng, image = shot.dng, shot.jpeg
+                else:
+                    dng = None
+                    image = self._script(
+                        body, "the capture script",
+                        lambda: body.device.shoot(
+                            stream=True, shutter_speed=shutter, market_iso=iso
+                        ),
+                    )
             except TimeoutError as exc:
                 elapsed = time.perf_counter() - started
                 self.logger.error(
@@ -1851,6 +1977,15 @@ class ChdkBackend(CameraBackend):
                     f"{body.port}: {stage} timed out after {elapsed:.1f}s"
                 ) from exc
             except Exception as exc:
+                if stage == "remote capture" and _is_dng_error(exc):
+                    # Every part arrived and the DNG could not be assembled
+                    # from them: the same state as a picture that is not
+                    # whole, and cleared the same way.
+                    self._refuse_picture(
+                        camera_index, body, None,
+                        f"its raw data could not be assembled into a DNG "
+                        f"({exc})",
+                    )
                 elapsed = time.perf_counter() - started
                 named = _name_failure(exc)
                 self.logger.error(
@@ -1874,7 +2009,7 @@ class ChdkBackend(CameraBackend):
                 raise error from exc
 
             elapsed = time.perf_counter() - started
-            if not image:
+            if not image or (raw and not dng):
                 self.logger.error(
                     f"[chdk] body {camera_index} ({body.port}): remote capture "
                     f"returned no bytes after {elapsed:.2f}s"
@@ -1891,21 +2026,62 @@ class ChdkBackend(CameraBackend):
                     f"CHDK capture on {body.port} returned no image data"
                 )
 
+            problem = _dng_problem(dng) if raw else None
+            if problem is not None:
+                self._refuse_picture(camera_index, body, dng, problem)
             problem, file_number = self._picture_problem(body, image)
             if problem is not None:
                 self._refuse_picture(camera_index, body, image, problem)
 
-            atomic_write(
-                destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
-            )
-            self.logger.info(
-                f"[chdk] body {camera_index} ({body.port}): remote capture ok, "
-                f"{len(image)} bytes in {elapsed:.2f}s from shutter to disk, "
-                f"saved as {destination.name}"
-            )
+            if raw:
+                master = destination.with_suffix(_DNG_SUFFIX)
+                picture_path = self._write_raw_capture(master, dng, image)
+                self.logger.info(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"ok, DNG of {len(dng)} bytes and JPEG of {len(image)} "
+                    f"bytes in {elapsed:.2f}s from shutter to disk, saved as "
+                    f"{master.name} with {picture_path.name}"
+                )
+            else:
+                master = picture_path = destination
+                atomic_write(
+                    destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
+                )
+                self.logger.info(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"ok, {len(image)} bytes in {elapsed:.2f}s from shutter to "
+                    f"disk, saved as {destination.name}"
+                )
             body.last_file_number = file_number
-            self._take_model_from_picture(body, destination)
-            return str(destination), None
+            self._take_model_from_picture(body, picture_path)
+            return str(master), None
+
+    def _write_raw_capture(self, master, dng, jpeg):
+        """Write a RAW capture's preview and then its DNG master. Returns the preview's path.
+
+        Each file is written atomically. The preview goes first. A failure
+        writing the DNG removes the preview again and propagates, so a
+        failure leaves neither file. A crash between the two leaves a lone
+        `_preview.jpg`: a derived file in the sidecar directory, which
+        capture_name_taken counts (so its name is not given out again) and
+        the integrity check reports as a preview whose master is gone. The
+        other order would leave a lone `.dng` among the masters, where it
+        reads as a capture whose preview is missing, and a CHDK DNG has no
+        preview of its own to make one from.
+        """
+        # Function-local, as in the gphoto2 backend: a module-level app
+        # import from here is circular through capture.service.
+        from app.core.paths import preview_sidecar_of
+
+        preview = preview_sidecar_of(master)
+        atomic_write(preview, lambda tmp: Path(tmp).write_bytes(bytes(jpeg)))
+        try:
+            atomic_write(master, lambda tmp: Path(tmp).write_bytes(bytes(dng)))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                preview.unlink()
+            raise
+        return preview
 
     def _picture_problem(self, body, image):
         """Say what is wrong with a picture, or None when it is whole.
@@ -1951,7 +2127,9 @@ class ChdkBackend(CameraBackend):
     def _refuse_picture(self, camera_index, body, image, problem):
         """Log a picture that is not whole, drain the body, and raise.
 
-        Nothing is written. The body is drained so that the next capture
+        `image` is the refused file's bytes (a JPEG, or the DNG of a RAW
+        capture), or None when the library could not assemble one. Nothing
+        is written. The body is drained so that the next capture
         starts clean, or dropped when it cannot be drained. The capture is
         not retried.
 
@@ -1959,9 +2137,10 @@ class ChdkBackend(CameraBackend):
             IncompleteCaptureError: Always.
         """
         chunks = getattr(body.device, "last_capture_chunks", None)
+        received = "no file" if image is None else f"{len(image)} bytes"
         self.logger.error(
             f"[chdk] body {camera_index} ({body.port}): remote capture "
-            f"refused, {problem}: {len(image)} bytes in {chunks} chunk(s) "
+            f"refused, {problem}: {received} in {chunks} chunk(s) "
             "(pychdk 0.1.3 reports only the number of chunks); nothing was "
             "saved"
         )
@@ -3383,6 +3562,183 @@ class ChdkBackend(CameraBackend):
             "focus_lock": True,
             "autofocus_calibration": False,
             "dslr_settings": False,
+            "image_formats": list(_IMAGE_FORMATS),
+        }
+
+    # ------------------------------------------------------------------
+    # Capture format
+    # ------------------------------------------------------------------
+
+    def capture_image_format(self, camera_index):
+        """The capture format stored for the body at this index, or None.
+
+        None when nothing is stored, when no body holds the index, and for a
+        body with no identity or an ambiguous one. The record capture routes
+        put the answer in the capture's CameraConfig.
+        """
+        body = self._body_at(camera_index)
+        if body is None or body.hardware_id is None or body.identity_clash:
+            return None
+        with self._map_lock:
+            return self._image_formats.get(body.hardware_id)
+
+    def _load_image_formats(self):
+        """Read the stored capture format of every open body not yet cached.
+
+        Called at the end of each enumeration. A body is read once per
+        backend; after that the cache answers, and apply_dslr_settings keeps
+        it equal to the registry.
+        """
+        with self._map_lock:
+            bodies = list(self._bodies.values())
+        for body in bodies:
+            hardware_id = body.hardware_id
+            if hardware_id is None or body.identity_clash:
+                continue
+            with self._image_format_lock:
+                with self._map_lock:
+                    if hardware_id in self._image_formats:
+                        continue
+                stored = self._stored_image_format(body)
+                with self._map_lock:
+                    self._image_formats[hardware_id] = stored
+
+    def _stored_image_format(self, body):
+        """The capture format stored in the registry for this body, or None.
+
+        A registry that cannot be opened or read is logged and treated as
+        holding nothing, as is a stored value normalise_image_format does not
+        recognise: the body captures JPEG. A stored RAW, the old name, is read
+        as RAW+JPEG.
+        """
+        try:
+            registry = self._registry_factory()
+            entry = registry.get_camera_by_id(body.hardware_id) if registry else None
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: could not read the stored capture format "
+                f"({exc!r}); the camera captures JPEG"
+            )
+            return None
+        stored = entry.get("image_format") if entry else None
+        if stored is None:
+            return None
+        image_format = normalise_image_format(stored)
+        if image_format is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored capture format {stored!r} is "
+                f"not one of {', '.join(_IMAGE_FORMATS)}; it is ignored and "
+                "the camera captures JPEG"
+            )
+            return None
+        return image_format
+
+    def get_dslr_settings(self, camera_index):
+        """The settings route's view of a CHDK body: its capture format alone.
+
+        The other fields are None: a CHDK body's shutter speed and ISO are not
+        read back from the camera. image_format is "JPEG" when nothing is
+        stored, which is what a capture then takes.
+
+        Raises:
+            RuntimeError: No body holds the index.
+        """
+        if self._body_at(camera_index) is None:
+            raise RuntimeError(f"No CHDK camera is open at index {camera_index}")
+        return self._format_settings(camera_index)
+
+    def apply_dslr_settings(self, camera_index, settings):
+        """Store the capture format for the body at this index.
+
+        Only image_format is taken, and only a value normalise_image_format
+        recognises; the old name RAW is stored as RAW+JPEG.
+        Nothing is sent to the camera. The value is written to the camera
+        registry under the body's hardware id, registering the body first
+        when the registry does not know it, and then to the cache. With no
+        registry available it is kept in memory only, with a warning, and a
+        backend restart loses it. A body with no identity, or one another
+        body answers to, cannot hold one: such a body is refused for capture
+        in any case, and a value kept for it could not follow it once it has
+        an identity.
+
+        Returns:
+            The settings as get_dslr_settings reports them.
+
+        Raises:
+            RuntimeError: Another setting was given, the format is not one
+                this backend captures, no body holds the index, or the body
+                has no identity of its own.
+        """
+        others = sorted(
+            name for name, value in settings.items()
+            if value is not None and name != "image_format"
+        )
+        if others:
+            raise RuntimeError(
+                f"A CHDK camera takes only image_format here, not "
+                f"{', '.join(others)}"
+            )
+        asked = settings.get("image_format")
+        image_format = normalise_image_format(asked)
+        if asked is not None and image_format is None:
+            raise RuntimeError(
+                f"A CHDK camera captures {' or '.join(_IMAGE_FORMATS)}, not "
+                f"{asked}"
+            )
+        body = self._body_at(camera_index)
+        if body is None:
+            raise RuntimeError(f"No CHDK camera is open at index {camera_index}")
+        if body.hardware_id is None or body.identity_clash:
+            raise RuntimeError(
+                f"The camera on {body.port} has no identity of its own yet, so "
+                "a capture format cannot be kept for it"
+            )
+        if image_format is not None:
+            with self._image_format_lock:
+                self._store_image_format(body, camera_index, image_format)
+                with self._map_lock:
+                    self._image_formats[body.hardware_id] = image_format
+            self.logger.info(
+                f"[chdk] {body.port}: capture format set to {image_format}"
+            )
+        return self._format_settings(camera_index)
+
+    def _store_image_format(self, body, camera_index, image_format):
+        """Write the capture format to the registry, as _store_zoom_step writes a step.
+
+        A registry write that fails propagates, and the cache is then left
+        as it was.
+        """
+        hardware_id = body.hardware_id
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: capture format {image_format} kept in "
+                "memory only; the camera registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            registry.register_resolved(
+                hardware_id,
+                {
+                    "model": body.model,
+                    "serial": body.serial,
+                    "location": f"USB {body.port}",
+                    "id": body.port,
+                    "index": camera_index,
+                },
+                camera_index,
+            )
+        registry.update_image_format(hardware_id, image_format)
+
+    def _format_settings(self, camera_index):
+        return {
+            "iso": None,
+            "shutter_speed": None,
+            "aperture": None,
+            "image_format": self.capture_image_format(camera_index) or "JPEG",
+            "focus_mode": None,
+            "flash_mode": None,
         }
 
     def get_backend_name(self) -> str:
