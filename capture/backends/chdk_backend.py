@@ -258,6 +258,81 @@ _HALF_PRESS_LUA = 'click("shoot_half")'
 _ENTER_ALT_LUA = "enter_alt()"
 _ALT_REASSERT_INTERVAL_S = 30.0
 
+# Idle keep-alive. Measured on 14 November 2026 on an A2500 under CHDK with
+# Canon's "Auto Power Down" on: a body switched on and left alone in playback
+# mode, never opened by the backend, left USB exactly five minutes after
+# power-on, twice (19:34:20 to 19:39:19, and 19:47:00 to 19:52:00), and the
+# USB recording shows no traffic to it in either window. The same body in the
+# same state, sent one Lua read a minute (get_mode() and get_vbatt()), was
+# still answering after twelve minutes, with its lens retracted. So USB
+# traffic resets the camera's power-down timer.
+#
+# A thread of the backend's own wakes every _KEEPALIVE_INTERVAL_S and sends
+# _KEEPALIVE_LUA to each open body that has had no traffic for at least that
+# long. The read switches no mode, sends no enter_alt() and changes no
+# setting. Any request to a body counts as traffic, so a body in use gets no
+# keep-alive. A body whose lock is held is skipped for that tick and never
+# waited on. A read that fails or times out evicts the body as a failed
+# capture does, and nothing more is sent to it until a scan opens it again.
+#
+# A body attached but never opened is opened by the keep-alive. Each tick
+# first reads which CHDK bodies are attached from the USB descriptors the
+# host already holds (_attached_usb_keys), which sends nothing to any camera.
+# On 14 November 2026 the USB recording of an open body on bus 1 showed 24
+# packets a minute to it with the presence scan and 24 without it.
+# When a body is attached and not open, and every open body has been idle for
+# _KEEPALIVE_INTERVAL_S, the tick runs one enumeration, the same one a device
+# listing runs, layout and all. A body with recent traffic means the scanner
+# is in use, and the next device listing will open the new body. Before the
+# enumeration every open body's lock is tried without waiting; if one is
+# held, the scan is left to the next tick and the address is not marked. A
+# request that starts between that probe and the enumeration still makes the
+# enumeration wait for it, as a device listing would. Each (bus, device
+# number) is tried once, whatever the outcome, and the address of a body
+# closed after any failure, by the keep-alive, by a request or by an
+# enumeration's checks, is marked as tried too; an operator's listing or
+# rescan still reopens it. On 14 November 2026 a body whose
+# card read timed out at opening (21:19:35) switched itself off at 21:23:57,
+# five minutes after the last request it answered (21:18:57), so a request
+# that times out does not reset the camera's timer and trying it every minute
+# keeps nothing alive. A body that leaves and comes back has a new device
+# number and is tried again.
+#
+# The rule: the keep-alive opens only the addresses it chose this tick, and
+# sends PTP commands only to bodies that are open. Every PTP command goes
+# through a body's ChdkDevice, a ChdkDevice is made only in _open_body, and
+# _open_body is called only from _enumerate, for a body that is not open.
+# The keep-alive's read goes only to open bodies. Its enumeration is given
+# `only`, the addresses its presence scan found attached, not open and not
+# tried, and opens an address only if it is in `only` and, read under
+# _map_lock at the moment of opening, still not in _keepalive_tried. The
+# chosen addresses are marked tried only after the enumeration, so an
+# address in `only` is in the tried set at that moment only if a failure
+# closed it in between: an operator's listing opened it and a request
+# evicted it. A body evicted at any time, or closed by this enumeration's
+# get_version check, is open or tried when the tick chooses, and so is not
+# in `only`, or is caught by the check at opening. The rest of the
+# enumeration touches only open bodies: a body that left the bus is closed,
+# an open one is checked with get_version (_still_answering) and has its card
+# read only if it has not been read, and the layout is published under the
+# locks of open bodies. What the enumeration does send to every attached
+# device, a tried one included, is pychdk.list_devices' read of the USB
+# serial, a string-descriptor request outside PTP.
+#
+# The parentheses keep the script to one return value, so the camera posts
+# one answer and _run_lua reads it; Lua's get_mode() returns three.
+#
+# A body in record mode with ALT on left USB about 35 minutes after its last
+# capture on the same day, with no traffic. That case is not explained, and
+# whether this keep-alive prevents it has not been measured.
+_KEEPALIVE_INTERVAL_S = 60.0
+_KEEPALIVE_LUA = "return (get_mode())"
+# How long cleanup waits for the keep-alive thread to end. A tick in progress
+# finishes the read it is on, which takes at most _SCRIPT_END_WAIT_S for a
+# running script and _LUA_TIMEOUT_S for the read, and sends nothing after the
+# stop is set.
+_KEEPALIVE_JOIN_S = 25.0
+
 # Optical zoom. Measured on 12 November 2026 on an A2500 under CHDK 1.5.1:
 # get_zoom_steps() returns 64, get_zoom() returns 0 at the widest, and
 # set_zoom(n) moves the lens and takes one to a few seconds. Spreads, the
@@ -414,6 +489,30 @@ _monotonic = time.monotonic
 # The unit's local wall-clock time. The camera keeps local time with no zone,
 # so this is what its clock is compared with and set to. A test replaces it.
 _now = datetime.datetime.now
+
+
+def _attached_usb_keys():
+    """(bus, device number) of every attached Canon PTP device.
+
+    pychdk's list_devices reads each device's USB serial, which is a string
+    descriptor request sent to the camera. This reads only the device and
+    configuration descriptors through pychdk's own find_ptp_devices, and
+    libusb answers those from what the host read at enumeration, without a
+    request to the device. A test replaces the backend's _presence_scan.
+    """
+    from pychdk.usb_transport import CANON_VENDOR_ID, find_ptp_devices
+
+    return [
+        (device.bus, device.address)
+        for device in find_ptp_devices(vendor_id=CANON_VENDOR_ID)
+    ]
+
+
+def _start_thread(target, name):
+    """Start a daemon thread running target. A test replaces this."""
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    return thread
 
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
@@ -914,6 +1013,10 @@ class _ChdkBody:
         # When ALT mode was last asserted, by _monotonic; None on a body that
         # has not had it asserted since it was opened.
         self.alt_asserted_at = None
+        # When the backend last talked to the body, by _monotonic; set by
+        # _note_traffic. The keep-alive reads it to tell an idle body from a
+        # busy one.
+        self.last_traffic_at = None
         # Optical zoom. zoom_steps is get_zoom_steps(), read once after the
         # body first reaches record mode; None until then, or when the camera
         # does not answer a positive integer. zoom_step is the step the
@@ -1108,6 +1211,19 @@ class ChdkBackend(CameraBackend):
         # not wait for one. Taken before _map_lock, never while holding a
         # body's lock or _map_lock.
         self._image_format_lock = threading.Lock()
+        # The idle keep-alive (see _KEEPALIVE_INTERVAL_S). The thread lives as
+        # long as the backend: started here, stopped and joined by cleanup.
+        self._keepalive_stop = threading.Event()
+        # The presence scan, and the (bus, device number) of every body the
+        # keep-alive has tried to open and of every body evicted after a
+        # failure, guarded by _map_lock. Each tick drops the addresses no
+        # longer on the bus.
+        self._presence_scan = _attached_usb_keys
+        self._keepalive_tried: set = set()
+        self._presence_failing = False
+        self._keepalive_thread = _start_thread(
+            self._keepalive_loop, "chdk-keepalive"
+        )
 
     # ------------------------------------------------------------------
     # Bodies
@@ -1144,6 +1260,8 @@ class ChdkBackend(CameraBackend):
             )
             return None
         body = _ChdkBody(info, device, self._read_model(device, info))
+        # Opening the device is a conversation with the camera.
+        self._note_traffic(body)
         if key in self._evicted:
             self._evicted.discard(key)
             self.logger.info(
@@ -1151,6 +1269,10 @@ class ChdkBackend(CameraBackend):
                 "failure; re-enumeration recovered it"
             )
         return body
+
+    def _note_traffic(self, body):
+        """Record that the backend has just talked to this body."""
+        body.last_traffic_at = _monotonic()
 
     def _is_the_same_body(self, body, info):
         """Is the camera at this address the one this session was opened on?
@@ -1189,8 +1311,10 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] {body.port}: stopped answering "
                     f"({_name_failure(exc)}); opening it again"
                 )
+                self._mark_failed(body.key)
                 self._close_body(body, "it stopped answering")
                 return False
+            self._note_traffic(body)
         return True
 
     def _read_model(self, device, info):
@@ -1246,9 +1370,23 @@ class ChdkBackend(CameraBackend):
             self.logger.info(f"[chdk] {body.port}: closed ({reason})")
 
     def _evict(self, body, reason):
-        """Drop a body that has stopped answering, so the next scan re-opens it."""
+        """Drop a body that has stopped answering, so the next scan re-opens it.
+
+        The keep-alive does not reopen it (see _KEEPALIVE_INTERVAL_S); a device
+        listing or a rescan does.
+        """
         self._evicted.add(body.key)
+        self._mark_failed(body.key)
         self._close_body(body, reason)
+
+    def _mark_failed(self, key):
+        """Mark an address the keep-alive must not open (see _KEEPALIVE_INTERVAL_S).
+
+        Called for every body closed after a failure. A device listing or a
+        rescan still opens it.
+        """
+        with self._map_lock:
+            self._keepalive_tried.add(key)
 
     def _is_absent(self, exc):
         """True when a download failed because the card has no such file."""
@@ -1295,6 +1433,7 @@ class ChdkBackend(CameraBackend):
             try:
                 raw = body.device.download_file(SIDE_FILE)
             except Exception as exc:
+                self._note_traffic(body)
                 if self._is_absent(exc):
                     body.side = None
                     body.camera_id = None
@@ -1310,6 +1449,7 @@ class ChdkBackend(CameraBackend):
                     f"({exc!r}); dropping the body"
                 )
                 return False
+            self._note_traffic(body)
             side, camera_id = pychdk.parse_own_txt(raw)
             body.side = side.lower() if side else None
             body.camera_id = camera_id
@@ -1519,8 +1659,14 @@ class ChdkBackend(CameraBackend):
             "clock_offset_s": body.clock_offset_s,
         }
 
-    def _enumerate(self, reread):
+    def _enumerate(self, reread, only=None):
         """Scan the bus, reconcile the open bodies with it, and lay them out.
+
+        `only`, when given, is the set of (bus, device number) addresses this
+        enumeration may open, and it opens no other; an address in it is
+        also left closed if it is in _keepalive_tried when it would be
+        opened. Only the keep-alive passes it (see _KEEPALIVE_INTERVAL_S).
+        Without it, every body on the bus that is not open is opened.
 
         Bodies that have left are closed and dropped; bodies that are new are
         opened and read; bodies that were already open keep their device, and
@@ -1562,6 +1708,13 @@ class ChdkBackend(CameraBackend):
                 if body is not None and not self._still_answering(body):
                     body = None
                 fresh = body is None
+                if fresh and only is not None:
+                    with self._map_lock:
+                        allowed = (
+                            key in only and key not in self._keepalive_tried
+                        )
+                    if not allowed:
+                        continue
                 if fresh:
                     body = self._open_body(info)
                     if body is None:
@@ -1576,6 +1729,7 @@ class ChdkBackend(CameraBackend):
                             # every connection check scanning the bus for a
                             # body that will not answer.
                             self._evicted.discard(key)
+                            self._mark_failed(key)
                             self._close_body(
                                 body, "its card could not be read again"
                             )
@@ -1777,7 +1931,12 @@ class ChdkBackend(CameraBackend):
                     raise RuntimeError(
                         f"Camera {camera_index} may not capture: {refusal}"
                     )
-            yield body
+            try:
+                yield body
+            finally:
+                # Whatever the operation sent, it was traffic to the body,
+                # and the keep-alive leaves the body alone for an interval.
+                self._note_traffic(body)
 
     def _retry_once_if_gone(self, camera_index, operation, run):
         """Run `run(expect_identity)`; if its body had left the bus, retry once.
@@ -2269,7 +2428,10 @@ class ChdkBackend(CameraBackend):
                 self.logger.warning(line)
             else:
                 self.logger.debug(line)
-        return send()
+        try:
+            return send()
+        finally:
+            self._note_traffic(body)
 
     def _send_lua(self, body, code, timeout=_LUA_TIMEOUT_S):
         """Run one Lua script with the NOKILL flag and return its result.
@@ -3741,6 +3903,162 @@ class ChdkBackend(CameraBackend):
             "flash_mode": None,
         }
 
+    # ------------------------------------------------------------------
+    # Idle keep-alive
+    # ------------------------------------------------------------------
+
+    def _keepalive_loop(self):
+        """The keep-alive thread: one tick per _KEEPALIVE_INTERVAL_S until stopped.
+
+        An exception from a tick is logged and the loop goes on to the next
+        one, so one bad tick never ends the keep-alive for the rest of the
+        session.
+        """
+        while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_S):
+            try:
+                self._keepalive_tick()
+            except Exception as exc:
+                self.logger.error(f"[chdk] keep-alive tick failed: {exc!r}")
+
+    def _keepalive_tick(self):
+        """Open an attached body that is not open, then read every idle body.
+
+        See _open_unopened_bodies for the first part. The reads stop before
+        the next body once cleanup has asked the thread to stop.
+        """
+        try:
+            self._open_unopened_bodies()
+        except Exception as exc:
+            self.logger.error(
+                f"[chdk] keep-alive: opening an unopened body failed: {exc!r}"
+            )
+        with self._map_lock:
+            bodies = [self._bodies[key] for key in sorted(self._bodies)]
+        for body in bodies:
+            if self._keepalive_stop.is_set():
+                return
+            self._keep_alive(body)
+
+    def _open_unopened_bodies(self):
+        """Run one enumeration for a body that is attached and not open.
+
+        Only when the presence scan finds such a body at an address the
+        keep-alive has not tried, and every open body is idle. The address
+        is marked tried before the enumeration, whatever comes of it. The
+        enumeration runs under the layout lock with the stop checked inside
+        it, so none starts once cleanup has begun.
+        """
+        try:
+            attached = set(self._presence_scan())
+        except Exception as exc:
+            if not self._presence_failing:
+                self._presence_failing = True
+                self.logger.warning(
+                    f"[chdk] keep-alive: could not read which cameras are "
+                    f"attached ({exc!r}); open cameras are still kept awake"
+                )
+            return
+        self._presence_failing = False
+        with self._map_lock:
+            self._keepalive_tried &= attached
+            bodies = [self._bodies[key] for key in sorted(self._bodies)]
+            untried = sorted(
+                attached - set(self._bodies) - self._keepalive_tried
+            )
+        if not untried:
+            return
+        if not all(self._is_idle(body) for body in bodies):
+            return
+        with self._layout_lock:
+            if self._keepalive_stop.is_set():
+                return
+            if not self._no_body_in_use(bodies):
+                return
+            ports = ", ".join(
+                f"usb:{bus:03d},{address:03d}" for bus, address in untried
+            )
+            self.logger.info(
+                f"[chdk] keep-alive: {ports} attached and not open; "
+                "enumerating to open it"
+            )
+            try:
+                self._enumerate(reread=False, only=frozenset(untried))
+            finally:
+                # Marked whatever the outcome, and only now: an address in
+                # the tried set during the enumeration is one a failure
+                # closed after this tick chose it.
+                with self._map_lock:
+                    self._keepalive_tried.update(untried)
+
+    def _no_body_in_use(self, bodies):
+        """True when every one of these bodies' locks is free right now.
+
+        Each lock is tried without waiting and released again at once. A
+        held lock is a request in progress, and an enumeration would wait
+        for it.
+        """
+        for body in bodies:
+            lock = body.lock
+            if not lock.acquire(blocking=False):
+                return False
+            lock.release()
+        return True
+
+    def _is_idle(self, body):
+        """True when nothing has been sent to the body for an interval."""
+        last = body.last_traffic_at
+        return last is None or _monotonic() - last >= _KEEPALIVE_INTERVAL_S
+
+    def _keep_alive(self, body):
+        """Send one read to this body if it is idle and nobody is using it.
+
+        The body's lock is tried without waiting: a body whose lock is held
+        is in use, and is skipped until the next tick. With the lock held the
+        body is checked again - still in the map, still connected, still
+        idle - because a request or a close can finish between the snapshot
+        and the lock. A read that fails or times out is logged once at
+        WARNING and the body is evicted, as a failed capture's is; nothing
+        more is sent to it.
+        """
+        if not self._is_idle(body):
+            return
+        if not body.lock.acquire(blocking=False):
+            return
+        try:
+            with self._map_lock:
+                current = self._bodies.get(body.key) is body
+            if not current or not body.device.is_connected:
+                return
+            if not self._is_idle(body):
+                return
+            try:
+                self._send_lua(body, _KEEPALIVE_LUA)
+            except Exception as exc:
+                failure = (
+                    "timed out" if isinstance(exc, TimeoutError)
+                    else f"failed with {_name_failure(exc)}"
+                )
+                self.logger.warning(
+                    f"[chdk] {body.port}: keep-alive read {failure} ({exc}); "
+                    "the body is closed until a scan opens it again"
+                )
+                self._evict(body, f"keep-alive read {failure}")
+        finally:
+            body.lock.release()
+
+    def _stop_keepalive(self):
+        """Stop the keep-alive thread and wait up to _KEEPALIVE_JOIN_S for it."""
+        self._keepalive_stop.set()
+        thread = self._keepalive_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(_KEEPALIVE_JOIN_S)
+        if thread.is_alive():
+            self.logger.warning(
+                f"[chdk] the keep-alive thread had not ended "
+                f"{_KEEPALIVE_JOIN_S:.0f}s after it was stopped"
+            )
+
     def get_backend_name(self) -> str:
         return "chdk"
 
@@ -3765,7 +4083,13 @@ class ChdkBackend(CameraBackend):
         scanned is part of that: the next question about a camera looks at
         the hardware again rather than reporting the rig it has just closed
         as absent.
+
+        The keep-alive thread is stopped first, and not started again: an
+        idle body of a backend that has been cleaned up gets no keep-alive.
+        shutdown_backend drops the backend after this, and the next one
+        built starts its own.
         """
+        self._stop_keepalive()
         with self._layout_lock:
             while True:
                 with self._map_lock:

@@ -243,6 +243,11 @@ def pytest_configure(config):
     config.addinivalue_line(
         "markers", "backend: mark test as camera backend specific"
     )
+    config.addinivalue_line(
+        "markers",
+        "real_chdk_thread: let the CHDK backend start its real keep-alive "
+        "thread; the test must stop it",
+    )
 
 
 def pytest_collection_modifyitems(config, items):
@@ -372,3 +377,33 @@ def _clean_process_state():
     yield
     unit_activity._reset_for_tests()
     restart_latch._reset_for_tests()
+
+
+class _UnstartedThread:
+    """What the CHDK backend's _start_thread returns in a test: nothing ran."""
+
+    def __init__(self, target, name):
+        self.target = target
+        self.name = name
+
+    def join(self, timeout=None):
+        pass
+
+    def is_alive(self):
+        return False
+
+
+@pytest.fixture(autouse=True)
+def _no_real_chdk_keepalive_thread(request, monkeypatch):
+    """No test starts the CHDK backend's keep-alive thread unless it asks.
+
+    The backend starts a daemon thread when it is built, and a test that
+    builds one without stopping it would leave the thread running into the
+    tests after it. A test marked real_chdk_thread gets the real thread and
+    stops it itself.
+    """
+    if request.node.get_closest_marker("real_chdk_thread"):
+        return
+    import capture.backends.chdk_backend as chdk_backend
+
+    monkeypatch.setattr(chdk_backend, "_start_thread", _UnstartedThread)
