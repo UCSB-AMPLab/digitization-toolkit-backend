@@ -229,11 +229,13 @@ def default_camera_config_from_registry(
             f"Using autofocus (slow). Run calibration for better performance."
         )
 
-    # The body's effective orientation: the saved one, or 90 when none was
-    # ever saved or the stored value is not one of the four supported angles
-    # (CameraRegistry.effective_orientation). An unknown body gets 90 too.
+    # The body's effective orientation: the saved one, or, when none was ever
+    # saved or the stored value is not one of the four supported angles, the
+    # default for the body's stored role: 270 left, 90 right, 90 with no role
+    # (CameraRegistry.effective_orientation). An unknown body gets 90.
     stored = (camera_data or {}).get("orientation")
-    config["rotate_deg"] = CameraRegistry.effective_orientation(stored)
+    role = (camera_data or {}).get("role")
+    config["rotate_deg"] = CameraRegistry.effective_orientation(stored, role)
     if CameraRegistry.is_valid_orientation(stored):
         subprocess_logger.info(
             f"Applied saved orientation for camera {camera_index} ({hw_id}): "
@@ -242,7 +244,7 @@ def default_camera_config_from_registry(
     else:
         subprocess_logger.info(
             f"No saved orientation for camera {camera_index} ({hw_id}): "
-            f"rotate_deg={config['rotate_deg']} (default)"
+            f"rotate_deg={config['rotate_deg']} (default, role={role})"
         )
 
     return config, hw_id
