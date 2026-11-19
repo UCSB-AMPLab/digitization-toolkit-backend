@@ -689,7 +689,6 @@ def test_a_failing_analysis_never_fails_the_capture(client, monkeypatch, caplog)
         ({"camera_index": 0, "rotate_deg": 270}, 270),
         ({"camera_index": 0, "rotate_deg": 90}, 90),
         ({"camera_index": 0, "rotate_deg": 0}, 0),
-        ({"camera_index": 0}, 90),
     ],
 )
 def test_the_saved_orientation_is_the_analysis_rotation(client, monkeypatch, config, expected_rotation):
@@ -721,6 +720,39 @@ def test_the_layout_header_uses_the_effective_orientation_from_the_registry(
 
         def get_camera_by_index(self, camera_index):
             return "hw", {"orientation": stored, "calibration": {}}
+
+    monkeypatch.setattr(project_manager_module, "CameraRegistry", _Registry)
+    calls = _record_analyser(monkeypatch)
+    _install_backend(monkeypatch, _FakeBackendBytes(_layout_scene()[0]))
+    api = _client_as(client, "op", "operator")
+
+    resp = api.post("/cameras/test-capture/0?layout=true&page_side=left")
+
+    assert resp.status_code == 200, resp.text
+    assert len(calls) == 1
+    assert calls[0]["rotation_deg"] == expected_rotation
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "record, expected_rotation",
+    [
+        ({"orientation": None, "role": "left"}, 270),
+        ({"orientation": None, "role": "right"}, 90),
+        ({"orientation": 0, "role": "left"}, 0),
+    ],
+)
+def test_the_layout_header_uses_the_role_default_of_a_never_set_body(
+    client, monkeypatch, record, expected_rotation
+):
+    from capture.camera_registry import CameraRegistry
+
+    class _Registry(CameraRegistry):
+        def __init__(self, *args, **kwargs):
+            pass
+
+        def get_camera_by_index(self, camera_index):
+            return "hw", {**record, "calibration": {}}
 
     monkeypatch.setattr(project_manager_module, "CameraRegistry", _Registry)
     calls = _record_analyser(monkeypatch)

@@ -32,8 +32,13 @@ except (ImportError, ValueError):
 logger = logging.getLogger(__name__)
 
 # The clockwise rotation, in degrees, of a body whose orientation was never
-# saved. See CameraRegistry.effective_orientation.
+# saved and which holds no role. See CameraRegistry.effective_orientation.
 DEFAULT_ORIENTATION = 90
+
+# The clockwise rotation of a body whose orientation was never saved, by the
+# role it holds. The two cameras of a unit are mounted mirrored, so the left
+# camera's pictures need 270 and the right camera's 90.
+DEFAULT_ORIENTATION_BY_ROLE = {"left": 270, "right": 90}
 
 class CameraRegistry:
     """
@@ -352,7 +357,7 @@ class CameraRegistry:
                     "first_registered_at": now,
                     "last_seen_at": now,
                     "calibration": calibration_data or {},
-                    "orientation": None,  # Never set; reads as DEFAULT_ORIENTATION (effective_orientation)
+                    "orientation": None,  # Never set; reads as the role's default (effective_orientation)
                 }
 
         self._mutate(change)
@@ -420,26 +425,34 @@ class CameraRegistry:
         return type(value) is int and value in CameraRegistry.VALID_ORIENTATIONS
 
     @staticmethod
-    def effective_orientation(stored) -> int:
+    def effective_orientation(stored, role) -> int:
         """The clockwise rotation, in degrees, that applies to a body.
 
-        A saved orientation (one of 0, 90, 180, 270) applies as saved. A body
-        whose orientation was never saved - None, a missing key, or a stored
-        value outside the four (a hand edit, a bool, 45) - has
-        DEFAULT_ORIENTATION, 90. Every backend read of a stored orientation
-        goes through this function: the default config used for captures
-        and test captures, the page layout analysis of a test capture, and
-        the device rows the API reports.
+        Args:
+            stored: The body's saved "orientation" from its registry record.
+            role: The body's stored "role" from the same record ("left",
+                "right"), or None when it holds none or is not registered.
 
-        The frontend showed and sent 90 for a never-set body from before
-        orientations were saved per body (NEH-71), because most digitisation
-        rigs mount their cameras vertically, so captures of such a body are
-        already stored turned 90. Backend reads that took None as "no
-        rotation" analysed those pictures unturned. The default now belongs
-        to the backend, at the same 90, so stored captures do not change.
+        A saved orientation (one of 0, 90, 180, 270) applies as saved,
+        whatever the role. A body whose orientation was never saved - None,
+        a missing key, or a stored value outside the four (a hand edit, a
+        bool, 45) - takes the default for its role from
+        DEFAULT_ORIENTATION_BY_ROLE: 270 for "left", 90 for "right". With no
+        role, or any other value, it takes DEFAULT_ORIENTATION, 90. The role
+        is read when the orientation is, so a never-set body whose role is
+        swapped or reassigned follows its new role.
+
+        Every backend read of a stored orientation goes through this
+        function: the default config used for captures and test captures
+        (which the page layout analysis of a test capture also reads), and
+        the device rows the API reports. It decides the rotation of new
+        captures only; a stored capture keeps the rotate_deg recorded with
+        it, and nothing re-derives that from the registry.
         """
         if CameraRegistry.is_valid_orientation(stored):
             return stored
+        if type(role) is str and role in DEFAULT_ORIENTATION_BY_ROLE:
+            return DEFAULT_ORIENTATION_BY_ROLE[role]
         return DEFAULT_ORIENTATION
 
     def update_orientation(self, hardware_id: str, degrees: int) -> None:
@@ -452,9 +465,9 @@ class CameraRegistry:
         body if it re-enumerates onto a different index.
 
         A value of None (set at registration, see register_resolved) means
-        orientation was never set for this body; it reads as
-        DEFAULT_ORIENTATION (90), not as "no rotation". See
-        effective_orientation.
+        orientation was never set for this body; it reads as the default for
+        the body's role (270 left, 90 right, 90 with no role), not as "no
+        rotation". See effective_orientation.
 
         Args:
             hardware_id: Hardware ID of the camera.

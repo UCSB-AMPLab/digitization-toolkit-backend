@@ -213,8 +213,9 @@ class DeviceInfo(BaseModel):
 	# Calibration data (populated when calibrated=True)
 	lens_position: Optional[float] = None
 	awb_gains: Optional[List[float]] = None
-	# The body's effective clockwise rotation: the saved one, or 90 when none
-	# was ever saved (CameraRegistry.effective_orientation). Never null.
+	# The body's effective clockwise rotation: the saved one, or, when none
+	# was ever saved, the default for the body's role: 270 left, 90 right, 90
+	# with no role (CameraRegistry.effective_orientation). Never null.
 	orientation: int = 90
 	# True when an orientation was saved for this body; False when
 	# `orientation` is the default.
@@ -524,7 +525,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			awb_gains=awb_gains,
 			# Always the effective angle; a malformed stored value reads as
 			# the default and counts as not saved.
-			orientation=CameraRegistry.effective_orientation(stored_orientation),
+			orientation=CameraRegistry.effective_orientation(stored_orientation, role_record["role"]),
 			orientation_saved=CameraRegistry.is_valid_orientation(stored_orientation),
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
@@ -705,9 +706,10 @@ def set_camera_roles(
 	StorageUnavailableError, which the app answers with 503.
 
 	The answer is the device rows and the setup report, read from the
-	registry after the write, for the rows listed before it. Nothing in
-	capture reads a stored role yet: indexes, pins, card files and capture
-	are unchanged.
+	registry after the write, for the rows listed before it. A stored role
+	sets only the default orientation of a body with none saved
+	(CameraRegistry.effective_orientation); indexes, pins, card files and
+	capture placement do not read it.
 	"""
 	try:
 		from capture.camera_registry import CameraRegistry
@@ -1294,9 +1296,9 @@ def _page_layout_header(
 ) -> Optional[str]:
 	"""The page layout of a test capture as compact JSON, for X-Page-Layout (NEH-343).
 
-	The rotation is the camera's effective orientation, read from the
-	registry the same way test_capture_bytes reads it (90 when none is
-	saved; CameraRegistry.effective_orientation): the
+	The rotation is the camera's effective orientation, the rotate_deg of
+	the config test_capture_bytes builds from the registry (the saved angle,
+	or the default for the body's role; CameraRegistry.effective_orientation): the
 	capture path records it only in the EXIF Orientation tag, so the pixels
 	are as the sensor delivered them. None when anything fails: the header
 	is a guide for the camera check screen, never a reason to fail the
@@ -1306,11 +1308,10 @@ def _page_layout_header(
 
 	try:
 		from capture import page_layout
-		from capture.camera_registry import CameraRegistry
 		from capture.project_manager import default_camera_config_from_registry
 
 		config, _hw_id = default_camera_config_from_registry(camera_index, resolution)
-		rotation = CameraRegistry.effective_orientation(config.get("rotate_deg"))
+		rotation = config["rotate_deg"]
 		result = page_layout.analyse_page(image_bytes, rotation_deg=rotation, page_side=page_side)
 		# allow_nan=False: NaN and Infinity are not JSON, and JSON.parse refuses them.
 		return json.dumps(_round_fractions(result), separators=(",", ":"), allow_nan=False)
