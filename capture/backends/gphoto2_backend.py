@@ -31,6 +31,7 @@ before each capture, through the `iso`, `shutterspeed`, `aperture` and
 Version: 0.1.0-beta
 """
 
+import contextlib
 import contextvars
 import fcntl
 import json
@@ -156,10 +157,14 @@ _BINDINGS_VERSION = 1
 # How long after the last bus scan a device listing that finds a pinned index
 # missing from the map may scan again. A pinned body that is unplugged keeps
 # its index absent, and the listing must not turn that into one scan per call
-# (NEH-250). A published port whose usbfs node has gone is not limited by
-# this: that is evidence the map is out of date, and the scan it causes
-# removes the port, so it cannot repeat.
+# (NEH-250): each listing scan that leaves the same pinned indices absent
+# doubles the wait, up to _LISTING_REDETECT_MAX_S, and the wait goes back to
+# _LISTING_REDETECT_MIN_S once a different set of pinned indices is absent.
+# A capture or an is_camera_connected() call still re-detects on its own
+# rule, so the longer wait only delays a body's return to the device list.
+# Both values are guesses, to be measured on the unit.
 _LISTING_REDETECT_MIN_S = 5.0
+_LISTING_REDETECT_MAX_S = 60.0
 
 # How many camera indices are sides of the rig. Indices below this are the
 # operator's left and right - a dual capture asks for exactly 0 and 1 (see
@@ -1118,6 +1123,19 @@ class GPhoto2Backend(CameraBackend):
         self._rescan_lock = threading.Lock()
         # serialises saves of the bindings file, snapshot and write together
         self._save_lock = threading.Lock()
+        # Ports a USB reset moved a body onto. A body there is not reset again
+        # until an open on that port has succeeded, so one wedge earns one
+        # reset however many reads follow it (see _init_camera). A usb devnum
+        # is not reused until the bus counter wraps, so an entry names one
+        # body. Read and written under _map_lock.
+        self._ports_moved_by_reset: set[str] = set()
+        # The device listing's own re-detection state (see
+        # _redetect_if_listing_is_stale), under _map_lock: the gone ports a
+        # listing has already scanned for, the pinned indices the current
+        # wait applies to, and that wait.
+        self._listing_gone_scanned: frozenset = frozenset()
+        self._listing_absent: frozenset = frozenset()
+        self._listing_redetect_wait = _LISTING_REDETECT_MIN_S
         self._load_pins()
 
     # ------------------------------------------------------------------
@@ -1748,12 +1766,16 @@ class GPhoto2Backend(CameraBackend):
         return self._claim_port(camera_index, port)
 
     def _open_identified_session(
-        self, camera_index: int, model: str, port: str
+        self, camera_index: int, model: str, port: str,
+        expected_serial: "str | None" = None,
     ) -> _PTPSession:
         """Open a session on `port` and hand it back only if it is the right body.
 
         The identity check runs before the session is cached, so a body that
-        contradicts the pin never becomes the session an index serves.
+        contradicts the pin never becomes the session an index serves. An
+        `expected_serial` (given only for an unpinned index) must be what the
+        body answers; a body that answers anything else, or nothing, is
+        refused, and nothing is pinned from it.
         """
         held_by = self._take_port(camera_index, port)
         if held_by is not None:
@@ -1763,7 +1785,8 @@ class GPhoto2Backend(CameraBackend):
             )
 
         try:
-            session = _PTPSession(port, model, self.logger)
+            with self._resets_allowed_on(port):
+                session = _PTPSession(port, model, self.logger)
         except BaseException:
             # No session came back, so nothing else will ever release this
             # claim - including the -105 path, which comes straight back here
@@ -1771,10 +1794,24 @@ class GPhoto2Backend(CameraBackend):
             self._release_port(camera_index, port)
             raise
         # From here the session owns the claim; _close_session gives it back.
+        self._opened_after_reset(port)
         serial = getattr(session, "serial", "") or ""
         self._remember_body_model(
             model, port, serial, getattr(session, "body_model", None)
         )
+        if expected_serial is not None and serial != expected_serial:
+            session.close()
+            self._release_port(camera_index, port)
+            if serial:
+                # A true observation about the port, cached without a pin.
+                with self._map_lock:
+                    self._serial_by_port[port] = serial
+            self._republish_port_map()
+            raise CameraIdentityError(
+                f"Camera {camera_index}: expected body {expected_serial!r}, "
+                f"found {serial or 'a body with no serial'!r} on {port}; the "
+                "cameras have re-enumerated - re-confirm left/right and retry"
+            )
         if not serial:
             # Documented limitation: a body that does not answer a serial
             # cannot be pinned, so it stays positional.
@@ -1925,8 +1962,10 @@ class GPhoto2Backend(CameraBackend):
         try:
             # The camera lock and the claim are held, so a reset of a wedged
             # body inside _init_camera cannot cut into anyone else's transfer.
-            cam = _init_camera(model, port, self.logger)
+            with self._resets_allowed_on(port):
+                cam = _init_camera(model, port, self.logger)
             initialized = True
+            self._opened_after_reset(port)
             cfg = cam.get_config()
             return cfg.get_child_by_name("serialnumber").get_value().strip()
         except _BodyMovedError:
@@ -1945,6 +1984,24 @@ class GPhoto2Backend(CameraBackend):
                     pass
             self._release_port(camera_index, port)
 
+    def _resets_allowed_on(self, port: str):
+        """A context in which an open of `port` may reset it, unless a reset moved a body there."""
+        with self._map_lock:
+            moved_here = port in self._ports_moved_by_reset
+        return _usb_reset_suppressed() if moved_here else contextlib.nullcontext()
+
+    def _moved_by_reset(self, port: "str | None"):
+        """Record that a reset moved a body onto `port`, so it is not reset there before it opens."""
+        if port is None:
+            return
+        with self._map_lock:
+            self._ports_moved_by_reset.add(port)
+
+    def _opened_after_reset(self, port: str):
+        """An open of `port` succeeded, so a later wedge there may be reset again."""
+        with self._map_lock:
+            self._ports_moved_by_reset.discard(port)
+
     def _follow_moved_body(self, camera_index: int, moved: "_BodyMovedError") -> bool:
         """Re-detect after a reset moved a body, and read its serial on the new port.
 
@@ -1957,8 +2014,10 @@ class GPhoto2Backend(CameraBackend):
         next pass. A serial read is learned against the index the fresh map
         gives the new port, so the caller's republish lays the body on its
         pinned index. Never resets, never raises. Returns True if a serial
-        was learned.
+        was learned. The new port is recorded as one a reset moved a body
+        onto, so later reads do not reset it before it has opened once.
         """
+        self._moved_by_reset(moved.new_port)
         self._refresh_port_map()
         new_port = moved.new_port
         if new_port is None:
@@ -2070,7 +2129,21 @@ class GPhoto2Backend(CameraBackend):
         is not the one pinned here is refused as usual. After the session is
         stored the map is laid out again, which puts the new port at this
         index once its serial has been learned.
+
+        Neither target is known to be the body that moved: the one new device
+        on the bus can be the other body re-enumerating, and the fresh map
+        can lay the other body at this index. So the open is made only when
+        the body that answers can be checked: against this index's pin, or,
+        with no pin, against the serial last read on the port the body left.
+        With neither, nothing is opened and the index is reported not
+        connected, rather than risk opening the other body as this side.
         """
+        self._moved_by_reset(moved.new_port)
+        with self._map_lock:
+            pinned = self._pins.get(camera_index)
+            known = self._serial_by_port.get(moved.port) or (
+                self._body_model_by_port.get(moved.port, ("", "", ""))[1]
+            )
         self._refresh_port_map()
         with self._map_lock:
             detected = {port: model for model, port in self._last_detected}
@@ -2084,8 +2157,18 @@ class GPhoto2Backend(CameraBackend):
                 f"Camera {camera_index}: {moved}; ensure the camera is on and "
                 "USB is connected, then try again"
             ) from moved
+        if pinned is None and not known:
+            raise RuntimeError(
+                f"Camera {camera_index}: {moved}; whether the body on "
+                f"{target[1]} is the same one cannot be checked, because this "
+                f"index has no saved camera assignment and no serial was read "
+                f"from {moved.port}; check left and right, then try again"
+            ) from moved
         with _usb_reset_suppressed():
-            session = self._open_identified_session(camera_index, *target)
+            session = self._open_identified_session(
+                camera_index, *target,
+                expected_serial=None if pinned is not None else known,
+            )
         self._sessions[camera_index] = session
         self._republish_port_map()
         return session
@@ -2316,11 +2399,16 @@ class GPhoto2Backend(CameraBackend):
         stale, both checked without touching the bus:
 
           - a published port whose usbfs node no longer exists (a stat per
-            published port): always scans, since the scan drops that port;
+            published port): scans once for that port. The scan normally
+            drops it; if autodetect() still reports it, later listings do
+            not scan for it again;
           - a pinned index absent from the map: the map is first laid out
             again from what is already known, which needs no scan; if the
             index is still absent, the bus is scanned only when the last scan
-            is at least _LISTING_REDETECT_MIN_S old.
+            is at least the current wait old. The wait starts at
+            _LISTING_REDETECT_MIN_S and doubles after each listing scan that
+            leaves the same pinned indices absent, up to
+            _LISTING_REDETECT_MAX_S.
 
         With every pinned body on a published port that still exists, nothing
         is scanned. Takes _map_lock only; the caller holds no camera lock.
@@ -2330,28 +2418,56 @@ class GPhoto2Backend(CameraBackend):
             if not self._port_map:
                 # The first listing builds the map in _get_port_map.
                 return
-        if any(_usb_port_has_left_the_bus(port) for port in ports):
+            scanned_for = self._listing_gone_scanned
+            nothing_absent = all(i in self._port_map for i in self._pins)
+        if nothing_absent:
+            # Every pinned body is on the map, so the next absence starts
+            # from the shortest wait.
+            self._listing_wait_for(frozenset())
+        gone = frozenset(
+            port for port in ports if _usb_port_has_left_the_bus(port)
+        )
+        if gone - scanned_for:
             self.logger.info(
                 "[gphoto2] a published port has left the bus; re-detecting"
             )
             self._refresh_port_map()
+            with self._map_lock:
+                self._listing_gone_scanned = gone
             return
         with self._map_lock:
-            absent = [i for i in self._pins if i not in self._port_map]
+            self._listing_gone_scanned = scanned_for & gone
+            absent = frozenset(i for i in self._pins if i not in self._port_map)
         if not absent:
             return
         self._republish_port_map()
         with self._map_lock:
-            absent = [i for i in self._pins if i not in self._port_map]
+            absent = frozenset(i for i in self._pins if i not in self._port_map)
             last = self._last_scan_at
+        wait = self._listing_wait_for(absent)
         if not absent:
             return
-        if last is not None and _monotonic() - last < _LISTING_REDETECT_MIN_S:
+        if last is not None and _monotonic() - last < wait:
             return
         self.logger.info(
-            f"[gphoto2] pinned indices {absent} are not on the map; re-detecting"
+            f"[gphoto2] pinned indices {sorted(absent)} are not on the map; "
+            "re-detecting"
         )
         self._refresh_port_map()
+        with self._map_lock:
+            still = frozenset(i for i in self._pins if i not in self._port_map)
+            if still and still == self._listing_absent:
+                self._listing_redetect_wait = min(
+                    self._listing_redetect_wait * 2, _LISTING_REDETECT_MAX_S
+                )
+
+    def _listing_wait_for(self, absent: frozenset) -> float:
+        """The listing's wait before a scan for `absent`, reset when the set changes."""
+        with self._map_lock:
+            if absent != self._listing_absent:
+                self._listing_absent = absent
+                self._listing_redetect_wait = _LISTING_REDETECT_MIN_S
+            return self._listing_redetect_wait
 
     def _enumerate_port_map(self, port_map) -> tuple[list, bool]:
         """One enumeration pass over `port_map`; returns (rows, learned_anything)."""

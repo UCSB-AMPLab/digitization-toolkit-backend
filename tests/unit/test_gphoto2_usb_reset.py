@@ -839,6 +839,240 @@ def test_the_listing_redetects_a_pinned_absent_index_at_most_once_per_interval(
     assert [(d["index"], d["port"]) for d in rows] == [(0, PORT_A), (1, PORT_B_NEW)]
 
 
+@pytest.mark.unit
+def test_the_listing_backs_off_while_a_pinned_body_stays_absent(rig, bindings_dir):
+    """An unplugged pinned body is looked for less and less often.
+
+    Each listing scan that finds the pinned index still absent doubles the
+    wait before the next one, up to _LISTING_REDETECT_MAX_S, so a camera left
+    unplugged costs a bounded number of bus scans however often the device
+    list is requested.
+    """
+    backend = _pinned_backend(rig, bindings_dir)
+    backend.list_devices()
+    rig.leave(PORT_B)
+    backend.list_devices()  # the port has left the bus: one scan
+    scans = rig.detect_calls
+
+    longest = getattr(gb, "_LISTING_REDETECT_MAX_S", 60.0)
+    waits = []
+    interval = gb._LISTING_REDETECT_MIN_S
+    while len(waits) < 6:
+        # Every second up to the wait, the listing does not scan ...
+        for _ in range(int(interval) - 1):
+            rig.now += 1.0
+            backend.list_devices()
+            assert rig.detect_calls == scans, (waits, interval)
+        # ... and at the wait it scans once.
+        rig.now += interval - (int(interval) - 1)
+        backend.list_devices()
+        scans += 1
+        assert rig.detect_calls == scans, (waits, interval)
+        waits.append(interval)
+        interval = min(interval * 2, longest)
+
+    assert waits == [5.0, 10.0, 20.0, 40.0, 60.0, 60.0]
+
+    # B comes back: the next scan the wait allows finds it, and the wait
+    # starts again from the shortest once nothing pinned is absent.
+    rig.present.add(PORT_B_NEW)
+    rig.detected.append((MODEL, PORT_B_NEW))
+    rig.serials[PORT_B_NEW] = SERIAL_B
+    rig.now += longest
+    rows = backend.list_devices()
+    assert [(d["index"], d["port"]) for d in rows] == [(0, PORT_A), (1, PORT_B_NEW)]
+    rig.leave(PORT_B_NEW)
+    backend.list_devices()  # left the bus: one scan
+    scans = rig.detect_calls
+    rig.now += gb._LISTING_REDETECT_MIN_S
+    backend.list_devices()
+    assert rig.detect_calls == scans + 1
+
+
+@pytest.mark.unit
+def test_a_gone_port_the_scan_still_reports_is_not_rescanned_on_every_listing(
+    rig, bindings_dir
+):
+    """A published port whose node is gone earns one scan, not one per listing.
+
+    If autodetect() keeps reporting a port whose usbfs node does not exist,
+    the scan cannot drop it from the map, and an unlimited rule would scan
+    the bus on every request.
+    """
+    backend = _pinned_backend(rig, bindings_dir)
+    backend.list_devices()
+    rig.present.discard(PORT_B)  # the node goes, autodetect still lists it
+    scans = rig.detect_calls
+
+    for _ in range(5):
+        backend.list_devices()
+
+    assert rig.detect_calls == scans + 1
+
+
+@pytest.mark.unit
+def test_unit_tests_run_the_scan_limits_on_a_fake_clock():
+    """Outside tests that drive it, the backend's clock does not move.
+
+    The listing and routine-scan limits are measured on _monotonic. On the
+    wall clock a slow test run could cross a limit between two calls and
+    scan where a fast one does not; tests/conftest.py stands a still clock in
+    for it, and tests that need time to pass set their own.
+    """
+    import time
+
+    assert gb._monotonic is not time.monotonic
+    first = gb._monotonic()
+    time.sleep(0.01)
+    assert gb._monotonic() == first
+
+
+@pytest.mark.unit
+def test_a_body_a_reset_moved_is_not_reset_again_until_it_has_opened(
+    rig, bindings_dir, caplog
+):
+    """One wedge, one reset: the body's new port is not reset by a later read.
+
+    A is wedged after a restart and the reset makes it re-enumerate on
+    PORT_A_NEW, where it does not answer yet. Neither the rest of that
+    identification nor a later listing resets it there a second time. Once
+    it has opened on its new port it is an ordinary port again.
+    """
+    rig.wedged[PORT_A] = GP_ERROR_TIMEOUT
+    rig.effects[PORT_A] = {"mode": "moves", "new_port": PORT_A_NEW}
+    rig.wedged[PORT_A_NEW] = GP_ERROR_TIMEOUT
+    backend = _pinned_backend(rig, bindings_dir)
+
+    with caplog.at_level(logging.INFO):
+        connected = backend.is_camera_connected(0)
+    assert len(rig.ioctls) == 1, "the moved body was reset again in the same call"
+    assert connected is False
+
+    backend.list_devices()
+    rig.now += 60.0
+    backend.list_devices()
+    connected = backend.is_camera_connected(0)
+    assert len(rig.ioctls) == 1, "the moved body was reset again by a later call"
+    assert connected is False
+    assert backend._claimed_ports == {}
+
+    # The body answers on its new port, and is identified there.
+    del rig.wedged[PORT_A_NEW]
+    assert backend.is_camera_connected(0) is True
+    assert backend._get_port_map()[0] == (MODEL, PORT_A_NEW)
+    assert len(rig.ioctls) == 1
+
+    # A later wedge on that port is a new one, and is reset.
+    rig.wedged[PORT_A_NEW] = GP_ERROR_TIMEOUT
+    with backend._get_camera_lock(0):
+        session = backend._get_or_open_session(0)
+    assert session.port == PORT_A_NEW
+    assert len(rig.ioctls) == 2
+
+
+@pytest.mark.unit
+def test_with_no_pins_a_moved_body_is_not_followed_onto_another_body(rig):
+    """With no saved assignment, a reset is never followed to a body it cannot check.
+
+    No bindings file and nothing read yet: A is wedged on its first open at
+    index 0, the reset loses it, and B re-enumerates during the wait, so B's
+    new port is the one new Canon device on the bus. Following it would open
+    B as index 0 and pin it there, a silent left/right swap.
+    """
+    rig.wedged[PORT_A] = GP_ERROR_TIMEOUT
+    rig.effects[PORT_A] = {"mode": "gone"}
+
+    def b_reenumerates(port):
+        rig.leave(PORT_B)
+        rig.arrive(PORT_B, PORT_B_NEW)
+
+    rig.on_ioctl = b_reenumerates
+    backend = _backend()
+    assert backend._pins == {}
+
+    with backend._get_camera_lock(0):
+        with pytest.raises(RuntimeError, match="cannot be checked"):
+            backend._get_or_open_session(0)
+
+    assert backend._sessions == {}
+    assert SERIAL_B not in backend._pins.values()
+    assert 0 not in backend._pins
+    assert rig.init_by_port.get(PORT_B_NEW, 0) == 0
+    assert backend._claimed_ports == {}
+
+
+@pytest.mark.unit
+def test_with_no_pins_a_moved_body_is_not_replaced_by_the_one_left_on_the_map(rig):
+    """With no saved assignment, the index is not handed to the other body.
+
+    A is wedged on its first open at index 0 and the reset loses it. The
+    fresh map then lays B, the only body left, at index 0; opening that as
+    the moved body would put B on the left.
+    """
+    rig.wedged[PORT_A] = GP_ERROR_TIMEOUT
+    rig.effects[PORT_A] = {"mode": "gone"}
+    backend = _backend()
+
+    with backend._get_camera_lock(0):
+        with pytest.raises(RuntimeError, match="cannot be checked"):
+            backend._get_or_open_session(0)
+
+    assert backend._sessions == {}
+    assert backend._pins == {}
+    assert rig.init_by_port.get(PORT_B, 0) == 0
+    assert backend._claimed_ports == {}
+
+
+def _identified_backend_without_pins(rig):
+    """A backend that has read both serials but holds no pins (as after a rescan dropped them)."""
+    backend = _backend()
+    backend.list_devices()
+    with backend._map_lock:
+        backend._pins.clear()
+    assert backend._serial_by_port == {PORT_A: SERIAL_A, PORT_B: SERIAL_B}
+    return backend
+
+
+@pytest.mark.unit
+def test_with_no_pins_a_body_known_by_serial_is_not_followed_onto_another(rig):
+    """The serial read on the old port stands in for the pin there is not.
+
+    After the reset loses A, B's new port is the only new device. B answers
+    another serial, so the open is refused and nothing is pinned.
+    """
+    backend = _identified_backend_without_pins(rig)
+    rig.wedged[PORT_A] = GP_ERROR_TIMEOUT
+    rig.effects[PORT_A] = {"mode": "gone"}
+
+    def b_reenumerates(port):
+        rig.leave(PORT_B)
+        rig.arrive(PORT_B, PORT_B_NEW)
+
+    rig.on_ioctl = b_reenumerates
+    with backend._get_camera_lock(0):
+        with pytest.raises(gb.CameraIdentityError):
+            backend._get_or_open_session(0)
+
+    assert backend._sessions == {}
+    assert backend._pins == {}
+    assert backend._serial_by_port.get(PORT_B_NEW) == SERIAL_B
+    assert backend._claimed_ports == {}
+
+
+@pytest.mark.unit
+def test_with_no_pins_a_body_known_by_serial_is_followed_to_itself(rig):
+    backend = _identified_backend_without_pins(rig)
+    rig.wedged[PORT_A] = GP_ERROR_TIMEOUT
+    rig.effects[PORT_A] = {"mode": "moves", "new_port": PORT_A_NEW}
+
+    with backend._get_camera_lock(0):
+        session = backend._get_or_open_session(0)
+
+    assert session.port == PORT_A_NEW and session.serial == SERIAL_A
+    assert backend._pins == {0: SERIAL_A}
+    assert len(rig.ioctls) == 1
+
+
 # ----------------------------------------------------------------------
 # reading the bus
 # ----------------------------------------------------------------------

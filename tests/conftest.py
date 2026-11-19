@@ -370,10 +370,16 @@ def _no_host_usb_devices(request, monkeypatch):
     usbfs, no Canon devices, and may not open any node; tests that exercise
     those paths replace these attributes themselves. Tests marked `camera`
     run against real hardware and keep the real calls.
+
+    The backend's clock (`_monotonic`, which the scan limits are measured on)
+    is held still, so whether a call scans the bus cannot depend on how fast
+    the machine runs the test. Tests that need time to pass set their own.
     """
     if request.node.get_closest_marker("camera") is not None:
         return
     import capture.backends.gphoto2_backend as gb
+
+    monkeypatch.setattr(gb, "_monotonic", lambda: 1000.0)
 
     def _no_node(path, flags):
         raise PermissionError(f"unit tests may not open {path}")
