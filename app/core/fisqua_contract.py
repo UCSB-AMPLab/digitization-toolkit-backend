@@ -282,3 +282,56 @@ F_RESULTS = "results"
 F_DATES_DISPLAY = "display"
 F_DATES_START = "start"
 F_DATES_END = "end"
+
+
+# ---------------------------------------------------------------------------
+# Pairing (contract 1.11, §12)
+# ---------------------------------------------------------------------------
+
+# The two routes are called on the main address of the environment, not
+# the tenant's host, with no token. Every answer is a JSON object; a 404
+# from the codes route whose body is not one means a Fisqua without 1.11
+# (§12.3).
+PAIRING_HOSTS = {
+    "production": "https://fisqua.org",
+    "staging": "https://staging.fisqua.org",
+}
+PAIRING_CODES_PATH = "/api/capture/v1/pairing/codes"
+PAIRING_COLLECT_PATH = "/api/capture/v1/pairing/collect"
+# The codes request.
+F_UNIT_NAME = "unitName"
+F_DEVICE_ID = "deviceId"
+F_CURRENT_TENANT = "currentTenant"
+UNIT_NAME_MAX_CHARS = 64
+# The codes answer (201) and the collect request.
+F_CODE = "code"
+F_COLLECT_SECRET = "collectSecret"
+F_EXPIRES_IN_SECONDS = "expiresInSeconds"
+F_POLL_SECONDS = "pollSeconds"
+COLLECT_SECRET_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# The collect answer's `state` (202, 410, 404).
+PAIRING_WAITING = "waiting"
+PAIRING_EXPIRED = "expired"
+PAIRING_COLLECTED = "collected"
+PAIRING_UNKNOWN = "unknown"
+# The rules of 400, 429, 503 and 405.
+RULE_UNIT_NAME = "unit-name"
+RULE_DEVICE_ID = "device-id"
+RULE_CURRENT_TENANT = "current-tenant"
+RULE_RATE_LIMITED = "rate-limited"
+RULE_BUSY = "busy"
+RULE_METHOD = "method"
+# The collect payload (200). Each value is a string; the keys are objects
+# holding two.
+F_TENANT = "tenant"
+F_ENVIRONMENT = "environment"
+F_TOKEN = "token"
+F_BUCKET = "bucket"
+F_WRITE_KEY = "writeKey"
+F_READ_KEY = "readKey"
+F_KEY_ID = "keyId"
+F_APPLICATION_KEY = "applicationKey"
+F_AGE_RECIPIENT = "ageRecipient"
+PAYLOAD_STRINGS = (F_TENANT, F_ENVIRONMENT, F_TOKEN, F_BUCKET, F_AGE_RECIPIENT)
+PAYLOAD_KEYS = (F_WRITE_KEY, F_READ_KEY)
+PAYLOAD_KEY_FIELDS = (F_KEY_ID, F_APPLICATION_KEY)

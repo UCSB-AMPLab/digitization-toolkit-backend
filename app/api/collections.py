@@ -464,7 +464,8 @@ def keep_collection_on_unit(
 # what can be refused at once is refused before the job starts, with 409.
 
 def _offsite_refused(exc) -> HTTPException:
-    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail(),
+                         headers=getattr(exc, "headers", None))
 
 
 @router.get("/{collection_id}/offsite/free")

@@ -44,10 +44,12 @@ def test_a_finished_job_is_dropped_once_it_is_older_than_the_ttl():
     recent = _finish(registry, registry.reserve(2, "free"))
     old.finished_at -= FINISHED_JOB_TTL + 1
 
-    registry.reserve(3, "restore")
+    third = registry.reserve(3, "restore")
 
     assert registry.get(old.id) is None
     assert registry.get(recent.id) is recent
+    # A reserved job is counted as offsite work until it runs or is discarded.
+    registry.discard(third)
 
 
 @pytest.mark.unit
@@ -62,13 +64,17 @@ def test_a_queued_or_running_job_is_never_dropped():
     running.created_at -= FINISHED_JOB_TTL + 1
     hold = _Hold()
     registry.run(running, lambda: gate.wait(10) and {}, hold)
+    third = None
     try:
-        registry.reserve(3, "free")
+        third = registry.reserve(3, "free")
         assert registry.get(queued.id) is queued
         assert registry.get(running.id) is running
     finally:
         gate.set()
         assert hold.released.wait(10)
+        registry.discard(queued)
+        if third is not None:
+            registry.discard(third)
 
 
 @pytest.mark.unit
@@ -88,3 +94,33 @@ def test_storage_unavailable_fails_the_job_with_its_message_and_one_warning(capl
     assert [r.levelno for r in records] == [logging.WARNING]
     assert records[0].exc_info is None, "no traceback"
     assert "The external drive is not connected." in records[0].getMessage()
+
+
+@pytest.mark.unit
+def test_every_reservation_is_released_by_run_or_discard():
+    """No exit leaves an offsite job counted: a finished run, a failed run, a discarded reservation."""
+    from app.core import unit_activity
+    from app.core.offsite_free import OffsiteJobRegistry
+
+    registry = OffsiteJobRegistry()
+    assert not unit_activity.in_progress(unit_activity.OFFSITE_JOB)
+    _finish(registry, registry.reserve(1, "free"))
+    _finish(registry, registry.reserve(2, "free"), lambda: 1 / 0)
+    registry.discard(registry.reserve(3, "restore"))
+    job = registry.reserve(4, "restore")
+    registry.discard(job)
+    registry.discard(job)  # twice: counted once
+    assert unit_activity.wait_idle(unit_activity.OFFSITE_JOB, 2)
+
+
+@pytest.mark.unit
+def test_start_restore_releases_the_reservation_when_preparing_fails(monkeypatch):
+    from app.core import offsite_free, unit_activity
+
+    def refuse(db, collection_id):
+        raise offsite_free.FreeRefused("no read remote")
+
+    monkeypatch.setattr(offsite_free, "_prepare_restore", refuse)
+    with pytest.raises(offsite_free.FreeRefused):
+        offsite_free.start_restore(None, 99, "admin1")
+    assert not unit_activity.in_progress(unit_activity.OFFSITE_JOB)

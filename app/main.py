@@ -4,6 +4,7 @@ from fastapi import FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
+import threading
 
 from app.core.db import init_db
 from app.core.schema import assert_schema_at_head
@@ -26,6 +27,52 @@ from app.api.imports import router as imports_router
 from app.api.fisqua import router as fisqua_router
 from app.api.network import router as network_router
 
+# How long the shutdown waits for the CHDK start-up scan to end before it
+# closes the backend. Closing waits for an enumeration in progress anyway;
+# this bound covers a scan still building the backend.
+CAMERA_STARTUP_JOIN_S = 30.0
+
+
+def _start_camera_startup_scan(backend_name):
+    """Build the CHDK backend and enumerate once, in a background thread.
+
+    The backend is otherwise built on the first camera request, so until
+    someone opens the dashboard no body is open and the keep-alive has no
+    backend to run in (capture/backends/chdk_backend.py, _KEEPALIVE_INTERVAL_S).
+    Start-up does not wait for the cameras, and a failure is logged at
+    WARNING and is not fatal. Nothing is done for the other backends.
+
+    Once shutdown has begun (restart_latch.begin_shutdown) no backend is
+    built and no enumeration started; the shutdown joins this thread before
+    it closes the backend.
+
+    Returns:
+        The thread, or None for a backend other than chdk.
+    """
+    if backend_name != "chdk":
+        return None
+    from app.core import restart_latch
+    from capture import service as capture_service
+
+    def scan():
+        try:
+            if restart_latch.shutting_down():
+                return
+            backend = capture_service.get_backend()
+            if restart_latch.shutting_down():
+                return
+            backend.list_devices()
+        except Exception as exc:
+            capture_service.subprocess_logger.warning(
+                f"[chdk] start-up camera scan failed ({exc!r}); the cameras "
+                "are opened at the first camera request instead"
+            )
+
+    thread = threading.Thread(target=scan, name="chdk-startup-scan", daemon=True)
+    thread.start()
+    return thread
+
+
 @asynccontextmanager
 async def lifespan(app: FastAPI):
     init_db()
@@ -39,7 +86,7 @@ async def lifespan(app: FastAPI):
     # application does not pull in the capture stack.
     from capture.service import assert_camera_backend_configured
 
-    assert_camera_backend_configured()
+    camera_backend = assert_camera_backend_configured()
     # Finish or discard any project rename interrupted by a crash/power loss before serving requests
     from app.core.db import SessionLocal
     from app.core.storage_ops import reconcile_pending_rename
@@ -60,6 +107,12 @@ async def lifespan(app: FastAPI):
     from app.core import unit_mode
 
     unit_mode.initialise()
+    # Write the unit's device id on first start (app.core.device_id); a
+    # no-op once written. A file that does not hold one is logged and kept,
+    # and the unit cannot ask Fisqua for a pairing code until it is repaired.
+    from app.core import device_id
+
+    device_id.initialise()
     # Schedule the offsite catalogue dump (NEH-249). A no-op on a unit with no
     # offsite remote configured.
     from app.core.catalogue_backup import catalogue_backup_scheduler
@@ -75,10 +128,33 @@ async def lifespan(app: FastAPI):
     from app.core.fisqua_outbox import fisqua_status_scheduler
 
     fisqua_status_scheduler.start()
+    # Open the CHDK cameras now rather than at the first camera request, so
+    # the keep-alive covers a body switched on before anyone opens the
+    # dashboard. Last, so a start-up step that fails leaves no camera open.
+    camera_scan = _start_camera_startup_scan(camera_backend)
     yield
+    # First: from here no provisioning run starts and pairing starts no
+    # scheduler (app.core.restart_latch).
+    from app.core import restart_latch
+
+    restart_latch.begin_shutdown()
+    # End any pairing session (app.core.fisqua_pairing_service): its secret
+    # is dropped and its thread joined.
+    from app.core.fisqua_pairing_service import pairing_registry
+
+    pairing_registry.shutdown()
     fisqua_status_scheduler.stop()
     image_upload_scheduler.stop()
     catalogue_backup_scheduler.stop()
+    # The CHDK start-up scan sees the shutdown flag and builds nothing more;
+    # one already under way is waited for, so the backend it builds is the
+    # one shutdown_backend closes.
+    # Not covered: a scan that has passed its second shutdown check and
+    # stalls for the whole bound before list_devices takes the layout lock
+    # would enumerate a backend that cleanup has already closed. cleanup
+    # leaves a backend usable, so nothing refuses that enumeration.
+    if camera_scan is not None:
+        camera_scan.join(CAMERA_STARTUP_JOIN_S)
     # The camera backends hold a PTP claim on each body for the life of the
     # process. Closing them here waits for whatever capture is still running
     # and releases the cameras, so a restart finds them free rather than
@@ -106,7 +182,7 @@ app.add_middleware(
     allow_credentials=True,
     allow_methods=["GET", "POST", "PUT", "PATCH", "DELETE"],
     allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token", "X-Requested-With"],
-    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "Retry-After"],
+    expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "X-Page-Layout", "Retry-After"],
 )
 
 app.include_router(records_router, prefix="/records", tags=["records"])

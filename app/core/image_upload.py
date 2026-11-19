@@ -95,6 +95,8 @@ from app.core.paths import (
     resolve_within_storage,
 )
 
+from app.core.scheduler_control import StoppableWorker
+
 logger = logging.getLogger(__name__)
 
 CATEGORY = "system"
@@ -1602,7 +1604,7 @@ def unit_upload_summary(db: Session) -> dict:
 # Schedule
 # ---------------------------------------------------------------------------
 
-class ImageUploadScheduler:
+class ImageUploadScheduler(StoppableWorker):
     """In-process schedule for the image upload, beside the catalogue backup's.
 
     The same single-process assumption as CatalogueBackupScheduler.start, and
@@ -1646,9 +1648,13 @@ class ImageUploadScheduler:
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
         self._wake.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        # A worker still alive is kept, so worker_alive() and wait_stopped()
+        # never report a live thread as gone.
+        if thread is not None and not thread.is_alive() and self._thread is thread:
+            self._thread = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()

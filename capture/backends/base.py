@@ -11,6 +11,38 @@ from typing import Optional
 from pathlib import Path
 
 
+# Capture formats, as CameraConfig.image_format and the settings route name
+# them. There are two on every camera type:
+#
+#   JPEG      the camera's JPEG is the master.
+#   RAW+JPEG  a raw master with a JPEG preview, `<name>_preview.jpg`, where
+#             app.core.paths.preview_sidecar_of puts it. On a gphoto2 DSLR
+#             the camera writes one .cr2 (imageformat "RAW") and the preview
+#             is extracted from it; on a CHDK compact the master is a .dng and
+#             the preview is the camera's own JPEG of the same exposure.
+#
+# "RAW" is the old name for RAW+JPEG and is accepted wherever a format comes
+# in - a request, a stored value, a CameraConfig - and read as RAW+JPEG. It is
+# never stored or reported. The gphoto2 side of this rule has not been run on
+# a T7 since the formats were renamed.
+IMAGE_FORMATS = ("JPEG", "RAW+JPEG")
+_IMAGE_FORMAT_ALIASES = {"RAW": "RAW+JPEG"}
+
+
+def normalise_image_format(value) -> Optional[str]:
+    """The current name of a capture format, or None when value names none.
+
+    "RAW" becomes "RAW+JPEG"; "JPEG" and "RAW+JPEG" are returned as they
+    are. Anything else - None, another string, a value that is not a string -
+    is None, and the caller decides whether that means "nothing chosen" or a
+    value to refuse.
+    """
+    if type(value) is not str:
+        return None
+    value = _IMAGE_FORMAT_ALIASES.get(value, value)
+    return value if value in IMAGE_FORMATS else None
+
+
 # CameraSettings.camera_model is String(255).
 _CAMERA_MODEL_MAX = 255
 # Strings that name no camera: picamera2's fallback, libgphoto2's generic
@@ -138,6 +170,22 @@ class CameraBackend(ABC):
             has_aperture_control (bool): True if aperture can be set via API.
             supports_zoom (bool): True if digital/ScalerCrop zoom is available.
 
+        A backend with stepped optical zoom (capabilities "zoom_steps") adds:
+            zoom_steps (int | None): How many zoom steps the lens has, or None
+                until the camera has reported it.
+            zoom_step (int | None): The step the backend last confirmed by
+                reading it back from the camera, or None until known.
+
+        A backend with focus lock (capabilities "focus_lock") adds:
+            focus_locked (bool | None): True while the camera holds a focus
+                lock it confirmed, False otherwise, and None until the body
+                is in shooting mode.
+            focus_distance (int | None): The distance in mm the camera
+                reported for that lock, or None.
+            focus_stale (bool): The zoom moved after the last lock.
+            focus_restore_failed (bool): A stored distance was sent on
+                entering shooting mode and the camera did not report it back.
+
         The default implementation returns an empty list. Backends should
         override to provide accurate enumeration for their hardware type.
         """
@@ -202,8 +250,18 @@ class CameraBackend(ABC):
             focus_control (bool): Supports `get_focus` / `set_focus`.
             live_controls (bool): Supports `set_camera_controls` (live picamera2 controls).
             zoom (bool): Supports ScalerCrop-based digital zoom.
+            zoom_steps (bool): Supports stepped optical zoom, set by step
+                number through `set_zoom_step` (CHDK compacts). Not the same
+                thing as `zoom`, which is digital.
+            focus_lock (bool): Supports `lock_focus` / `unlock_focus`, an
+                autofocus taken once and held (CHDK compacts).
             autofocus_calibration (bool): Can run AF + WB calibration routines.
             dslr_settings (bool): Exposes ISO / shutter speed / aperture via PTP.
+            image_formats (list): The capture formats (IMAGE_FORMATS) the
+                settings route accepts for this backend: ["JPEG",
+                "RAW+JPEG"] on gphoto2 and CHDK. Without dslr_settings the
+                route takes the format alone (CHDK). Empty when the backend
+                offers no choice.
 
         Subclasses should override this to reflect their actual capabilities.
         """
@@ -213,6 +271,18 @@ class CameraBackend(ABC):
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": False,
+            "focus_lock": False,
             "autofocus_calibration": False,
             "dslr_settings": False,
+            "image_formats": [],
         }
+
+    def capture_image_format(self, camera_index: int) -> Optional[str]:
+        """The capture format stored for this camera, for the capture's CameraConfig.
+
+        None, the default, leaves CameraConfig.image_format unset. A backend
+        whose format is a choice per capture rather than a setting on the
+        camera (CHDK) returns the format stored for the body at the index.
+        """
+        return None

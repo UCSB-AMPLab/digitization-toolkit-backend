@@ -36,6 +36,7 @@ if str(backend_dir) not in sys.path:
 
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
+from .backends.errors import CameraNotConnectedError
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import (
     CameraBackend,
@@ -527,12 +528,16 @@ def _unlink_capture_output(path) -> None:
                 pass
 
 
-def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
+def test_capture_bytes(
+    camera_index: int,
+    resolution: str = "medium",
+    focus_check: bool = False,
+) -> tuple[bytes, float]:
     """Take a real still for the dashboard's "Probar camaras" button and return it inline.
 
     Exercises the same shutter/autofocus/backend path as POST /capture -
     same registry-driven CameraConfig (default_camera_config_from_registry,
-    so a saved orientation still applies) and the same
+    so the body's effective orientation applies) and the same
     get_backend().capture_image() call - but the file never lands under the
     projects root: it is written to a throwaway temp directory that is
     always removed before returning, and no manifest record is ever
@@ -542,6 +547,10 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     Args:
         camera_index: The index of the camera to test.
         resolution: Resolution preset (see capture.camera.IMG_SIZES).
+        focus_check: Ask the backend for a focus-check capture (one trigger
+            attempt, a short deadline; NEH-339). Passed only to a backend
+            whose class sets supports_focus_check = True (GPhoto2Backend);
+            every other backend captures as usual.
 
     Returns:
         tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
@@ -566,8 +575,15 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     try:
         output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
 
+        backend = get_backend()
+        # The class, not the instance: getattr on a mock instance is truthy.
+        if focus_check and getattr(type(backend), "supports_focus_check", False) is True:
+            capture_kwargs = {"focus_check": True}
+        else:
+            capture_kwargs = {}
+
         start_time = time.perf_counter()
-        result = get_backend().capture_image(output_path, camera_config)
+        result = backend.capture_image(output_path, camera_config, **capture_kwargs)
         elapsed_time = time.perf_counter() - start_time
 
         # Result is a (path_or_paths, metadata) pair from the picamera2,
@@ -790,7 +806,9 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
 
     Raises:
         ValueError: If ``resolution`` is not a known IMG_SIZES key.
-        RuntimeError: If the camera is not connected or capture fails.
+        CameraNotConnectedError: If the camera is not connected.
+        RuntimeError: If capture fails; PreviewFrameFailedError when the
+            backend reports a connected body whose frame failed.
     """
     img_size = IMG_SIZES.get(resolution)
     if img_size is None:
@@ -799,7 +817,7 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
         )
 
     if not is_camera_connected(camera_index):
-        raise RuntimeError(f"Camera {camera_index} is not connected")
+        raise CameraNotConnectedError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
@@ -998,6 +1016,66 @@ def apply_zoom(camera_index: int, zoom_factor: float) -> None:
         )
 
     backend.apply_zoom(camera_index, zoom_factor)
+
+
+def apply_zoom_step(camera_index: int, step: int) -> int:
+    """Move the optical zoom of *camera_index* to *step*, and store it.
+
+    Only a backend that reports the "zoom_steps" capability (CHDK) has
+    stepped optical zoom; it validates the step against the camera's own
+    range, confirms it, and stores it per body.
+
+    Returns the step the camera confirmed.
+
+    Raises ValueError for a step outside the camera's range, and
+    RuntimeError if the camera is unavailable, the backend has no stepped
+    zoom, or the camera did not confirm the step.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("zoom_steps", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support stepped optical zoom"
+        )
+
+    return backend.set_zoom_step(camera_index, step)
+
+
+def _focus_lock_backend(camera_index: int):
+    """The backend, once the camera is connected and the backend can lock focus."""
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("focus_lock", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support focus lock"
+        )
+    return backend
+
+
+def lock_focus(camera_index: int) -> int:
+    """Autofocus *camera_index* once, lock the focus, and store the distance.
+
+    Only a backend that reports the "focus_lock" capability (CHDK) can do
+    this; it reads the distance back from the camera and stores it per body.
+
+    Returns the distance in mm the camera reported.
+
+    Raises RuntimeError if the camera is unavailable, the backend has no
+    focus lock, or the camera did not confirm the lock.
+    """
+    return _focus_lock_backend(camera_index).lock_focus(camera_index)
+
+
+def unlock_focus(camera_index: int) -> None:
+    """Release the focus lock of *camera_index* and clear its stored distance.
+
+    The camera then autofocuses on every picture. Raises as lock_focus does.
+    """
+    _focus_lock_backend(camera_index).unlock_focus(camera_index)
 
 
 def main():

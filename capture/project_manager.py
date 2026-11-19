@@ -229,19 +229,22 @@ def default_camera_config_from_registry(
             f"Using autofocus (slow). Run calibration for better performance."
         )
 
-    # Apply the saved rotation for this body, if one was ever set (NEH-71).
-    # None (never set) leaves rotate_deg out of the dict entirely, so
-    # CameraConfig's own default (0) applies and _apply_rotation's
-    # `if rotate_deg:` skips the rotation.
-    # Only the four supported angles count; anything else in the file (a
-    # hand edit, a bool, 45) is treated as unset rather than handed to the
-    # capture path, where it would be rejected on every request.
-    orientation = (camera_data or {}).get("orientation")
-    if CameraRegistry.is_valid_orientation(orientation):
-        config["rotate_deg"] = orientation
+    # The body's effective orientation: the saved one, or, when none was ever
+    # saved or the stored value is not one of the four supported angles, the
+    # default for the body's stored role: 270 left, 90 right, 90 with no role
+    # (CameraRegistry.effective_orientation). An unknown body gets 90.
+    stored = (camera_data or {}).get("orientation")
+    role = (camera_data or {}).get("role")
+    config["rotate_deg"] = CameraRegistry.effective_orientation(stored, role)
+    if CameraRegistry.is_valid_orientation(stored):
         subprocess_logger.info(
             f"Applied saved orientation for camera {camera_index} ({hw_id}): "
-            f"rotate_deg={orientation}"
+            f"rotate_deg={stored}"
+        )
+    else:
+        subprocess_logger.info(
+            f"No saved orientation for camera {camera_index} ({hw_id}): "
+            f"rotate_deg={config['rotate_deg']} (default, role={role})"
         )
 
     return config, hw_id

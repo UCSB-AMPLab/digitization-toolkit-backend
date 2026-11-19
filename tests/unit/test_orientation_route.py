@@ -111,7 +111,10 @@ def test_operator_can_set_orientation_and_it_is_saved_and_reported(client, monke
     assert resp.status_code == 200, resp.text
     devices_by_index = {d["index"]: d for d in resp.json()}
     assert devices_by_index[1]["orientation"] == 270
-    assert devices_by_index[0]["orientation"] is None
+    assert devices_by_index[1]["orientation_saved"] is True
+    # Never set: the default, reported as an integer, marked as not saved.
+    assert devices_by_index[0]["orientation"] == 90
+    assert devices_by_index[0]["orientation_saved"] is False
 
 
 @pytest.mark.unit
