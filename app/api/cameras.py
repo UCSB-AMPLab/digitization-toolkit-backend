@@ -899,6 +899,15 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
 
+# The preview route's answer for a camera that is connected but did not
+# deliver this frame, as against a 404 for one that is not connected.
+# Clients tell it from the 503 for a missing capture system by detail.code.
+PREVIEW_FRAME_FAILED_DETAIL = {
+	"code": "preview_frame_failed",
+	"message": "The camera is connected but did not send a preview frame.",
+}
+
+
 @router.get("/preview/{camera_index}")
 def get_camera_preview(
 	camera_index: int,
@@ -913,14 +922,19 @@ def get_camera_preview(
 	`resolution`, so it shows the field of view a capture at that resolution
 	would record, with no AF cycle and no denoise warmup.
 
-	Returns 422 for an unknown resolution, 404 when the requested camera is
-	not connected or the frame could not be captured (any RuntimeError from
-	the capture service), 500 on anything else.
+	Returns 422 for an unknown resolution, 503 with detail
+	PREVIEW_FRAME_FAILED_DETAIL when the backend reports a connected body
+	whose frame failed (PreviewFrameFailedError; the next poll may succeed),
+	404 for a camera that is not connected and for every other RuntimeError
+	from the capture service (the wrong body at the index included), and 500
+	on anything else. The status comes from the exception's class alone: the
+	backend is not asked again.
 	"""
 	from fastapi.responses import Response
 
 	try:
 		from capture.service import capture_preview_frame
+		from capture.backends.errors import PreviewFrameFailedError
 	except ImportError as e:
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
@@ -929,6 +943,9 @@ def get_camera_preview(
 		return Response(content=jpeg_bytes, media_type="image/jpeg")
 	except ValueError as e:
 		raise HTTPException(status_code=422, detail=str(e))
+	except PreviewFrameFailedError as e:
+		logger.warning(f"Preview frame failed for connected camera {camera_index}: {e}")
+		raise HTTPException(status_code=503, detail=PREVIEW_FRAME_FAILED_DETAIL)
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
