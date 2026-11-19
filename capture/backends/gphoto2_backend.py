@@ -57,7 +57,7 @@ from .base import (
 # Re-exported below for the callers that import it from here (app/api/cameras.py,
 # tests/unit/test_test_capture_route.py). The class itself is shared, so a CHDK
 # timeout and a DSLR timeout are one class and take the same route out.
-from .errors import CaptureTimeoutError
+from .errors import CameraNotConnectedError, CaptureTimeoutError, PreviewFrameFailedError
 from ..utils import atomic_write
 from . import usb_topology
 
@@ -185,6 +185,21 @@ _ROUTINE_SCAN_MIN_S = 10.0
 # The clock the routine-scan interval is measured on; a module-level name so
 # tests can drive it.
 _monotonic = time.monotonic
+
+# A failed live-preview frame is tried once more, after this pause with the
+# camera lock released. The pause lets a capture already waiting on the lock
+# take it first; a frame normally comes back in ~30 ms, so this is a few
+# frames' worth of time, not a wait the operator sees.
+_PREVIEW_RETRY_DELAY_S = 0.1
+
+# Two failed preview polls belong to the same run of failures only when the
+# second comes within this many seconds of the first. The capture screen polls
+# every 2 s and the dashboard every 2.5 s, so a dead session polled by either
+# fails well inside it; a poller as slow as once per _ROUTINE_SCAN_MIN_S still
+# keeps its run together, with the rest of the bound as room for a poll
+# delayed behind a capture on the lock. A failure after a longer silence
+# starts a new run, so an old failure cannot close a session at once.
+_PREVIEW_FAILURE_GAP_S = 2 * _ROUTINE_SCAN_MIN_S
 
 _USB_PORT_RE = re.compile(r"usb:(\d{3}),(\d{3})")
 
@@ -774,6 +789,16 @@ class GPhoto2Backend(CameraBackend):
         self._last_scan_at: "float | None" = None
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
+        # camera_index -> (session, _monotonic() of the first and of the last
+        # failed preview poll in the current run of failures on it); read and
+        # written under _preview_record_lock (see _note_preview_failure)
+        self._preview_failing_since: dict[
+            int, tuple[_PTPSession, float, float]
+        ] = {}
+        # guards _preview_failing_since alone, so a poll that cannot have the
+        # camera lock can still record its failure; it may be taken with a
+        # camera lock held, and no other lock is taken while it is held
+        self._preview_record_lock = threading.Lock()
         # usb port -> the index that currently holds a PTP claim on it. This
         # is the record of what is claimed *now*, which self._sessions is not:
         # a session claims its body before it is stored and is popped before
@@ -782,6 +807,10 @@ class GPhoto2Backend(CameraBackend):
         # per-camera lock for capture serialisation
         self._session_locks: dict[int, threading.Lock] = {}
         self._map_lock = threading.Lock()
+        # True from a bus scan in is_camera_connected() that raised until the
+        # next one there that completes, so a run of failed scans is logged
+        # once; read and written under _map_lock
+        self._scan_failing = False
         # serialises rescan() so overlapping snapshots publish in order
         self._rescan_lock = threading.Lock()
         # serialises saves of the bindings file, snapshot and write together
@@ -1142,6 +1171,32 @@ class GPhoto2Backend(CameraBackend):
                 )
             return dict(self._port_map)
 
+    def _published_port_map(self) -> dict[int, tuple[str, str]]:
+        """The port map as last published, read under _map_lock; never scans.
+
+        Unlike _get_port_map(), an empty map is returned as it is: after a
+        completed scan it means no bodies are on the bus.
+        """
+        with self._map_lock:
+            return dict(self._port_map)
+
+    def _port_map_for(self, may_scan: bool) -> dict[int, tuple[str, str]]:
+        """The port map for a session lookup: _get_port_map(), or with may_scan
+        False the published map without a scan.
+
+        The one exception to "without a scan" is a backend on which no scan
+        has completed since start (_last_scan_at is None): there the
+        published map is empty because nothing has looked yet, not because
+        the bus is empty, so _get_port_map() builds it as before.
+        """
+        if may_scan:
+            return self._get_port_map()
+        with self._map_lock:
+            scanned = self._last_scan_at is not None
+        if not scanned:
+            return self._get_port_map()
+        return self._published_port_map()
+
     def camera_model(self, camera_index: int) -> "str | None":
         """The model of the body at this index, from the session or the map.
 
@@ -1310,11 +1365,15 @@ class GPhoto2Backend(CameraBackend):
     # Session management
     # ------------------------------------------------------------------
 
-    def _session_matches_map(self, camera_index: int) -> "_PTPSession | None":
+    def _session_matches_map(
+        self, camera_index: int, may_scan: bool = True
+    ) -> "_PTPSession | None":
         """Return the cached session for camera_index if the current map still backs it.
 
-        Reads the port map fresh on every call - via self._get_port_map() -
-        rather than accepting a map the caller copied earlier, because
+        Reads the port map fresh on every call - via self._port_map_for(), so
+        with may_scan False an empty map after a completed scan is not
+        rebuilt by a bus scan - rather than accepting a map the
+        caller copied earlier, because
         _refresh_port_map() can publish a new map at any time, outside
         _rescan_lock, and a caller's snapshot can predate that publish. A
         session validated against a stale snapshot could be closed for no
@@ -1333,7 +1392,8 @@ class GPhoto2Backend(CameraBackend):
         session = self._sessions.get(camera_index)
         if session is None:
             return None
-        entry = self._get_port_map().get(camera_index)
+        port_map = self._port_map_for(may_scan)
+        entry = port_map.get(camera_index)
         if session._cam is not None and entry == (session.model, session.port):
             return session
         self.logger.info(
@@ -1377,7 +1437,9 @@ class GPhoto2Backend(CameraBackend):
             if self._claimed_ports.get(port) == camera_index:
                 del self._claimed_ports[port]
 
-    def _take_port(self, camera_index: int, port: str) -> "int | None":
+    def _take_port(
+        self, camera_index: int, port: str, may_scan: bool = True
+    ) -> "int | None":
         """Claim `port` for `camera_index`, clearing a stale session if it can.
 
         A body that moves index leaves a window between the publish that moved
@@ -1395,7 +1457,8 @@ class GPhoto2Backend(CameraBackend):
         skip and try again later.
 
         Returns None when the claim is now held (the caller must release it),
-        otherwise the index still holding the port.
+        otherwise the index still holding the port. may_scan is passed to
+        _session_matches_map.
         """
         holder = self._claim_port(camera_index, port)
         if holder is None:
@@ -1409,21 +1472,23 @@ class GPhoto2Backend(CameraBackend):
         if not other_lock.acquire(blocking=False):
             return holder
         try:
-            self._session_matches_map(holder)
+            self._session_matches_map(holder, may_scan)
         finally:
             other_lock.release()
 
         return self._claim_port(camera_index, port)
 
     def _open_identified_session(
-        self, camera_index: int, model: str, port: str
+        self, camera_index: int, model: str, port: str, may_scan: bool = True
     ) -> _PTPSession:
         """Open a session on `port` and hand it back only if it is the right body.
 
         The identity check runs before the session is cached, so a body that
-        contradicts the pin never becomes the session an index serves.
+        contradicts the pin never becomes the session an index serves. With
+        may_scan False the map is laid out again from the last detection
+        (_republish_port_map) instead of a new bus scan.
         """
-        held_by = self._take_port(camera_index, port)
+        held_by = self._take_port(camera_index, port, may_scan)
         if held_by is not None:
             raise RuntimeError(
                 f"Camera {camera_index}: port {port} is still held by index "
@@ -1468,7 +1533,10 @@ class GPhoto2Backend(CameraBackend):
         session.close()
         self._release_port(camera_index, port)
         self._learn_serial(camera_index, port, serial)
-        self._refresh_port_map()
+        if may_scan:
+            self._refresh_port_map()
+        else:
+            self._republish_port_map()
         raise CameraIdentityError(
             f"Camera {camera_index}: expected body {pinned!r}, found {serial!r}"
             + (f" (pinned to index {elsewhere})" if elsewhere is not None else "")
@@ -1583,7 +1651,9 @@ class GPhoto2Backend(CameraBackend):
                     )
         return learned
 
-    def _get_or_open_session(self, camera_index: int) -> _PTPSession:
+    def _get_or_open_session(
+        self, camera_index: int, may_scan: bool = True
+    ) -> _PTPSession:
         """Return an existing open session, or open a new one.
 
         The cached session is validated against the port map as currently
@@ -1598,14 +1668,22 @@ class GPhoto2Backend(CameraBackend):
         the session is cached, so a re-enumeration that put a different body
         on this port raises CameraIdentityError instead of quietly serving
         the wrong camera.
+
+        With may_scan False no bus scan is made anywhere below once a scan
+        has completed (see _port_map_for), so a caller holding the camera
+        lock does not scan under it: every map read is the published map (an
+        empty one after a completed scan is "no bodies", so
+        CameraNotConnectedError), and a -105 on open re-reads the
+        published map instead of re-detecting, retrying only if another
+        thread has since published a different entry for this index.
         """
-        existing = self._session_matches_map(camera_index)
+        existing = self._session_matches_map(camera_index, may_scan)
         if existing is not None:
             return existing
 
-        port_map = self._get_port_map()
+        port_map = self._port_map_for(may_scan)
         if camera_index not in port_map:
-            raise RuntimeError(
+            raise CameraNotConnectedError(
                 f"Camera index {camera_index} not found. "
                 f"Detected indices: {sorted(port_map.keys())}. "
                 "Ensure the camera is on and USB is connected, then try again."
@@ -1613,25 +1691,38 @@ class GPhoto2Backend(CameraBackend):
 
         model, port = port_map[camera_index]
         try:
-            session = self._open_identified_session(camera_index, model, port)
+            session = self._open_identified_session(
+                camera_index, model, port, may_scan
+            )
             self._sessions[camera_index] = session
             return session
         except gp.GPhoto2Error as exc:
             # -105 Unknown model usually means ports changed (USB re-enumeration
             # after a power-cycle). Refresh the port map once and retry.
             if "-105" in str(exc) or "Unknown model" in str(exc):
-                self.logger.warning(
-                    f"[gphoto2] Camera {camera_index}: session init failed ({exc}). "
-                    "Refreshing port map and retrying ..."
-                )
-                self._refresh_port_map()
-                port_map = self._get_port_map()
+                if may_scan:
+                    self.logger.warning(
+                        f"[gphoto2] Camera {camera_index}: session init failed ({exc}). "
+                        "Refreshing port map and retrying ..."
+                    )
+                    self._refresh_port_map()
+                    port_map = self._get_port_map()
+                else:
+                    self.logger.warning(
+                        f"[gphoto2] Camera {camera_index}: session init failed "
+                        f"({exc}); re-reading the published port map"
+                    )
+                    port_map = self._published_port_map()
+                    if port_map.get(camera_index) == (model, port):
+                        raise
                 if camera_index not in port_map:
-                    raise RuntimeError(
+                    raise CameraNotConnectedError(
                         f"Camera index {camera_index} not found after port map refresh."
                     ) from exc
                 model, port = port_map[camera_index]
-                session = self._open_identified_session(camera_index, model, port)
+                session = self._open_identified_session(
+                    camera_index, model, port, may_scan
+                )
                 self._sessions[camera_index] = session
                 return session
             raise
@@ -1674,13 +1765,30 @@ class GPhoto2Backend(CameraBackend):
         holding a working pair of cameras on provisional indices. A pin
         learned in this process is never dropped here - only rescan(), which
         the operator asks for, may do that.
+
+        A scan that raises is not an answer: the scan failed, which says
+        nothing about whether the body is there. "The scan failed" means
+        gp.Camera.autodetect() raised gp.GPhoto2Error inside the
+        re-detection; the published map is then left as the last completed
+        scan made it, and the answer is True only if that map has the index
+        and the port's device node still exists (_last_scan_still_backs), so
+        a body that was connected stays connected until its node goes and
+        one that was absent stays absent. The
+        first failure in a run is logged as an error and the scan that ends
+        the run at info; the failures between are logged at debug. Any other
+        exception is still logged and answered as False. The answer to a scan
+        that completes is unchanged.
         """
         try:
             # Detect afresh unless the map still points at live devices, so a
             # power-cycle since the last call is reflected without scanning
             # the bus on every preview and capture.
             if not self._port_map_is_current(camera_index):
-                self._refresh_port_map()
+                try:
+                    self._refresh_port_map()
+                except gp.GPhoto2Error as exc:
+                    return self._answer_from_last_scan(camera_index, exc)
+                self._note_scan_completed()
             with self._map_lock:
                 pinned = camera_index in self._pins
                 absent = camera_index not in self._port_map
@@ -1699,10 +1807,81 @@ class GPhoto2Backend(CameraBackend):
                     self._identify_unknown_ports()
                     self._drop_seeded_pins_if_none_present()
                 self._republish_port_map()
-            return camera_index in self._get_port_map()
+            # The map just checked or published, read without the rebuild
+            # _get_port_map() does for an empty map: an empty map here is a
+            # scan's answer, and a second autodetect() would only repeat it.
+            with self._map_lock:
+                return camera_index in self._port_map
         except Exception as exc:
             self.logger.error(f"[gphoto2] is_camera_connected({camera_index}): {exc}")
             return False
+
+    def _last_scan_still_backs(self, camera_index: int) -> bool:
+        """Does the last completed scan still put a body at this index?
+
+        The rule: a body recorded in the last completed scan counts as
+        connected only while its usbfs device node still exists
+        (_port_node_exists). The node is direct evidence that the device is
+        on the bus; the published map is only what the bus said when it was
+        last read. Where the node cannot be seen (no usbfs), the answer is
+        False.
+
+        Every answer from is_camera_connected() or capture_preview() that a
+        body is connected, made without a scan completed in the same call,
+        is listed here, and each checks the node:
+        1. is_camera_connected() with a current map (_port_map_is_current):
+           a scan completed within _ROUTINE_SCAN_MIN_S, and every published
+           port's node exists, checked there.
+        2. is_camera_connected() when its scan raised gp.GPhoto2Error
+           (_answer_from_last_scan): this method.
+        3. capture_preview()'s PreviewFrameFailedError, the 503 that tells
+           the client the body is connected. It is raised in exactly one
+           place, _raise_no_frame_or_not_connected, and only after that
+           method has read the map as published at that moment, found the
+           session's own model and port at this index, and found the port's
+           node present; any other finding raises CameraNotConnectedError
+           and closes the session if it is still the cached one. Every exit
+           of capture_preview() after a frame failed with gp.GPhoto2Error
+           goes through it: a retry skipped because the camera lock was
+           busy, a re-detect before the retry that raised, and a retried
+           frame that failed. capture_preview()'s other exits are a frame
+           returned, which is the body answering in that call; the errors
+           raised while the session is resolved (_get_or_open_session); and
+           any exception other than gp.GPhoto2Error from a frame call, which
+           propagates as it is. None of those is PreviewFrameFailedError.
+        Every other True from is_camera_connected() follows a scan that
+        completed in that call, any other exception there answers False, and
+        before any scan has completed the map is empty, so the answer is
+        False.
+        """
+        with self._map_lock:
+            entry = self._port_map.get(camera_index)
+        return entry is not None and _port_node_exists(entry[1])
+
+    def _answer_from_last_scan(self, camera_index: int, exc: Exception) -> bool:
+        """is_camera_connected()'s answer when its bus scan raised exc."""
+        connected = self._last_scan_still_backs(camera_index)
+        with self._map_lock:
+            first = not self._scan_failing
+            self._scan_failing = True
+        message = (
+            f"[gphoto2] is_camera_connected({camera_index}): the bus scan "
+            f"failed ({exc}); answering {connected} from the last completed "
+            "scan and the device node"
+        )
+        if first:
+            self.logger.error(message)
+        else:
+            self.logger.debug(message)
+        return connected
+
+    def _note_scan_completed(self):
+        """End a run of failed scans in is_camera_connected(), logging that it ended."""
+        with self._map_lock:
+            ended = self._scan_failing
+            self._scan_failing = False
+        if ended:
+            self.logger.info("[gphoto2] The bus scan completes again")
 
     # capture_image() takes focus_check (NEH-339); capture.service passes it
     # only to a backend class that sets this.
@@ -1753,6 +1932,9 @@ class GPhoto2Backend(CameraBackend):
                     f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"
                 )
+                # The session works, so any run of failed preview polls on it
+                # is over.
+                self._end_preview_failure_run(camera_index, session)
                 return str(actual_path), None
             except (gp.GPhoto2Error, CaptureTimeoutError) as exc:
                 if isinstance(exc, CaptureTimeoutError):
@@ -2097,23 +2279,230 @@ class GPhoto2Backend(CameraBackend):
         subsystem); subsequent frames are ~30ms at ~33 fps.
 
         The per-camera lock serialises preview and full-capture calls so they
-        never interleave on the same session.
+        never interleave on the same session. Once a scan has completed, no
+        bus scan is made while it is held: the session is resolved with
+        _get_or_open_session(may_scan=False), against the published map only.
+
+        A Canon body can fail one frame ([-1] Unspecified error) and serve the
+        next, so a failed frame does not close the session. It is tried once
+        more, after _PREVIEW_RETRY_DELAY_S with the lock released, and only if
+        the lock is free then: a capture waiting on the lock goes first and
+        this poll is reported as failed. Before the retry, a port whose usbfs
+        node has gone (_port_node_exists) sends the map through a re-detect,
+        as is_camera_connected() would, with the lock released; the session
+        is then resolved again, which closes it if the published map no
+        longer backs it and raises when the index is gone
+        (CameraNotConnectedError) or holds another body (CameraIdentityError).
+
+        Every exit at which no frame was obtained - a retry skipped for a
+        busy lock, a re-detect that raised gp.GPhoto2Error, a retried frame
+        that failed - goes through _raise_no_frame_or_not_connected, which
+        decides between PreviewFrameFailedError and CameraNotConnectedError
+        from the evidence the backend holds at that moment. A run of failed
+        polls that lasts _ROUTINE_SCAN_MIN_S closes the session (see
+        _note_preview_failure), at once when the camera lock is free and
+        otherwise at the next acquisition here (_close_session_if_run_due).
         """
         lock = self._get_camera_lock(camera_index)
         with lock:
-            session = self._get_or_open_session(camera_index)
+            self._close_session_if_run_due(camera_index)
+            session = self._get_or_open_session(camera_index, False)
             try:
-                camera_file = session._cam.capture_preview()
-                data = camera_file.get_data_and_size()
-                return bytes(data)
+                return self._preview_frame(camera_index, session)
+            except gp.GPhoto2Error as exc:
+                first_exc = exc
+                self.logger.warning(
+                    f"[gphoto2] Camera {camera_index}: preview capture failed: "
+                    f"{exc}; trying once more"
+                )
+
+        time.sleep(_PREVIEW_RETRY_DELAY_S)
+        if not _port_node_exists(session.port):
+            try:
+                self._refresh_port_map()
+            except gp.GPhoto2Error as exc:
+                self.logger.warning(
+                    f"[gphoto2] Camera {camera_index}: re-detect before the "
+                    f"preview retry failed: {exc}"
+                )
+                self._raise_no_frame_or_not_connected(
+                    camera_index, session, first_exc,
+                    f"re-detect failed: {exc}; not retried",
+                )
+
+        if not lock.acquire(blocking=False):
+            self._raise_no_frame_or_not_connected(
+                camera_index, session, first_exc, "camera busy; not retried"
+            )
+        try:
+            session = self._get_or_open_session(camera_index, False)
+            try:
+                return self._preview_frame(camera_index, session)
             except gp.GPhoto2Error as exc:
                 self.logger.error(
                     f"[gphoto2] Camera {camera_index}: preview capture failed: {exc}"
                 )
-                self._close_session(camera_index)
-                raise RuntimeError(
-                    f"DSLR preview capture failed: {exc}"
-                ) from exc
+                failed = exc
+        finally:
+            lock.release()
+        self._raise_no_frame_or_not_connected(camera_index, session, failed)
+
+    def _raise_no_frame_or_not_connected(
+        self,
+        camera_index: int,
+        session: "_PTPSession",
+        cause: Exception,
+        note: str = "",
+    ):
+        """Raise for a preview poll that got no frame on session: "no frame" or "not connected".
+
+        Raises CameraNotConnectedError, after closing session through
+        _close_gone_session, when the backend's current evidence says the
+        body is not there: the map as published now (read under _map_lock;
+        no bus scan is made) has no entry at camera_index, or has an entry
+        other than session's own model and port, or session's port has no
+        usbfs node (_port_node_exists). Otherwise records the failure in the
+        run (_record_preview_failure) and raises PreviewFrameFailedError.
+        This is the only place in the backend that raises
+        PreviewFrameFailedError. The caller must not hold the camera lock.
+        """
+        with self._map_lock:
+            entry = self._port_map.get(camera_index)
+        if entry is None:
+            reason = f"the port map has no camera at index {camera_index}"
+        elif entry != (session.model, session.port):
+            reason = f"the port map has {entry[0]} on {entry[1]} at this index"
+        elif not _port_node_exists(session.port):
+            reason = f"the device node for {session.port} is gone"
+        else:
+            self._record_preview_failure(camera_index, session)
+            raise PreviewFrameFailedError(
+                f"DSLR preview capture failed: {cause}"
+                + (f" ({note})" if note else "")
+            ) from cause
+        self._close_gone_session(camera_index, session, reason)
+        raise CameraNotConnectedError(
+            f"Camera {camera_index} is not connected: {reason} "
+            f"(preview capture failed: {cause}"
+            + (f"; {note})" if note else ")")
+        ) from cause
+
+    def _close_gone_session(
+        self, camera_index: int, session: "_PTPSession", reason: str
+    ):
+        """Close session, whose body is not there (reason), if it is still the cached one.
+
+        Takes the camera lock, waiting for it, then _close_session takes
+        _map_lock inside it; no bus scan is made under the camera lock. A
+        session already replaced or closed by someone else is left alone.
+        """
+        with self._get_camera_lock(camera_index):
+            if self._sessions.get(camera_index) is not session:
+                return
+            self._end_preview_failure_run(camera_index, session)
+            self.logger.info(
+                f"[gphoto2] Camera {camera_index}: {reason}; closing the session"
+            )
+            self._close_session(camera_index)
+
+    def _preview_frame(self, camera_index: int, session: "_PTPSession") -> bytes:
+        """One capture_preview() on session; a good frame clears the failure record.
+
+        Caller holds the camera lock.
+        """
+        camera_file = session._cam.capture_preview()
+        data = bytes(camera_file.get_data_and_size())
+        self._end_preview_failure_run(camera_index)
+        return data
+
+    def _end_preview_failure_run(
+        self, camera_index: int, session: "_PTPSession | None" = None
+    ):
+        """Forget the run of failed polls at camera_index (only session's, if given)."""
+        with self._preview_record_lock:
+            recorded = self._preview_failing_since.get(camera_index)
+            if recorded is not None and (session is None or recorded[0] is session):
+                del self._preview_failing_since[camera_index]
+
+    def _note_preview_failure(self, camera_index: int, session: "_PTPSession") -> bool:
+        """Record a failed poll; True once the run of failures spans the scan interval.
+
+        Takes _preview_record_lock and nothing else, so it may be called with
+        or without the camera lock. A run is a sequence of failed polls on
+        one session, each within _PREVIEW_FAILURE_GAP_S of the one before,
+        with no good frame and no successful capture on that session in
+        between; a failure after a longer gap, or on another session, starts
+        a new run. The window is _ROUTINE_SCAN_MIN_S because the capture
+        service asks is_camera_connected() before every poll and that
+        re-detects the bus at least that often: once a run has lasted that
+        long, the body has been seen on the bus again during it and the
+        session is what is failing, so it is to be closed and the next poll
+        re-opens it. A run of one poll never spans the window, so a single
+        failed poll never closes the session. The record stays in place
+        until the session is closed (_close_session_if_run_due) or the run
+        ends.
+        """
+        now = _monotonic()
+        with self._preview_record_lock:
+            recorded = self._preview_failing_since.get(camera_index)
+            if (
+                recorded is None
+                or recorded[0] is not session
+                or now - recorded[2] > _PREVIEW_FAILURE_GAP_S
+            ):
+                self._preview_failing_since[camera_index] = (session, now, now)
+                return False
+            first = recorded[1]
+            self._preview_failing_since[camera_index] = (session, first, now)
+            return now - first >= _ROUTINE_SCAN_MIN_S
+
+    def _record_preview_failure(self, camera_index: int, session: "_PTPSession"):
+        """Record a failed poll in the run, closing session if the run now spans the window.
+
+        Called with the camera lock not held, and never waits for it: the
+        record has its own lock (_preview_record_lock), and the close is made
+        here only if the camera lock can be taken at once. When it cannot,
+        the record is left spanning the window and whoever next takes the
+        lock in capture_preview() closes the session
+        (_close_session_if_run_due).
+        """
+        if not self._note_preview_failure(camera_index, session):
+            return
+        lock = self._get_camera_lock(camera_index)
+        if not lock.acquire(blocking=False):
+            return
+        try:
+            self._close_session_if_run_due(camera_index)
+        finally:
+            lock.release()
+
+    def _close_session_if_run_due(self, camera_index: int):
+        """Close the cached session if its recorded run of failed polls spans the window.
+
+        Caller holds the camera lock. A run spans the window when its first
+        and last failures are _ROUTINE_SCAN_MIN_S or more apart; a record
+        whose last failure is more than _PREVIEW_FAILURE_GAP_S old is not
+        acted on, as a new failure would start a new run. A record for a
+        session that is no longer the cached one closes nothing.
+        """
+        now = _monotonic()
+        with self._preview_record_lock:
+            recorded = self._preview_failing_since.get(camera_index)
+            if recorded is None:
+                return
+            session, first, last = recorded
+            if (
+                self._sessions.get(camera_index) is not session
+                or last - first < _ROUTINE_SCAN_MIN_S
+                or now - last > _PREVIEW_FAILURE_GAP_S
+            ):
+                return
+            del self._preview_failing_since[camera_index]
+        self.logger.error(
+            f"[gphoto2] Camera {camera_index}: every preview frame has failed "
+            f"for {last - first:.0f}s; closing the session"
+        )
+        self._close_session(camera_index)
 
     def get_dslr_settings(self, camera_index: int) -> dict:
         """Read current DSLR settings from the open PTP session.

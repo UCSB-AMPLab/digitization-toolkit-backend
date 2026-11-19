@@ -36,6 +36,7 @@ if str(backend_dir) not in sys.path:
 
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
+from .backends.errors import CameraNotConnectedError
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import (
     CameraBackend,
@@ -805,7 +806,9 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
 
     Raises:
         ValueError: If ``resolution`` is not a known IMG_SIZES key.
-        RuntimeError: If the camera is not connected or capture fails.
+        CameraNotConnectedError: If the camera is not connected.
+        RuntimeError: If capture fails; PreviewFrameFailedError when the
+            backend reports a connected body whose frame failed.
     """
     img_size = IMG_SIZES.get(resolution)
     if img_size is None:
@@ -814,7 +817,7 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
         )
 
     if not is_camera_connected(camera_index):
-        raise RuntimeError(f"Camera {camera_index} is not connected")
+        raise CameraNotConnectedError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
