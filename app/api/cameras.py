@@ -373,13 +373,21 @@ class WhiteBalanceManualRequest(BaseModel):
 
 
 class DSLRSettingsResponse(BaseModel):
-	"""Current DSLR camera settings read via PTP."""
+	"""Current DSLR camera settings read via PTP.
+
+	image_format is the format a capture takes: on a gphoto2 DSLR what the
+	camera holds, on CHDK the stored format or JPEG. stored_image_format is
+	the format stored on the unit for the body at the index, null when none
+	is stored; on a DSLR a difference between the two shows that the camera
+	does not hold the chosen format.
+	"""
 	iso: Optional[str] = None
 	shutter_speed: Optional[str] = None
 	aperture: Optional[str] = None
 	image_format: Optional[str] = None
 	focus_mode: Optional[str] = None
 	flash_mode: Optional[str] = None
+	stored_image_format: Optional[str] = None
 
 
 class DSLRSettingsUpdate(BaseModel):
@@ -403,19 +411,29 @@ def _takes_camera_settings(caps: dict) -> bool:
 def _put_stored_image_format(config_dict: dict, camera_index: int) -> None:
 	"""Put the capture format the backend stores for this camera into config_dict.
 
-	On CHDK the format is a choice per capture, stored per body by the
-	settings route, so a record capture carries it in its CameraConfig. A
-	gphoto2 DSLR holds its format as a camera setting and stores nothing
-	here, so config_dict is left as it is. Test captures, the focus check
-	and the live preview build their own configuration and do not call
-	this, so they capture JPEG.
+	On CHDK the format is stored per body by the settings route and is a
+	choice per capture, so a record capture carries it in its CameraConfig.
+	A backend that resolves the stored format itself, under its own camera
+	lock and for the body its session holds (resolves_capture_format: the
+	gphoto2 DSLR), gets nothing here, so a configuration built before a
+	rescan or a settings change cannot carry another body's format or an
+	older choice. A body with nothing stored, or with no identity of its
+	own, leaves config_dict as it is. Test captures, the focus check and
+	the live preview build their own configuration and do not call this. On
+	CHDK they capture JPEG. On a DSLR a test capture and the focus check go
+	through GPhoto2Backend.capture_image like any capture, so the body's
+	stored format is applied to them and the file they produce is checked
+	against it; the live preview takes no configuration and sets no format.
 
 	The backend is read as it stands, never constructed, as
 	capture.service.camera_model reads it: the format is stored on the
 	backend instance, so a backend not yet built holds none.
 	"""
 	import capture.service as capture_service
-	stored = getattr(capture_service._backend, "capture_image_format", None)
+	backend = capture_service._backend
+	if getattr(type(backend), "resolves_capture_format", False) is True:
+		return
+	stored = getattr(backend, "capture_image_format", None)
 	image_format = stored(camera_index) if callable(stored) else None
 	if isinstance(image_format, str):
 		config_dict["image_format"] = image_format
@@ -2128,7 +2146,15 @@ def apply_dslr_settings(
 	"""
 	Apply DSLR settings (ISO, shutter speed, aperture, image format) to the
 	given camera via PTP.  Only fields present in the request body are applied;
-	omitted fields are left at their current camera value.
+	omitted fields are left at their current camera value. On a gphoto2 DSLR
+	a 200 for an image format means one of two things. For a body the unit
+	identifies, the camera holds the format and it is stored for the body.
+	For a body it cannot identify (no serial, or one another body answers
+	to), the camera holds the format and nothing is stored, which the
+	response shows with stored_image_format null. In every other outcome the
+	camera is set back to the format it held before the request and the
+	answer is 502, whose detail says whether it was set back
+	(GPhoto2Backend.apply_dslr_settings).
 
 	Returns HTTP 501 when the active backend does not support DSLR settings.
 	"""

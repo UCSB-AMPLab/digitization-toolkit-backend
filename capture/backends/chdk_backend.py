@@ -3901,6 +3901,9 @@ class ChdkBackend(CameraBackend):
             "image_format": self.capture_image_format(camera_index) or "JPEG",
             "focus_mode": None,
             "flash_mode": None,
+            # The format stored for the body, None when none is: what
+            # image_format reports when one is stored.
+            "stored_image_format": self.capture_image_format(camera_index),
         }
 
     # ------------------------------------------------------------------
