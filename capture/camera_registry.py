@@ -93,6 +93,15 @@ class CameraRegistry:
                 pass
             return {"cameras": {}, "version": "1.0"}
 
+    @property
+    def write_refusal(self) -> Optional[str]:
+        """Why this registry cannot be written, or None when it can.
+
+        A registry that refuses writes reads as empty, so an empty answer
+        from it says nothing about what is stored.
+        """
+        return self._write_refusal
+
     def _refuse_write(self) -> None:
         if self._write_refusal is not None:
             from app.core.storage_override import StorageUnavailableError
@@ -342,25 +351,32 @@ class CameraRegistry:
         letting a second resolution pick a different body.
         """
         def change(cameras: Dict) -> None:
-            now = datetime.now(timezone.utc).isoformat()
-            if hardware_id in cameras["cameras"] and not force:
-                cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
-                cameras["cameras"][hardware_id]["last_seen_at"] = now
-            else:
-                cameras["cameras"][hardware_id] = {
-                    "model": info.get("model"),
-                    "serial": info.get("serial"),
-                    "location": info.get("location"),
-                    "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
-                    "label": None,  # Human-readable description
-                    "last_seen_index": camera_index,
-                    "first_registered_at": now,
-                    "last_seen_at": now,
-                    "calibration": calibration_data or {},
-                    "orientation": None,  # Never set; reads as the role's default (effective_orientation)
-                }
+            self._register_in(cameras, hardware_id, info, camera_index,
+                              calibration_data, force)
 
         self._mutate(change)
+
+    @staticmethod
+    def _register_in(cameras: Dict, hardware_id: str, info: Dict, camera_index: int,
+                     calibration_data: Optional[Dict] = None, force: bool = False) -> None:
+        """register_resolved's change, applied to an already loaded registry."""
+        now = datetime.now(timezone.utc).isoformat()
+        if hardware_id in cameras["cameras"] and not force:
+            cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
+            cameras["cameras"][hardware_id]["last_seen_at"] = now
+        else:
+            cameras["cameras"][hardware_id] = {
+                "model": info.get("model"),
+                "serial": info.get("serial"),
+                "location": info.get("location"),
+                "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
+                "label": None,  # Human-readable description
+                "last_seen_index": camera_index,
+                "first_registered_at": now,
+                "last_seen_at": now,
+                "calibration": calibration_data or {},
+                "orientation": None,  # Never set; reads as the role's default (effective_orientation)
+            }
 
     def get_camera_by_id(self, hardware_id: str) -> Optional[Dict]:
         """Get camera data by hardware ID."""
@@ -611,13 +627,15 @@ class CameraRegistry:
         return normalise_image_format(value) is not None
 
     def update_image_format(self, hardware_id: str, image_format: str) -> None:
-        """Persist the capture format chosen for this camera body (CHDK only).
+        """Persist the capture format chosen for this camera body.
 
         Keyed by hardware id for the same reason as the zoom step. The value
         is stored under its current name, so the old name RAW is written as
-        RAW+JPEG. A body with no "image_format" key has never had one chosen,
-        and captures JPEG. A gphoto2 DSLR holds its format on the camera, and
-        nothing is stored for it here. The time of the change is recorded.
+        RAW+JPEG. A body with no "image_format" key has never had one chosen:
+        a CHDK body then captures JPEG, and a gphoto2 DSLR captures in the
+        format the camera holds until one is stored (the backend stores that
+        format at the first session that opens on the body). The time of the
+        change is recorded.
 
         Raises:
             ValueError: image_format is not a capture format.
@@ -640,6 +658,45 @@ class CameraRegistry:
             entry["image_format_updated_at"] = datetime.now(timezone.utc).isoformat()
 
         self._mutate(change)
+
+    def adopt_image_format(
+        self, hardware_id: str, image_format: str, info: Dict, camera_index: int
+    ):
+        """Store image_format for the body only if its entry holds no format.
+
+        The entry is read from the file inside the registry's write lock, so
+        a format stored after an earlier read is never replaced. A body the
+        registry does not know is registered first, in the same write.
+        Returns the value the entry holds afterwards: image_format when it
+        was stored, or the value that was already there, as it is (which may
+        name no format; the caller decides what that means).
+
+        Raises:
+            ValueError: image_format is not a capture format.
+        """
+        from .backends.base import IMAGE_FORMATS, normalise_image_format
+
+        stored = normalise_image_format(image_format)
+        if stored is None:
+            raise ValueError(
+                f"image format must be one of {', '.join(IMAGE_FORMATS)}; "
+                f"got {image_format!r}"
+            )
+        result = {}
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                self._register_in(cameras, hardware_id, info, camera_index)
+            entry = cameras["cameras"][hardware_id]
+            if entry.get("image_format") is not None:
+                result["value"] = entry["image_format"]
+                return
+            entry["image_format"] = stored
+            entry["image_format_updated_at"] = datetime.now(timezone.utc).isoformat()
+            result["value"] = stored
+
+        self._mutate(change)
+        return result["value"]
 
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""

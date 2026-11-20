@@ -28,6 +28,22 @@ ISO, shutter speed, aperture and image format are applied from CameraConfig
 before each capture, through the `iso`, `shutterspeed`, `aperture` and
 `imageformat` PTP widgets (_PTPSession.apply_dslr_config).
 
+The capture format chosen for a body is stored in the camera registry under
+the body's hardware id (the entry's "image_format", as on CHDK). The settings
+route sets it on the camera and stores it, and succeeds only when both hold. A
+session reads the stored format once, at open, and sets it on the camera
+unless the camera already holds it. A capture resolves the format under the
+camera lock, for the body its session holds: the one its configuration names,
+else the stored one; the format is written only when it differs from the one
+the session last set, and a capture whose file is of the other type clears
+that memory, so the next capture writes it again. When nothing is stored for
+a body whose identity is known, a format the camera holds at open is adopted
+(see GPhoto2Backend._adopt_format).
+
+Two connected bodies that answer one serial are not told apart before both
+have been read, so the first of them to open may be given the format stored
+under that serial. Canon bodies have distinct serials.
+
 Version: 0.1.0-beta
 """
 
@@ -135,6 +151,68 @@ def _ptp_image_format(image_format):
     return _IMAGE_FORMAT_MAP.get(
         normalise_image_format(image_format), _IMAGE_FORMAT_DEFAULT
     )
+
+
+def _set_imageformat(session, widget) -> bool:
+    """Set the imageformat widget on `session` and record what it now holds.
+
+    session.imageformat_set is the widget value this session last set
+    successfully, or None when the camera's value is not known to be one
+    Captua set: before the first set, and after a set that failed.
+    """
+    took = session._set_config("imageformat", widget)
+    session.imageformat_set = widget if took else None
+    return took
+
+
+def _forget_imageformat_if_changed(session, held) -> None:
+    """Drop the session's record of the format it set when a read shows another.
+
+    A body whose format was changed on its own menu then has the stored
+    format set again by the next capture.
+    """
+    known = getattr(session, "imageformat_set", None)
+    if known is not None and held != known:
+        session.imageformat_set = None
+
+
+def _hardware_id(model: str, serial: str) -> str:
+    """The registry's hardware id for a gphoto2 body: "{model slug}_{serial}"."""
+    return f"{re.sub(r'[^a-z0-9]', '', model.lower())}_{serial}"
+
+
+def _write_system_log(*, level: str, action: str, subject: str, detail: str) -> None:
+    """Write one row to the system log in a session of its own; never raises.
+
+    Function-local imports: app.core.db reaches the app configuration, and a
+    module-level import from this module would be circular through
+    capture.service.
+    """
+    try:
+        from app.core import audit
+        from app.core.db import SessionLocal
+
+        db = SessionLocal()
+        try:
+            audit.log_event(
+                db, level=level, category="capture", action=action,
+                subject=subject, detail=detail,
+            )
+        finally:
+            db.close()
+    except Exception:
+        pass
+
+
+def _open_camera_registry():
+    """Open the camera registry at its default path.
+
+    Function-local import: capture.camera_registry reaches capture.service,
+    which builds this backend, so a module-level import would be circular.
+    """
+    from capture.camera_registry import CameraRegistry
+
+    return CameraRegistry()
 
 # Minimum settle time used as retry_delay in capture (seconds).
 # Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
@@ -306,6 +384,17 @@ class _PTPSession:
         # EOS 1500D"; None when the body does not answer one. self.model stays
         # the abilities name: lookup_model and session matching depend on it.
         self.body_model = None
+        # The imageformat widget value as read at session open, or None when
+        # the body does not answer one.
+        self.opened_imageformat = None
+        # The imageformat widget value this session last set successfully, or
+        # None (see _set_imageformat).
+        self.imageformat_set = None
+        # The capture format stored for this session's body, as read at open
+        # and kept equal to every store made through this session; None when
+        # nothing is stored, the registry could not be read, or the body's
+        # identity is unknown.
+        self.stored_format = None
         self._open()
 
     def _open(self):
@@ -340,6 +429,7 @@ class _PTPSession:
             serial = self._child_value(cfg, "serialnumber")
             self.serial = str(serial).strip() if serial is not None else ""
             self.body_model = self._read_body_model(cfg)
+            self.opened_imageformat = self._child_value(cfg, "imageformat")
         except Exception as exc:
             self._logger.warning(
                 f"[gphoto2] {self.port}: error during session init ({exc}), releasing device"
@@ -390,20 +480,28 @@ class _PTPSession:
         self._set_config("capturetarget", "Internal RAM")
         self._set_config("reviewtime", "None")
 
-    def apply_dslr_config(self, camera_config) -> None:
+    def apply_dslr_config(self, camera_config, image_format=None) -> None:
         """Apply DSLR-specific CameraConfig fields to the camera via PTP.
 
         Called before each capture so settings reflect the current config.
         Fields that are None are left at their current camera value.
+        image_format is the format applied when the configuration names none
+        (the body's stored format); a format the configuration names wins.
         Flash is always enforced off here as an archival safety guard.
         """
         # -- Flash guard: must be first, before shutter opens ----------
         self._enforce_flash_off()
 
+        # A format is written only when it differs from the one this session
+        # last set; with no format in the configuration the camera's value is
+        # left as it is.
         fmt = getattr(camera_config, "image_format", None)
+        if fmt is None:
+            fmt = image_format
         if fmt is not None:
-            self._set_config("imageformat", _ptp_image_format(fmt))
-        # If fmt is None, leave the camera's current imageformat unchanged
+            widget = _ptp_image_format(fmt)
+            if widget != getattr(self, "imageformat_set", None):
+                _set_imageformat(self, widget)
 
         iso = getattr(camera_config, "iso", None)
         if iso is not None:
@@ -815,6 +913,14 @@ class GPhoto2Backend(CameraBackend):
         self._rescan_lock = threading.Lock()
         # serialises saves of the bindings file, snapshot and write together
         self._save_lock = threading.Lock()
+        # Opens the camera registry, where a body's stored capture format
+        # lives. It is opened at a session open and for a store, never for a
+        # capture or a settings read, which use the session's stored_format.
+        # A test replaces it; a factory that returns None means no registry,
+        # and a format is then kept on the session only.
+        self._registry_factory = _open_camera_registry
+        # Writes a row to the system log (_write_system_log); a test replaces it.
+        self._system_log = _write_system_log
         self._load_pins()
 
     # ------------------------------------------------------------------
@@ -1525,6 +1631,7 @@ class GPhoto2Backend(CameraBackend):
 
         if pinned == serial or (pinned is None and elsewhere is None):
             self._learn_serial(camera_index, port, serial)
+            self._set_stored_format_at_open(camera_index, session)
             return session
 
         # The body is not the one this index is for. Release the claim first,
@@ -1579,6 +1686,8 @@ class GPhoto2Backend(CameraBackend):
             if port in known:
                 continue
             serial = ""
+            # The open session that got its serial here, if one did.
+            identified = None
             with self._get_camera_lock(camera_index):
                 session = self._session_matches_map(camera_index)
                 if session is not None:
@@ -1597,6 +1706,7 @@ class GPhoto2Backend(CameraBackend):
                             serial = ""
                         if serial:
                             session.serial = serial
+                            identified = session
                 else:
                     read_port = port
                     if self._get_port_map().get(camera_index) != (model, port):
@@ -1644,6 +1754,10 @@ class GPhoto2Backend(CameraBackend):
                         self._release_port(camera_index, port)
                 if serial:
                     learned = self._learn_serial(camera_index, read_port, serial) or learned
+                    if identified is not None:
+                        self._set_stored_format_when_identified(
+                            camera_index, identified
+                        )
                 else:
                     self.logger.info(
                         f"[gphoto2] Camera {camera_index}: no serial could be "
@@ -1922,8 +2036,19 @@ class GPhoto2Backend(CameraBackend):
 
         with lock:
             session = self._get_or_open_session(camera_index)
+            # The format this capture is meant to take: the one its
+            # configuration names, else the one stored for the body the open
+            # session holds, resolved here under the camera lock.
+            intended = getattr(camera_config, "image_format", None)
+            stored = None
+            if intended is None and self._body_hardware_id(camera_index, session):
+                stored = getattr(session, "stored_format", None)
+                intended = stored
             try:
-                session.apply_dslr_config(camera_config)
+                if stored is None:
+                    session.apply_dslr_config(camera_config)
+                else:
+                    session.apply_dslr_config(camera_config, image_format=stored)
                 if focus_check:
                     elapsed, actual_path = session.capture(output_path, focus_check=True)
                 else:
@@ -1935,29 +2060,47 @@ class GPhoto2Backend(CameraBackend):
                 # The session works, so any run of failed preview polls on it
                 # is over.
                 self._end_preview_failure_run(camera_index, session)
-                return str(actual_path), None
+                mismatch = self._check_produced_format(
+                    camera_index, session, intended, actual_path
+                )
             except (gp.GPhoto2Error, CaptureTimeoutError) as exc:
-                if isinstance(exc, CaptureTimeoutError):
-                    self.logger.error(
-                        f"[gphoto2] Camera {camera_index}: capture timed out "
-                        f"({exc}); closing session"
-                    )
-                    # Closing an EOS session runs several PTP operations, each
-                    # bounded by libgphoto2's own USB timeouts; on a wedged body
-                    # they are slow, so the elapsed time is logged.
-                    t_close = time.perf_counter()
-                    self._close_session(camera_index)
-                    self.logger.error(
-                        f"[gphoto2] Camera {camera_index}: session closed after "
-                        f"timeout in {time.perf_counter() - t_close:.1f}s"
-                    )
-                else:
-                    self.logger.error(
-                        f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
-                    )
-                    # Close the failed session so the next call re-opens it cleanly.
-                    self._close_session(camera_index)
-                raise RuntimeError(f"DSLR capture failed: {exc}") from exc
+                self._raise_capture_failure(camera_index, exc)
+        if mismatch is not None:
+            try:
+                self._system_log(**mismatch)
+            except Exception as exc:
+                self.logger.warning(
+                    f"[gphoto2] Camera {camera_index}: the system log row for a "
+                    f"capture format mismatch was not written ({exc!r})"
+                )
+        return str(actual_path), None
+
+    def _raise_capture_failure(self, camera_index: int, exc: Exception):
+        """Close the session after a failed capture and raise RuntimeError.
+
+        Called with the camera lock held.
+        """
+        if isinstance(exc, CaptureTimeoutError):
+            self.logger.error(
+                f"[gphoto2] Camera {camera_index}: capture timed out "
+                f"({exc}); closing session"
+            )
+            # Closing an EOS session runs several PTP operations, each
+            # bounded by libgphoto2's own USB timeouts; on a wedged body
+            # they are slow, so the elapsed time is logged.
+            t_close = time.perf_counter()
+            self._close_session(camera_index)
+            self.logger.error(
+                f"[gphoto2] Camera {camera_index}: session closed after "
+                f"timeout in {time.perf_counter() - t_close:.1f}s"
+            )
+        else:
+            self.logger.error(
+                f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
+            )
+            # Close the failed session so the next call re-opens it cleanly.
+            self._close_session(camera_index)
+        raise RuntimeError(f"DSLR capture failed: {exc}") from exc
 
     def list_devices(self) -> list:
         """Enumerate all connected DSLR cameras and return device metadata.
@@ -2031,8 +2174,6 @@ class GPhoto2Backend(CameraBackend):
 
     def _enumerate_port_map(self, port_map) -> tuple[list, bool]:
         """One enumeration pass over `port_map`; returns (rows, learned_anything)."""
-        import re
-
         result = []
         learned = False
         for idx, (model_raw, port) in sorted(port_map.items()):
@@ -2057,12 +2198,14 @@ class GPhoto2Backend(CameraBackend):
                     # a busy body (a live preview, say) from losing its
                     # identity to a read it is too busy to answer.
                     serial = getattr(session, "serial", "") or ""
+                    newly_identified = False
                     if not serial:
                         try:
                             cfg = session._cam.get_config()
                             serial = cfg.get_child_by_name("serialnumber").get_value().strip()
                         except Exception:
                             serial = ""
+                        newly_identified = bool(serial)
                     if serial:
                         # Learn it here too. A body whose read failed at
                         # session open has no pin, and reporting a serial
@@ -2076,6 +2219,8 @@ class GPhoto2Backend(CameraBackend):
                         learned = self._learn_serial(
                             idx, session.port, serial
                         ) or learned
+                        if newly_identified:
+                            self._set_stored_format_when_identified(idx, session)
                 else:
                     current_entry = self._get_port_map().get(idx)
                     if current_entry != (model_raw, port):
@@ -2154,10 +2299,9 @@ class GPhoto2Backend(CameraBackend):
                 if pinned_here:
                     role_guess = _ROLE_GUESS_BY_PIN_INDEX.get(idx)
 
-            model_slug = re.sub(r"[^a-z0-9]", "", row_model.lower())
             hw_id = (
-                f"{model_slug}_{serial}" if serial
-                else f"{model_slug}_idx{idx}"
+                _hardware_id(row_model, serial) if serial
+                else _hardware_id(row_model, f"idx{idx}")
             )
             result.append({
                 "index": idx,
@@ -2509,23 +2653,22 @@ class GPhoto2Backend(CameraBackend):
 
         Returns a dict with keys:
             iso (str | None), shutter_speed (str | None), aperture (str | None),
-            image_format (str | None), focus_mode (str | None), flash_mode (str | None)
+            image_format (str | None), focus_mode (str | None),
+            flash_mode (str | None), stored_image_format (str | None)
+
+        image_format is what the camera holds; stored_image_format is the
+        format stored for the body (see capture_image_format), None when
+        nothing is stored or the body's identity is unknown or ambiguous.
+        The stored format is the one the session read at open, so no
+        registry file is read here.
         """
         lock = self._get_camera_lock(camera_index)
         with lock:
             session = self._get_or_open_session(camera_index)
             try:
                 raw = session.get_info()
-                return {
-                    "iso": raw.get("iso"),
-                    "shutter_speed": raw.get("shutterspeed"),
-                    "aperture": raw.get("aperture"),
-                    "image_format": _IMAGE_FORMAT_REVERSE_MAP.get(
-                        raw.get("imageformat", ""), raw.get("imageformat")
-                    ),
-                    "focus_mode": raw.get("focusmode"),
-                    "flash_mode": raw.get("flashmode"),
-                }
+                _forget_imageformat_if_changed(session, raw.get("imageformat"))
+                return self._settings_dict(camera_index, session, raw)
             except gp.GPhoto2Error as exc:
                 self.logger.error(
                     f"[gphoto2] Camera {camera_index}: get_dslr_settings failed: {exc}"
@@ -2542,12 +2685,48 @@ class GPhoto2Backend(CameraBackend):
             image_format (str): "JPEG" or "RAW+JPEG" ("RAW", the old name,
                 is taken as "RAW+JPEG")
 
+        An image_format is kept only when the camera holds it and it is
+        stored for the body. The camera's imageformat is read before the
+        write; after the write it is read back, and the format is stored
+        only when the read-back is the value written. In every other outcome
+        (the write refused, the read-back unreadable or different, the store
+        or the body's registration failing) the camera is set back to the
+        value read before the request, the session's record of the format it
+        set is cleared, and RuntimeError is raised, naming the state the
+        camera is in as read after the set-back. The format is handled
+        before ISO, shutter speed and aperture, so a format that is not kept
+        leaves those three unwritten. A body whose identity is unknown or ambiguous has the
+        format set on the camera only: nothing is stored, a warning is
+        logged, and the settings are returned with stored_image_format None;
+        when its camera does not take the value (the write refused, the
+        read-back unreadable or different) it is set back as above. ISO,
+        shutter speed and aperture are set as they always were.
+
         Returns the full settings dict (same shape as get_dslr_settings) after
         applying the requested changes.
         """
+        asked = settings.get("image_format")
+        wanted = normalise_image_format(asked) if asked is not None else None
+        if asked is not None and wanted is None:
+            raise RuntimeError(
+                f"A DSLR captures {' or '.join(IMAGE_FORMATS)}, not {asked!r}"
+            )
         lock = self._get_camera_lock(camera_index)
         with lock:
             session = self._get_or_open_session(camera_index)
+            hardware_id = None
+            if wanted is not None:
+                hardware_id = self._body_hardware_id(camera_index, session)
+            # The format goes first: when it is not kept, RuntimeError is
+            # raised here and nothing else is written. _get_config and
+            # _set_config answer a PTP error with None and False.
+            if wanted is not None:
+                before = session._get_config("imageformat")
+                took = _set_imageformat(session, _ptp_image_format(wanted))
+                self._keep_chosen_format(
+                    camera_index, session, hardware_id, wanted, before, took,
+                    session._get_config("imageformat"),
+                )
             try:
                 if settings.get("iso") is not None:
                     session._set_config("iso", str(settings["iso"]))
@@ -2555,26 +2734,381 @@ class GPhoto2Backend(CameraBackend):
                     session._set_config("shutterspeed", settings["shutter_speed"])
                 if settings.get("aperture") is not None:
                     session._set_config("aperture", settings["aperture"])
-                if settings.get("image_format") is not None:
-                    session._set_config(
-                        "imageformat", _ptp_image_format(settings["image_format"])
-                    )
                 raw = session.get_info()
-                return {
-                    "iso": raw.get("iso"),
-                    "shutter_speed": raw.get("shutterspeed"),
-                    "aperture": raw.get("aperture"),
-                    "image_format": _IMAGE_FORMAT_REVERSE_MAP.get(
-                        raw.get("imageformat", ""), raw.get("imageformat")
-                    ),
-                    "focus_mode": raw.get("focusmode"),
-                    "flash_mode": raw.get("flashmode"),
-                }
+                _forget_imageformat_if_changed(session, raw.get("imageformat"))
             except gp.GPhoto2Error as exc:
                 self.logger.error(
                     f"[gphoto2] Camera {camera_index}: apply_dslr_settings failed: {exc}"
                 )
                 raise RuntimeError(f"Failed to apply DSLR settings: {exc}") from exc
+            return self._settings_dict(camera_index, session, raw)
+
+    def _keep_chosen_format(
+        self, camera_index, session, hardware_id, wanted, before, took, held
+    ) -> None:
+        """Store a format the settings route has set, or set the camera back.
+
+        Called with the camera lock held. Returns only when the camera holds
+        the format (`held`, the value read back, is the value written) and it
+        is stored, or, for a body with no identity (hardware_id None), when
+        the camera holds it; otherwise the camera is set back to `before` and
+        RuntimeError is raised.
+        """
+        widget = _ptp_image_format(wanted)
+        if not took:
+            problem = "the camera refused it"
+        elif held is None:
+            problem = "the camera's format could not be read back"
+        elif held != widget:
+            problem = f"the camera reports imageformat={held!r}"
+        elif hardware_id is None:
+            self.logger.warning(
+                f"[gphoto2] Camera {camera_index}: capture format {wanted} is "
+                "held by the camera only; the body has no identity of its own, "
+                "so nothing is stored for it"
+            )
+            return
+        else:
+            try:
+                self._write_stored_format(hardware_id, wanted, camera_index, session)
+                self.logger.info(
+                    f"[gphoto2] Camera {camera_index}: capture format {wanted} "
+                    f"stored for {hardware_id}"
+                )
+                return
+            except Exception as exc:
+                problem = f"it was not stored ({exc})"
+        if before is None:
+            state = (
+                "the camera could not be set back, because its format before "
+                f"the request could not be read; it reports imageformat={held!r}"
+            )
+        else:
+            # The write's success says only that it was sent; the camera is
+            # read again to say what it holds.
+            session._set_config("imageformat", before)
+            now = session._get_config("imageformat")
+            if now == before:
+                state = f"the camera was set back to imageformat={before!r}"
+            elif now is None:
+                state = (
+                    f"the camera could not be set back to imageformat={before!r}; "
+                    "its format could not be read"
+                )
+            else:
+                state = (
+                    f"the camera could not be set back to imageformat={before!r}; "
+                    f"it holds imageformat={now!r}"
+                )
+        session.imageformat_set = None
+        message = f"Capture format {wanted} was not kept: {problem}; {state}"
+        self.logger.error(f"[gphoto2] Camera {camera_index}: {message}")
+        raise RuntimeError(message)
+
+    def _settings_dict(self, camera_index: int, session, raw: dict) -> dict:
+        return {
+            "iso": raw.get("iso"),
+            "shutter_speed": raw.get("shutterspeed"),
+            "aperture": raw.get("aperture"),
+            "image_format": _IMAGE_FORMAT_REVERSE_MAP.get(
+                raw.get("imageformat", ""), raw.get("imageformat")
+            ),
+            "focus_mode": raw.get("focusmode"),
+            "flash_mode": raw.get("flashmode"),
+            "stored_image_format": self._session_stored_format(camera_index, session),
+        }
+
+    # ------------------------------------------------------------------
+    # Stored capture format
+    # ------------------------------------------------------------------
+
+    # The record capture routes put no stored format into a gphoto2
+    # capture's configuration: capture_image resolves it under the camera
+    # lock (CameraBackend.resolves_capture_format).
+    resolves_capture_format = True
+
+    def capture_image_format(self, camera_index: int) -> "str | None":
+        """The capture format stored for the body the open session holds, or None.
+
+        None when no session is open at the index, when nothing is stored or
+        the registry could not be read at the session's open, and for a body
+        whose identity is unknown or ambiguous. No registry file is read.
+        """
+        return self._session_stored_format(
+            camera_index, self._sessions.get(camera_index)
+        )
+
+    def _session_stored_format(self, camera_index: int, session) -> "str | None":
+        if session is None or self._body_hardware_id(camera_index, session) is None:
+            return None
+        return getattr(session, "stored_format", None)
+
+    def _body_hardware_id(self, camera_index: int, session) -> "str | None":
+        """The hardware id of the body `session` holds at this index, or None.
+
+        The serial is the one the session read at open. None for a body that
+        answered no serial; for one whose serial is not the one pinned at
+        this index, when a pin exists; and for an ambiguous one: its serial
+        is pinned at another index, or cached for another port the published
+        map holds.
+        """
+        if session is None:
+            return None
+        serial = getattr(session, "serial", "") or ""
+        model = getattr(session, "model", None)
+        port = getattr(session, "port", None)
+        if not serial or not isinstance(model, str):
+            return None
+        with self._map_lock:
+            pinned = self._pins.get(camera_index)
+            if pinned is not None and pinned != serial:
+                return None
+            if any(i != camera_index and s == serial for i, s in self._pins.items()):
+                return None
+            published = {p for _m, p in self._port_map.values()}
+            if any(
+                p != port and s == serial and p in published
+                for p, s in self._serial_by_port.items()
+            ):
+                return None
+        return _hardware_id(model, serial)
+
+    def _read_stored_format(self, hardware_id: str) -> "tuple[bool, str | None, object]":
+        """(readable, format, registry) for the body, read from the file now.
+
+        readable is False when the registry cannot be opened, when it refuses
+        writes (it then reads as empty, which says nothing about what is
+        stored), and when it holds a value normalise_image_format does not
+        recognise; nothing is then set at session open and nothing is
+        adopted. A stored RAW, the old name, is read as RAW+JPEG. With no
+        registry (the factory returns None) nothing is stored.
+        """
+        try:
+            registry = self._registry_factory()
+            if registry is None:
+                return True, None, None
+            refusal = getattr(registry, "write_refusal", None)
+            if refusal:
+                self.logger.warning(
+                    f"[gphoto2] {hardware_id}: the camera registry cannot be used "
+                    f"({refusal}); the camera's own format is left as it is"
+                )
+                return False, None, registry
+            entry = registry.get_camera_by_id(hardware_id)
+        except Exception as exc:
+            self.logger.warning(
+                f"[gphoto2] {hardware_id}: could not read the stored capture "
+                f"format ({exc!r}); the camera's own format is left as it is"
+            )
+            return False, None, None
+        stored = entry.get("image_format") if entry else None
+        if stored is None:
+            return True, None, registry
+        image_format = normalise_image_format(stored)
+        if image_format is None:
+            self.logger.warning(
+                f"[gphoto2] {hardware_id}: the stored capture format {stored!r} "
+                f"is not one of {', '.join(IMAGE_FORMATS)}; it is ignored and "
+                "the camera's own format is left as it is"
+            )
+            return False, None, registry
+        return True, image_format, registry
+
+    def _body_info(self, camera_index: int, session) -> dict:
+        port = getattr(session, "port", None)
+        return {
+            "model": getattr(session, "model", None),
+            "serial": getattr(session, "serial", None) or None,
+            "location": f"USB {port}",
+            "id": port,
+            "index": camera_index,
+        }
+
+    def _write_stored_format(
+        self, hardware_id: str, image_format: str, camera_index: int, session
+    ) -> None:
+        """Store the format for the body, registering the body first when needed.
+
+        A registry write that fails propagates, and the session's
+        stored_format is then left as it was. With no registry the format is
+        kept on the session only.
+        """
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[gphoto2] {hardware_id}: capture format {image_format} kept "
+                "on the session only; the camera registry is not available"
+            )
+        else:
+            if registry.get_camera_by_id(hardware_id) is None:
+                registry.register_resolved(
+                    hardware_id, self._body_info(camera_index, session), camera_index
+                )
+            registry.update_image_format(hardware_id, image_format)
+        session.stored_format = image_format
+
+    def _check_produced_format(self, camera_index: int, session, intended, produced):
+        """Compare the file a capture produced with the format it was meant to take.
+
+        Called with the camera lock held, after the download. When nothing
+        was intended nothing is checked. When the file's type (`.cr2` or
+        not) disagrees with the intended format, the session's record of the
+        format it set is cleared, so the next capture writes the format
+        again, and a warning is logged; the system log row to write is
+        returned, for the caller to write once the lock is released.
+        Otherwise None. The capture's file is kept either way.
+        """
+        if intended is None:
+            return None
+        meant_raw = _ptp_image_format(intended) == _IMAGE_FORMAT_MAP["RAW+JPEG"]
+        made_raw = Path(produced).suffix.lower() == ".cr2"
+        if meant_raw == made_raw:
+            return None
+        meant = normalise_image_format(intended) or "JPEG"
+        made = "RAW+JPEG" if made_raw else "JPEG"
+        session.imageformat_set = None
+        detail = (
+            f"camera {camera_index} was meant to capture {meant} and produced "
+            f"{made} ({Path(produced).name}); the next capture sets the format "
+            "again"
+        )
+        self.logger.warning(f"[gphoto2] Camera {camera_index}: {detail}")
+        return {
+            "level": "WARN",
+            "action": "capture_format_mismatch",
+            "subject": f"camera {camera_index}",
+            "detail": detail,
+        }
+
+    def _set_stored_format_when_identified(self, camera_index: int, session) -> None:
+        """Load and set the stored format for a session whose serial was read after open.
+
+        Called with the camera lock held, by list_devices and
+        _identify_unknown_ports, once they have given an open session the
+        serial its open could not read. The camera's imageformat is read
+        again first, since the value read at open may no longer hold; the
+        step is then the one a session open runs, with the same
+        no-write-when-equal and adoption rules.
+        """
+        try:
+            session.opened_imageformat = session._get_config("imageformat")
+        except Exception:
+            session.opened_imageformat = None
+        self._set_stored_format_at_open(camera_index, session)
+
+    def _set_stored_format_at_open(self, camera_index: int, session) -> None:
+        """Read the body's stored format and set it on a session that has just opened.
+
+        Called from _open_identified_session, with the camera lock held, once
+        the body has been confirmed as the one this index is for. This is the
+        one registry read a session makes; the format read is kept as
+        session.stored_format. When the camera already holds the stored
+        format nothing is written and the session records it as set. When
+        nothing is stored for a body whose identity is known, the format may
+        be adopted from the camera (see _adopt_format). A body whose identity
+        is unknown or ambiguous, or whose registry entry cannot be read, has
+        nothing set. No failure here fails the open.
+        """
+        try:
+            hardware_id = self._body_hardware_id(camera_index, session)
+            if hardware_id is None:
+                return
+            readable, stored, _registry = self._read_stored_format(hardware_id)
+            if not readable:
+                return
+            if stored is None:
+                stored = self._adopt_format(camera_index, session, hardware_id)
+                if stored is None:
+                    return
+            session.stored_format = stored
+            widget = _ptp_image_format(stored)
+            if getattr(session, "opened_imageformat", None) == widget:
+                session.imageformat_set = widget
+                return
+            if _set_imageformat(session, widget):
+                self.logger.info(
+                    f"[gphoto2] Camera {camera_index}: capture format {stored} "
+                    "set at session open"
+                )
+            else:
+                self.logger.warning(
+                    f"[gphoto2] Camera {camera_index}: the stored capture format "
+                    f"{stored} could not be set at session open; the next "
+                    "record capture sets it"
+                )
+        except Exception as exc:
+            self.logger.warning(
+                f"[gphoto2] Camera {camera_index}: the stored capture format was "
+                f"not applied at session open ({exc!r})"
+            )
+
+    def _adopt_format(self, camera_index: int, session, hardware_id: str):
+        """Store the format the camera held at session open; return the stored one.
+
+        After a unit's first session with a body whose camera holds "L" or
+        "RAW", the unit owns that body's format: it is stored, and a format
+        later changed on the camera's own menu is set back at the next
+        session open or after the next capture that produces the other file
+        type. Only a widget value Captua itself sets for a format is adopted:
+        the values of _IMAGE_FORMAT_MAP, "L" for JPEG and "RAW" for
+        RAW+JPEG. Any other value ("RAW + L", another JPEG size, anything
+        unknown) is logged and not adopted: nothing is stored and nothing is
+        set, and the camera's own format governs until a format is chosen.
+
+        The entry is read again inside the registry's write lock
+        (CameraRegistry.adopt_image_format): when it already holds a format,
+        that format is returned and nothing is written. Returns None when
+        nothing is stored.
+        """
+        held = getattr(session, "opened_imageformat", None)
+        if held is None:
+            self.logger.info(
+                f"[gphoto2] Camera {camera_index}: no capture format is stored "
+                "and the camera's could not be read; nothing is stored"
+            )
+            return None
+        adopted = next(
+            (name for name, widget in _IMAGE_FORMAT_MAP.items() if widget == held),
+            None,
+        )
+        if adopted is None:
+            self.logger.warning(
+                f"[gphoto2] Camera {camera_index}: the camera holds "
+                f"imageformat={held!r}, which is not the value Captua sets for "
+                f"{' or '.join(IMAGE_FORMATS)}; nothing is stored, and the "
+                "camera's own format is used until a format is chosen"
+            )
+            return None
+        try:
+            registry = self._registry_factory()
+            if registry is None:
+                return None
+            value = registry.adopt_image_format(
+                hardware_id, adopted, self._body_info(camera_index, session),
+                camera_index,
+            )
+        except Exception as exc:
+            self.logger.warning(
+                f"[gphoto2] Camera {camera_index}: the camera's capture format "
+                f"{adopted} could not be stored ({exc!r}); it is adopted at the "
+                "next session open"
+            )
+            return None
+        stored = normalise_image_format(value)
+        if value != adopted:
+            if stored is None:
+                self.logger.warning(
+                    f"[gphoto2] {hardware_id}: the stored capture format "
+                    f"{value!r} is not one of {', '.join(IMAGE_FORMATS)}; it is "
+                    "ignored and the camera's own format is left as it is"
+                )
+            return stored
+        self.logger.info(
+            f"[gphoto2] Camera {camera_index}: adopted the camera's capture "
+            f"format {adopted} (imageformat={held!r}) as the stored format "
+            f"for {hardware_id}"
+        )
+        return adopted
 
     def supports_streaming(self) -> bool:
         return False

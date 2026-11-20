@@ -278,11 +278,18 @@ class CameraBackend(ABC):
             "image_formats": [],
         }
 
+    # True for a backend that resolves a capture's stored format itself,
+    # under its own camera lock, for the body its session holds (gphoto2).
+    # The record capture routes then put no stored format into the
+    # capture's configuration (app.api.cameras._put_stored_image_format).
+    resolves_capture_format = False
+
     def capture_image_format(self, camera_index: int) -> Optional[str]:
         """The capture format stored for this camera, for the capture's CameraConfig.
 
         None, the default, leaves CameraConfig.image_format unset. A backend
-        whose format is a choice per capture rather than a setting on the
-        camera (CHDK) returns the format stored for the body at the index.
+        that stores a format per body (CHDK, and the gphoto2 DSLR, which then
+        sets it on the camera) returns the format stored for the body at the
+        index.
         """
         return None
