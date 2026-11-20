@@ -395,6 +395,46 @@ class Collection(Base):
         """
         return self.filename_stem is not None and self.has_captured()
 
+    def captures_adopted_away(self) -> bool:
+        """Whether the volume's captures were adopted into another volume, so it may be deleted.
+
+        A volume whose captures were adopted away (NEH-387, app.core.adopt_apply)
+        may be deleted although it reserves its stem: it has a stem, no
+        record, no image and no sub-volume, no adoption journal names it
+        (app.core.adopt_journal), and every offsite key under its stem
+        (`<any tenant>/<stem>/...`) is a retired row, of which there is at
+        least one: no row attached to an image, and no detached row that is
+        not retired. Deleting it does not free its stem: the retired keys
+        still hold it (offsite_keys_under_stem, _refuse_a_stem_held_offsite),
+        so no volume can take it while one remains. DELETE /collections/{id}
+        and the before-flush delete guard both apply this rule and no other
+        exception to reserves_its_stem. Reads with autoflush off, so it can
+        run inside a flush.
+        """
+        from app.models.offsite_object import OffsiteObject
+
+        session = object_session(self)
+        if session is None or self.id is None or not self.filename_stem:
+            return False
+        from app.core.adopt_journal import journal_names_volume
+
+        if journal_names_volume(self.id):
+            return False
+        with session.no_autoflush:
+            if session.execute(select(Record.id).where(Record.collection_id == self.id).limit(1)).first():
+                return False
+            if session.execute(select(Collection.id).where(Collection.parent_collection_id == self.id)
+                               .limit(1)).first():
+                return False
+            retired = []
+            query = select(OffsiteObject.object_key, OffsiteObject.retired_at).where(
+                OffsiteObject.object_key.like(f"%/{self.filename_stem}/%"))
+            for key, retired_at in session.execute(query):
+                parts = key.split("/", 2)
+                if len(parts) == 3 and parts[1] == self.filename_stem and parts[2]:
+                    retired.append(retired_at is not None)
+        return bool(retired) and all(retired)
+
     @property
     def stem_reserved(self) -> bool:
         """reserves_its_stem() as an attribute, for CollectionRead."""
@@ -551,7 +591,7 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
     doomed = [obj for obj in list(session.deleted) if isinstance(obj, Collection)]
     doomed.extend(_orphaned_volumes(session))
     for obj in doomed:
-        if obj.reserves_its_stem():
+        if obj.reserves_its_stem() and not obj.captures_adopted_away():
             raise StemReservedError(
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
