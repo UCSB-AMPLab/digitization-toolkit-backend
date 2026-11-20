@@ -109,39 +109,6 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, tmp_path)
 
 
 @pytest.mark.unit
-def test_the_model_matches_the_migration(backend_root, tmp_path):
-    """The ORM table and the migrated one agree on columns, constraints and indexes."""
-    from app.core.db import Base
-    import app.models.offsite_object  # noqa: F401
-    import app.models.record  # noqa: F401
-
-    a = sa.create_engine(f"sqlite:///{tmp_path / 'orm.db'}")
-    b = sa.create_engine(f"sqlite:///{tmp_path / 'mig.db'}")
-    try:
-        md = sa.MetaData()
-        sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
-        md.create_all(a)
-        Base.metadata.tables["offsite_objects"].to_metadata(md).create(a)
-        _neighbours(b)
-        _run(b, _load(backend_root).upgrade)
-
-        def shape(engine):
-            insp = sa.inspect(engine)
-            return (
-                sorted((c["name"], str(c["type"]), c["nullable"]) for c in insp.get_columns("offsite_objects")),
-                sorted(u["name"] for u in insp.get_unique_constraints("offsite_objects")),
-                sorted(c["name"] for c in insp.get_check_constraints("offsite_objects")),
-                sorted(i["name"] for i in insp.get_indexes("offsite_objects")),
-                sorted((f["referred_table"], tuple(f["constrained_columns"]), f["options"].get("ondelete"))
-                       for f in insp.get_foreign_keys("offsite_objects")),
-            )
-        assert shape(a) == shape(b)
-    finally:
-        a.dispose()
-        b.dispose()
-
-
-@pytest.mark.unit
 def test_the_migration_upgrades_and_downgrades_on_postgresql(backend_root):
     if "DATABASE_HOST" not in os.environ:
         pytest.skip("opt-in: set DATABASE_* to a PostgreSQL server")

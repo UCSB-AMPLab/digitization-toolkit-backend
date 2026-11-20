@@ -129,7 +129,7 @@ from __future__ import annotations
 
 from typing import Optional
 
-from sqlalchemy import func
+from sqlalchemy import func, or_
 from sqlalchemy.orm import Session
 
 # Problem codes.
@@ -308,7 +308,10 @@ def _has_left_unit(db: Session, collection) -> bool:
 
     A file counts from its first offsite row that is not refused: pending
     (its key claimed, the copy under way or left by a crash), uploaded or
-    verified. A row whose image was deleted (record_image_id NULL) is
+    verified. An image has left the unit if any offsite row is attached to
+    it or was retired from it (retired_image_id, app.core.offsite_retired):
+    an adopted image is offsite under its retired keys until its upload
+    under the new ones verifies. A row whose image was deleted (record_image_id NULL) is
     counted when its key is under the volume's `<tenant>/<stem>/`, the only
     way it can be told to be this volume's; with no stem or no valid tenant
     such a row cannot be attributed, and is not counted.
@@ -320,7 +323,8 @@ def _has_left_unit(db: Session, collection) -> bool:
 
     collection_id = collection.id
     copied = (db.query(OffsiteObject.id)
-              .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+              .join(RecordImage, or_(OffsiteObject.record_image_id == RecordImage.id,
+                                     OffsiteObject.retired_image_id == RecordImage.id))
               .join(Record, RecordImage.record_id == Record.id)
               .filter(Record.collection_id == collection_id, OffsiteObject.refused_at.is_(None))
               .first())

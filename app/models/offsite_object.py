@@ -28,10 +28,18 @@ States, all derived from the columns:
 An adopted object (app.core.image_upload.adopt_objects) has `verified_at`
 and no `uploaded_at`: this unit's uploader never sent it.
 
+A retired row (app.core.offsite_retired) is the key of an image whose file
+was renamed by an adoption and is uploaded again under a new key. It has
+`retired_at` and `retired_image_id` (the image, NULL once that image is
+deleted), no `record_image_id`, and `verified_at`
+(check_offsite_object_retired), so the image takes a new row of the same
+kind and the old object stays recorded until a person deletes it from the
+bucket.
+
 `object_key` is relative to OFFSITE_REMOTE. It is written when the row is
 created and never changed (OffsiteObject's before_update guard).
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 from datetime import datetime, timezone
@@ -59,9 +67,13 @@ class OffsiteObject(Base):
     verified_at = Column(DateTime, nullable=True)
     refused_at = Column(DateTime, nullable=True)
     refusal = Column(String(20), nullable=True)
+    retired_at = Column(DateTime, nullable=True)
+    retired_image_id = Column(Integer, ForeignKey("record_images.id", ondelete="SET NULL",
+                                                  name="offsite_objects_retired_image_id_fkey"),
+                              nullable=True, index=True)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
 
-    image = relationship("RecordImage")
+    image = relationship("RecordImage", foreign_keys=[record_image_id])
 
     __table_args__ = (
         UniqueConstraint("object_key", name="offsite_objects_object_key_key"),
@@ -72,6 +84,8 @@ class OffsiteObject(Base):
             "(refused_at IS NULL AND refusal IS NULL) OR "
             "(refused_at IS NOT NULL AND refusal IS NOT NULL AND refusal IN ('remote_differs', 'fixity'))",
             name="check_offsite_object_refusal"),
+        CheckConstraint("retired_at IS NULL OR (record_image_id IS NULL AND verified_at IS NOT NULL)",
+                        name="check_offsite_object_retired"),
     )
 
 
