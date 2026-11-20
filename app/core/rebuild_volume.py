@@ -981,6 +981,12 @@ def rebuild_volume(db: Session, stem: str, bundle_dir: str, *, apply: bool = Fal
     if collection is None:
         db.rollback()
         raise RebuildRefused(f"no volume has the file name stem {stem!r}")
+    from app.core.adopt_journal import journal_names_volume
+
+    if journal_names_volume(collection.id):
+        db.rollback()
+        raise RebuildRefused(f"an unfinished adoption names the volume {stem!r}; restart the backend to finish "
+                             "or undo it first")
     db.commit()
     counter_after, planned = load_bundle(bundle_dir, stem)
     offset = _index_offset(planned)
