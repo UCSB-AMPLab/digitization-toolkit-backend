@@ -18,10 +18,15 @@ reads with autoflush off so nothing pending in the session is flushed,
 creates or touches no file, and calls no bucket.
 
 Refusals are codes from REFUSAL_CODES, every one that applies, in that
-order; `details` holds what each refers to. A source or target that does not
-exist, or the same volume twice, ends the checks there. Without both stems,
-or without a projects root that can be written, no image is checked and no
-rename is built.
+order; `details` holds what each refers to. While an adoption's journal
+exists (app.core.adopt_journal), every adoption is refused
+(`adoption_unfinished`), whatever its volumes. Two images naming one
+thumbnail file are refused (`source_thumbnail_shared`): the file can be
+moved for only one of them. A source or target that does not exist, or the
+same volume twice, ends the checks there. A source or target
+with a fisqua_outbox or fisqua_status row has been sent to Fisqua, and is
+refused. Without both stems, or without a projects root that can be
+written, no image is checked and no rename is built.
 
 The record-state refusal is POST /collections/{id}/move-records' own
 (app.api.collections.move_collection_records, through
@@ -65,7 +70,25 @@ capture.manifestHandler.is_capture_record, as the rebuild and the layout
 migration read a volume's own manifest. Each image is matched to the
 capture lines of its capture id, and refused when none names its master's
 path relative to the volume's root. Capture lines whose capture id no image
-has are reported, not refused.
+has are reported, not refused. Every path a capture line of an image's
+capture id names must be a file some source image owns (its master, its
+preview or its buffer, compared case-insensitively), since the target's
+copy of the line is rewritten through the renames
+(app.core.adopt_manifest). A capture whose line is already refused as
+missing is not checked again, here or for its preview's digest.
+
+A capture line of the image's capture id that names its master must give
+the master's sha256: the target's copy of the line is where the export and
+the fixity check find it, and the source's relocation record carries it
+(app.core.adopt_manifest). A RAW master's preview must have a digest in
+the source's own manifest at the path preview_sidecar_of names, where the
+Fisqua export looks it up
+(app.core.capture_manifest): an index of that manifest alone
+(build_fixity_index over the source's root) is asked, since only that
+manifest's lines are copied into the target. A preview whose listed name is
+not that name refuses the adoption as `source_name_not_contract`, since the
+export takes a preview key only as `<capture name stem>_preview.jpg` and
+the plan keeps the listed name.
 
 Version: 0.3.3
 """
@@ -81,6 +104,7 @@ from sqlalchemy.orm import Session
 
 # Every refusal, in the order plan_adopt_captures lists them.
 REFUSAL_CODES = (
+    "adoption_unfinished",              # an adoption's journal is in the data directory (app.core.adopt_journal)
     "source_not_found",                 # no volume has the source id
     "target_not_found",                 # no volume has the target id
     "same_volume",                      # the source is the target
@@ -89,22 +113,31 @@ REFUSAL_CODES = (
     "target_not_assigned",              # the target has no Fisqua reference code (external_id)
     "target_withdrawn",                 # the queue withdrew the target (queue_hidden_at)
     "source_sent_to_fisqua",            # a fisqua_outbox row in any state, or a fisqua_status row
+    "target_sent_to_fisqua",            # the same, for the target
     "source_kept_on_unit",
     "target_kept_on_unit",
     "source_has_sub_volumes",           # a collection has the source as its parent
+    "source_has_no_images",             # the source holds no image at all
     "target_has_records",
     "target_has_images",
     "target_counter_raised",            # capture_counter above 0
     "target_has_offsite_keys",          # an offsite_objects key `<any tenant>/<target stem>/...`
     "offsite_tenant_not_configured",    # no valid CAPTUA_OFFSITE_TENANT, so no new key can be built
     "storage_unavailable",              # the projects root cannot be written, so no new path can be built
+    "source_outside_storage",           # a source directory or old path resolves outside the storage
+    "target_outside_storage",           # a target directory or new path resolves outside the storage
     "source_records_handed_over",       # a record move-records would refuse (not `captured`)
     "source_files_freed",               # master_freed_at or preview_freed_at set
     "source_file_outside_own_folder",   # a master not in the source's own `captures/`
     "source_file_missing",              # a master, or a RAW master's preview, not on disk
     "source_not_verified_offsite",      # a capture, or a RAW master's preview, without a verified row
     "source_capture_line_missing",      # no capture line of the image's capture id names its master
-    "source_name_not_contract",         # a file name that is not `<source stem>-img_<nnnn>_c<n>.<ext>`
+    "source_manifest_path_unmapped",    # a capture line of an image's capture id names a file no image owns
+    "source_digest_missing",            # no capture line naming a master gives its sha256
+    "source_preview_digest_missing",    # a RAW master's preview without a digest in the source's manifest
+    "source_name_not_contract",         # a master not `<source stem>-img_<nnnn>_c<n>.<ext>`, or a preview not
+                                        # `<master stem>_preview.jpg`
+    "source_thumbnail_shared",          # two source images name one thumbnail file
     "source_has_unowned_files",         # a file in `captures/` or `previews/` no source image owns
     "new_name_collides",                # a new name or key already taken
 )
@@ -238,7 +271,11 @@ def _plan(db: Session, source_id: int, target_id: int) -> AdoptPlan:
     from app.core.storage_ops import resolve_project
     from app.models.collection import Collection
 
+    from app.core.adopt_journal import journal_exists
+
     plan = AdoptPlan(source_id, target_id)
+    if journal_exists():
+        plan.refuse("adoption_unfinished")
     source = db.get(Collection, source_id)
     target = db.get(Collection, target_id)
     if source is None:
@@ -247,7 +284,8 @@ def _plan(db: Session, source_id: int, target_id: int) -> AdoptPlan:
         plan.refuse("target_not_found")
     if source is not None and target is not None and source.id == target.id:
         plan.refuse("same_volume")
-    if plan.refusals:
+    if set(plan.refusals) - {"adoption_unfinished"}:
+        plan._order()
         return plan
 
     plan.source_stem, plan.target_stem = source.filename_stem, target.filename_stem
@@ -275,11 +313,15 @@ def _check_volumes(db: Session, plan: AdoptPlan, source, target) -> None:
         plan.refuse("target_not_assigned")
     if target.queue_hidden_at is not None:
         plan.refuse("target_withdrawn")
-    sent = (db.query(FisquaOutbox.id).filter(FisquaOutbox.collection_id == source.id).first() is not None
-            or db.query(FisquaStatus.collection_id).filter(FisquaStatus.collection_id == source.id).first()
-            is not None)
-    if sent:
+    def sent(volume) -> bool:
+        return (db.query(FisquaOutbox.id).filter(FisquaOutbox.collection_id == volume.id).first() is not None
+                or db.query(FisquaStatus.collection_id).filter(FisquaStatus.collection_id == volume.id).first()
+                is not None)
+
+    if sent(source):
         plan.refuse("source_sent_to_fisqua")
+    if sent(target):
+        plan.refuse("target_sent_to_fisqua")
     if source.kept_on_unit:
         plan.refuse("source_kept_on_unit")
     if target.kept_on_unit:
@@ -362,6 +404,9 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
 
     if not (source.filename_stem and target.filename_stem):
         return
+    if not images:
+        # Recovery decides by the records, but an adoption of no image has nothing to adopt.
+        plan.refuse("source_has_no_images")
     src_stem, tgt_stem = source.filename_stem, target.filename_stem
     try:
         src_captures = collection_image_dir(db, source)
@@ -376,15 +421,23 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
     listings = _Listings()
     src_masters = [Path(img.file_path) for img in images]
     owned = set()   # the resolved paths of every file a source image owns
+    owned_relative = set()   # the same files, and every RAW master's derived preview, relative to the root, casefolded
+    digests = _SourceIndex(src_root)
 
     lines = _capture_lines(src_root / METADATA_DIR / MANIFEST_NAME)
     plan.capture_lines = len(lines)
     named = {}
+    digested = {}   # capture id -> the paths its capture lines give a sha256
     for entry in lines:
         named.setdefault(entry["capture_id"], set()).update(_named_paths(entry))
+        digested.setdefault(entry["capture_id"], set()).update(
+            os.path.normpath(f["relative_path"]) for f in entry.get("files") or []
+            if isinstance(f, dict) and isinstance(f.get("relative_path"), str) and f.get("sha256"))
     image_capture_ids = {img.capture_id for img in images if img.capture_id}
     plan.unaccounted_capture_lines = sorted({e["capture_id"] for e in lines} - image_capture_ids)
 
+    line_missing = set()
+    thumbnails = {}   # resolved thumbnail path -> the ids of the images that name it
     for img in images:
         master = Path(img.file_path)
         raw = is_raw_suffix(master)
@@ -403,7 +456,12 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
         buffer = None if raw else _raw_buffer(db, listings, master, src_masters)
         if buffer is not None:
             owned.add(_resolved(buffer))
+        for p in (master, derived_preview, preview, buffer):
+            if p is not None:
+                owned_relative.add(_relative_key(p, src_root))
         thumb = Path(img.thumbnail_path) if img.thumbnail_path else None
+        if thumb is not None:
+            thumbnails.setdefault(_resolved(thumb), []).append((img.id, img.thumbnail_path))
         thumb_present = thumb is not None and _on_disk(thumb)
         if thumb_present:
             owned.add(_resolved(thumb))
@@ -425,6 +483,12 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
         has_line = bool(img.capture_id) and relative in named.get(img.capture_id, set())
         if not has_line:
             plan.refuse("source_capture_line_missing", {"image_id": img.id, "capture_id": img.capture_id})
+            line_missing.add(img.capture_id)
+        elif relative not in digested.get(img.capture_id, set()):
+            plan.refuse("source_digest_missing", {"image_id": img.id, "path": img.file_path})
+        if (raw and has_line and preview is not None and img.preview_freed_at is None
+                and digests.expected(img.capture_id, derived_preview) is None):
+            plan.refuse("source_preview_digest_missing", {"image_id": img.id, "path": str(derived_preview)})
 
         m = pattern.match(img.filename or "")
         if m is None or master.name != img.filename or int(m.group(1)) < 1:
@@ -446,6 +510,9 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
             rename.old_preview_path = preview if preview is not None else derived_preview
             rename.new_preview_path = preview_sidecar_of(new_master).with_name(
                 _swap_prefix(rename.old_preview_path.name, master.stem, new_master.stem))
+            if rename.old_preview_path.name != derived_preview.name:
+                plan.refuse("source_name_not_contract", {"image_id": img.id,
+                                                         "filename": rename.old_preview_path.name})
         if buffer is not None:
             rename.old_raw_buffer_path = buffer
             rename.new_raw_buffer_path = raw_sidecar_of(new_master).with_name(
@@ -470,10 +537,101 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
             plan.refuse("source_not_verified_offsite", {"volume": source.id, "total": state["total"],
                                                         "verified": state["verified"]})
 
+    for named_by in thumbnails.values():
+        if len(named_by) > 1:
+            plan.refuse("source_thumbnail_shared", {"path": named_by[0][1],
+                                                    "image_ids": sorted(i for i, _ in named_by)})
+    source_out, target_out = outside_storage(src_stem, tgt_stem, plan.renames)
+    for path in source_out:
+        plan.refuse("source_outside_storage", {"path": path})
+    for path in target_out:
+        plan.refuse("target_outside_storage", {"path": path})
+    _unmapped(plan, lines, image_capture_ids - line_missing, owned_relative)
     _uncovered(plan, src_root, owned)
     highest = max((r.number for r in plan.renames), default=0)
     plan.counter_after = max(plan.counter_before, source.capture_counter or 0, highest)
     _check_collisions(db, plan, tgt_stem, tgt_captures, tgt_root)
+
+
+def outside_storage(src_stem: str, tgt_stem: str, renames: list) -> tuple:
+    """(source paths, target paths) that resolve outside the storage; both empty when none does.
+
+    Every path an adoption reads from or renames to is inside the storage
+    roots after resolving: the source's root and each of its four
+    directories, every old path (master, preview, buffer, thumbnail), the
+    target's root and its four directories, and every new path. The
+    volumes' directories are checked as the volume layout migration checks
+    a volume's (volume_layout._volume_dirs_inside: each resolved, symbolic
+    links followed, inside the projects root), and every file path as every
+    reader checks a stored one (paths.resolve_within_storage, on the
+    resolved path). The plan refuses on either side, and the apply step
+    asks again just before its first rename.
+    """
+    from app.core import config
+    from app.core.paths import VOLUME_SUBDIRS, resolve_within_storage
+    from app.core.storage_override import writable_projects_dir
+    from app.core.volume_layout import _volume_dirs_inside
+
+    root = writable_projects_dir(config.settings).resolve()
+
+    def volume_dirs(stem: str) -> list:
+        if _volume_dirs_inside(root, stem):
+            return []
+        volume, bad = root / stem, []
+        for p in [volume] + [volume / d for d in VOLUME_SUBDIRS]:
+            try:
+                if not p.resolve().is_relative_to(root):
+                    bad.append(str(p))
+            except (OSError, RuntimeError):
+                bad.append(str(p))
+        return bad
+
+    def files(bad: list, paths) -> list:
+        for p in paths:
+            if p is not None and resolve_within_storage(str(p)) is None and str(p) not in bad:
+                bad.append(str(p))
+        return bad
+
+    source = files(volume_dirs(src_stem), (p for r in renames for p in (
+        r.old_path, r.old_preview_path, r.old_raw_buffer_path, r.old_thumbnail_path)))
+    target = files(volume_dirs(tgt_stem), (p for r in renames for p in (
+        r.new_path, r.new_preview_path, r.new_raw_buffer_path, r.new_thumbnail_path)))
+    return source, target
+
+
+def _relative_key(path: Path, root: Path) -> str:
+    """`path` relative to `root`, normalised and casefolded, as a manifest line's path is compared with it."""
+    return os.path.normpath(os.path.relpath(path, root)).casefold()
+
+
+class _SourceIndex:
+    """The fixity index of the source's own manifest alone, built on first use."""
+
+    def __init__(self, src_root: Path):
+        self._root = src_root
+        self._index = None
+
+    def expected(self, capture_id: str, path: Path) -> Optional[str]:
+        from app.core.integrity import build_fixity_index
+
+        if self._index is None:
+            self._index = build_fixity_index(self._root)
+        try:
+            resolved = path.resolve()
+        except (OSError, ValueError):
+            resolved = path
+        return self._index.expected(capture_id, None, resolved)
+
+
+def _unmapped(plan: AdoptPlan, lines: list, capture_ids: set, owned_relative: set) -> None:
+    """Refuse every path a capture line of `capture_ids` names that no source image owns."""
+    for entry in lines:
+        if entry["capture_id"] not in capture_ids:
+            continue
+        for f in entry.get("files") or []:
+            rel = f.get("relative_path") if isinstance(f, dict) else None
+            if isinstance(rel, str) and os.path.normpath(rel).casefold() not in owned_relative:
+                plan.refuse("source_manifest_path_unmapped", {"capture_id": entry["capture_id"], "path": rel})
 
 
 def _resolved(path: Path) -> str:

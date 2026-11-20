@@ -16,7 +16,9 @@ from app.models.collection import STEM_RESERVED_MESSAGE, Collection, stem_direct
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
-from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
+from app.schemas.collection import (
+    AdoptPlanRead, AdoptResultRead, CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren,
+)
 from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusChangeRead, ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
@@ -451,6 +453,91 @@ def keep_collection_on_unit(
     if collection is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     return _offsite_state(db, collection)
+
+
+# ==============================================================================
+# Adopting a hand-made volume's captures into the volume Fisqua assigned (NEH-387)
+# ==============================================================================
+#
+# GET is the dry run (the plan; it changes nothing and calls no bucket);
+# POST applies it, synchronously: the renames are on one card, and the
+# bucket is only listed, never written, so it ends within a request.
+
+def _rename_body(r) -> dict:
+    def text(path):
+        return str(path) if path is not None else None
+
+    return {
+        "image_id": r.image_id, "record_id": r.record_id, "is_current": r.is_current, "number": r.number,
+        "old_name": r.old_name, "new_name": r.new_name, "old_path": str(r.old_path), "new_path": str(r.new_path),
+        "old_preview_path": text(r.old_preview_path), "new_preview_path": text(r.new_preview_path),
+        "old_raw_buffer_path": text(r.old_raw_buffer_path), "new_raw_buffer_path": text(r.new_raw_buffer_path),
+        "old_thumbnail_path": text(r.old_thumbnail_path), "new_thumbnail_path": text(r.new_thumbnail_path),
+        "old_pair_id": r.old_pair_id, "new_pair_id": r.new_pair_id, "capture_id": r.capture_id,
+        "old_keys": dict(r.old_keys), "new_keys": dict(r.new_keys),
+    }
+
+
+@router.get("/{source_id}/adopt-into/{target_id}", response_model=AdoptPlanRead)
+def plan_adopt_into(
+    source_id: int,
+    target_id: int,
+    limit: int = Query(50, ge=1, le=1000, description="How many renames to list"),
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Dry run of adopting the source volume's captures into the target; admin only.
+
+    The plan (app.core.adopt_captures.plan_adopt_captures): every refusal
+    with its details, the counts, the first `limit` renames and whether
+    more were left out, the entries no source image owns, the missing
+    thumbnails and both projects. A volume that does not exist is a
+    refusal in the plan, not a 404. Changes nothing.
+    """
+    from app.core.adopt_captures import plan_adopt_captures
+
+    plan = plan_adopt_captures(db, source_id, target_id)
+    db.rollback()  # no transaction stays open from the reads
+    return {
+        "source_id": plan.source_id, "target_id": plan.target_id, "may_adopt": plan.may_adopt,
+        "refusals": plan.refusals, "details": jsonable_encoder(plan.details),
+        "source_stem": plan.source_stem, "target_stem": plan.target_stem,
+        "source_project_id": plan.source_project_id, "target_project_id": plan.target_project_id,
+        "project_changes": plan.project_changes, "records": plan.records,
+        "images_current": plan.images_current, "images_superseded": plan.images_superseded,
+        "bytes": plan.bytes, "counter_before": plan.counter_before, "counter_after": plan.counter_after,
+        "renames_count": len(plan.renames), "renames_truncated": len(plan.renames) > limit,
+        "renames": [_rename_body(r) for r in plan.renames[:limit]],
+        "uncovered": plan.uncovered, "thumbnails_missing": plan.thumbnails_missing,
+        "capture_lines": plan.capture_lines, "unaccounted_capture_lines": plan.unaccounted_capture_lines,
+    }
+
+
+@router.post("/{source_id}/adopt-into/{target_id}", response_model=AdoptResultRead)
+def adopt_into(
+    source_id: int,
+    target_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Adopt the source volume's captures into the target (app.core.adopt_apply); admin only.
+
+    Returns what it did. 409 with `codes` and `details` when the plan
+    refuses, when the bucket holds objects under the target's stem, when an
+    offsite row of the source is not verified, and when an export of either
+    volume is queued or running or its files are being read for upload
+    (`volume_held`); 503 when the bucket cannot be listed; 500 when it
+    stopped after it began to rename, with `restored` saying whether every
+    file is back where it was.
+    """
+    from app.core.adopt_apply import AdoptFailed, AdoptRefused, adopt_captures
+
+    try:
+        return adopt_captures(db, source_id, target_id, actor=current_user.username)
+    except AdoptRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=jsonable_encoder(exc.as_detail()))
+    except AdoptFailed as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
 
 
 # ==============================================================================
@@ -898,6 +985,9 @@ def move_collection_records(
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Neither out of nor into a volume an unfinished adoption names (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_journaled
+    refuse_if_journaled([collection_id, target_collection_id])
 
     target = db.query(Collection).filter(Collection.id == target_collection_id).first()
     if not target:
@@ -1011,15 +1101,25 @@ def delete_collection(
     empty collection has no files of its own, so no file is removed: a file
     found in its directory (one no row references, such as a file the volume
     layout migration left there) stays, with the directories above it, and is
-    logged at WARNING.
+    logged at WARNING. A volume whose captures were adopted away
+    (Collection.captures_adopted_away) is the one exception to the stem
+    refusal: it is deleted, its manifest moved to `.retired-manifests/`
+    (storage_ops.retire_project_manifest), and its stem stays held by its
+    retired offsite keys.
     """
     # Under the row lock, so that a PATCH setting a first stem cannot land
     # between this check and the delete.
     collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Not a volume an unfinished adoption names, nor one above it (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_journaled
+    refuse_if_journaled(collection_and_descendants(db, collection_id))
 
-    if collection.reserves_its_stem():
+    # A volume that has captured keeps its row, so its stem is never issued again; the one exception is a
+    # volume whose captures were adopted away (Collection.captures_adopted_away), whose retired keys hold it.
+    adopted_away = collection.reserves_its_stem() and collection.captures_adopted_away()
+    if collection.reserves_its_stem() and not adopted_away:
         raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
 
     # Refuse to delete a non-empty collection; report the blocking counts
@@ -1043,6 +1143,11 @@ def delete_collection(
             )
         # Remove the directories first so a filesystem failure aborts before touching the DB
         try:
+            if adopted_away:
+                # Its manifest holds the relocation records of the adopted files: moved out, where the
+                # fixity index keeps reading it (app.core.integrity.manifest_base), never deleted.
+                from app.core.storage_ops import retire_project_manifest
+                retire_project_manifest(col_dir)
             left = remove_empty_dirs(col_dir)
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
@@ -1521,6 +1626,9 @@ def export_collection_bagit(
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Not a volume an unfinished adoption names (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_journaled
+    refuse_if_journaled([collection_id])
 
     records = (
         db.query(Record)

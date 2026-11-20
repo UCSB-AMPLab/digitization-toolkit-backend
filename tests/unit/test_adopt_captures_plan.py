@@ -15,14 +15,15 @@ The default source volume is in project "Fondo 10" and the target in "Fondo
 and thumbnail, both cameras of an event sharing its number and capture id:
 the first record holds a superseded pair (number 1) and its current retake
 (number 2), the second a current pair (number 3). Each event has one capture
-line in the manifest naming its masters and previews, and every capture and
-preview has a verified offsite row under the source's stem.
+line in the manifest naming its masters and previews with their sha256, and
+every capture and preview has a verified offsite row under the source's stem.
 
     python -m pytest tests/unit/test_adopt_captures_plan.py
 
 Version: 0.3.3
 """
 
+import hashlib
 import json
 import uuid
 from datetime import datetime, timezone
@@ -33,6 +34,23 @@ import pytest
 SRC = "co-ahr-con-caj80-car008"
 TGT = "co-ahr-con-caj080-car008"
 TENANT = "captua-test"
+
+
+@pytest.fixture(autouse=True)
+def own_data_dir(tmp_path, override_projects_root):
+    """A data directory of the test's own, so an adoption journal never outlives its test.
+
+    After override_projects_root, which reloads app.core.config and so
+    replaces the settings object this patches; with a MonkeyPatch of its
+    own, so a test's monkeypatch.undo() leaves it in place.
+    """
+    from app.core import config
+
+    data = tmp_path / "adopt-data"
+    data.mkdir(exist_ok=True)
+    with pytest.MonkeyPatch.context() as patch:
+        patch.setattr(config.settings, "DATA_DIR", str(data))
+        yield data
 
 
 @pytest.fixture
@@ -89,11 +107,12 @@ def _manifest_line(root, stem, line):
 
 
 def _image(db, rec, root, stem, name, data, *, capture_id=None, current=True, verified=True, thumbnail=True,
-           preview=True):
+           preview=True, digest=True, preview_digest=True):
     """An image of `rec` with its files in `<root>/<stem>/` and, when `verified`, verified offsite rows.
 
     A RAW master gets a preview unless `preview` is false. Returns the image
-    and the manifest entries of its files.
+    and the manifest entries of its files, each with its sha256, except the
+    master's when `digest` is false and the preview's when `preview_digest` is.
     """
     from app.core.paths import is_raw_suffix, preview_sidecar_of
     from app.models.offsite_object import OffsiteObject
@@ -103,12 +122,16 @@ def _image(db, rec, root, stem, name, data, *, capture_id=None, current=True, ve
     master.parent.mkdir(parents=True, exist_ok=True)
     master.write_bytes(data)
     files = [{"role": "single", "relative_path": f"captures/{name}"}]
+    if digest:
+        files[0]["sha256"] = hashlib.sha256(data).hexdigest()
     side = None
     if preview and is_raw_suffix(master):
         side = preview_sidecar_of(master)
         side.parent.mkdir(parents=True, exist_ok=True)
         side.write_bytes(b"preview " + data)
         files.append({"role": "single_preview", "relative_path": f"previews/{side.name}"})
+        if preview_digest:
+            files[-1]["sha256"] = hashlib.sha256(b"preview " + data).hexdigest()
     thumb = None
     if thumbnail:
         thumb = root / stem / "thumbnails" / f"{uuid.uuid4().hex}_thumb.jpg"
@@ -306,12 +329,30 @@ def test_a_raw_buffer_beside_a_jpeg_master_is_renamed_with_it(db_session, overri
 
 
 @pytest.mark.unit
-def test_sidecars_are_found_by_listing_whatever_the_case_of_their_names(db_session, override_projects_root, tenant):
-    """A preview named `_preview.JPG` and a buffer named `.RAW` are found on a case-sensitive disk too.
+def test_a_raw_buffer_is_found_by_listing_whatever_the_case_of_its_name(db_session, override_projects_root, tenant):
+    """A buffer named `.RAW` is found on a case-sensitive disk too, and planned under the name it is listed with."""
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    rec = _record(db_session, src, "f. 5", mode="single")
+    jpg = _capture(db_session, rec, root, SRC, 4, cams=(0,), ext="jpg")[(4, 0)]
+    buffer = root / SRC / "captures" / f"{SRC}-img_0004_c0.RAW"
+    buffer.write_bytes(b"buffer")
 
-    The plan is built from the directory's listing compared case-insensitively,
-    so it names the files as they are listed, not as preview_sidecar_of and
-    raw_sidecar_of spell them.
+    plan = _plan(db_session, src, tgt)
+    r = {r.image_id: r for r in plan.renames}[jpg.id]
+
+    assert plan.refusals == [], plan.details
+    assert r.old_raw_buffer_path.name == buffer.name
+    assert r.new_raw_buffer_path.name == f"{TGT}-img_0004_c0.RAW"
+    assert plan.uncovered == []
+
+
+@pytest.mark.unit
+def test_a_preview_not_named_as_its_key_must_be_is_found_and_refused(db_session, override_projects_root, tenant):
+    """A preview listed as `_preview.JPG` is found, planned under that name, and refused.
+
+    The export takes a preview key only in the form `<stem>-img_<nnnn>_c<n>_preview.jpg`
+    (app.core.capture_manifest), and the plan keeps the listed name.
     """
     root = override_projects_root
     src, tgt, images = _default(db_session, root)
@@ -319,20 +360,14 @@ def test_sidecars_are_found_by_listing_whatever_the_case_of_their_names(db_sessi
     lower = root / SRC / "previews" / f"{SRC}-img_0003_c1_preview.jpg"
     upper = lower.with_name(f"{SRC}-img_0003_c1_preview.JPG")
     lower.rename(upper)
-    rec = _record(db_session, src, "f. 5", mode="single")
-    jpg = _capture(db_session, rec, root, SRC, 4, cams=(0,), ext="jpg")[(4, 0)]
-    buffer = root / SRC / "captures" / f"{SRC}-img_0004_c0.RAW"
-    buffer.write_bytes(b"buffer")
 
     plan = _plan(db_session, src, tgt)
-    by_id = {r.image_id: r for r in plan.renames}
+    r = {r.image_id: r for r in plan.renames}[img.id]
 
-    assert plan.refusals == [], plan.details
-    assert by_id[img.id].old_preview_path.name == upper.name
-    assert by_id[img.id].new_preview_path.name == f"{TGT}-img_0003_c1_preview.JPG"
-    assert by_id[img.id].new_keys["preview"] == f"{TENANT}/{TGT}/previews/{TGT}-img_0003_c1_preview.JPG"
-    assert by_id[jpg.id].old_raw_buffer_path.name == buffer.name
-    assert by_id[jpg.id].new_raw_buffer_path.name == f"{TGT}-img_0004_c0.RAW"
+    assert plan.refusals == ["source_name_not_contract"]
+    assert plan.details["source_name_not_contract"] == [{"image_id": img.id, "filename": upper.name}]
+    assert r.old_preview_path.name == upper.name
+    assert r.new_preview_path.name == f"{TGT}-img_0003_c1_preview.JPG"
     assert plan.uncovered == []
 
 
@@ -476,6 +511,25 @@ def test_a_target_withdrawn_from_the_queue_is_refused(db_session, override_proje
 
 
 @pytest.mark.unit
+def test_a_source_with_records_and_no_image_is_refused(db_session, override_projects_root, tenant):
+    src = _volume(db_session, "Solo placeholders", SRC)
+    tgt = _volume(db_session, "Asignado", TGT, external_id=TGT, project="Fondo 13")
+    _record(db_session, src, "missing opening")
+
+    assert _plan(db_session, src, tgt).refusals == ["source_has_no_images"]
+
+
+@pytest.mark.unit
+def test_an_imageless_record_among_records_with_images_is_allowed(db_session, override_projects_root, tenant):
+    src, tgt, _ = _default(db_session, override_projects_root)
+    _record(db_session, src, "missing opening")
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == [] and plan.records == 3
+
+
+@pytest.mark.unit
 def test_a_source_with_a_sub_volume_is_refused(db_session, override_projects_root, tenant):
     from app.models.collection import Collection
 
@@ -514,6 +568,21 @@ def test_a_source_with_a_fisqua_status_is_refused(db_session, override_projects_
     db_session.commit()
 
     assert _plan(db_session, src, tgt).refusals == ["source_sent_to_fisqua"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("row", ["outbox", "status"])
+def test_a_target_already_sent_to_fisqua_is_refused(db_session, override_projects_root, tenant, row):
+    from app.models.fisqua import FisquaOutbox, FisquaStatus
+
+    src, tgt, _ = _default(db_session, override_projects_root)
+    if row == "outbox":
+        db_session.add(FisquaOutbox(collection_id=tgt.id, manifest_id=str(uuid.uuid4()), state="waiting_for_upload"))
+    else:
+        db_session.add(FisquaStatus(collection_id=tgt.id, status_checked_at=_now()))
+    db_session.commit()
+
+    assert _plan(db_session, src, tgt).refusals == ["target_sent_to_fisqua"]
 
 
 @pytest.mark.unit
@@ -855,6 +924,175 @@ def test_a_number_the_targets_manifest_names_is_refused(db_session, override_pro
     ]
 
 
+@pytest.mark.unit
+def test_a_capture_line_without_the_masters_digest_is_refused(db_session, override_projects_root, tenant):
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    rec = _record(db_session, src, "f. 5")
+    undigested = _capture(db_session, rec, root, SRC, 4, digest=False)
+    src.capture_counter = 4
+    db_session.commit()
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == ["source_digest_missing"]
+    assert plan.details["source_digest_missing"] == [
+        {"image_id": i.id, "path": i.file_path} for i in sorted(undigested.values(), key=lambda i: i.id)]
+
+
+@pytest.mark.unit
+def test_a_raw_preview_with_no_digest_in_the_sources_manifest_is_refused(db_session, override_projects_root, tenant):
+    from app.core.paths import preview_sidecar_of
+
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    rec = _record(db_session, src, "f. 5")
+    undigested = _capture(db_session, rec, root, SRC, 4, preview_digest=False)
+    src.capture_counter = 4
+    db_session.commit()
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == ["source_preview_digest_missing"]
+    assert plan.details["source_preview_digest_missing"] == [
+        {"image_id": i.id, "path": str(preview_sidecar_of(Path(i.file_path)))}
+        for i in sorted(undigested.values(), key=lambda i: i.id)]
+
+
+@pytest.mark.unit
+def test_a_raw_preview_whose_digest_was_backfilled_is_not_refused(db_session, override_projects_root, tenant):
+    from app.core.paths import preview_sidecar_of
+
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    rec = _record(db_session, src, "f. 5")
+    undigested = _capture(db_session, rec, root, SRC, 4, preview_digest=False)
+    src.capture_counter = 4
+    db_session.commit()
+    for i in undigested.values():
+        preview = preview_sidecar_of(Path(i.file_path))
+        _manifest_line(root, SRC, {"record_type": "preview_digest", "capture_id": i.capture_id, "image_id": i.id,
+                                   "files": [{"role": "single_preview", "relative_path": f"previews/{preview.name}",
+                                              "sha256": hashlib.sha256(preview.read_bytes()).hexdigest()}]})
+
+    assert _plan(db_session, src, tgt).refusals == []
+
+
+@pytest.mark.unit
+def test_a_capture_line_naming_a_file_no_image_has_is_refused(db_session, override_projects_root, tenant):
+    root = override_projects_root
+    src, tgt, images = _default(db_session, root)
+    capture_id = images[(2, 0)].capture_id
+    gone = f"captures/{_name(SRC, 2, 2)}"   # a third camera's file, deleted with its row
+    _manifest_line(root, SRC, {"capture_id": capture_id, "files": [{"role": "single", "relative_path": gone,
+                                                                   "sha256": "4" * 64}]})
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == ["source_manifest_path_unmapped"]
+    assert plan.details["source_manifest_path_unmapped"] == [{"capture_id": capture_id, "path": gone}]
+
+
+@pytest.mark.unit
+def test_a_capture_line_of_a_capture_id_no_image_has_is_not_checked_for_its_paths(db_session, override_projects_root, tenant):
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    _manifest_line(root, SRC, {"capture_id": str(uuid.uuid4()), "files": [{"relative_path": "captures/gone.CR2"}]})
+
+    assert _plan(db_session, src, tgt).refusals == []
+
+
+@pytest.mark.unit
+def test_two_images_sharing_one_thumbnail_are_refused(db_session, override_projects_root, tenant):
+    from app.models.record import RecordImage
+
+    src, tgt, images = _default(db_session, override_projects_root)
+    a, b = images[(2, 0)], images[(3, 1)]
+    db_session.get(RecordImage, b.id).thumbnail_path = a.thumbnail_path
+    db_session.commit()
+
+    plan = _plan(db_session, src, tgt)
+
+    # b's own thumbnail is now one no image owns, which is reported, not refused.
+    assert plan.refusals == ["source_thumbnail_shared"]
+    assert plan.details["source_thumbnail_shared"] == [{"path": a.thumbnail_path, "image_ids": [a.id, b.id]}]
+
+
+@pytest.mark.unit
+def test_an_unfinished_adoption_refuses_every_adoption(db_session, override_projects_root, tenant, own_data_dir):
+    src, tgt, _ = _default(db_session, override_projects_root)
+    (own_data_dir / "adopt-captures.journal").write_text(json.dumps({"version": 1, "source_id": 98,
+                                                                       "target_id": 99}))
+
+    assert _plan(db_session, src, tgt).refusals == ["adoption_unfinished"]
+    (own_data_dir / "adopt-captures.journal").write_text("not json")
+    assert _plan(db_session, src, tgt).refusals == ["adoption_unfinished"]
+
+
+def _outside(tmp_path, name):
+    outside = tmp_path / name
+    outside.mkdir()
+    return outside
+
+
+@pytest.mark.unit
+def test_a_source_previews_directory_that_leads_outside_the_storage_is_refused(db_session, override_projects_root, tenant, tmp_path):
+    root = override_projects_root
+    src, tgt, images = _default(db_session, root)
+    outside = _outside(tmp_path, "elsewhere")
+    previews = root / SRC / "previews"
+    for p in previews.iterdir():
+        p.rename(outside / p.name)
+    previews.rmdir()
+    previews.symlink_to(outside, target_is_directory=True)
+
+    plan = _plan(db_session, src, tgt)
+
+    assert "source_outside_storage" in plan.refusals
+    paths = {d["path"] for d in plan.details["source_outside_storage"]}
+    assert str(previews) in paths
+    assert str(previews / f"{SRC}-img_0001_c0_preview.jpg") in paths
+
+
+@pytest.mark.unit
+def test_a_source_thumbnail_outside_the_storage_is_refused(db_session, override_projects_root, tenant, tmp_path):
+    from app.models.record import RecordImage
+
+    root = override_projects_root
+    src, tgt, images = _default(db_session, root)
+    outside = _outside(tmp_path, "elsewhere")
+    img = images[(2, 0)]
+    moved = outside / Path(img.thumbnail_path).name
+    Path(img.thumbnail_path).rename(moved)
+    db_session.get(RecordImage, img.id).thumbnail_path = str(moved)
+    db_session.commit()
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == ["source_outside_storage"]
+    assert plan.details["source_outside_storage"] == [{"path": str(moved)}]
+
+
+@pytest.mark.unit
+def test_a_buffer_reached_through_a_source_captures_directory_outside_the_storage_is_refused(db_session, override_projects_root, tenant, tmp_path):
+    root = override_projects_root
+    src, tgt, _ = _default(db_session, root)
+    rec = _record(db_session, src, "f. 5", mode="single")
+    _capture(db_session, rec, root, SRC, 4, cams=(0,), ext="jpg")
+    (root / SRC / "captures" / f"{SRC}-img_0004_c0.raw").write_bytes(b"buffer")
+    outside = _outside(tmp_path, "elsewhere")
+    captures = root / SRC / "captures"
+    for p in captures.iterdir():
+        p.rename(outside / p.name)
+    captures.rmdir()
+    captures.symlink_to(outside, target_is_directory=True)
+
+    plan = _plan(db_session, src, tgt)
+
+    assert "source_outside_storage" in plan.refusals
+    assert str(captures / f"{SRC}-img_0004_c0.raw") in {d["path"] for d in plan.details["source_outside_storage"]}
+
+
 # ---------------------------------------------------------------------------
 # Several refusals together, and their order
 # ---------------------------------------------------------------------------
@@ -864,14 +1102,17 @@ def test_the_refusal_codes_are_in_this_order():
     from app.core.adopt_captures import REFUSAL_CODES
 
     assert REFUSAL_CODES == (
-        "source_not_found", "target_not_found", "same_volume",
+        "adoption_unfinished", "source_not_found", "target_not_found", "same_volume",
         "source_has_no_stem", "target_has_no_stem", "target_not_assigned", "target_withdrawn",
-        "source_sent_to_fisqua", "source_kept_on_unit", "target_kept_on_unit", "source_has_sub_volumes",
-        "target_has_records", "target_has_images", "target_counter_raised", "target_has_offsite_keys",
-        "offsite_tenant_not_configured", "storage_unavailable",
+        "source_sent_to_fisqua", "target_sent_to_fisqua", "source_kept_on_unit", "target_kept_on_unit",
+        "source_has_sub_volumes", "source_has_no_images", "target_has_records", "target_has_images", "target_counter_raised",
+        "target_has_offsite_keys",
+        "offsite_tenant_not_configured", "storage_unavailable", "source_outside_storage",
+        "target_outside_storage",
         "source_records_handed_over", "source_files_freed", "source_file_outside_own_folder",
         "source_file_missing", "source_not_verified_offsite", "source_capture_line_missing",
-        "source_name_not_contract", "source_has_unowned_files", "new_name_collides",
+        "source_manifest_path_unmapped", "source_digest_missing", "source_preview_digest_missing",
+        "source_name_not_contract", "source_thumbnail_shared", "source_has_unowned_files", "new_name_collides",
     )
 
 
@@ -897,13 +1138,23 @@ def test_every_refusal_that_applies_is_given_in_the_fixed_order(db_session, over
     db_session.commit()
     Path(images[(2, 0)].file_path).unlink()
     (root / SRC / "previews" / "stray_preview.jpg").write_bytes(b"stray")
+    _manifest_line(root, SRC, {"capture_id": images[(1, 0)].capture_id,
+                               "files": [{"relative_path": f"captures/{_name(SRC, 1, 2)}"}]})
+    _capture(db_session, db_session.get(Record, images[(3, 0)].record_id), root, SRC, 4, digest=False,
+             preview_digest=False)
+    db_session.add(FisquaStatus(collection_id=tgt.id, status_checked_at=_now()))
+    images[(1, 1)].thumbnail_path = images[(1, 0)].thumbnail_path
+    db_session.commit()
+    (config.settings.data_dir / "adopt-captures.journal").write_text("{}")
 
     plan = _plan(db_session, src, tgt)
 
-    expected = ["target_not_assigned", "target_withdrawn", "source_sent_to_fisqua", "source_kept_on_unit",
-                "target_kept_on_unit", "source_has_sub_volumes", "target_has_records", "target_counter_raised",
-                "offsite_tenant_not_configured", "source_records_handed_over", "source_files_freed",
-                "source_file_missing", "source_has_unowned_files"]
+    expected = ["adoption_unfinished", "target_not_assigned", "target_withdrawn", "source_sent_to_fisqua", "target_sent_to_fisqua",
+                "source_kept_on_unit", "target_kept_on_unit", "source_has_sub_volumes", "target_has_records",
+                "target_counter_raised", "offsite_tenant_not_configured", "source_records_handed_over",
+                "source_files_freed", "source_file_missing", "source_manifest_path_unmapped",
+                "source_digest_missing", "source_preview_digest_missing", "source_thumbnail_shared",
+                "source_has_unowned_files"]
     assert plan.refusals == expected
     assert plan.refusals == [c for c in REFUSAL_CODES if c in expected]
     assert not plan.may_adopt
