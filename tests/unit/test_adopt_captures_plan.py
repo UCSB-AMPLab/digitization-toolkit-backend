@@ -477,6 +477,36 @@ def test_a_volume_adopted_into_itself_is_refused(db_session, override_projects_r
     assert _plan(db_session, src, src).refusals == ["same_volume"]
 
 
+def _testing_volume(db, stem):
+    from app.core.project_names import TESTING_PREFIX, TESTING_PROJECT_PREFIX
+    from app.models.collection import Collection
+    from app.models.project import Project
+
+    name = TESTING_PROJECT_PREFIX + "Pruebas"
+    project = db.query(Project).filter(Project.name == name).one_or_none()
+    if project is None:
+        project = Project(name=name, testing=True)
+        db.add(project)
+        db.commit()
+    vol = Collection(name="Tomo de prueba", project_id=project.id, filename_stem=TESTING_PREFIX + stem)
+    db.add(vol)
+    db.commit()
+    assert vol.testing
+    return vol
+
+
+@pytest.mark.unit
+def test_a_testing_volume_is_neither_source_nor_target(db_session, override_projects_root, tenant):
+    src, tgt, _ = _default(db_session, override_projects_root)
+    testing = _testing_volume(db_session, "000901")
+
+    plan = _plan(db_session, testing, tgt)
+    assert plan.refusals == ["source_testing_volume"] and not plan.may_adopt and plan.renames == []
+    assert _plan(db_session, src, testing).refusals == ["target_testing_volume"]
+    other = _testing_volume(db_session, "000902")
+    assert _plan(db_session, testing, other).refusals == ["source_testing_volume", "target_testing_volume"]
+
+
 @pytest.mark.unit
 def test_a_source_without_a_stem_is_refused(db_session, override_projects_root, tenant):
     src = _volume(db_session, "Sin raíz", None)
@@ -1103,7 +1133,7 @@ def test_the_refusal_codes_are_in_this_order():
 
     assert REFUSAL_CODES == (
         "adoption_unfinished", "source_not_found", "target_not_found", "same_volume",
-        "source_has_no_stem", "target_has_no_stem", "target_not_assigned", "target_withdrawn",
+        "source_testing_volume", "target_testing_volume", "source_has_no_stem", "target_has_no_stem", "target_not_assigned", "target_withdrawn",
         "source_sent_to_fisqua", "target_sent_to_fisqua", "source_kept_on_unit", "target_kept_on_unit",
         "source_has_sub_volumes", "source_has_no_images", "target_has_records", "target_has_images", "target_counter_raised",
         "target_has_offsite_keys",

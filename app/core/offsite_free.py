@@ -324,10 +324,13 @@ def _listings(keys: Iterable[str]) -> dict:
     return out
 
 
-def _fixity_index():
+def _fixity_index(db: Session, collection):
     from app.core.integrity import build_fixity_index
 
-    return build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter
+
+    projects_dir = config.settings.projects_dir.resolve()
+    return build_fixity_index(projects_dir, include=manifest_filter(db, bool(collection.testing), projects_dir))
 
 
 def _digest_refusal(obj: _Object, index) -> Optional[dict]:
@@ -588,7 +591,7 @@ def plan_free(db: Session, collection_id: int) -> dict:
     finally:
         hold.release()
     files, refused = [], []
-    index = _fixity_index()
+    index = _fixity_index(db, collection)
     for obj in objects:
         refusal = (_layout_refusal(obj) or _digest_refusal(obj, index)
                    or _listing_refusal(obj, listed.get(obj.key)))
@@ -630,10 +633,10 @@ def _stable_sha1(path: Path) -> Optional[str]:
 
 def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str]) -> dict:
     """Hash, list again, and free what passes. Runs under the caller's hold."""
-    _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
+    collection = _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     objects = _objects(db, collection_id, freed=False)
     refused, hashed = [], []
-    index = _fixity_index()
+    index = _fixity_index(db, collection)
     for obj in objects:
         refusal = _layout_refusal(obj) or _digest_refusal(obj, index)
         if refusal is not None:

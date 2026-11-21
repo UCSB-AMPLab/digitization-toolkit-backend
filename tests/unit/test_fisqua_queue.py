@@ -1031,3 +1031,99 @@ def test_an_ack_that_cannot_be_kept_is_not_posted_and_the_revision_is_applied_ag
     assert len(transport.acks_sent) == 1
     assert len(_volumes(db_session)) == 1
     assert fisqua_queue._read_state()["revision"] == "r1"
+
+
+# ---------------------------------------------------------------------------
+# A Fisqua that cannot be reached
+# ---------------------------------------------------------------------------
+
+def _operators_tick(db, transport):
+    from app.core.fisqua_queue import mark_operators_due, send_operators
+    mark_operators_due()
+    return send_operators(db, transport=transport, only_if_due=True)
+
+
+def _fresh_operators(monkeypatch):
+    from app.core import fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    monkeypatch.setattr(fisqua_queue, "_send_failures", 0)
+
+
+@pytest.mark.unit
+def test_a_run_of_failed_sends_is_logged_once_and_its_recovery_names_the_count(
+        fisqua, db_session, monkeypatch, caplog):
+    import logging
+    _fresh_operators(monkeypatch)
+    failures = 5
+    transport = QueueTransport(operators=[_result("error", error="connection refused")] * failures
+                               + [_result("delivered")]
+                               + [_result("error", error="timed out")] * 2)
+    with caplog.at_level(logging.INFO, logger="app.core.fisqua_queue"):
+        for _ in range(failures):
+            assert _operators_tick(db_session, transport)["status"] == "error"
+        warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+        assert len(warnings) == 1
+        assert "connection refused" in warnings[0].getMessage()
+        assert not [r for r in caplog.records if "again" in r.getMessage() and r.levelno == logging.INFO]
+
+        assert _operators_tick(db_session, transport)["status"] == "sent"
+        recovered = [r for r in caplog.records if r.levelno == logging.INFO]
+        assert len(recovered) == 1
+        assert f"{failures} " in recovered[0].getMessage()
+
+        # A later failure starts a new run, and is logged again.
+        assert _operators_tick(db_session, transport)["status"] == "error"
+        assert _operators_tick(db_session, transport)["status"] == "error"
+    warnings = [r for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "timed out" in warnings[1].getMessage()
+    # The sending itself is unchanged: every tick sent.
+    assert len(transport.operators_sent) == failures + 1 + 2
+
+
+@pytest.mark.unit
+def test_a_send_that_succeeds_first_time_logs_no_recovery(fisqua, db_session, monkeypatch, caplog):
+    import logging
+    _fresh_operators(monkeypatch)
+    transport = QueueTransport(operators=[_result("delivered")])
+    with caplog.at_level(logging.INFO, logger="app.core.fisqua_queue"):
+        assert _operators_tick(db_session, transport)["status"] == "sent"
+    assert caplog.records == []
+
+
+@pytest.mark.unit
+def test_a_refusal_after_a_run_of_failures_is_logged_as_a_refusal(fisqua, db_session, monkeypatch, caplog):
+    import logging
+    _fresh_operators(monkeypatch)
+    transport = QueueTransport(operators=[_result("error", error="connection refused")] * 3
+                               + [_refused("/operators/0/role")])
+    with caplog.at_level(logging.INFO, logger="app.core.fisqua_queue"):
+        for _ in range(3):
+            assert _operators_tick(db_session, transport)["status"] == "error"
+        assert _operators_tick(db_session, transport)["status"] == "refused"
+    messages = [r.getMessage() for r in caplog.records]
+    assert len([m for m in messages if "failed" in m]) == 1
+    assert len([m for m in messages if "refused the unit's users" in m]) == 1
+    assert any("/operators/0/role" in m for m in messages)
+
+
+@pytest.mark.unit
+def test_a_refused_mode_send_ends_a_run_of_failures(fisqua, db_session, monkeypatch, caplog):
+    import logging
+
+    from app.core.fisqua_queue import send_operators_with_mode
+    _fresh_operators(monkeypatch)
+    transport = QueueTransport(operators=[_result("error", error="timed out"),
+                                          _refused("/operators/0/role"),
+                                          _result("delivered"),
+                                          _result("error", error="connection refused")])
+    with caplog.at_level(logging.INFO, logger="app.core.fisqua_queue"):
+        assert _operators_tick(db_session, transport)["status"] == "error"
+        ok, why = send_operators_with_mode(db_session, "fisqua", transport=transport)
+        assert not ok and why.startswith("refused")
+        assert _operators_tick(db_session, transport)["status"] == "sent"
+        assert not [r for r in caplog.records if r.levelno == logging.INFO]
+        assert _operators_tick(db_session, transport)["status"] == "error"
+    warnings = [r.getMessage() for r in caplog.records if r.levelno == logging.WARNING]
+    assert len(warnings) == 2
+    assert "timed out" in warnings[0] and "connection refused" in warnings[1]

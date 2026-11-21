@@ -12,8 +12,10 @@ offsite hold (app.core.fisqua_outbox).
   left out. Sent when the backend starts (FisquaStatusScheduler), after
   each user created, changed or deleted through the users routes
   (notify_operators_changed, run after the response), and at least once a
-  day. A failed send is logged and leaves the list due, so the next poll
-  tick sends it; it never fails the route. A list Fisqua refuses (422,
+  day. A failed send leaves the list due, so the next poll tick sends it;
+  it never fails the route. The first failure of a run is logged, the
+  later ones are counted, and the next delivered send logs how many
+  attempts failed. A list Fisqua refuses (422,
   logged with its problems, or 413), or one longer than MAX_OPERATORS, is
   not sent again until the list itself is different.
 * **The queue** (sync_fisqua_queue), at each status poll tick. GET
@@ -169,6 +171,31 @@ class _OperatorsState:
 # and never _operators.lock. Nothing takes them the other way round.
 _operators = _OperatorsState()
 
+# The failed sends of the unit's users since Fisqua last answered one (a
+# delivery or a refusal). Changed only under _operators.lock. The backend
+# logs the first failure of a run, counts the rest without logging them,
+# and logs the count once when a send is delivered again. Every tick still
+# sends.
+_send_failures = 0
+
+
+def _note_send_failed(answer: TransportResult) -> None:
+    """A send that failed for a reason that may pass: logged when it starts a run, else only counted."""
+    global _send_failures
+    _send_failures += 1
+    if _send_failures == 1:
+        logger.warning("Sending the unit's users to Fisqua failed (%s); sent again at the next tick",
+                       fisqua_outbox.scrub(answer.error or answer.outcome))
+
+
+def _note_send_answered(delivered: bool) -> None:
+    """A send Fisqua answered: a delivery after failures logs their count; either ends the run."""
+    global _send_failures
+    if delivered and _send_failures:
+        logger.info("Sending the unit's users to Fisqua works again, after %d failed attempt(s)",
+                    _send_failures)
+    _send_failures = 0
+
 
 def operators_body(db: Session, mode: Optional[str] = None) -> dict:
     """The PUT body: every admin and operator, active or not, by username, and the unit's mode.
@@ -224,76 +251,82 @@ def send_operators(db: Session, *, transport=None, now: Optional[datetime] = Non
     gated = _gate(db)
     if gated is not None:
         return gated
+    owned = transport is None
     transport = transport if transport is not None else get_transport()
-    if isinstance(transport, NullTransport):
-        return {"status": "no_transport"}
-    now = fisqua_outbox._naive(now) or fisqua_outbox._now()
-    with _operators.lock:
-        refused = _operators.refused_body
-        if only_if_due and refused is None and not _operators.is_due():
-            return {"status": "not_due"}
-        try:
-            # Read again under the lock a change of mode holds from its PUT to
-            # its commit (unit_mode.change): a switch out of fisqua that won
-            # the lock is seen here, and the body below carries the mode
-            # stored now, never the one a switch has just replaced.
-            if not unit_mode.link_on(db):
+    try:
+        if isinstance(transport, NullTransport):
+            return {"status": "no_transport"}
+        now = fisqua_outbox._naive(now) or fisqua_outbox._now()
+        with _operators.lock:
+            refused = _operators.refused_body
+            if only_if_due and refused is None and not _operators.is_due():
+                return {"status": "not_due"}
+            try:
+                # Read again under the lock a change of mode holds from its PUT to
+                # its commit (unit_mode.change): a switch out of fisqua that won
+                # the lock is seen here, and the body below carries the mode
+                # stored now, never the one a switch has just replaced.
+                if not unit_mode.link_on(db):
+                    db.rollback()
+                    _operators.due = True
+                    return unit_mode.off(db)
+                if fisqua_outbox.config_error() is not None:
+                    return {"status": "config_error"}
+                body = operators_body(db)
                 db.rollback()
+            except Exception:
+                db.rollback()
+                logger.exception("Reading the unit's users for Fisqua failed; sent at the next tick")
                 _operators.due = True
-                return unit_mode.off(db)
-            if fisqua_outbox.config_error() is not None:
-                return {"status": "config_error"}
-            body = operators_body(db)
-            db.rollback()
-        except Exception:
-            db.rollback()
-            logger.exception("Reading the unit's users for Fisqua failed; sent at the next tick")
-            _operators.due = True
-            return {"status": "error"}
-        if refused is not None:
-            if body == refused:
+                return {"status": "error"}
+            if refused is not None:
+                if body == refused:
+                    return {"status": "refused"}
+                _operators.refused_body = None
+            if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
+                logger.warning("The unit has %d admins and operators, more than the %d Fisqua takes; the list is "
+                               "not sent until it changes", len(body[fc.F_OPERATORS]), fc.MAX_OPERATORS)
+                _operators.refused_body = body
+                _operators.due = False
                 return {"status": "refused"}
-            _operators.refused_body = None
-        if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
-            logger.warning("The unit has %d admins and operators, more than the %d Fisqua takes; the list is "
-                           "not sent until it changes", len(body[fc.F_OPERATORS]), fc.MAX_OPERATORS)
-            _operators.refused_body = body
+            if not fisqua_outbox.call_budget.take():
+                _operators.due = True
+                return {"status": "rate_limited"}
+            answer = _call(transport, "put_operators", body)
+            if answer.outcome == unit_mode.OFF_STATUS:
+                # The transport's mode gate refused it, and nothing was sent.
+                _operators.due = True
+                return {"status": unit_mode.OFF_STATUS}
+            if answer.outcome == "config_error":
+                fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
+                _operators.due = True
+                return {"status": "config_error"}
+            if answer.outcome == "unsupported":
+                _note_unsupported(answer)
+                _operators.due = True
+                return {"status": "unsupported"}
+            if answer.outcome == "refused":
+                logger.warning("Fisqua refused the unit's users (HTTP %s): %s; not sent again until the list changes",
+                               answer.status_code,
+                               fisqua_outbox.scrub(json.dumps(answer.problems, ensure_ascii=False)
+                                                   if answer.problems else (answer.error or "no problems given")))
+                _operators.refused_body = body
+                _operators.due = False
+                _note_send_answered(delivered=False)
+                return {"status": "refused"}
+            if answer.outcome != "delivered":
+                _note_send_failed(answer)
+                if answer.retry_after is not None:
+                    fisqua_outbox.call_budget.cool_down(answer.retry_after)
+                _operators.due = True
+                return {"status": "error"}
+            _note_send_answered(delivered=True)
             _operators.due = False
-            return {"status": "refused"}
-        if not fisqua_outbox.call_budget.take():
-            _operators.due = True
-            return {"status": "rate_limited"}
-        answer = _call(transport, "put_operators", body)
-        if answer.outcome == unit_mode.OFF_STATUS:
-            # The transport's mode gate refused it, and nothing was sent.
-            _operators.due = True
-            return {"status": unit_mode.OFF_STATUS}
-        if answer.outcome == "config_error":
-            fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
-            _operators.due = True
-            return {"status": "config_error"}
-        if answer.outcome == "unsupported":
-            _note_unsupported(answer)
-            _operators.due = True
-            return {"status": "unsupported"}
-        if answer.outcome == "refused":
-            logger.warning("Fisqua refused the unit's users (HTTP %s): %s; not sent again until the list changes",
-                           answer.status_code,
-                           fisqua_outbox.scrub(json.dumps(answer.problems, ensure_ascii=False)
-                                               if answer.problems else (answer.error or "no problems given")))
-            _operators.refused_body = body
-            _operators.due = False
-            return {"status": "refused"}
-        if answer.outcome != "delivered":
-            logger.warning("Sending the unit's users to Fisqua failed (%s); sent again at the next tick",
-                           fisqua_outbox.scrub(answer.error or answer.outcome))
-            if answer.retry_after is not None:
-                fisqua_outbox.call_budget.cool_down(answer.retry_after)
-            _operators.due = True
-            return {"status": "error"}
-        _operators.due = False
-        _operators.sent_at = _monotonic()
-        return {"status": "sent", "operators": len(body[fc.F_OPERATORS])}
+            _operators.sent_at = _monotonic()
+            return {"status": "sent", "operators": len(body[fc.F_OPERATORS])}
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)
 
 
 def send_operators_with_mode(db: Session, mode: str, *, transport=None, now: Optional[datetime] = None,
@@ -316,43 +349,55 @@ def send_operators_with_mode(db: Session, mode: str, *, transport=None, now: Opt
         return False, "not_configured"
     if offsite_hold.held("fisqua mode change"):
         return False, "held"
+    owned = transport is None
     transport = transport if transport is not None else unit_mode.get_transport()
-    if isinstance(transport, NullTransport):
-        return False, "not_configured"
-    now = fisqua_outbox._naive(now) or fisqua_outbox._now()
-    with (contextlib.nullcontext() if lock_held else _operators.lock):
-        try:
-            if fisqua_outbox.config_error() is not None:
-                return False, "config_error: the link is stopped until its configuration changes"
-            body = operators_body(db, mode)
-            db.rollback()
-        except Exception as exc:
-            db.rollback()
-            logger.exception("Reading the unit's users for Fisqua failed")
-            return False, f"error: {type(exc).__name__}"
-        if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
-            return False, f"refused: more than {fc.MAX_OPERATORS} admins and operators"
-        # Fisqua asked the unit to wait (a Retry-After on any call): nothing is sent until it has passed.
-        if fisqua_outbox.call_budget.cooling():
-            return False, "rate_limited: cooling down after Fisqua's Retry-After"
-        if not fisqua_outbox.call_budget.take():
-            return False, "rate_limited"
-        answer = _call(transport, "put_operators", body)
-        if answer.outcome == "delivered":
-            _operators.due = False
-            _operators.refused_body = None
-            _operators.sent_at = _monotonic()
-            return True, None
-        if answer.outcome == "config_error":
-            fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
-        elif answer.outcome == "unsupported":
-            _note_unsupported(answer)
-        elif answer.retry_after is not None:
-            fisqua_outbox.call_budget.cool_down(answer.retry_after)
-        # Whatever happened, the regular send goes again once the mode allows it.
-        _operators.due = True
-        detail = answer.error or (f"HTTP {answer.status_code}" if answer.status_code else answer.outcome)
-        return False, f"{answer.outcome}: {fisqua_outbox.scrub(detail)}"
+    try:
+        if isinstance(transport, NullTransport):
+            return False, "not_configured"
+        now = fisqua_outbox._naive(now) or fisqua_outbox._now()
+        with (contextlib.nullcontext() if lock_held else _operators.lock):
+            try:
+                if fisqua_outbox.config_error() is not None:
+                    return False, "config_error: the link is stopped until its configuration changes"
+                body = operators_body(db, mode)
+                db.rollback()
+            except Exception as exc:
+                db.rollback()
+                logger.exception("Reading the unit's users for Fisqua failed")
+                return False, f"error: {type(exc).__name__}"
+            if len(body[fc.F_OPERATORS]) > fc.MAX_OPERATORS:
+                return False, f"refused: more than {fc.MAX_OPERATORS} admins and operators"
+            # Fisqua asked the unit to wait (a Retry-After on any call): nothing is sent until it has passed.
+            if fisqua_outbox.call_budget.cooling():
+                return False, "rate_limited: cooling down after Fisqua's Retry-After"
+            if not fisqua_outbox.call_budget.take():
+                return False, "rate_limited"
+            answer = _call(transport, "put_operators", body)
+            if answer.outcome == "delivered":
+                _note_send_answered(delivered=True)
+                _operators.due = False
+                _operators.refused_body = None
+                _operators.sent_at = _monotonic()
+                return True, None
+            if answer.outcome == "refused":
+                # Fisqua answered: the run of failed regular sends ends, as a
+                # refusal ends it in send_operators.
+                _note_send_answered(delivered=False)
+            # A failure that is not a refusal is neither logged nor counted
+            # here: the regular send goes again at the next tick and counts it.
+            if answer.outcome == "config_error":
+                fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
+            elif answer.outcome == "unsupported":
+                _note_unsupported(answer)
+            elif answer.retry_after is not None:
+                fisqua_outbox.call_budget.cool_down(answer.retry_after)
+            # Whatever happened, the regular send goes again once the mode allows it.
+            _operators.due = True
+            detail = answer.error or (f"HTTP {answer.status_code}" if answer.status_code else answer.outcome)
+            return False, f"{answer.outcome}: {fisqua_outbox.scrub(detail)}"
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)
 
 
 def notify_operators_changed() -> None:
@@ -502,10 +547,12 @@ KEPT_ON_UNIT_REASON = "kept_on_unit"
 
 
 def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
-    """Whether a volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
+    """Whether a real volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
 
     The stem is the reference code (contract 1.2 §8), and an admin's kept
-    volume may have only a stem.
+    volume may have only a stem. Testing volumes are left out: a queue item
+    cannot carry a code or stem in the testing namespace
+    (app.core.testing_space), and the queue reads real work only.
     """
     from sqlalchemy import or_
 
@@ -516,6 +563,7 @@ def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
         return False
     return db.query(Collection.id).filter(
         Collection.kept_on_unit.is_(True),
+        Collection.testing.is_(False),
         or_(Collection.external_id.in_(names), Collection.filename_stem.in_(names)),
     ).first() is not None
 
@@ -820,102 +868,108 @@ def sync_fisqua_queue(db: Session, *, transport=None, now: Optional[datetime] = 
     gated = _gate(db)
     if gated is not None:
         return gated
+    owned = transport is None
     transport = transport if transport is not None else get_transport()
-    if isinstance(transport, NullTransport):
-        return {"status": "no_transport"}
-    now = fisqua_outbox._naive(now) or fisqua_outbox._now()
-    with _queue_lock:
-        try:
-            if fisqua_outbox.config_error() is not None:
-                return {"status": "config_error"}
-            operators = send_operators(db, transport=transport, now=now, only_if_due=True)
-            if operators["status"] == "config_error":
-                return {"status": "config_error", "operators": operators["status"]}
-            if fisqua_outbox.call_budget.cooling():
-                return {"status": "cooling_down", "operators": operators["status"]}
+    try:
+        if isinstance(transport, NullTransport):
+            return {"status": "no_transport"}
+        now = fisqua_outbox._naive(now) or fisqua_outbox._now()
+        with _queue_lock:
+            try:
+                if fisqua_outbox.config_error() is not None:
+                    return {"status": "config_error"}
+                operators = send_operators(db, transport=transport, now=now, only_if_due=True)
+                if operators["status"] == "config_error":
+                    return {"status": "config_error", "operators": operators["status"]}
+                if fisqua_outbox.call_budget.cooling():
+                    return {"status": "cooling_down", "operators": operators["status"]}
 
-            state = _read_state()
-            revision = state.get("revision") if isinstance(state.get("revision"), str) else None
-            pending = state.get("pendingAck")
-            if isinstance(pending, dict):
-                stopped = _settle_ack(transport, pending, now)
+                state = _read_state()
+                revision = state.get("revision") if isinstance(state.get("revision"), str) else None
+                pending = state.get("pendingAck")
+                if isinstance(pending, dict):
+                    stopped = _settle_ack(transport, pending, now)
+                    if stopped is not None:
+                        return {**stopped, "operators": operators["status"]}
+                    revision = pending.get(fc.F_REVISION)
+
+                # A switch out of fisqua mode during the tick stops it before the queue is asked for.
+                if not unit_mode.link_on(db):
+                    db.rollback()
+                    return {**unit_mode.off(db), "operators": operators["status"]}
+                if not fisqua_outbox.call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
+                    return {"status": "rate_limited", "operators": operators["status"]}
+                answer = _call(transport, "get_queue", revision)
+                if answer.outcome == unit_mode.OFF_STATUS:
+                    return {"status": unit_mode.OFF_STATUS, "operators": operators["status"]}
+                if answer.outcome == "config_error":
+                    fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
+                    return {"status": "config_error", "operators": operators["status"]}
+                if answer.outcome == "not_modified":
+                    return {"status": "unchanged", "revision": revision, "operators": operators["status"]}
+                if answer.outcome == "unsupported":
+                    _note_unsupported(answer)
+                    return {"status": "unsupported", "operators": operators["status"]}
+                if answer.outcome != "queue":
+                    logger.warning("Asking Fisqua for the digitisation queue failed: %s",
+                                   fisqua_outbox.scrub(answer.error or answer.outcome))
+                    if answer.retry_after is not None:
+                        fisqua_outbox.call_budget.cool_down(answer.retry_after)
+                    return {"status": "error", "operators": operators["status"]}
+
+                body = answer.response
+                new_revision = body.get(fc.F_REVISION) if isinstance(body, dict) else None
+                if not isinstance(new_revision, str) or not new_revision:
+                    new_revision = answer.etag
+                if not new_revision:
+                    logger.warning("Fisqua's digitisation queue came without a revision; not applied")
+                    return {"status": "unreadable", "operators": operators["status"]}
+                try:
+                    ack, report, document = apply_queue(db, body, new_revision, now)
+                except QueueUnreadable as exc:
+                    db.rollback()
+                    logger.warning("Fisqua's digitisation queue revision %s cannot be applied: %s; not acknowledged",
+                                   fisqua_outbox.scrub(new_revision), fisqua_outbox.scrub(exc))
+                    return {"status": "unreadable", "operators": operators["status"]}
+                except QueueRetry as exc:
+                    db.rollback()
+                    logger.warning("Applying Fisqua's digitisation queue stopped: %s; tried again at the next tick",
+                                   exc)
+                    return {"status": "error", "operators": operators["status"]}
+
+                try:
+                    list_import.store_queue_list(QUEUE_LIST_ID, document, report)
+                except OSError:
+                    logger.exception("Could not store queue revision %s for Cola; not acknowledged, applied again "
+                                     "at the next tick", fisqua_outbox.scrub(new_revision))
+                    return {"status": "store_failed", "operators": operators["status"]}
+                from app.core.audit import log_event
+
+                log_event(db, level="INFO", category="activity", action="fisqua_queue_applied",
+                          actor=QUEUE_ACTOR, subject=report["listName"],
+                          detail=(f"revision {new_revision}: {report['created']} created, {report['updated']} "
+                                  f"updated, {report['hidden']} hidden, {report['skipped']} skipped")[:2000])
+                ack = _without_unknown(ack)
+                try:
+                    _write_state({"revision": revision, "pendingAck": ack})
+                except OSError:
+                    # Posted without being kept, a lost answer could not be
+                    # retried with the same body. Applying is idempotent: the
+                    # next tick asks under the old revision, applies again and
+                    # tries to keep the ack again.
+                    logger.exception("Could not keep the ack of queue revision %s, so it is not posted; applied "
+                                     "again at the next tick", fisqua_outbox.scrub(new_revision))
+                    return {"status": "ack_not_kept", "operators": operators["status"]}
+                stopped = _settle_ack(transport, ack, now)
                 if stopped is not None:
                     return {**stopped, "operators": operators["status"]}
-                revision = pending.get(fc.F_REVISION)
-
-            # A switch out of fisqua mode during the tick stops it before the queue is asked for.
-            if not unit_mode.link_on(db):
+                return {"status": "applied", "revision": new_revision, "created": report["created"],
+                        "updated": report["updated"], "hidden": report["hidden"], "skipped": report["skipped"],
+                        "operators": operators["status"]}
+            except Exception:
                 db.rollback()
-                return {**unit_mode.off(db), "operators": operators["status"]}
-            if not fisqua_outbox.call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
-                return {"status": "rate_limited", "operators": operators["status"]}
-            answer = _call(transport, "get_queue", revision)
-            if answer.outcome == unit_mode.OFF_STATUS:
-                return {"status": unit_mode.OFF_STATUS, "operators": operators["status"]}
-            if answer.outcome == "config_error":
-                fisqua_outbox.record_config_error(answer.status_code, answer.reason, now)
-                return {"status": "config_error", "operators": operators["status"]}
-            if answer.outcome == "not_modified":
-                return {"status": "unchanged", "revision": revision, "operators": operators["status"]}
-            if answer.outcome == "unsupported":
-                _note_unsupported(answer)
-                return {"status": "unsupported", "operators": operators["status"]}
-            if answer.outcome != "queue":
-                logger.warning("Asking Fisqua for the digitisation queue failed: %s",
-                               fisqua_outbox.scrub(answer.error or answer.outcome))
-                if answer.retry_after is not None:
-                    fisqua_outbox.call_budget.cool_down(answer.retry_after)
-                return {"status": "error", "operators": operators["status"]}
-
-            body = answer.response
-            new_revision = body.get(fc.F_REVISION) if isinstance(body, dict) else None
-            if not isinstance(new_revision, str) or not new_revision:
-                new_revision = answer.etag
-            if not new_revision:
-                logger.warning("Fisqua's digitisation queue came without a revision; not applied")
-                return {"status": "unreadable", "operators": operators["status"]}
-            try:
-                ack, report, document = apply_queue(db, body, new_revision, now)
-            except QueueUnreadable as exc:
-                db.rollback()
-                logger.warning("Fisqua's digitisation queue revision %s cannot be applied: %s; not acknowledged",
-                               fisqua_outbox.scrub(new_revision), fisqua_outbox.scrub(exc))
-                return {"status": "unreadable", "operators": operators["status"]}
-            except QueueRetry as exc:
-                db.rollback()
-                logger.warning("Applying Fisqua's digitisation queue stopped: %s; tried again at the next tick", exc)
-                return {"status": "error", "operators": operators["status"]}
-
-            try:
-                list_import.store_queue_list(QUEUE_LIST_ID, document, report)
-            except OSError:
-                logger.exception("Could not store queue revision %s for Cola; not acknowledged, applied again "
-                                 "at the next tick", fisqua_outbox.scrub(new_revision))
-                return {"status": "store_failed", "operators": operators["status"]}
-            from app.core.audit import log_event
-
-            log_event(db, level="INFO", category="activity", action="fisqua_queue_applied",
-                      actor=QUEUE_ACTOR, subject=report["listName"],
-                      detail=(f"revision {new_revision}: {report['created']} created, {report['updated']} "
-                              f"updated, {report['hidden']} hidden, {report['skipped']} skipped")[:2000])
-            ack = _without_unknown(ack)
-            try:
-                _write_state({"revision": revision, "pendingAck": ack})
-            except OSError:
-                # Posted without being kept, a lost answer could not be
-                # retried with the same body. Applying is idempotent: the
-                # next tick asks under the old revision, applies again and
-                # tries to keep the ack again.
-                logger.exception("Could not keep the ack of queue revision %s, so it is not posted; applied "
-                                 "again at the next tick", fisqua_outbox.scrub(new_revision))
-                return {"status": "ack_not_kept", "operators": operators["status"]}
-            stopped = _settle_ack(transport, ack, now)
-            if stopped is not None:
-                return {**stopped, "operators": operators["status"]}
-            return {"status": "applied", "revision": new_revision, "created": report["created"],
-                    "updated": report["updated"], "hidden": report["hidden"], "skipped": report["skipped"],
-                    "operators": operators["status"]}
-        except Exception:
-            db.rollback()
-            logger.exception("The Fisqua queue sync raised")
-            return {"status": "error"}
+                logger.exception("The Fisqua queue sync raised")
+                return {"status": "error"}
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)

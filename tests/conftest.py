@@ -379,6 +379,24 @@ def _clean_process_state():
     restart_latch._reset_for_tests()
 
 
+@pytest.fixture(autouse=True)
+def _dump_recipient(monkeypatch):
+    """A valid age recipient for the catalogue dump, so a test that configures offsite upload has
+    a unit whose backup prerequisites are all met (app.core.unit_mode.prerequisites), as a unit
+    set up for the bucket has. A test of a missing or invalid recipient sets its own value.
+
+    In the environment as well as on the settings: override_projects_root reloads
+    app.core.config, and the reloaded settings read the environment.
+    """
+    import pyrage
+    from app.core import config
+
+    key = str(pyrage.x25519.Identity.generate().to_public())
+    monkeypatch.setenv("CAPTUA_OFFSITE_DUMP_RECIPIENT", key)
+    monkeypatch.setattr(config.settings, "OFFSITE_DUMP_RECIPIENT", key, raising=False)
+    return key
+
+
 class _UnstartedThread:
     """What the CHDK backend's _start_thread returns in a test: nothing ran."""
 

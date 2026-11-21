@@ -82,9 +82,9 @@ logger = logging.getLogger(__name__)
 JOURNAL_NAME = "adopt-captures.journal"
 JOURNAL_VERSION = 1
 CATEGORY = "system"
-COMPLETED_ACTION = "volume_captures_adoption_completed_at_startup"
-REVERTED_ACTION = "volume_captures_adoption_reverted_at_startup"
-UNFINISHED_ACTION = "volume_captures_adoption_unfinished"
+RECOVERY_COMPLETED_ACTION = "volume_captures_adoption_completed_at_startup"
+RECOVERY_REVERTED_ACTION = "volume_captures_adoption_reverted_at_startup"
+RECOVERY_UNFINISHED_ACTION = "volume_captures_adoption_unfinished"
 
 UNFINISHED_MESSAGE = ("An earlier adoption of captures did not finish, and its journal ({path}) is still there. "
                       "Restart the backend to finish or undo it; if that does not clear it, the unit's system "
@@ -458,7 +458,7 @@ def _recover(db: Session, journal: dict) -> dict:
             _append_lines(target_root, missing)
         sync_journal_directories(journal)
         remove_journal()
-        return _done(db, journal, COMPLETED_ACTION, "INFO", "completed",
+        return _done(db, journal, RECOVERY_COMPLETED_ACTION, "INFO", "completed",
                      f"renamed={len(todo)} lines_appended={len(missing)}")
     for src, dst in reversed(todo):
         _rename(src, dst)
@@ -469,7 +469,7 @@ def _recover(db: Session, journal: dict) -> dict:
             pass  # not empty, or already gone
     sync_journal_directories(journal)
     remove_journal()
-    return _done(db, journal, REVERTED_ACTION, "WARN", "reverted", f"put_back={len(todo)}")
+    return _done(db, journal, RECOVERY_REVERTED_ACTION, "WARN", "reverted", f"put_back={len(todo)}")
 
 
 def _subject(journal: Optional[dict]) -> Optional[str]:
@@ -493,7 +493,7 @@ def _unfinished(db: Session, journal: Optional[dict], reason: str) -> dict:
     path = journal_file()
     logger.error(f"Adoption recovery: nothing was changed, and {path} is kept for repair by hand: {reason}")
     detail = f"journal kept at {path}, repair by hand: {reason}"
-    audit.log_event(db, level="ERR", category=CATEGORY, action=UNFINISHED_ACTION,
+    audit.log_event(db, level="ERR", category=CATEGORY, action=RECOVERY_UNFINISHED_ACTION,
                     actor=journal.get("actor") if journal else None, subject=_subject(journal),
                     detail=detail[:500])
     return {"outcome": "unfinished", "reason": reason}

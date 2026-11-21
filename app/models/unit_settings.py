@@ -9,6 +9,17 @@
 - `default_project_id`: the project every new volume goes into while
   projects are hidden. Null until first needed; set null if that project
   is deleted, and chosen again at the next need.
+- `testing_enabled`: whether an admin has switched the testing space on
+  (app.core.testing_space).
+- `testing_user_id`: the unit's one testing account; set null if that
+  account is deleted.
+- `testing_expiry_days`: how many days a testing volume is kept before it
+  is due to be removed after its last capture; at least 1
+  (check_unit_settings_testing_expiry_days).
+- `testing_reserve_gb`: the free space, in GB of 10^9 bytes, kept for real
+  work on the file system that holds the active projects root; below it
+  the testing account's captures are refused (app.core.testing_space,
+  refuse_below_reserve). 1 to 10000 (check_unit_settings_testing_reserve_gb).
 - `updated_at`, `updated_by`: the last change, and the username that made it
   (null for the unit itself).
 
@@ -19,13 +30,17 @@ Version: 0.3.3
 
 from datetime import datetime, timezone
 
-from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, false
+from sqlalchemy import Boolean, CheckConstraint, Column, DateTime, ForeignKey, Integer, String, false, text
 
 from app.core.db import Base
 
 MODES = ("offline", "backup", "fisqua")
 MODE_CHECK = "mode IN ('offline','backup','fisqua')"
 SINGLE_ROW_CHECK = "id = 1"
+TESTING_EXPIRY_CHECK = "testing_expiry_days >= 1"
+DEFAULT_TESTING_EXPIRY_DAYS = 30
+TESTING_RESERVE_CHECK = "testing_reserve_gb >= 1 AND testing_reserve_gb <= 10000"
+DEFAULT_TESTING_RESERVE_GB = 20
 
 
 def _utcnow() -> datetime:
@@ -39,10 +54,19 @@ class UnitSettings(Base):
     mode = Column(String(16), nullable=False)
     projects_enabled = Column(Boolean, nullable=False, default=False, server_default=false())
     default_project_id = Column(Integer, ForeignKey("projects.id", ondelete="SET NULL"), nullable=True)
+    testing_enabled = Column(Boolean, nullable=False, default=False, server_default=false())
+    testing_user_id = Column(Integer, ForeignKey("users.id", ondelete="SET NULL",
+                                                 name="unit_settings_testing_user_id_fkey"), nullable=True)
+    testing_expiry_days = Column(Integer, nullable=False, default=DEFAULT_TESTING_EXPIRY_DAYS,
+                                 server_default=text(str(DEFAULT_TESTING_EXPIRY_DAYS)))
+    testing_reserve_gb = Column(Integer, nullable=False, default=DEFAULT_TESTING_RESERVE_GB,
+                                server_default=text(str(DEFAULT_TESTING_RESERVE_GB)))
     updated_at = Column(DateTime, nullable=False, default=_utcnow)
     updated_by = Column(String(150), nullable=True)
 
     __table_args__ = (
         CheckConstraint(MODE_CHECK, name="check_unit_settings_mode"),
         CheckConstraint(SINGLE_ROW_CHECK, name="check_unit_settings_single_row"),
+        CheckConstraint(TESTING_EXPIRY_CHECK, name="check_unit_settings_testing_expiry_days"),
+        CheckConstraint(TESTING_RESERVE_CHECK, name="check_unit_settings_testing_reserve_gb"),
     )

@@ -1,7 +1,7 @@
 """offsite_objects.retired_at, retired_image_id: keys an adoption retires (NEH-387)
 
 Revision ID: c8e0a2f4b6d9
-Revises: b6d8f0a2c4e7
+Revises: c8e2a4f6b0d1
 Create Date: 2026-11-19 12:00:00.000000
 
 An adoption of a hand-made volume's captures renames each file and uploads
@@ -34,7 +34,7 @@ import sqlalchemy as sa
 
 # revision identifiers, used by Alembic.
 revision: str = 'c8e0a2f4b6d9'
-down_revision: Union[str, None] = 'b6d8f0a2c4e7'
+down_revision: Union[str, None] = 'c8e2a4f6b0d1'
 branch_labels: Union[str, Sequence[str], None] = None
 depends_on: Union[str, Sequence[str], None] = None
 

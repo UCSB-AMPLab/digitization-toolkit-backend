@@ -97,8 +97,17 @@ def _run_migration(engine, fn):
 
 @pytest.mark.unit
 def test_the_migration_follows_unit_settings(backend_root):
+    import re
     mod = _load_migration(backend_root)
     assert mod.revision == REVISION and mod.down_revision == "d7f9a1c3e5b2"
+    revisions, downs = set(), set()
+    for path in (backend_root / "alembic" / "versions").glob("*.py"):
+        text = path.read_text()
+        revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
+        downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
+    # Later revisions follow this one, and there is one head (test_offsite_retired_keys.py).
+    assert REVISION in downs
+    assert len(revisions - downs) == 1
     assert "marks no existing volume" in mod.__doc__
 
 

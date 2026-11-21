@@ -29,9 +29,9 @@ and unsent rows go out if the unit returns to fisqua. The offsite hold
 file keeps its meaning in every mode.
 
 **Starting mode.** The backend writes the row at start-up (initialise):
-`fisqua` when Fisqua is configured, else `backup` when offsite upload is,
-else `offline`, with projects off; logged `unit_mode_initialised` with
-the mode and why. Until a row exists (a unit not yet restarted on this
+`fisqua` when all its prerequisites are met, else `backup` when all its
+are, else `offline`, with projects off (inferred, which reads
+prerequisites); logged `unit_mode_initialised` with the mode and why. Until a row exists (a unit not yet restarted on this
 release, or a test), current() answers that inferred mode without
 writing it. Anything that needs the row (a change, the default project)
 writes it, with the same inference and the same log line.
@@ -157,14 +157,18 @@ class UnitState:
 
 
 def inferred() -> tuple[str, str]:
-    """The mode the unit's configuration implies, and why."""
-    from app.core import fisqua_outbox, image_upload
+    """The mode the unit's configuration implies, and why.
 
-    if fisqua_outbox.fisqua_configured():
-        return FISQUA, "Fisqua is configured (environment, token and offsite tenant)"
-    if image_upload.is_enabled():
-        return BACKUP, "offsite upload is configured (remote and tenant) and Fisqua is not"
-    return OFFLINE, "neither offsite upload nor Fisqua is configured"
+    The first of fisqua, backup and offline whose prerequisites are all met,
+    read from prerequisites() itself, so a unit with no stored mode never
+    starts in a mode a switch to it would refuse. offline has none.
+    """
+    missing = prerequisites()
+    if not missing[FISQUA]:
+        return FISQUA, "Fisqua, offsite upload and the catalogue dump are configured"
+    if not missing[BACKUP]:
+        return BACKUP, "offsite upload and the catalogue dump are configured and Fisqua is not"
+    return OFFLINE, "backup mode lacks " + ", ".join(missing[BACKUP])
 
 
 def _row(db: Session, lock: bool = False):
@@ -468,9 +472,12 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
 
 
 def _any_kept(db: Session) -> bool:
+    """Whether any volume but a testing one is kept: testing volumes are kept for good and ask for no decision."""
     from app.models.collection import Collection
 
-    return db.query(Collection.id).filter(Collection.kept_on_unit.is_(True)).first() is not None
+    return (db.query(Collection.id)
+            .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
+            .first() is not None)
 
 
 DETAIL_MAX = 500  # system_logs.detail, as _log_in_session cuts it
@@ -504,10 +511,14 @@ def _decide_kept(db: Session, kept: str, actor: Optional[str]) -> None:
     lock_for_reparent and refuse_kept_move take them (app.core.kept_volumes,
     "Lock order"). It holds the unit_settings row first, which none of
     those take, so that lock cannot close a cycle either.
+
+    Testing volumes (app.core.testing_space) are not among them: they stay
+    kept whatever the decision, and are neither locked nor counted.
     """
     from app.models.collection import Collection
 
-    ids = [cid for (cid,) in db.query(Collection.id).filter(Collection.kept_on_unit.is_(True))
+    ids = [cid for (cid,) in db.query(Collection.id)
+           .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
            .order_by(Collection.id).with_for_update(key_share=True).all()]
     if not ids:
         return
@@ -549,21 +560,75 @@ def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], trans
 
 
 # ---------------------------------------------------------------------------
+# The testing space's settings (app.core.testing_space)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TestingSettings:
+    enabled: bool
+    user_id: Optional[int]
+    expiry_days: int
+    reserve_gb: int
+
+
+def _testing_settings(row) -> TestingSettings:
+    from app.models.unit_settings import DEFAULT_TESTING_EXPIRY_DAYS, DEFAULT_TESTING_RESERVE_GB
+
+    if row is None:
+        return TestingSettings(False, None, DEFAULT_TESTING_EXPIRY_DAYS, DEFAULT_TESTING_RESERVE_GB)
+    return TestingSettings(bool(row.testing_enabled), row.testing_user_id, row.testing_expiry_days,
+                           row.testing_reserve_gb)
+
+
+def testing_settings(db: Session) -> TestingSettings:
+    """The stored testing settings, or, with no row yet, the space off with the default expiry and reserve. Reads only."""
+    return _testing_settings(_row(db))
+
+
+def lock_testing_settings(db: Session) -> TestingSettings:
+    """The testing settings with the row FOR UPDATE, the row inserted (and logged) when missing. Not committed.
+
+    For app.core.testing_space's changes, taken before the testing account
+    is read, so two changes of the space or its account run one after the
+    other. The caller holds no uncommitted change of its own (_ensure_row).
+    """
+    return _testing_settings(_ensure_row(db))
+
+
+def store_testing_settings(db: Session, *, actor: Optional[str], enabled: bool, user_id: Optional[int],
+                           expiry_days: int, reserve_gb: int) -> None:
+    """Write the testing settings to the row lock_testing_settings holds; committed with the caller's change."""
+    row = _row(db, lock=True)
+    if (bool(row.testing_enabled), row.testing_user_id, row.testing_expiry_days, row.testing_reserve_gb) == (
+            bool(enabled), user_id, expiry_days, reserve_gb):
+        return
+    row.testing_enabled = bool(enabled)
+    row.testing_user_id = user_id
+    row.testing_expiry_days = expiry_days
+    row.testing_reserve_gb = reserve_gb
+    row.updated_at = _now()
+    row.updated_by = actor
+
+
+# ---------------------------------------------------------------------------
 # The default project
 # ---------------------------------------------------------------------------
 
 def stored_default_project(db: Session):
-    """The stored default project, or None when none is stored or it no longer exists. Reads only."""
+    """The stored default project, or None when none is stored, its row is gone or it is a testing project. Reads only."""
     from app.models.project import Project
 
     project_id = current(db).default_project_id
-    return db.get(Project, project_id) if project_id is not None else None
+    project = db.get(Project, project_id) if project_id is not None else None
+    return project if project is not None and not project.testing else None
 
 
 def default_project(db: Session, actor: Optional[str]):
     """The project new volumes go into while projects are hidden: (project, created now). Commits.
 
-    The stored one when it still exists; else the only project when there is
+    Never a testing project (app.core.testing_space): a stored one that is
+    testing is passed over, and testing projects are not counted. The
+    stored one when it exists; else the only project when there is
     exactly one; else the project an import of a list named `default` would
     use, created when there is none (list_import._project_for, under the
     shared project lock, with no admin needed). The choice is stored and
@@ -577,12 +642,12 @@ def default_project(db: Session, actor: Optional[str]):
     row = _ensure_row(db)
     if row.default_project_id is not None:
         project = db.get(Project, row.default_project_id)
-        if project is not None:
+        if project is not None and not project.testing:
             db.commit()
             return project, False
     db.commit()
 
-    projects = db.query(Project).order_by(Project.id).limit(2).all()
+    projects = db.query(Project).filter(Project.testing.is_(False)).order_by(Project.id).limit(2).all()
     created = False
     if len(projects) == 1:
         project, how = projects[0], "the unit's only project"
@@ -594,7 +659,7 @@ def default_project(db: Session, actor: Optional[str]):
     row = _ensure_row(db)
     if row.default_project_id is not None and row.default_project_id != project_id:
         chosen = db.get(Project, row.default_project_id)
-        if chosen is not None:
+        if chosen is not None and not chosen.testing:
             # Another request stored one meanwhile; that one stands.
             db.commit()
             return chosen, False
@@ -697,40 +762,45 @@ def check_reference_code(db: Session, reference_code: str, *, transport=None,
         raise unreachable("config_error: the link is stopped until its configuration changes")
     # The gated transport: the lookup runs only in fisqua mode, so it needs no
     # bypass, and a switch out of fisqua made meanwhile stops it (off_in_this_mode).
+    owned = transport is None
     transport = transport if transport is not None else get_lookup_transport()
-    if isinstance(transport, NullTransport):
-        raise unreachable("not_configured")
-    if fisqua_outbox.call_budget.cooling():
-        raise unreachable("cooling_down")
-    if not fisqua_outbox.call_budget.take():
-        raise unreachable("rate_limited")
     try:
-        answer = transport.get_description(reference_code)
-    except Exception as exc:
-        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-    answer = fisqua_outbox._redacted(answer)
-    if answer.outcome == "description":
-        body = answer.response
-        answered = body.get(fc.F_REFERENCE_CODE) if isinstance(body, dict) else None
-        if not isinstance(answered, str):
-            raise unreachable(f"unreadable: the answer has no {fc.F_REFERENCE_CODE}")
-        if answered != reference_code:
-            # Not the description asked for: the code is not known as given.
-            raise CodeRefused(422, UNKNOWN_REFERENCE_CODE,
-                              UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code), reference_code)
-        return body
-    if answer.outcome == "unknown_code":
-        raise CodeRefused(422, UNKNOWN_REFERENCE_CODE, UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code),
-                          reference_code)
-    if answer.outcome == "unsupported":
-        raise CodeRefused(409, FISQUA_NO_LOOKUP, FISQUA_NO_LOOKUP_MESSAGE, reference_code,
-                          f"unsupported: HTTP {answer.status_code}")
-    if answer.outcome == "config_error":
-        fisqua_outbox.record_config_error(answer.status_code, answer.reason,
-                                          fisqua_outbox._naive(now) or fisqua_outbox._now())
-    elif answer.retry_after is not None:
-        fisqua_outbox.call_budget.cool_down(answer.retry_after)
-    raise unreachable(f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}")
+        if isinstance(transport, NullTransport):
+            raise unreachable("not_configured")
+        if fisqua_outbox.call_budget.cooling():
+            raise unreachable("cooling_down")
+        if not fisqua_outbox.call_budget.take():
+            raise unreachable("rate_limited")
+        try:
+            answer = transport.get_description(reference_code)
+        except Exception as exc:
+            answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+        answer = fisqua_outbox._redacted(answer)
+        if answer.outcome == "description":
+            body = answer.response
+            answered = body.get(fc.F_REFERENCE_CODE) if isinstance(body, dict) else None
+            if not isinstance(answered, str):
+                raise unreachable(f"unreadable: the answer has no {fc.F_REFERENCE_CODE}")
+            if answered != reference_code:
+                # Not the description asked for: the code is not known as given.
+                raise CodeRefused(422, UNKNOWN_REFERENCE_CODE,
+                                  UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code), reference_code)
+            return body
+        if answer.outcome == "unknown_code":
+            raise CodeRefused(422, UNKNOWN_REFERENCE_CODE, UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code),
+                              reference_code)
+        if answer.outcome == "unsupported":
+            raise CodeRefused(409, FISQUA_NO_LOOKUP, FISQUA_NO_LOOKUP_MESSAGE, reference_code,
+                              f"unsupported: HTTP {answer.status_code}")
+        if answer.outcome == "config_error":
+            fisqua_outbox.record_config_error(answer.status_code, answer.reason,
+                                              fisqua_outbox._naive(now) or fisqua_outbox._now())
+        elif answer.retry_after is not None:
+            fisqua_outbox.call_budget.cool_down(answer.retry_after)
+        raise unreachable(f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}")
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)
 
 
 def check_reference_codes(db: Session, codes) -> None:
@@ -840,38 +910,43 @@ def search_descriptions(db: Session, q: Optional[str], *, transport=None,
     if fisqua_outbox.config_error() is not None:
         raise SearchRefused(503, FISQUA_UNREACHABLE,
                             "config_error: the link is stopped until its configuration changes")
+    owned = transport is None
     transport = transport if transport is not None else get_lookup_transport()
-    if isinstance(transport, NullTransport):
-        raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
-    if fisqua_outbox.call_budget.cooling():
-        raise SearchRefused(429, RATE_LIMITED, "cooling_down",
-                            _seconds(fisqua_outbox.call_budget.cooling_for()))
-    if not fisqua_outbox.call_budget.take(reserve=fc.SEARCH_RESERVED_CALLS):
-        raise SearchRefused(429, RATE_LIMITED, "rate_limited")
     try:
-        answer = transport.search_descriptions(query)
-    except Exception as exc:
-        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-    answer = fisqua_outbox._redacted(answer)
-    if answer.outcome == "search":
-        results = answer.response.get(fc.F_RESULTS) if isinstance(answer.response, dict) else None
-        if not isinstance(results, list):
-            raise SearchRefused(503, FISQUA_UNREACHABLE, f"unreadable: the answer has no {fc.F_RESULTS} list")
-        entries = [e for e in (_search_entry(entry) for entry in results) if e is not None]
-        return {fc.F_RESULTS: entries[:fc.SEARCH_MAX_RESULTS]}
-    if answer.outcome == "unsupported":
-        return {fc.F_RESULTS: [], "search": False}
-    if answer.outcome == "query_too_short":
-        raise SearchRefused(400, QUERY_TOO_SHORT)
-    if answer.outcome == OFF_STATUS:
-        raise SearchRefused(409, OFF_STATUS)
-    if answer.outcome == "config_error":
-        fisqua_outbox.record_config_error(answer.status_code, answer.reason,
-                                          fisqua_outbox._naive(now) or fisqua_outbox._now())
-    elif answer.retry_after is not None:
-        fisqua_outbox.call_budget.cool_down(answer.retry_after)
-    error = f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}"
-    if answer.status_code == 429:
-        raise SearchRefused(429, RATE_LIMITED, error,
-                            _seconds(answer.retry_after) if answer.retry_after is not None else None)
-    raise SearchRefused(503, FISQUA_UNREACHABLE, error)
+        if isinstance(transport, NullTransport):
+            raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
+        if fisqua_outbox.call_budget.cooling():
+            raise SearchRefused(429, RATE_LIMITED, "cooling_down",
+                                _seconds(fisqua_outbox.call_budget.cooling_for()))
+        if not fisqua_outbox.call_budget.take(reserve=fc.SEARCH_RESERVED_CALLS):
+            raise SearchRefused(429, RATE_LIMITED, "rate_limited")
+        try:
+            answer = transport.search_descriptions(query)
+        except Exception as exc:
+            answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+        answer = fisqua_outbox._redacted(answer)
+        if answer.outcome == "search":
+            results = answer.response.get(fc.F_RESULTS) if isinstance(answer.response, dict) else None
+            if not isinstance(results, list):
+                raise SearchRefused(503, FISQUA_UNREACHABLE, f"unreadable: the answer has no {fc.F_RESULTS} list")
+            entries = [e for e in (_search_entry(entry) for entry in results) if e is not None]
+            return {fc.F_RESULTS: entries[:fc.SEARCH_MAX_RESULTS]}
+        if answer.outcome == "unsupported":
+            return {fc.F_RESULTS: [], "search": False}
+        if answer.outcome == "query_too_short":
+            raise SearchRefused(400, QUERY_TOO_SHORT)
+        if answer.outcome == OFF_STATUS:
+            raise SearchRefused(409, OFF_STATUS)
+        if answer.outcome == "config_error":
+            fisqua_outbox.record_config_error(answer.status_code, answer.reason,
+                                              fisqua_outbox._naive(now) or fisqua_outbox._now())
+        elif answer.retry_after is not None:
+            fisqua_outbox.call_budget.cool_down(answer.retry_after)
+        error = f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}"
+        if answer.status_code == 429:
+            raise SearchRefused(429, RATE_LIMITED, error,
+                                _seconds(answer.retry_after) if answer.retry_after is not None else None)
+        raise SearchRefused(503, FISQUA_UNREACHABLE, error)
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)

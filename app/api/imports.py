@@ -24,9 +24,11 @@ from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from app.api.activity import status_counts
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core.audit import log_event
+from app.core.project_names import ProjectDirectoryTaken
 from app.core.list_import import (
     ListHashNotRecorded,
     ProjectLockUnavailable,
@@ -138,6 +140,8 @@ def import_digitisation_list(
                              kept_on_unit=kept_on_unit, is_admin=current_user.role == "admin")
     except kept_volumes.KeepRefused as exc:
         raise HTTPException(status_code=exc.status, detail=exc.detail())
+    except ProjectDirectoryTaken as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
@@ -170,6 +174,7 @@ def import_digitisation_list(
 
 @router.get("/digitisation-lists")
 def list_digitisation_lists(
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
@@ -205,6 +210,10 @@ def list_digitisation_lists(
     [{captuaRecordId, pairId, side}], [] otherwise. A queue item's
     `doneMark` is kept by its itemId, so it follows the entry from one
     revision to the next; a file's by its position. Reads only.
+
+    An item is joined only to a volume of the caller's space
+    (app.core.testing_space.scope_query); one whose volume is in the other
+    space has `collectionId`, `projectId` and `status` null, as with no volume.
     """
     lists = stored_lists()
     # A stem the import would refuse is never bound: psycopg refuses a NUL
@@ -214,10 +223,10 @@ def list_digitisation_lists(
     volume_of: dict[str, tuple[int, int | None]] = {}
     hidden: set[int] = set()
     if stems:
-        rows = (db.query(Collection.filename_stem, Collection.id, Collection.project_id,
-                         Collection.queue_hidden_at)
-                .filter(Collection.filename_stem.in_(stems))
-                .all())
+        rows = scope_query(db.query(Collection.filename_stem, Collection.id, Collection.project_id,
+                                    Collection.queue_hidden_at)
+                           .filter(Collection.filename_stem.in_(stems)),
+                           Collection, current_user, space).all()
         volume_of = {stem: (cid, pid) for stem, cid, pid, _ in rows}
         hidden = {cid for _, cid, _, hidden_at in rows if hidden_at is not None}
     counts = status_counts(db, sorted({cid for cid, _ in volume_of.values()}))

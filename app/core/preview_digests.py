@@ -86,7 +86,8 @@ def backfill_preview_digests(db: Session, stem: str, *, apply: bool = False) -> 
 
     projects_dir = config.settings.projects_dir.resolve()
     volume_dir = projects_dir / stem
-    index = build_fixity_index(projects_dir)
+    from app.core.testing_space import manifest_filter
+    index = build_fixity_index(projects_dir, include=manifest_filter(db, bool(collection.testing), projects_dir))
 
     images = (db.query(RecordImage)
               .join(Record, RecordImage.record_id == Record.id)

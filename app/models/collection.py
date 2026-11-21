@@ -5,6 +5,7 @@ from sqlalchemy import event, inspect as sa_inspect, Boolean, Column, Integer, S
 from sqlalchemy.orm import Session, relationship, validates, object_session
 
 from app.core.db import Base
+from app.models.project import TestingSpaceError, refuse_testing_change
 from app.models.record import ImmutableFieldError, Record, RecordImage
 
 
@@ -129,6 +130,12 @@ class StemIsProjectDirectoryError(StemDirectoryCollisionError):
     """The stem is the directory name of a project."""
 
 
+def stem_is_project_directory_message(stem: str) -> str:
+    """The refusal of a stem that is a project's directory name. It names the stem sent, never the project."""
+    return (f"The file name stem {stem} is the directory of a project; "
+            "a volume's files and a project's tree cannot share it.")
+
+
 class StemDirectoryOccupiedError(StemDirectoryCollisionError):
     """`<projects root>/<stem>/` already holds files that are not the volume's."""
 
@@ -189,9 +196,7 @@ def stem_directory_conflict(session, stem=None, project_name=None, collection=No
         if stem is not None:
             for (name,) in session.query(Project.name).all():
                 if project_dir_name(name) == stem:
-                    return StemIsProjectDirectoryError(
-                        f"The file name stem {stem} is the directory of project {name!r}; "
-                        "a volume's files and a project's tree cannot share it.")
+                    return StemIsProjectDirectoryError(stem_is_project_directory_message(stem))
             if _stem_directory_is_someone_elses(session, stem, collection):
                 return StemDirectoryOccupiedError(
                     f"The directory {stem} already exists in the projects root and holds files that are "
@@ -199,6 +204,13 @@ def stem_directory_conflict(session, stem=None, project_name=None, collection=No
         if project_name is not None:
             directory = project_dir_name(project_name)
             if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
+                # The name as the caller sent it: a testing project's without the
+                # prefix, and its directory, which carries the prefix, not named.
+                from app.core.project_names import display_project_name
+                shown = display_project_name(project_name)
+                if shown != project_name:
+                    return ProjectNameIsStemError(
+                        f"The project name {shown!r} would use the directory of a volume's file name stem.")
                 return ProjectNameIsStemError(
                     f"The project name {project_name!r} would use the directory {directory}, "
                     "which is a volume's file name stem.")
@@ -292,6 +304,17 @@ class Collection(Base):
     # admin; cleared by an admin, or for every kept volume when an admin
     # switches out of offline mode and includes them.
     kept_on_unit = Column(Boolean, nullable=False, default=False, server_default=false())
+
+    # A testing volume (app.core.testing_space): testing work beside the
+    # real work, never copied offsite, never sent to Fisqua and never
+    # released into real work. Set at insert and never changed
+    # (_testing_is_fixed_at_insert); at insert it is the volume's project's,
+    # or its parent's (_a_volume_follows_its_project_or_parent). A testing
+    # volume is always kept on the unit (_a_testing_volume_stays_kept, and
+    # check_collection_testing_kept in the database).
+    testing = Column(Boolean, nullable=False, default=False, server_default=false())
+    # When a testing volume is due to be removed; null for every other volume.
+    testing_expires_at = Column(DateTime, nullable=True)
 
     # Relationships
     project = relationship("Project", back_populates="collections")
@@ -440,6 +463,25 @@ class Collection(Base):
         """reserves_its_stem() as an attribute, for CollectionRead."""
         return self.reserves_its_stem()
 
+    @validates("testing", include_removes=True)
+    def _testing_is_fixed_at_insert(self, key, value, is_remove):
+        return refuse_testing_change(self, value, is_remove)
+
+    @validates("kept_on_unit", include_removes=True)
+    def _a_testing_volume_stays_kept(self, key, value, is_remove):
+        """Refuse clearing kept_on_unit on a stored testing volume.
+
+        A testing volume is never released into real work, so its flag stays
+        set. Before insert the flag is free; the flush that inserts a testing
+        volume sets it (_a_volume_follows_its_project_or_parent). An ORM
+        attribute guard; check_collection_testing_kept refuses the same in
+        the database, for `query().update()` and raw SQL.
+        """
+        if sa_inspect(self).has_identity and self.testing and (is_remove or not value):
+            raise TestingSpaceError(
+                f"collections.kept_on_unit stays set on a testing volume (volume {self.id})")
+        return value
+
     @validates("capture_counter", include_removes=True)
     def _capture_counter_never_decreases(self, key, value, is_remove):
         """Refuse any write that would lower or clear a stored capture_counter.
@@ -512,6 +554,11 @@ class Collection(Base):
         CheckConstraint(
             'capture_counter >= 0',
             name='check_collection_capture_counter'
+        ),
+        # A testing volume is always kept on the unit.
+        CheckConstraint(
+            'NOT testing OR kept_on_unit',
+            name='check_collection_testing_kept'
         ),
         CheckConstraint(
             _EXTERNAL_ID_TRIMMED_POSTGRES,
@@ -671,12 +718,134 @@ def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances
     for stem, volume in new_stems.items():
         error = stem_directory_conflict(session, stem=stem, collection=volume)
         if error is None and stem in new_dirs:
-            error = StemIsProjectDirectoryError(
-                f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
-                "a volume's files and a project's tree cannot share it.")
+            error = StemIsProjectDirectoryError(stem_is_project_directory_message(stem))
         if error is not None:
             raise error
     for directory, project in new_dirs.items():
         error = stem_directory_conflict(session, project_name=project.name)
         if error is not None:
             raise error
+
+
+def _expected_testing(session, volume, seen=None) -> bool:
+    """Whether `volume`'s project, or its parent volume, is testing work.
+
+    A parent or a project in the same flush is read from its object; one not
+    yet given `testing` (still None before its insert) is read as its column
+    default, false, for a project, and for a volume as its own project's or
+    parent's in turn. Read without a lock: `testing` never changes after
+    insert.
+    """
+    from app.models.project import Project
+
+    seen = seen if seen is not None else set()
+    if id(volume) in seen:
+        return False
+    seen.add(id(volume))
+    parent = _pending_target(session, volume, "parent_collection", "parent_collection_id", Collection)
+    if parent is not None:
+        if parent.testing is not None:
+            return bool(parent.testing)
+        return _expected_testing(session, parent, seen)
+    project = _pending_target(session, volume, "project", "project_id", Project)
+    return bool(project.testing) if project is not None and project.testing is not None else False
+
+
+def _pending_target(session, volume, relationship_name, column_name, cls):
+    """The parent (or project) `volume` will have once flushed, through the relationship or the id.
+
+    An object assigned to the relationship since the load wins; then a
+    changed id; then the relationship cleared; then the stored id, or the
+    loaded relationship of a volume that has no id set.
+    """
+    attrs = sa_inspect(volume).attrs
+    relationship = attrs[relationship_name].history
+    if relationship.added:
+        return relationship.added[0]
+    target_id = getattr(volume, column_name)
+    if attrs[column_name].history.has_changes():
+        return session.get(cls, target_id) if target_id is not None else None
+    if relationship.deleted:
+        return None
+    if target_id is not None:
+        return session.get(cls, target_id)
+    return getattr(volume, relationship_name)
+
+
+@event.listens_for(Session, "before_flush")
+def _a_volume_follows_its_project_or_parent(session, flush_context, instances):
+    """Give a new volume its project's or its parent's `testing`; refuse one that differs.
+
+    Covers every writer through the ORM. A new volume with `testing` unset
+    takes the value of its parent volume, or of its project for a top-level
+    volume; one given a different value raises TestingSpaceError. A new
+    testing volume is kept on the unit, whatever kept_on_unit it was given:
+    a testing volume is always kept.
+
+    A stored volume given another parent or project through the ORM is
+    refused the same way when the new one's `testing` differs from its own.
+    The routes refuse such a move first, with a 409 `cross_space`
+    (app.core.testing_space.refuse_cross_space); POST
+    /projects/{id}/move-collections moves volumes with `query().update()`,
+    which goes around this, and refuses the move itself.
+    """
+    for obj in list(session.new):
+        if not isinstance(obj, Collection):
+            continue
+        expected = _expected_testing(session, obj)
+        if obj.testing is None:
+            obj.testing = expected
+        elif bool(obj.testing) != expected:
+            raise TestingSpaceError(
+                f"A volume's testing is its project's or its parent's: volume {obj.name!r} "
+                f"asked for {bool(obj.testing)}, its {'parent' if obj.parent_collection_id or obj.parent_collection else 'project'} "
+                f"is {expected}")
+        if obj.testing and not obj.kept_on_unit:
+            obj.kept_on_unit = True
+    for obj in list(session.dirty):
+        if not isinstance(obj, Collection) or obj in session.new:
+            continue
+        attrs = sa_inspect(obj).attrs
+        if not any(attrs[name].history.has_changes() for name in
+                   ("project_id", "parent_collection_id", "project", "parent_collection")):
+            continue
+        if bool(obj.testing) != _expected_testing(session, obj):
+            raise TestingSpaceError(
+                f"A volume cannot move between testing and real work (volume {obj.id})")
+
+
+@event.listens_for(Session, "before_flush")
+def _a_volumes_codes_are_in_its_spaces_namespace(session, flush_context, instances):
+    """Refuse a flush that gives a volume a stem, a reference code or (a real one) a name outside its space's namespace.
+
+    A testing volume's filename_stem and external_id, when set, begin with
+    app.core.project_names.TESTING_PREFIX (code `testing_name_required`);
+    a real volume's, and a real volume's name, never do, in any capitals,
+    accents or width (code `name_reserved`). Registered after _a_volume_follows_its_project_or_parent,
+    so a new volume's `testing` is already its project's or its parent's.
+    Only a new volume or a changed stem or external_id is checked.
+    `query().update()` and raw SQL go around it.
+    """
+    from app.core import testing_space
+
+    for obj in list(session.new) + list(session.dirty):
+        if not isinstance(obj, Collection):
+            continue
+        attrs = sa_inspect(obj).attrs
+        testing = bool(obj.testing) if obj.testing is not None else _expected_testing(session, obj)
+        # The reference code first, as the list import checks an item. A
+        # real volume's name is checked too: a volume without a stem keeps
+        # its files in a directory named after it, under its project's
+        # (capture.project_manager.collection_capture_root). A testing
+        # volume's name is free: its directory is its stem's, or inside
+        # its testing project's.
+        for field in ("external_id", "filename_stem", "name"):
+            if field == "name" and testing:
+                continue
+            if obj not in session.new and not attrs[field].history.has_changes():
+                continue
+            code = testing_space.namespace_problem(testing, getattr(obj, field))
+            if code is not None:
+                raise TestingSpaceError(
+                    f"{testing_space.NAMESPACE_MESSAGES[code]} (collections.{field})", code=code,
+                    field=f"collections.{field}")

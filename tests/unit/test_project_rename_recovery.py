@@ -50,8 +50,8 @@ def test_reconcile_finishes_db_when_files_already_moved(db_session, data_dir):
     """Crash after the FS move but before the commit: DB still old, files at new_root -> finish the DB side."""
     root = data_dir / "projects"
     old_root, new_root = root / "old", root / "new"
-    new_root.mkdir(parents=True)
-    (new_root / "img.jpg").write_text("x")
+    old_root.mkdir(parents=True)
+    (old_root / "img.jpg").write_text("x")
 
     p = _add_project(db_session, "old")
     rec = Record(title="r", project_id=p.id, status="in_review", capture_mode="single")
@@ -60,6 +60,8 @@ def test_reconcile_finishes_db_when_files_already_moved(db_session, data_dir):
     _add_image(db_session, rec.id, old_root / "img.jpg")
 
     so.write_rename_journal(p.id, "old", "new", old_root, new_root)
+    # The tree moved, and the crash came before the commit.
+    old_root.rename(new_root)
     so.reconcile_pending_rename(db_session)
 
     db_session.refresh(p)

@@ -345,7 +345,9 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         chunk = image_ids[start:start + 500]
         for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
             rows[(row.record_image_id, row.kind)] = row
-    index = build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter
+    projects_dir = config.settings.projects_dir.resolve()
+    index = build_fixity_index(projects_dir, include=manifest_filter(db, bool(collection.testing), projects_dir))
 
     capture_prefix = f"{tenant}/{stem}/{CAPTURES_DIR}/" if tenant and stem else None
     preview_prefix = f"{tenant}/{stem}/{PREVIEWS_DIR}/" if tenant and stem else None

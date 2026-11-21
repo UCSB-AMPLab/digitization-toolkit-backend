@@ -20,11 +20,23 @@ import capture.backends.gphoto2_backend as gb
 
 
 class _Session:
-    """Records the PTP widgets set and answers get_info from them."""
+    """Records the PTP widgets set and answers get_info from them.
+
+    The body answers a serial, so a format the settings route sets is kept
+    for it; the backend in this file has no registry, so it is kept on the
+    session only.
+    """
+
+    port = "usb:001,004"
+    model = "Canon EOS 1500D"
+    serial = "0123"
 
     def __init__(self, imageformat="L"):
         self.widgets = {"imageformat": imageformat}
         self.set_calls = []
+
+    def _get_config(self, key):
+        return self.widgets.get(key)
 
     def _set_config(self, key, value):
         self.set_calls.append((key, value))
@@ -42,6 +54,7 @@ def _backend(monkeypatch, session):
     monkeypatch.setattr(gb, "_GP_AVAILABLE", True)
     monkeypatch.setattr(gb, "gp", SimpleNamespace(GPhoto2Error=RuntimeError))
     backend = gb.GPhoto2Backend(logging.getLogger("test-gphoto2-image-format"))
+    backend._registry_factory = lambda: None
     monkeypatch.setattr(backend, "_get_or_open_session", lambda index: session)
     return backend
 

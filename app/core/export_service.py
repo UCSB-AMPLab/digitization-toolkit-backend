@@ -386,7 +386,7 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
 
 
 def _filtered_manifest_blob(db, collection, records):
-    """The capture records of this collection's current images, from every capture manifest.
+    """The capture records of this collection's current images, from every capture manifest of its space.
 
     The records are found the way the fixity gate finds checksums
     (app.core.integrity): in any manifest under the active projects root,
@@ -402,9 +402,14 @@ def _filtered_manifest_blob(db, collection, records):
     capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
     if not capture_ids:
         return None
-    root = config.settings.projects_dir.resolve()
-    own = root / collection.filename_stem if collection.filename_stem else None
-    kept = capture_record_lines(root, capture_ids, volume_root=own)
+    # Only the manifests of the volume's own space are read
+    # (app.core.testing_space.manifest_space), whatever capture ids its
+    # images carry: a real volume's bag never holds a testing capture's line.
+    from app.core.testing_space import manifest_filter
+    projects_dir = config.settings.projects_dir.resolve()
+    own = projects_dir / collection.filename_stem if collection.filename_stem else None
+    kept = capture_record_lines(projects_dir, capture_ids, volume_root=own,
+                                include=manifest_filter(db, bool(collection.testing), projects_dir))
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 
 

@@ -737,10 +737,15 @@ def test_the_object_is_age_ciphertext_for_the_configured_recipient(offsite, db_s
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
 ])
 def test_no_dump_is_uploaded_without_a_valid_recipient(offsite, db_session, monkeypatch, caplog, recipient):
+    """A unit stored in backup mode whose recipient is then lost or mistyped: without a stored
+    mode the unit would start offline (app.core.unit_mode.inferred) and take no dump at all."""
     from app.core.config import settings
     from app.models.system_log import SystemLog
+    from app.models.unit_settings import UnitSettings
 
     cb = offsite.module
+    db_session.add(UnitSettings(id=1, mode="backup", projects_enabled=False))
+    db_session.commit()
     monkeypatch.setattr(settings, "OFFSITE_DUMP_RECIPIENT", recipient, raising=False)
 
     with caplog.at_level(logging.ERROR, logger="app.core.catalogue_backup"):

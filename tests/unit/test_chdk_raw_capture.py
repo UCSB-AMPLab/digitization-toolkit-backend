@@ -385,6 +385,19 @@ def test_the_format_is_written_to_the_registry_under_the_bodys_identity(
 
 
 @pytest.mark.unit
+def test_the_settings_report_the_stored_format_as_stored_image_format(
+    monkeypatch, tmp_path
+):
+    backend = _registry_backend(monkeypatch, tmp_path)
+    assert backend.get_dslr_settings(0)["stored_image_format"] is None
+
+    updated = backend.apply_dslr_settings(0, {"image_format": "RAW+JPEG"})
+
+    assert updated["stored_image_format"] == updated["image_format"] == "RAW+JPEG"
+    assert backend.get_dslr_settings(0)["stored_image_format"] == "RAW+JPEG"
+
+
+@pytest.mark.unit
 def test_the_format_survives_a_backend_restart(monkeypatch, tmp_path):
     first = _registry_backend(monkeypatch, tmp_path)
     first.apply_dslr_settings(0, {"image_format": "RAW+JPEG"})

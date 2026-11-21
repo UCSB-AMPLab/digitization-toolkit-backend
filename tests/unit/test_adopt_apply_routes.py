@@ -176,3 +176,39 @@ def test_both_routes_refuse_an_unauthenticated_request(client, db_session, overr
     assert client.get(_url(src, tgt)).status_code == 401
     assert client.post(_url(src, tgt)).status_code == 401
     assert _snapshot(db_session, root) == before
+
+
+@pytest.mark.unit
+def test_an_adoption_naming_a_testing_volume_is_not_found_and_refused_below(
+        client, db_session, override_projects_root, tenant, empty_bucket):
+    """With a real session the space rule answers 404; the plan, and so the apply, refuses besides."""
+    from app.core.adopt_apply import AdoptRefused
+    from app.core.adopt_captures import plan_adopt_captures
+    from app.core.security import create_access_token
+    from app.models.user import User
+    from tests.unit.test_adopt_apply import _adopt
+    from tests.unit.test_adopt_captures_plan import _testing_volume
+
+    root = override_projects_root
+    src, tgt, _, _ = _setup(db_session, root)
+    testing = _testing_volume(db_session, "000903")
+    admin = User(username="adopt-admin", hashed_password="x", role="admin", is_active=True)
+    db_session.add(admin)
+    db_session.commit()
+    headers = {"Authorization": f"Bearer {create_access_token(str(admin.id))}"}
+    before = _snapshot(db_session, root)
+
+    for url in (_url(testing, tgt), _url(src, testing)):
+        for method in ("GET", "POST"):
+            r = client.request(method, url, headers=headers)
+            assert r.status_code == 404 and r.json()["detail"]["code"] == "not_found", (method, url, r.text)
+    assert _snapshot(db_session, root) == before
+
+    assert plan_adopt_captures(db_session, testing.id, tgt.id).refusals == ["source_testing_volume"]
+    with pytest.raises(AdoptRefused) as refused:
+        _adopt(db_session, src, testing)
+    assert refused.value.codes == ["target_testing_volume"]
+    with pytest.raises(AdoptRefused) as refused:
+        _adopt(db_session, testing, tgt)
+    assert refused.value.codes == ["source_testing_volume"]
+    assert _snapshot(db_session, root) == before

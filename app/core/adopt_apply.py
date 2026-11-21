@@ -7,10 +7,11 @@ lock taken is refused at once (`adoption_in_progress`). In this order:
 
 1. Both volumes are held for file changes (export_jobs.hold_for_file_changes)
    until the end, so no export of either runs and the offsite upload reads
-   neither (it gets FilesChanging and skips). A volume an export is queued
-   or running for, or whose files the upload is reading, is refused
-   (`volume_held`). The hold does not exclude another request that changes
-   files; the row locks below do.
+   neither (it gets FilesChanging and skips), and no USB copy of either
+   starts (export_jobs.hold_for_copy). A volume an export is queued or
+   running for, whose files the upload is reading, or which a USB copy is
+   reading, is refused (`volume_held`). The hold does not exclude another
+   request that changes files; the row locks below do.
 2. The plan is made once without locks, and any refusal ends the adoption
    there. Then the bucket is listed under `<tenant>/<target stem>/`, with
    no row locked: any object there refuses (`target_has_bucket_objects`),

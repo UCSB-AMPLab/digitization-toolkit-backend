@@ -22,8 +22,11 @@ order; `details` holds what each refers to. While an adoption's journal
 exists (app.core.adopt_journal), every adoption is refused
 (`adoption_unfinished`), whatever its volumes. Two images naming one
 thumbnail file are refused (`source_thumbnail_shared`): the file can be
-moved for only one of them. A source or target that does not exist, or the
-same volume twice, ends the checks there. A source or target
+moved for only one of them. A source or target that does not exist, the
+same volume twice, or a source or target that is testing work
+(app.core.testing_space.is_testing: `source_testing_volume`,
+`target_testing_volume`), ends the checks there: an adoption concerns real
+volumes only, and nothing moves between testing and real work. A source or target
 with a fisqua_outbox or fisqua_status row has been sent to Fisqua, and is
 refused. Without both stems, or without a projects root that can be
 written, no image is checked and no rename is built.
@@ -108,6 +111,8 @@ REFUSAL_CODES = (
     "source_not_found",                 # no volume has the source id
     "target_not_found",                 # no volume has the target id
     "same_volume",                      # the source is the target
+    "source_testing_volume",            # the source is testing work (app.core.testing_space)
+    "target_testing_volume",            # the target is testing work
     "source_has_no_stem",
     "target_has_no_stem",
     "target_not_assigned",              # the target has no Fisqua reference code (external_id)
@@ -272,6 +277,7 @@ def _plan(db: Session, source_id: int, target_id: int) -> AdoptPlan:
     from app.models.collection import Collection
 
     from app.core.adopt_journal import journal_exists
+    from app.core.testing_space import is_testing
 
     plan = AdoptPlan(source_id, target_id)
     if journal_exists():
@@ -284,6 +290,10 @@ def _plan(db: Session, source_id: int, target_id: int) -> AdoptPlan:
         plan.refuse("target_not_found")
     if source is not None and target is not None and source.id == target.id:
         plan.refuse("same_volume")
+    if source is not None and is_testing(db, collection_id=source.id):
+        plan.refuse("source_testing_volume")
+    if target is not None and is_testing(db, collection_id=target.id):
+        plan.refuse("target_testing_volume")
     if set(plan.refusals) - {"adoption_unfinished"}:
         plan._order()
         return plan

@@ -39,6 +39,7 @@ from app.core.audit import log_event
 from app.core import recapture_turn
 from app.core.export_jobs import export_jobs
 from app.core.storage_override import refuse_writes_under_unusable_root
+from app.core.testing_space import scope_query, space_query_param
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -233,7 +234,18 @@ def create_record(
 	under the volume's row lock (app/core/record_sequence.py); `sequence` in
 	the body is not used. A record outside a volume, or naming a volume that
 	does not exist, is given no sequence.
+
+	The testing account creates records in its own volumes only
+	(app.api.space.enforce_space refuses real ones): a testing record always
+	belongs to a testing volume, so one without `collection_id` is 400
+	`testing_record_needs_volume`, whatever project it names, and one naming
+	a place with no row is 404 `not_found`.
 	"""
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_record_without_volume(rec_in.collection_id)
+		if not testing_space.is_testing(db, project_id=rec_in.project_id, collection_id=rec_in.collection_id):
+			raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
 	sequence = None
 	if rec_in.collection_id is not None:
 		sequences = next_sequences(db, rec_in.collection_id, 1)
@@ -269,11 +281,12 @@ def list_records(
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""List all records with optional filtering."""
-	query = db.query(Record).options(joinedload(Record.images))
+	"""List the records of the caller's space (app.core.testing_space.scope_query), with optional filtering."""
+	query = scope_query(db.query(Record).options(joinedload(Record.images)), Record, current_user, space)
 	
 	if project_id is not None:
 		query = query.filter(Record.project_id == project_id)
@@ -305,11 +318,12 @@ def list_records(
 def count_records(
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Return the total number of records matching the given filters."""
-	query = db.query(Record)
+	"""Return the number of records of the caller's space matching the given filters."""
+	query = scope_query(db.query(Record), Record, current_user, space)
 	if project_id is not None:
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
@@ -348,6 +362,7 @@ def _to_retake_query(db: Session):
 
 @router.get("/to-retake", response_model=List[RecordToRetake])
 def list_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
@@ -367,10 +382,11 @@ def list_records_to_retake(
 	volume), name and id, so a record in no volume comes last; then by the
 	record's sequence (one without last) and id, so an operator works
 	through a volume in its own order. GET /to-retake/count counts the same
-	set.
+	set. Only the records of the caller's space are listed
+	(app.core.testing_space.scope_query).
 	"""
 	rows = (
-		_to_retake_query(db)
+		scope_query(_to_retake_query(db), Record, current_user, space)
 		.order_by(
 			Collection.filename_stem.asc().nulls_last(),
 			Collection.name.asc().nulls_last(),
@@ -405,16 +421,25 @@ def list_records_to_retake(
 
 @router.get("/to-retake/count")
 def count_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""How many records GET /records/to-retake lists, for the side menu's badge: the same pending set."""
+	"""How many records GET /records/to-retake lists, for the side menu's badge: the same pending set, in the caller's space."""
+	return {"count": _pending_in_space(db, current_user, space)}
+
+
+def _pending_in_space(db: Session, user: User, space: Optional[str]) -> int:
+	"""recapture_turn.pending_records, counted over the caller's space only."""
+	from sqlalchemy import func
 	from app.core import recapture_turn
-	return {"count": recapture_turn.pending_records(db)}
+	query = db.query(func.count(Record.id)).filter(recapture_turn.pending_clause())
+	return scope_query(query, Record, user, space).scalar() or 0
 
 
 @router.get("/to-retake/summary")
 def summarise_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
@@ -439,6 +464,12 @@ def summarise_records_to_retake(
 	committed while the summary is read cannot make them disagree, and a
 	volume left with no pending record is not listed. The same statement
 	runs on PostgreSQL and SQLite, with no array aggregate.
+
+	The volumes and pendingRecords are the caller's space's
+	(app.core.testing_space.scope_query). The turn is the unit's real
+	work's, read over every pending record of real work, as the capture
+	routes read it, whatever the caller's space: no testing record counts
+	for it and no testing volume is named by it (app.core.recapture_turn).
 	"""
 	from sqlalchemy import or_
 	from app.core import recapture_turn
@@ -446,12 +477,15 @@ def summarise_records_to_retake(
 
 	is_pending = recapture_turn.pending_clause()
 	ever_rejected = db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
-	rows = (
+	query = (
 		db.query(Collection.id, Collection.name, Collection.filename_stem,
 		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"),
 		         Record.status, recapture_turn.pending_reason_clause().label("pending_reason"))
 		.join(Record, Record.collection_id == Collection.id)
 		.filter(or_(is_pending, ever_rejected, Record.status == "excluded"))
+	)
+	rows = (
+		scope_query(query, Record, current_user, space)
 		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
 		.all()
 	)
@@ -485,11 +519,24 @@ def summarise_records_to_retake(
 			"missingSideRecordIds": vol["missing"],
 		})
 	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
-	pending_records = recapture_turn.pending_records(db)
+	from sqlalchemy import case, func, not_
+	from app.core.testing_space import lists_testing, testing_clause
+	in_space = testing_clause(Record)
+	if not lists_testing(current_user, space):
+		in_space = not_(in_space)
+	# One statement: the unit's pending records of real work, which decide
+	# the turn, and those of the caller's space, which pendingRecords gives.
+	real = recapture_turn.real_work_clause()
+	unit_pending, space_pending = (
+		db.query(func.coalesce(func.sum(case((real, 1), else_=0)), 0),
+		         func.coalesce(func.sum(case((in_space, 1), else_=0)), 0))
+		.filter(recapture_turn.pending_clause())
+		.one()
+	)
 	return {
-		"pendingRecords": pending_records,
+		"pendingRecords": int(space_pending or 0),
 		"volumes": volumes,
-		"turn": recapture_turn.turn(db, pending_records),
+		"turn": recapture_turn.turn(db, int(unit_pending or 0)),
 	}
 
 
@@ -533,6 +580,11 @@ def update_record(
 		data["collection_id"] = None
 	elif set_collection:
 		data["project_id"] = None
+	# A testing record always belongs to a testing volume: the testing
+	# account moves it between its volumes, never out of them.
+	from app.core import testing_space as _testing_space
+	if current_user.role == _testing_space.TESTING_ROLE and ("project_id" in data or "collection_id" in data):
+		_testing_space.refuse_record_without_volume(data.get("collection_id", rec.collection_id))
 
 	# Moving a record between collections is a withdrawal once it has been
 	# handed over, and the handover is a per-collection act by ruling
@@ -554,10 +606,12 @@ def update_record(
 			# its recovery decides by where the records are (app.core.adopt_journal).
 			from app.core.adopt_journal import refuse_if_journaled
 			refuse_if_journaled([rec.collection_id, new_parent[1]])
-			# Not between a volume Captua keeps on the unit and one it does
+			# Not between testing and real work (app.core.testing_space); not
+			# between a volume Captua keeps on the unit and one it does
 			# not, nor out of or into a kept one from outside every volume (NEH-320).
-			from app.core import kept_volumes
+			from app.core import kept_volumes, testing_space
 			try:
+				testing_space.refuse_cross_space(db, (rec.project_id, rec.collection_id), new_parent)
 				kept_volumes.refuse_kept_move(db, rec.collection_id, new_parent[1])
 			except kept_volumes.KeepRefused as exc:
 				db.rollback()
@@ -649,6 +703,11 @@ def delete_record(
 	files_to_unlink: List[Path] = []
 	for img in rec.images:
 		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path, db=db))
+	# The testing account's records are testing work: their files go only
+	# where the testing space's removal would take them (app.core.testing_space).
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		files_to_unlink = testing_space.testing_unlinks(db, files_to_unlink)
 
 	# An export of the record's collection reads these files; refused while one
 	# runs. No check of the storage root here: a delete creates nothing.
@@ -697,6 +756,11 @@ async def add_image_to_record(
 	# by the image insert's foreign-key check (FOR KEY SHARE), after the
 	# volume: the opposite order to a retake, and the two deadlock on
 	# PostgreSQL.
+	# The testing account writes no file while free space is below the
+	# reserve kept for real work (app.core.testing_space).
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_below_reserve(db)
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
@@ -719,6 +783,8 @@ async def add_image_to_record(
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
 	if volume_lacks_stem(db, rec.collection_id):
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+	# A testing volume a purge is removing takes no upload.
+	testing_space.refuse_volume_being_removed(rec.collection)
 
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
@@ -961,12 +1027,22 @@ def delete_image(
 		)
 	]
 	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings, db)
+	# The testing account's images are testing work: their files go only
+	# where the testing space's removal would take them (app.core.testing_space).
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		files_to_unlink = testing_space.testing_unlinks(db, files_to_unlink)
 
 	# An export of the record's collection reads this file if it is current;
 	# refused while one runs, and held from before the delete until the file
 	# is unlinked. A superseded image is not read by an export, so it is not
-	# held. No check of the storage root here: a delete creates nothing.
-	with export_jobs.hold_for_file_changes(_collection_of(rec) if img.is_current else []):
+	# held, unless a USB copy holds the volume (app.core.usb_copy): the copy
+	# chose its files when it started, and a retake since then supersedes
+	# images it is still reading. No check of the storage root here: a
+	# delete creates nothing.
+	held = _collection_of(rec)
+	with export_jobs.hold_for_file_changes(
+			held if img.is_current or export_jobs.copying(held) else []):
 		record_id = img.record_id
 		db.delete(img)
 
@@ -1804,7 +1880,10 @@ def close_missing_record(
 	was_pending = recapture_turn.record_is_pending(rec)
 	rec.closed_reason = payload.reason
 	rec.closed_note = payload.note.strip() if payload.note and payload.note.strip() else None
-	if was_pending and rec.collection_id is not None:
+	# The turn is real work's alone: closing a testing record takes no turn
+	# lock and completes nothing (app.core.recapture_turn).
+	from app.core.testing_space import is_testing
+	if was_pending and rec.collection_id is not None and not is_testing(db, collection_id=rec.collection_id):
 		# As a retake that leaves its volume with nothing pending
 		# (app.api.cameras._record_turn_events): the record's row, then the
 		# volume's, then the turn, and the event in this transaction.

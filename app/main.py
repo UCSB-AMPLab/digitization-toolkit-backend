@@ -1,6 +1,6 @@
 # Version: 0.3.3
 
-from fastapi import FastAPI, Request
+from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
 from fastapi.responses import JSONResponse
 from contextlib import asynccontextmanager
@@ -26,6 +26,7 @@ from app.api.activity import router as activity_router
 from app.api.imports import router as imports_router
 from app.api.fisqua import router as fisqua_router
 from app.api.network import router as network_router
+from app.api.space import enforce_space
 
 # How long the shutdown waits for the CHDK start-up scan to end before it
 # closes the backend. Closing waits for an enumeration in progress anyway;
@@ -134,6 +135,11 @@ async def lifespan(app: FastAPI):
     from app.core.fisqua_outbox import fisqua_status_scheduler
 
     fisqua_status_scheduler.start()
+    # Remove expired testing material every hour, whether the testing space
+    # is on or off (app.core.testing_space).
+    from app.core.testing_space import testing_expiry_scheduler
+
+    testing_expiry_scheduler.start()
     # Open the CHDK cameras now rather than at the first camera request, so
     # the keep-alive covers a body switched on before anyone opens the
     # dashboard. Last, so a start-up step that fails leaves no camera open.
@@ -149,6 +155,7 @@ async def lifespan(app: FastAPI):
     from app.core.fisqua_pairing_service import pairing_registry
 
     pairing_registry.shutdown()
+    testing_expiry_scheduler.stop()
     fisqua_status_scheduler.stop()
     image_upload_scheduler.stop()
     catalogue_backup_scheduler.stop()
@@ -191,17 +198,20 @@ app.add_middleware(
     expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "X-Page-Layout", "Retry-After"],
 )
 
-app.include_router(records_router, prefix="/records", tags=["records"])
-app.include_router(cameras_router, prefix="/cameras", tags=["cameras"])
-app.include_router(projects_router, prefix="/projects", tags=["projects"])
-app.include_router(collections_router, prefix="/collections", tags=["collections"])
-app.include_router(auth_router, prefix="/auth", tags=["auth"])
-app.include_router(users_router, prefix="/users", tags=["users"])
-app.include_router(system_router, prefix="/system", tags=["system"])
-app.include_router(activity_router, prefix="/activity", tags=["activity"])
-app.include_router(imports_router, prefix="/imports", tags=["imports"])
-app.include_router(fisqua_router, prefix="/fisqua", tags=["fisqua"])
-app.include_router(network_router, prefix="/network", tags=["network"])
+# Every router runs the testing space's access rule (app.api.space), so a
+# route added to any of them later runs it too.
+_SPACE = [Depends(enforce_space)]
+app.include_router(records_router, prefix="/records", tags=["records"], dependencies=_SPACE)
+app.include_router(cameras_router, prefix="/cameras", tags=["cameras"], dependencies=_SPACE)
+app.include_router(projects_router, prefix="/projects", tags=["projects"], dependencies=_SPACE)
+app.include_router(collections_router, prefix="/collections", tags=["collections"], dependencies=_SPACE)
+app.include_router(auth_router, prefix="/auth", tags=["auth"], dependencies=_SPACE)
+app.include_router(users_router, prefix="/users", tags=["users"], dependencies=_SPACE)
+app.include_router(system_router, prefix="/system", tags=["system"], dependencies=_SPACE)
+app.include_router(activity_router, prefix="/activity", tags=["activity"], dependencies=_SPACE)
+app.include_router(imports_router, prefix="/imports", tags=["imports"], dependencies=_SPACE)
+app.include_router(fisqua_router, prefix="/fisqua", tags=["fisqua"], dependencies=_SPACE)
+app.include_router(network_router, prefix="/network", tags=["network"], dependencies=_SPACE)
 
 
 from app.core.storage_override import StorageUnavailableError
@@ -237,6 +247,23 @@ async def reference_code_differs_from_stem(request: Request, exc: ReferenceCodeD
         "message": str(exc), "reason": exc.reason,
         "external_id": exc.external_id, "filename_stem": exc.filename_stem,
     }})
+
+
+from app.models.project import TestingSpaceError
+
+
+@app.exception_handler(TestingSpaceError)
+async def testing_space_refused(request: Request, exc: TestingSpaceError):
+    """A write that would put testing and real work together, refused at a flush that no route checked first.
+
+    The detail carries the code and its public message, never the stored
+    values the exception names.
+    """
+    from app.core import testing_space
+
+    code = exc.code or testing_space.CROSS_SPACE
+    message = testing_space.NAMESPACE_MESSAGES.get(code, testing_space.CROSS_SPACE_MESSAGE)
+    return JSONResponse(status_code=409, content={"detail": {"code": code, "message": message}})
 
 
 @app.get("/health")
