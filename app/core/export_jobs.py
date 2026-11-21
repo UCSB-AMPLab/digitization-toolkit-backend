@@ -1,6 +1,6 @@
 """In-process registry of background export jobs for the single-process appliance
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 
 import logging
@@ -55,6 +55,9 @@ FILES_CHANGING_MESSAGE = (
 FILES_BEING_READ_MESSAGE = (
     "Captua is preparing a file of this volume for the offsite copy. Try again in a moment."
 )
+USB_COPY_MESSAGE = (
+    "This volume is being copied to a USB drive. Try again once the copy has finished."
+)
 
 
 class FilesChanging(Exception):
@@ -72,6 +75,8 @@ class ExportJobRegistry:
         # Collections whose files the offsite upload is reading by path
         # (hold_for_reading), with how many such reads hold each one.
         self._reading: Counter = Counter()
+        # Collections a USB copy is reading (hold_for_copy, app.core.usb_copy).
+        self._copying: Counter = Counter()
 
     @contextmanager
     def hold_for_file_changes(
@@ -96,6 +101,8 @@ class ExportJobRegistry:
                     raise HTTPException(status_code=409, detail=message)
                 if self._reading[cid] > 0:
                     raise HTTPException(status_code=409, detail=FILES_BEING_READ_MESSAGE)
+                if self._copying[cid] > 0:
+                    raise HTTPException(status_code=409, detail=USB_COPY_MESSAGE)
             self._held.update(ids)
         try:
             yield
@@ -136,6 +143,34 @@ class ExportJobRegistry:
             with self._lock:
                 self._reading.subtract(ids)
                 self._reading += Counter()
+
+    @contextmanager
+    def hold_for_copy(self, collection_ids: Iterable[int]) -> Iterator[None]:
+        """Hold collections for the whole run of a USB copy (app.core.usb_copy).
+
+        As hold_for_reading, with its own count and message: raises
+        FilesChanging when a request holds any of the collections for file
+        changes; otherwise, until the block exits, hold_for_file_changes
+        refuses them with a 409 (USB_COPY_MESSAGE), so a move, a rename or
+        a delete of their files, and a purge of a testing volume
+        (app.core.testing_space.purge_volume), waits for the copy's end.
+        """
+        ids = set(collection_ids)
+        with self._lock:
+            if any(self._held[cid] > 0 for cid in ids):
+                raise FilesChanging(FILES_CHANGING_MESSAGE)
+            self._copying.update(ids)
+        try:
+            yield
+        finally:
+            with self._lock:
+                self._copying.subtract(ids)
+                self._copying += Counter()
+
+    def copying(self, collection_ids: Iterable[int]) -> bool:
+        """Whether a USB copy holds any of the collections now."""
+        with self._lock:
+            return any(self._copying[cid] > 0 for cid in set(collection_ids))
 
     def active_for(self, collection_id: int) -> Optional[ExportJob]:
         with self._lock:

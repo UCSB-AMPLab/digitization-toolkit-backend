@@ -94,6 +94,21 @@ class CollectionCreate(VolumeIdentityFields, CollectionBase):
         }
 
 
+class CollectionCreateRequest(CollectionCreate):
+    """The body POST /collections/ reads: CollectionCreate with `filename_stem` optional.
+
+    The testing account sends no stem: every testing volume is given one by
+    the backend (app.core.testing_space.series_stem). Every other caller's
+    body is validated again as CollectionCreate by the route, so a body
+    without a stem is still a 422 for it, with the errors pydantic gives.
+    """
+    filename_stem: Optional[str] = Field(
+        None, max_length=FILENAME_STEM_MAX_LENGTH, pattern=FILENAME_STEM_PATTERN,
+        description=("Lowercase slug the volume's image file names are built from, e.g. co-ahrb-aht-003; "
+                     "required for every caller but the testing account, which sends none"),
+    )
+
+
 class CollectionUpdate(VolumeIdentityFields):
     """Update a collection. All fields optional."""
     name: Optional[str] = Field(None, min_length=1, max_length=255)
@@ -131,6 +146,11 @@ class CollectionRead(CollectionBase):
     # Set at creation, by POST /collections/{id}/keep-on-unit, and cleared by
     # POST /collections/{id}/release-from-unit or a switch out of offline mode.
     kept_on_unit: bool = False
+    # Read-only (app.core.testing_space): whether the volume is testing work,
+    # and when it is due to be removed (its last capture plus the term, naive
+    # UTC); null for every real volume.
+    testing: bool = False
+    testing_expires_at: Optional[datetime] = None
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None

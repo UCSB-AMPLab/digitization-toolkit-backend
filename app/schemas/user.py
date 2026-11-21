@@ -5,7 +5,10 @@ from pydantic import BaseModel, field_validator
 from datetime import datetime
 import re
 
-VALID_ROLES = ("admin", "operator", "reviewer")
+# Every role a user row may hold. `testing` is the unit's one testing account
+# (app.core.testing_space): it is never given or taken away through
+# UserCreate or UserRoleUpdate, which accept the other three only.
+VALID_ROLES = ("admin", "operator", "reviewer", "testing")
 
 
 class UserCreate(BaseModel):

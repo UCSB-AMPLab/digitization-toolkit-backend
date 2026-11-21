@@ -6,6 +6,7 @@ from sqlalchemy.orm import Session
 from sqlalchemy import func
 from sqlalchemy.exc import IntegrityError
 from pydantic import BaseModel
+import contextlib
 import logging
 
 from app.core.export_jobs import export_jobs
@@ -23,6 +24,7 @@ from app.core.storage_ops import (
 )
 
 from app.api.deps import get_db_dependency
+from app.core.testing_space import TESTING_SPACE, scope_query, space_query_param
 from app.api.auth import get_current_user, RoleChecker
 from app.models.project import Project
 from app.models.project_member import ProjectMember
@@ -68,26 +70,146 @@ def create_project(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency)
 ):
-    if db.query(Project).filter(Project.name == payload.name).first():
+    """Create a project: a real one for an administrator, a testing one for the testing account.
+
+    An administrator's project is real, and its name may not lie in the
+    testing space's namespace (409 `name_reserved`). The testing account's
+    project is a testing project (`testing` set at insert): the name it
+    sends is its display name, at most display_name_max_length characters
+    and with a non-empty directory name of its own (422
+    `project_name_invalid`), stored with the project prefix
+    (app.core.testing_space.stored_project_name), and the response gives
+    the display name. A testing project takes the capture format sent,
+    JPEG when none is (checked_capture_format: 422
+    `capture_format_unavailable` for one the cameras do not offer); a
+    format sent for a real project is 422 `capture_format_not_testing`.
+    Both are refused before anything is written. The name and directory checks and the commit run
+    under the project lock (app.core.list_import.project_lock), as a rename
+    and a list import's project creation do; 503 when it cannot be taken.
+    """
+    from app.core import testing_space
+
+    testing = current_user.role == testing_space.TESTING_ROLE
+    capture_format = checked_capture_format(testing, payload.capture_format)
+    if testing and capture_format is None:
+        from app.models.project import DEFAULT_TESTING_CAPTURE_FORMAT
+        capture_format = DEFAULT_TESTING_CAPTURE_FORMAT
+    with _project_lock():
+        return _create_project_locked(payload, current_user, db, capture_format)
+
+
+@contextlib.contextmanager
+def _project_lock():
+    """Hold the project lock (app.core.list_import.project_lock) for the block; 503 when it cannot be taken."""
+    from app.core import list_import
+
+    with contextlib.ExitStack() as stack:
+        try:
+            stack.enter_context(list_import.project_lock())
+        except list_import.ProjectLockUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        yield
+
+
+def _create_project_locked(payload: ProjectCreate, current_user: User, db: Session,
+                           capture_format: Optional[str]) -> ProjectRead:
+    """The body of create_project, run under the project lock; capture_format is the checked one."""
+    from app.core import testing_space
+
+    testing = current_user.role == testing_space.TESTING_ROLE
+    if testing:
+        _refuse_a_testing_name_too_long(payload.name)
+    name = testing_space.stored_project_name(testing, payload.name)
+    _refuse_a_name_outside_its_namespace(testing, name)
+    if db.query(Project).filter(Project.name == name).first():
         raise HTTPException(status_code=409, detail="Project with this name already exists")
-    _refuse_a_name_that_is_a_stem(db, payload.name)
-    p = Project(name=payload.name, description=payload.description, fondo=payload.fondo, serie=payload.serie, signatura=payload.signatura, created_by=payload.created_by or current_user.username)
+    _refuse_a_taken_directory(db, name)
+    _refuse_a_name_that_is_a_stem(db, name)
+    p = Project(name=name, description=payload.description, fondo=payload.fondo, serie=payload.serie,
+                signatura=payload.signatura, created_by=payload.created_by or current_user.username,
+                testing=testing, capture_format=capture_format)
     db.add(p)
     db.commit()
     db.refresh(p)
-    # Creator is an admin, always an implicit collaborator — no explicit
-    # ProjectMember row needed (see list_project_members).
+    # An admin creator is always an implicit collaborator, so no explicit
+    # ProjectMember row is needed (see list_project_members); the testing
+    # account is never a project's member.
     return ProjectRead.model_validate(p)
+
+
+CAPTURE_FORMAT_NOT_TESTING = "capture_format_not_testing"
+CAPTURE_FORMAT_UNAVAILABLE = "capture_format_unavailable"
+
+
+def checked_capture_format(testing: bool, value: Optional[str]) -> Optional[str]:
+    """The capture format a project body sends, checked and in its current name; None when none is sent.
+
+    Only a testing project has a capture format: a non-null value for an
+    ordinary project is 422 `capture_format_not_testing`. For a testing
+    project the value is read as capture.backends.base.normalise_image_format
+    reads it ("RAW" is RAW+JPEG). JPEG is always taken. Any other format is
+    taken only when the cameras offer it: the image formats GET
+    /cameras/capabilities reports (app.api.cameras.offered_capture_formats).
+    A value that names no format, one not offered, and RAW+JPEG while the
+    capabilities cannot be read are 422 `capture_format_unavailable`.
+    """
+    from capture.backends.base import normalise_image_format
+
+    if not testing:
+        if value is not None:
+            raise HTTPException(status_code=422, detail={
+                "code": CAPTURE_FORMAT_NOT_TESTING,
+                "message": "Only a testing project has a capture format."})
+        return None
+    if value is None:
+        return None
+    image_format = normalise_image_format(value)
+    if image_format == "JPEG":
+        return image_format
+    from app.api.cameras import offered_capture_formats
+
+    offered = offered_capture_formats()
+    if image_format is None or offered is None or image_format not in offered:
+        raise HTTPException(status_code=422, detail={
+            "code": CAPTURE_FORMAT_UNAVAILABLE,
+            "message": "The unit's cameras do not offer this capture format.",
+            "offered": sorted(set(offered or []) | {"JPEG"})})
+    return image_format
+
+
+def _refuse_a_testing_name_too_long(name: str) -> None:
+    """422 project_name_invalid for a testing project's display name that is too long or folds to nothing.
+
+    Too long: longer than display_name_max_length, so the stored name would
+    not fit projects.name. Folds to nothing: project_dir_name of the display
+    name is empty, as a real project's name that gives no directory is
+    refused (project_names.refuse_empty_directory); the stored name's
+    directory would be the project prefix alone.
+    """
+    from app.core import testing_space
+    from app.core.paths import project_dir_name
+    from app.core.project_names import ProjectNameInvalid
+
+    if not project_dir_name(name):
+        exc = ProjectNameInvalid()
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if len(name) > testing_space.display_name_max_length():
+        exc = ProjectNameInvalid()
+        raise HTTPException(status_code=exc.status, detail={
+            "code": exc.code,
+            "message": f"A testing project's name is at most {testing_space.display_name_max_length()} characters."})
 
 
 @router.get("/", response_model=List[ProjectRead])
 def list_projects(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
-    items = db.query(Project).offset(skip).limit(limit).all()
+    """The projects of the caller's space (app.core.testing_space.scope_query)."""
+    items = scope_query(db.query(Project), Project, current_user, space).offset(skip).limit(limit).all()
     return [ProjectRead.model_validate(i) for i in items]
 
 
@@ -123,6 +245,13 @@ def add_record_to_project(
         raise HTTPException(status_code=404, detail="Record not found")
     if (r.project_id, r.collection_id) != (p.id, None):
         assert_movable(r)
+        # Not between testing and real work (app.core.testing_space).
+        from app.core import testing_space
+        try:
+            testing_space.refuse_cross_space(db, (r.project_id, r.collection_id), (p.id, None))
+        except testing_space.SpaceRefused as exc:
+            db.rollback()
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
         # A record whose images are in the bucket stays in its volume: their
         # keys are under the volume's stem and never change. Checked under the
         # record's lock, which the uploader takes before it writes a first
@@ -169,10 +298,44 @@ def remove_record_from_project(
         raise HTTPException(status_code=404, detail="Record not found on this project")
     # Detaching is a parent change too, and it orphans the record (NEH-260).
     assert_movable(r)
+    # A record in no place is real work, so out of a testing project it is
+    # a crossing (app.core.testing_space).
+    from app.core import testing_space
+    try:
+        testing_space.refuse_cross_space(db, (r.project_id, r.collection_id), (None, None))
+    except testing_space.SpaceRefused as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
     r.project_id = None
     db.add(r)
     db.commit()
     return {"detail": "record removed"}
+
+
+def _refuse_a_taken_directory(db: Session, name: str, project_id: Optional[int] = None) -> None:
+    """409 project_directory_taken when another project's directory is the one `name` would use.
+
+    422 project_name_invalid when `name` gives an empty directory name,
+    which would be the projects root itself.
+    """
+    from app.core.project_names import ProjectDirectoryTaken, refuse_empty_directory
+    from app.core.storage_ops import refuse_taken_project_directory
+
+    try:
+        refuse_empty_directory(name)
+        refuse_taken_project_directory(db, name, exclude_id=project_id)
+    except ProjectDirectoryTaken as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+
+
+def _refuse_a_name_outside_its_namespace(testing: bool, name: str) -> None:
+    """409 name_reserved for a real project's name in the testing space's namespace (app.core.testing_space)."""
+    from app.core import testing_space
+
+    try:
+        testing_space.refuse_namespace(testing, name, project=True)
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
 
 def _refuse_a_name_that_is_a_stem(db: Session, name: str) -> None:
@@ -196,18 +359,52 @@ def update_project(
     Migrated volumes keep their files in `<stem>/`, outside the tree, and a
     rename touches none of them. Files of a volume given a stem since the last
     startup are still in the tree: they move with it and their rows follow.
+
+    A testing project's capture format may be changed (checked_capture_format);
+    one sent for an ordinary project is 422 `capture_format_not_testing`.
     """
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
+    # Checked before anything is written or moved (checked_capture_format);
+    # None leaves the project's format as it is.
+    payload = payload.model_copy(update={
+        "capture_format": checked_capture_format(bool(p.testing), payload.capture_format)})
+    if not payload.name:
+        return _update_project_checked(db, p, payload)
+    # A rename checks the name and the directory, and commits, under the
+    # project lock, as POST /projects/ and the list import's project
+    # creation do, so no other create or rename checks a directory between
+    # this one's check and its commit. The export hold on the volumes with
+    # files in the tree is taken inside the lock, and the rename journal is
+    # written, the tree moved, and the journal cleared after the commit,
+    # all while the lock is held. The row is read again under the lock.
+    with _project_lock():
+        db.refresh(p)
+        return _update_project_checked(db, p, payload)
 
+
+def _update_project_checked(db: Session, p: Project, payload: ProjectUpdate) -> ProjectRead:
+    """The checks of update_project and the update itself; for a rename, run under the project lock."""
+    # The name sent is the project's display name: a testing project's is
+    # stored with the testing prefix (app.core.testing_space).
+    from app.core import testing_space
     old_name = p.name
+    if payload.name and p.testing:
+        # The stored name, with the prefix, would not fit projects.name: refused before anything moves.
+        _refuse_a_testing_name_too_long(payload.name)
+    if payload.name:
+        payload = payload.model_copy(update={"name": testing_space.stored_project_name(bool(p.testing), payload.name)})
     name_changed = bool(payload.name) and payload.name != old_name
     if name_changed:
+        # A real project's new name may not lie in the testing namespace.
+        _refuse_a_name_outside_its_namespace(bool(p.testing), payload.name)
         existing = db.query(Project).filter(Project.name == payload.name).first()
         if existing:
             raise HTTPException(status_code=409, detail="Project with this name already exists")
-        # Before the tree moves: its new directory may not be a volume's stem.
+        # Before the tree moves: its new directory may not be another project's.
+        _refuse_a_taken_directory(db, payload.name, p.id)
+        # Nor a volume's stem.
         _refuse_a_name_that_is_a_stem(db, payload.name)
 
     # A rename moves the project's whole tree, so every volume with files in
@@ -223,6 +420,9 @@ def update_project(
 def _update_project_held(db: Session, p: Project, payload: ProjectUpdate, old_name: str, name_changed: bool) -> ProjectRead:
     """The body of update_project, run while the project's collections are held against exports."""
     for field, value in payload.model_dump(exclude_unset=True).items():
+        # A project's capture format is never cleared through this route.
+        if field == "capture_format" and value is None:
+            continue
         setattr(p, field, value)
 
     # The whole on-disk tree (images, manifest, packages, the name-based
@@ -245,6 +445,13 @@ def _update_project_held(db: Session, p: Project, payload: ProjectUpdate, old_na
         if secure_project_filename(old_name) != secure_project_filename(p.name):
             old_root = project_capture_root(old_name)
             new_root = project_capture_root(p.name)
+            # A directory already there is never taken over, whether or not
+            # this project has a tree to move into it.
+            if new_root.exists():
+                from app.core.project_names import ProjectDirectoryTaken
+                db.rollback()
+                exc = ProjectDirectoryTaken()
+                raise HTTPException(status_code=exc.status, detail=exc.detail())
             # Record intent durably before the move so a crash between the move
             # and the commit is repairable at startup rather than left dangling.
             write_rename_journal(p.id, old_name, p.name, old_root, new_root)
@@ -303,7 +510,8 @@ def move_collections(
 ):
     """
     Move all top-level collections from this project to another project.
-    Sub-collections follow automatically through their parent FK.
+    Sub-collections follow automatically through their parent FK. Refused
+    (409 `cross_space`) between a testing project and a real one.
 
     The files of each moved volume that are in the name-based layout (every
     file of a volume without a stem, and those of a volume given a stem since
@@ -321,6 +529,14 @@ def move_collections(
         raise HTTPException(status_code=404, detail="Target project not found")
     if project_id == payload.target_project_id:
         raise HTTPException(status_code=400, detail="Source and target project must be different")
+    # Not between a testing project and a real one (app.core.testing_space):
+    # the volumes take their project's space, and the move below goes
+    # around the model's check.
+    from app.core import testing_space
+    try:
+        testing_space.refuse_cross_space(db, (project_id, None), (payload.target_project_id, None))
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
     # Full moved subtree (top-level collections plus their nested descendants)
     moved_collection_ids: list[int] = []
@@ -388,7 +604,11 @@ def delete_project(
 
     The project's capture manifest is not deleted: it is moved to
     `<projects root>/.retired-manifests/` first (retire_project_manifest),
-    where the fixity index keeps reading it.
+    where the fixity index keeps reading it. A testing project's manifest is
+    removed, never retired, and its directory removed when empty, on every
+    projects root the unit knows: only the files it holds by name are
+    deleted, and a directory that still holds anything else stays and is
+    logged (app.core.testing_space.remove_project_directory).
 
     Refuses (409) if the project still has collections or records (those must
     be moved or deleted first) or if its directory still holds files that a
@@ -414,6 +634,18 @@ def delete_project(
 
     project_dir = project_capture_root(project_name)
 
+    # A directory another project's name also maps to (two projects that
+    # shared one before the rule refused it) is that project's too: it is
+    # neither retired nor removed, and the log says so.
+    from app.core.storage_ops import projects_sharing_directory
+    if projects_sharing_directory(db, project_name, exclude_id=p.id):
+        db.delete(p)
+        db.commit()
+        log_event(db, level="WARN", category="activity", action="project_deleted",
+                  actor=current_user.username, subject=project_name,
+                  detail=f"directory {project_dir.name} left in place: another project's name maps to it")
+        return {"detail": "project deleted; its directory was left in place, another project uses it"}
+
     # Hard guard: never remove a directory that still holds a surviving record's files
     if surviving_images_under(db, project_dir):
         raise HTTPException(
@@ -432,14 +664,30 @@ def delete_project(
             detail="Project directory holds a capture manifest other than its own. Move it out first.",
         )
     try:
-        retire_project_manifest(project_dir)
+        # A testing project's manifest goes with its directory and is never
+        # retired: no reader is left a manifest of testing work to classify.
+        if not p.testing:
+            retire_project_manifest(project_dir)
     except OSError as e:
         logger.error(f"Failed to retire the capture manifest of {project_dir}: {e}")
         raise HTTPException(status_code=500, detail="Failed to keep the project's capture manifest; nothing was deleted")
 
     # Remove files first so a filesystem failure aborts before touching the DB
     try:
-        remove_tree(project_dir)
+        if p.testing:
+            # Only the files a testing project's directory holds by name (its
+            # manifests), on every projects root the unit knows, then the
+            # directory when it is empty (app.core.testing_space).
+            from app.core import testing_space
+            from app.core.storage_override import StorageUnavailableError
+            left = testing_space.remove_project_directory(db, project_name)
+            if left is None:
+                raise StorageUnavailableError(
+                    "A storage drive that holds testing files cannot be read now. Reconnect it, then delete "
+                    "the project again.")
+            testing_space.log_files_left(db, left)
+        else:
+            remove_tree(project_dir)
     except OSError as e:
         logger.error(f"Failed to remove project directory {project_dir}: {e}")
         raise HTTPException(status_code=500, detail="Failed to remove project files from disk")
@@ -500,15 +748,20 @@ def list_project_records(
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
-    """List all records associated with a project."""
+    """List the records associated with a project, those of the project's space only.
+
+    app.api.space.enforce_space has refused a project outside the caller's
+    space; an administrator reads a testing project's records here.
+    """
     p = db.query(Project).filter(Project.id == project_id).first()
     if not p:
         raise HTTPException(status_code=404, detail="Project not found")
     
     from app.schemas.record import RecordRead
-    recs = db.query(Record).filter(
+    space = TESTING_SPACE if current_user.role == "admin" and p.testing else None
+    recs = scope_query(db.query(Record).filter(
         Record.project_id == project_id
-    ).offset(skip).limit(limit).all()
+    ), Record, current_user, space).offset(skip).limit(limit).all()
     
     return [RecordRead.model_validate(r) for r in recs]
 
@@ -594,6 +847,12 @@ def add_project_member(
     target_user = db.query(User).filter(User.id == payload.user_id).first()
     if not target_user:
         raise HTTPException(status_code=404, detail="User not found")
+    # The testing account is managed through the unit's testing settings only.
+    from app.core import testing_space
+    try:
+        testing_space.refuse_testing_account(target_user)
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
     existing = db.query(ProjectMember).filter(
         ProjectMember.project_id == project_id,

@@ -50,8 +50,13 @@ _optional_bearer = HTTPBearer(auto_error=False)
 # Bearer requests skip the check: a browser never adds an Authorization header
 # on its own.
 #
-# Tokens stay stateless. Logout clears the cookie, but a token copied out of
-# it remains valid until its exp; the backend keeps no revocation list.
+# Tokens are signed, not stored. A token carries its user's session
+# generation (`ver`, users.token_version; 0 when absent), and every route
+# that reads a token to a user refuses one whose `ver` is not the user's
+# current value (_token_is_current). Raising token_version ends every
+# session of that user; app.core.testing_space does so when it deactivates
+# the testing account or gives it a new password. Logout clears the cookie,
+# but a token copied out of it remains valid until its exp.
 # ---------------------------------------------------------------------------
 
 SESSION_COOKIE_NAME = "dtk_session"
@@ -122,6 +127,14 @@ def _session_token(
     return cookie, "cookie"
 
 
+def _token_is_current(payload: dict, user: User) -> bool:
+    """Whether a token's session generation (`ver`, 0 when absent) is the user's current one."""
+    try:
+        return int(payload.get("ver", 0)) == int(user.token_version or 0)
+    except (TypeError, ValueError):
+        return False
+
+
 def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None:
     """Gate first-user admin bootstrap behind a local trust factor.
 
@@ -172,6 +185,8 @@ def register(
         caller = db.query(User).filter(
             User.id == int(token_payload.get("sub")), User.is_active == True
         ).first()
+        if caller is not None and not _token_is_current(token_payload, caller):
+            raise HTTPException(status_code=401, detail="Invalid or expired token")
         if not caller or caller.role != "admin":
             raise HTTPException(status_code=403, detail="Only admins can register new users")
 
@@ -203,6 +218,15 @@ def register(
               actor=actor, subject=user.username)
     _operators_changed(background_tasks)
     return UserRead.model_validate(user)
+
+
+def _refuse_testing_account(user: User, status: int = 409) -> None:
+    """The testing account is managed only through the unit's testing settings (app.core.testing_space)."""
+    from app.core import testing_space
+    try:
+        testing_space.refuse_testing_account(user, status)
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
 
 def _operators_changed(background_tasks: Optional[BackgroundTasks]) -> None:
@@ -243,27 +267,44 @@ def login(payload: UserLogin, request: Request, response: Response, db: Session 
         raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.",
                             headers={"Retry-After": str(retry)})
 
-    user = db.query(User).filter(User.username == payload.username).first()
-    if not user or not verify_password(payload.password, user.hashed_password):
+    def refuse_credentials():
         login_throttle.record_failure(acct_key, ip_key)
         log_event(db, level="WARN", category="access", action="login_failed",
                   actor=payload.username)
         raise HTTPException(status_code=401, detail="Invalid credentials")
-    if not user.is_active:
+
+    # The login decides on this one read: the hash checked, the active flag
+    # and the session generation the token carries are all taken here, so a
+    # password change or a deactivation committed during the slow password
+    # check leaves this login with a token of the generation it ended.
+    user = db.query(User).filter(User.username == payload.username).first()
+    if not user:
+        refuse_credentials()
+    user_id, username = user.id, user.username
+    stored_hash, active, version = user.hashed_password, bool(user.is_active), int(user.token_version or 0)
+    if not verify_password(payload.password, stored_hash):
+        refuse_credentials()
+    if not active:
         log_event(db, level="WARN", category="access", action="login_failed",
-                  actor=user.username, detail="cuenta inactiva")
+                  actor=username, detail="cuenta inactiva")
         raise HTTPException(status_code=403, detail="User is inactive")
 
     # Success: clear the throttle counters and upgrade a legacy/weak hash while we still hold the plaintext
     login_throttle.reset(acct_key, ip_key)
-    if needs_rehash(user.hashed_password):
-        user.hashed_password = hash_password(payload.password)
-        db.add(user)
+    if needs_rehash(stored_hash):
+        # Written only over the hash that was verified: a password set
+        # meanwhile is never replaced, and this login is refused.
+        upgraded = (db.query(User)
+                    .filter(User.id == user_id, User.hashed_password == stored_hash)
+                    .update({User.hashed_password: hash_password(payload.password)},
+                            synchronize_session=False))
         db.commit()
+        if upgraded != 1:
+            refuse_credentials()
 
     log_event(db, level="INFO", category="access", action="login_success",
-              actor=user.username)
-    token = create_access_token(subject=str(user.id))
+              actor=username)
+    token = create_access_token(subject=str(user_id), version=version)
     set_session_cookie(response, request, token)
     if request.headers.get(CSRF_HEADER):
         # The browser app sends X-Requested-With on every request and keeps
@@ -305,7 +346,9 @@ def refresh_token(
     user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
-    new_token = create_access_token(subject=str(user.id))
+    if not _token_is_current(payload, user):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    new_token = create_access_token(subject=str(user.id), version=user.token_version or 0)
     if source == "cookie":
         # A cookie session receives the new token in a new cookie only, so no
         # page script receives a token it could use elsewhere.
@@ -333,6 +376,9 @@ def reset_password(
     user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
     if not user:
         raise HTTPException(status_code=401, detail="User not found or inactive")
+    if not _token_is_current(token_payload, user):
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
+    _refuse_testing_account(user, status=403)
 
     if not verify_password(payload.old_password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Old password incorrect")
@@ -343,6 +389,23 @@ def reset_password(
     return {"detail": "password updated successfully"}
 
 
+def _user_of_token(raw_token: Optional[str], db: Session) -> tuple[Optional[User], Optional[str]]:
+    """The active user a token names and is current for, else None and the 401's detail."""
+    if not raw_token:
+        return None, "Not authenticated"
+    payload = verify_access_token(raw_token)
+    if not payload:
+        return None, "Invalid or expired token"
+    user_id = int(payload.get("sub"))
+    # Mirror refresh_token: reject deactivated users so deactivation cuts access on the next request
+    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
+    if not user:
+        return None, "User not found or inactive"
+    if not _token_is_current(payload, user):
+        return None, "Invalid or expired token"
+    return user, None
+
+
 def get_current_user(
     request: Request,
     credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
@@ -350,25 +413,64 @@ def get_current_user(
 ):
     # The Authorization header, else the session cookie; never a query parameter.
     raw_token, _ = _session_token(request, credentials)
-    if not raw_token:
-        raise HTTPException(status_code=401, detail="Not authenticated")
-    payload = verify_access_token(raw_token)
-    if not payload:
-        raise HTTPException(status_code=401, detail="Invalid or expired token")
-    user_id = int(payload.get("sub"))
-    # Mirror refresh_token: reject deactivated users so deactivation cuts access on the next request
-    user = db.query(User).filter(User.id == user_id, User.is_active == True).first()
-    if not user:
-        raise HTTPException(status_code=401, detail="User not found or inactive")
+    user, problem = _user_of_token(raw_token, db)
+    if user is None:
+        raise HTTPException(status_code=401, detail=problem)
+    return user
+
+
+def session_user_or_none(request: Request, db: Session) -> Optional[User]:
+    """The user get_current_user would answer for this request, or None where it would raise.
+
+    Raises nothing: app.api.space.enforce_space reads the caller with it and
+    leaves every refusal of the session itself (401, the CSRF 403) to the
+    route's own dependencies.
+    """
+    # The credentials _optional_bearer (HTTPBearer, auto_error=False) gives
+    # get_current_user for the same request: none unless the header is a
+    # Bearer scheme with a value.
+    from fastapi.security.utils import get_authorization_scheme_param
+
+    authorization = request.headers.get("Authorization")
+    scheme, value = get_authorization_scheme_param(authorization)
+    credentials = None
+    if authorization and scheme and value and scheme.lower() == "bearer":
+        credentials = HTTPAuthorizationCredentials(scheme=scheme, credentials=value)
+    try:
+        raw_token, _ = _session_token(request, credentials)
+    except HTTPException:
+        return None
+    user, _ = _user_of_token(raw_token, db)
     return user
 
 
 class RoleChecker:
+    """The one role check of the application: a route's allowed roles, and the testing account where admitted.
+
+    Every API module makes its instances from this class. A caller whose
+    role is in `allowed_roles` passes. The testing account, whose role is
+    in no list, passes exactly on the routes app.core.space_routes admits
+    it to (`testing=True`), found by the route that matched the request;
+    on every other route, and on a route with no entry, it is refused.
+    """
+
     def __init__(self, allowed_roles: list[str]):
         self.allowed_roles = allowed_roles
 
-    def __call__(self, user: User = Depends(get_current_user)):
-        if user.role not in self.allowed_roles:
+    def admits(self, user: User, route_key) -> bool:
+        """Whether `user` passes this check on the route keyed (method, full path)."""
+        from app.core import space_routes
+        from app.core.testing_space import TESTING_ROLE
+
+        if user.role == TESTING_ROLE:
+            entry = space_routes.entry_for(route_key)
+            return entry is not None and entry.testing
+        return user.role in self.allowed_roles
+
+    def __call__(self, request: Request, user: User = Depends(get_current_user)):
+        from app.core import space_routes
+
+        if not self.admits(user, space_routes.route_key(request)):
             raise HTTPException(status_code=403, detail="Operation not permitted")
         return user
 
@@ -425,10 +527,15 @@ def update_user_role(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Change a user's role. Admin only."""
+    """Change a user's role. Admin only.
+
+    The testing role is never given (UserRoleUpdate does not accept it) and
+    the testing account's role is never changed (409 `testing_account`).
+    """
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    _refuse_testing_account(user)
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Admins cannot change their own role")
     user.role = payload.role
@@ -447,10 +554,11 @@ def set_user_active(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Activate or deactivate a user account. Admin only."""
+    """Activate or deactivate a user account. Admin only; not the testing account (409 `testing_account`)."""
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    _refuse_testing_account(user)
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Admins cannot deactivate their own account")
     user.is_active = is_active
@@ -471,6 +579,8 @@ def delete_user(
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
+    # The testing account is managed through the unit's testing settings only.
+    _refuse_testing_account(user)
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Admins cannot delete their own account")
     # Refuse to remove the last active admin: a headless appliance with no active

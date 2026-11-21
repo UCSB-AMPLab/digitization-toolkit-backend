@@ -58,6 +58,7 @@ Version: 0.3.3
 
 from __future__ import annotations
 
+import contextlib
 import fcntl
 import json
 import logging
@@ -66,7 +67,6 @@ import os
 import re
 import tempfile
 import time
-import unicodedata
 import uuid
 from datetime import date, datetime, timezone
 from pathlib import Path
@@ -77,6 +77,9 @@ from sqlalchemy.orm import Session
 
 # The module, not the settings object, so that a reloaded config is seen.
 from app.core import config
+from app.core import project_names
+from app.core.paths import project_dir_name
+from app.core.project_names import ProjectDirectoryTaken
 from app.core.db_errors import constraint_name
 from app.models.collection import (
     FILENAME_STEM_MAX_LENGTH,
@@ -89,9 +92,13 @@ from app.models.collection import (
     StemIsProjectDirectoryError,
     stem_directory_conflict,
 )
-from app.models.project import Project
+from app.models.project import Project, TestingSpaceError
 
 logger = logging.getLogger(__name__)
+
+# Whether a value lies in the testing space's namespace (app.core.project_names),
+# which no real volume's reference code, stem or name ever does.
+_in_reserved_namespace = project_names.in_reserved_namespace
 
 CONTRACT_NAME = "fisqua-captua-exchange"
 LIST_KIND = "digitisation-list"
@@ -148,6 +155,26 @@ REASONS = {
         "Images are stored offsite under this filenameStem, so it cannot be given to a new volume."
     ),
     "mode_changed": "Someone changed the unit's mode during the import, so Captua did not create the volume.",
+    "reference_code_reserved": (
+        "The referenceCode begins with a prefix kept for the testing space, in some capitals or accents. "
+        "A list's volumes are real work."
+    ),
+    "filename_stem_reserved": (
+        "The filenameStem begins with a prefix kept for the testing space. A list's volumes are real work."
+    ),
+    "title_reserved": (
+        "The title begins with a prefix kept for the testing space, in some capitals or accents, and a "
+        "list's volumes are real work."
+    ),
+    "testing_space_refused": "The volume would put testing and real work together.",
+}
+
+# A refusal by the testing space's namespace rule at the flush (app.models.collection),
+# by the column refused, mapped to its reason.
+_TESTING_SPACE_REASONS = {
+    "collections.external_id": "reference_code_reserved",
+    "collections.filename_stem": "filename_stem_reserved",
+    "collections.name": "title_reserved",
 }
 
 # A refusal by app.models.collection's stem directory check, mapped to its reason.
@@ -169,6 +196,14 @@ _CONSTRAINT_REASONS = {
 
 class ListRefused(Exception):
     """The file as a whole cannot be imported; nothing has been written."""
+
+
+class ListProjectDirectoryTaken(ListRefused, ProjectDirectoryTaken):
+    """The list's project cannot be created: its directory is another project's (409 project_directory_taken).
+
+    A ListRefused, so every caller that answers a refused list answers it,
+    and a ProjectDirectoryTaken, so the list import route answers its code.
+    """
 
 
 class ListUnreadable(Exception):
@@ -321,6 +356,26 @@ def _release_project_lock(fd: int) -> None:
         os.close(fd)
 
 
+@contextlib.contextmanager
+def project_lock():
+    """Hold the project lock (`<imports>/.project-create.lock`) for the block; ProjectLockUnavailable if it cannot be taken.
+
+    The one lock under which a project's name and directory are checked and
+    the project created or renamed, until the commit: POST /projects/, PUT
+    /projects/{id} and the list import's project creation (_project_for)
+    all take it, so no two of them check a directory at once. It blocks
+    until the holder lets it go. It is taken by none of the export holds or
+    row locks, so it is taken first and released last.
+    """
+    fd = _take_project_lock()
+    if fd is None:
+        raise ProjectLockUnavailable(PROJECT_LOCK_UNAVAILABLE_MESSAGE)
+    try:
+        yield
+    finally:
+        _release_project_lock(fd)
+
+
 class ProjectNeedsAdmin(Exception):
     """The list would create a project and the caller may not; nothing has been written."""
 
@@ -328,6 +383,10 @@ class ProjectNeedsAdmin(Exception):
 PROJECT_NEEDS_ADMIN_MESSAGE = (
     "No project of this list's name exists, and importing this list would create one. "
     "An admin must import a list that creates a project."
+)
+LIST_NAME_RESERVED_MESSAGE = (
+    "The list name begins with a prefix kept for the testing space, in some capitals or accents. "
+    "A list is real work: rename the list."
 )
 
 
@@ -372,6 +431,13 @@ def check_envelope(document: Any) -> tuple[str, str, list]:
         raise ListRefused("The list name contains a NUL character.")
     if len(_project_name(name)) > _PROJECT_NAME_MAX_LENGTH:
         raise ListRefused(f"The list name is longer than {_PROJECT_NAME_MAX_LENGTH} characters.")
+    # The project a list makes is real work, so its name never lies in the
+    # testing space's namespace (app.core.project_names), and it names a
+    # directory under the projects root.
+    if project_names.in_reserved_namespace(_project_name(name)):
+        raise ListRefused(LIST_NAME_RESERVED_MESSAGE)
+    if not project_dir_name(_project_name(name)):
+        raise ListRefused(project_names.PROJECT_NAME_INVALID_MESSAGE)
     items = document.get("items")
     if not isinstance(items, list):
         raise ListRefused("The file's items are not a list.")
@@ -427,7 +493,9 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     """The reject reason for an item, or None and the volume's column values.
 
     Checks run in a fixed order and the first failure is the reason given:
-    the reference code's checks, then the stem's format and length, then
+    the reference code's checks (its place in the testing namespace among
+    them, reference_code_reserved), then the stem's format and length and
+    namespace, then
     that the stem equals the code, then the stem's duplicate in the list,
     then the title, dates and sequence.
     The checks against volumes already on the unit come after this, in
@@ -446,6 +514,10 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "reference_code_padded", {}
     if first_code.get(code) != position:
         return "reference_code_duplicated_in_list", {}
+    # A list's volumes are real work, so no code lies in the testing
+    # namespace, in any capitals, accents or width.
+    if _in_reserved_namespace(code):
+        return "reference_code_reserved", {}
 
     stem = item.get("filenameStem")
     if stem is None or stem == "":
@@ -454,6 +526,8 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "filename_stem_not_a_slug", {}
     if len(stem) > FILENAME_STEM_MAX_LENGTH:
         return "filename_stem_too_long", {}
+    if _in_reserved_namespace(stem):
+        return "filename_stem_reserved", {}
     # The stem is the volume's reference code, unchanged (contract 1.1 §8,
     # ruled 2026-10-23). Checked after the stem's own format, so a stem that
     # is not a slug or is too long is reported as that.
@@ -470,6 +544,10 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
         return "missing_title", {}
     if not isinstance(title, str) or len(title) > _NAME_MAX_LENGTH or "\x00" in title:
         return "invalid_title", {}
+    # The title is the volume's name, and a real volume's name never lies
+    # in the testing namespace (app.models.collection).
+    if _in_reserved_namespace(title):
+        return "title_reserved", {}
 
     dates = item.get("dates")
     if dates is None:
@@ -512,18 +590,10 @@ def _check_item(position: int, item: Any, first_code: dict, first_stem: dict) ->
     }
 
 
-def _project_name(name: str) -> str:
-    """The list name as a project is stored under: stripped, in NFC."""
-    return unicodedata.normalize("NFC", name.strip())
-
-
-def _name_key(name: str) -> str:
-    """What two project names are compared by: stripped, NFC, case-folded.
-
-    Accents are kept: "válida" and "valida" are different names, as are
-    "Peña" and "Pena".
-    """
-    return _project_name(name).casefold()
+# The list name as a project is stored under, and what two project names are
+# compared by (app.core.project_names).
+_project_name = project_names.stored_name
+_name_key = project_names.name_key
 
 
 # The longest list.notes stored as a project's description.
@@ -553,10 +623,13 @@ def _find_project(db: Session, name: str) -> Optional[Project]:
 
     Compared in Python, since neither engine normalises Unicode; a unit
     holds tens of projects. If several existing projects match (POST
-    /projects compares names exactly), the oldest is used.
+    /projects compares names exactly), the oldest is used. Real projects
+    only: a testing project (app.core.testing_space) is never a list's,
+    and its stored name, in the testing namespace, never matches a real
+    one's.
     """
     key = _name_key(name)
-    for project in db.query(Project).order_by(Project.id).all():
+    for project in db.query(Project).filter(Project.testing.is_(False)).order_by(Project.id).all():
         if _name_key(project.name) == key:
             return project
     return None
@@ -583,6 +656,9 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     be taken, ProjectLockUnavailable is raised before the project is
     created: going on unlocked could create a second project of the same
     normalised name. An existing project is still found without the lock.
+
+    A testing project is never returned, and none stands in the way of a
+    real project of the list's name.
     """
     project = _find_project(db, name)
     if project is not None:
@@ -592,13 +668,8 @@ def _project_for(db: Session, name: str, actor: Optional[str], may_create_projec
     # Looking for the project by its normalised name and creating it are
     # one step across all imports, whatever their list ids: two lists named
     # "Basket" and "basket" would otherwise both find none and create two.
-    fd = _take_project_lock()
-    if fd is None:
-        raise ProjectLockUnavailable(PROJECT_LOCK_UNAVAILABLE_MESSAGE)
-    try:
+    with project_lock():
         return _create_project_locked(db, name, actor, notes)
-    finally:
-        _release_project_lock(fd)
 
 
 def _create_project_locked(db: Session, name: str, actor: Optional[str], notes: Any) -> tuple[Project, bool]:
@@ -607,6 +678,13 @@ def _create_project_locked(db: Session, name: str, actor: Optional[str], notes: 
     if project is not None:
         return project, False
     description = notes if notes_skip_reason(notes) is None else None
+    # Its directory may not be another project's, in either space
+    # (ProjectDirectoryTaken, 409, before anything is written).
+    from app.core.storage_ops import refuse_taken_project_directory
+    try:
+        refuse_taken_project_directory(db, _project_name(name))
+    except ProjectDirectoryTaken:
+        raise ListProjectDirectoryTaken(ProjectDirectoryTaken.message) from None
     project = Project(name=_project_name(name), description=description, created_by=actor)
     db.add(project)
     try:
@@ -706,6 +784,12 @@ def create_volume(db: Session, list_id: str, position: int, project_id: int, act
         # this item only is rolled back and reported.
         db.rollback()
         return None, "filename_stem_held_offsite"
+    except TestingSpaceError as exc:
+        # The model refused the volume for the testing space (a code in its
+        # namespace, which _check_item refuses first): this item only is
+        # rolled back and reported.
+        db.rollback()
+        return None, _TESTING_SPACE_REASONS.get(exc.field, "testing_space_refused")
     except ReferenceCodeDiffersFromStemError:
         # _check_item refuses this first; the model's flush listener is
         # the rule for every writer, so its refusal is reported the same.
