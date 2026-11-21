@@ -112,7 +112,7 @@ def test_schemas():
         from app.schemas.project import ProjectCreate
         from app.schemas.record import RecordCreate, RecordUpdate
         
-        user = UserCreate(username="testuser", email="test@example.com", password="pwd123")
+        user = UserCreate(username="testuser", email="test@example.com", password="pwd12345")
         assert user.username == "testuser"
         
         project = ProjectCreate(name="Test Project", description="A test project")
@@ -310,7 +310,7 @@ def test_password_reset_missing_credentials_returns_401(client):
     """/auth/password-reset with no Authorization header must return 401. NEH-167."""
     resp = client.post(
         "/auth/password-reset",
-        json={"old_password": "x", "new_password": "y"},
+        json={"old_password": "x", "new_password": "fake-new-pw"},
     )
     assert resp.status_code == 401
 

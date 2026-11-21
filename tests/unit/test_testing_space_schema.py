@@ -457,7 +457,7 @@ def test_the_testing_role_is_valid_but_never_given_through_the_role_update():
     with pytest.raises(ValidationError):
         UserRoleUpdate(role="testing")
     with pytest.raises(ValidationError):
-        UserCreate(username="x", password="y", role="testing")
+        UserCreate(username="x", password="fake-pw-8", role="testing")
 
 
 @pytest.mark.unit

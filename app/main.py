@@ -244,6 +244,7 @@ async def reference_code_differs_from_stem(request: Request, exc: ReferenceCodeD
 
 
 from app.models.project import TestingSpaceError
+from app.schemas.user import PasswordRefused
 from fastapi.exceptions import RequestValidationError
 from app.core.validation_errors import plain_errors
 
@@ -259,6 +260,12 @@ async def validation_refused(request: Request, exc: RequestValidationError):
     response or a log line.
     """
     return JSONResponse(status_code=422, content={"detail": plain_errors(exc.errors())})
+
+
+@app.exception_handler(PasswordRefused)
+async def password_refused(request: Request, exc: PasswordRefused):
+    """A new password the rule refuses (app.schemas.user.check_new_password): 422 with its code, never the password."""
+    return JSONResponse(status_code=422, content={"detail": exc.detail()})
 
 
 @app.exception_handler(TestingSpaceError)
