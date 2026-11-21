@@ -16,7 +16,7 @@ while the rest of the project is on the drive. Instead, everything that writes
 into the projects tree gets its root from writable_projects_dir, which raises
 StorageUnavailableError for such a root.
 
-Version: 0.1.0-beta
+Version: 0.3.3
 """
 import json
 import logging
@@ -177,3 +177,31 @@ def writable_projects_dir(settings=None) -> Path:
         logger.error("Storage override root %s refused for writing: %s", root, problem)
         raise StorageUnavailableError(problem)
     return root
+
+
+def projects_root_usage(settings=None):
+    """The disk usage of the file system that holds the active projects root: (usage, None), or (None, reason).
+
+    `usage` is shutil.disk_usage's answer for settings.projects_dir. The
+    default root is created when it is missing; an override root never is,
+    and one that override_root_problem refuses is not read. A root that
+    cannot be read answers its reason. GET /system/storage and the testing
+    space's reserve (app.core.testing_space.free_bytes) read free space here.
+    """
+    import shutil
+
+    if settings is None:
+        from app.core.config import settings
+
+    override, _corrupt = get_storage_override_or_fallback()
+    root = settings.projects_dir
+    if override is not None:
+        problem = override_root_problem(root)
+        if problem:
+            return None, problem
+    try:
+        if override is None:
+            root.mkdir(parents=True, exist_ok=True)
+        return shutil.disk_usage(root), None
+    except OSError:
+        return None, "The storage path for projects cannot be read."

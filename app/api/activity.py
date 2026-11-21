@@ -18,6 +18,7 @@ from sqlalchemy import case, func
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker
+from app.core.testing_space import scope_query, space_query_param
 from app.api.deps import get_db_dependency
 from app.models.collection import Collection
 from app.models.record import Record, RecordImage, RecordStatusChange
@@ -33,8 +34,12 @@ STATUSES = ("captured", "in_review", "rejected", "approved", "excluded")
 REVIEW_OUTCOMES = ("approved", "rejected", "excluded")
 
 
-def _collections_in_scope(db: Session, project_id: Optional[int]) -> List[int]:
-    """Every collection id, or those belonging to a project at any depth.
+def _collections_in_scope(db: Session, project_id: Optional[int], user: User,
+                          space: Optional[str]) -> List[int]:
+    """Every collection id of the caller's space, or those belonging to a project at any depth.
+
+    The space is app.core.testing_space.scope_query's; a sub-volume is in
+    its parent's space, so the walk below stays in it.
 
     A nested collection has no project_id of its own, only a parent, so the
     project's collections are found by walking down from its top-level ones.
@@ -42,9 +47,9 @@ def _collections_in_scope(db: Session, project_id: Optional[int]) -> List[int]:
     than one query per level, which is what
     app.core.storage_ops.collection_ids_under_project does.
     """
-    rows = db.query(
+    rows = scope_query(db.query(
         Collection.id, Collection.project_id, Collection.parent_collection_id
-    ).order_by(Collection.id).all()
+    ), Collection, user, space).order_by(Collection.id).all()
     if project_id is None:
         return [cid for cid, _, _ in rows]
 
@@ -84,6 +89,7 @@ def status_counts(db: Session, ids: List[int]) -> dict[int, StatusCounts]:
 @router.get("/collections", response_model=List[CollectionActivity])
 def collection_activity(
     project_id: Optional[int] = Query(None, description="Only this project's collections, at any depth"),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
@@ -95,7 +101,7 @@ def collection_activity(
     the collection stored on each change row, as in
     GET /collections/{id}/status-changes.
     """
-    ids = _collections_in_scope(db, project_id)
+    ids = _collections_in_scope(db, project_id, current_user, space)
     if not ids:
         return []
 
@@ -176,11 +182,14 @@ def daily_activity(
             "to get UTC. Used only when tz is not given."
         ),
     ),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
     """Images captured and records reviewed on each of the last `days` local
     days, oldest first, with a zero for a day on which nothing was done.
+    Only the images and the status changes of the caller's space count
+    (app.core.testing_space.scope_query).
 
     With `tz`, the local day of a stored naive-UTC timestamp t is its date in
     that zone, with the zone's offset at t, so an event on either side of a
@@ -214,26 +223,26 @@ def daily_activity(
     end_utc = local_midnight_utc(today + timedelta(days=1))
 
     captured: dict[date, int] = defaultdict(int)
-    for (created_at,) in (
+    for (created_at,) in scope_query(
         db.query(RecordImage.created_at)
-        .filter(RecordImage.created_at >= start_utc, RecordImage.created_at < end_utc)
-        .all()
-    ):
+        .filter(RecordImage.created_at >= start_utc, RecordImage.created_at < end_utc),
+        RecordImage, current_user, space,
+    ).all():
         captured[local_day(created_at)] += 1
 
     # Per day, the distinct live records reviewed, plus one for each row of a
     # deleted record, whose rows can no longer be told apart by record.
     reviewed_ids: dict[date, set[int]] = defaultdict(set)
     reviewed_deleted: dict[date, int] = defaultdict(int)
-    for record_id, changed_at in (
+    for record_id, changed_at in scope_query(
         db.query(RecordStatusChange.record_id, RecordStatusChange.changed_at)
         .filter(
             RecordStatusChange.to_status.in_(REVIEW_OUTCOMES),
             RecordStatusChange.changed_at >= start_utc,
             RecordStatusChange.changed_at < end_utc,
-        )
-        .all()
-    ):
+        ),
+        RecordStatusChange, current_user, space,
+    ).all():
         d = local_day(changed_at)
         if record_id is None:
             reviewed_deleted[d] += 1

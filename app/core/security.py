@@ -67,12 +67,18 @@ def needs_rehash(hashed: str) -> bool:
     return True  # legacy 2-part or anything unrecognized
 
 
-def create_access_token(subject: str, expires_seconds: Optional[int] = None) -> str:
+def create_access_token(subject: str, expires_seconds: Optional[int] = None, version: int = 0) -> str:
+    """A signed token for user `subject`, carrying the user's session generation as `ver`.
+
+    `version` is the user's token_version; app.api.auth refuses a token
+    whose `ver` is not the user's current one.
+    """
     if expires_seconds is None:
         expires_seconds = DEFAULT_EXPIRE_SECONDS
     payload = {
         "sub": str(subject),
         "exp": int(time.time()) + int(expires_seconds),
+        "ver": int(version),
     }
     payload_b = json.dumps(payload, separators=(",", ":")).encode("utf-8")
     payload_enc = _b64u_encode(payload_b)

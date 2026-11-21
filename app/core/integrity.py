@@ -132,7 +132,7 @@ def read_manifest_lines(path: Path) -> Tuple[List[str], int]:
     return lines, undecodable
 
 
-def build_fixity_index(projects_dir: Path) -> FixityIndex:
+def build_fixity_index(projects_dir: Path, include=None) -> FixityIndex:
     """Index every metadata/manifest.jsonl under `projects_dir`: each project's, and each stemmed volume's.
 
     A capture record's paths are relative to the directory that holds its
@@ -182,6 +182,12 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     followed by the same rule: every relocation record of a JPEG master is
     also read as one for the buffer raw_sidecar_of names beside it, which
     keeps its capture-time digest. It is not a preview.
+
+    With `include` (app.core.testing_space.manifest_filter), a manifest for
+    which include(manifest) is false is not read: a check made for one
+    volume reads the manifests of that volume's space only. Without it,
+    every manifest is read, as the whole-card integrity report and the
+    startup layout migration read them.
     """
     from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
@@ -192,6 +198,8 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     raw_moves: List[Tuple[str, str, str]] = []  # (capture_id, raw buffer of from, raw buffer of to), absolute
 
     for manifest in _manifests(projects_dir):
+        if include is not None and not include(manifest):
+            continue
         project_root = manifest_base(manifest, projects_dir)
         try:
             lines, unparsed = read_manifest_lines(manifest)
@@ -366,7 +374,7 @@ def manifest_base(manifest: Path, projects_dir: Path) -> Path:
     return manifest.parent.parent
 
 
-def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]:
+def capture_record_lines(projects_dir: Path, capture_ids: Set[str], include=None) -> List[str]:
     """The capture records of `capture_ids`, as their manifest lines, one per capture.
 
     Read from every manifest build_fixity_index reads. A volume captured
@@ -380,13 +388,16 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
     are left out: they are the appliance's own bookkeeping, of files renamed
     after capture and of preview digests computed after it. Manifests are
     read in path order and each in line order. Unreadable manifests and
-    lines that are not JSON objects are skipped.
+    lines that are not JSON objects are skipped. With `include`, a manifest
+    for which include(manifest) is false is not read.
     """
     from capture.manifestHandler import is_capture_record
 
     originals: List[Tuple[str, str]] = []
     copies: List[Tuple[str, str]] = []
     for manifest in sorted(_manifests(projects_dir)):
+        if include is not None and not include(manifest):
+            continue
         try:
             lines, _ = read_manifest_lines(manifest)
         except OSError:
@@ -436,9 +447,14 @@ def verify_images_against_manifest(images) -> List[dict]:
     checked against its upload record. A missing file is skipped too; it is
     a separate failure the caller handles. So is a master freed from the
     card (app.core.offsite_free): its bytes are in the bucket, verified by
-    SHA1 when it was freed. Read-only.
+    SHA1 when it was freed. Read-only. Only the manifests of the images'
+    space are read (app.core.testing_space.manifest_filter_for_images).
     """
-    index = build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter_for_images
+
+    images = list(images)
+    projects_dir = config.settings.projects_dir.resolve()
+    index = build_fixity_index(projects_dir, include=manifest_filter_for_images(images, projects_dir))
     mismatches: List[dict] = []
     for img in images:
         if not img.capture_id or getattr(img, "master_freed_at", None) is not None:

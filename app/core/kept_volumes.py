@@ -54,6 +54,13 @@ While a volume is kept:
 * nothing of it can be freed from the card (offsite_free refuses it, code
   `kept_on_unit`), though a kept volume has nothing verified offsite.
 
+**Testing volumes** (app.core.testing_space) are kept on the unit for good:
+release() and keep() refuse them (`testing_volume`, 409), the switch's
+include leaves them kept, and they are not among the volumes kept_volumes()
+lists or the switch's decision is asked about. A testing volume is only
+ever inside a testing volume or a testing project, so a keep or a release
+of a real volume never reaches one.
+
 The catalogue dump is a pg_dumpall of the whole database
 (app.core.catalogue_backup) and cannot hold back one volume: a kept
 volume's records go offsite with the daily dump in backup and fisqua mode;
@@ -210,16 +217,17 @@ def kept_on_create(mode: str, requested: Optional[bool], is_admin: bool) -> bool
 
 
 def kept_volumes(db: Session) -> list:
-    """Every kept volume as {id, name, files}, in id order; `files` is the count Captua would copy offsite.
+    """Every kept volume but the testing ones as {id, name, files}, in id order; `files` is the count Captua would copy offsite.
 
     Files are counted as image_upload._object_counts counts a volume's
-    objects; a volume with no stem has none.
+    objects; a volume with no stem has none. Testing volumes are kept for
+    good and are not listed.
     """
     from app.core.image_upload import _object_counts
     from app.models.collection import Collection
 
     rows = (db.query(Collection.id, Collection.name)
-            .filter(Collection.kept_on_unit.is_(True))
+            .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
             .order_by(Collection.id).all())
     if not rows:
         return []
@@ -350,7 +358,8 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
     it, and their ids (_with_detail).
 
     Refused as a whole, with nothing changed (KeepRefused 409), when the
-    volume is already kept (already_kept_on_unit), and when anything of it
+    volume is a testing volume (testing_volume, app.core.testing_space:
+    already kept, for good), when it is already kept (already_kept_on_unit), and when anything of it
     or of any volume inside it has left or may be leaving the unit
     (already_left_unit, _has_left_unit): a file with an offsite row that is
     not refused, or an outbox row in any state but waiting_for_upload,
@@ -382,7 +391,7 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
     committed first changes the image state the claim compares, so it
     writes nothing.
     """
-    from app.core import unit_mode
+    from app.core import testing_space, unit_mode
 
     for _ in range(LOCK_ATTEMPTS):
         # The settings row FOR SHARE first, so a switch of mode (which holds
@@ -400,6 +409,9 @@ def keep(db: Session, collection_id: int, actor: Optional[str]):
         if set(_subtree(db, collection_id)) != set(tree):
             db.rollback()
             continue
+        if collection.testing:
+            db.rollback()
+            testing_space.refuse_testing_volume(collection)
         if collection.kept_on_unit:
             db.rollback()
             raise KeepRefused(409, ALREADY_KEPT, ALREADY_KEPT_MESSAGE)
@@ -421,7 +433,9 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
             mode: Optional[str] = None, check_for=None):
     """Release a kept volume, and every kept volume inside it; commits. Returns the volume, or None if not found.
 
-    Refused (KeepRefused 409) when the volume is not kept (not_kept_on_unit)
+    Refused (KeepRefused 409) when the volume is a testing volume
+    (testing_volume, app.core.testing_space: never released into real
+    work), when it is not kept (not_kept_on_unit)
     and when its parent volume is kept (kept_parent): a volume inside a kept
     volume is kept, so the parent is released first, and this one with it.
     Logged as one `volume_released_from_unit` entry for the volume, whose
@@ -460,18 +474,22 @@ def release(db: Session, collection_id: int, actor: Optional[str], *, check=None
     locks every kept row FOR NO KEY UPDATE in ascending id order before it
     releases them, the same order as here.
     """
-    from app.core import unit_mode
+    from app.core import testing_space, unit_mode
     from app.models.collection import Collection
 
     mode_changed = False
     for _ in range(LOCK_ATTEMPTS):
         if check_for is not None:
             check = check_for(mode)
-        stored = (db.query(Collection.kept_on_unit, Collection.parent_collection_id)
+        stored = (db.query(Collection.kept_on_unit, Collection.parent_collection_id, Collection.testing)
                   .filter(Collection.id == collection_id).first())
         if stored is None:
             db.rollback()
             return None
+        if stored.testing:
+            # Fixed at insert, so read once, without a lock.
+            db.rollback()
+            testing_space.refuse_testing_volume(stored)
         if not stored.kept_on_unit:
             db.rollback()
             raise KeepRefused(409, NOT_KEPT, NOT_KEPT_MESSAGE)

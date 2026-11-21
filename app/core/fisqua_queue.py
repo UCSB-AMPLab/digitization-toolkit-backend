@@ -502,10 +502,12 @@ KEPT_ON_UNIT_REASON = "kept_on_unit"
 
 
 def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
-    """Whether a volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
+    """Whether a real volume Captua keeps on the unit has `code` as its reference code, or as (or `stem` as) its stem.
 
     The stem is the reference code (contract 1.2 §8), and an admin's kept
-    volume may have only a stem.
+    volume may have only a stem. Testing volumes are left out: a queue item
+    cannot carry a code or stem in the testing namespace
+    (app.core.testing_space), and the queue reads real work only.
     """
     from sqlalchemy import or_
 
@@ -516,6 +518,7 @@ def _kept_volume_for(db: Session, code: Any, stem: Any) -> bool:
         return False
     return db.query(Collection.id).filter(
         Collection.kept_on_unit.is_(True),
+        Collection.testing.is_(False),
         or_(Collection.external_id.in_(names), Collection.filename_stem.in_(names)),
     ).first() is not None
 

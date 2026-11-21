@@ -34,7 +34,8 @@ route sets it on the camera and stores it, and succeeds only when both hold. A
 session reads the stored format once, at open, and sets it on the camera
 unless the camera already holds it. A capture resolves the format under the
 camera lock, for the body its session holds: the one its configuration names,
-else the stored one; the format is written only when it differs from the one
+else the stored one; a named format is written only while a stored one is held
+(GPhoto2Backend.capture_image); the format is written only when it differs from the one
 the session last set, and a capture whose file is of the other type clears
 that memory, so the next capture writes it again. When nothing is stored for
 a body whose identity is known, a format the camera holds at open is adopted
@@ -47,6 +48,7 @@ under that serial. Canon bodies have distinct serials.
 Version: 0.1.0-beta
 """
 
+import copy
 import json
 import os
 import re
@@ -2015,6 +2017,17 @@ class GPhoto2Backend(CameraBackend):
         (iso, shutter_speed, aperture, image_format) are applied through
         _PTPSession.apply_dslr_config before the shutter fires.
 
+        The capture's format, resolved under the camera lock: a format the
+        configuration names, when the session holds a stored format for the
+        body (session.stored_format, for a body whose identity is known); the
+        stored format, when the configuration names none; otherwise none, and
+        the camera's own format is left as it is. A named format is written
+        only when a stored one is held, because only then does the next
+        capture without a named format set the camera back. When none is
+        held the named format is not written, one line is logged at INFO,
+        and the capture is taken in whatever the camera holds, with nothing
+        checked (_check_produced_format gets no intended format).
+
         Args:
             output_path: Destination path for the captured JPEG.
             camera_config: CameraConfig (camera_index used for routing).
@@ -2041,9 +2054,22 @@ class GPhoto2Backend(CameraBackend):
             # session holds, resolved here under the camera lock.
             intended = getattr(camera_config, "image_format", None)
             stored = None
-            if intended is None and self._body_hardware_id(camera_index, session):
+            if self._body_hardware_id(camera_index, session):
                 stored = getattr(session, "stored_format", None)
+            if intended is None:
                 intended = stored
+            elif stored is None:
+                # Nothing would set the camera back after this capture, so the
+                # explicit format is not written and nothing is checked.
+                self.logger.info(
+                    f"[gphoto2] Camera {camera_index}: the capture's format "
+                    f"{normalise_image_format(intended) or intended} was not applied: "
+                    "the session holds no stored format for this body, so the "
+                    "capture is taken in the format the camera holds"
+                )
+                camera_config = copy.copy(camera_config)
+                camera_config.image_format = None
+                intended = None
             try:
                 if stored is None:
                     session.apply_dslr_config(camera_config)

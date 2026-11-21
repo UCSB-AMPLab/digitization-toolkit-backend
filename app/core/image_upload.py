@@ -689,7 +689,7 @@ def _claim(db: Session, row, item: Work, key: str, state: tuple, **fields):
     return _save(db, row, item.image_id, item.kind, key, **fields)
 
 
-def _fixity_index(result: RunResult, *, fresh: bool = False):
+def _fixity_index(result: RunResult, db: Session, *, fresh: bool = False):
     """The capture-time sha256 index, built once per run and only when a run reaches a capture.
 
     `fresh` rebuilds it: a move during the run appends relocation records the run's copy does not have.
@@ -697,7 +697,10 @@ def _fixity_index(result: RunResult, *, fresh: bool = False):
     if result.fixity is None or fresh:
         from app.core.integrity import build_fixity_index
 
-        result.fixity = build_fixity_index(config.settings.projects_dir.resolve())
+        # Real work only: a testing volume is kept on the unit and never uploaded.
+        from app.core.testing_space import manifest_filter
+        projects_dir = config.settings.projects_dir.resolve()
+        result.fixity = build_fixity_index(projects_dir, include=manifest_filter(db, False, projects_dir))
     return result.fixity
 
 
@@ -767,11 +770,11 @@ def _process_read(db: Session, tenant: str, item: Work, result: RunResult, row, 
         return
 
     if item.kind == "capture":
-        expected = _fixity_index(result).expected(read.capture_id, item.image_id, path)
+        expected = _fixity_index(result, db).expected(read.capture_id, item.image_id, path)
         if expected is not None and expected != sha256:
             # Refused only on the manifests as they stand now, never on
             # the copy read at the start of the run.
-            expected = _fixity_index(result, fresh=True).expected(read.capture_id, item.image_id, path)
+            expected = _fixity_index(result, db, fresh=True).expected(read.capture_id, item.image_id, path)
         if expected is not None and expected != sha256:
             _refuse(db, row, item, key, result, reason="fixity", local_sha1=sha1,
                     detail={"local_path": str(path), "local_sha256": sha256,
@@ -1564,7 +1567,8 @@ def unit_upload_summary(db: Session) -> dict:
     The volumes Captua keeps on the unit (NEH-320, app.core.kept_volumes)
     are left out of every count and total, pending included: `kept_volumes`
     counts them (with or without a stem) and `kept_files` the files Captua
-    would copy of them.
+    would copy of them. Testing volumes (app.core.testing_space), kept for
+    good, are in neither.
     """
     from app.models.collection import Collection
     from app.core import unit_mode
@@ -1576,8 +1580,11 @@ def unit_upload_summary(db: Session) -> dict:
         tenant, misconfigured = None, str(exc)
     counted = _object_counts(db)
     per_volume = {cid: s for cid, s in counted.items() if not s["kept_on_unit"]}
-    kept_files = sum(s["total"] for s in counted.values() if s["kept_on_unit"])
-    kept_volumes = db.query(func.count(Collection.id)).filter(Collection.kept_on_unit.is_(True)).scalar() or 0
+    testing = {cid for (cid,) in db.query(Collection.id).filter(Collection.testing.is_(True))}
+    kept_files = sum(s["total"] for cid, s in counted.items() if s["kept_on_unit"] and cid not in testing)
+    kept_volumes = (db.query(func.count(Collection.id))
+                    .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
+                    .scalar() or 0)
     last = [s["last_verified_at"] for s in per_volume.values() if s["last_verified_at"]]
     return {
         "enabled": is_enabled(),
