@@ -61,6 +61,56 @@ jobs:
           CAPTUA_DATA_DIR: ${{ runner.temp }}/captua-data
           APP_ENV: test
 
+      # The step above leaves DATABASE_* unset on purpose. Its tests get their
+      # databases from the db_session fixtures, which build a SQLite file per
+      # test, but app.core.config reads DATABASE_* at import and app.core.db
+      # builds its engine from them, so setting them there would point every
+      # code path that uses that engine at this service.
+      #
+      # The tests that need PostgreSQL skip unless DATABASE_HOST is set:
+      # tests/integration/test_pg_*.py (row locks, which SQLite does not take)
+      # and the migration tests named *_on_postgresql. Each creates a schema of
+      # its own in the database DATABASE_* names and drops it afterwards, so
+      # they share the service database with the drift guard below, which
+      # migrates and compares only the default schema. `-k` selects them by
+      # name, so a test added under either name is picked up.
+      #
+      # A skipped PostgreSQL test fails this step: it means DATABASE_* did not
+      # reach the service, and pytest exits 0 on skips. The check reads the
+      # JUnit report and counts the test cases in test_pg_* modules or named
+      # *_on_postgresql, a module skipped at import among them; at least one
+      # must be there and none may be skipped. Skips reported by other modules
+      # while they are collected are not counted.
+      - name: PostgreSQL tests
+        run: |
+          pixi run -e dev pytest tests/ -k "test_pg_ or on_postgresql" -q --junitxml="$RUNNER_TEMP/pg-tests.xml"
+          python3 -I - "$RUNNER_TEMP/pg-tests.xml" <<'EOF'
+          import sys
+          import xml.etree.ElementTree as ET
+          # A module skipped at import is reported with an empty classname and
+          # the module's dotted path as its name.
+          def node(c):
+              return f"{c.get('classname', '')}.{c.get('name', '')}"
+          cases = [c for c in ET.parse(sys.argv[1]).getroot().iter("testcase")
+                   if "test_pg_" in node(c) or "on_postgresql" in node(c)]
+          skipped = [c for c in cases if c.find("skipped") is not None]
+          print(f"PostgreSQL tests: {len(cases)} in the report, {len(skipped)} skipped")
+          for c in skipped:
+              reason = (c.find("skipped").get("message") or "").splitlines()[:1]
+              print(f"  skipped: {node(c).lstrip('.')}: {''.join(reason)}")
+          if not cases or skipped:
+              sys.exit("PostgreSQL tests were skipped or none ran: check DATABASE_* and the postgres service")
+          EOF
+        env:
+          DATABASE_HOST: localhost
+          DATABASE_PORT: ${{ job.services.postgres.ports[5432] }}
+          DATABASE_USER: captua
+          DATABASE_PASSWORD: captua
+          DATABASE_NAME: captua
+          CAPTUA_LOG_DIR: ${{ runner.temp }}/captua-logs
+          CAPTUA_DATA_DIR: ${{ runner.temp }}/captua-data
+          APP_ENV: test
+
       - name: Schema drift guard
         run: pixi run -e dev db-check-drift
         env:
