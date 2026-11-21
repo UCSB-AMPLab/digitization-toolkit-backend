@@ -49,10 +49,7 @@ def pg(override_projects_root):
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.orm import sessionmaker
 
-    from app.core.db import Base, DATABASE_URL
-    from app.models import (  # noqa: F401
-        user, project, project_member, collection, record, camera, system_log, offsite_object,
-    )
+    from app.core.db import Base, DATABASE_URL, init_db
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.project import Project
@@ -74,6 +71,9 @@ def pg(override_projects_root):
     target = captures / "f.jpg"
     key = f"t/{STEM}/captures/f.jpg"
     try:
+        # init_db imports every model module, so create_all makes every table,
+        # including those the flush hooks read (offsite_objects for a stem).
+        init_db()
         Base.metadata.create_all(engine)
         with Session() as db:
             p = Project(name="P")
