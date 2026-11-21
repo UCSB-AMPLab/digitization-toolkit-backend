@@ -244,6 +244,28 @@ async def reference_code_differs_from_stem(request: Request, exc: ReferenceCodeD
 
 
 from app.models.project import TestingSpaceError
+from app.schemas.user import PasswordRefused
+from fastapi.exceptions import RequestValidationError
+from app.core.validation_errors import plain_errors
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_refused(request: Request, exc: RequestValidationError):
+    """Every router's 422 (app.core.validation_errors.plain_errors).
+
+    Errors raised at the request-validation boundary carry `type`, `loc` and
+    `msg` and no submitted value. A route's own HTTPException message may
+    name a non-credential parameter it refused (for example an unknown time
+    zone or a resolution). No credential, hash or token is ever placed in a
+    response or a log line.
+    """
+    return JSONResponse(status_code=422, content={"detail": plain_errors(exc.errors())})
+
+
+@app.exception_handler(PasswordRefused)
+async def password_refused(request: Request, exc: PasswordRefused):
+    """A new password the rule refuses (app.schemas.user.check_new_password): 422 with its code, never the password."""
+    return JSONResponse(status_code=422, content={"detail": exc.detail()})
 
 
 @app.exception_handler(TestingSpaceError)

@@ -148,6 +148,7 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/auth/users/{user_id}'): (('admin',),),
     ('PATCH', '/auth/users/{user_id}/role'): (('admin',),),
     ('PATCH', '/auth/users/{user_id}/active'): (('admin',),),
+    ('PUT', '/auth/users/{user_id}/password'): (('admin',),),
     ('DELETE', '/auth/users/{user_id}'): (('admin',),),
     ('GET', '/users/me'): (),
     ('GET', '/system/logs'): (('admin',),),

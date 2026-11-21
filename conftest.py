@@ -245,7 +245,9 @@ def db_session(override_projects_root):
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     test_db_url = f"sqlite:///{temp_db.name}"
     
-    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
+    # Parameters hidden, as app.core.db's engine hides them.
+    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False},
+                                hide_parameters=True)
     
     Base.metadata.create_all(test_engine)
     

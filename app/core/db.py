@@ -28,6 +28,10 @@ engine = create_engine(
 	poolclass=QueuePool,
 	pool_pre_ping=True,
 	pool_recycle=1800,
+	# A database error's text names the statement, never the values bound to
+	# it: a failed UPDATE of users would otherwise carry the password's hash
+	# into the exception and the log.
+	hide_parameters=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)

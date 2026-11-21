@@ -435,7 +435,7 @@ def test_the_sender_recorder_sees_an_ordinary_user_change(client, db_session, se
     admin = User(username="adm", hashed_password="x", role="admin")
     db_session.add(admin)
     db_session.commit()
-    resp = client.post("/auth/register", json={"username": "nuevo", "password": "pw"},
+    resp = client.post("/auth/register", json={"username": "nuevo", "password": "fake-pw-nuevo"},
                        headers={"Authorization": f"Bearer {create_access_token(str(admin.id))}"})
     assert resp.status_code == 200, resp.text
     assert len(sends) == 1
@@ -789,7 +789,7 @@ def test_a_stale_token_is_refused_by_the_password_reset_route(client, db_session
     _admin(client).patch("/system/testing/account", json={"password": OTHER_PASSWORD})
     _real_auth()
     resp = client.post("/auth/password-reset", headers=_bearer(token),
-                       json={"old_password": OTHER_PASSWORD, "new_password": "x"})
+                       json={"old_password": OTHER_PASSWORD, "new_password": "fake-new-pw"})
     assert resp.status_code == 401 and resp.json()["detail"] == "Invalid or expired token"
 
 
@@ -801,7 +801,8 @@ def test_a_stale_admin_token_is_refused_by_the_register_route(client, db_session
     admin.token_version = 1
     db_session.commit()
     _real_auth()
-    resp = client.post("/auth/register", json={"username": "nuevo", "password": "pw"}, headers=_bearer(token))
+    resp = client.post("/auth/register", json={"username": "nuevo", "password": "fake-pw-nuevo"},
+                       headers=_bearer(token))
     assert resp.status_code == 401, resp.text
     assert db_session.query(User).filter(User.username == "nuevo").first() is None
 

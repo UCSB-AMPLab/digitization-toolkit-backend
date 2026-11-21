@@ -242,6 +242,10 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/auth/users/{user_id}"): Entry(),
     ("PATCH", "/auth/users/{user_id}/role"): Entry(),
     ("PATCH", "/auth/users/{user_id}/active"): Entry(),
+    # An administrator gives another user a new password. The testing
+    # account's is set through /system/testing only, and a user id names
+    # no material.
+    ("PUT", "/auth/users/{user_id}/password"): Entry(),
     ("DELETE", "/auth/users/{user_id}"): Entry(),
     ("GET", "/users/me"): Entry(testing=True),
 

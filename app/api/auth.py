@@ -11,7 +11,7 @@ from typing import List, Optional
 
 from app.api.deps import get_db_dependency
 from app.models.user import User
-from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
+from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, PasswordSet, TokenRefresh
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token, needs_rehash
 from app.core.config import settings, is_dev_env
 from app.core.login_throttle import login_throttle
@@ -60,8 +60,9 @@ _optional_bearer = HTTPBearer(auto_error=False)
 # current value (_token_is_current). Raising token_version ends every
 # session of that user. Logout raises it for every role but testing
 # (end_sessions), set_user_active when it deactivates a user, and
-# reset_password with the user's own new password, each in one UPDATE that
-# adds one in the database; app.core.testing_space raises the testing
+# reset_password with the user's own new password, set_user_password with
+# the new password an administrator gives another user, each in one UPDATE
+# that adds one in the database; app.core.testing_space raises the testing
 # account's when it deactivates it or gives it a new password.
 # ---------------------------------------------------------------------------
 
@@ -270,19 +271,29 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+THROTTLED_DETAIL = "Too many failed login attempts. Try again later."
+
+
+def _throttle_keys(username: str, request: Request) -> tuple[str, str]:
+    """The login throttle's keys for an account and the request's client: `user:<username>` and `ip:<address>`."""
+    return f"user:{username.strip().lower()}", f"ip:{_client_ip(request)}"
+
+
+def _throttled(retry: int) -> HTTPException:
+    """The 429 a throttled account or client is answered with, as POST /auth/login answers it."""
+    return HTTPException(status_code=429, detail=THROTTLED_DETAIL, headers={"Retry-After": str(retry)})
+
+
 @router.post("/login")
 def login(payload: UserLogin, request: Request, response: Response, db: Session = Depends(get_db_dependency)):
     # Throttle brute force per account and per client IP on the untrusted LAN.
-    ip = _client_ip(request)
-    acct_key = f"user:{payload.username.strip().lower()}"
-    ip_key = f"ip:{ip}"
+    acct_key, ip_key = _throttle_keys(payload.username, request)
 
     retry = login_throttle.retry_after(acct_key, ip_key)
     if retry > 0:
         log_event(db, level="WARN", category="access", action="login_throttled",
                   actor=payload.username, detail=f"locked; retry after {retry}s")
-        raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.",
-                            headers={"Retry-After": str(retry)})
+        raise _throttled(retry)
 
     def refuse_credentials():
         login_throttle.record_failure(acct_key, ip_key)
@@ -434,17 +445,35 @@ def reset_password(
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     _refuse_testing_account(user, status=403)
 
+    # The current password counts against the login throttle as a sign-in
+    # does: while the account or the client is locked the route answers as
+    # POST /auth/login does without checking it, a wrong one is recorded
+    # against the same keys, and a change that is written clears them.
+    acct_key, ip_key = _throttle_keys(user.username, request)
+    retry = login_throttle.retry_after(acct_key, ip_key)
+    if retry > 0:
+        raise _throttled(retry)
     if not verify_password(payload.old_password, user.hashed_password):
+        login_throttle.record_failure(acct_key, ip_key)
         raise HTTPException(status_code=401, detail="Old password incorrect")
 
-    # The new password and the raise of token_version in one UPDATE: every
-    # session of the user ends, the one that sent this request included.
-    (db.query(User)
-       .filter(User.id == user.id)
-       .update({User.hashed_password: hash_password(payload.new_password),
-                User.token_version: User.token_version + 1},
-               synchronize_session=False))
+    # The new password and the raise of token_version in one UPDATE, so every
+    # session of the user ends, the one that sent this request included. It
+    # is written only under the session generation this request's token was
+    # checked against: a raise committed since (an administrator's new
+    # password, a deactivation, a sign-out) ends this session too, and then
+    # no row changes, nothing is written and the request is answered as any
+    # ended session is, with nothing counted in the throttle.
+    written = (db.query(User)
+                 .filter(User.id == user.id, User.token_version == int(token_payload.get("ver", 0)))
+                 .update({User.hashed_password: hash_password(payload.new_password),
+                          User.token_version: User.token_version + 1},
+                         synchronize_session=False))
+    if written != 1:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     db.commit()
+    login_throttle.reset(acct_key, ip_key)
     return {"detail": "password updated successfully"}
 
 
@@ -636,6 +665,60 @@ def set_user_active(
     db.commit()
     db.refresh(user)
     _operators_changed(background_tasks)
+    return UserRead.model_validate(user)
+
+
+USER_NOT_FOUND = "user_not_found"
+USER_NOT_FOUND_MESSAGE = "No user has this id."
+USE_OWN_PASSWORD_CHANGE = "use_own_password_change"
+USE_OWN_PASSWORD_CHANGE_MESSAGE = (
+    "This is your own account. You change your own password with your current password."
+)
+
+
+@router.put("/users/{user_id}/password", response_model=UserRead)
+def set_user_password(
+    user_id: int,
+    payload: PasswordSet,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Give another user a new password. Admin only; ends every session of that user.
+
+    The new password is held to the rule POST /auth/register holds a
+    password to (app.schemas.user.check_new_password, on PasswordSet as on
+    UserCreate) and hashed with hash_password. The hash and the raise of the user's token_version
+    are one UPDATE, so every token issued to them before is refused; no
+    other user's sessions change. Refused with {code, message} and nothing
+    written: 404 `user_not_found`; the testing account, 409 `testing_account`
+    (its password is set through /system/testing only); the administrator's
+    own account, 409 `use_own_password_change`: an administrator changes
+    their own password through POST /auth/password-reset, which needs the
+    current password.
+    An administrator may set another administrator's password. Logs
+    `user_password_set` with the administrator as actor and the user as
+    subject; neither the password nor its hash is returned or logged.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail={"code": USER_NOT_FOUND, "message": USER_NOT_FOUND_MESSAGE})
+    _refuse_testing_account(user)
+    if user.id == current_user.id:
+        raise HTTPException(status_code=409, detail={"code": USE_OWN_PASSWORD_CHANGE,
+                                                     "message": USE_OWN_PASSWORD_CHANGE_MESSAGE})
+    # Unconditional on the target's current hash and session generation: an
+    # administrator overrides whatever the user's password was, and a user's
+    # own change in flight is then refused by its own guarded UPDATE
+    # (reset_password).
+    (db.query(User)
+       .filter(User.id == user.id)
+       .update({User.hashed_password: hash_password(payload.new_password),
+                User.token_version: User.token_version + 1},
+               synchronize_session=False))
+    db.commit()
+    db.refresh(user)
+    log_event(db, level="INFO", category="access", action="user_password_set",
+              actor=current_user.username, subject=user.username)
     return UserRead.model_validate(user)
 
 
