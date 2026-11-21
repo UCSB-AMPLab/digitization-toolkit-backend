@@ -1,9 +1,11 @@
 # Version: 0.3.0
 
 import hmac
+import logging
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
+from sqlalchemy.exc import SQLAlchemyError
 from sqlalchemy.orm import Session
 from typing import List, Optional
 
@@ -15,6 +17,8 @@ from app.core.config import settings, is_dev_env
 from app.core.login_throttle import login_throttle
 from app.core.audit import log_event
 from app.core.fisqua_queue import notify_operators_changed
+
+logger = logging.getLogger(__name__)
 
 router = APIRouter()
 users_router = APIRouter()  # mounted at /users in main.py
@@ -54,9 +58,11 @@ _optional_bearer = HTTPBearer(auto_error=False)
 # generation (`ver`, users.token_version; 0 when absent), and every route
 # that reads a token to a user refuses one whose `ver` is not the user's
 # current value (_token_is_current). Raising token_version ends every
-# session of that user; app.core.testing_space does so when it deactivates
-# the testing account or gives it a new password. Logout clears the cookie,
-# but a token copied out of it remains valid until its exp.
+# session of that user. Logout raises it for every role but testing
+# (end_sessions), set_user_active when it deactivates a user, and
+# reset_password with the user's own new password, each in one UPDATE that
+# adds one in the database; app.core.testing_space raises the testing
+# account's when it deactivates it or gives it a new password.
 # ---------------------------------------------------------------------------
 
 SESSION_COOKIE_NAME = "dtk_session"
@@ -133,6 +139,17 @@ def _token_is_current(payload: dict, user: User) -> bool:
         return int(payload.get("ver", 0)) == int(user.token_version or 0)
     except (TypeError, ValueError):
         return False
+
+
+def end_sessions(db: Session, user_id: int) -> None:
+    """Raise the user's token_version by one, so every token issued to them before is refused; not committed.
+
+    One UPDATE that adds one to the stored value, so raises made at the
+    same time by other requests all count.
+    """
+    (db.query(User)
+       .filter(User.id == user_id)
+       .update({User.token_version: User.token_version + 1}, synchronize_session=False))
 
 
 def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None:
@@ -316,14 +333,51 @@ def login(payload: UserLogin, request: Request, response: Response, db: Session 
 
 
 @router.post("/logout", status_code=204)
-def logout(request: Request):
-    """Clear the session cookie.
+def logout(
+    request: Request,
+    credentials: Optional[HTTPAuthorizationCredentials] = Security(_optional_bearer),
+    db: Session = Depends(get_db_dependency),
+):
+    """Clear the session cookie and end the signed-out user's sessions.
+
+    When the request carries a current token (the Authorization header,
+    else the cookie) of an active user, that user's token_version is raised
+    (end_sessions), so every token issued to them before is refused: an
+    ordinary user signed in on two screens is signed out of both. The
+    testing account is the exception: several people use it at once, so
+    its sign-out clears the cookie only and its other sessions go on.
 
     Needs no session, so an operator whose token has expired can still log
-    out. Needs the CSRF header, so a cross-site page cannot log the operator
-    out.
+    out: a missing, expired, stale or unreadable token is answered 204 too,
+    and ends nothing. Needs the CSRF header, so a cross-site page cannot log
+    the operator out.
+
+    A database error while reading the user or raising the version is
+    rolled back and logged at ERROR with the user id (never the token), and
+    the answer is still 204 with the cookie cleared: the browser's cookie
+    is gone, but the user's other sessions are not ended.
     """
+    from app.core.testing_space import TESTING_ROLE
+
     _require_csrf_header(request)
+    raw_token, _ = _session_token(request, credentials)
+    payload = verify_access_token(raw_token) if raw_token else None
+    user_id = payload.get("sub") if payload else None
+    try:
+        try:
+            user, _ = _user_of_token(raw_token, db)
+        except (TypeError, ValueError):
+            user = None  # a signed token whose `sub` is not a user id
+        if user is not None and user.role != TESTING_ROLE:
+            end_sessions(db, user.id)
+            db.commit()
+    except SQLAlchemyError:
+        try:
+            db.rollback()
+        except SQLAlchemyError:
+            pass  # the error logged below is the one that matters
+        logger.error("Sign-out of user %s cleared the cookie but could not end the user's sessions",
+                     user_id, exc_info=True)
     response = Response(status_code=204)
     clear_session_cookie(response, request)
     return response
@@ -383,8 +437,13 @@ def reset_password(
     if not verify_password(payload.old_password, user.hashed_password):
         raise HTTPException(status_code=401, detail="Old password incorrect")
 
-    user.hashed_password = hash_password(payload.new_password)
-    db.add(user)
+    # The new password and the raise of token_version in one UPDATE: every
+    # session of the user ends, the one that sent this request included.
+    (db.query(User)
+       .filter(User.id == user.id)
+       .update({User.hashed_password: hash_password(payload.new_password),
+                User.token_version: User.token_version + 1},
+               synchronize_session=False))
     db.commit()
     return {"detail": "password updated successfully"}
 
@@ -554,15 +613,26 @@ def set_user_active(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Activate or deactivate a user account. Admin only; not the testing account (409 `testing_account`)."""
+    """Activate or deactivate a user account. Admin only; not the testing account (409 `testing_account`).
+
+    Deactivating an active user raises their token_version in the same
+    UPDATE, so every token issued to them before stays refused once they
+    are active again; making a user active leaves it.
+    """
     user = db.query(User).filter(User.id == user_id).first()
     if not user:
         raise HTTPException(status_code=404, detail="User not found")
     _refuse_testing_account(user)
     if user.id == current_user.id:
         raise HTTPException(status_code=400, detail="Admins cannot deactivate their own account")
-    user.is_active = is_active
-    db.add(user)
+    if is_active:
+        user.is_active = True
+        db.add(user)
+    else:
+        (db.query(User)
+           .filter(User.id == user.id, User.is_active == True)
+           .update({User.is_active: False, User.token_version: User.token_version + 1},
+                   synchronize_session=False))
     db.commit()
     db.refresh(user)
     _operators_changed(background_tasks)
