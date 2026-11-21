@@ -96,7 +96,7 @@ def _run_migration(engine, fn):
 
 
 @pytest.mark.unit
-def test_the_migration_follows_unit_settings_and_is_the_only_head(backend_root):
+def test_the_migration_follows_unit_settings(backend_root):
     import re
     mod = _load_migration(backend_root)
     assert mod.revision == REVISION and mod.down_revision == "d7f9a1c3e5b2"
@@ -105,7 +105,7 @@ def test_the_migration_follows_unit_settings_and_is_the_only_head(backend_root):
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    # The head is now the testing space revision (test_testing_space_schema.py), which follows this one.
+    # Later revisions follow this one, and there is one head (test_offsite_retired_keys.py).
     assert REVISION in downs
     assert len(revisions - downs) == 1
     assert "marks no existing volume" in mod.__doc__
@@ -1715,3 +1715,34 @@ def test_a_keep_committed_after_the_queues_kept_check_stops_the_update(db_sessio
     db_session.expire_all()
     kept = db_session.get(Collection, col.id)
     assert kept.sequence is None and kept.queue_hidden_at is None
+
+
+# ---------------------------------------------------------------------------
+# An adopted volume's images are offsite under retired keys until they are uploaded again (NEH-387)
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_volume_whose_images_are_offsite_only_under_retired_keys_cannot_be_kept(db_session, override_projects_root, tenant):
+    from app.core import kept_volumes
+    from app.models.offsite_object import OffsiteObject
+    from tests.unit.test_adopt_apply import _adopt, _setup
+    from tests.unit.test_adopt_captures_plan import own_data_dir  # noqa: F401
+
+    src, tgt, _, plan = _setup(db_session, override_projects_root)
+    _adopt(db_session, src, tgt)
+
+    with pytest.raises(kept_volumes.KeepRefused) as refused:
+        kept_volumes.keep(db_session, tgt.id, "admin")
+    assert refused.value.code == kept_volumes.ALREADY_LEFT_UNIT
+
+    # Once uploaded again under the new keys, it is refused as any uploaded volume is.
+    db_session.rollback()
+    for r in plan.renames:
+        for kind, key in r.new_keys.items():
+            db_session.add(OffsiteObject(record_image_id=r.image_id, kind=kind, object_key=key, local_sha1="0" * 40,
+                                         uploaded_at=datetime.now(timezone.utc),
+                                         verified_at=datetime.now(timezone.utc)))
+    db_session.commit()
+    with pytest.raises(kept_volumes.KeepRefused) as refused:
+        kept_volumes.keep(db_session, tgt.id, "admin")
+    assert refused.value.code == kept_volumes.ALREADY_LEFT_UNIT

@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.3.3
 
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -173,3 +173,68 @@ class CollectionWithChildren(CollectionRead):
 
     class Config:
         from_attributes = True
+
+
+class AdoptRenameRead(BaseModel):
+    """One source image's names before and after an adoption (app.core.adopt_captures.ImageRename)."""
+    image_id: int
+    record_id: int
+    is_current: bool
+    number: int
+    old_name: str
+    new_name: str
+    old_path: str
+    new_path: str
+    old_preview_path: Optional[str] = None
+    new_preview_path: Optional[str] = None
+    old_raw_buffer_path: Optional[str] = None
+    new_raw_buffer_path: Optional[str] = None
+    old_thumbnail_path: Optional[str] = None
+    new_thumbnail_path: Optional[str] = None
+    old_pair_id: Optional[str] = None
+    new_pair_id: Optional[str] = None
+    capture_id: Optional[str] = None
+    old_keys: Dict[str, str] = {}
+    new_keys: Dict[str, str] = {}
+
+
+class AdoptPlanRead(BaseModel):
+    """The dry run of an adoption: the plan, with the first `limit` renames."""
+    source_id: int
+    target_id: int
+    may_adopt: bool
+    refusals: List[str]
+    details: Dict[str, Any]
+    source_stem: Optional[str] = None
+    target_stem: Optional[str] = None
+    source_project_id: Optional[int] = None
+    target_project_id: Optional[int] = None
+    project_changes: bool
+    records: int
+    images_current: int
+    images_superseded: int
+    bytes: Dict[str, int]
+    counter_before: int
+    counter_after: int
+    renames_count: int
+    renames_truncated: bool
+    renames: List[AdoptRenameRead]
+    uncovered: List[Dict[str, str]]
+    thumbnails_missing: List[Dict[str, Any]]
+    capture_lines: int
+    unaccounted_capture_lines: List[str]
+
+
+class AdoptResultRead(BaseModel):
+    """What an adoption did (app.core.adopt_apply.adopt_captures)."""
+    source_id: int
+    target_id: int
+    records: int
+    images: int
+    files_renamed: int
+    rows_retired: int
+    counter_after: int
+    source_lines_appended: int
+    target_lines_appended: bool
+    target_lines_pending: bool
+    recovery_pending: bool

@@ -393,9 +393,11 @@ def _filtered_manifest_blob(db, collection, records):
     the project's or the volume's own, so a volume migrated into its stem
     layout, whose earlier captures are recorded in its project's manifest
     and later ones in `<stem>/metadata/manifest.jsonl`, has all of them in
-    its bag. Relocation records are the appliance's own bookkeeping of files
-    renamed after capture; the bag names its files itself, so only the
-    capture records go into it.
+    its bag. A capture whose record in the volume's own manifest names only
+    files under the volume takes that record (an adopted volume's copies:
+    integrity.capture_record_lines). Relocation records are the appliance's
+    own bookkeeping of files renamed after capture; the bag names its files
+    itself, so only the capture records go into it.
     """
     capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
     if not capture_ids:
@@ -405,7 +407,8 @@ def _filtered_manifest_blob(db, collection, records):
     # images carry: a real volume's bag never holds a testing capture's line.
     from app.core.testing_space import manifest_filter
     projects_dir = config.settings.projects_dir.resolve()
-    kept = capture_record_lines(projects_dir, capture_ids,
+    own = projects_dir / collection.filename_stem if collection.filename_stem else None
+    kept = capture_record_lines(projects_dir, capture_ids, volume_root=own,
                                 include=manifest_filter(db, bool(collection.testing), projects_dir))
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 

@@ -165,6 +165,10 @@ FREED_EXPORT_MESSAGE = (
 )
 
 
+# The detail code of a free or restore refused while an adoption's journal names the volume.
+ADOPTION_UNFINISHED = "adoption_unfinished"
+
+
 class FreeRefused(Exception):
     """A free, a dry run or a restore that cannot start; the route answers status_code with message."""
 
@@ -400,8 +404,19 @@ def _require_own_folder(db: Session, collection) -> None:
 
 
 def _stem_volume(db: Session, collection_id: int):
-    """The volume, refused unless it has a stem and every image is in `<stem>/`."""
+    """The volume, refused unless it has a stem and every image is in `<stem>/`.
+
+    Refused too while an adoption's journal names the volume
+    (app.core.adopt_journal.journal_names_volume): its files may be at
+    either of two names until startup recovery decides, and a file freed
+    meanwhile would be at neither. Every free, its dry run, its job and a
+    restore start here.
+    """
+    from app.core.adopt_journal import journal_names_volume, unfinished_message
+
     collection = _volume(db, collection_id)
+    if journal_names_volume(collection.id):
+        raise FreeRefused(unfinished_message(), detail={"code": ADOPTION_UNFINISHED})
     _require_own_folder(db, collection)
     return collection
 
@@ -1141,6 +1156,11 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
         raise ValueError(f"no volume has the file name stem {stem!r}")
     if collection.kept_on_unit:
         raise ValueError(f"Captua keeps the volume {stem!r} on the unit, so none of its files is marked freed")
+    from app.core.adopt_journal import journal_names_volume
+
+    if journal_names_volume(collection.id):
+        raise ValueError(f"an unfinished adoption names the volume {stem!r}, so none of its files is marked freed; "
+                         "restart the backend to finish or undo it")
 
     absent, unaccounted = [], []
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,

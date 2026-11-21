@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
@@ -923,3 +924,58 @@ def power_control(
     else:
         message = "The device will restart in a few seconds."
     return {"action": body.action, "message": message}
+
+
+# ==============================================================================
+# The old objects an adoption left in the bucket (NEH-387, app.core.offsite_retired)
+# ==============================================================================
+
+RETIRED_KEYS_NOTE = ("This unit cannot delete anything in the bucket: its key can upload and list only. A key "
+                     "marked deletable has its bytes verified at its new key, and can be deleted by someone "
+                     "holding the bucket's own credentials.")
+
+
+class RetiredKeyOut(BaseModel):
+    key: str
+    kind: str
+    retired_at: Optional[datetime] = None
+    volume_id: Optional[int] = None
+    volume_stem: Optional[str] = None
+    image_id: Optional[int] = None
+    current_key: Optional[str] = None
+    deletable: bool
+
+
+class RetiredKeysOut(BaseModel):
+    note: str
+    totals: dict
+    keys: list[RetiredKeyOut]
+
+
+@router.get("/offsite/retired-keys", response_model=RetiredKeysOut)
+def retired_offsite_keys(
+    format: Literal["json", "text"] = Query("json", description="text: the deletable keys only, one per line"),
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Every retired offsite key, for the person who deletes the old objects; admin only. Deletes nothing.
+
+    Each key with its kind, when it was retired, the volume and image it now
+    belongs to, its new key and whether it is deletable
+    (app.core.offsite_retired.retired_keys), and the totals. With
+    `format=text`, the deletable keys alone as plain text, one per line,
+    relative to the remote, to hand to a deletion run with the bucket's own
+    credentials.
+    """
+    from fastapi.responses import PlainTextResponse
+
+    from app.core.offsite_retired import retired_keys
+
+    keys = retired_keys(db)
+    db.rollback()  # no transaction stays open from the read
+    if format == "text":
+        return PlainTextResponse("".join(f"{k['key']}\n" for k in keys if k["deletable"]))
+    deletable = sum(1 for k in keys if k["deletable"])
+    return {"note": RETIRED_KEYS_NOTE,
+            "totals": {"keys": len(keys), "deletable": deletable, "not_deletable": len(keys) - deletable},
+            "keys": keys}

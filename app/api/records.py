@@ -602,6 +602,10 @@ def update_record(
 		              data.get("collection_id", rec.collection_id))
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
+			# Neither out of nor into a volume an unfinished adoption names:
+			# its recovery decides by where the records are (app.core.adopt_journal).
+			from app.core.adopt_journal import refuse_if_journaled
+			refuse_if_journaled([rec.collection_id, new_parent[1]])
 			# Not between testing and real work (app.core.testing_space); not
 			# between a volume Captua keeps on the unit and one it does
 			# not, nor out of or into a kept one from outside every volume (NEH-320).
@@ -675,6 +679,9 @@ def delete_record(
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# Not in a volume an unfinished adoption names (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_journaled
+	refuse_if_journaled([rec.collection_id])
 
 	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first.
 	# An excluded one (a Fisqua decision, contract 1.6) is locked too: its masters stay where they are.
@@ -757,6 +764,9 @@ async def add_image_to_record(
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# Not into a volume an unfinished adoption names (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_journaled
+	refuse_if_journaled([rec.collection_id])
 	# An excluded record (a Fisqua decision, contract 1.6) takes no image, as
 	# it takes no capture (app.api.cameras): the image would stay out of the
 	# export, and every later decision on the record would be skipped as
@@ -983,6 +993,9 @@ def delete_image(
 	# The files are chosen under this lock and unlinked only once the commit
 	# that removes the row has succeeded (NEH-262).
 	rec = _locked_record(db, img.record_id, with_images=False)
+	# Not in a volume an unfinished adoption names (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_journaled
+	refuse_if_journaled([rec.collection_id] if rec is not None else [])
 	# Read the image again now the record is locked: a move that relocated
 	# its file and committed between the first read and the lock would
 	# otherwise leave the old paths in the list below.

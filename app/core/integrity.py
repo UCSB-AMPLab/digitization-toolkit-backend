@@ -14,6 +14,7 @@ Version: 0.1.0-beta
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -374,8 +375,19 @@ def manifest_base(manifest: Path, projects_dir: Path) -> Path:
     return manifest.parent.parent
 
 
-def capture_record_lines(projects_dir: Path, capture_ids: Set[str], include=None) -> List[str]:
+def capture_record_lines(projects_dir: Path, capture_ids: Set[str],
+                         volume_root: Optional[Path] = None, include=None) -> List[str]:
     """The capture records of `capture_ids`, as their manifest lines, one per capture.
+
+    With `volume_root` (a stemmed volume's `<stem>/`), a capture whose
+    record in that volume's own manifest names only files under that
+    volume gets that record, and no other manifest's, whether or not it is
+    marked `copied_from`: an adoption's copies (app.core.adopt_manifest)
+    name the files under their new names there, while the layout
+    migration's copies name the files where they were captured, outside
+    the volume (`../<project>/...`), and so do not take the place of the
+    capture-time record. Without it, or for any other capture, the rule
+    below holds.
 
     Read from every manifest build_fixity_index reads. A volume captured
     before it had a stem has its earlier capture records in its project's
@@ -393,11 +405,12 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str], include=None
     """
     from capture.manifestHandler import is_capture_record
 
-    originals: List[Tuple[str, str]] = []
-    copies: List[Tuple[str, str]] = []
+    found: List[Tuple[str, str, bool, bool]] = []   # (capture id, line, a copy, the volume's own naming only its files)
+    own_manifest = str((volume_root / "metadata" / "manifest.jsonl").resolve()) if volume_root is not None else None
     for manifest in sorted(_manifests(projects_dir)):
         if include is not None and not include(manifest):
             continue
+        in_volume = own_manifest is not None and str(manifest.resolve()) == own_manifest
         try:
             lines, _ = read_manifest_lines(manifest)
         except OSError:
@@ -411,20 +424,36 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str], include=None
             except json.JSONDecodeError:
                 continue
             if (is_capture_record(entry) and entry.get("capture_id") in capture_ids):
-                (copies if "copied_from" in entry else originals).append((entry["capture_id"], stripped))
+                found.append((entry["capture_id"], stripped, "copied_from" in entry,
+                              in_volume and _names_only_files_under(entry)))
+    owned = {cid for cid, _, _, own in found if own}
     kept: List[str] = []
     kept_lines: Set[str] = set()
     seen: Set[str] = set()
-    for cid, line in originals:
-        if line not in kept_lines:
+    for cid, line, copy, own in found:
+        if (own if cid in owned else not copy) and line not in kept_lines:
             kept_lines.add(line)
             kept.append(line)
-        seen.add(cid)
-    for cid, line in copies:
-        if cid not in seen:
+            seen.add(cid)
+    for cid, line, copy, _ in found:
+        if copy and cid not in seen:
             kept.append(line)
             seen.add(cid)
     return kept
+
+
+def _names_only_files_under(entry: dict) -> bool:
+    """Whether a capture record names at least one file and every path it names stays under its manifest's base."""
+    paths = [f.get("relative_path") for f in entry.get("files") or [] if isinstance(f, dict)]
+    if not paths:
+        return False
+    for rel in paths:
+        if not isinstance(rel, str) or not rel or Path(rel).is_absolute():
+            return False
+        normal = Path(os.path.normpath(rel))
+        if normal.parts[:1] == ("..",):
+            return False
+    return True
 
 
 def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:

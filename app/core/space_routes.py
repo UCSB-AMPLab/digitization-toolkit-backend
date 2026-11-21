@@ -224,6 +224,13 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/collections/{collection_id}/export"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/export/status/{job_id}"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/export/download"): Entry(targets=(_COL,)),
+    # The adoption of a hand-made volume's captures into the volume Fisqua assigned: real work only,
+    # both volumes. A testing volume is answered 404 here, and the plan refuses one besides
+    # (app.core.adopt_captures, `source_testing_volume`, `target_testing_volume`).
+    ("GET", "/collections/{source_id}/adopt-into/{target_id}"): Entry(targets=(
+        _p("source_id", COLLECTION), _p("target_id", COLLECTION))),
+    ("POST", "/collections/{source_id}/adopt-into/{target_id}"): Entry(targets=(
+        _p("source_id", COLLECTION), _p("target_id", COLLECTION))),
     # The copy of a testing volume to a USB drive: the testing account and administrators,
     # who may name a testing volume here; the handler refuses a real volume to both.
     ("POST", "/collections/{collection_id}/usb-copy"): Entry(testing=True, admin_reads_testing=True,
@@ -258,6 +265,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/system/testing/clear"): Entry(),
     # The USB drives a testing volume can be copied to.
     ("GET", "/system/testing/usb"): Entry(testing=True),
+    # The offsite keys adoptions retired. A testing volume has no offsite key, so none is listed.
+    ("GET", "/system/offsite/retired-keys"): Entry(),
     ("GET", "/system/pairing"): Entry(),
     ("POST", "/system/pairing"): Entry(),
     ("POST", "/system/pairing/renew"): Entry(),
