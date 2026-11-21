@@ -429,7 +429,11 @@ def _write_account(db: Session, account, *, actor: str, username: Optional[str] 
     The one writer of the account's row. A new account needs `username`
     and `hashed_password` (_hashed), and is active. A new password, and a
     change from active to inactive, each raise the account's token_version
-    by one, so every token issued before is refused (app.api.auth); a new
+    by one, so every token issued before is refused (app.api.auth); the raise
+    is one UPDATE that adds one to the stored value (app.api.auth.end_sessions),
+    in the transaction of the password or the flag, and the account's
+    token_version is read again afterwards, so no flush writes an older
+    value back and raises made at the same time all count; a new
     username and a return to active leave it. A username another user
     holds is SpaceRefused (409, username_taken); a second testing account
     that committed after `account` was read is refused by
@@ -466,7 +470,9 @@ def _write_account(db: Session, account, *, actor: str, username: Optional[str] 
                 ends_sessions = True
             account.is_active = bool(active)
         if ends_sessions:
-            account.token_version = (account.token_version or 0) + 1
+            from app.api.auth import end_sessions
+            end_sessions(db, account.id)
+            db.expire(account, ["token_version"])
     try:
         db.flush()
     except IntegrityError:
