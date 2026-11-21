@@ -121,8 +121,7 @@ def _as_collection_create(payload: CollectionCreateRequest) -> CollectionCreate:
 
     A body with no stem and another invalid field is answered with the
     other field's error only, since FastAPI refuses it before this runs.
-    The `input` echoed in a stem error is the parsed body, not the bytes
-    sent.
+    The 422 carries each error's type, loc and msg only (app.main).
     """
     from fastapi.exceptions import RequestValidationError
     from pydantic import ValidationError

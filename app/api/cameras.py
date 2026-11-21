@@ -328,7 +328,7 @@ _VALID_ROTATIONS = (0, 90, 180, 270)
 
 def _validate_rotate_deg(v: Optional[int]) -> Optional[int]:
 	if v is not None and v not in _VALID_ROTATIONS:
-		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}; got {v}")
+		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}")
 	return v
 
 
