@@ -140,6 +140,12 @@ def _create_project_locked(payload: ProjectCreate, current_user: User, db: Sessi
 CAPTURE_FORMAT_NOT_TESTING = "capture_format_not_testing"
 CAPTURE_FORMAT_UNAVAILABLE = "capture_format_unavailable"
 
+PROJECT_NOT_EMPTY = "project_not_empty"
+PROJECT_FILES_HELD = "project_files_held"
+PROJECT_MANIFEST_FOREIGN = "project_manifest_foreign"
+PROJECT_MANIFEST_KEEP_FAILED = "project_manifest_keep_failed"
+PROJECT_FILES_REMOVE_FAILED = "project_files_remove_failed"
+
 
 def checked_capture_format(testing: bool, value: Optional[str]) -> Optional[str]:
     """The capture format a project body sends, checked and in its current name; None when none is sent.
@@ -610,9 +616,14 @@ def delete_project(
     deleted, and a directory that still holds anything else stays and is
     logged (app.core.testing_space.remove_project_directory).
 
-    Refuses (409) if the project still has collections or records (those must
-    be moved or deleted first) or if its directory still holds files that a
-    surviving record points at. A move relocates files, so the honest flow is
+    Refuses with a detail {"code", "message"}: 409 project_not_empty (with the
+    counts `collections` and `records`) if the project still has collections
+    or records (those must be moved or deleted first), 409 project_files_held
+    if its directory still holds files that a surviving record points at, 409
+    project_manifest_foreign for another capture manifest in its tree, and 500
+    project_manifest_keep_failed or project_files_remove_failed when the disk
+    refuses. A testing project whose storage drive cannot be read is a 503
+    with a string detail (StorageUnavailableError). A move relocates files, so the honest flow is
     "move contents out, then delete the emptied project".
     """
     from capture.project_manager import project_capture_root
@@ -629,7 +640,12 @@ def delete_project(
     if collection_count or record_count:
         raise HTTPException(
             status_code=409,
-            detail=f"Cannot delete a non-empty project: {collection_count} collection(s) and {record_count} record(s) remain. Move or delete them first.",
+            detail={
+                "code": PROJECT_NOT_EMPTY,
+                "message": f"Cannot delete a non-empty project: {collection_count} collection(s) and {record_count} record(s) remain. Move or delete them first.",
+                "collections": collection_count,
+                "records": record_count,
+            },
         )
 
     project_dir = project_capture_root(project_name)
@@ -650,7 +666,10 @@ def delete_project(
     if surviving_images_under(db, project_dir):
         raise HTTPException(
             status_code=409,
-            detail="Project directory still holds files referenced by other records. Move those records first.",
+            detail={
+                "code": PROJECT_FILES_HELD,
+                "message": "Project directory still holds files referenced by other records. Move those records first.",
+            },
         )
 
     # A capture manifest is never deleted: it may hold the capture-time
@@ -661,7 +680,10 @@ def delete_project(
     if others:
         raise HTTPException(
             status_code=409,
-            detail="Project directory holds a capture manifest other than its own. Move it out first.",
+            detail={
+                "code": PROJECT_MANIFEST_FOREIGN,
+                "message": "Project directory holds a capture manifest other than its own. Move it out first.",
+            },
         )
     try:
         # A testing project's manifest goes with its directory and is never
@@ -670,7 +692,9 @@ def delete_project(
             retire_project_manifest(project_dir)
     except OSError as e:
         logger.error(f"Failed to retire the capture manifest of {project_dir}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to keep the project's capture manifest; nothing was deleted")
+        raise HTTPException(status_code=500, detail={
+            "code": PROJECT_MANIFEST_KEEP_FAILED,
+            "message": "Failed to keep the project's capture manifest; nothing was deleted"})
 
     # Remove files first so a filesystem failure aborts before touching the DB
     try:
@@ -690,7 +714,9 @@ def delete_project(
             remove_tree(project_dir)
     except OSError as e:
         logger.error(f"Failed to remove project directory {project_dir}: {e}")
-        raise HTTPException(status_code=500, detail="Failed to remove project files from disk")
+        raise HTTPException(status_code=500, detail={
+            "code": PROJECT_FILES_REMOVE_FAILED,
+            "message": "Failed to remove project files from disk"})
 
     db.delete(p)
     db.commit()
