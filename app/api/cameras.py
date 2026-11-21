@@ -196,16 +196,38 @@ def _refuse_a_project_name_outside_the_testing_space(db: Session, project_name: 
 
 
 def _refuse_a_testing_capture_below_the_reserve(db: Session, user: User) -> None:
-	"""507 testing_reserve for the testing account while free space is below the reserve kept for real work.
+	"""507 testing_reserve for the testing account while free space is below its reserve.
 
-	Called before any camera is touched, any number taken or any file
-	written (app.core.testing_space.refuse_below_reserve). Real work is not
-	checked against the reserve.
+	Its reserve is the larger of the testing reserve and the storage reserve
+	(app.core.testing_space.refuse_below_reserve). Called before any camera
+	is touched, any number taken or any file written. Every other caller is
+	checked by _refuse_a_real_capture_below_the_storage_reserve instead.
 	"""
 	from app.core import testing_space
 
 	if user.role == testing_space.TESTING_ROLE:
 		testing_space.refuse_below_reserve(db)
+
+
+def _refuse_a_real_capture_below_the_storage_reserve(db: Session, user: User, root) -> None:
+	"""507 storage_reserve for every caller but the testing account while free space is below the storage reserve.
+
+	The last refusal of a capture: called after every other check and after
+	the event's number is taken, immediately before the camera is triggered,
+	on `root`, the projects root the capture retained for its files,
+	so a request refused for anything else is answered as before. The
+	number taken is rolled back with the transaction
+	(app.core.storage_override.refuse_below_storage_reserve).
+	"""
+	from app.core import storage_override, testing_space
+
+	if user.role == testing_space.TESTING_ROLE:
+		return
+	try:
+		storage_override.refuse_below_storage_reserve(root)
+	except HTTPException:
+		db.rollback()
+		raise
 
 
 def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int],
@@ -1634,6 +1656,7 @@ def trigger_capture(
 		root = projects_root()
 		# One capture event: its number, in the transaction that writes its image.
 		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+		_refuse_a_real_capture_below_the_storage_reserve(db, current_user, root)
 
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
@@ -1880,6 +1903,7 @@ def trigger_dual_capture(
 		# One capture event for the pair: one number, which both images carry
 		# and which is their pair id.
 		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+		_refuse_a_real_capture_below_the_storage_reserve(db, current_user, root)
 
 		# left_camera_index says which physical camera takes the left page;
 		# the manifest and the rows record the same roles.

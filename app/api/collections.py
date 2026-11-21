@@ -466,8 +466,12 @@ def get_collection_offsite_state(
 def _offsite_state(db: Session, collection) -> dict:
     from app.core.fisqua_outbox import volume_fisqua_state
     from app.core.image_upload import volume_upload_state
+    from app.core.offsite_free import restore_available
 
-    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id)}
+    # `restorable`: whether this unit can restore freed files (NEH-380), so the
+    # interface offers a restore only where one can run.
+    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id),
+            "restorable": restore_available()}
 
 
 # ==============================================================================
@@ -549,7 +553,9 @@ def keep_collection_on_unit(
 # Freeing a received volume from the card, and restoring it (app.core.offsite_free)
 # ==============================================================================
 #
-# Under /{id}/offsite, beside the received indicator they depend on. GET of
+# Under /{id}/offsite, beside the received indicator they depend on. The dry
+# run, the free and a free job's status are the admin's and the operator's;
+# restore and a restore job's status are the admin's. GET of
 # /offsite/free is the dry run (it lists the bucket and changes nothing);
 # POST runs the free. Both POSTs answer 202 with a job to poll, as the export
 # does, because hashing a volume's masters outlasts the proxy's read timeout;
@@ -563,7 +569,7 @@ def _offsite_refused(exc) -> HTTPException:
 @router.get("/{collection_id}/offsite/free")
 def plan_free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
     """Dry run: which masters and previews freeing would remove, their count and bytes, and what it would refuse and why."""
@@ -583,10 +589,10 @@ def _job_body(collection_id: int, job) -> dict:
 @router.post("/{collection_id}/offsite/free", status_code=202)
 def free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
-    """Free the volume's masters and RAW previews from the card; thumbnails stay.
+    """Free the volume's masters and RAW previews from the card; thumbnails stay. Admin and operator.
 
     Refused with 409 when the volume has no stem, when not every one of its
     objects is verified in the bucket, while an export of it is queued or
@@ -612,7 +618,7 @@ def restore_collection(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
+    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place. Admin only.
 
     Refused with 409 when the volume has no stem, when no read remote is
     configured (CAPTUA_OFFSITE_READ_REMOTE), and while an export of it is
@@ -628,18 +634,28 @@ def restore_collection(
     return _job_body(collection_id, job)
 
 
+RESTORE_JOB_ADMIN_ONLY = "Only an administrator can read a restore job."
+
+
 @router.get("/{collection_id}/offsite/jobs/{job_id}")
 def offsite_job_status(
     collection_id: int,
     job_id: str,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
 ):
-    """The state of a free or restore job, with its result once done."""
+    """The state of a free or restore job, with its result once done.
+
+    Admin and operator for a free job; a restore job, which only an admin
+    starts, is the admin's alone: an operator is answered 403 for it, with
+    nothing of the job.
+    """
     from app.core.offsite_free import offsite_jobs
 
     job = offsite_jobs.get(job_id)
     if job is None or job.collection_id != collection_id:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.action == "restore" and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail=RESTORE_JOB_ADMIN_ONLY)
     return job.to_dict()
 
 
@@ -1720,12 +1736,14 @@ def export_collection_bagit(
 
     # A master freed from the card is in the bucket, not here, and a bag is
     # built from the card. 409: the volume's state, which a restore changes.
-    from app.core.offsite_free import FREED_EXPORT_MESSAGE
+    # `restorable` says whether a restore can bring them back to this unit (restore_available).
+    from app.core.offsite_free import FREED_EXPORT_MESSAGE, restore_available
     freed = [i.id for r in records for i in r.images if i.is_current and i.master_freed_at is not None]
     if freed:
         raise HTTPException(
             status_code=409,
-            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed},
+            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed,
+                    "restorable": restore_available()},
         )
 
     # One export per collection at a time: a retry returns the running job instead of

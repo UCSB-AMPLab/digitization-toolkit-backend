@@ -1,4 +1,4 @@
-"""The admin routes that free and restore a volume, and how every reader treats a freed file.
+"""The routes that free a volume (admin and operator) and restore it (admin), and how every reader treats a freed file.
 
 Freed is never missing (NEH-248): the image routes answer 410 with the key,
 the integrity check counts freed files apart from missing ones, the export
@@ -35,12 +35,14 @@ def _wait(client, vol, job_id, timeout=30):
 # ---------------------------------------------------------------------------
 
 @pytest.mark.unit
-@pytest.mark.parametrize("role", ["operator", "reviewer"])
-def test_only_an_admin_may_free_plan_or_restore(remote, client, db_session, override_projects_root, role):
-    _as(role)
+def test_the_reviewer_may_not_free_plan_or_restore_and_the_operator_may_not_restore(
+        remote, client, db_session, override_projects_root):
     vol, _, _ = _received(db_session, override_projects_root)
+    _as("reviewer")
     assert client.get(f"/collections/{vol.id}/offsite/free").status_code == 403
     assert client.post(f"/collections/{vol.id}/offsite/free").status_code == 403
+    assert client.post(f"/collections/{vol.id}/offsite/restore").status_code == 403
+    _as("operator")
     assert client.post(f"/collections/{vol.id}/offsite/restore").status_code == 403
     assert _paths(override_projects_root, "f2.jpg")[0].exists()
 

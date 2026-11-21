@@ -274,7 +274,10 @@ def test_free_space_that_cannot_be_read_refuses_a_testing_write(unit, disk, name
 
 @pytest.mark.unit
 @pytest.mark.parametrize("free", [0, None], ids=["full", "unreadable"])
-def test_real_work_is_never_refused_by_the_reserve(unit, disk, free):
+def test_real_work_is_never_refused_by_the_reserve(unit, disk, free, monkeypatch):
+    # Real work has a reserve of its own (CAPTUA_STORAGE_RESERVE_GB), set to none here.
+    from app.core.config import settings
+    monkeypatch.setattr(settings, "STORAGE_RESERVE_GB", 0)
     disk.free = free
     for path, body in (("/cameras/capture/dual", {"project_name": unit.real_project.name,
                                                   "collection_id": unit.real_volume.id}),

@@ -1463,7 +1463,8 @@ def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
 # The received indicator, derived
 # ---------------------------------------------------------------------------
 
-def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) -> dict:
+def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None, *,
+                   real_released_only: bool = False, probe_previews: bool = True) -> dict:
     """Per stemmed volume: total, verified, pending, refused, last verification, refusals, freed.
 
     A volume's uploadable objects are each image's capture, and, for a RAW
@@ -1473,34 +1474,49 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
     verified too, since freeing needs a verified object. `kept_on_unit` is
     the volume's flag (app.core.kept_volumes); its counts are what they are,
     and callers decide what a kept volume's pending means.
+
+    With `real_released_only`, testing volumes and volumes kept on the unit
+    are left out of every query, so none of their files is looked for.
+
+    With `probe_previews` false no file is looked for: a current RAW image
+    whose preview has no row counts its preview as one more object still to
+    upload, so its volume is not received; a RAW image that is not current
+    and has no preview row counts no preview. This is the database-only
+    reading of the list of volumes that can be freed (offsite_free.freeable_volumes).
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
     q = (db.query(RecordImage.id, RecordImage.file_path, Collection.id,
-                  RecordImage.master_freed_bytes, RecordImage.preview_freed_bytes)
+                  RecordImage.master_freed_bytes, RecordImage.preview_freed_bytes, RecordImage.is_current)
          .join(Record, RecordImage.record_id == Record.id)
          .join(Collection, Record.collection_id == Collection.id)
          .filter(Collection.filename_stem.isnot(None)))
+    # The offsite rows of those same images, in one query joined the same way,
+    # so the number of queries does not grow with the unit's images.
+    objects = (db.query(OffsiteObject)
+               .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+               .join(Record, RecordImage.record_id == Record.id)
+               .join(Collection, Record.collection_id == Collection.id)
+               .filter(Collection.filename_stem.isnot(None)))
     stemmed = db.query(Collection.id, Collection.kept_on_unit).filter(Collection.filename_stem.isnot(None))
     if collection_ids is not None:
         ids = list(collection_ids)
         q = q.filter(Collection.id.in_(ids))
+        objects = objects.filter(Collection.id.in_(ids))
         stemmed = stemmed.filter(Collection.id.in_(ids))
+    if real_released_only:
+        real = (Collection.testing.is_(False), Collection.kept_on_unit.is_(False))
+        q, objects, stemmed = q.filter(*real), objects.filter(*real), stemmed.filter(*real)
     images = q.all()
 
-    rows = {}
-    image_ids = [i for i, *_ in images]
-    for start in range(0, len(image_ids), 500):
-        chunk = image_ids[start:start + 500]
-        for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
-            rows[(row.record_image_id, row.kind)] = row
+    rows = {(row.record_image_id, row.kind): row for row in objects}
 
     out = {cid: {"total": 0, "verified": 0, "refused": 0, "last_verified_at": None, "refusals": [],
                  "freed_files": 0, "freed_bytes": 0, "kept_on_unit": bool(kept)}
            for cid, kept in stemmed.all()}
-    for image_id, file_path, cid, master_freed, preview_freed in images:
+    for image_id, file_path, cid, master_freed, preview_freed, is_current in images:
         state = out[cid]
         for freed_bytes in (master_freed, preview_freed):
             if freed_bytes is not None:
@@ -1510,6 +1526,9 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
         if is_raw_suffix(Path(file_path)):
             if (image_id, "preview") in rows:
                 kinds.append("preview")
+            elif not probe_previews:
+                if is_current:
+                    kinds.append("preview")
             else:
                 sidecar = local_file("preview", file_path)
                 if sidecar is not None and sidecar.is_file():

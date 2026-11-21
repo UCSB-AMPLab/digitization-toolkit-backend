@@ -112,6 +112,11 @@ class Settings(BaseSettings):
     EXPORTS_ROOT: str = Field(default="", validation_alias=_names("EXPORTS_DIR"))
     # Application-level cap on uploaded image size. Defends the SD even if nginx (client_max_body_size 100m) is not in front of the app. Enforced while streaming.
     MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, validation_alias=_names("MAX_UPLOAD_BYTES"))
+    # Free space, in GB of 10^9 bytes, that Captua keeps for its own work on the
+    # file system that holds the active projects root
+    # (app.core.storage_override.refuse_below_storage_reserve). Below it, captures
+    # and image uploads of real work are refused. 0 keeps no reserve.
+    STORAGE_RESERVE_GB: int = Field(default=2, ge=0, validation_alias=_names("STORAGE_RESERVE_GB"))
 
     # Offsite catalogue backup (NEH-249). Empty OFFSITE_REMOTE disables the
     # whole path, so a unit without provisioned credentials does nothing rather

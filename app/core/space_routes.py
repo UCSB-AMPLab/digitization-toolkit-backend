@@ -267,6 +267,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/system/pairing/renew"): Entry(),
     ("DELETE", "/system/pairing"): Entry(),
     ("GET", "/system/storage"): Entry(),
+    # The real volumes that can be freed; the handler leaves testing volumes out.
+    ("GET", "/system/storage/freeable"): Entry(),
     ("GET", "/system/storage/devices"): Entry(),
     ("POST", "/system/storage/mount"): Entry(),
     ("DELETE", "/system/storage/mount"): Entry(),

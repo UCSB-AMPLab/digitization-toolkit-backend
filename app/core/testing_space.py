@@ -357,11 +357,17 @@ def refuse_below_reserve(db: Session) -> None:
     POST /records/{id}/images and POST /collections/. Real work is never
     passed to it. The thumbnail GET is not checked: it rewrites a small file
     derived from an image already stored.
+
+    The reserve is the larger of the testing reserve and the storage reserve
+    (settings.STORAGE_RESERVE_GB, app.core.storage_override), so the testing
+    account never writes into space real work is refused; the code stays
+    `testing_reserve` and `reserve_gb` is that larger figure.
     """
     from fastapi import HTTPException
     from app.core import unit_mode
+    from app.core.config import settings
 
-    reserve_gb = unit_mode.testing_settings(db).reserve_gb
+    reserve_gb = max(unit_mode.testing_settings(db).reserve_gb, max(0, int(settings.STORAGE_RESERVE_GB)))
     free = free_bytes()
     if free is not None and free >= reserve_gb * BYTES_PER_GB:
         return

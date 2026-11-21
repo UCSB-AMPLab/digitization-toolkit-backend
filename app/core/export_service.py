@@ -177,9 +177,11 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     # the request. A freed master is stored offsite, not missing.
     freed = [i.id for rec in records for i in rec.images if i.is_current and i.master_freed_at is not None]
     if freed:
-        from app.core.offsite_free import FREED_EXPORT_MESSAGE
+        from app.core.offsite_free import FREED_EXPORT_MESSAGE, restore_available
+        # `restorable`: whether a restore can bring the masters back to this unit.
         raise ExportError(FREED_EXPORT_MESSAGE.format(n=len(freed)),
-                          detail={"reason": "freed_files", "freed_image_ids": freed})
+                          detail={"reason": "freed_files", "freed_image_ids": freed,
+                                  "restorable": restore_available()})
 
     for idx, rec in enumerate(records):
         seq_label = f"{idx + 1:04d}"
