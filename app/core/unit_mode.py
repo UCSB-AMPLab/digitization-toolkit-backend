@@ -468,9 +468,12 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
 
 
 def _any_kept(db: Session) -> bool:
+    """Whether any volume but a testing one is kept: testing volumes are kept for good and ask for no decision."""
     from app.models.collection import Collection
 
-    return db.query(Collection.id).filter(Collection.kept_on_unit.is_(True)).first() is not None
+    return (db.query(Collection.id)
+            .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
+            .first() is not None)
 
 
 DETAIL_MAX = 500  # system_logs.detail, as _log_in_session cuts it
@@ -504,10 +507,14 @@ def _decide_kept(db: Session, kept: str, actor: Optional[str]) -> None:
     lock_for_reparent and refuse_kept_move take them (app.core.kept_volumes,
     "Lock order"). It holds the unit_settings row first, which none of
     those take, so that lock cannot close a cycle either.
+
+    Testing volumes (app.core.testing_space) are not among them: they stay
+    kept whatever the decision, and are neither locked nor counted.
     """
     from app.models.collection import Collection
 
-    ids = [cid for (cid,) in db.query(Collection.id).filter(Collection.kept_on_unit.is_(True))
+    ids = [cid for (cid,) in db.query(Collection.id)
+           .filter(Collection.kept_on_unit.is_(True), Collection.testing.is_(False))
            .order_by(Collection.id).with_for_update(key_share=True).all()]
     if not ids:
         return
@@ -549,21 +556,75 @@ def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], trans
 
 
 # ---------------------------------------------------------------------------
+# The testing space's settings (app.core.testing_space)
+# ---------------------------------------------------------------------------
+
+@dataclass(frozen=True)
+class TestingSettings:
+    enabled: bool
+    user_id: Optional[int]
+    expiry_days: int
+    reserve_gb: int
+
+
+def _testing_settings(row) -> TestingSettings:
+    from app.models.unit_settings import DEFAULT_TESTING_EXPIRY_DAYS, DEFAULT_TESTING_RESERVE_GB
+
+    if row is None:
+        return TestingSettings(False, None, DEFAULT_TESTING_EXPIRY_DAYS, DEFAULT_TESTING_RESERVE_GB)
+    return TestingSettings(bool(row.testing_enabled), row.testing_user_id, row.testing_expiry_days,
+                           row.testing_reserve_gb)
+
+
+def testing_settings(db: Session) -> TestingSettings:
+    """The stored testing settings, or, with no row yet, the space off with the default expiry and reserve. Reads only."""
+    return _testing_settings(_row(db))
+
+
+def lock_testing_settings(db: Session) -> TestingSettings:
+    """The testing settings with the row FOR UPDATE, the row inserted (and logged) when missing. Not committed.
+
+    For app.core.testing_space's changes, taken before the testing account
+    is read, so two changes of the space or its account run one after the
+    other. The caller holds no uncommitted change of its own (_ensure_row).
+    """
+    return _testing_settings(_ensure_row(db))
+
+
+def store_testing_settings(db: Session, *, actor: Optional[str], enabled: bool, user_id: Optional[int],
+                           expiry_days: int, reserve_gb: int) -> None:
+    """Write the testing settings to the row lock_testing_settings holds; committed with the caller's change."""
+    row = _row(db, lock=True)
+    if (bool(row.testing_enabled), row.testing_user_id, row.testing_expiry_days, row.testing_reserve_gb) == (
+            bool(enabled), user_id, expiry_days, reserve_gb):
+        return
+    row.testing_enabled = bool(enabled)
+    row.testing_user_id = user_id
+    row.testing_expiry_days = expiry_days
+    row.testing_reserve_gb = reserve_gb
+    row.updated_at = _now()
+    row.updated_by = actor
+
+
+# ---------------------------------------------------------------------------
 # The default project
 # ---------------------------------------------------------------------------
 
 def stored_default_project(db: Session):
-    """The stored default project, or None when none is stored or it no longer exists. Reads only."""
+    """The stored default project, or None when none is stored, its row is gone or it is a testing project. Reads only."""
     from app.models.project import Project
 
     project_id = current(db).default_project_id
-    return db.get(Project, project_id) if project_id is not None else None
+    project = db.get(Project, project_id) if project_id is not None else None
+    return project if project is not None and not project.testing else None
 
 
 def default_project(db: Session, actor: Optional[str]):
     """The project new volumes go into while projects are hidden: (project, created now). Commits.
 
-    The stored one when it still exists; else the only project when there is
+    Never a testing project (app.core.testing_space): a stored one that is
+    testing is passed over, and testing projects are not counted. The
+    stored one when it exists; else the only project when there is
     exactly one; else the project an import of a list named `default` would
     use, created when there is none (list_import._project_for, under the
     shared project lock, with no admin needed). The choice is stored and
@@ -577,12 +638,12 @@ def default_project(db: Session, actor: Optional[str]):
     row = _ensure_row(db)
     if row.default_project_id is not None:
         project = db.get(Project, row.default_project_id)
-        if project is not None:
+        if project is not None and not project.testing:
             db.commit()
             return project, False
     db.commit()
 
-    projects = db.query(Project).order_by(Project.id).limit(2).all()
+    projects = db.query(Project).filter(Project.testing.is_(False)).order_by(Project.id).limit(2).all()
     created = False
     if len(projects) == 1:
         project, how = projects[0], "the unit's only project"
@@ -594,7 +655,7 @@ def default_project(db: Session, actor: Optional[str]):
     row = _ensure_row(db)
     if row.default_project_id is not None and row.default_project_id != project_id:
         chosen = db.get(Project, row.default_project_id)
-        if chosen is not None:
+        if chosen is not None and not chosen.testing:
             # Another request stored one meanwhile; that one stands.
             db.commit()
             return chosen, False

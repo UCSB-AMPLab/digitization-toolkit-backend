@@ -62,6 +62,13 @@ routes that send a full rescan to review hold their record locks, then take
 the volume's row, then lock_turn (award_rescan_turns): the order of every
 path that takes lock_turn.
 
+The turn is real work's alone (app.core.testing_space). A testing record
+is never pending for the turn (pending_records), no event is written for a
+testing volume (record_event, the one writer of the three events). A capture into a testing volume is never refused for the turn
+and takes no turn lock (app.api.cameras), closing a testing record writes
+no completion (app.api.records.close_missing_record), and no testing
+volume is a full rescan for the turn (lock_rescan_volumes).
+
 Version: 0.3.3
 """
 from datetime import datetime, timezone
@@ -178,8 +185,16 @@ def record_is_pending(rec: Record) -> bool:
 
 
 def pending_records(db: Session) -> int:
-	"""How many records are pending on the unit."""
-	return db.query(func.count(Record.id)).filter(pending_clause()).scalar() or 0
+	"""How many records of real work are pending on the unit: the count the turn is read from."""
+	return db.query(func.count(Record.id)).filter(pending_clause(), real_work_clause()).scalar() or 0
+
+
+def real_work_clause():
+	"""SQL for "this record is real work", not testing work (app.core.testing_space.testing_clause)."""
+	from sqlalchemy import not_
+	from app.core.testing_space import testing_clause
+
+	return not_(testing_clause(Record))
 
 
 def volume_pending(db: Session, collection_id: int) -> int:
@@ -253,7 +268,7 @@ def lock_rescan_volumes(db: Session, collection_ids) -> list:
 		rescans = sorted({
 			cid for cid in collection_ids
 			if cid is not None and (volume := db.get(Collection, cid)) is not None
-			and volume_is_full_rescan(volume)
+			and not volume.testing and volume_is_full_rescan(volume)
 		})
 	for cid in rescans:
 		volume_stem.locked_volume_query(db, cid).first()
@@ -297,7 +312,8 @@ def _newest(db: Session, *actions: str) -> Optional[SystemLog]:
 def turn(db: Session, pending: Optional[int] = None) -> dict:
 	"""The turn as GET /records/to-retake/summary gives it: {"state", "unlockedBy"}.
 
-	`pending` is the unit's rejected count, when the caller has it already.
+	`pending` is the unit's pending count of real work (pending_records),
+	when the caller has it already.
 	unlockedBy names the volume whose completion opened a "new" turn, by its
 	current name; a volume deleted since keeps the name the event recorded.
 	"""
@@ -326,7 +342,10 @@ def record_event(db: Session, action: str, volume: Collection, actor: Optional[s
 
 	Not app.core.audit.log_event, which commits at once: the event must stand
 	or fall with the capture that caused it, and be inserted under lock_turn.
+	Nothing is written for a testing volume: the turn is real work's alone.
 	"""
+	if volume.testing:
+		return
 	db.add(SystemLog(
 		level="INFO",
 		category="capture",

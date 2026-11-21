@@ -7,14 +7,17 @@ import re
 import shutil
 import subprocess
 from pathlib import Path
-from typing import Literal, Optional
+from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict
+from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
 from app.api.deps import get_db_dependency
+from app.core.testing_space import (
+    MAX_EXPIRY_DAYS, MAX_RESERVE_GB, MIN_EXPIRY_DAYS, MIN_RESERVE_GB, USERNAME_MAX_LENGTH,
+)
 from app.models.system_log import SystemLog
 from app.models.user import User
 from app.schemas.system_log import SystemLogOut
@@ -196,10 +199,20 @@ def get_unit(
     A switch to fisqua also needs Fisqua to take the operators call.
     `keptVolumes` lists every volume Captua keeps on the unit (NEH-320) as
     {id, name, files}, `files` being the count it would copy offsite.
+
+    The testing account receives the same keys, with the mode and the
+    projects setting (`mode`, `projectsEnabled`) only: `projectsShown` is
+    true, since the account always works in its own projects and never in
+    the default project, `defaultProjectId` is null and `prerequisites`
+    and `keptVolumes` are empty, since they name or count real work.
     """
     from app.core import unit_mode
+    from app.core.testing_space import TESTING_ROLE
 
-    return unit_mode.as_api(db)
+    body = unit_mode.as_api(db)
+    if current_user.role == TESTING_ROLE:
+        body = {**body, "projectsShown": True, "defaultProjectId": None, "prerequisites": [], "keptVolumes": []}
+    return body
 
 
 @router.put("/unit")
@@ -235,6 +248,185 @@ def put_unit(
     except unit_mode.ModeRefused as exc:
         raise HTTPException(status_code=409, detail=exc.detail())
     return unit_mode.as_api(db)
+
+
+# ---------------------------------------------------------------------------
+# The testing space and its account (app.core.testing_space)
+# ---------------------------------------------------------------------------
+
+# The testing account's username is stripped of surrounding whitespace and is then 1 to
+# USERNAME_MAX_LENGTH characters. Its password is kept as sent and carries no constraint
+# here, so a 422 validation body never echoes it; app.core.testing_space refuses an
+# empty one (password_empty).
+_TestingUsername = Annotated[str, StringConstraints(strip_whitespace=True, min_length=1,
+                                                    max_length=USERNAME_MAX_LENGTH)]
+
+
+class TestingUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    enabled: Annotated[bool, Field(strict=True)]
+    username: Optional[_TestingUsername] = None
+    password: Optional[str] = None
+    # Absent leaves the stored value; null is refused, as is anything but an integer in range.
+    expiry_days: Annotated[int, Field(strict=True, ge=MIN_EXPIRY_DAYS, le=MAX_EXPIRY_DAYS)] = None
+    reserve_gb: Annotated[int, Field(strict=True, ge=MIN_RESERVE_GB, le=MAX_RESERVE_GB)] = None
+
+
+class TestingAccountUpdate(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    username: Optional[_TestingUsername] = None
+    password: Optional[str] = None
+
+    @model_validator(mode="after")
+    def _something_to_change(self):
+        if self.username is None and self.password is None:
+            raise ValueError("Give a username, a password, or both.")
+        return self
+
+
+def _space_refused(exc) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=exc.detail())
+
+
+@router.get("/testing")
+def get_testing(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """The testing space's settings and account. Admin only, in every mode.
+
+    {enabled, username, account_active, expiry_days, reserve_gb, free_gb,
+    projects, volumes}: `reserve_gb` is the free space, in GB of 10^9 bytes,
+    kept for real work, below which the testing account's captures are
+    refused; `free_gb` is the free space on the file system that holds the
+    active projects root, rounded to one decimal, or null when it cannot be
+    read. `username` is null while the unit has no testing account; `projects`
+    and `volumes` count the testing projects and the testing volumes at
+    every level. The password is never part of it.
+    """
+    from app.core import testing_space
+
+    return testing_space.as_api(db)
+
+
+@router.put("/testing")
+def put_testing(
+    payload: TestingUpdate,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Switch the testing space on or off, and set how long testing volumes are kept. Admin only.
+
+    Returns the GET /system/testing body. Switching on with no testing
+    account creates it from `username` and `password` (422
+    `account_required` when either is missing); with one, it is made active
+    again and the `username` and `password` sent are applied. Switching off
+    makes the account inactive and ends its sessions: every token issued
+    before is refused, also after the space is switched on again. A new
+    password ends them too; a new username or `expiry_days` does not. The
+    testing material is left as it is; it expires on its own dates. `username` or `password` sent with
+    `enabled: false` is 422 `space_off`; an empty password, 422
+    `password_empty`; one that cannot be encoded, 422 `password_invalid`. A username another user
+    holds is 409 `username_taken`; a second testing account created
+    meanwhile, 409 `account_exists`. A new `expiry_days` (1 to 365) shifts
+    every testing volume's testing_expires_at by the difference, in the same
+    transaction. `reserve_gb` (1 to 10000) is stored. Nothing is sent to Fisqua. Logged `testing_space_changed`,
+    `testing_account_created`, `testing_account_changed`.
+    """
+    from app.core import testing_space
+
+    try:
+        testing_space.change(db, actor=current_user.username, enabled=payload.enabled,
+                             username=payload.username, password=payload.password,
+                             expiry_days=payload.expiry_days, reserve_gb=payload.reserve_gb)
+    except testing_space.SpaceRefused as exc:
+        raise _space_refused(exc)
+    return testing_space.as_api(db)
+
+
+@router.patch("/testing/account")
+def patch_testing_account(
+    payload: TestingAccountUpdate,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Give the testing account a new username, a new password, or both. Admin only.
+
+    Returns the GET /system/testing body. 404 `no_testing_account` when the
+    unit has none; 409 `username_taken` for a username another user holds;
+    422 `password_empty` for an empty password, `password_invalid` for one
+    that cannot be encoded; 422 when neither is given.
+    A new password ends the account's sessions: every token issued before
+    is refused. A new username leaves them. The account's active flag is
+    left as it is. Nothing is sent to Fisqua. Logged
+    `testing_account_changed`.
+    """
+    from app.core import testing_space
+
+    try:
+        testing_space.change_account(db, actor=current_user.username,
+                                     username=payload.username, password=payload.password)
+    except testing_space.SpaceRefused as exc:
+        raise _space_refused(exc)
+    return testing_space.as_api(db)
+
+
+@router.post("/testing/clear")
+def clear_testing(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Remove every testing volume and then every testing project, whatever their dates. Admin only.
+
+    Answers {projects, volumes, skipped}: the projects and volumes removed,
+    and the volumes left because a capture held them. A held sub-volume
+    leaves its whole top-level volume, and `skipped` counts every volume in
+    that tree. A project that still holds a volume is left. Each volume
+    tree and project is removed in its own try; one that fails is logged and
+    counted in `skipped`, and the answer is always 200 with the three counts.
+    409 `testing_purge_running`, at once, while the scheduled run holds the
+    purge. The testing account and the settings stay. No
+    body. Logged `testing_space_cleared`.
+    """
+    from app.core import testing_space
+
+    try:
+        return testing_space.clear(db, actor=current_user.username)
+    except testing_space.PurgeRunning:
+        raise HTTPException(status_code=409, detail={"code": testing_space.TESTING_PURGE_RUNNING,
+                                                     "message": testing_space.TESTING_PURGE_RUNNING_MESSAGE})
+
+
+@router.get("/testing/usb")
+def list_testing_usb_drives(
+    current_user: User = Depends(allow_admin),
+):
+    """The USB drives a testing volume can be copied to, and the copy running now.
+
+    Admin and the testing account. {drives: [{name, label, size, fstype,
+    free_bytes}], active: {collection_id, job_id} | null}. `drives` is
+    app.core.usb_copy.eligible_drives: unmounted vfat or exFAT partitions of
+    USB disks that are not the unit's own; `size` is in bytes and
+    `free_bytes` is always null, since an offered drive is not mounted.
+    `active` is the copy that holds the unit's one slot (queued or running),
+    whoever started it, and null otherwise. The testing account starts
+    copies of testing volumes only, and the status route answers only for
+    a volume the caller reaches.
+    """
+    from app.core import usb_copy
+
+    return {"drives": usb_copy.eligible_drives(), "active": usb_copy.usb_copies.active()}
+
+
+def _refuse_usb_copy_drive(*, device=None, path=None) -> None:
+    """HTTPException 409 `usb_copy_running` when a USB copy holds this device or a path at or below its mountpoint."""
+    from app.core import usb_copy
+
+    if usb_copy.usb_copies.holds_drive(device=device, path=path):
+        raise HTTPException(status_code=409, detail={
+            "code": usb_copy.USB_COPY_RUNNING, "message": usb_copy.MESSAGES[usb_copy.USB_COPY_RUNNING]})
 
 
 # ---------------------------------------------------------------------------
@@ -422,7 +614,7 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
     and gives the reason in unavailable_reason, which is null otherwise.
     """
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override_or_fallback, override_root_problem
+    from app.core.storage_override import get_storage_override_or_fallback, projects_root_usage
 
     # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
     override, override_invalid = get_storage_override_or_fallback()
@@ -440,17 +632,9 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
             "unavailable_reason": reason,
         }
 
-    if override is not None:
-        problem = override_root_problem(projects_path)
-        if problem:
-            return unavailable(problem)
-
-    try:
-        if override is None:
-            projects_path.mkdir(parents=True, exist_ok=True)
-        usage = shutil.disk_usage(projects_path)
-    except OSError:
-        return unavailable("The storage path for projects cannot be read.")
+    usage, problem = projects_root_usage(settings)
+    if usage is None:
+        return unavailable(problem)
 
     return {
         "projects_path":      str(projects_path),
@@ -489,9 +673,13 @@ def mount_device(
     The mounts root is root-owned and the helper is its only writer: the backend
     just decides the mountpoint *name*; the helper creates the directory and
     removes it again if the mount fails.
+
+    409 `usb_copy_running` while a testing volume's USB copy holds the device
+    or the mountpoint (app.core.usb_copy).
     """
     if not _DEVICE_RE.match(body.device):
         raise HTTPException(status_code=400, detail="Invalid device path.")
+    _refuse_usb_copy_drive(device=body.device)
 
     # Look up device info so we can build a labelled mount point
     partitions = _parse_lsblk()
@@ -507,6 +695,7 @@ def mount_device(
     label = dev_info.get("label") or dev_info["name"]
     safe  = re.sub(r"[^a-zA-Z0-9_\-]", "_", label)[:32]
     mountpoint = _MOUNT_BASE / safe
+    _refuse_usb_copy_drive(path=mountpoint)
 
     # Mount through the privileged helper. It handles fstype-specific options
     # (uid/gid for vfat/exfat) and always mounts nosuid,nodev, so we don't build
@@ -543,6 +732,8 @@ def unmount_device(
 
     The helper removes the (root-owned) mountpoint directory after a successful
     umount, so no cleanup happens here.
+
+    409 `usb_copy_running` while a testing volume's USB copy holds the mountpoint.
     """
     from app.core.storage_override import get_storage_override, clear_storage_override, StorageOverrideError
     from app.core.audit import log_event
@@ -554,6 +745,7 @@ def unmount_device(
         target.resolve().relative_to(_MOUNT_BASE.resolve())
     except ValueError:
         raise HTTPException(status_code=400, detail="Only paths Captua mounted can be unmounted.")
+    _refuse_usb_copy_drive(path=target)
 
     # If this mountpoint (or a subpath) is the active storage override, clear it first, so the backend doesn't try to write to a stale path
     override_cleared = False
@@ -596,12 +788,17 @@ def activate_storage(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Set a mounted path as the active projects storage root."""
+    """Set a mounted path as the active projects storage root.
+
+    409 `usb_copy_running` for a path at or below the mountpoint of a running
+    testing volume's USB copy (app.core.usb_copy).
+    """
     from pathlib import Path
     from app.core.storage_override import set_storage_override
     from app.core.audit import log_event
 
     target = Path(body.path)
+    _refuse_usb_copy_drive(path=target)
     if not target.exists():
         raise HTTPException(status_code=400, detail="The path does not exist.")
     if not target.is_dir():

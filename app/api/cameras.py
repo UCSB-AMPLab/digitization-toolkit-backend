@@ -10,6 +10,8 @@ from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, m
 import logging
 
 from app.api.deps import get_db_dependency
+from app.core.project_names import display_project_name
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import get_current_user, RoleChecker
 from app.models.camera import CameraSettings
 from app.models.user import User
@@ -77,6 +79,9 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	volume = locked_volume_query(db, collection_id).first()
 	if volume is None:
 		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+	# A testing volume a purge is removing takes no capture (app.core.testing_space).
+	from app.core.testing_space import refuse_volume_being_removed
+	refuse_volume_being_removed(volume)
 	if retake_record is not None:
 		if retake_record.collection_id is None:
 			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
@@ -113,10 +118,17 @@ def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_rec
 	takes no turn lock and returns False, so it writes no new_volume_started
 	and leaves the turn as it was. Called after the other refusals, before
 	any number is taken or camera touched.
+
+	The turn is real work's alone: a capture into a testing volume is never
+	refused for it, takes no turn lock and returns False, so it writes no
+	new_volume_started either.
 	"""
+	volume = db.get(Collection, collection_id)
+	if volume is not None and volume.testing:
+		return False
 	if retake_record is not None or not recapture_turn.volume_is_empty(db, collection_id):
 		return False
-	if recapture_turn.volume_is_full_rescan(db.get(Collection, collection_id)):
+	if recapture_turn.volume_is_full_rescan(volume):
 		return False
 	recapture_turn.lock_turn(db)
 	if user.role != "admin" and recapture_turn.turn(db)["state"] == "recaptures":
@@ -138,10 +150,15 @@ def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook
 	retakes are part of its capture, and its first promotion is what opens
 	a turn. Once it carries rescan_volume_completed, its retakes complete it
 	as any volume's do.
+
+	A capture into a testing volume writes no event and takes no turn lock:
+	the turn is real work's alone (app.core.recapture_turn).
 	"""
 	if not (starts_volume or retook_pending):
 		return
 	volume = db.get(Collection, record.collection_id)
+	if volume is None or volume.testing:
+		return
 	if starts_volume:
 		recapture_turn.record_event(db, recapture_turn.STARTED_ACTION, volume, user.username)
 		return
@@ -153,13 +170,54 @@ def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook
 		recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, user.username)
 
 
-def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
+def _stored_capture_project_name(project_name: str, user: Optional[User]) -> str:
+	"""The stored name of the project a capture body names: the testing account sends a testing project's display name."""
+	from app.core.testing_space import TESTING_ROLE, stored_project_name
+
+	return stored_project_name(user is not None and user.role == TESTING_ROLE, project_name)
+
+
+def _refuse_a_project_name_outside_the_testing_space(db: Session, project_name: str, user: User) -> None:
+	"""404 not_found when the testing account's project_name names no testing project.
+
+	The testing account names a testing project by its display name
+	(app.core.testing_space._project_name_space); a name that names none,
+	a real project's included, is answered as material it does not reach,
+	before anything is locked or any camera touched. Every other caller's
+	name is left as it was.
+	"""
+	from app.core import testing_space
+
+	if user.role != testing_space.TESTING_ROLE:
+		return
+	stored = _stored_capture_project_name(project_name, user)
+	if db.query(Project.id).filter(Project.name == stored, Project.testing.is_(True)).first() is None:
+		raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+
+
+def _refuse_a_testing_capture_below_the_reserve(db: Session, user: User) -> None:
+	"""507 testing_reserve for the testing account while free space is below the reserve kept for real work.
+
+	Called before any camera is touched, any number taken or any file
+	written (app.core.testing_space.refuse_below_reserve). Real work is not
+	checked against the reserve.
+	"""
+	from app.core import testing_space
+
+	if user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_below_reserve(db)
+
+
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int],
+                            user: Optional[User] = None) -> tuple[str, Optional[str], Optional[str]]:
 	"""Authoritative (project_name, collection_name, stem) for the on-disk capture path.
 
 	A volume with a file name stem captures into `<stem>/captures/`; one
 	without captures into its name-based directory under its project
 	(image_output_dir). Both are returned, with the stem None for a volume
-	without one; a project-level capture has neither.
+	without one; a project-level capture has neither. The project name is
+	the stored one; `project_name` is read as `user` sends it
+	(_stored_capture_project_name).
 	"""
 	if collection_id:
 		col = db.query(Collection).filter(Collection.id == collection_id).first()
@@ -169,7 +227,7 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 		if not resolved:
 			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
 		return resolved, col.name, col.filename_stem
-	project = db.query(Project).filter(Project.name == project_name).first()
+	project = db.query(Project).filter(Project.name == _stored_capture_project_name(project_name, user)).first()
 	if not project:
 		raise HTTPException(status_code=422, detail="project_name does not match a known project")
 	return project.name, None, None
@@ -437,6 +495,70 @@ def _put_stored_image_format(config_dict: dict, camera_index: int) -> None:
 	image_format = stored(camera_index) if callable(stored) else None
 	if isinstance(image_format, str):
 		config_dict["image_format"] = image_format
+
+
+def offered_capture_formats() -> Optional[List[str]]:
+	"""The capture formats the unit's cameras offer, as GET /cameras/capabilities reports them; None when unreadable.
+
+	Read from the active backend's capabilities (`image_formats`), the list
+	the capabilities route returns. An empty list is a backend that offers
+	no choice. None when the backend or its capabilities cannot be read.
+	"""
+	try:
+		from capture.service import get_backend
+		formats = get_backend().get_capabilities().get("image_formats")
+	except Exception as exc:
+		logger.warning(f"The camera capabilities could not be read for the capture formats: {exc}")
+		return None
+	return list(formats or [])
+
+
+def _testing_capture_format(db: Session, collection_id: Optional[int]) -> Optional[str]:
+	"""The capture format of a capture into this volume when it is testing work, else None.
+
+	A testing volume's format is its project's, the project found through
+	the volume (app.core.storage_ops.resolve_project, through its parents
+	for a sub-volume). A testing project whose format cannot be read, or a
+	project that cannot be found, gives JPEG.
+	"""
+	from app.core import storage_ops
+	from app.models.project import DEFAULT_TESTING_CAPTURE_FORMAT
+	from capture.backends.base import normalise_image_format
+
+	if not collection_id:
+		return None
+	volume = db.get(Collection, collection_id)
+	if volume is None or not volume.testing:
+		return None
+	project = storage_ops.resolve_project(db, volume)
+	image_format = normalise_image_format(project.capture_format) if project is not None else None
+	return image_format or DEFAULT_TESTING_CAPTURE_FORMAT
+
+
+def _put_capture_format(db: Session, config_dict: dict, camera_index: int, collection_id: Optional[int]) -> None:
+	"""Put the format a record capture takes into config_dict.
+
+	The order of precedence: for a capture into a testing volume, its
+	project's capture format (_testing_capture_format), put as the
+	capture's explicit format on every backend; otherwise the format the
+	backend stores for the body, where the route puts one
+	(_put_stored_image_format); otherwise nothing, and the backend decides
+	(on a gphoto2 DSLR, the format stored for the body its session holds).
+	A testing capture's format is the capture's alone: nothing is stored
+	for the body. On a gphoto2 DSLR it is written to the camera only when
+	the session holds a stored format for the body; the next capture without
+	an explicit format then sets the stored format again, since a format is
+	written whenever it differs from the one the session last set, and the
+	produced-file check compares the file with the explicit format. When the
+	session holds none, the explicit format is not written and the capture
+	is taken in the format the camera holds, unchecked
+	(GPhoto2Backend.capture_image).
+	"""
+	testing_format = _testing_capture_format(db, collection_id)
+	if testing_format is not None:
+		config_dict["image_format"] = testing_format
+		return
+	_put_stored_image_format(config_dict, camera_index)
 
 
 def _image_size_and_exif(master):
@@ -1451,6 +1573,8 @@ def trigger_capture(
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
+	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
+	_refuse_a_testing_capture_below_the_reserve(db, current_user)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -1499,11 +1623,11 @@ def trigger_capture(
 		# including 0, overrides it.
 		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
-		_put_stored_image_format(config_dict, request.camera_index)
+		_put_capture_format(db, config_dict, request.camera_index, request.collection_id)
 		camera_config = CameraConfig(**config_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
 
 		# Read once: the number is checked against, and the image written
 		# under, the same root.
@@ -1555,7 +1679,8 @@ def trigger_capture(
 			_supersede_current_images(record)
 		else:
 			record = Record(
-				title=request.record_title or f"{project_name} - {file_path.stem}",
+				# A record's title is read by callers: the project's display name.
+				title=request.record_title or f"{display_project_name(project_name)} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
@@ -1669,6 +1794,8 @@ def trigger_dual_capture(
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
+	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
+	_refuse_a_testing_capture_below_the_reserve(db, current_user)
 	if request.after_record_id is not None and request.record_id:
 		raise HTTPException(
 			status_code=422,
@@ -1740,13 +1867,13 @@ def trigger_dual_capture(
 		if request.rotate_deg_cam1 is not None:
 			config1_dict["rotate_deg"] = request.rotate_deg_cam1
 
-		_put_stored_image_format(config0_dict, 0)
-		_put_stored_image_format(config1_dict, 1)
+		_put_capture_format(db, config0_dict, 0, request.collection_id)
+		_put_capture_format(db, config1_dict, 1, request.collection_id)
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
 
 		# Read once (see trigger_capture).
 		root = projects_root()
@@ -1801,7 +1928,7 @@ def trigger_dual_capture(
 			else:
 				sequence = _next_record_sequence(db, request.collection_id)
 			record = Record(
-				title=request.record_title or f"{project_name} - Dual capture",
+				title=request.record_title or f"{display_project_name(project_name)} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
@@ -2289,10 +2416,12 @@ def create_camera_settings(
 def list_camera_settings(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
-	items = db.query(CameraSettings).offset(skip).limit(limit).all()
+	"""The camera settings rows of the images of the caller's space (app.core.testing_space.scope_query)."""
+	items = scope_query(db.query(CameraSettings), CameraSettings, current_user, space).offset(skip).limit(limit).all()
 	return [CameraSettingsRead.model_validate(i) for i in items]
 
 

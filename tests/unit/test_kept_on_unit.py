@@ -105,7 +105,9 @@ def test_the_migration_follows_unit_settings_and_is_the_only_head(backend_root):
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    assert revisions - downs == {REVISION}
+    # The head is now the testing space revision (test_testing_space_schema.py), which follows this one.
+    assert REVISION in downs
+    assert len(revisions - downs) == 1
     assert "marks no existing volume" in mod.__doc__
 
 

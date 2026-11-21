@@ -42,16 +42,23 @@ Relocation = Tuple[Path, str, int, str, str, str]
 
 
 class FixityIndexOnce:
-    """The capture manifests' FixityIndex under the active projects root, built on first use and kept."""
+    """The capture manifests' FixityIndex under the active projects root, built on first use and kept.
+
+    Built from the manifests of the space of the first image it is asked
+    for (app.core.testing_space.manifest_filter_for_images): the images of
+    one move are all in one space, since no move crosses spaces.
+    """
 
     def __init__(self) -> None:
         self._index = None
 
-    def __call__(self):
+    def __call__(self, img: Optional[RecordImage] = None):
         if self._index is None:
             from app.core.integrity import build_fixity_index
+            from app.core.testing_space import manifest_filter_for_images
 
-            self._index = build_fixity_index(config.settings.projects_dir.resolve())
+            projects_dir = config.settings.projects_dir.resolve()
+            self._index = build_fixity_index(projects_dir, include=manifest_filter_for_images([img], projects_dir))
         return self._index
 
 
@@ -76,7 +83,7 @@ def relocation_of(img: RecordImage, src: Path, dst: Path, fixity_index: FixityIn
     src, dst = src.resolve(), dst.resolve()
     if not dst.is_relative_to(root) or len(dst.relative_to(root).parts) < 2:
         return None
-    sha = fixity_index().expected(img.capture_id, img.id, src)
+    sha = fixity_index(img).expected(img.capture_id, img.id, src)
     if sha is None:
         logger.warning(f"No capture checksum is held for image {img.id} at {src}; "
                        f"no relocation record is written for its rename to {dst}")
@@ -830,7 +837,12 @@ def _rename_journal_file() -> Path:
 
 
 def write_rename_journal(project_id: int, old_name: str, new_name: str, old_root: Path, new_root: Path) -> None:
-    """Durably record intent to rename, before the on-disk move happens."""
+    """Durably record intent to rename, before the on-disk move happens.
+
+    The journal also records whether old_root existed then: a project with
+    no tree moves nothing, so a directory at new_root found later is not
+    its tree (reconcile_pending_rename).
+    """
     from capture.utils import atomic_write
 
     path = _rename_journal_file()
@@ -841,6 +853,7 @@ def write_rename_journal(project_id: int, old_name: str, new_name: str, old_root
         "new_name": new_name,
         "old_root": str(old_root),
         "new_root": str(new_root),
+        "old_root_existed": old_root.exists(),
     }, indent=2)
     atomic_write(path, lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"))
 
@@ -865,8 +878,35 @@ def read_rename_journal() -> Optional[dict]:
         return None
 
 
+def _rename_not_completed(db: Session, j: dict, why: str) -> None:
+    """Log, as an error in the log and in system_logs, a journalled rename the recovery leaves as it is.
+
+    The journal is kept, so every startup checks it again until the
+    directories are put right by hand.
+    """
+    from app.models.system_log import SystemLog
+
+    detail = f"{why}; journal kept: {j['old_root']} -> {j['new_root']}"
+    logger.error("[ERROR] Project rename of project %s not completed after restart: %s", j["project_id"], detail)
+    db.add(SystemLog(level="ERR", category="system", action="project_rename_not_completed",
+                     subject=f"project {j['project_id']}", detail=detail[:500]))
+    db.commit()
+
+
 def reconcile_pending_rename(db: Session) -> None:
-    """Replay or discard a rename interrupted by a crash. Idempotent; safe at every startup."""
+    """Replay or discard a rename interrupted by a crash. Idempotent; safe at every startup.
+
+    A rename is never completed onto a directory that is not this
+    project's tree: one that another project's name maps to
+    (projects_sharing_directory), one that existed before the move (the
+    journal says old_root did not exist, so nothing moved there), or, when
+    the tree is still at old_root, one that exists already. In each of
+    those cases the database and the disk are left as they are, the
+    journal is kept, and the case is logged `project_rename_not_completed`
+    (_rename_not_completed).
+    """
+    from app.core.paths import project_dir_name
+
     j = read_rename_journal()
     if not j:
         return
@@ -879,10 +919,18 @@ def reconcile_pending_rename(db: Session) -> None:
         clear_rename_journal()
         return
 
+    taken = bool(projects_sharing_directory(db, j["new_name"], exclude_id=project.id))
+
     # DB already carries the new name, so the move preceded the commit and files
     # belong at new_root; repair only if a crash left them at old_root.
     if project.name == j["new_name"]:
-        if old_root.exists() and not new_root.exists():
+        if old_root.exists():
+            if new_root.exists():
+                _rename_not_completed(db, j, "both directories exist; the tree is not moved onto the new one")
+                return
+            if taken:
+                _rename_not_completed(db, j, f"another project's name maps to {project_dir_name(j['new_name'])}")
+                return
             try:
                 move_project_tree(old_root, new_root)
             except OSError:
@@ -894,6 +942,13 @@ def reconcile_pending_rename(db: Session) -> None:
     # DB still carries the old name: finish the DB side only if the files already moved.
     if project.name == j["old_name"]:
         if new_root.exists() and not old_root.exists():
+            if taken:
+                _rename_not_completed(db, j, f"another project's name maps to {project_dir_name(j['new_name'])}")
+                return
+            if not j.get("old_root_existed", True):
+                _rename_not_completed(db, j, "the project had no tree when the rename began, so the directory "
+                                             "at the new name is not its tree")
+                return
             project.name = j["new_name"]
             for img in db.query(RecordImage).all():
                 new_fp = rebase_stored_path(img.file_path, old_root, new_root)
@@ -910,3 +965,26 @@ def reconcile_pending_rename(db: Session) -> None:
 
     # Name matches neither side (renamed again since): the journal is stale.
     clear_rename_journal()
+
+
+def projects_sharing_directory(db: Session, name: str, exclude_id: Optional[int] = None) -> List[int]:
+    """The ids of the projects, other than `exclude_id`, whose directory is the one `name` would use."""
+    from app.core.paths import project_dir_name
+
+    directory = project_dir_name(name)
+    return [pid for pid, other in db.query(Project.id, Project.name).all()
+            if pid != exclude_id and project_dir_name(other) == directory]
+
+
+def refuse_taken_project_directory(db: Session, name: str, exclude_id: Optional[int] = None) -> None:
+    """ProjectDirectoryTaken when another project, testing or real, has the directory `name` would use.
+
+    A project's directory is project_dir_name of its name, which folds case,
+    accents and punctuation, so two different names can share one. Called
+    by POST /projects/, PUT /projects/{id} and the list import before a
+    project is created or renamed.
+    """
+    from app.core.project_names import ProjectDirectoryTaken
+
+    if projects_sharing_directory(db, name, exclude_id):
+        raise ProjectDirectoryTaken()

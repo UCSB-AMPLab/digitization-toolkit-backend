@@ -3,6 +3,7 @@
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -11,12 +12,15 @@ from sqlalchemy.exc import IntegrityError
 import logging
 
 from app.api.deps import get_db_dependency
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import get_current_user, RoleChecker
 from app.models.collection import STEM_RESERVED_MESSAGE, Collection, stem_directory_collision
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
-from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
+from app.schemas.collection import (
+    CollectionCreate, CollectionCreateRequest, CollectionRead, CollectionUpdate, CollectionWithChildren,
+)
 from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusChangeRead, ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
@@ -112,9 +116,27 @@ def _immutable_message(exc: ImmutableFieldError) -> str:
     return "The volume's external identifier is written once and cannot be changed."
 
 
+def _as_collection_create(payload: CollectionCreateRequest) -> CollectionCreate:
+    """The body validated as CollectionCreate, which requires a stem; a 422 with pydantic's errors otherwise.
+
+    A body with no stem and another invalid field is answered with the
+    other field's error only, since FastAPI refuses it before this runs.
+    The `input` echoed in a stem error is the parsed body, not the bytes
+    sent.
+    """
+    from fastapi.exceptions import RequestValidationError
+    from pydantic import ValidationError
+
+    try:
+        return CollectionCreate.model_validate(payload.model_dump(mode="json", exclude_unset=True))
+    except ValidationError as exc:
+        raise RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)]) from None
+
+
 @router.post("/", response_model=CollectionRead, status_code=201)
 def create_collection(
-    payload: CollectionCreate,
+    payload: CollectionCreateRequest,
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
@@ -142,18 +164,48 @@ def create_collection(
     the insert's transaction, the settings row and the parent's row FOR
     SHARE; a switch, or a keep or a release of the parent, committed
     meanwhile is a 409 `mode_changed` and nothing is created.
-    """
-    from app.core import kept_volumes, unit_mode
-    from app.core.list_import import ListRefused, ProjectLockUnavailable
 
+    The testing account creates testing volumes only, in every mode: in a
+    testing project (`project_id`, required for a top-level volume and
+    honoured with projects hidden; 400 without it) or under a testing
+    volume. It is not refused in fisqua mode, its volume is kept on the
+    unit whatever `kept_on_unit` says and is not checked with Fisqua, and a
+    `filename_stem` or `external_id` it sends is a 409
+    `testing_volume_codes`. While free space is below the reserve kept for
+    real work the testing account creates none (507 `testing_reserve`,
+    app.core.testing_space.refuse_below_reserve). Every testing volume, whoever creates it, is
+    given its stem from the reserved series in the insert's transaction
+    (app.core.testing_space.series_stem), and no reference code.
+    """
+    from app.core import kept_volumes, testing_space, unit_mode
+    from app.core.list_import import ListRefused, ProjectLockUnavailable
+    from app.core.project_names import ProjectDirectoryTaken
+
+    tester = current_user.role == testing_space.TESTING_ROLE
+    if not tester:
+        payload = _as_collection_create(payload)
     unit = unit_mode.current(db)
     from_fisqua = unit.mode == unit_mode.FISQUA
-    if from_fisqua and current_user.role != "admin":
+    if tester:
+        try:
+            testing_space.refuse_testing_volume_codes(payload.filename_stem, payload.external_id)
+        except testing_space.SpaceRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+        if payload.project_id is None and payload.parent_collection_id is None:
+            raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
+        # A new testing volume is where testing captures go: none is created
+        # while free space is below the reserve kept for real work.
+        testing_space.refuse_below_reserve(db)
+    if from_fisqua and current_user.role != "admin" and not tester:
         raise _volumes_from_fisqua()
-    try:
-        kept = kept_volumes.kept_on_create(unit.mode, payload.kept_on_unit, current_user.role == "admin")
-    except kept_volumes.KeepRefused as exc:
-        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if tester:
+        # A testing volume is kept on the unit (below), whatever is sent.
+        kept = True
+    else:
+        try:
+            kept = kept_volumes.kept_on_create(unit.mode, payload.kept_on_unit, current_user.role == "admin")
+        except kept_volumes.KeepRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
     # A subcollection of a volume Captua keeps on the unit is kept too.
     parent_kept = (payload.parent_collection_id is not None
                    and _kept_parent(db, payload.parent_collection_id))
@@ -161,15 +213,39 @@ def create_collection(
         kept = True
 
     # While projects are hidden every new volume goes into the unit's default
-    # project, whoever creates it: a given project_id is ignored. A
-    # subcollection (parent_collection_id) is created as before.
-    project_id = payload.project_id if unit.projects_shown else None
+    # project, whoever creates it but the testing account: a given
+    # project_id is ignored. The testing account's project_id is always
+    # honoured; it never uses the default project. A subcollection
+    # (parent_collection_id) is created as before.
+    project_id = payload.project_id if unit.projects_shown or tester else None
     # Validate that exactly one parent is specified
     if project_id is None and payload.parent_collection_id is None and unit.projects_shown:
         raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
     
     if project_id is not None and payload.parent_collection_id is not None:
         raise HTTPException(status_code=400, detail="Cannot specify both project_id and parent_collection_id")
+
+    # A volume in a testing project, or under a testing volume, is testing
+    # work and kept on the unit from here (app.core.testing_space), so it is
+    # not checked with Fisqua. The default project chosen below is never a
+    # testing project.
+    volume_testing = testing_space.is_testing(db, project_id=project_id, collection_id=payload.parent_collection_id)
+    if tester and not volume_testing:
+        # A place that names no row: the testing account creates no real volume.
+        raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+    if volume_testing:
+        kept = True
+    # Its stem and reference code lie in its space's namespace: a real
+    # volume's, and its name, never in the testing one (409 name_reserved), a testing
+    # volume's always (409 testing_name_required). The default project
+    # chosen below is real, as a volume with neither place is.
+    # A real volume's name never lies in it either (app.models.collection).
+    try:
+        testing_space.refuse_namespace(volume_testing, payload.filename_stem, payload.external_id)
+        if not volume_testing:
+            testing_space.refuse_namespace(False, payload.name)
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
 
     if from_fisqua and not kept:
         _check_codes_with_fisqua(db, [payload.filename_stem, payload.external_id])
@@ -179,6 +255,8 @@ def create_collection(
             project_id = unit_mode.default_project(db, current_user.username)[0].id
         except ProjectLockUnavailable as exc:
             raise HTTPException(status_code=503, detail=str(exc))
+        except ProjectDirectoryTaken as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
         except ListRefused as exc:
             raise HTTPException(status_code=409, detail={"message": str(exc)})
 
@@ -227,9 +305,22 @@ def create_collection(
             and _kept_parent(db, payload.parent_collection_id, lock=True) != parent_kept):
         db.rollback()
         raise HTTPException(status_code=409, detail=unit_mode.ModeChangedDuringWrite().detail())
+    # Under the parent's row: nothing joins a testing tree a purge is removing.
+    if volume_testing and payload.parent_collection_id is not None:
+        try:
+            testing_space.refuse_joining_a_marked_tree(db, payload.parent_collection_id)
+        except HTTPException:
+            db.rollback()
+            raise
 
     try:
         db.add(collection)
+        if volume_testing:
+            # Its stem, from its own id, before anything can capture into it.
+            db.flush()
+            collection.filename_stem = testing_space.series_stem(collection.id)
+            # Kept for a term from now; every capture into it keeps it longer.
+            collection.testing_expires_at = testing_space.expires_at(db)
         db.commit()
     except IntegrityError as e:
         # A duplicate filename_stem or external_id, or a CHECK on the row.
@@ -238,7 +329,7 @@ def create_collection(
     db.refresh(collection)
     log_event(db, level="INFO", category="activity", action="collection_created",
               actor=current_user.username, subject=collection.name)
-    if from_fisqua:
+    if from_fisqua and not tester:
         detail = _volume_change_detail(collection.id, stem=(None, collection.filename_stem),
                                        external_id=(None, collection.external_id))
         if kept:
@@ -254,17 +345,18 @@ def list_collections(
     parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection (use 'null' for top-level)"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
     """
-    List collections with optional filters.
+    List the collections of the caller's space (app.core.testing_space.scope_query) with optional filters.
     
-    - No filters: Returns all collections
+    - No filters: Returns all collections of the space
     - project_id: Returns all collections under this project (top-level only)
     - parent_collection_id: Returns all subcollections of this collection
     """
-    query = db.query(Collection)
+    query = scope_query(db.query(Collection), Collection, current_user, space)
     
     if project_id is not None:
         query = query.filter(Collection.project_id == project_id)
@@ -315,11 +407,12 @@ def list_collections(
 def count_collections(
     project_id: Optional[int] = Query(None, description="Filter by project"),
     parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection id"),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
-    """Return the total number of collections matching the given filters."""
-    query = db.query(Collection)
+    """Return the number of collections of the caller's space matching the given filters."""
+    query = scope_query(db.query(Collection), Collection, current_user, space)
     if project_id is not None:
         query = query.filter(Collection.project_id == project_id)
     if parent_collection_id is not None:
@@ -659,7 +752,15 @@ def update_collection(
     A volume Captua keeps on the unit (NEH-320) is not checked with Fisqua:
     its codes are checked when an admin releases it.
 
-    A re-parent is refused (409 `kept_on_unit_move`) when the new parent is
+    The testing account never sets or changes filename_stem or
+    external_id (409 `testing_volume_codes`), and a new one lies in the
+    volume's space's namespace (409 `name_reserved` for a real volume,
+    `testing_name_required` for a testing one; app.core.testing_space).
+
+    A re-parent is refused (409 `cross_space`) when one of the volume and
+    its new parent is testing work and the other real work
+    (app.core.testing_space.refuse_cross_space), and (409
+    `kept_on_unit_move`) when the new parent is
     kept on the unit and the volume is not (kept_volumes.refuse_kept_reparent).
     Locks: the volume FOR UPDATE (the PATCH may change its unique stem or
     external_id, which a weaker lock would have to upgrade at the flush)
@@ -670,12 +771,37 @@ def update_collection(
     release (FOR NO KEY UPDATE) between the same volumes lock them in one
     order.
     """
-    from app.core import unit_mode
+    from app.core import testing_space, unit_mode
 
     from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
     code_fields = {name: value for name, value in payload.model_dump(exclude_unset=True).items()
                    if name in ("filename_stem", "external_id")}
     checked: set = set()
+
+    # Before any Fisqua lookup or row lock: the testing account never sets
+    # or changes a volume's stem or reference code (409
+    # testing_volume_codes), and a new code lies in the volume's space's
+    # namespace (409 name_reserved, testing_name_required), as a real
+    # volume's new name does. A value equal
+    # to the stored one changes nothing and passes. The model checks the
+    # namespace again at the flush.
+    new_name = payload.model_dump(exclude_unset=True).get("name")
+    if code_fields or new_name is not None:
+        stored = (db.query(Collection.filename_stem, Collection.external_id, Collection.testing)
+                  .filter(Collection.id == collection_id).first())
+        if stored is not None:
+            new_codes = {name: value for name, value in code_fields.items()
+                         if value != {"filename_stem": stored.filename_stem,
+                                      "external_id": stored.external_id}[name]}
+            try:
+                if new_codes and current_user.role == testing_space.TESTING_ROLE:
+                    raise testing_space.SpaceRefused(409, testing_space.TESTING_VOLUME_CODES,
+                                                     testing_space.TESTING_VOLUME_CODES_MESSAGE)
+                testing_space.refuse_namespace(bool(stored.testing), *new_codes.values())
+                if not stored.testing:
+                    testing_space.refuse_namespace(False, new_name)
+            except testing_space.SpaceRefused as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail())
 
     def code_changes(stem, external_id) -> dict:
         stored = {"filename_stem": stem, "external_id": external_id}
@@ -712,6 +838,14 @@ def update_collection(
         collection = kept_volumes.lock_for_reparent(db, collection_id, new_parent_id)
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Under the new parent's row: nothing joins a testing tree a purge is removing.
+    if new_parent_id is not None and new_parent_id != collection_id and collection.testing:
+        from app.core import testing_space as _testing_space
+        try:
+            _testing_space.refuse_joining_a_marked_tree(db, new_parent_id)
+        except HTTPException:
+            db.rollback()
+            raise
 
     code_override = False
     if from_fisqua and code_fields:
@@ -733,11 +867,18 @@ def update_collection(
                 raise
         code_override = bool(changes)
     
-    # A re-parent that would put a volume Captua does not keep inside a kept
-    # one (NEH-320); a kept volume may move anywhere.
+    # A re-parent between testing and real work (app.core.testing_space), or
+    # one that would put a volume Captua does not keep inside a kept one
+    # (NEH-320); a kept volume may otherwise move anywhere. A null parent
+    # takes the volume to the top level of its root's project, the same
+    # space as its root, so only a new parent is compared.
+    from app.core import testing_space
     reparent = payload.model_dump(exclude_unset=True)
     if "parent_collection_id" in reparent and reparent["parent_collection_id"] != collection.parent_collection_id:
         try:
+            if reparent["parent_collection_id"] is not None:
+                testing_space.refuse_cross_space(db, (None, collection.id),
+                                                 (None, reparent["parent_collection_id"]))
             kept_volumes.refuse_kept_reparent(db, collection, reparent["parent_collection_id"])
         except kept_volumes.KeepRefused as exc:
             db.rollback()
@@ -953,9 +1094,11 @@ def move_collection_records(
             },
         )
 
-    # Not between a volume Captua keeps on the unit and one it does not (NEH-320).
-    from app.core import kept_volumes
+    # Not between testing and real work (app.core.testing_space), nor between
+    # a volume Captua keeps on the unit and one it does not (NEH-320).
+    from app.core import kept_volumes, testing_space
     try:
+        testing_space.refuse_cross_space(db, (None, collection_id), (None, target_collection_id))
         kept_volumes.refuse_kept_move(db, collection_id, target_collection_id)
     except kept_volumes.KeepRefused as exc:
         db.rollback()
@@ -1012,7 +1155,31 @@ def delete_collection(
     found in its directory (one no row references, such as a file the volume
     layout migration left there) stays, with the directories above it, and is
     logged at WARNING.
+
+    A testing volume (which only the testing account reaches here) is
+    removed completely, captured or not, with its sub-volumes, records,
+    images, files and manifest (app.core.testing_space.purge_volume): its
+    stem is its own id in the reserved series and is never given out
+    again, so it reserves nothing. 409 `testing_volume_busy`, with no row
+    removed, while it cannot be removed now: a capture holds it, a USB copy
+    is reading it or one of its sub-volumes, or a projects root holding its
+    files cannot be read.
     """
+    from app.core import testing_space
+
+    target = db.query(Collection).filter(Collection.id == collection_id).first()
+    if target is not None and target.testing:
+        name, stem = target.name, target.filename_stem
+        if not testing_space.purge_volume(db, target, reason=testing_space.FOR_DELETE):
+            message = (testing_space.TESTING_VOLUME_COPYING_MESSAGE
+                       if testing_space.copy_running_in(db, collection_id)
+                       else testing_space.TESTING_VOLUME_BUSY_MESSAGE)
+            raise HTTPException(status_code=409, detail={"code": testing_space.TESTING_VOLUME_BUSY,
+                                                         "message": message})
+        log_event(db, level="WARN", category="activity", action="collection_deleted",
+                  actor=current_user.username, subject=name,
+                  detail=f"id={collection_id}; stem {stem!r}; testing volume removed with all it held")
+        return None
     # Under the row lock, so that a PATCH setting a first stem cannot land
     # between this check and the delete.
     collection = _locked_collection_query(db, collection_id).first()
@@ -1593,6 +1760,67 @@ def export_status(
     if job.state == "done" and job.zip_filename:
         body["download_url"] = f"/collections/{collection_id}/export/download"
     return body
+
+
+class UsbCopyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device: str
+
+
+@router.post("/{collection_id}/usb-copy", status_code=202)
+def start_usb_copy(
+    collection_id: int,
+    body: UsbCopyRequest,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Copy a testing volume's pictures to a USB drive, in the background; {job_id}. Admin and the testing account.
+
+    `device` is a name as GET /system/testing/usb lists it. The volume must
+    be a testing volume: the testing account naming a real volume is
+    answered 404 `not_found` (app.api.space), an administrator 409
+    `usb_real_volume`. 409 `usb_copy_busy` while another copy runs on the
+    unit; 422 `usb_not_eligible` for a device not in the list; 409
+    `testing_volume_busy` while a request moves, renames or deletes the
+    volume's files; 404 `not_found` for a volume a purge is removing. The
+    copy itself (app.core.usb_copy) reports its result in the status.
+    """
+    from app.core import testing_space, usb_copy
+
+    volume = db.query(Collection).filter(Collection.id == collection_id).first()
+    if volume is None:
+        raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+    try:
+        job = usb_copy.usb_copies.start(db, volume, body.device, current_user.username)
+    except usb_copy.UsbRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    return {"job_id": job.id}
+
+
+@router.get("/{collection_id}/usb-copy/status/{job_id}")
+def usb_copy_status(
+    collection_id: int,
+    job_id: str,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """A USB copy's state and progress. Admin and the testing account; 404 unless the job is this volume's.
+
+    {job_id, collection_id, state (queued, running, done, failed), done,
+    total (files), bytes_done, bytes_total, error (a code or null),
+    message, folder (the new folder's name on the drive,
+    `<stem>_<YYYYMMDD-HHMMSS>` in UTC), drive, skipped {not_regular,
+    outside, missing}, unmounted (the copy unmounted the drive it
+    mounted)}. The registry keeps the 20 most recent finished copies; an
+    older one is 404.
+    """
+    from app.core import usb_copy
+
+    job = usb_copy.usb_copies.get(job_id)
+    if job is None or job.collection_id != collection_id:
+        raise HTTPException(status_code=404, detail="USB copy not found")
+    return job.to_dict()
 
 
 @router.get("/{collection_id}/export/download")

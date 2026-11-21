@@ -222,7 +222,9 @@ def insert_placeholders(db: Session, collection_id: int, after_record_id: int, c
     if sequences is None:
         return None
     volume = db.get(Collection, collection_id)
-    project_name = resolve_project_name(db, volume)
+    # A record's title is read by callers, so it carries the project's display name.
+    from app.core.project_names import display_project_name
+    project_name = display_project_name(resolve_project_name(db, volume))
     title = f"{project_name} - Dual capture" if project_name else "Dual capture"
     made = [Record(title=title, collection_id=collection_id, sequence=sequence, status="captured",
                    capture_mode="dual", missing_side="both", missing_expected=expected,
