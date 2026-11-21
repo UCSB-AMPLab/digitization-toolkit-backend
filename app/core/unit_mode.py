@@ -697,40 +697,45 @@ def check_reference_code(db: Session, reference_code: str, *, transport=None,
         raise unreachable("config_error: the link is stopped until its configuration changes")
     # The gated transport: the lookup runs only in fisqua mode, so it needs no
     # bypass, and a switch out of fisqua made meanwhile stops it (off_in_this_mode).
+    owned = transport is None
     transport = transport if transport is not None else get_lookup_transport()
-    if isinstance(transport, NullTransport):
-        raise unreachable("not_configured")
-    if fisqua_outbox.call_budget.cooling():
-        raise unreachable("cooling_down")
-    if not fisqua_outbox.call_budget.take():
-        raise unreachable("rate_limited")
     try:
-        answer = transport.get_description(reference_code)
-    except Exception as exc:
-        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-    answer = fisqua_outbox._redacted(answer)
-    if answer.outcome == "description":
-        body = answer.response
-        answered = body.get(fc.F_REFERENCE_CODE) if isinstance(body, dict) else None
-        if not isinstance(answered, str):
-            raise unreachable(f"unreadable: the answer has no {fc.F_REFERENCE_CODE}")
-        if answered != reference_code:
-            # Not the description asked for: the code is not known as given.
-            raise CodeRefused(422, UNKNOWN_REFERENCE_CODE,
-                              UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code), reference_code)
-        return body
-    if answer.outcome == "unknown_code":
-        raise CodeRefused(422, UNKNOWN_REFERENCE_CODE, UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code),
-                          reference_code)
-    if answer.outcome == "unsupported":
-        raise CodeRefused(409, FISQUA_NO_LOOKUP, FISQUA_NO_LOOKUP_MESSAGE, reference_code,
-                          f"unsupported: HTTP {answer.status_code}")
-    if answer.outcome == "config_error":
-        fisqua_outbox.record_config_error(answer.status_code, answer.reason,
-                                          fisqua_outbox._naive(now) or fisqua_outbox._now())
-    elif answer.retry_after is not None:
-        fisqua_outbox.call_budget.cool_down(answer.retry_after)
-    raise unreachable(f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}")
+        if isinstance(transport, NullTransport):
+            raise unreachable("not_configured")
+        if fisqua_outbox.call_budget.cooling():
+            raise unreachable("cooling_down")
+        if not fisqua_outbox.call_budget.take():
+            raise unreachable("rate_limited")
+        try:
+            answer = transport.get_description(reference_code)
+        except Exception as exc:
+            answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+        answer = fisqua_outbox._redacted(answer)
+        if answer.outcome == "description":
+            body = answer.response
+            answered = body.get(fc.F_REFERENCE_CODE) if isinstance(body, dict) else None
+            if not isinstance(answered, str):
+                raise unreachable(f"unreadable: the answer has no {fc.F_REFERENCE_CODE}")
+            if answered != reference_code:
+                # Not the description asked for: the code is not known as given.
+                raise CodeRefused(422, UNKNOWN_REFERENCE_CODE,
+                                  UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code), reference_code)
+            return body
+        if answer.outcome == "unknown_code":
+            raise CodeRefused(422, UNKNOWN_REFERENCE_CODE, UNKNOWN_REFERENCE_CODE_MESSAGE.format(code=reference_code),
+                              reference_code)
+        if answer.outcome == "unsupported":
+            raise CodeRefused(409, FISQUA_NO_LOOKUP, FISQUA_NO_LOOKUP_MESSAGE, reference_code,
+                              f"unsupported: HTTP {answer.status_code}")
+        if answer.outcome == "config_error":
+            fisqua_outbox.record_config_error(answer.status_code, answer.reason,
+                                              fisqua_outbox._naive(now) or fisqua_outbox._now())
+        elif answer.retry_after is not None:
+            fisqua_outbox.call_budget.cool_down(answer.retry_after)
+        raise unreachable(f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}")
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)
 
 
 def check_reference_codes(db: Session, codes) -> None:
@@ -840,38 +845,43 @@ def search_descriptions(db: Session, q: Optional[str], *, transport=None,
     if fisqua_outbox.config_error() is not None:
         raise SearchRefused(503, FISQUA_UNREACHABLE,
                             "config_error: the link is stopped until its configuration changes")
+    owned = transport is None
     transport = transport if transport is not None else get_lookup_transport()
-    if isinstance(transport, NullTransport):
-        raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
-    if fisqua_outbox.call_budget.cooling():
-        raise SearchRefused(429, RATE_LIMITED, "cooling_down",
-                            _seconds(fisqua_outbox.call_budget.cooling_for()))
-    if not fisqua_outbox.call_budget.take(reserve=fc.SEARCH_RESERVED_CALLS):
-        raise SearchRefused(429, RATE_LIMITED, "rate_limited")
     try:
-        answer = transport.search_descriptions(query)
-    except Exception as exc:
-        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-    answer = fisqua_outbox._redacted(answer)
-    if answer.outcome == "search":
-        results = answer.response.get(fc.F_RESULTS) if isinstance(answer.response, dict) else None
-        if not isinstance(results, list):
-            raise SearchRefused(503, FISQUA_UNREACHABLE, f"unreadable: the answer has no {fc.F_RESULTS} list")
-        entries = [e for e in (_search_entry(entry) for entry in results) if e is not None]
-        return {fc.F_RESULTS: entries[:fc.SEARCH_MAX_RESULTS]}
-    if answer.outcome == "unsupported":
-        return {fc.F_RESULTS: [], "search": False}
-    if answer.outcome == "query_too_short":
-        raise SearchRefused(400, QUERY_TOO_SHORT)
-    if answer.outcome == OFF_STATUS:
-        raise SearchRefused(409, OFF_STATUS)
-    if answer.outcome == "config_error":
-        fisqua_outbox.record_config_error(answer.status_code, answer.reason,
-                                          fisqua_outbox._naive(now) or fisqua_outbox._now())
-    elif answer.retry_after is not None:
-        fisqua_outbox.call_budget.cool_down(answer.retry_after)
-    error = f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}"
-    if answer.status_code == 429:
-        raise SearchRefused(429, RATE_LIMITED, error,
-                            _seconds(answer.retry_after) if answer.retry_after is not None else None)
-    raise SearchRefused(503, FISQUA_UNREACHABLE, error)
+        if isinstance(transport, NullTransport):
+            raise SearchRefused(409, FISQUA_NOT_CONFIGURED)
+        if fisqua_outbox.call_budget.cooling():
+            raise SearchRefused(429, RATE_LIMITED, "cooling_down",
+                                _seconds(fisqua_outbox.call_budget.cooling_for()))
+        if not fisqua_outbox.call_budget.take(reserve=fc.SEARCH_RESERVED_CALLS):
+            raise SearchRefused(429, RATE_LIMITED, "rate_limited")
+        try:
+            answer = transport.search_descriptions(query)
+        except Exception as exc:
+            answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+        answer = fisqua_outbox._redacted(answer)
+        if answer.outcome == "search":
+            results = answer.response.get(fc.F_RESULTS) if isinstance(answer.response, dict) else None
+            if not isinstance(results, list):
+                raise SearchRefused(503, FISQUA_UNREACHABLE, f"unreadable: the answer has no {fc.F_RESULTS} list")
+            entries = [e for e in (_search_entry(entry) for entry in results) if e is not None]
+            return {fc.F_RESULTS: entries[:fc.SEARCH_MAX_RESULTS]}
+        if answer.outcome == "unsupported":
+            return {fc.F_RESULTS: [], "search": False}
+        if answer.outcome == "query_too_short":
+            raise SearchRefused(400, QUERY_TOO_SHORT)
+        if answer.outcome == OFF_STATUS:
+            raise SearchRefused(409, OFF_STATUS)
+        if answer.outcome == "config_error":
+            fisqua_outbox.record_config_error(answer.status_code, answer.reason,
+                                              fisqua_outbox._naive(now) or fisqua_outbox._now())
+        elif answer.retry_after is not None:
+            fisqua_outbox.call_budget.cool_down(answer.retry_after)
+        error = f"{answer.outcome}: {fisqua_outbox.scrub(answer.error or answer.outcome)}"
+        if answer.status_code == 429:
+            raise SearchRefused(429, RATE_LIMITED, error,
+                                _seconds(answer.retry_after) if answer.retry_after is not None else None)
+        raise SearchRefused(503, FISQUA_UNREACHABLE, error)
+    finally:
+        if owned:
+            fisqua_outbox.close_transport(transport)
