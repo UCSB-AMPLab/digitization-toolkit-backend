@@ -29,9 +29,9 @@ and unsent rows go out if the unit returns to fisqua. The offsite hold
 file keeps its meaning in every mode.
 
 **Starting mode.** The backend writes the row at start-up (initialise):
-`fisqua` when Fisqua is configured, else `backup` when offsite upload is,
-else `offline`, with projects off; logged `unit_mode_initialised` with
-the mode and why. Until a row exists (a unit not yet restarted on this
+`fisqua` when all its prerequisites are met, else `backup` when all its
+are, else `offline`, with projects off (inferred, which reads
+prerequisites); logged `unit_mode_initialised` with the mode and why. Until a row exists (a unit not yet restarted on this
 release, or a test), current() answers that inferred mode without
 writing it. Anything that needs the row (a change, the default project)
 writes it, with the same inference and the same log line.
@@ -157,14 +157,18 @@ class UnitState:
 
 
 def inferred() -> tuple[str, str]:
-    """The mode the unit's configuration implies, and why."""
-    from app.core import fisqua_outbox, image_upload
+    """The mode the unit's configuration implies, and why.
 
-    if fisqua_outbox.fisqua_configured():
-        return FISQUA, "Fisqua is configured (environment, token and offsite tenant)"
-    if image_upload.is_enabled():
-        return BACKUP, "offsite upload is configured (remote and tenant) and Fisqua is not"
-    return OFFLINE, "neither offsite upload nor Fisqua is configured"
+    The first of fisqua, backup and offline whose prerequisites are all met,
+    read from prerequisites() itself, so a unit with no stored mode never
+    starts in a mode a switch to it would refuse. offline has none.
+    """
+    missing = prerequisites()
+    if not missing[FISQUA]:
+        return FISQUA, "Fisqua, offsite upload and the catalogue dump are configured"
+    if not missing[BACKUP]:
+        return BACKUP, "offsite upload and the catalogue dump are configured and Fisqua is not"
+    return OFFLINE, "backup mode lacks " + ", ".join(missing[BACKUP])
 
 
 def _row(db: Session, lock: bool = False):

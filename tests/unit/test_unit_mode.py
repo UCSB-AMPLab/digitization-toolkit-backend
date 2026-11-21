@@ -281,6 +281,119 @@ def test_a_stored_mode_is_kept_whatever_the_environment_says(db_session, fisqua)
     assert unit_mode.current(db_session).mode == "offline"
 
 
+# Every input inferred() and prerequisites() read, set explicitly in each
+# configuration: Fisqua's environment and token, the offsite tenant and
+# remote, and the catalogue dump's age recipient. VALID_RECIPIENT stands for
+# a well-formed age public key, generated per test.
+VALID_RECIPIENT = "valid"
+SECRET_KEY = "AGE-SECRET-KEY-1QQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQQ"
+_NOTHING = {"FISQUA_ENV": "", "FISQUA_TOKEN": "", "OFFSITE_TENANT": "", "OFFSITE_REMOTE": "",
+            "OFFSITE_DUMP_RECIPIENT": ""}
+_UPLOAD = {"OFFSITE_TENANT": TENANT, "OFFSITE_REMOTE": "b2unit:bucket"}
+_LINK = {"FISQUA_ENV": "staging", "FISQUA_TOKEN": TOKEN}
+
+# (name, configuration, the mode a unit with no stored mode starts in)
+CONFIGURATIONS = [
+    ("nothing configured", {}, "offline"),
+    ("upload, valid recipient", {**_UPLOAD, "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "backup"),
+    ("upload, no recipient", {**_UPLOAD}, "offline"),
+    ("upload, invalid recipient", {**_UPLOAD, "OFFSITE_DUMP_RECIPIENT": "age1notarecipient"}, "offline"),
+    ("upload, private key as recipient", {**_UPLOAD, "OFFSITE_DUMP_RECIPIENT": SECRET_KEY}, "offline"),
+    ("recipient only", {"OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "offline"),
+    ("remote without tenant", {"OFFSITE_REMOTE": "b2unit:bucket", "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT},
+     "offline"),
+    ("tenant without remote", {"OFFSITE_TENANT": TENANT, "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "offline"),
+    ("upload with a tenant that is not a prefix",
+     {**_UPLOAD, "OFFSITE_TENANT": "Not_A_Prefix", "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "offline"),
+    ("Fisqua, upload, valid recipient", {**_LINK, **_UPLOAD, "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "fisqua"),
+    ("Fisqua, upload, no recipient", {**_LINK, **_UPLOAD}, "offline"),
+    ("Fisqua, upload, invalid recipient", {**_LINK, **_UPLOAD, "OFFSITE_DUMP_RECIPIENT": "age1notarecipient"},
+     "offline"),
+    ("Fisqua and tenant, no remote", {**_LINK, "OFFSITE_TENANT": TENANT, "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT},
+     "offline"),
+    ("Fisqua without tenant, remote, valid recipient",
+     {**_LINK, "OFFSITE_REMOTE": "b2unit:bucket", "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "offline"),
+    ("Fisqua token malformed, upload, valid recipient",
+     {**_LINK, **_UPLOAD, "FISQUA_TOKEN": "not-a-token", "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "backup"),
+    ("Fisqua environment unknown, upload, valid recipient",
+     {**_LINK, **_UPLOAD, "FISQUA_ENV": "elsewhere", "OFFSITE_DUMP_RECIPIENT": VALID_RECIPIENT}, "backup"),
+]
+_IDS = [name for name, _, _ in CONFIGURATIONS]
+
+
+def _configure(monkeypatch, recipient, configuration):
+    """Set every input of inferred() and prerequisites() to `configuration`, the rest empty.
+
+    Called after db_session, whose fixtures rebuild config.settings from the environment.
+    """
+    from pydantic import SecretStr
+
+    from app.core import config
+    for name, value in {**_NOTHING, **configuration}.items():
+        if name == "OFFSITE_DUMP_RECIPIENT" and value == VALID_RECIPIENT:
+            value = recipient
+        if name == "FISQUA_TOKEN":
+            value = SecretStr(value)
+        monkeypatch.setattr(config.settings, name, value, raising=False)
+
+
+def _met(mode):
+    """Whether every prerequisite of `mode` is met (offline has none)."""
+    from app.core import unit_mode
+    return mode == "offline" or unit_mode.prerequisites()[mode] == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("name, configuration, expected", CONFIGURATIONS, ids=_IDS)
+def test_with_no_stored_mode_the_unit_starts_in_the_first_mode_whose_prerequisites_are_met(
+        db_session, monkeypatch, recipient, name, configuration, expected):
+    from app.core import unit_mode
+    _configure(monkeypatch, recipient, configuration)
+    assert unit_mode.inferred()[0] == expected
+    assert _met(expected), unit_mode.prerequisites()
+    assert unit_mode.current(db_session).mode == expected
+    assert unit_mode.initialise() == expected
+    db_session.expire_all()
+    assert unit_mode.current(db_session).mode == expected
+    logs = _logs(db_session, "unit_mode_initialised")
+    assert len(logs) == 1 and logs[0].detail.startswith(f"{expected}: ")
+
+
+@pytest.mark.unit
+def test_the_inferred_mode_never_lacks_a_prerequisite(db_session, monkeypatch, recipient):
+    """Over every configuration: the mode inferred() returns has all its prerequisites, and no
+    higher mode (fisqua above backup above offline) with all of its own is passed over."""
+    from app.core import unit_mode
+    failures = []
+    for name, configuration, _ in CONFIGURATIONS:
+        _configure(monkeypatch, recipient, configuration)
+        mode, why = unit_mode.inferred()
+        prerequisites = unit_mode.prerequisites()
+        if not _met(mode):
+            failures.append(f"{name}: {mode} lacks {prerequisites[mode]} ({why})")
+        higher = unit_mode.MODES[unit_mode.MODES.index(mode) + 1:]
+        passed_over = [m for m in higher if _met(m)]
+        if passed_over:
+            failures.append(f"{name}: {mode} chosen over {passed_over}, whose prerequisites are met")
+    assert failures == []
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("stored", ["offline", "backup", "fisqua"])
+@pytest.mark.parametrize("name, configuration, expected", CONFIGURATIONS, ids=_IDS)
+def test_a_stored_mode_is_kept_in_every_configuration(db_session, monkeypatch, recipient, stored, name,
+                                                      configuration, expected):
+    from app.core import unit_mode
+    _unit(db_session, stored)
+    _configure(monkeypatch, recipient, configuration)
+    assert unit_mode.current(db_session).mode == stored
+    assert unit_mode.mode_for_insert(db_session) == stored
+    assert unit_mode.initialise() is None
+    db_session.expire_all()
+    assert unit_mode.current(db_session).mode == stored
+    assert _logs(db_session, "unit_mode_initialised") == []
+
+
 @pytest.mark.unit
 def test_startup_initialises_the_mode(backend_root):
     text = (backend_root / "app" / "main.py").read_text(encoding="utf-8")
