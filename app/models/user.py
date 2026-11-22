@@ -5,6 +5,8 @@ from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstrai
 
 from app.core.db import Base
 
+USER_LANGUAGE_CHECK = "language IN ('es','en')"
+
 
 class User(Base):
     __tablename__ = "users"
@@ -24,9 +26,14 @@ class User(Base):
     # absent), and a token whose `ver` differs is refused (app.api.auth).
     token_version = Column(Integer, default=0, server_default=text("0"), nullable=False)
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
+    # The account's own language, `es` or `en`; null until the user chooses
+    # one (PUT /users/me/language). The first account takes the language
+    # chosen for the unit at first run.
+    language = Column(String(2), nullable=True)
 
     __table_args__ = (
         CheckConstraint("role IN ('admin','operator','reviewer','testing')", name='check_user_role'),
+        CheckConstraint(USER_LANGUAGE_CHECK, name='check_user_language'),
         # At most one account has the testing role.
         Index('uq_users_one_testing_account', 'role', unique=True,
               postgresql_where=text("role = 'testing'"), sqlite_where=text("role = 'testing'")),
