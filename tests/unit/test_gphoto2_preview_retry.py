@@ -16,7 +16,7 @@ answer. The route answers 503 with code preview_frame_failed only for
 PreviewFrameFailedError, 404 for every other RuntimeError, and never asks
 the backend a second time.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

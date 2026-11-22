@@ -158,7 +158,7 @@ manifest, and their offsite-freed lines. None blocks the run when K is at
 least the highest number the old records used: their keys then carry numbers
 1 to K, and the planned ones K + 1 on.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import argparse

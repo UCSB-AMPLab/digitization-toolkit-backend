@@ -10,7 +10,7 @@ either would falsify it.
 
 Run with: python -m pytest tests/unit/test_excluded_status_migration.py
 
-Version: 0.2.1
+Version: 0.3.0
 """
 
 import importlib.util

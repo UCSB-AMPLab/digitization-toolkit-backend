@@ -11,7 +11,7 @@ uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib

@@ -13,7 +13,7 @@ inside the same handling as the capture itself, or the commonest
 first-contact failure there is reaches the operator as a generic 500 instead
 of a timeout.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

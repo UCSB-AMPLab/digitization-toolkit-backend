@@ -17,7 +17,7 @@ every (re)configure, ``apply_zoom`` crops inside it, and a still waits for a
 frame actually exposed at it. Bench testing on the appliance confirms the
 band.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import os

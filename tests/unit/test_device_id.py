@@ -2,7 +2,7 @@
 
     python -m pytest tests/unit/test_device_id.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import os

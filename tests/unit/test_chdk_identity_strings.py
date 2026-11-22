@@ -3,7 +3,7 @@
 Real pychdk 0.1.3 returns the A2500's serial with a trailing NUL byte, and the
 A2500's USB product string is the generic "Canon Digital Camera".
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

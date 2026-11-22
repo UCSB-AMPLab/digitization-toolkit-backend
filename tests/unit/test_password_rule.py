@@ -16,6 +16,8 @@ for is not held to the rule. The testing account keeps its own rule
 (/system/testing: not empty, encodable).
 
     python -m pytest tests/unit/test_password_rule.py
+
+Version: 0.3.0
 """
 
 import pytest

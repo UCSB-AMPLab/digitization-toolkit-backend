@@ -8,7 +8,7 @@ writes a version it read earlier back over the stored one.
 
     python -m pytest tests/unit/test_testing_space_token_version.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re

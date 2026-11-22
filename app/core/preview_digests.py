@@ -44,7 +44,7 @@ come from that read, not from the listing query; the file is identified by
 its inode on both sides of the hash, and the row must read the same
 afterwards.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import json

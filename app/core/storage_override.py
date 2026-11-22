@@ -16,7 +16,7 @@ while the rest of the project is on the drive. Instead, everything that writes
 into the projects tree gets its root from writable_projects_dir, which raises
 StorageUnavailableError for such a root.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 import json
 import logging

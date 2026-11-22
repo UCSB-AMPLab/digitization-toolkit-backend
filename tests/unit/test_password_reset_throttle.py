@@ -11,6 +11,8 @@ password; a correct current password clears both keys, as a successful
 sign-in does.
 
     python -m pytest tests/unit/test_password_reset_throttle.py
+
+Version: 0.3.0
 """
 
 import pytest

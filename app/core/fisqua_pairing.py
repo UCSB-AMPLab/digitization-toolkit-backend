@@ -83,7 +83,7 @@ daemon, so it never holds the process.
 **One session per process** (PairingRegistry), the same single-process
 assumption as catalogue_backup's scheduler.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

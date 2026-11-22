@@ -69,7 +69,7 @@ and takes no turn lock (app.api.cameras), closing a testing record writes
 no completion (app.api.records.close_missing_record), and no testing
 volume is a full rescan for the turn (lock_rescan_volumes).
 
-Version: 0.3.3
+Version: 0.3.0
 """
 from datetime import datetime, timezone
 import json

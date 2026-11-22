@@ -10,7 +10,7 @@ capture, because nothing it produces could be attributed to a body; and
 neither may a body whose parity another body also claims, because one of the
 two would be filed as the wrong page.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

@@ -4,7 +4,7 @@ Camera registry and hardware identification system.
 Manages physical camera identification, calibration, and configuration
 at a global level (PROJECTS_ROOT/cameras.json).
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import json
 import logging

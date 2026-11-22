@@ -78,7 +78,7 @@ command). Reading from the bucket changes nothing on either side, so
 restore and the dry run are allowed in every mode, as are the adopt
 commands of app.core.image_upload.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

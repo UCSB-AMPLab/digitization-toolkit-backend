@@ -17,7 +17,7 @@ The node check and the clock are module-level indirections
 (_port_node_exists, _monotonic), replaced here by a set of live ports and a
 counter, so nothing below sleeps or depends on timing.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

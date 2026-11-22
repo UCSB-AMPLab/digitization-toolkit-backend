@@ -16,7 +16,7 @@ The record evaluate_setup reads, per hardware id:
 and the pair last confirmed together, as {"left": hw_id, "right": hw_id} or
 None when no pair has been confirmed.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import re

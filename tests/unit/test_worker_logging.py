@@ -9,7 +9,7 @@ ERROR. No line carries the token or a key's credentials.
 
     python -m pytest tests/unit/test_worker_logging.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

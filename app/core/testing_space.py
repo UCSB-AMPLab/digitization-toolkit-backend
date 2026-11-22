@@ -99,7 +99,7 @@ network time restores its last saved time at start, so its clock is behind,
 and both the dates written and the comparison use that same clock. A clock
 set far ahead by hand would make every testing volume due.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

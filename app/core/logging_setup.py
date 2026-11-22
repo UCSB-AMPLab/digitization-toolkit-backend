@@ -25,7 +25,7 @@ read. The filter sits on the
 loggers rather than on uvicorn's handlers so it holds whatever handlers
 `--log-config` or uvicorn's defaults install.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

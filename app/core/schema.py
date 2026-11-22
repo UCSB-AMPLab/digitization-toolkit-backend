@@ -10,7 +10,7 @@ of band); DTK_SKIP_SCHEMA_CHECK, the other name every setting has, is read
 when CAPTUA_SKIP_SCHEMA_CHECK is unset or empty. If Alembic or the config cannot be loaded the check is skipped with a
 warning; only a genuine revision mismatch aborts startup.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

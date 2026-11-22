@@ -23,6 +23,8 @@ statements recorded include the administrator's UPDATE; each test picks
 the request's own by its WHERE clause.
 
     python -m pytest tests/unit/test_password_write_races.py
+
+Version: 0.3.0
 """
 
 import re

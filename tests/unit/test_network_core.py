@@ -8,7 +8,7 @@ captures from the bench unit.
 
     python -m pytest tests/unit/test_network_core.py
 
-Version: 0.3.4
+Version: 0.3.0
 """
 
 import logging

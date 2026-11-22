@@ -15,7 +15,7 @@ takes `reserve_gb` as it takes `expiry_days`.
 
     python -m pytest tests/unit/test_testing_space_reserve.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import shutil

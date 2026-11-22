@@ -9,7 +9,7 @@ collection in a single UPDATE and adds its rows with
 record_bulk_status_changes. A record's birth as "captured" is not a change and
 writes no row; its created_at dates it.
 
-Version: 0.2.1
+Version: 0.3.0
 """
 from typing import Iterable
 

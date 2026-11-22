@@ -39,7 +39,7 @@ of them.
 
     python -m pytest tests/unit/test_testing_space_isolation.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

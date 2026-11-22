@@ -8,7 +8,7 @@ and the payload reach no log, repr or error text.
 
     python -m pytest tests/unit/test_fisqua_pairing_http.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

@@ -14,7 +14,7 @@ shared testing account through these routes only:
 
     python -m pytest tests/unit/test_testing_space_admin.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

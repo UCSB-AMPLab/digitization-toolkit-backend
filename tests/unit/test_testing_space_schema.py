@@ -20,7 +20,7 @@ This file covers what holds whatever routes later reach them:
 
     python -m pytest tests/unit/test_testing_space_schema.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util

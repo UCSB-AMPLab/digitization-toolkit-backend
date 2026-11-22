@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

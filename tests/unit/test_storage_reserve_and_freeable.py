@@ -20,6 +20,8 @@ touched or anything written; the testing account keeps its own reserve
 (`testing_reserve`), which sits above this one.
 
     python -m pytest tests/unit/test_storage_reserve_and_freeable.py
+
+Version: 0.3.0
 """
 
 from datetime import datetime, timezone

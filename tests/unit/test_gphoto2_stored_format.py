@@ -18,7 +18,7 @@ widgets it changed. The shutter is not fired: _PTPSession.capture is replaced
 by a stub that writes a `.cr2` when the body's imageformat widget is "RAW" or
 "RAW + L" and a `.jpg` otherwise, so a test sees the file type produced.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

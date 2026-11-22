@@ -9,6 +9,8 @@ reports "RAW" or "RAW + L" is reported as RAW+JPEG.
 No camera is involved: the session is a stand-in that records what is set.
 
 Run with: python -m pytest tests/unit/test_gphoto2_image_format.py
+
+Version: 0.3.0
 """
 
 import logging

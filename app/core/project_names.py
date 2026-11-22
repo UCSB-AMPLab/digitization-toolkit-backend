@@ -28,7 +28,7 @@ Pure functions, with no database or model imports, so that the models
 - display_project_name: the name a caller reads and sends for a project,
   the stored name without the project prefix.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import unicodedata

@@ -12,7 +12,7 @@ test_promotion_invariant.py).
 
 Run with: python -m pytest tests/unit/test_record_status_transitions.py
 
-Version: 0.2.1
+Version: 0.3.0
 """
 
 import pytest

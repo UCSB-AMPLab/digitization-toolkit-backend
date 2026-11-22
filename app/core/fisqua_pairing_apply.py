@@ -60,7 +60,7 @@ tenant, the environment, when, and the administrator who asked for the
 code. No secret. Written atomically after a verified link, read by the
 card after the restart.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib

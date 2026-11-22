@@ -9,7 +9,7 @@ custom_attributes.fisqua like any other unmapped field.
 
 Run with: python -m pytest tests/unit/test_import_queue.py
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import json

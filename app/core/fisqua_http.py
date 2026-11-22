@@ -50,7 +50,7 @@ configuration errors as above; the rest, 429 and any other 400 included,
 errors. The query goes as the one query parameter `q`, with the search's
 own timeout (fisqua_contract.SEARCH_TIMEOUT_SECONDS) for every phase.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from datetime import datetime, timezone

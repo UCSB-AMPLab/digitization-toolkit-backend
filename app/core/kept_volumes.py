@@ -129,7 +129,7 @@ no other row lock in that transaction (its process-wide _queue_lock is a
 thread lock, not a row lock, and the settings row is not taken there), so
 it closes no cycle either.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

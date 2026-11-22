@@ -13,6 +13,8 @@ pydantic's own messages and any later validator.
 A route's own HTTPException message may name a non-credential parameter it
 refused (for example an unknown time zone or a resolution). No credential,
 hash or token is ever placed in a response or a log line.
+
+Version: 0.3.0
 """
 
 

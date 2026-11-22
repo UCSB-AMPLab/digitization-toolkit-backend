@@ -7,7 +7,7 @@ settings, writes nothing, or exits non-zero, as told.
 
     python -m pytest tests/unit/test_fisqua_pairing_apply.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

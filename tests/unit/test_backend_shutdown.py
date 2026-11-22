@@ -5,7 +5,7 @@ process, and their cleanup is what waits for whatever is running and releases
 them. The application lifespan calls it on the way out; without that call, a
 restart would drop the sessions rather than close them.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

@@ -119,7 +119,7 @@ row. Run by hand, with the backend stopped, as
 `python -m app.core.volume_layout [--dry-run]`; a dry run reports what would
 be done and writes nothing.
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import argparse

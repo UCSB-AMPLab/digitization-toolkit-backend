@@ -6,7 +6,7 @@ point inside the application's storage roots. A database row that points
 elsewhere (e.g. /etc/passwd, ~/.ssh/id_rsa, the project .env) must never be
 served, unlinked, or otherwise acted upon.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import os

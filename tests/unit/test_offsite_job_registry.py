@@ -6,7 +6,7 @@ grow for as long as the backend runs. A running job is never dropped.
 
     python -m pytest tests/unit/test_offsite_job_registry.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

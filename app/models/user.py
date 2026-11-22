@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from datetime import datetime, timezone
 from sqlalchemy import Column, Integer, String, Boolean, DateTime, CheckConstraint, Index, text

@@ -53,7 +53,7 @@ while it is uploaded. A renumber renames nothing. Where a hard link cannot
 be made (a file system without hard links), a copy is made there instead,
 and removed after the upload.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import argparse

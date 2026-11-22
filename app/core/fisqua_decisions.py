@@ -107,7 +107,7 @@ transaction (app.core.fisqua_outbox.hand_over_again_after_missing_change).
 What applying did is kept on fisqua_status (decisions_report) for the
 volume page, and written to the system log as `fisqua_decisions_applied`.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

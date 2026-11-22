@@ -4,7 +4,7 @@ Minimal test script to validate API endpoints and routes.
 This script tests the core functionality without requiring a running server.
 Run with: python -m pytest tests/unit/test_api.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import sys
