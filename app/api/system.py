@@ -26,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 allow_admin     = RoleChecker(["admin"])
+allow_contributor = RoleChecker(["admin", "operator"])
 
 # Single root-privileged entry point installed (root-owned, sudoers-whitelisted)
 # by the superproject setup. All privileged shell-outs go through this helper
@@ -612,9 +613,15 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
     when it is missing or not on a mounted drive (see
     storage_override.override_root_problem) the response says available:false
     and gives the reason in unavailable_reason, which is null otherwise.
+
+    `reserve_bytes` is the space Captua keeps for its own work
+    (settings.STORAGE_RESERVE_GB, storage_override.refuse_below_storage_reserve),
+    and `usable_free_bytes` the free space above it, never below 0; 0 when
+    the figures cannot be read.
     """
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override_or_fallback, projects_root_usage
+    from app.core.storage_override import (
+        get_storage_override_or_fallback, projects_root_usage, storage_reserve_bytes)
 
     # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
     override, override_invalid = get_storage_override_or_fallback()
@@ -630,8 +637,11 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
             "free_bytes":         0,
             "available":          False,
             "unavailable_reason": reason,
+            "reserve_bytes":      reserve,
+            "usable_free_bytes":  0,
         }
 
+    reserve = storage_reserve_bytes(settings)
     usage, problem = projects_root_usage(settings)
     if usage is None:
         return unavailable(problem)
@@ -645,7 +655,25 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
         "free_bytes":         usage.free,
         "available":          True,
         "unavailable_reason": None,
+        "reserve_bytes":      reserve,
+        "usable_free_bytes":  max(0, usage.free - reserve),
     }
+
+
+@router.get("/storage/freeable")
+def list_freeable_volumes(
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """The real volumes freeing is on offer for, largest first, with what freeing each would remove.
+
+    From the database only (app.core.offsite_free.freeable_volumes): no
+    call to the bucket and no file read. `mode_allows` is false in offline
+    mode, where freeing is refused (`off_in_this_mode`).
+    """
+    from app.core.offsite_free import freeable_volumes
+
+    return freeable_volumes(db)
 
 
 @router.get("/storage/devices")

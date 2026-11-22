@@ -749,9 +749,11 @@ async def add_image_to_record(
 	# by the image insert's foreign-key check (FOR KEY SHARE), after the
 	# volume: the opposite order to a retake, and the two deadlock on
 	# PostgreSQL.
-	# The testing account writes no file while free space is below the
-	# reserve kept for real work (app.core.testing_space).
-	from app.core import testing_space
+	# The testing account writes no file while free space is below its
+	# reserve, the larger of the testing and storage reserves
+	# (app.core.testing_space). Every other caller is checked against the
+	# storage reserve last, just before the file is written (below).
+	from app.core import storage_override, testing_space
 	if current_user.role == testing_space.TESTING_ROLE:
 		testing_space.refuse_below_reserve(db)
 	rec = _locked_record(db, rec_id, with_images=False)
@@ -818,6 +820,17 @@ async def add_image_to_record(
 	# without one is given its own.
 	if not capture_id:
 		capture_id = str(uuid.uuid4())
+
+	# The last refusal before the file is written, measured on the folder it is
+	# written to: free space below the space
+	# Captua keeps for its own work (app.core.storage_override), for every
+	# caller but the testing account. The number taken is rolled back.
+	if current_user.role != testing_space.TESTING_ROLE:
+		try:
+			storage_override.refuse_below_storage_reserve(uploads_dir)
+		except HTTPException:
+			db.rollback()
+			raise
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
