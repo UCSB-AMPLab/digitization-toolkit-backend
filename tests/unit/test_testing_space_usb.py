@@ -26,7 +26,7 @@ and a temporary directory under a temporary mounts root is the drive.
 
     python -m pytest tests/unit/test_testing_space_usb.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import errno

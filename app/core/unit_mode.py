@@ -63,7 +63,7 @@ the only project when there is exactly one, else a project named
 `default`, created if there is none; the choice is stored and logged
 `default_project_set`. Nothing moves an existing volume.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

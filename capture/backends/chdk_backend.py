@@ -54,7 +54,7 @@ it (``gui_live.lua``, update_canvas_size and the put_to_cd_canvas call under
 it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import contextlib

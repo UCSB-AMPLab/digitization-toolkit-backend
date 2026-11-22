@@ -11,7 +11,7 @@ projects on), every new volume goes into the unit's default project.
 
     python -m pytest tests/unit/test_unit_mode.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util

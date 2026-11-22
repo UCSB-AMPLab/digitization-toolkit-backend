@@ -39,7 +39,7 @@ The invariant: start() is called only on a scheduler whose worker has
 exited (wait_stopped answered True), so no path starts one beside a live
 worker and none leaves two.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

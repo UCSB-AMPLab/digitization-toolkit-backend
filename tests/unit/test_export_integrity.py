@@ -2,7 +2,7 @@
 whose bytes no longer match its capture-time checksum both fail the export. 
 The export runs as a background job, so these surface as a failed job with detail.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

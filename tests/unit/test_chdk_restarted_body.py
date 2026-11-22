@@ -7,7 +7,7 @@ once more on the body now at that index, provided that body has the same
 hardware identity. A different or missing identity is refused, and only one
 retry is made.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

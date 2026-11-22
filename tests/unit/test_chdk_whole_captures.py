@@ -23,7 +23,7 @@ sends waits first until no script is running, so the next one waits for it.
 The fake body in chdk_fakes raises ScriptSentWhileRunning whenever a script
 arrives while one is running, so every CHDK test enforces that rule.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import io

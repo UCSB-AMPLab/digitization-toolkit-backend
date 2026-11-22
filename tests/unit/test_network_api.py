@@ -6,7 +6,7 @@ thread body runs synchronously in the request.
 
     python -m pytest tests/unit/test_network_api.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

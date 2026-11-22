@@ -14,7 +14,7 @@ acknowledgement, the operators PUT carrying the unit's mode. The reference
 code lookup (contract 1.8) and the description search (contract 1.10)
 are at the end.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re

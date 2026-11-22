@@ -13,7 +13,7 @@ fails is NULL too, and never fails the capture.
 
 Run with: python -m pytest tests/unit/test_camera_model_recorded.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

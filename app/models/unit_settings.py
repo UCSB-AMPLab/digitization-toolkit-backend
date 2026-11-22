@@ -25,7 +25,7 @@
 
 `id` is always 1 (check_unit_settings_single_row).
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from datetime import datetime, timezone

@@ -21,6 +21,8 @@ administrator route. No response and no log line carries the password or
 its hash.
 
     python -m pytest tests/unit/test_set_password.py
+
+Version: 0.3.0
 """
 
 import logging

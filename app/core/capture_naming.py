@@ -15,7 +15,7 @@ number. The callers turn its CaptureNameRefused into a 409 carrying the
 exception's fixed text, after rolling back, so a refused event consumes no
 number.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import logging
 import os

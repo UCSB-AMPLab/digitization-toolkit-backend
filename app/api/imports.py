@@ -9,7 +9,7 @@ list with its items and the volume each one names. The import itself is
 app/core/list_import.py. The digitisation queue synced with Fisqua
 (app/core/fisqua_queue.py) is one more list there, with `source` `queue`.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib

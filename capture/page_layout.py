@@ -100,6 +100,8 @@ the width inside the edge on three of them, from 1% on four more, from 1.5%
 on two and from 2% on one; nearer the edge it is reported as unknown, not as
 good. Near the 4% limit the measured margin differed from the crop's by up
 to 0.3 points of the width (up to 0.7 points at 3%).
+
+Version: 0.3.0
 """
 
 from __future__ import annotations

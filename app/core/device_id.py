@@ -24,7 +24,7 @@ The backend writes it once, at start-up beside unit_mode.initialise()
 
 A copied SD card copies the id with it; nothing here detects that.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

@@ -8,6 +8,8 @@ over crops of them made on the gutter side, when the samples are present on
 this machine; they are skipped otherwise. Four pictures from the zoom
 sweep of 13 November 2026, reduced to the analysis size, are kept under
 tests/unit/data/page_layout/ and always run.
+
+Version: 0.3.0
 """
 
 import io

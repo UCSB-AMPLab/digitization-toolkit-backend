@@ -4,7 +4,7 @@ The path names the socket a cable is plugged into, so it stays the same when
 a body re-enumerates onto a new device number. The helper reads it from a
 pyusb device or from sysfs, and answers None wherever it cannot tell.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import types

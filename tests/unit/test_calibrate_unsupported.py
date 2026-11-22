@@ -4,6 +4,8 @@ that cannot calibrate answer 501, not 200 with success=false (NEH-326).
 Both handlers raise HTTPException(501) inside a try whose generic
 ``except Exception`` used to catch it and return a 200 body, so a client
 checking the status code saw success.
+
+Version: 0.3.0
 """
 
 import pytest

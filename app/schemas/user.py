@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from typing import Optional, Literal
 from pydantic import BaseModel, field_validator

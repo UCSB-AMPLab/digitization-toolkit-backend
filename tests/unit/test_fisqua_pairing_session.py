@@ -6,7 +6,7 @@ waits of a few milliseconds.
 
     python -m pytest tests/unit/test_fisqua_pairing_session.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

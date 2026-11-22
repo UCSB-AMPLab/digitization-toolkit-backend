@@ -1,4 +1,4 @@
-# Version: 0.3.4
+# Version: 0.3.0
 """The unit's network, through NetworkManager's nmcli (NEH-253).
 
 Status, the Wi-Fi scan, joining a Wi-Fi network (open, password, or

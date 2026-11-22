@@ -45,7 +45,7 @@ Two connected bodies that answer one serial are not told apart before both
 have been read, so the first of them to open may be given the format stored
 under that serial. Canon bodies have distinct serials.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import copy

@@ -12,6 +12,8 @@ make_scene draws the scene in the upright picture, where the page is known
 exactly, and then turns it counter-clockwise by rotation_deg, so that the
 analyser has to turn it clockwise by rotation_deg to make it upright again,
 as it does with a camera's saved orientation.
+
+Version: 0.3.0
 """
 
 import io

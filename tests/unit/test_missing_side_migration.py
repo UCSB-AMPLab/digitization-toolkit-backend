@@ -6,7 +6,7 @@ drops both. The placeholders revision after it widens the check to "both".
 
 Run with: python -m pytest tests/unit/test_missing_side_migration.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util

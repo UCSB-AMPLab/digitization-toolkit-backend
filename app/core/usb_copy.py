@@ -109,7 +109,7 @@ lsblk through _run_lsblk only; the free space, the allocation unit, the
 clock and the job's thread through _free_bytes, _allocation_unit, _now and
 _start_thread.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

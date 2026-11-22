@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 from contextlib import contextmanager
 from typing import Generator

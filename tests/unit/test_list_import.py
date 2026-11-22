@@ -5,7 +5,7 @@ item, in a project named after the basket; items that cannot be created are
 reported as rejects and the rest are still created. The fixtures are the two
 synthetic lists in tests/fixtures/ (tenant captua-test, codes xx-test-...).
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

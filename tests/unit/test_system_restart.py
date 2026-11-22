@@ -5,7 +5,7 @@ helper is a file in a temporary directory.
 
     python -m pytest tests/unit/test_system_restart.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import subprocess

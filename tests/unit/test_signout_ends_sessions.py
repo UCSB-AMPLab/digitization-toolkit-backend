@@ -16,7 +16,7 @@ database.
 
     python -m pytest tests/unit/test_signout_ends_sessions.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re

@@ -12,7 +12,7 @@ header only through a CORS preflight, which the origin allowlist refuses, so
 the header check backs up SameSite=Strict on browsers or paths where the
 browser does not apply that attribute.
 
-Version: 0.1.0
+Version: 0.3.0
 """
 
 import pytest

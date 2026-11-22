@@ -7,7 +7,7 @@ neither reports a freed file as missing nor the run manifests as foreign.
 
     python -m pytest tests/unit/test_offsite_free_routes.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import threading

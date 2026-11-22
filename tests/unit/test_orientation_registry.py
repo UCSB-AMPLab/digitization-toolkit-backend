@@ -9,7 +9,7 @@ Also covers concurrent saves: two CameraRegistry instances are constructed per r
 of the file. Without a reload-modify-save discipline under a shared lock, an
 instance that saves after another would silently clobber the other's change.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import threading

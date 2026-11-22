@@ -31,7 +31,7 @@ tests/unit/test_testing_space_access.py walks the application's routes and
 fails when a route has no entry, an entry has no route, or a path, query
 or body field named like material is not declared as a target.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

@@ -82,7 +82,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re

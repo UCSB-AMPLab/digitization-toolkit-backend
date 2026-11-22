@@ -70,7 +70,7 @@ offsite hold (app.core.fisqua_outbox).
   (`mode`), and a change of mode sends it at once
   (send_operators_with_mode), bypassing that gate.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

@@ -18,7 +18,7 @@ old volume had OFFSET numbers, and the new files take OFFSET + 1 on.
 
     python -m pytest tests/unit/test_rebuild_volume.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib

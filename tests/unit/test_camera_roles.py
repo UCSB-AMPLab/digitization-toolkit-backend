@@ -4,7 +4,7 @@ A pure function over the device rows, the stored role records and the pair
 last confirmed together. Each reason code has its own test, and so does the
 case in which nothing needs doing.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import copy

@@ -10,7 +10,7 @@ returns immediately and wait_for_event(timeout_ms) delivers the file event in
 bounded steps, so a deadline can be checked between calls. The fake Camera
 deliberately has no capture() method, so a blocking capture path cannot pass.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

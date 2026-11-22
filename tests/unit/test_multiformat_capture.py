@@ -10,6 +10,8 @@ removes the raw sidecar with it.
 The backend is stood in for as test_master_orientation.py does.
 
 Run with: python -m pytest tests/unit/test_multiformat_capture.py
+
+Version: 0.3.0
 """
 
 import io

@@ -34,7 +34,7 @@ that name of the validated model (or the body parameter of that name):
 aliases, defaults and coercions are the handler's. A body target is
 declared by its field name, never by an alias.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

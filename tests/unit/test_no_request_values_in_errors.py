@@ -14,6 +14,8 @@ Two rules:
   for every router).
 
     python -m pytest tests/unit/test_no_request_values_in_errors.py
+
+Version: 0.3.0
 """
 
 import json

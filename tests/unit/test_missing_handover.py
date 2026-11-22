@@ -13,7 +13,7 @@ moves are written to the record's status history.
 
 Run with: python -m pytest tests/unit/test_missing_handover.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

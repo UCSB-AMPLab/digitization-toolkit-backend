@@ -12,7 +12,7 @@ before, empty or not.
 
     python -m pytest tests/unit/test_env_names.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

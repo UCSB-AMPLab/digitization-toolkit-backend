@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder

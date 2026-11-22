@@ -39,7 +39,7 @@ Retry-After, on the camera routes and the offsite job routes alike.
 One backend process, as for the schedulers: nothing here is shared
 between processes.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import threading

@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 """The network screen's routes (NEH-253), over app.core.network.
 
 GET    /network/status              what the unit is connected to

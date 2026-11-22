@@ -3,6 +3,8 @@
 ``live_preview`` means a backend can return a preview frame on request.
 ``continuous_preview`` means the capture screen may poll preview frames
 continuously. Only the picamera2 backend sets it.
+
+Version: 0.3.0
 """
 
 import pytest

@@ -23,7 +23,7 @@ is the production path.
 
     python -m pytest tests/unit/test_catalogue_backup.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import errno

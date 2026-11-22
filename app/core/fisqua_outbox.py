@@ -99,7 +99,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib

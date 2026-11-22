@@ -5,7 +5,7 @@ clears those roles from every other record, and stores the pair confirmed
 together, all in one replace of cameras.json. Nothing reads a stored role
 for indexes, pins or capture in this step.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import json

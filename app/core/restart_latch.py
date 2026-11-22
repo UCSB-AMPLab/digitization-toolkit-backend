@@ -22,7 +22,7 @@ starts no scheduler (fisqua_pairing_service._start_again); and GET
 /system/pairing reports `restartRequired`, so the card offers the unit's
 restart after a reload, or to a second administrator.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import threading

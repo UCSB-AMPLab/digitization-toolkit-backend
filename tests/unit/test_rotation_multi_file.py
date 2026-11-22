@@ -8,7 +8,7 @@ for byte as the camera wrote it.
 
     python -m pytest tests/unit/test_rotation_multi_file.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import io

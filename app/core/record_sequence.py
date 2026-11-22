@@ -25,7 +25,7 @@ so it takes the rewrite's locks, the records and then the row, and holds
 both while it adds. A caller that has already taken them, as a capture after
 a record does before it touches the cameras, waits for nothing new.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 from typing import List, Optional, Tuple
 

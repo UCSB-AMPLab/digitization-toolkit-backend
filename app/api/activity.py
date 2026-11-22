@@ -6,7 +6,7 @@ columns. Neither loads ORM objects, because a unit holds thousands of records
 and the dashboard calls them on every visit. status_counts is also what
 GET /imports/digitisation-lists shows for each item's volume.
 
-Version: 0.2.1
+Version: 0.3.0
 """
 from collections import defaultdict
 from datetime import date, datetime, time, timedelta, timezone

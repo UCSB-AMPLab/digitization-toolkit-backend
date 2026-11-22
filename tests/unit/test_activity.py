@@ -7,7 +7,7 @@ written directly as naive UTC, the form they are stored in.
 
 Run with: python -m pytest tests/unit/test_activity.py
 
-Version: 0.2.1
+Version: 0.3.0
 """
 from datetime import date, datetime, timedelta
 
