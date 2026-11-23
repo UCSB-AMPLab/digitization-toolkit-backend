@@ -151,12 +151,14 @@ ROLE_LISTS_BEFORE = {
     ('PUT', '/auth/users/{user_id}/password'): (('admin',),),
     ('DELETE', '/auth/users/{user_id}'): (('admin',),),
     ('GET', '/users/me'): (),
+    ('PUT', '/users/me/language'): (),
     ('GET', '/system/logs'): (('admin',),),
     ('GET', '/system/integrity'): (('admin',),),
     ('GET', '/system/temperature'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/system/catalogue-backup'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/system/unit'): (('admin', 'operator', 'reviewer'),),
     ('PUT', '/system/unit'): (('admin',),),
+    ('PUT', '/system/unit/capture-key'): (('admin', 'operator'),),
     ('GET', '/system/testing'): (('admin',),),
     ('PUT', '/system/testing'): (('admin',),),
     ('PATCH', '/system/testing/account'): (('admin',),),
@@ -330,6 +332,8 @@ FIELD_NOT_MATERIAL = {
     "unitName": "the unit's name sent to Fisqua at pairing",
     "user_id": "a user account",
     "pair_id": "groups the images of one dual capture; nothing is looked up by it, on any route",
+    "expected_image_ids": "a retake's own record's current images, compared with the record named by record_id "
+                          "(itself a target); nothing is looked up by them",
     "filename_stem": "a volume's own stem, set on the volume itself; a stem another volume holds is refused "
                      "by the model's uniqueness check, not looked up",
 }
@@ -936,7 +940,8 @@ def test_the_testing_account_reads_its_own_profile_and_the_unit(world, client):
 @pytest.mark.unit
 def test_public_routes_and_missing_sessions_are_left_alone(world, client):
     assert client.get("/health").status_code == 200
-    assert client.get("/auth/setup/status").json() == {"needs_setup": False}
+    assert client.get("/auth/setup/status").json() == {"needs_setup": False, "local": False,
+                                                       "default_language": "es"}
     assert client.post("/auth/login", json={"username": "u-operator", "password": "wrong"}).status_code == 401
     assert client.post("/auth/refresh").status_code == 401
     assert client.post("/auth/logout", headers={"X-Requested-With": "x"}).status_code == 204

@@ -1485,12 +1485,15 @@ def promote_collection(
     # be refused (records_captured).
     locked = (
         db.query(Record)
-        .options(joinedload(Record.images))
         .filter(Record.collection_id == collection_id)
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
+    # The images, which _apply_status_change checks, read after the locks
+    # (records.read_after_lock).
+    from app.api.records import read_after_lock
+    read_after_lock(db, locked)
     records = [
         rec for rec in locked
         if rec.status == "captured" and (rec.missing_side is None or rec.closed_reason is not None)

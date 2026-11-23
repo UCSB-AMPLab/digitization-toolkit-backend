@@ -181,6 +181,46 @@ class UnitUpdate(BaseModel):
     projectsEnabled: Optional[bool] = None
     # Leaving offline mode while volumes are kept on the unit (NEH-320).
     keptVolumes: Optional[Literal["include", "keep"]] = None
+    # The unit's language (NEH-336); null or absent leaves it.
+    defaultLanguage: Optional[Literal["es", "en"]] = None
+
+
+# The keys a capture chord may never be (the frontend's capture-key.ts):
+# a modifier on its own, a dead key, and a key the browser cannot name.
+UNBINDABLE_KEYS = frozenset({"Control", "Alt", "Shift", "Meta", "Dead", "Unidentified"})
+CHORD_KEY_MAX = 32
+
+
+class CaptureChord(BaseModel):
+    """One chord as the frontend stores it (CaptureChord in capture-key.ts): KeyboardEvent.key and four modifiers.
+
+    Strict: the modifiers are JSON booleans and the key a string of 1 to
+    CHORD_KEY_MAX characters, none a control character, that is not in
+    UNBINDABLE_KEYS; no other field.
+    """
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    key: str = Field(min_length=1, max_length=CHORD_KEY_MAX)
+    ctrl: bool
+    alt: bool
+    meta: bool
+    shift: bool
+
+    @field_validator("key")
+    @classmethod
+    def _bindable(cls, v: str) -> str:
+        if v in UNBINDABLE_KEYS:
+            raise ValueError("this key cannot start a capture on its own")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+            raise ValueError("the key holds a control character")
+        return v
+
+
+class CaptureKeyUpdate(BaseModel):
+    """The body of PUT /system/unit/capture-key: a chord, or null for the built-in default. Required."""
+    model_config = ConfigDict(extra="forbid")
+
+    capture_key: Optional[CaptureChord]
 
 
 @router.get("/unit")
@@ -241,14 +281,40 @@ def put_unit(
     switch (`kept_volumes_released`); `keep` leaves them kept
     (`kept_volumes_kept`). Into offline, or with no kept volume, it is
     ignored.
+
+    `defaultLanguage` (`es` or `en`) sets the unit's language, after any
+    change of mode has been stored; logged `unit_default_language_changed`.
     """
     from app.core import unit_mode
 
-    try:
-        unit_mode.change(db, actor=current_user.username, mode=payload.mode,
-                         projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
-    except unit_mode.ModeRefused as exc:
-        raise HTTPException(status_code=409, detail=exc.detail())
+    mode_fields = (payload.mode, payload.projectsEnabled, payload.keptVolumes)
+    if any(v is not None for v in mode_fields) or payload.defaultLanguage is None:
+        try:
+            unit_mode.change(db, actor=current_user.username, mode=payload.mode,
+                             projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
+        except unit_mode.ModeRefused as exc:
+            raise HTTPException(status_code=409, detail=exc.detail())
+    if payload.defaultLanguage is not None:
+        unit_mode.set_default_language(db, payload.defaultLanguage, actor=current_user.username)
+    return unit_mode.as_api(db)
+
+
+@router.put("/unit/capture-key")
+def put_capture_key(
+    payload: CaptureKeyUpdate,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """Set the unit's capture key, or clear it with null for the built-in default. Admin and operator.
+
+    The body is `{"capture_key": {key, ctrl, alt, meta, shift} | null}`
+    (CaptureChord). Returns the GET /system/unit body; logged
+    `unit_capture_key_changed` when the key changes.
+    """
+    from app.core import unit_mode
+
+    chord = payload.capture_key.model_dump() if payload.capture_key is not None else None
+    unit_mode.set_capture_key(db, chord, actor=current_user.username)
     return unit_mode.as_api(db)
 
 

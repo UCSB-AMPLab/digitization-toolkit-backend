@@ -1,7 +1,9 @@
 # Version: 0.3.0
 
 import hmac
+import ipaddress
 import logging
+import threading
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -11,7 +13,8 @@ from typing import List, Optional
 
 from app.api.deps import get_db_dependency
 from app.models.user import User
-from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, PasswordSet, TokenRefresh
+from app.schemas.user import (LanguageUpdate, UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset,
+                              PasswordResetRequest, PasswordSet, TokenRefresh)
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token, needs_rehash
 from app.core.config import settings, is_dev_env
 from app.core.login_throttle import login_throttle
@@ -171,11 +174,87 @@ def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None
         raise HTTPException(status_code=401, detail="Invalid or missing bootstrap token")
 
 
+# ---------------------------------------------------------------------------
+# The first account from the unit itself (NEH-336)
+#
+# The first account may be created without the bootstrap token when the
+# request comes from the unit itself: the kiosk's browser, which asks the
+# backend at http://127.0.0.1:8000 directly. Such a request is local
+# (request_is_local) when all three hold:
+#
+# * its socket peer, the ASGI scope's `client`, is 127.0.0.1 or ::1;
+# * it carries no forwarding header (FORWARDING_HEADERS). uvicorn's
+#   ProxyHeadersMiddleware, on by default, replaces `client` with the
+#   address X-Forwarded-For names, but only for a peer in
+#   FORWARDED_ALLOW_IPS (127.0.0.1 unless set), and leaves the header in
+#   the request. So a request whose `client` was taken from a header still
+#   carries that header and is refused, whatever FORWARDED_ALLOW_IPS says;
+#   one without any such header has the socket peer in `client`. A proxy on
+#   the unit, which connects from loopback and names its client in a
+#   header, is not local either. nginx connects from the Docker bridge
+#   (172.30.0.0/24), never from loopback, and sets X-Real-IP and
+#   X-Forwarded-For.
+# * its Host header names a loopback host (LOOPBACK_HOSTS), so a page of
+#   another site whose name was made to resolve to 127.0.0.1 in the kiosk's
+#   browser is not local.
+#
+# A request from anywhere else needs the token as before; once an account
+# exists, local or not, only an administrator creates accounts.
+# ---------------------------------------------------------------------------
+
+LOOPBACK_PEERS = frozenset({ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto")
+
+# Held from the count of accounts to the commit of the first one, so two
+# first registrations in this process create one account: the second
+# counts the first and is answered as any registration once an account
+# exists. On SQLite this lock is the only guard: SQLite ignores FOR UPDATE,
+# and without the lock two registrations both count no account and both
+# create an administrator. On PostgreSQL the unit's settings row, taken FOR
+# UPDATE (app.core.unit_mode.lock_for_first_account) before the second
+# count, is the guard across processes as well. The backend runs as one
+# process.
+_first_account_lock = threading.Lock()
+
+
+def _host_name(host_header: str) -> str:
+    """The host of a Host header without its port, lower case: `[::1]:8000` gives `::1`."""
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def request_is_local(request: Request) -> bool:
+    """Whether the request comes from the unit itself: a loopback peer, no forwarding header, a loopback host."""
+    client = request.scope.get("client")
+    if not client:
+        return False
+    try:
+        peer = ipaddress.ip_address(client[0])
+    except ValueError:
+        return False
+    if peer not in LOOPBACK_PEERS:
+        return False
+    if any(name in request.headers for name in FORWARDING_HEADERS):
+        return False
+    return _host_name(request.headers.get("host", "")) in LOOPBACK_HOSTS
+
+
 @router.get("/setup/status")
-def setup_status(db: Session = Depends(get_db_dependency)):
-    """Check whether initial setup is needed (no users exist yet). No auth required."""
+def setup_status(request: Request, db: Session = Depends(get_db_dependency)):
+    """Whether the unit has no account yet, whether this request is local, and the unit's language. No auth.
+
+    `local` is request_is_local: true only for a request from the unit
+    itself to its loopback address, never through nginx. `default_language`
+    is the unit's (`es` until set), read without writing anything.
+    """
+    from app.core import unit_mode
+
     needs_setup = db.query(User).count() == 0
-    return {"needs_setup": needs_setup}
+    return {"needs_setup": needs_setup, "local": request_is_local(request),
+            "default_language": unit_mode.default_language(db)}
 
 
 @router.post("/register", response_model=UserRead)
@@ -187,12 +266,33 @@ def register(
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_dependency),
 ):
+    """Create an account: the first one (an administrator) without a session, every later one by an administrator.
+
+    The first account needs the bootstrap token, unless the request is
+    local (request_is_local). With `default_language`, the first account
+    sets the unit's language and takes it as its own; on any later account
+    `default_language` is ignored, and the account starts with no language.
+    """
+    with _first_account_lock:
+        return _register(payload, request, credentials, bootstrap_token, background_tasks, db)
+
+
+def _register(payload, request, credentials, bootstrap_token, background_tasks, db):
+    from app.core import unit_mode
+
     is_first_user = db.query(User).count() == 0
 
     if is_first_user:
-        # Unauthenticated first-user bootstrap requires a local bootstrap token
-        _authorize_bootstrap(bootstrap_token)
-    else:
+        # Unauthenticated first-user bootstrap requires a local bootstrap
+        # token, or a request from the unit itself.
+        if not request_is_local(request):
+            _authorize_bootstrap(bootstrap_token)
+        unit_mode.lock_for_first_account(db)
+        if db.query(User).count() != 0:
+            # Another process created the first account meanwhile.
+            db.rollback()
+            is_first_user = False
+    if not is_first_user:
         # After bootstrap, only admins may create accounts.
         raw_token, _ = _session_token(request, credentials)
         if not raw_token:
@@ -227,8 +327,11 @@ def register(
         email=payload.email,
         hashed_password=hash_password(payload.password),
         role=role,
+        language=payload.default_language if is_first_user else None,
     )
     db.add(user)
+    if is_first_user and payload.default_language is not None:
+        unit_mode.store_default_language(db, payload.default_language, actor=payload.username)
     db.commit()
     db.refresh(user)
     actor = caller.username if not is_first_user else "bootstrap"
@@ -575,6 +678,25 @@ allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 @users_router.get("/me", response_model=UserRead)
 def get_me(current_user: User = Depends(get_current_user)):
     """Return the authenticated user's profile including their role."""
+    return UserRead.model_validate(current_user)
+
+
+@users_router.put("/me/language", response_model=UserRead)
+def set_my_language(
+    payload: LanguageUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    """Set the signed-in user's own language, `es` or `en`. Any role, the testing account included.
+
+    A personal preference: it names no material and changes nothing of
+    anyone else. Returns the GET /users/me body.
+    """
+    (db.query(User)
+       .filter(User.id == current_user.id)
+       .update({User.language: payload.language}, synchronize_session=False))
+    db.commit()
+    db.refresh(current_user)
     return UserRead.model_validate(current_user)
 
 

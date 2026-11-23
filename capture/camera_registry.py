@@ -467,6 +467,21 @@ class CameraRegistry:
         """
         if CameraRegistry.is_valid_orientation(stored):
             return stored
+        return CameraRegistry.default_orientation(role)
+
+    @staticmethod
+    def default_orientation(role) -> int:
+        """The clockwise rotation, in degrees, that a body's role expects.
+
+        Args:
+            role: The body's stored "role" ("left", "right"), or None.
+
+        From DEFAULT_ORIENTATION_BY_ROLE: 270 for "left", 90 for "right";
+        DEFAULT_ORIENTATION, 90, with no role or any other value. It is what
+        a never-set body takes, and what the device rows report beside the
+        effective angle, so that the capture screen can tell a turn that
+        leaves a body upside down from what its role expects.
+        """
         if type(role) is str and role in DEFAULT_ORIENTATION_BY_ROLE:
             return DEFAULT_ORIENTATION_BY_ROLE[role]
         return DEFAULT_ORIENTATION

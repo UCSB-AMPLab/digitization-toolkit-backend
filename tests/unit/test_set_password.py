@@ -47,7 +47,7 @@ from tests.unit.test_testing_space_admin import (
 from tests.unit.test_unit_mode import _logs
 
 NEW_PASSWORD = "fake-new-pw-395"
-USER_SHAPE = {"id", "username", "email", "role", "is_active", "created_at"}
+USER_SHAPE = {"id", "username", "email", "role", "is_active", "created_at", "language"}
 
 
 # ---------------------------------------------------------------------------
