@@ -1037,6 +1037,14 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	available for specific backends (e.g. focus slider for picamera2,
 	ISO/shutter/aperture dropdowns for gphoto2 DSLRs).
 
+	Beside the flags, which kind of camera the unit drives and what is
+	connected (app.core.camera_kind.report): `configured`, the kind in
+	effect; `source`, why (`stored`, `environment`, `detected`,
+	`last_used`, `default`); `connected`, the cameras of each kind found
+	now, without claiming any; `detected`, the one kind connected, or null
+	for none or for more than one (`mixed`); `mismatch`, true when cameras
+	of another kind are connected and none of the kind in effect.
+
 	Example response:
 	    {
 	        "backend": "gphoto2",
@@ -1048,14 +1056,21 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	        "zoom_steps": false,
 	        "focus_lock": false,
 	        "autofocus_calibration": false,
-	        "dslr_settings": true
+	        "dslr_settings": true,
+	        "configured": "gphoto2",
+	        "source": "detected",
+	        "detected": "gphoto2",
+	        "connected": {"picamera2": 0, "gphoto2": 2, "chdk": 0},
+	        "mixed": false,
+	        "mismatch": false
 	    }
 	"""
 	try:
 		from capture.service import get_backend
+		from app.core import camera_kind
 		backend = get_backend()
 		caps = backend.get_capabilities()
-		return {"backend": backend.get_backend_name(), **caps}
+		return {"backend": backend.get_backend_name(), **caps, **camera_kind.report(backend)}
 	except HTTPException:
 		raise
 	except Exception as e:

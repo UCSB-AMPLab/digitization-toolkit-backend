@@ -275,6 +275,9 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/system/storage/activate"): Entry(),
     ("DELETE", "/system/storage/activate"): Entry(),
     ("POST", "/system/power"): Entry(testing=True),
+    ("GET", "/system/camera-kind"): Entry(testing=True),
+    ("PUT", "/system/camera-kind"): Entry(),
+    ("DELETE", "/system/camera-kind"): Entry(),
 
     # Activity totals.
     ("GET", "/activity/collections"): Entry(lists="Collection", targets=(_q("project_id", PROJECT),)),
