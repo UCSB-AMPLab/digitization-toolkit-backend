@@ -102,7 +102,14 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO", validation_alias=_names("LOG_LEVEL"))
     
     PROJECTS_ROOT: str = ""
-    CAMERA_BACKEND: str = "picamera2"
+    # The camera driver: picamera2, subprocess, gphoto2 or chdk. Unset: the
+    # unit detects the kind of the cameras connected at start-up
+    # (app.core.camera_kind), and an administrator's stored choice wins over
+    # either.
+    CAMERA_BACKEND: Optional[str] = None
+    # Where the administrator's camera kind and the kind last used are kept
+    # (app.core.camera_kind). Empty: camera-kind.json in DATA_DIR.
+    CAMERA_KIND_FILE: str = Field(default="", validation_alias=_names("CAMERA_KIND_FILE"))
     SECRET_KEY: str = "dev-secret-change-me"
     # Per-unit token protecting first-user admin bootstrap over the network
     BOOTSTRAP_TOKEN: str = ""

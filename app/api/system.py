@@ -6,6 +6,7 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
@@ -1017,3 +1018,241 @@ def power_control(
     else:
         message = "The device will restart in a few seconds."
     return {"action": body.action, "message": message}
+
+
+# ---------------------------------------------------------------------------
+# The kind of camera the unit drives (app.core.camera_kind)
+# ---------------------------------------------------------------------------
+
+_CAMERA_KIND_REFUSALS = {
+    "busy_capturing": "A capture is in progress; try again when it ends.",
+    "offsite_job_running": "A volume is being freed or restored; try again when it ends.",
+    "backend_restarting": "Captua is restarting; try again in a minute.",
+    "driver_unavailable": "This unit lacks the driver for that kind of camera.",
+}
+
+
+class CameraKindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _known_kind(cls, value):
+        from app.core import camera_kind
+        from capture.service import canonical_backend_name
+
+        if not isinstance(value, str):
+            raise ValueError("kind must be one of " + ", ".join(camera_kind.KINDS))
+        kind = canonical_backend_name(value)
+        if kind not in camera_kind.KINDS:
+            raise ValueError("kind must be one of " + ", ".join(camera_kind.KINDS))
+        return kind
+
+
+def _camera_kind_refused(reason: str) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": reason, "message": _CAMERA_KIND_REFUSALS[reason]})
+
+
+# Held across each PUT and DELETE of the camera kind, so two changes are
+# made one after the other.
+_camera_kind_lock = threading.Lock()
+
+
+def _refuse_camera_work() -> None:
+    """409 while camera work or an offsite job is counted: what reserve_restart refuses on, checked without reserving.
+
+    Called inside unit_activity.no_restart_reserved, which has already
+    refused a reserved restart. Nothing can be counted or reserved while
+    that hold lasts, so reserve_restart, called later in the same hold,
+    admits what this admits.
+    """
+    from app.core import unit_activity
+
+    if unit_activity.in_progress(unit_activity.CAMERA):
+        raise _camera_kind_refused("busy_capturing")
+    if unit_activity.in_progress(unit_activity.OFFSITE_JOB):
+        raise _camera_kind_refused("offsite_job_running")
+
+
+def _store_or_500(change) -> None:
+    try:
+        change()
+    except Exception as exc:
+        logger.error("The camera kind could not be stored (%s)", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="The camera kind could not be stored.") from None
+
+
+def _put_back(previous) -> None:
+    from app.core import camera_kind
+
+    try:
+        if previous is None:
+            camera_kind.clear_choice()
+        else:
+            camera_kind.store_choice(previous)
+    except Exception as exc:
+        logger.error("The camera kind stored before could not be put back (%s)", type(exc).__name__)
+
+
+def _change_camera_kind(change, *, restart: bool) -> str:
+    """Make `change` with no restart reserved, under the lock reservations are taken under; restart after it when asked.
+
+    In one hold of unit_activity's lock (no_restart_reserved): refuse a
+    reserved restart, and with `restart` camera work or an offsite job;
+    write the change; with `restart`, reserve the restart only now, after
+    the write, so a slow write cannot spend the reservation's window. A
+    change that cannot be written answers 500 with nothing reserved. A
+    reservation refused after the write (it cannot be, see
+    _refuse_camera_work) puts the stored choice back and answers 409.
+    The hold is left and the helper called next, with nothing between:
+    `restarting`, or `restart_needed` (no restart-backend verb, or it
+    failed) with the change kept and the reservation released, so the
+    unit's restart (POST /system/power) takes it up. Without `restart`:
+    the change only, `not_needed`.
+    """
+    from app.core import camera_kind, system_helper, unit_activity
+
+    try:
+        with unit_activity.no_restart_reserved():
+            if restart:
+                _refuse_camera_work()
+            previous = camera_kind.stored_choice()
+            _store_or_500(change)
+            if restart and not unit_activity.reserve_restart():
+                _put_back(previous)
+                raise _camera_kind_refused("backend_restarting")
+    except unit_activity.Refused:
+        raise _camera_kind_refused("backend_restarting") from None
+    if not restart:
+        return "not_needed"
+    restarting = False
+    try:
+        if not system_helper.supports(system_helper.RESTART_BACKEND):
+            logger.info("Camera kind stored; the system helper has no %s verb, so the unit must be restarted",
+                        system_helper.RESTART_BACKEND)
+            return "restart_needed"
+        if not system_helper.run(system_helper.RESTART_BACKEND):
+            return "restart_needed"
+        restarting = True
+        return "restarting"
+    finally:
+        if not restarting:
+            unit_activity.release_restart()
+
+
+# Whether a PUT or DELETE restarts, by the choice this process started with
+# (applied, camera_kind.applied_choice) and the kind in effect, A; B is
+# another kind. Pending after: the stored choice differs from applied.
+#
+#   applied  stored before  request    stored after  answer                      pending
+#   none     none           PUT A      A             not_needed (applied := A)   no
+#   none     none           PUT B      B             restarting/restart_needed   yes
+#   none     B              PUT B      B             restarting/restart_needed   yes
+#   none     B              PUT A      A             not_needed (applied := A)   no
+#   none     B              DELETE     none          not_needed                  no
+#   none     none           DELETE     none          not_needed                  no
+#   A        A              DELETE     none          restarting/restart_needed   yes
+#   A        none           DELETE     none          restarting/restart_needed   yes
+#   A        none           PUT A      A             not_needed                  no
+#   A        A              PUT B      B             restarting/restart_needed   yes
+#   A        A              PUT A      A             not_needed                  no
+#
+# A PUT of the kind in effect never needs a restart (the process already
+# runs it), and becomes the applied choice. Any other change that leaves the
+# stored choice different from applied restarts, again on each request.
+
+
+@router.get("/camera-kind")
+def get_camera_kind(current_user: User = Depends(allow_read_only)):
+    """Which kind of camera the unit drives and what is connected, for every role and the testing account.
+
+    The same object GET /cameras/capabilities carries beside its flags
+    (app.core.camera_kind.report), answered without building the camera
+    backend, so it is there when the backend cannot be built. A backend
+    already built is asked for its own count only for a kind whose probe
+    could not run.
+    """
+    from app.core import camera_kind
+    from capture import service as capture_service
+
+    return camera_kind.report(capture_service._backend)
+
+
+@router.put("/camera-kind")
+def put_camera_kind(
+    payload: CameraKindRequest,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Store the kind of camera the unit drives, and restart the backend to use it. Admin only.
+
+    `kind` is picamera2, gphoto2 or chdk, read as CAMERA_BACKEND is (case
+    and surrounding spaces ignored); anything else is 422. A kind whose
+    driver library this unit cannot import is 409 `driver_unavailable`,
+    with nothing stored or reserved. The stored
+    choice wins over CAMERA_BACKEND and over detection at every start
+    (app.core.camera_kind).
+
+    While a restart is reserved, every PUT is refused with 409
+    `backend_restarting` and nothing is stored, the kind in effect
+    included. The kind already in effect is stored and nothing is
+    restarted: `restart` is `not_needed`. Otherwise the restart is reserved as the
+    pairing restart reserves it (app.core.unit_activity): 409
+    `busy_capturing` while camera work runs, `offsite_job_running` while a
+    volume is freed or restored, `backend_restarting` while a restart is
+    pending, each with nothing stored. Then the choice is stored and the
+    helper's restart-backend verb run: `restart` is `restarting`, and the
+    client polls GET /health until the backend answers again, then
+    reloads; or `restart_needed` when the helper cannot restart it, with
+    the choice stored for the unit's next start.
+
+    Answer: {"kind": the kind stored, "configured": the kind in effect in
+    this process, "restart": "restarting" | "restart_needed" | "not_needed"}.
+    Logged `camera_kind_changed`.
+    """
+    from app.core import camera_kind
+    from app.core.audit import log_event
+
+    kind = payload.kind
+    if not camera_kind.driver_available(kind):
+        raise _camera_kind_refused("driver_unavailable")
+    configured = camera_kind.in_effect()["kind"]
+
+    def store():
+        camera_kind.store_choice(kind)
+        if kind == configured:
+            camera_kind.mark_stored(kind)
+
+    with _camera_kind_lock:
+        restart = _change_camera_kind(store, restart=kind != configured)
+    log_event(db, level="INFO", category="system", action="camera_kind_changed", actor=current_user.username,
+              subject=kind, detail=f"in effect {configured}; restart {restart}")
+    return {"kind": kind, "configured": configured, "restart": restart}
+
+
+@router.delete("/camera-kind")
+def delete_camera_kind(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Clear the stored camera kind, so CAMERA_BACKEND or detection chooses it again, and restart. Admin only.
+
+    While a restart is reserved, 409 `backend_restarting`, with nothing
+    cleared. The choice is cleared; the backend is restarted when this
+    process started with a stored choice (the table above), with PUT's
+    refusals, and again on a repeated DELETE until a restart applies it;
+    otherwise `not_needed`. The kind last used is kept.
+    Answer: {"kind": null, "configured", "restart"}. Logged
+    `camera_kind_cleared`.
+    """
+    from app.core import camera_kind
+    from app.core.audit import log_event
+
+    configured = camera_kind.in_effect()["kind"]
+    with _camera_kind_lock:
+        restart = _change_camera_kind(camera_kind.clear_choice, restart=camera_kind.applied_choice() is not None)
+    log_event(db, level="INFO", category="system", action="camera_kind_cleared", actor=current_user.username,
+              detail=f"in effect {configured}; restart {restart}")
+    return {"kind": None, "configured": configured, "restart": restart}

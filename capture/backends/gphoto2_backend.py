@@ -1236,6 +1236,7 @@ class GPhoto2Backend(CameraBackend):
     def _refresh_port_map(self):
         with self._map_lock:
             self._port_map = self._build_port_map(self._pins, self._serial_by_port)
+            self._published_body_count = len(self._port_map)
 
     def _port_map_is_current(self, camera_index: int) -> bool:
         """Can is_camera_connected() answer for this index without a bus scan?
@@ -1270,6 +1271,7 @@ class GPhoto2Backend(CameraBackend):
             self._port_map = self._build_port_map(
                 self._pins, self._serial_by_port, self._last_detected
             )
+            self._published_body_count = len(self._port_map)
 
     def _get_port_map(self) -> dict[int, tuple[str, str]]:
         with self._map_lock:
@@ -1277,6 +1279,7 @@ class GPhoto2Backend(CameraBackend):
                 self._port_map = self._build_port_map(
                     self._pins, self._serial_by_port
                 )
+                self._published_body_count = len(self._port_map)
             return dict(self._port_map)
 
     def _published_port_map(self) -> dict[int, tuple[str, str]]:
@@ -2194,6 +2197,7 @@ class GPhoto2Backend(CameraBackend):
             differs = rebuilt != port_map
             if differs:
                 self._port_map = rebuilt
+                self._published_body_count = len(self._port_map)
         if differs:
             result, _ = self._enumerate_port_map(rebuilt)
         return result
@@ -3158,6 +3162,22 @@ class GPhoto2Backend(CameraBackend):
 
     def get_backend_name(self) -> str:
         return "gphoto2"
+
+    def held_body_count(self) -> "int | None":
+        """How many bodies the port map holds; no bus scan, no session, no wait.
+
+        _map_lock is held across an autodetect, so the lock is only tried:
+        when it is taken, the count last published with the map is given
+        (None before the first).
+        """
+        if not self._map_lock.acquire(blocking=False):
+            return getattr(self, "_published_body_count", None)
+        try:
+            count = len(self._port_map)
+            self._published_body_count = count
+            return count
+        finally:
+            self._map_lock.release()
 
     def cleanup(self):
         """Close all open PTP sessions and forget every learned identity."""

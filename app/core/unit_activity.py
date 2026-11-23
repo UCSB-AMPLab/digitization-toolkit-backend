@@ -133,6 +133,21 @@ def reserve_restart() -> bool:
         return True
 
 
+@contextmanager
+def no_restart_reserved() -> Iterator[None]:
+    """Hold the lock reservations are taken under, for the block; Refused if a restart is reserved.
+
+    Nothing can reserve a restart while the block runs, so a write made in
+    it cannot land during a reserved restart. The lock is re-entrant: the
+    block may call reserve_restart, release_restart and in_progress.
+    Keep the block short; camera work waits on the same lock to start and end.
+    """
+    with _lock:
+        if _pending_locked():
+            raise Refused()
+        yield
+
+
 def release_restart() -> None:
     global _restart_until
     with _lock:
