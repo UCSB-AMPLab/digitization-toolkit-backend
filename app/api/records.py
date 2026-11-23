@@ -1369,6 +1369,39 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def read_after_lock(db: Session, records, rejections: bool = False) -> None:
+	"""Read the images (and with `rejections`, the rejections) of records whose rows this transaction has locked.
+
+	A separate statement, issued once the locks are held, whose rows replace
+	whatever the session held for these records. On PostgreSQL under READ
+	COMMITTED, a locking statement that waited for another transaction's lock
+	re-reads the locked row once it has it, but rows it joins come from the
+	snapshot it started with: a retake that waited for another retake's commit
+	would see the images from before it, pass its checks on them, and leave
+	two sets current. So every path that locks records and decides something
+	from their images locks the rows alone and reads the images here.
+	"""
+	from sqlalchemy.orm.attributes import set_committed_value
+
+	records = list(records)
+	ids = [rec.id for rec in records]
+	if not ids:
+		return
+	images = {rec_id: [] for rec_id in ids}
+	for img in (db.query(RecordImage).filter(RecordImage.record_id.in_(ids))
+	            .order_by(RecordImage.id).populate_existing()):
+		images[img.record_id].append(img)
+	for rec in records:
+		set_committed_value(rec, "images", images[rec.id])
+	if rejections:
+		found = {rec_id: [] for rec_id in ids}
+		for rej in (db.query(RecordRejection).filter(RecordRejection.record_id.in_(ids))
+		            .order_by(RecordRejection.rejected_at.desc()).populate_existing()):
+			found[rej.record_id].append(rej)
+		for rec in records:
+			set_committed_value(rec, "rejections", found[rec.id])
+
+
 def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	"""Load a record with its row locked for the rest of the transaction.
 
@@ -1382,7 +1415,11 @@ def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	all, so the tests exercise the surrounding logic and cannot demonstrate the
 	locking. That is verified by reading the emitted SQL, not by the suite.
 	"""
-	return _locked_record_query(db, rec_id, with_images).first()
+	rec = _locked_record_query(db, rec_id, with_images).first()
+	# The images in a second statement, after the lock (read_after_lock).
+	if rec is not None and with_images:
+		read_after_lock(db, [rec])
+	return rec
 
 
 def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
@@ -1390,10 +1427,9 @@ def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
 	against the PostgreSQL dialect and read the lock clause off the SQL, which
 	is the only way to check it without a server — see
 	tests/unit/test_workflow_row_locking.py."""
-	query = db.query(Record)
-	if with_images:
-		query = query.options(joinedload(Record.images))
-	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+	# The record row alone, whatever `with_images` says: _locked_record reads
+	# the images in a statement of their own, once the lock is held.
+	return db.query(Record).filter(Record.id == rec_id).with_for_update(of=Record)
 
 
 def is_movable(rec: Record) -> bool:
@@ -1608,7 +1644,6 @@ def bulk_update_status(
 	# and cannot deadlock against each other.
 	records = (
 		db.query(Record)
-		.options(joinedload(Record.images))
 		.filter(Record.id.in_(payload.record_ids))
 		.order_by(Record.id)
 		.with_for_update(of=Record)
@@ -1616,6 +1651,8 @@ def bulk_update_status(
 	)
 	if not records:
 		raise HTTPException(status_code=404, detail="No matching records found")
+	# The images, which _apply_status_change checks, read after the locks.
+	read_after_lock(db, records)
 
 	skipped: list[int] = []
 	updated: list[Record] = []

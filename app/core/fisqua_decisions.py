@@ -116,7 +116,7 @@ from types import SimpleNamespace
 from typing import Any, Optional
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session, joinedload
+from sqlalchemy.orm import Session
 
 from app.core import fisqua_contract as fc
 
@@ -355,14 +355,19 @@ def _lock_records(db: Session, ids: list) -> dict:
     """{id: record} for the records with these ids, with images and rejections, their rows locked in id order."""
     from app.models.record import Record
 
+    from app.api.records import read_after_lock
+
     if not ids:
         return {}
-    return {rec.id: rec for rec in (db.query(Record)
-                                     .options(joinedload(Record.images), joinedload(Record.rejections))
-                                     .filter(Record.id.in_(ids))
-                                     .order_by(Record.id)
-                                     .with_for_update(of=Record)
-                                     .all())}
+    records = (db.query(Record)
+               .filter(Record.id.in_(ids))
+               .order_by(Record.id)
+               .with_for_update(of=Record)
+               .all())
+    # The images and rejections the decisions are checked against, read by
+    # statements issued once the locks are held (records.read_after_lock).
+    read_after_lock(db, records, rejections=True)
+    return {rec.id: rec for rec in records}
 
 
 def _empty_report() -> dict:

@@ -334,6 +334,8 @@ FIELD_NOT_MATERIAL = {
     "pair_id": "groups the images of one dual capture; nothing is looked up by it, on any route",
     "client_capture_id": "a client's id for one capture request; the capture routes answer a stored capture "
                          "only to a request of its kind, volume and space, and refuse any other naming nothing of it",
+    "expected_image_ids": "a retake's own record's current images, compared with the record named by record_id "
+                          "(itself a target); nothing is looked up by them",
     "filename_stem": "a volume's own stem, set on the volume itself; a stem another volume holds is refused "
                      "by the model's uniqueness check, not looked up",
 }

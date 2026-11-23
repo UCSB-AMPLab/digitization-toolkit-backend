@@ -42,6 +42,16 @@ _CAMERA_BUSY = [Depends(unit_activity.tracked)]
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 
 
+RECORD_CHANGED_DETAIL = {
+	"code": "record_changed",
+	"message": "This record's current images are not the ones the retake names; it was changed elsewhere.",
+}
+
+# The most image ids a retake may name in expected_image_ids: a record holds
+# one current image, or two for a pair; the bound only keeps the body small.
+MAX_EXPECTED_IMAGE_IDS = 16
+
+
 PLACEHOLDER_NEEDS_DUAL_DETAIL = {
 	"code": "placeholder_needs_dual",
 	"message": "This record is a placeholder for a whole opening; capture it with both cameras.",
@@ -103,6 +113,32 @@ def _refuse_retake_out_of_the_operators_hands(retake_record: Optional[Record]) -
 	"""
 	if retake_record is not None and retake_record.status not in ("captured", "rejected"):
 		raise HTTPException(status_code=409, detail=RETAKE_STATUS_DETAIL)
+
+
+def _refuse_expected_images_without_a_record(expected_image_ids: Optional[List[int]], record_id: Optional[int]) -> None:
+	"""422 for expected_image_ids on a capture that retakes no record: they name what a retake replaces."""
+	if expected_image_ids is not None and not record_id:
+		raise HTTPException(
+			status_code=422,
+			detail="expected_image_ids names the images a retake replaces; it needs record_id.",
+		)
+
+
+def _refuse_a_retake_of_other_images(retake_record: Optional[Record], expected_image_ids: Optional[List[int]]) -> None:
+	"""409 record_changed for a retake whose expected_image_ids are not the record's current images.
+
+	A retake may name the images it replaces (NEH-388): the screen that sends
+	it read them, and another screen's retake can commit between that read
+	and this request. Compared as a set, under the record's lock, which every
+	path that changes which images are current takes, so the check still holds
+	at commit. Called with the other retake refusals, before any number is
+	taken or camera touched. Without the field, nothing is compared.
+	"""
+	if retake_record is None or expected_image_ids is None:
+		return
+	current = {img.id for img in retake_record.images if img.is_current}
+	if current != set(expected_image_ids):
+		raise HTTPException(status_code=409, detail=RECORD_CHANGED_DETAIL)
 
 
 def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_record: Optional[Record], user: User) -> bool:
@@ -301,6 +337,9 @@ class DeviceInfo(BaseModel):
 	# True when an orientation was saved for this body; False when
 	# `orientation` is the default.
 	orientation_saved: bool = False
+	# The default for the body's role, whatever is saved: 270 left, 90 right,
+	# 90 with no role (CameraRegistry.default_orientation). Never null.
+	default_orientation: int = 90
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
@@ -386,6 +425,9 @@ class CaptureRequest(BaseModel):
 	# The client's id for this capture (app.core.capture_requests): a request
 	# repeating it is answered from the saved capture. None captures as always.
 	client_capture_id: Optional[str] = None
+	# With record_id: the ids of the record's current images the retake
+	# replaces; refused with 409 record_changed when they are not (NEH-388).
+	expected_image_ids: Optional[List[int]] = Field(default=None, max_length=MAX_EXPECTED_IMAGE_IDS)
 
 	@field_validator("rotate_deg")
 	@classmethod
@@ -420,6 +462,9 @@ class DualCaptureRequest(BaseModel):
 	after_record_id: Optional[int] = Field(default=None, alias="afterRecordId")
 	# As CaptureRequest.client_capture_id.
 	client_capture_id: Optional[str] = None
+	# With record_id: the ids of the record's current images the retake
+	# replaces; refused with 409 record_changed when they are not (NEH-388).
+	expected_image_ids: Optional[List[int]] = Field(default=None, max_length=MAX_EXPECTED_IMAGE_IDS)
 
 	model_config = ConfigDict(populate_by_name=True)
 
@@ -722,6 +767,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			# the default and counts as not saved.
 			orientation=CameraRegistry.effective_orientation(stored_orientation, role_record["role"]),
 			orientation_saved=CameraRegistry.is_valid_orientation(stored_orientation),
+			default_orientation=CameraRegistry.default_orientation(role_record["role"]),
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
 			zoom_steps=dev.get("zoom_steps"),
@@ -1657,6 +1703,7 @@ def trigger_capture(
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
 	_refuse_a_testing_capture_below_the_reserve(db, current_user)
+	_refuse_expected_images_without_a_record(request.expected_image_ids, request.record_id)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -1665,6 +1712,7 @@ def trigger_capture(
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
+	_refuse_a_retake_of_other_images(retake_record, request.expected_image_ids)
 	# A placeholder (contract 1.9 §10) is a whole opening: only a dual capture fills it.
 	if retake_record is not None and retake_record.missing_side == "both":
 		raise HTTPException(status_code=409, detail=PLACEHOLDER_NEEDS_DUAL_DETAIL)
@@ -1885,6 +1933,7 @@ def trigger_dual_capture(
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
 	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
 	_refuse_a_testing_capture_below_the_reserve(db, current_user)
+	_refuse_expected_images_without_a_record(request.expected_image_ids, request.record_id)
 	if request.after_record_id is not None and request.record_id:
 		raise HTTPException(
 			status_code=422,
@@ -1916,6 +1965,7 @@ def trigger_dual_capture(
 				detail=f"Record {request.after_record_id} is not in volume {request.collection_id}.",
 			)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
+	_refuse_a_retake_of_other_images(retake_record, request.expected_image_ids)
 	# A retake is redone only in the mode the record was captured in.
 	if retake_record is not None and retake_record.capture_mode != "dual":
 		raise HTTPException(
