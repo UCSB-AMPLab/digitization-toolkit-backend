@@ -208,7 +208,7 @@ def test_exported_bag_metadata_carries_capture_mode_and_a_schema_version(
     # also pins what a receiving institution reads out of the bag, and JSON round-trips
     # True as `true`, which no equality check against the constant would catch.
     assert type(meta["schema_version"]) is int
-    assert meta["schema_version"] == 2
+    assert meta["schema_version"] == 3
     assert len(meta["records"]) == 1
     entry = meta["records"][0]
     assert entry["capture_mode"] == "single"

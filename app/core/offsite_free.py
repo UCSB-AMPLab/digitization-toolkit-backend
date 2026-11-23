@@ -651,6 +651,10 @@ def freeable_volumes(db: Session) -> dict:
     `probe_previews` false), although the volume page, which looks for the
     preview file, may still offer to free it.
 
+    Colour card shots (app.core.colour_card) are never freed and never
+    counted here: they have their own objects (colour_card_objects), which
+    no query of this module reads.
+
     `mode_allows` is false in offline mode, where freeing is refused
     (`off_in_this_mode`). `restorable` is restore_available(), once for the
     unit. `jobs` lists the free jobs queued or running on the unit

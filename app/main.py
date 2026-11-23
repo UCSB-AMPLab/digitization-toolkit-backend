@@ -20,6 +20,7 @@ from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router
 from app.api.projects import router as projects_router
 from app.api.collections import router as collections_router
+from app.api.colour_card import router as colour_card_router
 from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
 from app.api.activity import router as activity_router
@@ -211,6 +212,7 @@ app.include_router(records_router, prefix="/records", tags=["records"], dependen
 app.include_router(cameras_router, prefix="/cameras", tags=["cameras"], dependencies=_SPACE)
 app.include_router(projects_router, prefix="/projects", tags=["projects"], dependencies=_SPACE)
 app.include_router(collections_router, prefix="/collections", tags=["collections"], dependencies=_SPACE)
+app.include_router(colour_card_router, prefix="/collections", tags=["colour-card"], dependencies=_SPACE)
 app.include_router(auth_router, prefix="/auth", tags=["auth"], dependencies=_SPACE)
 app.include_router(users_router, prefix="/users", tags=["users"], dependencies=_SPACE)
 app.include_router(system_router, prefix="/system", tags=["system"], dependencies=_SPACE)

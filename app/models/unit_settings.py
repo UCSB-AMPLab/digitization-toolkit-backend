@@ -29,6 +29,10 @@
   `{key, ctrl, alt, meta, shift}` (app.api.system.CaptureChord), or
   null for the frontend's built-in default. Set by an administrator or an
   operator (PUT /system/unit/capture-key).
+- `colour_card_shots`: whether operators are asked for colour card shots
+  in a volume (app.core.colour_card). False on a unit that updates to the
+  release that adds it; set true by the registration that creates the
+  first account, and by an administrator (PUT /system/unit).
 - `updated_at`, `updated_by`: the last change, and the username that made it
   (null for the unit itself).
 
@@ -76,6 +80,7 @@ class UnitSettings(Base):
     default_language = Column(String(2), nullable=False, default=DEFAULT_LANGUAGE,
                               server_default=DEFAULT_LANGUAGE)
     capture_key = Column(JSON, nullable=True)
+    colour_card_shots = Column(Boolean, nullable=False, default=False, server_default=false())
     updated_at = Column(DateTime, nullable=False, default=_utcnow)
     updated_by = Column(String(150), nullable=True)
 

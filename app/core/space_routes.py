@@ -205,6 +205,19 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/collections/{collection_id}/offsite/restore"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/offsite/jobs/{job_id}"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/capture-manifest"): Entry(targets=(_COL,)),
+    # Colour card shots (app.core.colour_card): a testing volume answers as not enabled.
+    ("GET", "/collections/{collection_id}/colour-card"): Entry(testing=True, admin_reads_testing=True,
+                                                               targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets"): Entry(testing=True, admin_reads_testing=True,
+                                                                     targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/shots"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/complete"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/skip"): Entry(testing=True, admin_reads_testing=True,
+                                                                     targets=(_COL,)),
+    ("GET", "/collections/{collection_id}/colour-card/shots/{shot_id}/preview"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
     ("GET", "/collections/{collection_id}/hierarchy"): Entry(testing=True, admin_reads_testing=True,
                                                             targets=(_COL,)),
     ("PATCH", "/collections/{collection_id}"): Entry(testing=True, targets=(

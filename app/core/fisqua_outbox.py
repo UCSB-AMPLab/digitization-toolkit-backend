@@ -956,6 +956,12 @@ def _promote(db: Session, row, result: _Run) -> None:
         db.rollback()
         result.waiting += 1
         return
+    except capture_manifest.CalibrationWaiting:
+        # Its colour card shots are still being uploaded: the evaluation that
+        # builds the manifest is the one that holds it (colour_card.evaluate).
+        db.rollback()
+        result.waiting += 1
+        return
     except capture_manifest.ManifestRefused as exc:
         db.rollback()
         if _kept_now(db, row.collection_id):

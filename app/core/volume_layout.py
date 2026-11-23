@@ -523,6 +523,10 @@ def _volume_dirs_inside(root: Path, stem: str) -> bool:
 # app.core.thumbnail.generate_thumbnail: `<uuid4().hex>_thumb.jpg`, in thumbnails/ only.
 _GENERATED_THUMBNAIL = re.compile(r"^[0-9a-f]{32}_thumb\.jpg$")
 
+# `<shot stem>.part-<8 hex>.<ext>`, and its `_preview.jpg` or `.raw`: a colour card shot's temporary name;
+# `<name stem>.old-<8 hex><suffix>`: an earlier shot's file while its replacement is saved.
+_COLOUR_CARD_TEMP = re.compile(r"^.+\.(part|old)-[0-9a-f]{8}(\.[^./]+|_preview\.jpg)$")
+
 # `.renumber_<uuid4().hex><suffix>`: the first-phase temporary name of a renumber that renamed files.
 # Units in service may hold one left by such a renumber that was interrupted.
 _RENUMBER_TEMP = re.compile(r"^\.renumber_[0-9a-f]{32}(\.[^./]+)?$")
@@ -558,10 +562,13 @@ def _writer_temp(sub: str, name: str) -> bool:
     (thumbnails are written directly under a uuid name, never through a
     temporary file).
     """
-    from app.core.paths import CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+    from app.core.paths import CALIBRATION_DIR, CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
 
     if sub in (CAPTURES_DIR, PREVIEWS_DIR):
         return _atomic_write_temp(name) or bool(_RENUMBER_TEMP.match(name)) or _move_temp(name)
+    if sub == CALIBRATION_DIR:
+        # A colour card shot is written under `<shot stem>.part-<8 hex>.<ext>` (app.core.colour_card.take_shot).
+        return bool(_COLOUR_CARD_TEMP.match(name)) or _atomic_write_temp(name)
     if sub == THUMBNAILS_DIR:
         return _move_temp(name)
     return False
@@ -580,13 +587,15 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     not foreign either: its resolved path is appended to `orphan_thumbnails`
     and it is left where it is.
 
-    The volume's are, inside the four directories only:
+    The volume's are, inside the four directories and `calibration/` only:
     - in `captures/`, a file named as one of its rows' masters is, or as the
       migration names a clashing one (`<stem>_img<image id>...`), so a
       restored row's moved file can still be adopted, and the `.raw` buffer
       of such a name when the master is not RAW (NEH-261);
     - in `previews/`, the `_preview.jpg` of such a name;
     - in `thumbnails/`, a row's thumbnail, or `<stem>_thumb.jpg` of such a name;
+    - in `calibration/`, a file one of its colour card shots names (the
+      master, its preview, a JPEG master's `.raw` buffer);
     - in `metadata/`, `manifest.jsonl`, always (see owned()), the
       `manifest.jsonl.part` an earlier version's crashed copy left, the
       `offsite-freed-*.jsonl` / `offsite-restored-*.jsonl` run manifests, and
@@ -596,12 +605,23 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
     Nothing when `<stem>/` does not exist.
     """
     from app.core.offsite_free import RUN_MANIFEST_PATTERN
-    from app.core.paths import CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
+    from app.core.paths import CALIBRATION_DIR, CAPTURES_DIR, METADATA_DIR, PREVIEWS_DIR, THUMBNAILS_DIR
     from app.core.rebuild_volume import LOCK_NAME as REBUILD_LOCK_NAME
+    from app.models.colour_card import ColourCardSet, ColourCardShot
     from capture.manifestHandler import MANIFEST_PART_NAME
 
     if not volume_dir.is_dir():
         return []
+    # The volume's colour card shots, by name: each master, its preview and a JPEG master's `.raw` buffer.
+    card_names: Set[str] = set()
+    for filename, preview in (db.query(ColourCardShot.filename, ColourCardShot.preview_filename)
+                              .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
+                              .filter(ColourCardSet.collection_id == collection_id).all()):
+        card_names.add(filename.casefold())
+        if not is_raw_suffix(Path(filename)):
+            card_names.add(Path(filename).with_suffix(RAW_SIDECAR_SUFFIX).name.casefold())
+        if preview:
+            card_names.add(preview.casefold())
     rows = (db.query(RecordImage.id, RecordImage.file_path, RecordImage.thumbnail_path, RecordImage.capture_id)
             .join(Record, RecordImage.record_id == Record.id)
             .filter(Record.collection_id == collection_id).all())
@@ -642,6 +662,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
             return name.endswith(PREVIEW_SIDECAR_SUFFIX) and stem_owned(f.name[: -len(PREVIEW_SIDECAR_SUFFIX)])
         if sub == THUMBNAILS_DIR:
             return name in thumbs or (name.endswith("_thumb.jpg") and stem_owned(f.name[: -len("_thumb.jpg")]))
+        if sub == CALIBRATION_DIR:
+            return name in card_names
         if sub == METADATA_DIR and f.name == MANIFEST_PART_NAME:
             return True  # left by an earlier version's copy; removed at the start of a run
         if sub == METADATA_DIR and RUN_MANIFEST_PATTERN.match(f.name):
@@ -658,7 +680,8 @@ def _foreign_entries(db: Session, volume_dir: Path, collection_id: int,
 
     foreign: List[str] = []
     for entry in _listdir(volume_dir):
-        if entry.name not in (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR) or not entry.is_dir():
+        if entry.name not in (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR,
+                              CALIBRATION_DIR) or not entry.is_dir():
             foreign.append(entry.name)
             continue
         for f in _listdir(entry):
