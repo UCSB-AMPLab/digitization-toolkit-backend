@@ -487,8 +487,11 @@ def test_promotion_locks_every_record_of_the_volume_before_the_volume_row(client
     engine = db_session.get_bind()
 
     def seen(conn, cursor, statement, parameters, *args):
-        if "FROM records LEFT OUTER JOIN record_images" in statement:
-            order.append(("records", statement))
+        # The locking read is the record rows alone; their images are read by
+        # a statement of their own after it (records.read_after_lock).
+        flat = " ".join(statement.split())
+        if "FROM records WHERE records.collection_id" in flat and "record_images" not in flat:
+            order.append(("records", flat))
 
     event.listen(engine, "before_cursor_execute", seen)
     try:
