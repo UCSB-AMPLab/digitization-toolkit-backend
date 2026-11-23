@@ -157,6 +157,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/cameras/capture/dual"): Entry(testing=True, targets=(
         _b("project_name", PROJECT_NAME), _b("record_id", RECORD), _b("collection_id", COLLECTION),
         _b("after_record_id", RECORD))),
+    # The answer is the stored capture's only when its record is in the caller's space; 404 otherwise.
+    ("GET", "/cameras/capture-requests/{client_capture_id}"): Entry(testing=True),
     ("POST", "/cameras/calibrate"): Entry(),
     ("POST", "/cameras/calibrate/white-balance"): Entry(),
     ("POST", "/cameras/calibrate/white-balance/manual"): Entry(),
