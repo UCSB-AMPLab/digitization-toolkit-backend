@@ -1,7 +1,7 @@
 # Version: 0.3.0
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Path as PathParam, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
@@ -28,6 +28,7 @@ from app.core.record_sequence import VOLUME_CHANGED_MESSAGE, VolumeChangedError,
 from app.core.record_status import change_record_status
 from app.core import recapture_turn
 from app.core import unit_activity
+from app.core import capture_requests
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -354,6 +355,20 @@ def _validate_rotate_deg(v: Optional[int]) -> Optional[int]:
 	return v
 
 
+# A UUID in its canonical 36-character form, in either case.
+_CLIENT_CAPTURE_ID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
+def _validate_client_capture_id(v: Optional[str]) -> Optional[str]:
+	"""None, or the id in lowercase: one id is one capture whatever case the client sends it in."""
+	import re
+	if v is None:
+		return None
+	if not re.fullmatch(_CLIENT_CAPTURE_ID_PATTERN, v):
+		raise ValueError("client_capture_id must be a UUID in its canonical 36-character form")
+	return v.lower()
+
+
 class CaptureRequest(BaseModel):
 	"""Request body for capture endpoint."""
 	project_name: str
@@ -368,11 +383,19 @@ class CaptureRequest(BaseModel):
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
+	# The client's id for this capture (app.core.capture_requests): a request
+	# repeating it is answered from the saved capture. None captures as always.
+	client_capture_id: Optional[str] = None
 
 	@field_validator("rotate_deg")
 	@classmethod
 	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
 		return _validate_rotate_deg(v)
+
+	@field_validator("client_capture_id")
+	@classmethod
+	def _check_client_capture_id(cls, v: Optional[str]) -> Optional[str]:
+		return _validate_client_capture_id(v)
 
 
 class DualCaptureRequest(BaseModel):
@@ -395,6 +418,8 @@ class DualCaptureRequest(BaseModel):
 	# every later record's sequence up one, instead of after the highest
 	# (contract 1.9 §10.2). Not with record_id. Sent as afterRecordId.
 	after_record_id: Optional[int] = Field(default=None, alias="afterRecordId")
+	# As CaptureRequest.client_capture_id.
+	client_capture_id: Optional[str] = None
 
 	model_config = ConfigDict(populate_by_name=True)
 
@@ -402,6 +427,11 @@ class DualCaptureRequest(BaseModel):
 	@classmethod
 	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
 		return _validate_rotate_deg(v)
+
+	@field_validator("client_capture_id")
+	@classmethod
+	def _check_client_capture_id(cls, v: Optional[str]) -> Optional[str]:
+		return _validate_client_capture_id(v)
 
 
 class CaptureResponse(BaseModel):
@@ -413,6 +443,9 @@ class CaptureResponse(BaseModel):
 	image_ids: Optional[List[int]] = None
 	timing: Optional[dict] = None
 	error: Optional[str] = None
+	# True when the answer is a capture saved earlier under the request's
+	# client_capture_id, not a new picture (app.core.capture_requests).
+	replayed: Optional[bool] = None
 
 
 class CalibrationRequest(BaseModel):
@@ -1575,7 +1608,31 @@ def test_capture(
 	)
 
 
+def _commit_capture(db: Session, request, kind: str, user: User) -> Optional[dict]:
+	"""Commit a capture; None when it committed.
+
+	The unique constraint on (client_capture_id, space) is the backstop for
+	a row committed by something the in-process claim does not see. When the
+	commit fails on it, the capture is rolled back (its files and manifest
+	line stay, as for any failed capture) and the request is answered from
+	the row that holds the id, or refused 409 when that row is not the
+	request's (app.core.capture_requests.answer_again). Any other IntegrityError
+	is raised to the handler, as before.
+	"""
+	try:
+		db.commit()
+		return None
+	except IntegrityError:
+		db.rollback()
+		stored = capture_requests.answer_again(db, request, kind, user)
+		if stored is None:
+			raise
+		logger.warning(f"client_capture_id {request.client_capture_id} was saved by another request; answering its capture")
+		return stored
+
+
 @router.post("/capture", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
+@capture_requests.answered_first("single")
 def trigger_capture(
 	request: CaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -1585,6 +1642,9 @@ def trigger_capture(
 	Trigger a single image capture on the specified camera.
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
+
+	A request with a client_capture_id is answered first from the capture
+	saved under it, if there is one (capture_requests.answered_first).
 	"""
 	# A missing retake record and a capture outside a stemmed volume are
 	# refused before any camera is touched. The retaken record is loaded
@@ -1774,8 +1834,11 @@ def trigger_capture(
 			# when an operator promotes its volume; a captured one stays.
 			change_record_status(db, record, "captured", current_user.username)
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
+		capture_requests.store(db, request, "single", current_user, record.id, [img.id])
 
-		db.commit()
+		stored = _commit_capture(db, request, "single", current_user)
+		if stored is not None:
+			return CaptureResponse(**stored)
 		db.refresh(record)
 		db.refresh(img)
 
@@ -1797,6 +1860,7 @@ def trigger_capture(
 
 
 @router.post("/capture/dual", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
+@capture_requests.answered_first("dual")
 def trigger_dual_capture(
 	request: DualCaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -1807,6 +1871,8 @@ def trigger_dual_capture(
 	
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
+
+	A client_capture_id is answered first as in trigger_capture.
 	"""
 	# A missing retake record and a capture outside a stemmed volume are
 	# refused before any camera is touched. The retaken record is loaded
@@ -2046,8 +2112,11 @@ def trigger_dual_capture(
 			record.closed_reason = None
 			record.closed_note = None
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
+		capture_requests.store(db, request, "dual", current_user, record.id, [img0.id, img1.id])
 
-		db.commit()
+		stored = _commit_capture(db, request, "dual", current_user)
+		if stored is not None:
+			return CaptureResponse(**stored)
 		db.refresh(record)
 		
 		logger.info(
@@ -2068,6 +2137,30 @@ def trigger_dual_capture(
 		# DB-only rollback: a file that already has a manifest entry is kept (recoverable via ?orphaned=true), never auto-unlinked
 		db.rollback()
 		return CaptureResponse(success=False, error=str(e))
+
+
+@router.get("/capture-requests/{client_capture_id}", response_model=None)
+def get_capture_request(
+	client_capture_id: str = PathParam(..., pattern="^" + _CLIENT_CAPTURE_ID_PATTERN + "$"),
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency),
+):
+	"""The state of a client_capture_id in the caller's space.
+
+	200 with the capture saved under it, as a repeated request is answered,
+	and `in_progress` false; 200 `{"in_progress": true}` while a request
+	with it is running; 404 when neither, including a saved capture with an
+	image deleted and any id of the other space. A malformed id is a 422.
+	"""
+	from app.core.testing_space import not_found_detail
+
+	state = capture_requests.lookup(db, client_capture_id.lower(), capture_requests.space_of(current_user))
+	if state is None:
+		raise HTTPException(status_code=404, detail=not_found_detail())
+	if state["in_progress"]:
+		return state
+	return {**CaptureResponse(**{k: v for k, v in state.items() if k != "in_progress"}).model_dump(),
+			"in_progress": False}
 
 
 @router.post("/calibrate", response_model=CalibrationResponse, dependencies=_CAMERA_BUSY)

@@ -87,6 +87,7 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/cameras/test-capture/{camera_index}'): (('admin', 'operator'),),
     ('POST', '/cameras/capture'): (('admin', 'operator'),),
     ('POST', '/cameras/capture/dual'): (('admin', 'operator'),),
+    ('GET', '/cameras/capture-requests/{client_capture_id}'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate/white-balance'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate/white-balance/manual'): (('admin', 'operator'),),
@@ -300,6 +301,8 @@ PATH_NOT_MATERIAL = {
     "list_id": "a digitisation list file",
     "position": "an item's position in a digitisation list file",
     "uuid": "a saved network connection",
+    "client_capture_id": "a client's id for one capture request; the lookup answers only a stored capture whose "
+                         "record is in the caller's space, and 404 for any other",
 }
 # Query and body fields that name material, and the kind each names.
 FIELD_MATERIAL = {
@@ -327,6 +330,8 @@ FIELD_NOT_MATERIAL = {
     "unitName": "the unit's name sent to Fisqua at pairing",
     "user_id": "a user account",
     "pair_id": "groups the images of one dual capture; nothing is looked up by it, on any route",
+    "client_capture_id": "a client's id for one capture request; the capture routes answer a stored capture "
+                         "only to a request of its kind, volume and space, and refuse any other naming nothing of it",
     "filename_stem": "a volume's own stem, set on the volume itself; a stem another volume holds is refused "
                      "by the model's uniqueness check, not looked up",
 }
@@ -614,7 +619,8 @@ def _role_admitted(caller, key, entry):
     return all(caller in roles for roles in ROLE_LISTS_BEFORE[key])
 
 
-_DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x"}
+_DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x",
+               "client_capture_id": "00000000-0000-4000-8000-000000000000"}
 
 
 def _body_base(world, key, space, caller):
