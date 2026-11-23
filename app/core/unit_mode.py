@@ -73,6 +73,14 @@ frontend's built-in default) is one chord, validated by
 app.api.system.CaptureChord, written by an administrator or an operator
 (set_capture_key), logged `unit_capture_key_changed`. Both are in as_api.
 
+**Colour card shots** (NEH-340). Whether operators are asked for colour
+card shots (colour_card_shots, app.core.colour_card) is off on a unit that
+updates to the release that adds it, and turned on by the registration that
+creates the first account (store_colour_card_shots, in that registration's
+transaction), so a newly set-up unit asks. An administrator changes it
+(set_colour_card_shots); each change is logged
+`unit_colour_card_shots_changed`. In as_api as `colourCardShots`.
+
 Version: 0.3.0
 """
 
@@ -280,6 +288,7 @@ def as_api(db: Session) -> dict:
         "keptVolumes": kept_volumes.kept_volumes(db),
         "defaultLanguage": default_language(db),
         "captureKey": capture_key(db),
+        "colourCardShots": colour_card_shots(db),
     }
 
 
@@ -635,6 +644,34 @@ def set_capture_key(db: Session, chord: Optional[dict], actor: str) -> None:
     row.capture_key = chord
     row.updated_at = _now()
     row.updated_by = actor
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Colour card shots (NEH-340, app.core.colour_card)
+# ---------------------------------------------------------------------------
+
+def colour_card_shots(db: Session) -> bool:
+    """Whether operators are asked for colour card shots; False with no row yet. Reads only."""
+    row = _row(db)
+    return bool(row.colour_card_shots) if row is not None else False
+
+
+def store_colour_card_shots(db: Session, on: bool, actor: Optional[str]) -> None:
+    """Write the setting to the row the caller holds FOR UPDATE; committed with the caller's change, logged when it changes."""
+    row = _row(db, lock=True)
+    if bool(row.colour_card_shots) == bool(on):
+        return
+    _log_in_session(db, "unit_colour_card_shots_changed", "on" if on else "off", actor=actor)
+    row.colour_card_shots = bool(on)
+    row.updated_at = _now()
+    row.updated_by = actor
+
+
+def set_colour_card_shots(db: Session, on: bool, actor: str) -> None:
+    """An administrator's change of the setting; commits."""
+    _ensure_row(db)
+    store_colour_card_shots(db, on, actor)
     db.commit()
 
 

@@ -91,6 +91,10 @@ class FixityIndex:
     # Absolute paths of RAW previews the manifests give a digest for: a
     # capture record's `<role>_preview` entries and `preview_digest` records.
     previews: Set[str] = field(default_factory=set)
+    # Absolute paths the manifests' colour card lines name
+    # (capture.manifestHandler.CALIBRATION_RECORD_TYPE). A shot's file is
+    # known through its row, never through its line.
+    calibration: Set[str] = field(default_factory=set)
 
     def expected(self, capture_id: Optional[str], image_id: Optional[int], resolved: Path) -> Optional[str]:
         """The sha256 an image's file should have, or None if none can be resolved.
@@ -189,7 +193,7 @@ def build_fixity_index(projects_dir: Path, include=None) -> FixityIndex:
     every manifest is read, as the whole-card integrity report and the
     startup layout migration read them.
     """
-    from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
+    from capture.manifestHandler import CALIBRATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
     if not projects_dir.exists():
         return index
@@ -239,6 +243,15 @@ def build_fixity_index(projects_dir: Path, include=None) -> FixityIndex:
                         chain.append((cid, str((project_root / frm).resolve()), str((project_root / to).resolve())))
                     except OSError:
                         pass
+                continue
+            if rec.get("record_type") == CALIBRATION_RECORD_TYPE:
+                # A colour card shot: never a capture, and its digest is its row's.
+                for f in rec.get("files", []) or []:
+                    if isinstance(f, dict) and f.get("relative_path"):
+                        try:
+                            index.calibration.add(str((project_root / f["relative_path"]).resolve()))
+                        except OSError:
+                            pass
                 continue
             backfilled = rec.get("record_type") == PREVIEW_DIGEST_RECORD_TYPE
             if not backfilled:
@@ -574,6 +587,13 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         if raw_buffer_of(Path(k), row_masters) is not None and Path(k).is_file()
     }
     known |= kept_previews
+    # Colour card shots (app.core.colour_card): each shot's master, its RAW
+    # preview and a multi-format capture's `.raw` buffer are known through
+    # the shot's row; a row whose master is gone is reported. The shots'
+    # manifest lines make nothing known (FixityIndex.calibration).
+    card_known, missing_card_files, card_shots = _colour_card_files(db)
+    known |= card_known
+    card_mismatches: List[dict] = []
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []
@@ -612,6 +632,16 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
                 })
                 continue
             eligible.append((img, resolved, expected))
+        # Every colour card shot's master and preview on disk joins the same
+        # list (_colour_card_hash_targets), so one budget, max_hash_checks,
+        # bounds every file this check reads. The sample is drawn uniformly
+        # from the one combined list, the pages' own rule, so each file, page
+        # or shot, is as likely to be hashed as any other on every run, and
+        # neither kind can starve the other over repeated runs. Finding the
+        # files (a row's path, whether it exists) reads no contents and stays
+        # outside the budget, as it does for pages (missing_files,
+        # missing_colour_card_files).
+        eligible.extend(_colour_card_hash_targets(db))
 
         hashes_eligible = len(eligible)
         to_hash = eligible
@@ -624,6 +654,12 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
             except OSError:
                 continue
             hashes_checked += 1
+            if isinstance(img, _ShotFile):
+                if actual != expected:
+                    card_mismatches.append({"colour_card_shot_id": img.shot_id, "kind": img.kind,
+                                            "file_path": img.file_path, "expected_sha256": expected,
+                                            "actual_sha256": actual})
+                continue
             if actual != expected:
                 manifest_mismatches.append({
                     "record_image_id": img.id,
@@ -651,6 +687,9 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "manifest_mismatches": len(manifest_mismatches),
         "manifest_missing_entry": len(manifest_missing_entry),
         "orphan_records": len(orphan_records),
+        "colour_card_shots": card_shots,
+        "missing_colour_card_files": len(missing_card_files),
+        "colour_card_mismatches": len(card_mismatches),
     }
     # "ok" reflects hard divergences (data loss or corruption). Missing thumbnails
     # are regenerable and a missing manifest entry is often benign (an image
@@ -658,6 +697,8 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     # are reported but do not by themselves fail the check.
     summary["ok"] = (
         summary["missing_files"] == 0
+        and summary["missing_colour_card_files"] == 0
+        and summary["colour_card_mismatches"] == 0
         and summary["orphan_files"] == 0
         and summary["manifest_mismatches"] == 0
     )
@@ -671,4 +712,55 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "manifest_mismatches": manifest_mismatches,
         "manifest_missing_entry": manifest_missing_entry,
         "orphan_records": orphan_records,
+        "missing_colour_card_files": missing_card_files,
+        "colour_card_mismatches": card_mismatches,
     }
+
+
+@dataclass(frozen=True)
+class _ShotFile:
+    """A colour card shot's file in the integrity check's hash list."""
+    shot_id: int
+    kind: str  # "shot" or "preview"
+    file_path: str
+
+
+def _colour_card_hash_targets(db: Session) -> List[Tuple]:
+    """(_ShotFile, resolved path, recorded sha256) for every shot master and preview on disk; no file is read."""
+    from app.models.colour_card import ColourCardShot
+
+    out: List[Tuple] = []
+    for shot in db.query(ColourCardShot).all():
+        for kind, stored, expected in (("shot", shot.file_path, shot.sha256),
+                                       ("preview", shot.preview_path, shot.preview_sha256)):
+            path = resolve_within_storage(stored) if stored else None
+            if path is None or not path.is_file() or not expected:
+                continue  # a missing file is reported under missing_colour_card_files
+            out.append((_ShotFile(shot.id, kind, stored), path, expected))
+    return out
+
+
+def _colour_card_files(db: Session) -> Tuple[Set[str], List[dict], int]:
+    """(known paths, missing, count) for the colour card shots: what each shot's row makes known, and each file it names that is gone (`kind` shot or preview)."""
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    known: Set[str] = set()
+    missing: List[dict] = []
+    rows = (db.query(ColourCardShot, ColourCardSet.collection_id)
+            .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id).all())
+    for shot, collection_id in rows:
+        # Every file the row names: its master and, when it has one, its preview.
+        for kind, stored in (("shot", shot.file_path), ("preview", shot.preview_path)):
+            if kind == "preview" and not stored:
+                continue
+            path = resolve_within_storage(stored)
+            if path is None or not path.exists():
+                missing.append({"colour_card_shot_id": shot.id, "collection_id": collection_id, "kind": kind,
+                                "file_path": stored})
+                continue
+            known.add(str(path))
+            if kind == "shot" and not is_raw_suffix(path):
+                buffer = raw_sidecar_of(path)
+                if buffer.is_file():
+                    known.add(str(buffer))
+    return known, missing, len(rows)

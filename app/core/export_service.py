@@ -38,7 +38,13 @@ FREE_SPACE_MARGIN = 100 * 1024 * 1024
 #    that display it upright, or null for an upload or an image captured
 #    before the rotation was recorded. A RAW master is bagged as the camera
 #    wrote it, so this is where its rotation is.
-METADATA_SCHEMA_VERSION = 2
+# 3: `colour_card`, the volume's colour card shots (app.core.colour_card):
+#    {"status", "sets": [{"number", "capture_mode", "completed_at", "shots":
+#    [{"camera_index", "role", "capture_id", "filename", "sha256",
+#    "preview_filename", "preview_sha256", "rotate_deg", "captured_at",
+#    "settings"}]}]}, the taken sets only; each shot and its preview are in
+#    the bag's `calibration/` folder.
+METADATA_SCHEMA_VERSION = 3
 
 
 def source_organization(project) -> str:
@@ -206,6 +212,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             detail={"reason": "missing_files", "missing_image_ids": [m["record_image_id"] for m in missing], "missing": missing},
         )
 
+    # The volume's colour card shots, beside the records in `calibration/`.
+    card_files, card_sets = _colour_card_payload(db, collection)
+
     # From here to the end of the write, a planned source can be moved,
     # renamed or deleted (the routes that do it hold the collection against
     # exports, but a file can still go by other means: a drive pulled, a file
@@ -216,7 +225,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         _fixity_gate([img for _, _, img in to_copy])
 
         # Refuse to start if the exports filesystem can't hold the archive.
-        total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
+        # The colour card shots and their previews go into the archive too.
+        total_src = (sum(resolved.stat().st_size for _, resolved, _ in to_copy)
+                     + sum(source.stat().st_size for source, _rel in card_files))
         free = shutil.disk_usage(exports_dir).free
         if free < total_src + FREE_SPACE_MARGIN:
             raise ExportError(
@@ -258,12 +269,14 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             )
 
         metadata_payload = _metadata_payload(collection, project, records, timestamp)
+        from app.core import colour_card
+        metadata_payload["colour_card"] = {"status": colour_card.status(db, collection), "sets": card_sets}
         blobs = [(json.dumps(metadata_payload, indent=2, ensure_ascii=False).encode("utf-8"), "metadata.json")]
         manifest_blob = _filtered_manifest_blob(db, collection, records)
         if manifest_blob:
             blobs.append((manifest_blob, "metadata/manifest.jsonl"))
 
-        payload_files = [(resolved, rel) for rel, resolved, _ in to_copy]
+        payload_files = [(resolved, rel) for rel, resolved, _ in to_copy] + card_files
         bag_info = {
             "Source-Organization": source_organization(project),
             "External-Description": collection.description or collection.name,
@@ -295,6 +308,54 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     job.zip_filename = zip_path.name
     _prune_exports(exports_dir, collection_id)
     logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
+
+
+def _colour_card_payload(db, collection) -> tuple:
+    """([(source, `calibration/<name>`)], sets for metadata.json) of the volume's taken colour card shots.
+
+    Each shot and its RAW preview must be on disk with the sha256 its row took
+    when it was written; otherwise the export is refused, as for a page.
+    """
+    import hashlib
+
+    from app.core import colour_card
+    from app.core.paths import CALIBRATION_DIR
+
+    files, sets, missing, mismatched = [], {}, [], []
+    for card_set, shot in colour_card._taken_shots(db, collection.id):
+        entry = sets.setdefault(card_set.id, {
+            "number": card_set.number, "capture_mode": card_set.capture_mode,
+            "completed_at": card_set.completed_at.isoformat() if card_set.completed_at else None, "shots": []})
+        entry["shots"].append({
+            "camera_index": shot.camera_index, "role": shot.role, "capture_id": shot.capture_id,
+            "filename": shot.filename, "sha256": shot.sha256, "preview_filename": shot.preview_filename,
+            "preview_sha256": shot.preview_sha256, "rotate_deg": shot.rotate_deg,
+            "captured_at": shot.captured_at.isoformat() if shot.captured_at else None, "settings": shot.settings})
+        for stored, name, sha in ((shot.file_path, shot.filename, shot.sha256),
+                                  (shot.preview_path, shot.preview_filename, shot.preview_sha256)):
+            if not stored:
+                continue
+            resolved = resolve_within_storage(stored)
+            if resolved is None or not resolved.is_file():
+                missing.append(shot.id)
+                continue
+            h = hashlib.sha256()
+            with open(resolved, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            if sha and h.hexdigest() != sha:
+                mismatched.append(shot.id)
+                continue
+            files.append((resolved, f"{CALIBRATION_DIR}/{name}"))
+    if missing:
+        raise ExportError(f"{len(set(missing))} colour card shot(s) are missing from disk.",
+                          detail={"reason": "missing_colour_card_files",
+                                  "missing_colour_card_shot_ids": sorted(set(missing))})
+    if mismatched:
+        raise ExportError(f"{len(set(mismatched))} colour card shot(s) fail their checksum (possible corruption).",
+                          detail={"reason": "checksum_mismatch",
+                                  "mismatched_colour_card_shot_ids": sorted(set(mismatched))})
+    return files, list(sets.values())
 
 
 def _fixity_gate(images) -> None:

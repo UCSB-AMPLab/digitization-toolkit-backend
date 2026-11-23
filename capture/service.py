@@ -529,6 +529,29 @@ def single_capture_image(
     return _image_of(output_path), record.capture_id, record.pair_id
 
 
+def colour_card_capture(camera_config: CameraConfig, output_path: Path) -> tuple:
+    """Photograph a colour card with one camera into `output_path`, in a volume's calibration folder.
+
+    Through the configured backend, as a page is (capture_image), so the
+    backend's own lock on the camera is taken. The rotation is recorded on
+    every JPEG as for a page. No manifest line is written here: the caller
+    names the files and writes the shot's line (app.core.colour_card).
+
+    Returns (paths, metadata): every file the backend wrote, the master
+    first, and the backend's capture metadata or None.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = get_backend().capture_image(output_path, camera_config, False)
+    if isinstance(result, tuple) and len(result) == 2:
+        actual_path, metadata = result
+    else:
+        actual_path, metadata = result, None
+    paths = _capture_paths(actual_path)
+    _rotate_capture_files(paths, getattr(camera_config, "rotate_deg", 0))
+    return paths, metadata
+
+
 def _unlink_capture_output(path) -> None:
     """Remove image file(s) from a capture that was never written to the manifest.
 

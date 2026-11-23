@@ -392,7 +392,7 @@ class Collection(Base):
 
     def has_captured(self) -> bool:
         """Whether the volume has ever captured: capture_counter above zero, any image,
-        or an offsite object keyed under its stem.
+        a colour card shot, or an offsite object keyed under its stem.
 
         The counter keeps the answer after the volume's records are deleted or
         moved out. next_capture_number raises it for each capture and upload
@@ -406,7 +406,26 @@ class Collection(Base):
         if (self.capture_counter or 0) > 0 or self.has_images():
             return True
         session = object_session(self)
-        return session is not None and offsite_keys_under_stem(session, self.filename_stem)
+        if session is None:
+            return False
+        return self.has_colour_card_shots() or offsite_keys_under_stem(session, self.filename_stem)
+
+    def has_colour_card_shots(self) -> bool:
+        """Whether a colour card shot of the volume exists, in any set (app.core.colour_card).
+
+        Its files are named after the stem and keyed under it offsite, so it
+        fixes the stem as a capture does. A shot removed with its open set
+        when the request was skipped leaves nothing named after the stem,
+        and counts no more. Read with autoflush off.
+        """
+        from app.models.colour_card import ColourCardSet, ColourCardShot
+
+        session = object_session(self)
+        if self.id is None or session is None:
+            return False
+        with session.no_autoflush:
+            return session.execute(select(exists().where(
+                ColourCardShot.set_id == ColourCardSet.id, ColourCardSet.collection_id == self.id))).scalar()
 
     def reserves_its_stem(self) -> bool:
         """Whether the volume has a stem and has captured, so its row must be kept.

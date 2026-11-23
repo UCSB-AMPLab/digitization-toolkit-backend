@@ -1235,6 +1235,15 @@ class ChdkBackend(CameraBackend):
             key = self._indices.get(camera_index)
             return self._bodies.get(key) if key is not None else None
 
+    def held_zoom(self, camera_index):
+        """The zoom state held for the body at this index, without talking to the camera; None when no body holds it.
+
+        `{"zoom_step": step}`, the step the body last confirmed (None until
+        known). Read by the colour card check (app.core.colour_card).
+        """
+        body = self._body_at(camera_index)
+        return {"zoom_step": body.zoom_step} if body is not None else None
+
     def camera_model(self, camera_index):
         """The model of the body holding this index.
 

@@ -124,6 +124,12 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/collections/{collection_id}/offsite/restore'): (('admin',),),
     ('GET', '/collections/{collection_id}/offsite/jobs/{job_id}'): (('admin', 'operator'),),
     ('GET', '/collections/{collection_id}/capture-manifest'): (('admin', 'operator'),),
+    ('GET', '/collections/{collection_id}/colour-card'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets/{set_id}/shots'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets/{set_id}/complete'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/skip'): (('admin', 'operator'),),
+    ('GET', '/collections/{collection_id}/colour-card/shots/{shot_id}/preview'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/collections/{collection_id}/hierarchy'): (('admin', 'operator', 'reviewer'),),
     ('PATCH', '/collections/{collection_id}'): (('admin', 'operator'),),
     ('POST', '/collections/{collection_id}/move-records'): (('admin', 'operator'),),
@@ -302,6 +308,8 @@ CAMERA_SETTINGS_PATHS = {"/cameras/{id}", "/cameras/settings/{id}"}
 PATH_NOT_MATERIAL = {
     "camera_index": "a camera body's index on the unit",
     "job_id": "an export or offsite job; the handler answers 404 unless the job is the path's volume's",
+    "set_id": "a volume's set of colour card shots; the handler answers 404 unless it is the path's volume's",
+    "shot_id": "a colour card shot; the handler answers 404 unless it is of the path's volume",
     "user_id": "a user account",
     "list_id": "a digitisation list file",
     "position": "an item's position in a digitisation list file",
@@ -627,6 +635,7 @@ def _role_admitted(caller, key, entry):
 
 
 _DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x",
+               "set_id": "999999", "shot_id": "999999",
                "client_capture_id": "00000000-0000-4000-8000-000000000000"}
 
 
@@ -1600,6 +1609,18 @@ ADMIN_READS = {
     ("POST", "/collections/{collection_id}/usb-copy"): lambda w, r: r.status_code == 422,
     ("GET", "/collections/{collection_id}/usb-copy/status/{job_id}"): lambda w, r: (
         r.status_code, r.json()["detail"]) == (404, "USB copy not found"),
+    # Colour card shots (app.core.colour_card): a testing volume answers as not enabled. Exercised in
+    # tests/unit/test_colour_card.py.
+    ("GET", "/collections/{collection_id}/colour-card"): lambda w, r: r.json()["enabled"] is False,
+    ("POST", "/collections/{collection_id}/colour-card/sets"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/shots"): lambda w, r: r.status_code == 422,
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/complete"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("POST", "/collections/{collection_id}/colour-card/skip"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("GET", "/collections/{collection_id}/colour-card/shots/{shot_id}/preview"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (404, "colour_card_shot_not_found"),
 }
 
 

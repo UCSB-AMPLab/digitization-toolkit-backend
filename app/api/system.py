@@ -11,7 +11,7 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, field_validator, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
@@ -183,6 +183,8 @@ class UnitUpdate(BaseModel):
     keptVolumes: Optional[Literal["include", "keep"]] = None
     # The unit's language (NEH-336); null or absent leaves it.
     defaultLanguage: Optional[Literal["es", "en"]] = None
+    # Whether operators are asked for colour card shots (NEH-340); null or absent leaves it.
+    colourCardShots: Optional[StrictBool] = None
 
 
 # The keys a capture chord may never be (the frontend's capture-key.ts):
@@ -241,6 +243,8 @@ def get_unit(
     A switch to fisqua also needs Fisqua to take the operators call.
     `keptVolumes` lists every volume Captua keeps on the unit (NEH-320) as
     {id, name, files}, `files` being the count it would copy offsite.
+    `colourCardShots` is whether operators are asked for colour card shots
+    (app.core.colour_card).
 
     The testing account receives the same keys, with the mode and the
     projects setting (`mode`, `projectsEnabled`) only: `projectsShown` is
@@ -284,11 +288,15 @@ def put_unit(
 
     `defaultLanguage` (`es` or `en`) sets the unit's language, after any
     change of mode has been stored; logged `unit_default_language_changed`.
+    `colourCardShots` (a JSON boolean) sets whether operators are asked for
+    colour card shots (app.core.colour_card), after the language; logged
+    `unit_colour_card_shots_changed`.
     """
     from app.core import unit_mode
 
     mode_fields = (payload.mode, payload.projectsEnabled, payload.keptVolumes)
-    if any(v is not None for v in mode_fields) or payload.defaultLanguage is None:
+    if any(v is not None for v in mode_fields) or (payload.defaultLanguage is None
+                                                   and payload.colourCardShots is None):
         try:
             unit_mode.change(db, actor=current_user.username, mode=payload.mode,
                              projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
@@ -296,6 +304,8 @@ def put_unit(
             raise HTTPException(status_code=409, detail=exc.detail())
     if payload.defaultLanguage is not None:
         unit_mode.set_default_language(db, payload.defaultLanguage, actor=current_user.username)
+    if payload.colourCardShots is not None:
+        unit_mode.set_colour_card_shots(db, payload.colourCardShots, actor=current_user.username)
     return unit_mode.as_api(db)
 
 

@@ -332,6 +332,9 @@ def _register(payload, request, credentials, bootstrap_token, background_tasks, 
     db.add(user)
     if is_first_user and payload.default_language is not None:
         unit_mode.store_default_language(db, payload.default_language, actor=payload.username)
+    if is_first_user:
+        # A newly set-up unit asks for colour card shots (NEH-340).
+        unit_mode.store_colour_card_shots(db, True, actor=payload.username)
     db.commit()
     db.refresh(user)
     actor = caller.username if not is_first_user else "bootstrap"

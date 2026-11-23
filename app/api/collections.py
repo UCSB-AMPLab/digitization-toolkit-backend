@@ -390,10 +390,13 @@ def list_collections(
             counts_by_id[collection_id] = count
             last_activity_by_id[collection_id] = last_activity
 
+    from app.core import colour_card
+    cards = colour_card.summaries(db, items)
     results = []
     for i in items:
         r = CollectionRead.model_validate(i)
         r.record_count = counts_by_id.get(i.id, 0)
+        r.colour_card = cards.get(i.id)
         # Left as None for a collection with no records: "never worked on" is
         # not the same as a date, and a caller listing volumes in progress needs
         # to tell them apart.
@@ -426,10 +429,14 @@ def get_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """Get a specific collection by ID."""
+    from app.core import colour_card
+
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    return CollectionRead.model_validate(collection)
+    read = CollectionRead.model_validate(collection)
+    read.colour_card = colour_card.summaries(db, [collection])[collection.id]
+    return read
 
 
 @router.get("/{collection_id}/offsite")
@@ -1229,6 +1236,10 @@ def delete_collection(
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
             raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
+        # The volume's colour card shots are removed with it, after the delete commits.
+        from app.core import colour_card
+        shot_files = {str(p) for p in colour_card.shot_file_paths(db, collection_id)}
+        left = [p for p in left if str(p.resolve()) not in shot_files]
         if left:
             logger.warning(
                 f"Deleting collection {collection_id}: {len(left)} file(s) no record references were left in "
@@ -1246,8 +1257,15 @@ def delete_collection(
     )
     deleted = dict(id=collection.id, name=collection.name, stem=collection.filename_stem,
                    project=collection.project_id, parent=collection.parent_collection_id)
+    # Its colour card sets and shots go with it, and their files once the delete commits.
+    from app.core import colour_card
+    card_files = colour_card.remove_volume_shots(db, collection_id)
     db.delete(collection)
     db.commit()
+    if card_files:
+        colour_card.remove_files(card_files)
+        if col_dir is not None:
+            remove_empty_dirs(col_dir)
     log_event(db, level="WARN", category="activity", action="collection_deleted",
               actor=current_user.username, subject=deleted["name"],
               detail=(f"id={deleted['id']}; stem {deleted['stem']!r}; project {deleted['project']}; "
