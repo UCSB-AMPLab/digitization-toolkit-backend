@@ -250,6 +250,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("PUT", "/auth/users/{user_id}/password"): Entry(),
     ("DELETE", "/auth/users/{user_id}"): Entry(),
     ("GET", "/users/me"): Entry(testing=True),
+    # The user's own language: a personal preference that names no material.
+    ("PUT", "/users/me/language"): Entry(testing=True),
 
     # The unit.
     ("GET", "/system/logs"): Entry(),
@@ -258,6 +260,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/system/catalogue-backup"): Entry(),
     ("GET", "/system/unit"): Entry(testing=True),
     ("PUT", "/system/unit"): Entry(),
+    # Admin and operator; not the testing account.
+    ("PUT", "/system/unit/capture-key"): Entry(),
     ("GET", "/system/testing"): Entry(),
     ("PUT", "/system/testing"): Entry(),
     ("PATCH", "/system/testing/account"): Entry(),
