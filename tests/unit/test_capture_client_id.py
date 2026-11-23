@@ -74,6 +74,20 @@ def _in_use(resp):
     assert "record_id" not in resp.text and "image_ids" not in resp.text and "file_path" not in resp.text
 
 
+def _gone(resp):
+    """The lookup of a stored capture whose record or an image has been deleted."""
+    assert resp.status_code == 410, resp.text
+    assert resp.json() == {"detail": {"code": "capture_no_longer_stored",
+                                      "message": "An image of the capture saved with this id has been deleted."}}
+
+
+def _abandoned(resp):
+    assert resp.status_code == 409, resp.text
+    detail = resp.json()["detail"]
+    assert detail["code"] == "capture_abandoned", resp.text
+    assert set(detail) == {"code", "message"}, resp.text
+
+
 def _stored(unit):
     from app.models.capture_request import StoredCaptureRequest
     unit.db.expire_all()
@@ -386,6 +400,7 @@ def test_a_stored_capture_whose_volume_was_deleted_is_not_a_request_naming_no_vo
 @pytest.mark.unit
 @pytest.mark.parametrize("dual", [False, True], ids=["single", "dual"])
 def test_a_capture_with_a_deleted_image_is_no_longer_stored(unit, dual):
+    """Its lookup answers 410 in its own space; the other space sees 404, as for any id it does not hold."""
     cid = _cid()
     capture = _dual if dual else _single
     first = _ok(capture(unit, cid))
@@ -399,7 +414,9 @@ def test_a_capture_with_a_deleted_image_is_no_longer_stored(unit, dual):
     assert set(again.json()["detail"]) == {"code", "message"}
     assert "record_id" not in again.text and "image_ids" not in again.text
     looked = _lookup(unit, cid)
-    assert looked.status_code == 404 and looked.json()["detail"]["code"] == "not_found", looked.text
+    _gone(looked)
+    other = _lookup(unit, cid, caller="testing")
+    assert other.status_code == 404 and other.json()["detail"]["code"] == "not_found", other.text
     assert unit.backend.requested == shots
 
 
@@ -434,7 +451,7 @@ def test_a_capture_whose_record_was_deleted_is_no_longer_stored(unit, dual):
     assert again.json()["detail"] == {"code": "capture_no_longer_stored",
                                       "message": again.json()["detail"]["message"]}
     looked = _lookup(unit, cid)
-    assert looked.status_code == 404 and looked.json()["detail"]["code"] == "not_found", looked.text
+    _gone(looked)
     assert unit.backend.requested == shots
 
 
@@ -453,7 +470,8 @@ def test_a_capture_in_a_deleted_testing_volume_is_no_longer_stored(unit):
 
     again = _testing_single(unit, project, volume, cid)
     assert again.status_code == 409 and again.json()["detail"]["code"] == "capture_no_longer_stored", again.text
-    assert _lookup(unit, cid, caller="testing").status_code == 404
+    _gone(_lookup(unit, cid, caller="testing"))
+    assert _lookup(unit, cid, caller="operator").status_code == 404
     assert unit.backend.requested == shots
 
 
@@ -479,7 +497,7 @@ def test_a_capture_whose_image_id_was_taken_by_another_capture_is_no_longer_stor
     assert again.json()["detail"]["code"] == "capture_no_longer_stored"
     assert str(other["file_path"]) not in again.text
     looked = _lookup(unit, cid)
-    assert looked.status_code == 404 and looked.json()["detail"]["code"] == "not_found", looked.text
+    _gone(looked)
     assert unit.backend.requested == shots
 
 
@@ -540,9 +558,13 @@ def test_a_lookup_paused_after_its_select_never_answers_404_for_a_capture_that_e
     _commits_and_releases_inside_find(monkeypatch, unit, cid, after_select=True)
 
     first = _lookup(unit, cid)
-    assert first.status_code == 200 and first.json() == {"in_progress": True}, first.text
+    assert first.status_code == 200, first.text
+    # The key was not in flight at the lookup's close, and the select after the close finds the row:
+    # the key is opened again and the stored capture answered.
+    assert first.json()["in_progress"] is False and first.json()["record_id"] == unit.real_record_id, first.text
     second = _lookup(unit, cid)
     assert second.status_code == 200 and second.json()["record_id"] == unit.real_record_id, second.text
+    assert not capture_requests.closed(("real", cid))
 
 
 @pytest.mark.unit
@@ -598,7 +620,7 @@ def test_a_refusal_raised_after_the_capture_wrote_is_rolled_back_before_the_id_i
 
 
 @pytest.mark.unit
-def test_after_a_restart_mid_capture_the_lookup_answers_404_and_a_new_request_photographs(unit):
+def test_after_a_restart_mid_capture_the_lookup_answers_404_and_a_new_id_photographs(unit):
     """A process killed after the shutter and before the commit saved nothing: its transaction rolled back.
 
     Stood in for by a capture that writes its file and fails before the
@@ -612,9 +634,12 @@ def test_after_a_restart_mid_capture_the_lookup_answers_404_and_a_new_request_ph
     unit.backend.fail_after_write = set()
     with capture_requests._lock:
         capture_requests._in_flight.clear()
+        for closed_here in capture_requests._closed.values():
+            closed_here.clear()
     assert _lookup(unit, cid).status_code == 404
     shots = len(unit.backend.requested)
-    fresh = _ok(_single(unit, cid))
+    _abandoned(_single(unit, cid))
+    fresh = _ok(_single(unit, _cid()))
     assert not fresh.get("replayed") and len(unit.backend.requested) == shots + 1
 
 
@@ -660,16 +685,16 @@ def test_an_id_in_flight_in_one_space_neither_blocks_nor_shows_in_the_other(unit
     cid = _cid()
     assert capture_requests.claim(("real", cid))
     try:
-        assert _lookup(unit, cid, caller="testing").status_code == 404
         assert _ok(_testing_single(unit, project, volume, cid))
+        assert _lookup(unit, cid, caller="testing").json()["in_progress"] is False
         assert _lookup(unit, cid, caller="operator").json() == {"in_progress": True}
     finally:
         capture_requests.release(("real", cid))
     cid = _cid()
     assert capture_requests.claim(("testing", cid))
     try:
-        assert _lookup(unit, cid, caller="operator").status_code == 404
         assert _ok(_single(unit, cid))
+        assert _lookup(unit, cid, caller="operator").json()["in_progress"] is False
         assert _lookup(unit, cid, caller="testing").json() == {"in_progress": True}
     finally:
         capture_requests.release(("testing", cid))
@@ -691,9 +716,9 @@ def test_a_testing_row_whose_volume_was_purged_is_never_read_as_real(unit):
 
     assert capture_requests.find(unit.db, cid, "real") is None
     assert capture_requests.find(unit.db, cid, "testing").record_id == orphan.id
-    assert _lookup(unit, cid, caller="operator").status_code == 404
     real = _ok(_single(unit, cid))
     assert not real.get("replayed") and real["record_id"] != orphan.id
+    assert _lookup(unit, cid, caller="operator").json()["record_id"] == real["record_id"]
 
 
 # ---------------------------------------------------------------------------
@@ -781,7 +806,6 @@ def test_a_retry_after_a_failed_original_photographs(unit, own_sessions):
     held.release.set()
     original.join(120)
     assert out["resp"].status_code == 200 and out["resp"].json()["success"] is False
-    assert _lookup(unit, cid).status_code == 404
 
     retry = _ok(_single(unit, cid))
     assert not retry.get("replayed")
@@ -790,10 +814,25 @@ def test_a_retry_after_a_failed_original_photographs(unit, own_sessions):
 
 
 @pytest.mark.unit
-def test_the_lookup_answers_each_of_its_three_states(unit, own_sessions):
+def test_a_failed_original_then_a_lookup_abandons_the_id(unit, own_sessions):
     cid = _cid()
-    looked = _lookup(unit, cid)
+    held = _Held(unit, fail=True)
+    original, out = _start(lambda: _single(unit, cid))
+    assert held.entered.wait(60)
+    held.release.set()
+    original.join(120)
+    assert out["resp"].json()["success"] is False
+    assert _lookup(unit, cid).status_code == 404
+    _abandoned(_single(unit, cid))
+    assert len(held.calls) == 1
+    assert _stored(unit) == []
+
+
+@pytest.mark.unit
+def test_the_lookup_answers_each_of_its_four_states(unit, own_sessions):
+    looked = _lookup(unit, _cid())
     assert looked.status_code == 404 and looked.json()["detail"]["code"] == "not_found"
+    cid = _cid()
     held = _Held(unit)
     original, out = _start(lambda: _single(unit, cid))
     assert held.entered.wait(60)
@@ -806,6 +845,12 @@ def test_the_lookup_answers_each_of_its_three_states(unit, own_sessions):
     assert looked.status_code == 200
     assert looked.json()["in_progress"] is False and looked.json()["record_id"] == first["record_id"]
     assert looked.json()["replayed"] is True
+    # Stored, and an image deleted since: 410, and the id stays open.
+    from app.core import capture_requests
+    resp = unit.client.delete(f"/records/images/{first['image_ids'][0]}", headers=unit.headers["operator"])
+    assert resp.status_code == 200, resp.text
+    _gone(_lookup(unit, cid))
+    assert not capture_requests.closed(("real", cid))
 
 
 @pytest.mark.unit
@@ -889,3 +934,588 @@ def test_a_duplicate_found_at_commit_that_does_not_match_is_refused(unit, monkey
     _row_saved_elsewhere(unit, cid, False)
     _check_misses_once(monkeypatch)
     _in_use(_dual(unit, cid))
+
+
+# ---------------------------------------------------------------------------
+# An id the lookup has answered as not found never executes afterwards
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+@pytest.mark.parametrize("dual", [False, True], ids=["single", "dual"])
+def test_a_post_after_a_lookup_that_answered_not_found_is_abandoned(unit, dual):
+    from app.core import capture_requests
+    cid = _cid()
+    looked = _lookup(unit, cid)
+    assert looked.status_code == 404 and looked.json()["detail"]["code"] == "not_found"
+    assert capture_requests.closed(("real", cid))
+    shots = list(unit.backend.requested)
+    before = unit.snapshot()
+
+    _abandoned((_dual if dual else _single)(unit, cid))
+    assert unit.backend.requested == shots, "an abandoned id must not reach the camera"
+    assert unit.snapshot() == before and _stored(unit) == []
+    assert _lookup(unit, cid).status_code == 404
+
+
+@pytest.mark.unit
+def test_a_new_id_after_an_abandoned_one_photographs(unit):
+    cid = _cid()
+    assert _lookup(unit, cid).status_code == 404
+    _abandoned(_single(unit, cid))
+    shots = len(unit.backend.requested)
+    fresh = _ok(_single(unit, _cid()))
+    assert not fresh.get("replayed") and len(unit.backend.requested) == shots + 1
+
+
+@pytest.mark.unit
+def test_a_lookup_of_a_stored_or_running_capture_closes_nothing(unit, own_sessions):
+    from app.core import capture_requests
+    stored_id = _cid()
+    _ok(_single(unit, stored_id))
+    assert _lookup(unit, stored_id).json()["in_progress"] is False
+    assert not capture_requests.closed(("real", stored_id))
+    assert _ok(_single(unit, stored_id))["replayed"] is True
+
+    running_id = _cid()
+    held = _Held(unit)
+    original, out = _start(lambda: _single(unit, running_id))
+    assert held.entered.wait(60)
+    assert _lookup(unit, running_id).json() == {"in_progress": True}
+    assert not capture_requests.closed(("real", running_id))
+    held.release.set()
+    original.join(120)
+    _ok(out["resp"])
+    assert _lookup(unit, running_id).json()["in_progress"] is False
+
+
+@pytest.mark.unit
+def test_a_malformed_id_closes_nothing(unit):
+    from app.core import capture_requests
+    assert _lookup(unit, "not-a-uuid").status_code == 422
+    with capture_requests._lock:
+        assert sum(len(c) for c in capture_requests._closed.values()) == 0
+
+
+@pytest.mark.unit
+def test_a_lookup_closes_only_its_own_spaces_id(unit):
+    from app.core import capture_requests
+    project, volume = _testing_volume(unit)
+    # The testing account's lookup closes the testing key; real work still captures with the id.
+    a = _cid()
+    assert _lookup(unit, a, caller="testing").status_code == 404
+    assert capture_requests.closed(("testing", a)) and not capture_requests.closed(("real", a))
+    assert not _ok(_single(unit, a)).get("replayed")
+    _abandoned(_testing_single(unit, project, volume, a))
+    # And the other way round.
+    b = _cid()
+    assert _lookup(unit, b, caller="operator").status_code == 404
+    assert capture_requests.closed(("real", b)) and not capture_requests.closed(("testing", b))
+    assert not _ok(_testing_single(unit, project, volume, b)).get("replayed")
+    _abandoned(_single(unit, b))
+
+
+@pytest.mark.unit
+def test_a_lookup_of_a_capture_that_lost_an_image_does_not_close_the_id(unit):
+    """The row exists, so the 404 is not a not-found: the POST keeps answering capture_no_longer_stored."""
+    from app.core import capture_requests
+    cid = _cid()
+    first = _ok(_dual(unit, cid))
+    resp = unit.client.delete(f"/records/images/{first['image_ids'][0]}", headers=unit.headers["operator"])
+    assert resp.status_code == 200, resp.text
+    _gone(_lookup(unit, cid))
+    assert not capture_requests.closed(("real", cid))
+    shots = list(unit.backend.requested)
+    again = _dual(unit, cid)
+    assert again.status_code == 409 and again.json()["detail"]["code"] == "capture_no_longer_stored", again.text
+    assert unit.backend.requested == shots
+
+
+@pytest.mark.unit
+def test_the_closed_ids_are_bounded_and_the_oldest_goes_first(monkeypatch):
+    from app.core import capture_requests
+    assert capture_requests.CLOSED_LIMIT == 100_000
+    monkeypatch.setattr(capture_requests, "CLOSED_LIMIT", 3)
+    keys = [("real", _cid()) for _ in range(4)]
+    for key in keys:
+        capture_requests.close(key)
+    assert [capture_requests.closed(k) for k in keys] == [False, True, True, True]
+    # The evicted one can be claimed again; the others are refused at the claim.
+    assert capture_requests.claim(keys[0]) == capture_requests.CLAIMED
+    capture_requests.release(keys[0])
+    assert all(capture_requests.claim(k) == capture_requests.CLOSED for k in keys[1:])
+    # Closing a closed key again makes it the newest.
+    capture_requests.close(keys[1])
+    capture_requests.close(("real", _cid()))
+    assert capture_requests.closed(keys[1]) and not capture_requests.closed(keys[2])
+
+
+class _ObservedLock:
+    """The registry's lock, with a hook: the first time the function `holder` holds it, `while_held` runs inside.
+
+    The callers are told apart by the function that takes the lock (the
+    handlers run on the server's own threads, not the test's): a caller in
+    the function `arriver` sets `arrived` just before it asks for the lock,
+    so the holder can wait until the other request is at the lock and let
+    it in only after its own decision.
+    """
+
+    def __init__(self, inner, holder, arriver, while_held):
+        self.inner, self.holder, self.arriver, self.while_held = inner, holder, arriver, while_held
+        self.arrived, self.done = threading.Event(), False
+
+    def __enter__(self):
+        import sys
+        caller = sys._getframe(1).f_code.co_name
+        if caller == self.arriver:
+            self.arrived.set()
+        self.inner.acquire()
+        if not self.done and caller == self.holder:
+            self.done = True
+            self.while_held(self)
+        return self
+
+    def __exit__(self, *exc):
+        self.inner.release()
+        return False
+
+
+def _named(name, fn):
+    out = {}
+    t = threading.Thread(target=lambda: out.setdefault("resp", fn()), name=name)
+    t.start()
+    return t, out
+
+
+@pytest.mark.unit
+def test_the_claim_first_at_the_lock_means_the_lookup_answers_in_progress(unit, own_sessions, monkeypatch):
+    """The POST holds the lock for its claim while the lookup arrives at it: the lookup sees the claim."""
+    from app.core import capture_requests
+    cid = _cid()
+    lookups = {}
+
+    def let_the_lookup_arrive(lock):
+        lookups["t"], lookups["out"] = _named("arrive-lookup", lambda: _lookup(unit, cid))
+        assert lock.arrived.wait(30), "the lookup never reached the lock"
+
+    monkeypatch.setattr(capture_requests, "_lock",
+                        _ObservedLock(capture_requests._lock, "claim", "lookup", let_the_lookup_arrive))
+    held = _Held(unit)
+    post, out = _named("post", lambda: _single(unit, cid))
+    assert held.entered.wait(60), "the POST never reached the camera"
+    lookups["t"].join(60)
+    looked = lookups["out"]["resp"]
+    assert looked.status_code == 200 and looked.json() == {"in_progress": True}, looked.text
+    held.release.set()
+    post.join(120)
+    first = _ok(out["resp"])
+    assert len(held.calls) == 1
+    stored = _lookup(unit, cid)
+    assert stored.json()["in_progress"] is False and stored.json()["record_id"] == first["record_id"]
+    assert not capture_requests.closed(("real", cid))
+
+
+@pytest.mark.unit
+def test_the_lookup_first_at_the_lock_means_the_post_is_abandoned(unit, own_sessions, monkeypatch):
+    """The lookup holds the lock for its decision while the POST arrives at it: the POST finds the id closed."""
+    from app.core import capture_requests
+    cid = _cid()
+    posts = {}
+
+    def let_the_post_arrive(lock):
+        posts["t"], posts["out"] = _named("arrive-post", lambda: _single(unit, cid))
+        assert lock.arrived.wait(30), "the POST never reached the lock"
+
+    monkeypatch.setattr(capture_requests, "_lock",
+                        _ObservedLock(capture_requests._lock, "lookup", "claim", let_the_post_arrive))
+    shots = list(unit.backend.requested)
+    lookup, out = _named("lookup", lambda: _lookup(unit, cid))
+    lookup.join(60)
+    assert out["resp"].status_code == 404, out["resp"].text
+    posts["t"].join(60)
+    _abandoned(posts["out"]["resp"])
+    assert unit.backend.requested == shots
+    assert _stored(unit) == []
+
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("one,other", [("testing", "real"), ("real", "testing")])
+def test_lookups_in_one_space_never_evict_the_other_spaces_closed_ids(monkeypatch, one, other):
+    from app.core import capture_requests
+    monkeypatch.setattr(capture_requests, "CLOSED_LIMIT", 3)
+    kept = (other, _cid())
+    capture_requests.close(kept)
+    flood = [(one, _cid()) for _ in range(10)]
+    for key in flood:
+        capture_requests.close(key)
+    assert capture_requests.closed(kept), "the other space's flood evicted this space's closed id"
+    assert capture_requests.claim(kept) == capture_requests.CLOSED
+    # Within the flooding space the bound holds, oldest first.
+    assert [capture_requests.closed(k) for k in flood] == [False] * 7 + [True] * 3
+
+
+@pytest.mark.unit
+def test_the_testing_accounts_lookups_never_evict_a_real_closed_id(unit, monkeypatch):
+    from app.core import capture_requests
+    monkeypatch.setattr(capture_requests, "CLOSED_LIMIT", 3)
+    real = _cid()
+    assert _lookup(unit, real).status_code == 404
+    for _ in range(5):
+        assert _lookup(unit, _cid(), caller="testing").status_code == 404
+    shots = list(unit.backend.requested)
+    _abandoned(_single(unit, real))
+    assert unit.backend.requested == shots
+
+
+# ---------------------------------------------------------------------------
+# The lookup does no database I/O under the registry's lock
+# ---------------------------------------------------------------------------
+
+class _LookupSelects:
+    """Patch find for the lookup's own calls only: the first can be made to miss, the second to wait.
+
+    `second_started` is set when the lookup's second select begins; it
+    waits for `go` (bounded) before reading. The capture routes' own finds
+    are left alone.
+    """
+
+    def __init__(self, monkeypatch, first_misses=False, pause_second=True):
+        import sys
+        from app.core import capture_requests
+        self.real, self.calls = capture_requests.find, 0
+        self.second_started, self.go = threading.Event(), threading.Event()
+        self.lock_free_during_second = None
+
+        def find(db, client_capture_id, space):
+            if sys._getframe(1).f_code.co_name != "lookup":
+                return self.real(db, client_capture_id, space)
+            self.calls += 1
+            if self.calls == 1 and first_misses:
+                return None
+            if self.calls == 2 and pause_second:
+                self.second_started.set()
+                assert self.go.wait(20), "the test never let the lookup's second select go on"
+            return self.real(db, client_capture_id, space)
+
+        monkeypatch.setattr(capture_requests, "find", find)
+
+
+@pytest.mark.unit
+def test_the_registry_lock_is_free_while_the_lookups_second_select_runs(unit, own_sessions, monkeypatch):
+    from app.core import capture_requests
+    selects = _LookupSelects(monkeypatch)
+    cid = _cid()
+    lookup, out = _start(lambda: _lookup(unit, cid))
+    assert selects.second_started.wait(30), "the lookup never reached its second select"
+
+    other = ("real", _cid())
+    claimed = {}
+    t = threading.Thread(target=lambda: claimed.setdefault("state", capture_requests.claim(other)))
+    t.start()
+    t.join(5)
+    alive = t.is_alive()
+    selects.go.set()
+    lookup.join(60)
+    t.join(30)
+    assert not alive, "a claim waited for the lookup's select: the registry lock was held across it"
+    assert claimed["state"] == capture_requests.CLAIMED
+    capture_requests.release(other)
+    assert out["resp"].status_code == 404
+
+
+@pytest.mark.unit
+def test_a_post_claiming_after_the_lookups_close_is_abandoned_and_the_lookup_answers_404(unit, own_sessions,
+                                                                                         monkeypatch):
+    selects = _LookupSelects(monkeypatch)
+    cid = _cid()
+    shots = list(unit.backend.requested)
+    lookup, out = _start(lambda: _lookup(unit, cid))
+    assert selects.second_started.wait(30)
+    _abandoned(_single(unit, cid))
+    selects.go.set()
+    lookup.join(60)
+    assert out["resp"].status_code == 404 and out["resp"].json()["detail"]["code"] == "not_found"
+    assert unit.backend.requested == shots and _stored(unit) == []
+
+
+@pytest.mark.unit
+def test_a_capture_committed_before_the_mark_is_found_by_the_second_select_and_nothing_is_closed(unit, own_sessions,
+                                                                                          monkeypatch):
+    """The lookup's first select missed a row committed just after it; the second, after the close, finds it."""
+    from app.core import capture_requests
+    cid = _cid()
+    first = _ok(_dual(unit, cid))
+    _LookupSelects(monkeypatch, first_misses=True, pause_second=False)
+    looked = _lookup(unit, cid)
+    assert looked.status_code == 200 and looked.json()["record_id"] == first["record_id"], looked.text
+    assert looked.json()["in_progress"] is False
+    assert not capture_requests.closed(("real", cid)), "the key must be opened again"
+    assert _ok(_dual(unit, cid))["replayed"] is True
+
+
+@pytest.mark.unit
+def test_a_repeat_of_a_stored_id_while_a_mark_is_pending_is_refused_as_abandoned(unit, own_sessions,
+                                                                                            monkeypatch):
+    """The one imprecise case: the capture is stored, yet a second send in that window is refused.
+
+    No client produces it: the screen never sends an id again, it asks the lookup.
+    """
+    from app.core import capture_requests
+    cid = _cid()
+    first = _ok(_dual(unit, cid))
+    selects = _LookupSelects(monkeypatch, first_misses=True)
+    shots = list(unit.backend.requested)
+    lookup, out = _start(lambda: _lookup(unit, cid))
+    assert selects.second_started.wait(30)
+    _abandoned(_dual(unit, cid))
+    selects.go.set()
+    lookup.join(60)
+    assert out["resp"].status_code == 200 and out["resp"].json()["record_id"] == first["record_id"]
+    assert not capture_requests.closed(("real", cid))
+    assert _ok(_dual(unit, cid))["replayed"] is True
+    assert unit.backend.requested == shots
+
+
+# ---------------------------------------------------------------------------
+# A key is closed only by a "not found" that was actually answered
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_second_select_that_fails_leaves_the_key_open(unit, monkeypatch):
+    """The database drops during the lookup's second select: the ask fails, and the stored capture is not abandoned."""
+    import sys
+    from app.core import capture_requests
+    cid = _cid()
+    first = _ok(_dual(unit, cid))
+    real, calls = capture_requests.find, []
+
+    def find(db, client_capture_id, space):
+        if sys._getframe(1).f_code.co_name != "lookup":
+            return real(db, client_capture_id, space)
+        calls.append(client_capture_id)
+        if len(calls) == 1:
+            return None  # the first select misses
+        raise RuntimeError("the database went away")
+
+    monkeypatch.setattr(capture_requests, "find", find)
+    with pytest.raises(RuntimeError):
+        _lookup(unit, cid)
+    assert len(calls) == 2
+    assert not capture_requests.closed(("real", cid)), "a failed ask closed the key"
+    monkeypatch.setattr(capture_requests, "find", real)
+
+    looked = _lookup(unit, cid)
+    assert looked.status_code == 200 and looked.json()["record_id"] == first["record_id"], looked.text
+    shots = list(unit.backend.requested)
+    again = _ok(_dual(unit, cid))
+    assert again["replayed"] is True and again["record_id"] == first["record_id"]
+    assert unit.backend.requested == shots
+
+
+# ---------------------------------------------------------------------------
+# An answered close is final; a pending mark is its own lookup's
+# ---------------------------------------------------------------------------
+
+class _ScriptedSelects:
+    """The lookup's own selects, in the order they run, each one `real`, `miss`, `pause` or `pause_raise`.
+
+    A `pause` sets `paused[n]` and waits (bounded) for `go[n]`, n being its
+    position in the script; `pause_raise` then raises. Calls past the end of
+    the script, and every find that is not the lookup's, read the table.
+    """
+
+    def __init__(self, monkeypatch, *script):
+        import sys
+        from app.core import capture_requests
+        self.real, self.script, self.calls = capture_requests.find, list(script), 0
+        self.paused = [threading.Event() for _ in script]
+        self.go = [threading.Event() for _ in script]
+        guard = threading.Lock()
+
+        def find(db, client_capture_id, space):
+            if sys._getframe(1).f_code.co_name != "lookup":
+                return self.real(db, client_capture_id, space)
+            with guard:
+                n = self.calls
+                self.calls += 1
+            action = self.script[n] if n < len(self.script) else "real"
+            if action == "miss":
+                return None
+            if action in ("pause", "pause_raise"):
+                self.paused[n].set()
+                assert self.go[n].wait(20), f"the test never let select {n} go on"
+                if action == "pause_raise":
+                    raise RuntimeError("the database went away")
+            return self.real(db, client_capture_id, space)
+
+        monkeypatch.setattr(capture_requests, "find", find)
+
+
+def _start_catching(fn):
+    """_start, keeping an exception raised in the thread as the result."""
+    out = {}
+
+    def run():
+        try:
+            out["resp"] = fn()
+        except BaseException as exc:  # noqa: BLE001 - the test reads it
+            out["error"] = exc
+
+    t = threading.Thread(target=run)
+    t.start()
+    return t, out
+
+
+def _no_marks():
+    from app.core import capture_requests
+    with capture_requests._lock:
+        return not capture_requests._pending
+
+
+@pytest.mark.unit
+def test_a_failing_lookup_does_not_undo_another_lookups_answered_not_found(unit, own_sessions, monkeypatch):
+    """The reviewer's schedule: A misses and is pending when B misses twice and answers 404; A's select then
+    raises; a late POST is still refused, as B answered."""
+    from app.core import capture_requests
+    cid = _cid()
+    # A: first select (real, no row), second select paused then raising; B: both real.
+    selects = _ScriptedSelects(monkeypatch, "real", "pause_raise", "real", "real")
+    a, a_out = _start_catching(lambda: _lookup(unit, cid))
+    assert selects.paused[1].wait(30), "A never reached its second select"
+
+    b = _lookup(unit, cid)
+    assert b.status_code == 404 and b.json()["detail"]["code"] == "not_found", b.text
+    selects.go[1].set()
+    a.join(60)
+    assert isinstance(a_out.get("error"), RuntimeError), a_out
+    assert capture_requests.closed(("real", cid)), "A's failure undid B's answered close"
+    assert _no_marks()
+
+    shots = list(unit.backend.requested)
+    _abandoned(_single(unit, cid))
+    assert unit.backend.requested == shots and _stored(unit) == []
+
+
+@pytest.mark.unit
+def test_two_pending_lookups_of_a_stored_capture_both_find_it_and_close_nothing(unit, own_sessions, monkeypatch):
+    """A row committed before either mark is seen by both second selects; nothing can commit one while a mark
+    is pending, so one finding the row and the other not is not possible."""
+    from app.core import capture_requests
+    cid = _cid()
+    first = _ok(_dual(unit, cid))
+    # A: misses, then its second select waits; B: misses, then reads.
+    selects = _ScriptedSelects(monkeypatch, "miss", "pause", "miss", "real")
+    a, a_out = _start_catching(lambda: _lookup(unit, cid))
+    assert selects.paused[1].wait(30)
+    b = _lookup(unit, cid)
+    assert b.status_code == 200 and b.json()["record_id"] == first["record_id"], b.text
+    selects.go[1].set()
+    a.join(60)
+    assert a_out["resp"].status_code == 200 and a_out["resp"].json()["record_id"] == first["record_id"]
+    assert not capture_requests.closed(("real", cid)) and _no_marks()
+    assert _ok(_dual(unit, cid))["replayed"] is True
+
+
+@pytest.mark.unit
+def test_two_pending_lookups_of_an_unknown_id_both_answer_404_and_the_id_stays_closed(unit, own_sessions,
+                                                                                       monkeypatch):
+    from app.core import capture_requests
+    cid = _cid()
+    selects = _ScriptedSelects(monkeypatch, "real", "pause", "real", "real")
+    a, a_out = _start_catching(lambda: _lookup(unit, cid))
+    assert selects.paused[1].wait(30)
+    assert _lookup(unit, cid).status_code == 404
+    selects.go[1].set()
+    a.join(60)
+    assert a_out["resp"].status_code == 404
+    assert capture_requests.closed(("real", cid)) and _no_marks()
+    _abandoned(_single(unit, cid))
+
+
+@pytest.mark.unit
+def test_a_claim_while_a_mark_is_pending_is_refused_and_the_marks_owner_then_answers(unit, own_sessions,
+                                                                                     monkeypatch):
+    from app.core import capture_requests
+    cid = _cid()
+    selects = _ScriptedSelects(monkeypatch, "real", "pause")
+    a, a_out = _start_catching(lambda: _lookup(unit, cid))
+    assert selects.paused[1].wait(30)
+    with capture_requests._lock:
+        assert capture_requests._pending.get(("real", cid)), "the lookup holds no mark while its select runs"
+    assert not capture_requests.closed(("real", cid)), "a pending mark is not an answered close"
+    assert capture_requests.claim(("real", cid)) == capture_requests.CLOSED
+    selects.go[1].set()
+    a.join(60)
+    assert a_out["resp"].status_code == 404
+    assert capture_requests.closed(("real", cid)) and _no_marks()
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("ending", ["in_progress", "not_found", "stored_at_the_second_select", "raises", "gone"])
+def test_the_lookups_mark_is_removed_on_every_exit_path(unit, own_sessions, monkeypatch, ending):
+    from app.core import capture_requests
+    cid = _cid()
+    if ending == "in_progress":
+        assert capture_requests.claim(("real", cid)) == capture_requests.CLAIMED
+        assert _lookup(unit, cid).json() == {"in_progress": True}
+        capture_requests.release(("real", cid))
+    elif ending == "not_found":
+        assert _lookup(unit, cid).status_code == 404
+    elif ending == "stored_at_the_second_select":
+        _ok(_single(unit, cid))
+        _ScriptedSelects(monkeypatch, "miss", "real")
+        assert _lookup(unit, cid).status_code == 200
+    elif ending == "raises":
+        _ScriptedSelects(monkeypatch, "real", "pause_raise").go[1].set()
+        with pytest.raises(RuntimeError):
+            _lookup(unit, cid)
+        assert not capture_requests.closed(("real", cid))
+    else:
+        first = _ok(_single(unit, cid))
+        unit.client.delete(f"/records/images/{first['image_ids'][0]}", headers=unit.headers["operator"])
+        _ScriptedSelects(monkeypatch, "miss", "real")
+        _gone(_lookup(unit, cid))
+        assert not capture_requests.closed(("real", cid))
+    assert _no_marks(), "a lookup left its mark behind"
+
+
+@pytest.mark.unit
+def test_no_key_leaves_the_closed_ids_except_by_eviction(unit, own_sessions, monkeypatch):
+    """Every way out of the closed sets but the bound's popitem(last=False) is recorded, and none is taken."""
+    from collections import OrderedDict
+    from app.core import capture_requests
+
+    removed = []
+
+    class Guarded(OrderedDict):
+        def pop(self, key, *default):
+            removed.append(("pop", key))
+            return super().pop(key, *default)
+
+        def __delitem__(self, key):
+            removed.append(("del", key))
+            super().__delitem__(key)
+
+        def popitem(self, last=True):
+            if last:
+                removed.append(("popitem-last", None))
+            return super().popitem(last=last)
+
+        def clear(self):
+            removed.append(("clear", None))
+            super().clear()
+
+    monkeypatch.setattr(capture_requests, "_closed",
+                        {capture_requests.REAL: Guarded(), capture_requests.TESTING: Guarded()})
+    stored, unknown, failing = _cid(), _cid(), _cid()
+    _ok(_dual(unit, stored))
+    _lookup(unit, stored)
+    assert _lookup(unit, unknown).status_code == 404
+    _abandoned(_single(unit, unknown))
+    selects = _ScriptedSelects(monkeypatch, "miss", "real", "real", "pause_raise")
+    assert _lookup(unit, stored).status_code == 200
+    selects.go[3].set()
+    with pytest.raises(RuntimeError):
+        _lookup(unit, failing)
+    assert _lookup(unit, unknown).status_code == 404
+    assert removed == [], removed
