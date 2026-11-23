@@ -495,7 +495,7 @@ def test_get_unit_shape_for_any_role(client, db_session, fisqua):
     body = resp.json()
     assert body == {"mode": "offline", "projectsEnabled": True, "projectsShown": True,
                     "defaultProjectId": None, "prerequisites": {"backup": [], "fisqua": []},
-                    "keptVolumes": []}
+                    "keptVolumes": [], "defaultLanguage": "es", "captureKey": None}
 
 
 @pytest.mark.unit

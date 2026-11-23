@@ -1,7 +1,7 @@
 # Version: 0.3.0
 
 from typing import Optional, Literal
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, field_validator
 from datetime import datetime
 import re
 
@@ -61,6 +61,10 @@ class UserCreate(BaseModel):
     email: Optional[str] = None
     password: str
     role: Literal["admin", "operator", "reviewer"] = "reviewer"
+    # The unit's language, chosen at first run: applied, and taken as the
+    # account's language, only when this registration creates the first
+    # account; ignored otherwise.
+    default_language: Optional[Literal["es", "en"]] = None
 
     @field_validator("password")
     @classmethod
@@ -102,9 +106,18 @@ class UserRead(BaseModel):
     role: str
     is_active: bool
     created_at: Optional[datetime]
+    # `es` or `en`; null until the user has chosen one.
+    language: Optional[str] = None
 
     class Config:
         from_attributes = True
+
+
+class LanguageUpdate(BaseModel):
+    """The body of PUT /users/me/language."""
+    model_config = ConfigDict(extra="forbid")
+
+    language: Literal["es", "en"]
 
 
 class UserRoleUpdate(BaseModel):

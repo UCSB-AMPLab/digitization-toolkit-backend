@@ -232,7 +232,9 @@ def test_the_migration_follows_kept_on_unit_and_is_the_only_head(backend_root):
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    assert revisions - downs == {REVISION}
+    # The head is now the languages and capture key revision (test_first_run.py), which follows this one.
+    assert REVISION in downs
+    assert len(revisions - downs) == 1
 
 
 @pytest.mark.unit

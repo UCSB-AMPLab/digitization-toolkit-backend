@@ -191,6 +191,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token", "X-Requested-With"],
     expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "X-Page-Layout", "Retry-After"],
 )
+# The kiosk's first-run page, at http://localhost, asks the backend's
+# loopback address for GET /auth/setup/status and POST /auth/register, and
+# nothing else, without credentials (app.core.first_run_cors). Added after
+# CORSMiddleware so it runs before it.
+from app.core.first_run_cors import FirstRunCORSMiddleware
+
+app.add_middleware(FirstRunCORSMiddleware, configured_origins=settings.CORS_ORIGINS)
 
 # Every router runs the testing space's access rule (app.api.space), so a
 # route added to any of them later runs it too.
