@@ -106,6 +106,8 @@ def canonical_backend_name(value: str) -> str:
     which object a caller consults. Each site reads its own object, and they
     agree because they normalise the same way.
     """
+    if value is None:
+        return ""
     return value.strip().lower()
 
 
@@ -124,6 +126,13 @@ def assert_camera_backend_configured() -> str:
     answer /health, and fail at the moment someone tried to photograph
     something.
     """
+    if settings.CAMERA_BACKEND is None:
+        # Unset and not yet resolved: the backend is being built without the
+        # lifespan (a hardware test, a script). The same order of choice is
+        # applied here, and writes the kind to this `settings`.
+        from app.core import camera_kind
+
+        camera_kind.apply_at_startup()
     configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
         # The RAW value, from THE SAME object the check above read. A freshly
@@ -165,6 +174,14 @@ def get_backend() -> CameraBackend:
         if _backend is None:
             _backend = get_camera_backend()
             subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+            # Only a driver that was built is remembered as the kind last
+            # used, the fallback of a later start (app.core.camera_kind).
+            try:
+                from app.core import camera_kind
+
+                camera_kind.driver_built(settings.CAMERA_BACKEND)
+            except Exception as exc:
+                subprocess_logger.warning(f"The camera kind in use could not be remembered ({exc!r})")
         return _backend
 
 

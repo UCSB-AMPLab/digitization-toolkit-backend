@@ -427,3 +427,30 @@ def _no_real_chdk_keepalive_thread(request, monkeypatch):
     import capture.backends.chdk_backend as chdk_backend
 
     monkeypatch.setattr(chdk_backend, "_start_thread", _UnstartedThread)
+
+
+@pytest.fixture(autouse=True)
+def _camera_kind_isolated(monkeypatch, tmp_path_factory):
+    """No test reads or writes the unit's camera-kind store, or probes real hardware for cameras.
+
+    The store (app.core.camera_kind) is a file of this test's own, made
+    only when written; both detection probes find nothing unless a test
+    stubs them; and CAMERA_BACKEND is put back after the test on both live
+    settings objects, since the lifespan writes the kind it resolves there.
+    """
+    from app.core import camera_kind, config
+    from capture import service as capture_service
+
+    path = tmp_path_factory.mktemp("camera-kind") / "camera-kind.json"
+    monkeypatch.setattr(camera_kind, "store_path", lambda: path)
+    monkeypatch.setattr(camera_kind, "_libcamera_count", lambda: 0)
+    monkeypatch.setattr(camera_kind, "_canon_product_ids", lambda: [])
+    monkeypatch.setattr(camera_kind, "_in_effect", None)
+    monkeypatch.setattr(camera_kind, "_probe_failures", {}, raising=False)
+    monkeypatch.setattr(camera_kind, "_built_recorded", False, raising=False)
+    monkeypatch.setattr(camera_kind, "_applied_choice", None, raising=False)
+    monkeypatch.setattr(camera_kind, "_availability",
+                        lambda: {"picamera2": True, "gphoto2": True, "chdk": True}, raising=False)
+    monkeypatch.setattr(camera_kind, "_rpicam_available", lambda: True, raising=False)
+    for settings in {id(config.settings): config.settings, id(capture_service.settings): capture_service.settings}.values():
+        monkeypatch.setattr(settings, "CAMERA_BACKEND", settings.CAMERA_BACKEND)

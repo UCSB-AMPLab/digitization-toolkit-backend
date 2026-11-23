@@ -86,7 +86,12 @@ async def lifespan(app: FastAPI):
     # Imported inside the lifespan, as shutdown_backend is, so importing the
     # application does not pull in the capture stack.
     from capture.service import assert_camera_backend_configured
+    # Which kind of camera the unit drives: the administrator's stored
+    # choice, an explicit CAMERA_BACKEND, detection, or the kind last used
+    # (app.core.camera_kind), written where the guard and the drivers read it.
+    from app.core import camera_kind
 
+    camera_kind.apply_at_startup()
     camera_backend = assert_camera_backend_configured()
     # Finish or discard any project rename interrupted by a crash/power loss before serving requests
     from app.core.db import SessionLocal

@@ -1363,6 +1363,7 @@ class ChdkBackend(CameraBackend):
             with self._map_lock:
                 if self._bodies.get(body.key) is body:
                     del self._bodies[body.key]
+                    self._published_body_count = len(self._bodies)
                     self._indices = {
                         index: key for index, key in self._indices.items()
                         if key != body.key
@@ -1745,6 +1746,7 @@ class ChdkBackend(CameraBackend):
                 if fresh:
                     with self._map_lock:
                         self._bodies[key] = body
+                        self._published_body_count = len(self._bodies)
 
             # Publishing is where a body changes index, and a capture that is
             # already running on one is using the index it had when it
@@ -4064,6 +4066,21 @@ class ChdkBackend(CameraBackend):
 
     def get_backend_name(self) -> str:
         return "chdk"
+
+    def held_body_count(self) -> "int | None":
+        """How many bodies this backend holds open, read from its map; nothing is sent to a camera, and nothing waits.
+
+        The lock is only tried: when it is taken, the count last published
+        with the map is given (None before the first).
+        """
+        if not self._map_lock.acquire(blocking=False):
+            return getattr(self, "_published_body_count", None)
+        try:
+            count = len(self._bodies)
+            self._published_body_count = count
+            return count
+        finally:
+            self._map_lock.release()
 
     def cleanup(self):
         """Close every open body, waiting for whatever is using it.

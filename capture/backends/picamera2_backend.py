@@ -182,6 +182,11 @@ class Picamera2Backend(CameraBackend):
             self._camera_info = Picamera2.global_camera_info()
         return self._camera_info
     
+    def held_body_count(self) -> Optional[int]:
+        """How many cameras the cached global_camera_info() lists, or None before it is cached; nothing is enumerated."""
+        info = getattr(self, "_camera_info", None)
+        return None if info is None else len(info)
+
     def camera_model(self, camera_index: int) -> Optional[str]:
         """The camera's Model from the cached global_camera_info(), if cached.
 
