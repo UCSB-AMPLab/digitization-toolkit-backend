@@ -370,15 +370,18 @@ def test_project(db_session, test_user):
 @pytest.fixture(autouse=True)
 def _clean_process_state():
     """Every test starts and ends with no unit work counted, no restart pending, no offsite block,
-    a clear restart latch and no shutdown begun: these are process-wide (app.core.unit_activity,
-    app.core.restart_latch), so one test's leftovers would otherwise reach the next."""
-    from app.core import restart_latch, unit_activity
+    a clear restart latch, no shutdown begun and no capture id in flight or closed: these are
+    process-wide (app.core.unit_activity, app.core.restart_latch, app.core.capture_requests), so
+    one test's leftovers would otherwise reach the next."""
+    from app.core import capture_requests, restart_latch, unit_activity
 
     unit_activity._reset_for_tests()
     restart_latch._reset_for_tests()
+    capture_requests._reset_for_tests()
     yield
     unit_activity._reset_for_tests()
     restart_latch._reset_for_tests()
+    capture_requests._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
