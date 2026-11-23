@@ -2214,8 +2214,10 @@ def get_capture_request(
 
 	200 with the capture saved under it, as a repeated request is answered,
 	and `in_progress` false; 200 `{"in_progress": true}` while a request
-	with it is running; 404 when neither, including a saved capture with an
-	image deleted and any id of the other space. A malformed id is a 422.
+	with it is running; 410 `capture_no_longer_stored` when a capture was
+	saved under it and its record or an image has been deleted since; 404
+	when no capture was saved under it in the caller's space, after which
+	the id is closed (app.core.capture_requests). A malformed id is a 422.
 	"""
 	from app.core.testing_space import not_found_detail
 
