@@ -48,12 +48,18 @@ under that serial. Canon bodies have distinct serials.
 Version: 0.3.0
 """
 
+import contextlib
+import contextvars
 import copy
+import fcntl
+import functools
+import logging
 import json
 import os
 import re
 import threading
 import time
+from collections import deque
 from pathlib import Path
 
 try:
@@ -71,6 +77,7 @@ except ImportError:
 
 from .base import (
     IMAGE_FORMATS, CameraBackend, normalise_camera_model, normalise_image_format,
+    preview_request, in_preview_request,
 )
 # Re-exported below for the callers that import it from here (app/api/cameras.py,
 # tests/unit/test_test_capture_route.py). The class itself is shared, so a CHDK
@@ -216,8 +223,7 @@ def _open_camera_registry():
 
     return CameraRegistry()
 
-# Minimum settle time used as retry_delay in capture (seconds).
-# Canon EOS 1500D needs ~3s between shots for reliable PTP operation.
+# Capture retry defaults match the exposure-sized busy polling policy.
 _DEFAULT_SETTLE = 3.0
 _DEFAULT_RETRY = 3
 
@@ -235,12 +241,8 @@ _EVENT_STEP_MS = 500
 # a short exposure. Treat both as this many seconds of exposure when sizing
 # the deadline.
 _UNKNOWN_EXPOSURE_S = 30.0
-# Focus check (NEH-339): the Refocus dialog's test picture, taken with the lens
-# on autofocus. A body that cannot find focus on AF does not release the
-# shutter, and under the normal policy (three trigger attempts, each busy one
-# waited out for the full capture deadline) that holds the camera's lock for
-# minutes. A focus check gets one trigger attempt and this many seconds from
-# the trigger to the file, whatever the exposure.
+# A Refocus test picture uses AF and this shorter deadline after an accepted
+# trigger, whatever the exposure. A busy response gets no retry on this path.
 _FOCUS_CHECK_DEADLINE_S = 20.0
 
 # Where the index -> body bindings are kept between runs, next to cameras.json
@@ -281,7 +283,7 @@ _PREVIEW_RETRY_DELAY_S = 0.1
 # starts a new run, so an old failure cannot close a session at once.
 _PREVIEW_FAILURE_GAP_S = 2 * _ROUTINE_SCAN_MIN_S
 
-_USB_PORT_RE = re.compile(r"usb:(\d{3}),(\d{3})")
+_USB_PORT_RE = re.compile(r"usb:([0-9]{3}),([0-9]{3})")
 
 # Where the USB topology path of a port is looked up; a module-level name so
 # tests can point it at a directory of their own.
@@ -363,6 +365,509 @@ def _capture_deadline_s(exposure: float) -> float:
     return _CAPTURE_TIMEOUT_BASE_S + 2 * exposure
 
 
+class _InitGate:
+    """FIFO admission prevents an opener's retry overtaking queued bodies."""
+
+    def __init__(self):
+        self._condition = threading.Condition()
+        self._waiters = deque()
+        self._active = False
+        self._holder = None
+
+    def acquire(self, blocking=True, timeout=-1):
+        return self._acquire(blocking, timeout, None)[0]
+
+    def acquire_for_port(self, port, timeout):
+        return self._acquire(True, timeout, (_OPEN_HOLDER_LABELS.get().get(port), port))
+
+    def _acquire(self, blocking, timeout, port):
+        if not blocking and timeout != -1:
+            raise ValueError("a nonblocking acquire cannot have a timeout")
+        deadline = None if timeout < 0 else _init_wait_clock() + timeout
+        ticket = object()
+        with self._condition:
+            if not blocking and (self._active or self._waiters):
+                return False, self._holder
+            self._waiters.append(ticket)
+            try:
+                while self._active or self._waiters[0] is not ticket:
+                    remaining = None if deadline is None else deadline - _init_wait_clock()
+                    if remaining is not None and remaining <= 0:
+                        self._waiters.remove(ticket)
+                        self._condition.notify_all()
+                        return False, self._holder
+                    self._condition.wait(remaining)
+                self._waiters.popleft()
+                self._active = True
+                self._holder = port
+                return True, None
+            except BaseException:
+                if ticket in self._waiters:
+                    self._waiters.remove(ticket)
+                self._condition.notify_all()
+                raise
+
+    def release(self):
+        with self._condition:
+            if not self._active:
+                raise RuntimeError("release of an unlocked init gate")
+            self._active = False
+            self._holder = None
+            self._condition.notify_all()
+
+    def locked(self):
+        with self._condition:
+            return self._active
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+
+
+# Back-off metadata never waits for the gate; native init acquires no backend locks.
+# A native init that never returns keeps the gate until process exit;
+# unplugging releases it only if the native call then returns.
+_init_wait_clock = time.monotonic
+_INIT_LOCK = _InitGate()
+_INIT_BACKOFF_LOCK = threading.Lock()
+_init_backoff = {}
+_INIT_BACKOFF_S = 20.0
+_INIT_SLOW_S = 1.0
+_RESET_LOCK = threading.Lock()
+_WAIT_LOG = logging.getLogger(__name__)
+_OPEN_POLICY = contextvars.ContextVar("gphoto2_open_policy", default=(None, True))
+_OPEN_LABELS = contextvars.ContextVar("gphoto2_open_labels", default={})
+_OPEN_HOLDER_LABELS = contextvars.ContextVar("gphoto2_holder_labels", default={})
+_RESET_CALL = contextvars.ContextVar("gphoto2_reset_call", default=None)
+_recent_resets = {}
+_reset_attempts = {}
+_RESET_LIMIT = 2
+_INIT_LOCK_WAIT_S = 5.0
+_WAIT_INFO_THRESHOLD_S = 0.250
+_CAMERA_LOCK_INFO_THRESHOLD_S = 10.0
+_RESET_INTERVAL_S = 20.0
+_STARTUP_INFO_THRESHOLD_S = 1.0
+_OPEN_DRAIN_S = 5.0
+_OPEN_DRAIN_EVENTS = 1000
+_usb_open, _usb_read, _usb_close = os.open, os.read, os.close
+_usb_ioctl = fcntl.ioctl
+_usb_sleep = time.sleep
+
+
+@contextlib.contextmanager
+def _wait_log(port, reason):
+    start = time.monotonic()
+    outcome = "ok"
+    details = {}
+    try:
+        yield details
+    except BaseException as exc:
+        outcome = "failed"
+        details.setdefault("error", repr(str(exc)))
+        raise
+    finally:
+        elapsed = time.monotonic() - start
+        if reason == "startup events":
+            report = (outcome == "failed" or details.get("files", 0) > 0
+                      or elapsed > _STARTUP_INFO_THRESHOLD_S)
+        elif reason == "camera lock":
+            report = outcome == "failed" or elapsed > _CAMERA_LOCK_INFO_THRESHOLD_S
+        elif reason == "camera init":
+            report = outcome == "failed" or details.get("held_s", elapsed) > _INIT_SLOW_S
+        elif (reason in {"session close", "capture download/save", "captured file delete"}
+              or reason.startswith(("identification ", "capture events", "trigger"))):
+            report = outcome == "failed"
+        else:
+            report = (reason.startswith("USB ") or reason == "busy capture events"
+                      or elapsed >= _WAIT_INFO_THRESHOLD_S)
+        deferred = details.pop("_defer", None)
+        if report:
+            emit = functools.partial(_WAIT_LOG.info,
+                "[gphoto2] %s: wait reason=%s duration=%.3fs outcome=%s%s%s",
+                _journal_camera(port), reason, elapsed, outcome,
+                "".join(f" {key}={value}" for key, value in details.items()),
+                f" ({port})" if str(port).startswith("usb:") else "",
+            )
+            if deferred is None:
+                emit()
+            else:
+                deferred.append(emit)
+
+
+class _CameraLock:
+    """A per-index lock reports the time a caller waits for that camera."""
+
+    def __init__(self, index):
+        self._lock = threading.Lock()
+        self._index = index
+
+    def acquire(self, blocking=True, timeout=-1):
+        with _wait_log(f"camera {self._index}", "camera lock") as detail:
+            acquired = self._lock.acquire(blocking, timeout)
+            detail["acquired"] = acquired
+            return acquired
+
+    def release(self):
+        self._lock.release()
+
+    def locked(self):
+        return self._lock.locked()
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *exc_info):
+        self.release()
+
+
+def _one_reset_call(method):
+    @functools.wraps(method)
+    def run(*args, **kwargs):
+        if _RESET_CALL.get() is not None:
+            return method(*args, **kwargs)
+        token = _RESET_CALL.set(set())
+        try:
+            return method(*args, **kwargs)
+        finally:
+            _RESET_CALL.reset(token)
+    return run
+
+
+def _usb_attachment(port):
+    """Socket, address, sysfs lifetime, vendor and product; None without sysfs."""
+    name = usb_topology.from_gphoto2_port(port, sysfs_root=_SYSFS_USB_DEVICES)
+    if name is None:
+        return None
+    base = Path(_SYSFS_USB_DEVICES) / name
+    try:
+        inode = base.stat().st_ino
+        dev = int((base / "devnum").read_text())
+        vendor = int((base / "idVendor").read_text(), 16)
+        product = int((base / "idProduct").read_text(), 16)
+        if base.stat().st_ino != inode or dev != int(port.rsplit(",", 1)[1]):
+            return None
+        return name, dev, inode, vendor, product
+    except (OSError, ValueError):
+        return None
+
+
+def _port_at_socket(socket):
+    base = Path(_SYSFS_USB_DEVICES) / socket
+    try:
+        bus = int((base / "busnum").read_text())
+        dev = int((base / "devnum").read_text())
+        return f"usb:{bus:03d},{dev:03d}"
+    except (OSError, ValueError):
+        return None
+
+
+class _PortMoved(RuntimeError):
+    def __init__(self, new_port, source_port=None):
+        self.new_port = new_port
+        label = _operator_camera(source_port or new_port)
+        super().__init__(
+            f"{label}: the camera reconnected. Wait and try again; "
+            "if it repeats, switch the camera off and on."
+        )
+
+
+class _PortClaimedError(RuntimeError):
+    """An in-flight claim prevents identification at this index."""
+
+    def __init__(self, port, holder, label):
+        self.port, self.holder = port, holder
+        super().__init__(f"{label}: the camera is already in use. Wait and try again.")
+
+
+class CaptureAttributionError(RuntimeError):
+    """A startup object cannot safely become this capture's page."""
+
+
+def _new_camera(model, port):
+    abilities = gp.CameraAbilitiesList()
+    abilities.load()
+    cam = gp.Camera()
+    cam.set_abilities(abilities[abilities.lookup_model(model)])
+    ports = gp.PortInfoList()
+    ports.load()
+    cam.set_port_info(ports[ports.lookup_path(port)])
+    return cam
+
+
+def _operator_camera(port):
+    return _OPEN_LABELS.get().get(port, "This camera")
+
+
+def _journal_camera(port):
+    if str(port).startswith("usb:"):
+        return _operator_camera(port)
+    return port
+
+
+def _backoff_key(port, attachment):
+    return attachment[0] if attachment is not None else port
+
+
+def _prune_init_backoff(now):
+    for key, (_, until, _) in list(_init_backoff.items()):
+        if now >= until:
+            del _init_backoff[key]
+
+
+class _PreviewInitPaused(RuntimeError):
+    """Human labels are rendered after the init gate has been released."""
+
+    def __init__(self, label, remaining, error):
+        super().__init__("Preview startup is paused")
+        self.label, self.remaining, self.error = label, remaining, error
+
+    def __str__(self):
+        label = str(self.label) if self.label is not None else None
+        return (
+            f"{label or 'This camera'}: preview startup is paused for {self.remaining:.1f}s. "
+            f"Wait and try again, or switch {label or 'this camera'} off and on."
+        )
+
+
+def _check_init_backoff(port, attachment):
+    """Expiry or a changed USB attachment admits another native attempt."""
+    now = _monotonic()
+    key = _backoff_key(port, attachment)
+    with _INIT_BACKOFF_LOCK:
+        _prune_init_backoff(now)
+        entry = _init_backoff.get(key)
+        if entry is not None and entry[0] != attachment:
+            del _init_backoff[key]
+            entry = None
+    if entry is not None:
+        _, until, error = entry
+        raise _PreviewInitPaused(_OPEN_LABELS.get().get(port), until - now, error)
+
+
+def _record_init_failure(port, attachment, exc, held_s):
+    if held_s <= _INIT_SLOW_S:
+        return
+    now = _monotonic()
+    error = f"{type(exc).__name__}: {exc}"
+    with _INIT_BACKOFF_LOCK:
+        _prune_init_backoff(now)
+        # Text retains the error without retaining its native session or traceback.
+        _init_backoff[_backoff_key(port, attachment)] = (
+            attachment, now + _INIT_BACKOFF_S, error
+        )
+    return True
+
+
+def _clear_init_failure(port, attachment):
+    key = _backoff_key(port, attachment)
+    with _INIT_BACKOFF_LOCK:
+        entry = _init_backoff.get(key)
+        if entry is not None and entry[0] == attachment:
+            del _init_backoff[key]
+
+
+def _init_camera(model, port, expected, may_reset):
+    """One reset at most, bound to a descriptor opened before the failing init.
+
+    The descriptor pins the kernel device across address reuse. Sysfs lifetime
+    and socket checks reject a replacement before opening that descriptor.
+    A reset follows only a transport init error, never a configuration error.
+    """
+    may_reset = may_reset and not in_preview_request()
+    attachment = _usb_attachment(port)
+    # Back-off throttles previews only; reset-capable opens follow the reset cooldown alone.
+    if not may_reset:
+        _check_init_backoff(port, attachment)
+    fd = None
+    if may_reset and expected is not None and expected[3] == 0x04a9:
+        match = _USB_PORT_RE.fullmatch(port)
+        if match and _usb_attachment(port) == expected:
+            try:
+                fd = _usb_open(f"/dev/bus/usb/{match[1]}/{match[2]}", os.O_RDWR)
+                descriptor = _usb_read(fd, 18)
+                valid = (len(descriptor) == 18
+                         and int.from_bytes(descriptor[8:10], "little") == expected[3]
+                         and int.from_bytes(descriptor[10:12], "little") == expected[4]
+                         and _usb_attachment(port) == expected)
+                if not valid:
+                    _usb_close(fd)
+                    fd = None
+            except OSError:
+                if fd is not None:
+                    _usb_close(fd)
+                fd = None
+    try:
+        try:
+            cam = _init_once(model, port, attachment, may_reset=may_reset)
+            if expected is not None:
+                with _RESET_LOCK:
+                    _reset_attempts.pop(expected[0], None)
+            return cam
+        except gp.GPhoto2Error as exc:
+            code = getattr(exc, "code", None)
+            if code is None:
+                match = re.match(r"\s*\[(-\d+)\]", str(exc))
+                code = int(match[1]) if match else None
+            if code not in (-7, -10):
+                raise
+            if fd is None:
+                _WAIT_LOG.info(
+                    "[gphoto2] %s: USB reset unavailable; no validated descriptor for init error %s",
+                    port, code,
+                )
+                raise
+            socket = expected[0]
+            now = _monotonic()
+            in_call = _RESET_CALL.get()
+            # Only recent socket attempts remain in the rate table.
+            with _RESET_LOCK:
+                for key, at in list(_recent_resets.items()):
+                    if now - at >= _RESET_INTERVAL_S:
+                        del _recent_resets[key]
+                exhausted = _reset_attempts.get(socket, 0) >= _RESET_LIMIT
+                refused = (exhausted or socket in _recent_resets
+                           or (in_call is not None and socket in in_call))
+                if not refused:
+                    _recent_resets[socket] = now
+                    _reset_attempts[socket] = _reset_attempts.get(socket, 0) + 1
+                    if in_call is not None:
+                        in_call.add(socket)
+            if refused:
+                _WAIT_LOG.info(
+                    "[gphoto2] %s: USB reset suppressed reason=%s; switch the camera off and on, then try again",
+                    port, "two-attempt limit" if exhausted else "call/cooldown",
+                )
+                raise
+            _WAIT_LOG.info("[gphoto2] %s: USB reset reason=init error %s socket=%s", port, code, socket)
+            try:
+                with _wait_log(port, "USB reset ioctl"):
+                    _usb_ioctl(fd, 0x5514, 0)
+            except OSError as reset_error:
+                _WAIT_LOG.warning("[gphoto2] %s: USB reset refused: %s", port, reset_error)
+                raise exc from reset_error
+            with _wait_log(port, "USB reset settle"):
+                _usb_sleep(2.0)
+            retry_error = exc
+            retried = False
+            new_port = None
+            with _wait_log(port, "USB socket reappearance"):
+                for step in range(17):
+                    current = _port_at_socket(socket)
+                    if current and current != port:
+                        _WAIT_LOG.info("[gphoto2] %s: USB reset new address=%s socket=%s", port, current, socket)
+                        new_port = current
+                        break
+                    if current == port and not retried:
+                        retried = True
+                        try:
+                            cam = _init_once(model, port, attachment, may_reset=True)
+                        except gp.GPhoto2Error as err:
+                            retry_error = err
+                        else:
+                            with _RESET_LOCK:
+                                _reset_attempts.pop(socket, None)
+                            _WAIT_LOG.info("[gphoto2] %s: USB reset recovered body", port)
+                            return cam
+                    if step < 16:
+                        _usb_sleep(0.5)
+            if new_port is not None:
+                raise _PortMoved(new_port, port)
+            raise retry_error
+    finally:
+        if fd is not None:
+            try:
+                _usb_close(fd)
+            except OSError as exc:
+                _WAIT_LOG.warning("[gphoto2] %s: USB descriptor close failed: %s", port, exc)
+
+
+def _init_once(model, port, attachment, may_reset=False):
+    if not may_reset:
+        _check_init_backoff(port, attachment)
+    pending = []
+    with _wait_log(port, "init lock") as detail:
+        acquired, holder = _INIT_LOCK.acquire_for_port(port, _INIT_LOCK_WAIT_S)
+        detail["acquired"] = acquired
+        if not acquired:
+            if holder is None or holder[0] is None:
+                raise RuntimeError("The cameras are busy starting. Wait and try again.")
+            label, address = holder
+            detail["holder"] = f"{label} ({address})"
+            waiting = _OPEN_LABELS.get().get(port, "This camera")
+            if waiting == "the other camera":
+                waiting = "This camera"
+            raise RuntimeError(
+                f"{waiting} is waiting for {label} to finish starting. "
+                f"Switch {label} off and on, then wait and try again; "
+                "if it repeats, ask the administrator."
+            )
+        detail["_defer"] = pending
+    started = _monotonic()
+    paused = False
+    failure = None
+    initialized = handed_back = False
+    try:
+        # A queued preview observes a slow failure recorded by the preceding owner.
+        if not may_reset:
+            _check_init_backoff(port, attachment)
+        try:
+            with _wait_log(port, "camera init") as detail:
+                detail["_defer"] = pending
+                try:
+                    cam = _new_camera(model, port)
+                    cam.init()
+                    initialized = True
+                finally:
+                    held_s = _monotonic() - started
+                    detail["held_s"] = held_s
+        except BaseException as exc:
+            if not initialized:
+                paused = _record_init_failure(port, attachment, exc, held_s)
+            failure = exc
+            raise
+        _clear_init_failure(port, attachment)
+        handed_back = True
+        return cam
+    finally:
+        _INIT_LOCK.release()
+        # Diagnostic role reads and journal writes never hold the init gate.
+        try:
+            for emit in pending:
+                emit()
+            if paused:
+                _WAIT_LOG.info(
+                    "[gphoto2] %s: preview init back-off held=%.3fs interval=%gs error=%r (%s)",
+                    _journal_camera(port), held_s, _INIT_BACKOFF_S, str(failure), port,
+                )
+        except BaseException:
+            handed_back = False
+            raise
+        finally:
+            if initialized and not handed_back:
+                try:
+                    cam.exit()
+                except BaseException:
+                    pass
+
+
+def _close_failed_capture(method):
+    @functools.wraps(method)
+    def run(self, *args, **kwargs):
+        try:
+            return method(self, *args, **kwargs)
+        except BaseException:
+            try:
+                self.close()
+            except BaseException:
+                pass
+            raise
+    return run
+
+
 class _PTPSession:
     """
     An open PTP/USB session to one DSLR camera.
@@ -375,6 +880,7 @@ class _PTPSession:
         self.port = port
         self.model = model
         self._logger = logger
+        self._label = _operator_camera(port)
         self._cam = None
         # Focus mode as read at session open; named in capture timeout messages.
         self._focus_mode = None
@@ -397,25 +903,18 @@ class _PTPSession:
         # nothing is stored, the registry could not be read, or the body's
         # identity is unknown.
         self.stored_format = None
+        # Only files announced before this session sends any trigger live here.
+        # The startup event cap bounds this set for the entire session.
+        self._unsolicited = set()
         self._open()
 
     def _open(self):
-        abilities_list = gp.CameraAbilitiesList()
-        abilities_list.load()
-        self._cam = gp.Camera()
-        abilities_idx = abilities_list.lookup_model(self.model)
-        self._cam.set_abilities(abilities_list[abilities_idx])
-
-        port_info_list = gp.PortInfoList()
-        port_info_list.load()
-        port_idx = port_info_list.lookup_path(self.port)
-        self._cam.set_port_info(port_info_list[port_idx])
-
-        self._cam.init()
-        self._logger.info(f"[gphoto2] Opened session: {self.model} on {self.port}")
-        # Run post-init config; on any error release the USB claim so the
-        # next attempt isn't blocked by a half-open session.
+        expected, may_reset = _OPEN_POLICY.get()
+        self._cam = _init_camera(self.model, self.port, expected, may_reset)
+        # Every exit after native init releases this session's USB claim.
         try:
+            self._logger.info(f"[gphoto2] Opened session: {self.model} on {self.port}")
+            self._drain_startup()
             self._apply_speed_preset()
             self._disable_autopoweroff()
             self._warn_if_af()
@@ -425,22 +924,69 @@ class _PTPSession:
             # without a second PTP round trip. The serial and the body's own
             # model come off one fetch of the config tree.
             try:
-                cfg = self._cam.get_config()
+                with _wait_log(self.port, "session identity read"):
+                    cfg = self._cam.get_config()
             except gp.GPhoto2Error:
                 cfg = None
             serial = self._child_value(cfg, "serialnumber")
             self.serial = str(serial).strip() if serial is not None else ""
             self.body_model = self._read_body_model(cfg)
             self.opened_imageformat = self._child_value(cfg, "imageformat")
-        except Exception as exc:
-            self._logger.warning(
-                f"[gphoto2] {self.port}: error during session init ({exc}), releasing device"
-            )
+        except BaseException:
             try:
-                self._cam.exit()
-            except Exception:
+                self.close()
+            except BaseException:
                 pass
             raise
+
+    def _drain_startup(self, step_ms=100):
+        """Read startup events before configuration without fetching camera files.
+
+        A timeout means the queue answered empty, not that an exposure finished.
+        The time and event caps stop noisy bodies before a shutter is requested.
+        Native event processing can outlast the Python budget.
+        """
+        start = time.monotonic()
+        count = 0
+        with _wait_log(self.port, "startup events") as detail:
+            try:
+                while count < _OPEN_DRAIN_EVENTS and time.monotonic() - start < _OPEN_DRAIN_S:
+                    event, data = self._cam.wait_for_event(step_ms)
+                    if event == gp.GP_EVENT_TIMEOUT:
+                        return
+                    count += 1
+                    if event == gp.GP_EVENT_FILE_ADDED:
+                        key = (data.folder, data.name)
+                        if key not in self._unsolicited:
+                            self._unsolicited.add(key)
+                            _WAIT_LOG.warning(
+                                "[gphoto2] %s: startup file=%s/%s; not fetched or deleted; excluded from this session's captures (%s)",
+                                _journal_camera(self.port), *key, self.port,
+                            )
+                raise CaptureAttributionError(
+                    f"{_operator_camera(self.port)}: startup events did not clear; no picture was requested. "
+                    "Switch the camera off and on, then try again."
+                )
+            except gp.GPhoto2Error as exc:
+                detail["error"] = repr(str(exc))
+                raise CaptureAttributionError(
+                    f"{_operator_camera(self.port)}: could not read startup events; no picture was requested. "
+                    "Switch the camera off and on, then try again."
+                ) from exc
+            finally:
+                detail.update(count=count, files=len(self._unsolicited))
+
+    def _capture_file(self, data):
+        if (data.folder, data.name) in self._unsolicited:
+            _WAIT_LOG.warning(
+                "[gphoto2] %s: refused startup file=%s/%s (%s)",
+                getattr(self, "_label", _operator_camera(self.port)), data.folder, data.name, self.port,
+            )
+            raise CaptureAttributionError(
+                f"{getattr(self, '_label', _operator_camera(self.port))}: a file was announced at startup; "
+                "nothing saved or deleted. Take the page again; if it repeats, switch the camera off and on."
+            )
+        return data
 
     # ------------------------------------------------------------------
     # Config helpers
@@ -448,18 +994,20 @@ class _PTPSession:
 
     def _set_config(self, key: str, value) -> bool:
         try:
-            cfg = self._cam.get_config()
-            widget = cfg.get_child_by_name(key)
-            widget.set_value(value)
-            self._cam.set_config(cfg)
+            with _wait_log(self.port, f"set config {key}"):
+                cfg = self._cam.get_config()
+                widget = cfg.get_child_by_name(key)
+                widget.set_value(value)
+                self._cam.set_config(cfg)
             return True
         except (gp.GPhoto2Error, TypeError, ValueError):
             return False
 
     def _get_config(self, key: str):
         try:
-            cfg = self._cam.get_config()
-            return cfg.get_child_by_name(key).get_value()
+            with _wait_log(self.port, f"read config {key}"):
+                cfg = self._cam.get_config()
+                return cfg.get_child_by_name(key).get_value()
         except gp.GPhoto2Error:
             return None
 
@@ -622,7 +1170,8 @@ class _PTPSession:
         """
         for attempt in range(1, retry + 1):
             try:
-                self._cam.trigger_capture()
+                with _wait_log(self.port, "trigger"):
+                    self._cam.trigger_capture()
                 return None
             except gp.GPhoto2Error as exc:
                 if not _is_busy_trigger_error(exc):
@@ -638,6 +1187,7 @@ class _PTPSession:
                     continue
                 raise
 
+
     def _poll_for_file(self, window_s: float):
         """Poll the event queue for window_s seconds; return a file if one lands.
 
@@ -646,12 +1196,14 @@ class _PTPSession:
         window even though trigger_capture() itself raised. Returns None if
         the window elapses with no file seen.
         """
-        start = time.monotonic()
-        while time.monotonic() - start < window_s:
-            event_type, event_data = self._cam.wait_for_event(_EVENT_STEP_MS)
-            if event_type == gp.GP_EVENT_FILE_ADDED:
-                return event_data
-        return None
+        with _wait_log(self.port, "busy capture events"):
+            start = time.monotonic()
+            while time.monotonic() - start < window_s:
+                event_type, event_data = self._cam.wait_for_event(_EVENT_STEP_MS)
+                if event_type == gp.GP_EVENT_FILE_ADDED:
+                    return self._capture_file(event_data)
+            return None
+
 
     def _wait_for_file_added(self, deadline_s: float, shutterspeed=None):
         """Poll the camera's event queue until a file lands, or the deadline passes.
@@ -661,11 +1213,10 @@ class _PTPSession:
         timeout, unknown - just continues the loop. The deadline is checked
         between wait_for_event() calls, each of which is bounded by
         libgphoto2's own USB timeouts, and only after a call comes back
-        without a file. A file that arrives after the deadline has already
-        passed is still returned, never treated as a timeout - the check
-        only ever runs on an empty queue, and a delivered image is a good
-        capture regardless of when it lands. The deadline bounds how long an
-        empty queue is waited on, not whether a delivered file is accepted.
+        without an acceptable file. Paths announced before this session's
+        first trigger are excluded. Any other delivered file is accepted even
+        after the deadline; the deadline bounds polling, not file attribution.
+        The event supplies no token that links it to the accepted trigger.
 
         Errors raised by wait_for_event() propagate untouched: the shutter has
         already fired by this point, so re-triggering would take a second
@@ -675,7 +1226,7 @@ class _PTPSession:
         while True:
             event_type, event_data = self._cam.wait_for_event(_EVENT_STEP_MS)
             if event_type == gp.GP_EVENT_FILE_ADDED:
-                return event_data
+                return self._capture_file(event_data)
             elapsed = time.monotonic() - start
             if elapsed >= deadline_s:
                 hint = ""
@@ -711,7 +1262,8 @@ class _PTPSession:
         """
         start = time.monotonic()
         try:
-            self._cam.trigger_capture()
+            with _wait_log(self.port, "trigger (focus check)"):
+                self._cam.trigger_capture()
         except gp.GPhoto2Error as exc:
             if not _is_busy_trigger_error(exc):
                 raise
@@ -727,7 +1279,8 @@ class _PTPSession:
             return file_path
         remaining = _FOCUS_CHECK_DEADLINE_S - (time.monotonic() - start)
         try:
-            return self._wait_for_file_added(remaining, shutterspeed)
+            with _wait_log(self.port, "capture events (focus check)"):
+                return self._wait_for_file_added(remaining, shutterspeed)
         except CaptureTimeoutError as exc:
             # Re-worded without the "flip to MF" hint: a focus check runs on
             # AF by design.
@@ -735,6 +1288,8 @@ class _PTPSession:
                 f"shutterspeed={shutterspeed!r}"
             ) from exc
 
+
+    @_close_failed_capture
     def capture(
         self,
         outpath: Path,
@@ -779,7 +1334,8 @@ class _PTPSession:
             deadline_s = _capture_deadline_s(_parse_exposure_seconds(shutterspeed))
             file_path = self._trigger_with_retry(retry, retry_delay, deadline_s)
             if file_path is None:
-                file_path = self._wait_for_file_added(deadline_s, shutterspeed)
+                with _wait_log(self.port, "capture events"):
+                    file_path = self._wait_for_file_added(deadline_s, shutterspeed)
 
         # The captured filename tells us the actual format (.cr2 vs .jpg)
         is_raw = file_path.name.lower().endswith(".cr2")
@@ -789,12 +1345,13 @@ class _PTPSession:
         else:
             actual_outpath = outpath
 
-        camera_file = self._cam.file_get(
-            file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
-        )
-        # Durable save: temp + fsync + atomic replace, so no partial master survives a crash
-        atomic_write(actual_outpath, lambda tmp: camera_file.save(tmp))
-        self._cam.file_delete(file_path.folder, file_path.name)
+        with _wait_log(self.port, "capture download/save"):
+            camera_file = self._cam.file_get(
+                file_path.folder, file_path.name, gp.GP_FILE_TYPE_NORMAL
+            )
+            atomic_write(actual_outpath, lambda tmp: camera_file.save(tmp))
+        with _wait_log(self.port, "captured file delete"):
+            self._cam.file_delete(file_path.folder, file_path.name)
         elapsed = time.perf_counter() - t0
 
         # Extract embedded JPEG from CR2 for thumbnail/review pipeline
@@ -811,6 +1368,7 @@ class _PTPSession:
 
         return elapsed, actual_outpath
 
+
     def get_info(self) -> dict:
         """Return current camera settings as a dict (for logging / future API)."""
         keys = [
@@ -821,12 +1379,16 @@ class _PTPSession:
 
     def close(self):
         if self._cam is not None:
+            cam, self._cam = self._cam, None
             try:
-                self._cam.exit()
+                with _wait_log(self.port, "session close"):
+                    cam.exit()
             except Exception:
                 pass
-            self._cam = None
             self._logger.info(f"[gphoto2] Closed session: {self.model} on {self.port}")
+
+
+_EventReader = _PTPSession
 
 
 class GPhoto2Backend(CameraBackend):
@@ -857,8 +1419,7 @@ class GPhoto2Backend(CameraBackend):
     def __init__(self, logger):
         if not _GP_AVAILABLE:
             raise RuntimeError(
-                "python-gphoto2 is not installed. "
-                "Add it to pixi.toml with: pixi add python-gphoto2"
+                "The cameras are unavailable: camera support (python-gphoto2) is not installed on this unit. Ask the administrator."
             )
         super().__init__(logger)
         # camera_index -> (model_name, usb_port)
@@ -874,6 +1435,9 @@ class GPhoto2Backend(CameraBackend):
         self._seeded_serials: set[str] = set()
         # usb port -> body serial, as last read on that port
         self._serial_by_port: dict[str, str] = {}
+        # A role belongs to the last identity read on this published port.
+        self._roles_by_port: dict[str, tuple[str, str]] = {}
+        self._usb_attachments = {}
         # usb port -> (abilities model, serial or "", body's own model) as
         # read by the last session opened on that port. It outlives the
         # session, so a capture's model lookup that lands after the session
@@ -921,6 +1485,7 @@ class GPhoto2Backend(CameraBackend):
         # A test replaces it; a factory that returns None means no registry,
         # and a format is then kept on the session only.
         self._registry_factory = _open_camera_registry
+
         # Writes a row to the system log (_write_system_log); a test replaces it.
         self._system_log = _write_system_log
         self._load_pins()
@@ -1174,6 +1739,7 @@ class GPhoto2Backend(CameraBackend):
         if detected is None:
             raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
+            self._usb_attachments = {port: _usb_attachment(port) for _, port in detected}
             self._last_detected = list(detected)
             self._last_scan_at = _monotonic()
 
@@ -1184,6 +1750,9 @@ class GPhoto2Backend(CameraBackend):
         for port in list(self._body_model_by_port):
             if port not in present:
                 del self._body_model_by_port[port]
+        for port in list(self._roles_by_port):
+            if port not in present:
+                del self._roles_by_port[port]
 
         port_map: dict[int, tuple[str, str]] = {}
         for model, port in detected:
@@ -1469,7 +2038,7 @@ class GPhoto2Backend(CameraBackend):
     def _get_camera_lock(self, camera_index: int) -> threading.Lock:
         with self._map_lock:
             if camera_index not in self._session_locks:
-                self._session_locks[camera_index] = threading.Lock()
+                self._session_locks[camera_index] = _CameraLock(camera_index)
             return self._session_locks[camera_index]
 
     # ------------------------------------------------------------------
@@ -1589,6 +2158,102 @@ class GPhoto2Backend(CameraBackend):
 
         return self._claim_port(camera_index, port)
 
+    def _open_labels(self, index, port, original=None, holder=False):
+        with self._map_lock:
+            labels = {}
+            roles = {}
+            for i, (model, address) in self._port_map.items():
+                serial = self._serial_by_port.get(address)
+                suffix = ""
+                if serial:
+                    hardware_id = _hardware_id(model, serial)
+                    cached = self._roles_by_port.get(address)
+                    if cached is not None and cached[0] == hardware_id:
+                        suffix = f" ({cached[1]})"
+                roles[address] = suffix
+                # Another camera is named only by a verified binding.
+                labels[address] = (f"Camera {i}{suffix}" if serial and self._pins.get(i) == serial
+                                   else "the other camera")
+            if holder:
+                # A new address has no holder identity until its serial is known.
+                labels.setdefault(port, "the other camera")
+            else:
+                # The caller's index identifies its request before any serial read.
+                suffix = roles.get(port, roles.get(original, ""))
+                labels[port] = f"Camera {index}{suffix}"
+            return labels
+
+    def _open_claimed(self, index, model, port, may_scan, factory):
+        """Claim the address before opening; a reset move transfers the claim once."""
+        original = port
+        for attempt in range(2):
+            held = self._take_port(index, port, may_scan)
+            if held is not None:
+                label = self._open_labels(index, port, original)[port]
+                raise _PortClaimedError(port, held, label)
+            expected = getattr(self, "_usb_attachments", {}).get(port)
+            if port != original:
+                expected = _usb_attachment(port)
+            token = _OPEN_POLICY.set((expected, may_scan))
+            names_token = holder_token = None
+            try:
+                names_token = _OPEN_LABELS.set(self._open_labels(index, port, original))
+                holder_token = _OPEN_HOLDER_LABELS.set(self._open_labels(index, port, original, True))
+                obj = factory(port)
+                if port != original:
+                    _WAIT_LOG.info("[gphoto2] %s: USB reset followed new address=%s", original, port)
+                return obj, port
+            except _PortMoved as moved:
+                self._release_port(index, port)
+                if not may_scan or attempt:
+                    raise
+                port = moved.new_port
+            except BaseException:
+                self._release_port(index, port)
+                raise
+            finally:
+                if holder_token is not None:
+                    _OPEN_HOLDER_LABELS.reset(holder_token)
+                if names_token is not None:
+                    _OPEN_LABELS.reset(names_token)
+                _OPEN_POLICY.reset(token)
+        raise RuntimeError(
+            f"{self._open_labels(index, original)[original]}: the camera did not finish reconnecting. Wait and try again; "
+            "if it repeats, switch the camera off and on or ask the administrator."
+        )
+
+    def _record_port_move(self, old, new):
+        if old == new:
+            return
+        with self._map_lock:
+            self._serial_by_port.pop(old, None)
+            self._body_model_by_port.pop(old, None)
+            self._roles_by_port.pop(old, None)
+            self._last_detected = [(m, new if p == old else p) for m, p in self._last_detected]
+            self._usb_attachments.pop(old, None)
+            self._usb_attachments[new] = _usb_attachment(new)
+            self._port_map = {i: (m, new if p == old else p) for i, (m, p) in self._port_map.items()}
+
+    def _brief_camera(self, index, model, port):
+        return self._open_claimed(index, model, port, True, lambda current:
+            _init_camera(model, current, *_OPEN_POLICY.get()))
+
+    def _finish_identification(self, cam, port, index):
+        token = None
+        try:
+            token = _OPEN_LABELS.set(self._open_labels(index, port))
+            reader = object.__new__(_EventReader)
+            reader.port, reader._cam = port, cam
+            reader._unsolicited = set()
+            reader._drain_startup(step_ms=0)
+        finally:
+            try:
+                with _wait_log(port, "identification close"):
+                    cam.exit()
+            finally:
+                if token is not None:
+                    _OPEN_LABELS.reset(token)
+
     def _open_identified_session(
         self, camera_index: int, model: str, port: str, may_scan: bool = True
     ) -> _PTPSession:
@@ -1599,28 +2264,38 @@ class GPhoto2Backend(CameraBackend):
         may_scan False the map is laid out again from the last detection
         (_republish_port_map) instead of a new bus scan.
         """
-        held_by = self._take_port(camera_index, port, may_scan)
-        if held_by is not None:
-            raise RuntimeError(
-                f"Camera {camera_index}: port {port} is still held by index "
-                f"{held_by} while the cameras are being reconciled; retry"
-            )
-
-        try:
-            session = _PTPSession(port, model, self.logger)
-        except BaseException:
-            # No session came back, so nothing else will ever release this
-            # claim - including the -105 path, which comes straight back here
-            # for a second attempt.
-            self._release_port(camera_index, port)
-            raise
+        original = port
+        session, port = self._open_claimed(
+            camera_index, model, port, may_scan,
+            lambda current: _PTPSession(current, model, self.logger),
+        )
+        if port != original:
+            if not getattr(session, "serial", ""):
+                session.close()
+                self._release_port(camera_index, port)
+                raise CameraIdentityError(
+                    f"{self._open_labels(camera_index, port)[port]}: the camera's identity could not be read; "
+                    "no picture was requested. Switch the camera off and on, then try again; "
+                    "if it repeats, ask the administrator."
+                )
+            self._record_port_move(original, port)
         # From here the session owns the claim; _close_session gives it back.
         serial = getattr(session, "serial", "") or ""
         self._remember_body_model(
             model, port, serial, getattr(session, "body_model", None)
         )
+        with self._map_lock:
+            pinned = self._pins.get(camera_index)
+        if not serial and pinned:
+            session.close()
+            self._release_port(camera_index, port)
+            raise CameraIdentityError(
+                f"{self._open_labels(camera_index, port)[port]}: the camera's identity could not be read; "
+                "no picture was requested. Switch the camera off and on, then try again; "
+                "if it repeats, ask the administrator."
+            )
         if not serial:
-            # Documented limitation: a body that does not answer a serial
+            # A body that does not answer a serial
             # cannot be pinned, so it stays positional.
             self.logger.warning(
                 f"[gphoto2] Camera {camera_index}: {model} on {port} answered "
@@ -1719,32 +2394,23 @@ class GPhoto2Backend(CameraBackend):
                         # lock; opening (model, port) would claim a port
                         # nothing backs any more.
                         continue
-                    held_by = self._take_port(camera_index, port)
-                    if held_by is not None:
-                        # Another index still holds a claim on this port.
-                        # Identification is never worth a second claim on a
-                        # body: leave the port unidentified and let the next
-                        # pass, after that claim is gone, read it.
-                        self.logger.info(
-                            f"[gphoto2] Camera {camera_index}: port {port} is "
-                            f"still held by index {held_by}; leaving it "
-                            "unidentified for now"
-                        )
-                        continue
                     cam = None
                     initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
+                        cam, actual_port = self._brief_camera(camera_index, model, port)
                         initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                        self._record_port_move(port, actual_port)
+                        port = actual_port
+                        read_port = port
+                        with _wait_log(port, "identification read"):
+                            cfg = cam.get_config()
+                            serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                    except _PortClaimedError as exc:
+                        self.logger.info(
+                            f"[gphoto2] Camera {camera_index}: identification skipped for "
+                            f"{exc.port}: held by index {exc.holder}"
+                        )
+                        continue
                     except Exception:
                         serial = ""
                     finally:
@@ -1753,7 +2419,7 @@ class GPhoto2Backend(CameraBackend):
                         # anything published from it.
                         if initialized:
                             try:
-                                cam.exit()
+                                self._finish_identification(cam, port, camera_index)
                             except Exception:
                                 pass
                         self._release_port(camera_index, port)
@@ -1770,6 +2436,7 @@ class GPhoto2Backend(CameraBackend):
                     )
         return learned
 
+    @_one_reset_call
     def _get_or_open_session(
         self, camera_index: int, may_scan: bool = True
     ) -> _PTPSession:
@@ -1798,6 +2465,7 @@ class GPhoto2Backend(CameraBackend):
         """
         existing = self._session_matches_map(camera_index, may_scan)
         if existing is not None:
+            existing._label = self._open_labels(camera_index, existing.port)[existing.port]
             return existing
 
         port_map = self._port_map_for(may_scan)
@@ -1813,6 +2481,7 @@ class GPhoto2Backend(CameraBackend):
             session = self._open_identified_session(
                 camera_index, model, port, may_scan
             )
+            session._label = self._open_labels(camera_index, session.port)[session.port]
             self._sessions[camera_index] = session
             return session
         except gp.GPhoto2Error as exc:
@@ -1842,6 +2511,7 @@ class GPhoto2Backend(CameraBackend):
                 session = self._open_identified_session(
                     camera_index, model, port, may_scan
                 )
+                session._label = self._open_labels(camera_index, session.port)[session.port]
                 self._sessions[camera_index] = session
                 return session
             raise
@@ -1862,6 +2532,7 @@ class GPhoto2Backend(CameraBackend):
     # CameraBackend interface
     # ------------------------------------------------------------------
 
+    @_one_reset_call
     def is_camera_connected(self, camera_index: int = 0) -> bool:
         """Is a body present at this index right now?
 
@@ -2036,9 +2707,8 @@ class GPhoto2Backend(CameraBackend):
             camera_config: CameraConfig (camera_index used for routing).
             capture_output: Unused - kept for interface compatibility.
             focus_check: One trigger attempt and a _FOCUS_CHECK_DEADLINE_S
-                deadline instead of the normal retry and deadline policy
-                (see _PTPSession.capture). False leaves the capture as it
-                always was.
+                deadline after an accepted trigger
+                (see _PTPSession.capture). False uses the exposure-sized deadline.
 
         Returns:
             (path, None): the saved image file's path as a string (`.cr2`
@@ -2092,45 +2762,42 @@ class GPhoto2Backend(CameraBackend):
                 mismatch = self._check_produced_format(
                     camera_index, session, intended, actual_path
                 )
-            except (gp.GPhoto2Error, CaptureTimeoutError) as exc:
-                self._raise_capture_failure(camera_index, exc)
+                result = (str(actual_path), None)
+            except BaseException as exc:
+                try:
+                    self._close_session(camera_index)
+                except BaseException:
+                    pass
+                if isinstance(exc, (gp.GPhoto2Error, CaptureTimeoutError, CaptureAttributionError)):
+                    self._raise_capture_failure(camera_index, exc)
+                raise
         if mismatch is not None:
             try:
                 self._system_log(**mismatch)
-            except Exception as exc:
+            except BaseException as exc:
+                with lock:
+                    if self._sessions.get(camera_index) is session:
+                        try:
+                            self._close_session(camera_index)
+                        except BaseException:
+                            pass
+                if not isinstance(exc, Exception):
+                    raise
                 self.logger.warning(
                     f"[gphoto2] Camera {camera_index}: the system log row for a "
                     f"capture format mismatch was not written ({exc!r})"
                 )
-        return str(actual_path), None
+        return result
 
     def _raise_capture_failure(self, camera_index: int, exc: Exception):
-        """Close the session after a failed capture and raise RuntimeError.
-
-        Called with the camera lock held.
-        """
-        if isinstance(exc, CaptureTimeoutError):
-            self.logger.error(
-                f"[gphoto2] Camera {camera_index}: capture timed out "
-                f"({exc}); closing session"
-            )
-            # Closing an EOS session runs several PTP operations, each
-            # bounded by libgphoto2's own USB timeouts; on a wedged body
-            # they are slow, so the elapsed time is logged.
-            t_close = time.perf_counter()
-            self._close_session(camera_index)
-            self.logger.error(
-                f"[gphoto2] Camera {camera_index}: session closed after "
-                f"timeout in {time.perf_counter() - t_close:.1f}s"
-            )
-        else:
-            self.logger.error(
-                f"[gphoto2] Camera {camera_index}: capture failed: {exc}"
-            )
-            # Close the failed session so the next call re-opens it cleanly.
-            self._close_session(camera_index)
+        """Report a typed capture failure after its session and claim are closed."""
+        reason = "capture timed out" if isinstance(exc, CaptureTimeoutError) else "capture failed"
+        self.logger.error(f"[gphoto2] Camera {camera_index}: {reason}: {exc}; session closed")
+        if isinstance(exc, CaptureAttributionError):
+            raise RuntimeError(str(exc)) from exc
         raise RuntimeError(f"DSLR capture failed: {exc}") from exc
 
+    @_one_reset_call
     def list_devices(self) -> list:
         """Enumerate all connected DSLR cameras and return device metadata.
 
@@ -2259,33 +2926,23 @@ class GPhoto2Backend(CameraBackend):
                         # claim a port nothing backs any more. Leave this row
                         # out - the next enumeration sees the current map.
                         continue
-                    held_by = self._take_port(idx, port)
-                    if held_by is not None:
-                        # Another index still holds a claim on this port, so
-                        # opening it here would be a second PTP claim on one
-                        # body. Leave the row out.
-                        self.logger.warning(
-                            f"[gphoto2] Camera {idx}: port {port} is still held "
-                            f"by index {held_by} while the cameras are being "
-                            "reconciled; leaving this row out"
-                        )
-                        continue
-                    # Nobody holds this camera, so a brief PTP connection just
-                    # to read the serial number is not a competing claim.
                     cam = None
                     initialized = False
                     try:
-                        al = gp.CameraAbilitiesList()
-                        al.load()
-                        cam = gp.Camera()
-                        cam.set_abilities(al[al.lookup_model(model_raw)])
-                        pil = gp.PortInfoList()
-                        pil.load()
-                        cam.set_port_info(pil[pil.lookup_path(port)])
-                        cam.init()
+                        cam, actual_port = self._brief_camera(idx, model_raw, port)
                         initialized = True
-                        cfg = cam.get_config()
-                        serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                        self._record_port_move(port, actual_port)
+                        port = actual_port
+                        row_port = port
+                        with _wait_log(port, "identification read"):
+                            cfg = cam.get_config()
+                            serial = cfg.get_child_by_name("serialnumber").get_value().strip()
+                    except _PortClaimedError as exc:
+                        self.logger.info(
+                            f"[gphoto2] Camera {idx}: listing skipped for "
+                            f"{exc.port}: held by index {exc.holder}"
+                        )
+                        continue
                     except Exception:
                         pass
                     finally:
@@ -2296,7 +2953,7 @@ class GPhoto2Backend(CameraBackend):
                         # the lock is dropped and enumeration continues.
                         if initialized:
                             try:
-                                cam.exit()
+                                self._finish_identification(cam, port, idx)
                             except Exception:
                                 pass
                         self._release_port(idx, port)
@@ -2354,6 +3011,7 @@ class GPhoto2Backend(CameraBackend):
 
         return result, learned
 
+    @_one_reset_call
     def rescan(self) -> list:
         """Re-detect the bodies, republish the port map, drop stale sessions.
 
@@ -2445,6 +3103,7 @@ class GPhoto2Backend(CameraBackend):
             )
             return self.list_devices()
 
+    @preview_request()
     def capture_preview(self, camera_index: int) -> bytes:
         """Return a live-preview JPEG frame from the camera.
 
@@ -2490,7 +3149,8 @@ class GPhoto2Backend(CameraBackend):
                     f"{exc}; trying once more"
                 )
 
-        time.sleep(_PREVIEW_RETRY_DELAY_S)
+        with _wait_log(camera_index, "preview retry pause"):
+            time.sleep(_PREVIEW_RETRY_DELAY_S)
         if not _port_node_exists(session.port):
             try:
                 self._refresh_port_map()
@@ -2931,6 +3591,15 @@ class GPhoto2Backend(CameraBackend):
                 f"format ({exc!r}); the camera's own format is left as it is"
             )
             return False, None, None
+        role = entry.get("role") if entry else None
+        with self._map_lock:
+            for _index, (model, port) in self._port_map.items():
+                serial = self._serial_by_port.get(port)
+                if serial and _hardware_id(model, serial) == hardware_id:
+                    if role in ("left", "right"):
+                        self._roles_by_port[port] = (hardware_id, role)
+                    else:
+                        self._roles_by_port.pop(port, None)
         stored = entry.get("image_format") if entry else None
         if stored is None:
             return True, None, registry
@@ -3198,5 +3867,6 @@ class GPhoto2Backend(CameraBackend):
             self._pins.clear()
             self._serial_by_port.clear()
             self._body_model_by_port.clear()
+            self._roles_by_port.clear()
             self._seeded_serials.clear()
         self.logger.info("[gphoto2] All sessions closed.")

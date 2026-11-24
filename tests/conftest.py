@@ -457,3 +457,11 @@ def _camera_kind_isolated(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(camera_kind, "_rpicam_available", lambda: True, raising=False)
     for settings in {id(config.settings): config.settings, id(capture_service.settings): capture_service.settings}.values():
         monkeypatch.setattr(settings, "CAMERA_BACKEND", settings.CAMERA_BACKEND)
+
+
+@pytest.fixture(autouse=True)
+def _gphoto2_init_backoff_isolated(monkeypatch):
+    """Each test owns its process-wide failed-init back-off state."""
+    from capture.backends import gphoto2_backend
+
+    monkeypatch.setattr(gphoto2_backend, "_init_backoff", {})
