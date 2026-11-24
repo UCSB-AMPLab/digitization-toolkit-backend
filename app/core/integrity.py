@@ -25,8 +25,8 @@ from sqlalchemy.orm import Session
 
 from app.core import config
 from app.core.paths import (
-    OFFSITE_STAGING_DIR, RAW_SUFFIXES, FileIdentities, is_raw_suffix, preview_sidecar_of, raw_buffer_of,
-    raw_sidecar_of,
+    ADOPTION_REPAIR_STAGING_DIR, OFFSITE_STAGING_DIR, RAW_SUFFIXES, FileIdentities, is_raw_suffix,
+    preview_sidecar_of, raw_buffer_of, raw_sidecar_of,
     resolve_within_storage,
 )
 from app.models.record import Record, RecordImage
@@ -65,11 +65,11 @@ def _scan_roots() -> List[Path]:
 
 
 def _iter_image_files(root: Path):
-    """Yield original image files under root, skipping derived thumbnails and the offsite upload's staged links."""
+    """Yield original image files under root, skipping derived thumbnails and the staged files of the offsite upload and of an adoption's repair."""
     for p in root.rglob("*"):
         if "thumbnails" in p.parts:
             continue
-        if p.relative_to(root).parts[:1] == (OFFSITE_STAGING_DIR,):
+        if p.relative_to(root).parts[:1] in ((OFFSITE_STAGING_DIR,), (ADOPTION_REPAIR_STAGING_DIR,)):
             continue
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             yield p

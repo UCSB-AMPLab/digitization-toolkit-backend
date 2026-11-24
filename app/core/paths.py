@@ -58,6 +58,14 @@ CALIBRATION_DIR = "calibration"
 # under a volume, so the integrity check does not count it as a file.
 OFFSITE_STAGING_DIR = ".captua-offsite-staging"
 
+# Directly under the projects root, flat: the files a repair of an unfinished
+# adoption fetches or derives before it renames them into their volumes
+# (app.core.adopt_repair). Removed whole by every repair and at every start.
+# A volume's stem cannot begin with a dot (FILENAME_STEM_PATTERN) and a
+# project's directory has its leading dots stripped (project_dir_name), so
+# no volume or project is ever given this name.
+ADOPTION_REPAIR_STAGING_DIR = ".captua-adoption-repair"
+
 
 def project_dir_name(project_name: str) -> str:
     """The name of a project's directory under the projects root.

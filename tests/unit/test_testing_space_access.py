@@ -174,6 +174,8 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/system/testing/clear'): (('admin',),),
     ('GET', '/system/testing/usb'): (('admin',),),
     ('GET', '/system/offsite/retired-keys'): (('admin',),),
+    ('GET', '/system/adoption'): (('admin',),),
+    ('POST', '/system/adoption/repair'): (('admin',),),
     ('GET', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing/renew'): (('admin',),),
