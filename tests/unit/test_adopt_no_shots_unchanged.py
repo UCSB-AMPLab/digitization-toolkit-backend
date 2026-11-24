@@ -32,7 +32,20 @@ _STAMP = re.compile(r"\d{4}-\d{2}-\d{2}[ T]\d{2}:\d{2}:\d{2}(\.\d+)?(\+00:00|Z)?
 def _normal(value, root: Path):
     text = json.dumps(value, sort_keys=True, ensure_ascii=False, default=str)
     text = text.replace(str(root.resolve()), "<root>").replace(str(root), "<root>")
-    return json.loads(_STAMP.sub("<t>", text))
+    return _without_host(json.loads(_STAMP.sub("<t>", text)))
+
+
+# The capture lines carry the machine that took them; the test's fixtures
+# stamp the machine the test runs on, which is not the same from one to the next.
+_HOST_KEYS = ("hostname", "machine", "platform")
+
+
+def _without_host(value):
+    if isinstance(value, dict):
+        return {k: ("<host>" if k in _HOST_KEYS else _without_host(v)) for k, v in value.items()}
+    if isinstance(value, list):
+        return [_without_host(v) for v in value]
+    return value
 
 
 def capture(db, root, monkeypatch) -> dict:

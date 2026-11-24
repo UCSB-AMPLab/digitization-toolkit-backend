@@ -428,9 +428,9 @@
       }
      ],
      "host": {
-      "hostname": "Juans-Mac-Mini.local",
-      "machine": "arm64",
-      "platform": "macOS-27.2-arm64-arm-64bit"
+      "hostname": "<host>",
+      "machine": "<host>",
+      "platform": "<host>"
      },
      "pair_id": "co-ahr-con-caj080-car008-img_0001",
      "project_name": "Fondo 10",
@@ -545,9 +545,9 @@
       }
      ],
      "host": {
-      "hostname": "Juans-Mac-Mini.local",
-      "machine": "arm64",
-      "platform": "macOS-27.2-arm64-arm-64bit"
+      "hostname": "<host>",
+      "machine": "<host>",
+      "platform": "<host>"
      },
      "pair_id": "co-ahr-con-caj080-car008-img_0002",
      "project_name": "Fondo 10",
@@ -646,9 +646,9 @@
       }
      ],
      "host": {
-      "hostname": "Juans-Mac-Mini.local",
-      "machine": "arm64",
-      "platform": "macOS-27.2-arm64-arm-64bit"
+      "hostname": "<host>",
+      "machine": "<host>",
+      "platform": "<host>"
      },
      "pair_id": "co-ahr-con-caj080-car008-img_0003",
      "project_name": "Fondo 10",
@@ -715,9 +715,9 @@
       }
      ],
      "host": {
-      "hostname": "Juans-Mac-Mini.local",
-      "machine": "arm64",
-      "platform": "macOS-27.2-arm64-arm-64bit"
+      "hostname": "<host>",
+      "machine": "<host>",
+      "platform": "<host>"
      },
      "pair_id": null,
      "project_name": "Fondo 10",
@@ -889,9 +889,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj080-car008-img_0001",
     "project_name": "Fondo 10",
@@ -1006,9 +1006,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj080-car008-img_0002",
     "project_name": "Fondo 10",
@@ -1107,9 +1107,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj080-car008-img_0003",
     "project_name": "Fondo 10",
@@ -1176,9 +1176,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": null,
     "project_name": "Fondo 10",
@@ -1343,9 +1343,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj80-car008-img_0001",
     "project_name": "Fondo 10",
@@ -1459,9 +1459,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj80-car008-img_0002",
     "project_name": "Fondo 10",
@@ -1559,9 +1559,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": "co-ahr-con-caj80-car008-img_0003",
     "project_name": "Fondo 10",
@@ -1627,9 +1627,9 @@
      }
     ],
     "host": {
-     "hostname": "Juans-Mac-Mini.local",
-     "machine": "arm64",
-     "platform": "macOS-27.2-arm64-arm-64bit"
+     "hostname": "<host>",
+     "machine": "<host>",
+     "platform": "<host>"
     },
     "pair_id": null,
     "project_name": "Fondo 10",
