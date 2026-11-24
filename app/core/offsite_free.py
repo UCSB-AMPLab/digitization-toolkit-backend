@@ -920,6 +920,10 @@ def read_remote_path(key: str) -> str:
     return f"{config.settings.OFFSITE_READ_REMOTE.strip().rstrip('/')}/{key.strip('/')}"
 
 
+# rclone's exit codes for a source directory or file that is not there.
+ABSENT_RETURN_CODES = (3, 4)
+
+
 def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
     """`rclone copyto` one object from the read remote to `dest`; an error message, or None on success.
 
@@ -929,6 +933,11 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
     rclone transfer runs at a time and the unit's link carries the same
     load whichever way the bytes go.
     """
+    return _copy_result(key, dest)[1]
+
+
+def _copy_result(key: str, dest: Path) -> tuple:
+    """(rclone's return code or None when it did not run to an end, error message or None) of _copy_from_bucket."""
     argv = _rclone_argv("copyto", read_remote_path(key), str(dest), "--inplace",
                         "--bwlimit", config.settings.OFFSITE_BWLIMIT)
     try:
@@ -936,12 +945,13 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
             result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                     timeout=_COPY_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        return f"the copy of {key} did not finish within {_COPY_TIMEOUT_SECONDS}s"
+        return None, f"the copy of {key} did not finish within {_COPY_TIMEOUT_SECONDS}s"
     except OSError as exc:
-        return f"rclone could not be started ({argv[0]}): {exc}"
+        return None, f"rclone could not be started ({argv[0]}): {exc}"
     if result.returncode != 0:
-        return f"the copy of {key} failed (rc={result.returncode}): {(result.stderr or result.stdout or '').strip()[:300]}"
-    return None
+        return result.returncode, (f"the copy of {key} failed (rc={result.returncode}): "
+                                   f"{(result.stderr or result.stdout or '').strip()[:300]}")
+    return 0, None
 
 
 def _fsync_file(path: Path) -> None:

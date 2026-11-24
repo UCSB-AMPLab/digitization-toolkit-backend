@@ -392,12 +392,15 @@ def list_collections(
             last_activity_by_id[collection_id] = last_activity
 
     from app.core import colour_card
+    from app.core.adopt_journal import journaled_volume_ids
     cards = colour_card.summaries(db, items)
+    journaled = journaled_volume_ids()  # None: a journal that cannot be read names every volume
     results = []
     for i in items:
         r = CollectionRead.model_validate(i)
         r.record_count = counts_by_id.get(i.id, 0)
         r.colour_card = cards.get(i.id)
+        r.adoption_unfinished = journaled is None or i.id in journaled
         # Left as None for a collection with no records: "never worked on" is
         # not the same as a date, and a caller listing volumes in progress needs
         # to tell them apart.
@@ -435,8 +438,11 @@ def get_collection(
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    from app.core.adopt_journal import journal_names_volume
+
     read = CollectionRead.model_validate(collection)
     read.colour_card = colour_card.summaries(db, [collection])[collection.id]
+    read.adoption_unfinished = journal_names_volume(collection.id)
     return read
 
 

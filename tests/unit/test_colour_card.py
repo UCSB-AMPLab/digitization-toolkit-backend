@@ -554,11 +554,17 @@ def test_a_retake_that_fails_leaves_the_earlier_shot_as_it_was(card, monkeypatch
 
 
 # ---------------------------------------------------------------------------
-# The volume list answers from the database alone
+# The volume list touches no volume's files; it reads the adoption journal once
 # ---------------------------------------------------------------------------
 
 def _list_queries(card, monkeypatch):
-    """(queries the list's colour_card objects take, the list's body), with every file look refused."""
+    """(queries the list's colour_card objects take, the list's body), with every file look refused.
+
+    Path.exists and Path.is_file are refused for the whole request, so no
+    volume's file is looked at. The list's one other read of the disk is
+    the adoption journal (app.core.adopt_journal.journaled_volume_ids),
+    opened once for every volume it lists.
+    """
     import pathlib
     from sqlalchemy import event
     from app.core import colour_card

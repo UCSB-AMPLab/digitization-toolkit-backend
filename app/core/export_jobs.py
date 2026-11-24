@@ -78,6 +78,30 @@ class ExportJobRegistry:
         # Collections a USB copy is reading (hold_for_copy, app.core.usb_copy).
         self._copying: Counter = Counter()
 
+    def _file_changes_refusal(self, ids, message: str) -> Optional[str]:
+        """The message hold_for_file_changes would refuse `ids` with, or None; read under self._lock, changes nothing."""
+        for cid in ids:
+            jid = self._active_by_collection.get(cid)
+            job = self._jobs.get(jid) if jid else None
+            if job and job.state in ("queued", "running"):
+                return message
+            # Counter lookups: a missing id reads 0 and is not inserted.
+            if self._reading[cid] > 0:
+                return FILES_BEING_READ_MESSAGE
+            if self._copying[cid] > 0:
+                return USB_COPY_MESSAGE
+        return None
+
+    def file_changes_refusal(self, collection_ids: Iterable[int], message: str = EXPORT_RUNNING_MESSAGE
+                             ) -> Optional[str]:
+        """Whether hold_for_file_changes would refuse now, and with what message; takes no hold.
+
+        For a caller that reports ahead of time what a later hold would say
+        (app.core.adopt_repair.precheck); the hold itself decides again.
+        """
+        with self._lock:
+            return self._file_changes_refusal(set(collection_ids), message)
+
     @contextmanager
     def hold_for_file_changes(
         self, collection_ids: Iterable[int], message: str = EXPORT_RUNNING_MESSAGE
@@ -94,15 +118,9 @@ class ExportJobRegistry:
         """
         ids = set(collection_ids)
         with self._lock:
-            for cid in ids:
-                jid = self._active_by_collection.get(cid)
-                job = self._jobs.get(jid) if jid else None
-                if job and job.state in ("queued", "running"):
-                    raise HTTPException(status_code=409, detail=message)
-                if self._reading[cid] > 0:
-                    raise HTTPException(status_code=409, detail=FILES_BEING_READ_MESSAGE)
-                if self._copying[cid] > 0:
-                    raise HTTPException(status_code=409, detail=USB_COPY_MESSAGE)
+            refused = self._file_changes_refusal(ids, message)
+            if refused is not None:
+                raise HTTPException(status_code=409, detail=refused)
             self._held.update(ids)
         try:
             yield

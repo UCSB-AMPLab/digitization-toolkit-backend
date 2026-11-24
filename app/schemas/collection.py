@@ -147,6 +147,13 @@ class CollectionRead(CollectionBase):
     # Set at creation, by POST /collections/{id}/keep-on-unit, and cleared by
     # POST /collections/{id}/release-from-unit or a switch out of offline mode.
     kept_on_unit: bool = False
+    # Read-only: when an adoption moved the volume's captures into another
+    # volume, which closes it (Collection.captures_adopted_at); null otherwise.
+    captures_adopted_at: Optional[datetime] = None
+    # Whether an unfinished adoption's journal names the volume
+    # (app.core.adopt_journal.journal_names_volume), which refuses most
+    # changes to it. False unless the endpoint populates it (list and detail).
+    adoption_unfinished: bool = False
     # Read-only (app.core.testing_space): whether the volume is testing work,
     # and when it is due to be removed (its last capture plus the term, naive
     # UTC); null for every real volume.

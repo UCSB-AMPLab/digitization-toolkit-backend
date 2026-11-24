@@ -840,6 +840,8 @@ def unmount_device(
     umount, so no cleanup happens here.
 
     409 `usb_copy_running` while a testing volume's USB copy holds the mountpoint.
+    409 `adoption_running` or `adoption_unfinished` while an adoption is
+    running or unfinished, for every drive (adopt_journal.storage_switch_guard).
     """
     from app.core.storage_override import get_storage_override, clear_storage_override, StorageOverrideError
     from app.core.audit import log_event
@@ -853,39 +855,45 @@ def unmount_device(
         raise HTTPException(status_code=400, detail="Only paths Captua mounted can be unmounted.")
     _refuse_usb_copy_drive(path=target)
 
-    # If this mountpoint (or a subpath) is the active storage override, clear it first, so the backend doesn't try to write to a stale path
-    override_cleared = False
-    try:
-        override = get_storage_override()
-    except StorageOverrideError:
-        # Override file is corrupt; clear it defensively rather than leave it behind.
-        clear_storage_override()
-        override = None
-        override_cleared = True
-    else:
-        if override and Path(override).resolve().is_relative_to(target.resolve()):
+    # No drive is unmounted while an adoption is running or unfinished
+    # (app.core.adopt_journal.storage_switch_guard), for the whole unmount:
+    # the umount below is bounded by its timeout.
+    from app.core.adopt_journal import storage_switch_guard
+
+    with storage_switch_guard():
+        # If this mountpoint (or a subpath) is the active storage override, clear it first, so the backend doesn't try to write to a stale path
+        override_cleared = False
+        try:
+            override = get_storage_override()
+        except StorageOverrideError:
+            # Override file is corrupt; clear it defensively rather than leave it behind.
             clear_storage_override()
+            override = None
             override_cleared = True
+        else:
+            if override and Path(override).resolve().is_relative_to(target.resolve()):
+                clear_storage_override()
+                override_cleared = True
 
-    result = subprocess.run(
-        ["sudo", HELPER, "umount", str(target)],
-        capture_output=True, text=True, timeout=30,
-    )
-    if result.returncode != 0:
-        # Restore the override if umount failed (best-effort)
-        if override_cleared and override:
-            from app.core.storage_override import set_storage_override
-            set_storage_override(override)
-        detail = result.stderr.strip() or result.stdout.strip() or "Unknown error while unmounting."
-        raise HTTPException(status_code=500, detail=detail)
+        result = subprocess.run(
+            ["sudo", HELPER, "umount", str(target)],
+            capture_output=True, text=True, timeout=30,
+        )
+        if result.returncode != 0:
+            # Restore the override if umount failed (best-effort)
+            if override_cleared and override:
+                from app.core.storage_override import set_storage_override
+                set_storage_override(override)
+            detail = result.stderr.strip() or result.stdout.strip() or "Unknown error while unmounting."
+            raise HTTPException(status_code=500, detail=detail)
 
-    log_event(db, level="INFO", category="system", action="storage_unmount",
-              actor=current_user.username, subject=str(target))
+        log_event(db, level="INFO", category="system", action="storage_unmount",
+                  actor=current_user.username, subject=str(target))
 
-    msg = "Device unmounted successfully."
-    if override_cleared:
-        msg += " Storage reverted to the default."
-    return {"message": msg, "override_cleared": override_cleared}
+        msg = "Device unmounted successfully."
+        if override_cleared:
+            msg += " Storage reverted to the default."
+        return {"message": msg, "override_cleared": override_cleared}
 
 
 @router.post("/storage/activate")
@@ -896,6 +904,9 @@ def activate_storage(
 ):
     """Set a mounted path as the active projects storage root.
 
+    409 `adoption_running` while an adoption, its recovery or its repair is
+    running, and `adoption_unfinished` while an adoption's journal exists
+    (app.core.adopt_journal.storage_switch_guard), checked first.
     409 `usb_copy_running` for a path at or below the mountpoint of a running
     testing volume's USB copy (app.core.usb_copy).
     """
@@ -903,44 +914,50 @@ def activate_storage(
     from app.core.storage_override import set_storage_override
     from app.core.audit import log_event
 
-    target = Path(body.path)
-    _refuse_usb_copy_drive(path=target)
-    if not target.exists():
-        raise HTTPException(status_code=400, detail="The path does not exist.")
-    if not target.is_dir():
-        raise HTTPException(status_code=400, detail="The path is not a directory.")
-    # The same test every writer applies to the stored root (see
-    # storage_override.override_root_problem), applied to the target before
-    # anything is created in it: a directory on the root filesystem is on the
-    # SD card, as an empty mount point with no drive mounted is.
-    from app.core.storage_override import override_root_problem
-    if override_root_problem(target):
-        raise HTTPException(status_code=400, detail="The path is not on a mounted drive.")
+    from app.core.adopt_journal import storage_switch_guard
 
-    # Use a clearly-labelled subdirectory so files aren't dumped into the root.
-    projects_path = target / "dtk-projects"
-    try:
-        # Works directly when the filesystem is mounted with uid/gid options (exfat/vfat)
-        # or when the pi user already owns the mount root.
-        projects_path.mkdir(parents=True, exist_ok=True)
-    except PermissionError:
-        # ext4 / ext2 partitions freshly formatted have a root-owned filesystem root.
-        # The helper does mkdir -p and hands ownership to the invoking user in one
-        # step (the path must end in dtk-projects, which it does).
-        r1 = subprocess.run(
-            ["sudo", HELPER, "prepare-projects", str(projects_path)],
-            capture_output=True, text=True, timeout=10,
-        )
-        if r1.returncode != 0:
-            detail = r1.stderr.strip() or "Error creating the directory."
-            raise HTTPException(status_code=500, detail=f"Cannot create the directory: {detail}")
+    # The resulting projects root is `<path>/dtk-projects` (below). Not while
+    # an adoption is running or unfinished, unless that root is the one the
+    # unfinished adoption's files are on (app.core.adopt_journal.storage_switch_guard).
+    with storage_switch_guard(Path(body.path) / "dtk-projects"):
+        target = Path(body.path)
+        _refuse_usb_copy_drive(path=target)
+        if not target.exists():
+            raise HTTPException(status_code=400, detail="The path does not exist.")
+        if not target.is_dir():
+            raise HTTPException(status_code=400, detail="The path is not a directory.")
+        # The same test every writer applies to the stored root (see
+        # storage_override.override_root_problem), applied to the target before
+        # anything is created in it: a directory on the root filesystem is on the
+        # SD card, as an empty mount point with no drive mounted is.
+        from app.core.storage_override import override_root_problem
+        if override_root_problem(target):
+            raise HTTPException(status_code=400, detail="The path is not on a mounted drive.")
 
-    set_storage_override(str(projects_path))
+        # Use a clearly-labelled subdirectory so files aren't dumped into the root.
+        projects_path = target / "dtk-projects"
+        try:
+            # Works directly when the filesystem is mounted with uid/gid options (exfat/vfat)
+            # or when the pi user already owns the mount root.
+            projects_path.mkdir(parents=True, exist_ok=True)
+        except PermissionError:
+            # ext4 / ext2 partitions freshly formatted have a root-owned filesystem root.
+            # The helper does mkdir -p and hands ownership to the invoking user in one
+            # step (the path must end in dtk-projects, which it does).
+            r1 = subprocess.run(
+                ["sudo", HELPER, "prepare-projects", str(projects_path)],
+                capture_output=True, text=True, timeout=10,
+            )
+            if r1.returncode != 0:
+                detail = r1.stderr.strip() or "Error creating the directory."
+                raise HTTPException(status_code=500, detail=f"Cannot create the directory: {detail}")
 
-    log_event(db, level="INFO", category="system", action="storage_activated",
-              actor=current_user.username, subject=str(projects_path))
+        set_storage_override(str(projects_path))
 
-    return {"projects_path": str(projects_path), "message": "Active storage updated."}
+        log_event(db, level="INFO", category="system", action="storage_activated",
+                  actor=current_user.username, subject=str(projects_path))
+
+        return {"projects_path": str(projects_path), "message": "Active storage updated."}
 
 
 @router.delete("/storage/activate")
@@ -948,12 +965,21 @@ def reset_storage(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Revert to the default DATA_DIR/projects storage path."""
+    """Revert to the default DATA_DIR/projects storage path.
+
+    409 `adoption_running` or `adoption_unfinished` as for POST /storage/activate.
+    """
     from app.core.storage_override import clear_storage_override
     from app.core.config import settings
     from app.core.audit import log_event
 
-    clear_storage_override()
+    from app.core.adopt_journal import storage_switch_guard
+
+    # The resulting projects root is the default one. Not while an adoption
+    # is running or unfinished, unless that is the root the unfinished
+    # adoption's files are on (app.core.adopt_journal.storage_switch_guard).
+    with storage_switch_guard(settings.default_projects_dir):
+        clear_storage_override()
 
     log_event(db, level="INFO", category="system", action="storage_reset",
               actor=current_user.username)
@@ -1087,6 +1113,46 @@ def retired_offsite_keys(
     return {"note": RETIRED_KEYS_NOTE,
             "totals": {"keys": len(keys), "deletable": deletable, "not_deletable": len(keys) - deletable},
             "keys": keys}
+
+
+# ---------------------------------------------------------------------------
+# An unfinished adoption of captures (app.core.adopt_repair)
+# ---------------------------------------------------------------------------
+
+@router.get("/adoption")
+def get_unfinished_adoption(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """The adoption whose journal is still on the unit, or {"unfinished": null}; admin only. Changes nothing.
+
+    The two volumes it names, whether it is running now or was left
+    (`recovering`, `blocked`), why recovery stopped (a code and a sentence),
+    each file at neither its old nor its new path with whether the unit can
+    bring it back, and whether a repair can run
+    (app.core.adopt_repair.report).
+    """
+    from app.core.adopt_repair import report
+
+    return report(db)
+
+
+@router.post("/adoption/repair")
+def repair_unfinished_adoption(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Fetch the files an unfinished adoption lacks from the bucket and run its recovery again; admin only.
+
+    Answers {"result": "finished" | "reverted" | "unfinished", ...}, or 409
+    with a code when it changed nothing (app.core.adopt_repair.repair).
+    """
+    from app.core.adopt_repair import RepairRefused, repair
+
+    try:
+        return repair(db, actor=current_user.username)
+    except RepairRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
 
 
 # ---------------------------------------------------------------------------

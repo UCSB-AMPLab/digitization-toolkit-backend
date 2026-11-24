@@ -66,7 +66,10 @@ never used to make it:
   the records, a file at both paths or at neither): nothing is changed,
   the journal is kept, and an ERROR and an audit event name it, for repair
   by hand. So is a recovery that raises: the backend still starts, and
-  `adoption_unfinished` stays in force.
+  `adoption_unfinished` stays in force. Each of these carries a code of
+  UNFINISHED_CODES, and the outcome of the last recovery is kept in this
+  process (last_recovery) for app.core.adopt_repair, which reports it and
+  runs this same recovery again once it has fetched the files it lacks.
 
 Every check is made before the first rename, and a rename is made only
 from where the file is to a name that is free, so a recovery killed part
@@ -80,6 +83,7 @@ import json
 import logging
 import os
 import threading
+from contextlib import contextmanager
 from pathlib import Path
 from typing import Iterable, Optional
 
@@ -103,6 +107,25 @@ UNFINISHED_MESSAGE = ("An earlier adoption of captures did not finish, and its j
 
 # One adoption, or recovery, at a time in this process (module header).
 ADOPTION_LOCK = threading.Lock()
+
+# The code of each way a recovery stops with the journal kept (_recover_locked, _recover).
+UNREADABLE = "journal_unreadable"              # the journal cannot be read
+FAILED = "recovery_failed"                     # the recovery raised
+RECORDS_SPLIT = "records_split"                # the records are not all in the target nor all in the source
+IMAGE_ROWS = "image_rows_contradict"           # an image row holds the other side's path
+CARD_ROWS = "colour_card_rows_contradict"      # a shot row or a set's volume is the other side's
+AT_BOTH = "file_at_both_paths"                 # a file is at its old path and at its new one
+AT_NEITHER = "file_at_neither_path"            # a file is at neither
+UNFINISHED_CODES = (UNREADABLE, FAILED, RECORDS_SPLIT, IMAGE_ROWS, CARD_ROWS, AT_BOTH, AT_NEITHER)
+
+# The outcome of the last recovery in this process, with the run_id of the journal it read (None when it
+# could read none); written under ADOPTION_LOCK.
+_last_recovery: Optional[dict] = None
+
+
+def last_recovery() -> Optional[dict]:
+    """{"run_id", "outcome", "code", "reason"} of the last recovery in this process, or None."""
+    return dict(_last_recovery) if _last_recovery else None
 
 
 class JournalUnreadable(RuntimeError):
@@ -352,6 +375,90 @@ def journal_names_volume(collection_id: Optional[int]) -> bool:
     return journal is not None and collection_id in (journal.get("source_id"), journal.get("target_id"))
 
 
+def journaled_volume_ids() -> Optional[set]:
+    """The ids of the volumes an adoption's journal names, read once; None while it cannot be read (it names every one).
+
+    One open of the journal and no other look at the disk: the volume list
+    asks it once for all its volumes.
+    """
+    try:
+        data = json.loads(journal_file().read_text(encoding="utf-8"))
+    except FileNotFoundError:
+        return set()
+    except (OSError, ValueError):
+        return None
+    if not isinstance(data, dict):
+        return None
+    # Only an integer id names a volume: a malformed one (a list, a string, missing) marks none.
+    return {cid for cid in (data.get("source_id"), data.get("target_id"))
+            if isinstance(cid, int) and not isinstance(cid, bool)}
+
+
+STORAGE_RUNNING_MESSAGE = ("An adoption of captures, its recovery or its repair is running now, so the storage "
+                           "is not switched. Try again when it has ended.")
+STORAGE_UNFINISHED_MESSAGE = ("An adoption of captures is unfinished, and its files are on the active storage, so "
+                              "the storage is not switched until it is finished or repaired.")
+
+
+def journal_projects_root(journal) -> Optional[Path]:
+    """The projects root a journal's files are on (its target root's parent), or None for a missing or malformed value.
+
+    Only a string holding an absolute path counts. The result is compared,
+    never written to or deleted under.
+    """
+    target_root = journal.get("target_root") if isinstance(journal, dict) else None
+    if not isinstance(target_root, str) or not os.path.isabs(target_root):
+        return None
+    return Path(target_root).parent
+
+
+def _same_root(a: Path, b: Path) -> bool:
+    try:
+        return Path(a).resolve() == Path(b).resolve()
+    except (OSError, RuntimeError):
+        return False
+
+
+def journal_root_is_active(journal) -> bool:
+    """Whether the journal's projects root, valid, is the projects root in use now, compared after resolving."""
+    root = journal_projects_root(journal)
+    return root is not None and _same_root(root, config.settings.projects_dir)
+
+
+@contextmanager
+def storage_switch_guard(resulting_root: Optional[Path] = None):
+    """Hold ADOPTION_LOCK across a change of the projects root; 409 while an adoption is running or unfinished.
+
+    Taken without waiting: a held lock is an adoption, a recovery or a
+    repair, `adoption_running`. Under the lock, a journal is
+    `adoption_unfinished`, except for a switch whose resulting projects root
+    (`resulting_root`) is, after resolving, the root of a readable journal
+    with a valid one (journal_projects_root): activating the storage the
+    unfinished adoption is on, which is how a repair becomes possible again.
+    No adoption, recovery or repair can start while the switch holds the
+    lock, and each of them takes it before it reads the root, so none runs
+    across a switch.
+    """
+    from fastapi import HTTPException
+
+    if not ADOPTION_LOCK.acquire(blocking=False):
+        raise HTTPException(status_code=409, detail={"code": "adoption_running",
+                                                     "message": STORAGE_RUNNING_MESSAGE})
+    try:
+        if journal_exists():
+            try:
+                journal = read_journal()
+            except JournalUnreadable:
+                journal = None
+            root = journal_projects_root(journal) if journal else None
+            if resulting_root is None or root is None or not _same_root(resulting_root, root):
+                raise HTTPException(status_code=409, detail={"code": "adoption_unfinished",
+                                                             "message": STORAGE_UNFINISHED_MESSAGE})
+        yield
+    finally:
+        ADOPTION_LOCK.release()
+
+
 def refuse_if_journaled(collection_ids: Iterable[Optional[int]]) -> None:
     """409 `adoption_unfinished` when an adoption's journal names any of the volumes."""
     from fastapi import HTTPException
@@ -442,29 +549,53 @@ def _card_rows(db: Session, journal: dict) -> tuple:
 def recover_adoption_at_startup(db: Session) -> Optional[dict]:
     """Finish or undo the adoption a journal records (module header); None when there is none.
 
-    Returns {"outcome": "completed" | "reverted" | "unfinished", "reason"}.
+    Returns {"outcome": "completed" | "reverted" | "unfinished", "reason"}, and
+    for "unfinished" its `code` (UNFINISHED_CODES).
     Never raises for a recovery that fails: the journal is kept, and an
     ERROR and an audit event say so.
     """
     with ADOPTION_LOCK:
-        return _recover_locked(db)
+        # What a killed repair staged goes first, with or without a journal (app.core.adopt_repair); a sweep
+        # that fails is logged and startup goes on.
+        try:
+            from app.core.adopt_repair import sweep_staging_at_startup
+
+            sweep_staging_at_startup()
+        except Exception:
+            logger.exception("Adoption repair: the staging sweep at startup failed; startup goes on")
+        return recover_holding_lock(db)
 
 
-def _recover_locked(db: Session) -> Optional[dict]:
+def recover_holding_lock(db: Session) -> Optional[dict]:
+    """recover_adoption_at_startup for a caller that already holds ADOPTION_LOCK (app.core.adopt_repair)."""
+    global _last_recovery
+
+    run_id = None
     try:
         journal = read_journal()
     except JournalUnreadable as exc:
-        return _unfinished(db, None, str(exc))
-    if journal is None:
-        return None
-    try:
-        return _recover(db, journal)
-    except Exception as exc:
-        logger.exception("Adoption recovery failed; the journal is kept")
-        return _unfinished(db, journal, f"recovery failed: {exc}")
+        result = _unfinished(db, None, str(exc), UNREADABLE)
+    else:
+        if journal is None:
+            return None
+        run_id = journal.get("run_id")
+        try:
+            result = _recover(db, journal)
+        except Exception as exc:
+            logger.exception("Adoption recovery failed; the journal is kept")
+            result = _unfinished(db, journal, f"recovery failed: {exc}", FAILED)
+    _last_recovery = {"run_id": run_id, **result}
+    return result
 
 
-def _recover(db: Session, journal: dict) -> dict:
+def decide(db: Session, journal: dict) -> tuple:
+    """(landed, problem) from the journal's rows, read now; no row locked, nothing written.
+
+    `landed` is True when the records are all in the target, False when all
+    in the source, None when neither. `problem` is (code, reason) for the
+    first row check that fails (module header), or None. The session is
+    rolled back after the reads.
+    """
     from app.models.record import Record, RecordImage
 
     # The records decide (module header).
@@ -479,19 +610,27 @@ def _recover(db: Session, journal: dict) -> dict:
     new = bool(record_ids) and all(homes.get(r) == journal.get("target_id") for r in record_ids)
     old = bool(record_ids) and all(homes.get(r) == journal.get("source_id") for r in record_ids)
     if new == old:
-        return _unfinished(db, journal, "the journal's records are not all in the target nor all in the source")
+        return None, (RECORDS_SPLIT, "the journal's records are not all in the target nor all in the source")
     wanted = "new_file_path" if new else "old_file_path"
     contradicting = [i["id"] for i in images if rows.get(i["id"]) != i[wanted]]
     if contradicting:
-        return _unfinished(db, journal, f"the rows of images {contradicting[:10]} contradict where the records are")
+        return new, (IMAGE_ROWS, f"the rows of images {contradicting[:10]} contradict where the records are")
     side = "new" if new else "old"
     home = journal.get("target_id") if new else journal.get("source_id")
     shots_off = [sh["id"] for sh in journal.get("colour_card_shots") or []
                  if shot_rows.get(sh["id"]) != (sh[f"{side}_file_path"], sh[f"{side}_preview_path"])]
     sets_off = [sid for sid in journal.get("colour_card_set_ids") or [] if set_homes.get(sid) != home]
     if shots_off or sets_off:
-        return _unfinished(db, journal, f"the colour card shots {shots_off[:10]} or sets {sets_off[:10]} contradict "
-                                        "where the records are")
+        return new, (CARD_ROWS, f"the colour card shots {shots_off[:10]} or sets {sets_off[:10]} contradict "
+                                "where the records are")
+    return new, None
+
+
+def _recover(db: Session, journal: dict) -> dict:
+    new, problem = decide(db, journal)
+    if problem is not None:
+        return _unfinished(db, journal, problem[1], problem[0])
+    old = not new
 
     moves = [(Path(m["old"]), Path(m["new"])) for m in journal.get("moves") or []]
     todo = []
@@ -499,7 +638,8 @@ def _recover(db: Session, journal: dict) -> dict:
         at_old, at_new = os.path.lexists(before), os.path.lexists(after)
         if at_old == at_new:
             where = "both" if at_old else "neither"
-            return _unfinished(db, journal, f"{before.name} is at {where} of its old and new paths")
+            return _unfinished(db, journal, f"{before.name} is at {where} of its old and new paths",
+                               AT_BOTH if at_old else AT_NEITHER)
         if new and at_old:
             todo.append((before, after))
         elif old and at_new:
@@ -546,7 +686,7 @@ def _done(db: Session, journal: dict, action: str, level: str, outcome: str, cou
     return {"outcome": outcome, "reason": counts}
 
 
-def _unfinished(db: Session, journal: Optional[dict], reason: str) -> dict:
+def _unfinished(db: Session, journal: Optional[dict], reason: str, code: str) -> dict:
     from app.core import audit
 
     path = journal_file()
@@ -555,4 +695,4 @@ def _unfinished(db: Session, journal: Optional[dict], reason: str) -> dict:
     audit.log_event(db, level="ERR", category=CATEGORY, action=RECOVERY_UNFINISHED_ACTION,
                     actor=journal.get("actor") if journal else None, subject=_subject(journal),
                     detail=detail[:500])
-    return {"outcome": "unfinished", "reason": reason}
+    return {"outcome": "unfinished", "reason": reason, "code": code}
