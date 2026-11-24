@@ -53,6 +53,21 @@ digests the target's copies give. A master for which the source's capture
 records hold no sha256 gets no relocation record, as relocation_of writes
 none.
 
+Colour card shots (app.core.adopt_captures.ShotRename) are carried the
+same way. The target gets a copy of every `calibration` line
+(capture.manifestHandler.CALIBRATION_RECORD_TYPE) of a planned shot's
+capture id whose paths all map to the shot's renames, each
+`files[].relative_path` rewritten to the new path relative to the target's
+root and marked `copied_from`; a line naming a path no rename maps is left
+out, since a shot's digest is its row's and its line is the record of how
+it was taken. The source gets one relocation record per shot moved, in the
+form of a page's with `shot_id` in place of `image_id`: its capture id, the
+shot's sha256 as its row gives it, `from` and `to` relative to the source's
+root, and `relocated_at`. The fixity index takes a relocation record only
+for an image it names, so a shot's adds no digest anywhere. The shots'
+lines come after the pages', so a source with no shot gives exactly the
+lines it gave before.
+
 Version: 0.3.3
 """
 import copy
@@ -79,12 +94,61 @@ def adopt_manifest_lines(plan, source_lines: list, *, adopted_at: str) -> tuple:
     refusal, and for a capture record of the plan's capture ids that names
     a path no rename maps.
     """
-    from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE, RELOCATION_RECORD_TYPE, is_capture_record
-
     if not plan.may_adopt:
         raise ValueError(f"the adoption is refused: {', '.join(plan.refusals)}")
     if not plan.renames:
         return [], []
+    target, source = _page_lines(plan, source_lines, adopted_at)
+    shot_target, shot_source = _shot_lines(plan, source_lines, adopted_at)
+    return target + shot_target, source + shot_source
+
+
+def _shot_lines(plan, source_lines: list, adopted_at: str) -> tuple:
+    """(target lines, source lines) for the plan's colour card shots (module header)."""
+    from capture.manifestHandler import CALIBRATION_RECORD_TYPE, RELOCATION_RECORD_TYPE
+
+    shots = getattr(plan, "shot_renames", None) or []
+    if not shots:
+        return [], []
+    src_root = plan.renames[0].old_path.parent.parent
+    tgt_root = plan.renames[0].new_path.parent.parent
+    new_paths = {}
+    for r in shots:
+        for old, new in ((r.old_path, r.new_path), (r.old_preview_path, r.new_preview_path),
+                         (r.old_raw_buffer_path, r.new_raw_buffer_path)):
+            if old is not None and new is not None:
+                new_paths[_key(old, src_root)] = os.path.relpath(new, tgt_root)
+    owned = {r.capture_id for r in shots}
+    provenance = f"{plan.source_stem}/metadata/manifest.jsonl"
+    target = []
+    for line in source_lines:
+        if not (isinstance(line, dict) and line.get("record_type") == CALIBRATION_RECORD_TYPE
+                and line.get("capture_id") in owned):
+            continue
+        entry = copy.deepcopy(line)
+        files = [f for f in entry.get("files") or [] if isinstance(f, dict) and isinstance(f.get("relative_path"), str)]
+        if any(_line_key(f["relative_path"]) not in new_paths for f in files):
+            continue
+        for f in files:
+            f["relative_path"] = new_paths[_line_key(f["relative_path"])]
+        entry.setdefault("copied_from", provenance)
+        target.append(entry)
+    source = [{
+        "record_type": RELOCATION_RECORD_TYPE,
+        "capture_id": r.capture_id,
+        "shot_id": r.shot_id,
+        "sha256": r.sha256,
+        "from": os.path.relpath(r.old_path, src_root),
+        "to": os.path.relpath(r.new_path, src_root),
+        "relocated_at": adopted_at,
+    } for r in shots if r.sha256]
+    return target, source
+
+
+def _page_lines(plan, source_lines: list, adopted_at: str) -> tuple:
+    """(target lines, source lines) for the plan's images (module header)."""
+    from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE, RELOCATION_RECORD_TYPE, is_capture_record
+
     src_root = plan.renames[0].old_path.parent.parent
     tgt_root = plan.renames[0].new_path.parent.parent
     new_paths = {}

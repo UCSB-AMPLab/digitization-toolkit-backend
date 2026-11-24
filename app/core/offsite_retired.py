@@ -24,10 +24,19 @@ takes its key (image_upload._key_holder, adopt_objects' held keys,
 adopt_rename_map), and the old volume counts it as copied
 (kept_volumes).
 
-retired_keys lists the retired rows for the person who deletes the old
-objects. A key is `deletable` only while the image it came from has a
-current row of the same kind that is verified and carries the same local
-SHA1: the bytes are then recorded at the new key. Nothing here lists or
+retire_card_rows does the same for a colour card shot adopted with its
+volume: each of its colour_card_objects rows, all verified, is detached
+(shot_id NULL) and marked retired (retired_at, retired_shot_id). The upload's
+work list for shots (image_upload.colour_card_work) then finds the shot with
+no row of that kind and uploads it under the key its new name and volume
+give; read by key, the old row still holds its key and its stem.
+
+retired_keys lists the retired rows of both tables for the person who
+deletes the old objects, in one list. A shot's rows carry the kinds
+`colour_card_shot` and `colour_card_preview`, so they are told apart from a
+page's `capture` and `preview`. A key is `deletable` only while the image or shot it came from
+has a current row of the same kind that is verified and carries the same
+local SHA1: the bytes are then recorded at the new key. Nothing here lists or
 changes the bucket.
 
 Version: 0.3.3
@@ -95,15 +104,65 @@ def retire_rows(db: Session, image_ids: Iterable[int], *, now: datetime) -> list
     return rows
 
 
+class CardRetireRefused(ValueError):
+    """A shot to be retired has a row that is not verified; nothing was changed.
+
+    `unverified` lists each such row as {shot_id, kind, key, state}, the
+    states of RetireRefused.
+    """
+
+    def __init__(self, unverified: list):
+        self.unverified = unverified
+        names = ", ".join(f"colour card shot {u['shot_id']} {u['kind']} ({u['state']})" for u in unverified)
+        super().__init__(f"only verified offsite objects can be retired, and these are not: {names}")
+
+
+def retire_card_rows(db: Session, shot_ids: Iterable[int], *, now: datetime) -> list:
+    """Detach and retire every colour_card_objects row of the shots, and return the rows (as retire_rows).
+
+    Every row must be verified; any other raises CardRetireRefused before
+    anything is changed. The rows are locked FOR UPDATE, then each gets
+    shot_id NULL, retired_at `now` and retired_shot_id the shot's id, and
+    the session is flushed. Nothing is committed. A shot with no row
+    retires nothing.
+    """
+    from app.models.colour_card import ColourCardObject
+
+    ids = sorted(set(shot_ids))
+    rows = []
+    for start in range(0, len(ids), 500):
+        rows.extend(db.query(ColourCardObject)
+                    .filter(ColourCardObject.shot_id.in_(ids[start:start + 500]))
+                    .order_by(ColourCardObject.shot_id, ColourCardObject.kind)
+                    .with_for_update()
+                    .all())
+    unverified = [{"shot_id": r.shot_id, "kind": r.kind, "key": r.object_key, "state": _state(r)}
+                  for r in rows if r.verified_at is None]
+    if unverified:
+        raise CardRetireRefused(unverified)
+    for row in rows:
+        row.retired_shot_id = row.shot_id
+        row.shot_id = None
+        row.retired_at = now
+    db.flush()
+    return rows
+
+
+CARD_KINDS = {"shot": "colour_card_shot", "preview": "colour_card_preview"}
+
+
 def retired_keys(db: Session) -> list:
     """Every retired row, oldest retirement first, as the person deleting old objects needs it.
 
     Each entry: `key`, `kind`, `local_sha1` and `remote_sha1` as stored,
     `bytes` (always None: offsite_objects stores no size), `verified_at`,
     `retired_at`, `image_id` (the image it came from, None once that image
-    is deleted), `volume_id` and `volume_stem` (the volume that image is in
-    now, None when it is in none), `current_key` (that image's current row
-    of the same kind, or None) and `deletable`.
+    is deleted) or `shot_id` (the colour card shot, likewise; the other is
+    None), `volume_id` and `volume_stem` (the volume that image or shot is
+    in now, None when it is in none), `current_key` (its current row of the
+    same kind, or None) and `deletable`. A page's kinds are `capture` and
+    `preview`; a shot's are `colour_card_shot` and `colour_card_preview`.
+    Pages' and shots' keys are in one list, by retirement time.
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
@@ -119,8 +178,48 @@ def retired_keys(db: Session) -> list:
             .filter(OffsiteObject.retired_at.isnot(None))
             .order_by(OffsiteObject.retired_at, OffsiteObject.id)
             .all())
-    return [{**_entry(row, now_row), "volume_id": volume_id, "volume_stem": stem}
-            for row, now_row, volume_id, stem in rows]
+    out = [(row.retired_at, 0, row.id,
+            {**_entry(row, now_row), "shot_id": None, "volume_id": volume_id, "volume_stem": stem})
+           for row, now_row, volume_id, stem in rows]
+    out.extend(_card_keys(db))
+    return [entry for *_order, entry in sorted(out, key=lambda e: e[:3])]
+
+
+def _card_keys(db: Session) -> list:
+    """(retired_at, 1, id, entry) for every retired colour_card_objects row."""
+    from app.models.collection import Collection
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
+
+    current = aliased(ColourCardObject)
+    rows = (db.query(ColourCardObject, current, Collection.id, Collection.filename_stem)
+            .outerjoin(current, (current.shot_id == ColourCardObject.retired_shot_id)
+                       & (current.kind == ColourCardObject.kind))
+            .outerjoin(ColourCardShot, ColourCardShot.id == ColourCardObject.retired_shot_id)
+            .outerjoin(ColourCardSet, ColourCardSet.id == ColourCardShot.set_id)
+            .outerjoin(Collection, Collection.id == ColourCardSet.collection_id)
+            .filter(ColourCardObject.retired_at.isnot(None))
+            .order_by(ColourCardObject.retired_at, ColourCardObject.id)
+            .all())
+    out = []
+    for row, now_row, volume_id, stem in rows:
+        deletable = (row.retired_shot_id is not None and now_row is not None and now_row.verified_at is not None
+                     and now_row.local_sha1 == row.local_sha1)
+        out.append((row.retired_at, 1, row.id, {
+            "key": row.object_key,
+            "kind": CARD_KINDS.get(row.kind, row.kind),
+            "local_sha1": row.local_sha1,
+            "remote_sha1": row.remote_sha1,
+            "bytes": None,
+            "verified_at": row.verified_at,
+            "retired_at": row.retired_at,
+            "image_id": None,
+            "shot_id": row.retired_shot_id,
+            "current_key": now_row.object_key if now_row is not None else None,
+            "deletable": bool(deletable),
+            "volume_id": volume_id,
+            "volume_stem": stem,
+        }))
+    return out
 
 
 def _entry(row, current: Optional[object]) -> dict:

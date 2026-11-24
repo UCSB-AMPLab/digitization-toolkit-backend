@@ -210,6 +210,23 @@ class AdoptRenameRead(BaseModel):
     new_keys: Dict[str, str] = {}
 
 
+class AdoptShotRenameRead(BaseModel):
+    """One source colour card shot's names before and after an adoption (app.core.adopt_captures.ShotRename)."""
+    shot_id: int
+    set_id: int
+    camera_index: int
+    old_name: str
+    new_name: str
+    old_path: str
+    new_path: str
+    old_preview_path: Optional[str] = None
+    new_preview_path: Optional[str] = None
+    old_raw_buffer_path: Optional[str] = None
+    new_raw_buffer_path: Optional[str] = None
+    old_keys: Dict[str, str] = {}
+    new_keys: Dict[str, str] = {}
+
+
 class AdoptPlanRead(BaseModel):
     """The dry run of an adoption: the plan, with the first `limit` renames."""
     source_id: int
@@ -235,6 +252,9 @@ class AdoptPlanRead(BaseModel):
     thumbnails_missing: List[Dict[str, Any]]
     capture_lines: int
     unaccounted_capture_lines: List[str]
+    colour_card_set_ids: List[int] = []
+    shot_renames: List[AdoptShotRenameRead] = []
+    shot_bytes: int = 0
 
 
 class AdoptResultRead(BaseModel):
@@ -246,6 +266,8 @@ class AdoptResultRead(BaseModel):
     files_renamed: int
     rows_retired: int
     counter_after: int
+    colour_card_sets: int = 0
+    colour_card_shots: int = 0
     source_lines_appended: int
     target_lines_appended: bool
     target_lines_pending: bool

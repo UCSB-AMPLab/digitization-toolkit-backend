@@ -1,7 +1,7 @@
 """Deleting the volume an adoption emptied (NEH-387).
 
 A volume whose captures were adopted away may be deleted
-(Collection.captures_adopted_away): it holds no record, no image and no
+(Collection.deletable_after_adoption): it holds no record, no image and no
 sub-volume, no adoption journal names it, and every offsite key under its
 stem is a retired row. Its stem stays held by those keys, so no volume can
 take it. Its manifest is moved to `.retired-manifests/`

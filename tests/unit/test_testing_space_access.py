@@ -2458,6 +2458,9 @@ IMAGE_PATH_WRITERS = {
     ("app/api/projects.py", "_update_project_held"),    # a project rename's rebase
     # An adoption's renames, built by its plan from the target's own directory; both volumes real work.
     ("app/core/adopt_apply.py", "_write_rows"),
+    # The same adoption's colour card shots: a shot row's paths, built by the plan from the target's own
+    # `calibration/`; not an image row, matched by the attribute's name.
+    ("app/core/adopt_apply.py", "_write_card_rows"),
 }
 
 

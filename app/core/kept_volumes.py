@@ -322,10 +322,11 @@ def _has_left_unit(db: Session, collection) -> bool:
 
     A file counts from its first offsite row that is not refused: pending
     (its key claimed, the copy under way or left by a crash), uploaded or
-    verified. An image has left the unit if any offsite row is attached to
-    it or was retired from it (retired_image_id, app.core.offsite_retired):
-    an adopted image is offsite under its retired keys until its upload
-    under the new ones verifies. A row whose image was deleted (record_image_id NULL) is
+    verified. An image or a colour card shot has left the unit if any
+    offsite row is attached to it or was retired from it (retired_image_id,
+    retired_shot_id, app.core.offsite_retired): an adopted image or shot is
+    offsite under its retired keys until its upload under the new ones
+    verifies, and the row counts for the volume it is in now. A row whose image was deleted (record_image_id NULL) is
     counted when its key is under the volume's `<tenant>/<stem>/`, the only
     way it can be told to be this volume's; with no stem or no valid tenant
     such a row cannot be attributed, and is not counted.
@@ -338,10 +339,14 @@ def _has_left_unit(db: Session, collection) -> bool:
     from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
 
     collection_id = collection.id
-    # A colour card shot's object counts as a page's does; a row that only
-    # records skips (no local_sha1: its bytes were never read) does not.
+    # A colour card shot's object counts as a page's does, attached or retired
+    # from it (retired_shot_id): an adopted shot is offsite under its retired
+    # keys until its upload under the new ones verifies, and the row counts
+    # for the volume the shot is in now. A row that only records skips (no
+    # local_sha1: its bytes were never read) does not.
     shot_copied = (db.query(ColourCardObject.id)
-                   .join(ColourCardShot, ColourCardObject.shot_id == ColourCardShot.id)
+                   .join(ColourCardShot, or_(ColourCardObject.shot_id == ColourCardShot.id,
+                                             ColourCardObject.retired_shot_id == ColourCardShot.id))
                    .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
                    .filter(ColourCardSet.collection_id == collection_id, ColourCardObject.refused_at.is_(None),
                            ColourCardObject.local_sha1.isnot(None))

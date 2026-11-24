@@ -1047,6 +1047,7 @@ class RetiredKeyOut(BaseModel):
     volume_id: Optional[int] = None
     volume_stem: Optional[str] = None
     image_id: Optional[int] = None
+    shot_id: Optional[int] = None
     current_key: Optional[str] = None
     deletable: bool
 
@@ -1065,8 +1066,10 @@ def retired_offsite_keys(
 ):
     """Every retired offsite key, for the person who deletes the old objects; admin only. Deletes nothing.
 
-    Each key with its kind, when it was retired, the volume and image it now
-    belongs to, its new key and whether it is deletable
+    Each key with its kind, when it was retired, the volume and the image or
+    colour card shot it now belongs to (a page's kinds are `capture` and
+    `preview`, a shot's `colour_card_shot` and `colour_card_preview`), its
+    new key and whether it is deletable
     (app.core.offsite_retired.retired_keys), and the totals. With
     `format=text`, the deletable keys alone as plain text, one per line,
     relative to the remote, to hand to a deletion run with the bucket's own

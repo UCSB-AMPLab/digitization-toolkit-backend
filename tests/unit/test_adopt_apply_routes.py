@@ -104,6 +104,7 @@ def test_post_applies_the_adoption(client, db_session, override_projects_root, t
     assert r.status_code == 200, r.text
     assert r.json() == {"source_id": src.id, "target_id": tgt.id, "records": 4, "images": 8,
                         "files_renamed": 23, "rows_retired": 14, "counter_after": 5,
+                        "colour_card_sets": 0, "colour_card_shots": 0,
                         "source_lines_appended": 8, "target_lines_appended": True,
                         "target_lines_pending": False, "recovery_pending": False}
     assert all(r_.new_path.is_file() and not r_.old_path.exists() for r_ in plan.renames)

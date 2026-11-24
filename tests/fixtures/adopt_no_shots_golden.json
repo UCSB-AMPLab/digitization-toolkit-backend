@@ -1,0 +1,2376 @@
+{
+ "files": [
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+   "4cc1845904151a37842dc87b4b63d82e55bf41a7fc32032748d82f56a55ffb01"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+   "4450152aa363bbfce976f076cdb48bb62cd9464510fb67fe16a3606f99142dd9"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+   "e685497d15ca32f0d36cbac7c85ef642c2a7077a44d86ab276bc08ee19523de4"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+   "22ed52ad35651c719d3e3f3884182eed24cd88a106d8e362ee548b36c8b209bc"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+   "2840fc732877fea15e01992110f473dd7abeec70c408e5b07a499200dc00bf53"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+   "1a202cab2706a5e98fd50bdaeb7772adc2b0ed10422c590c30c6b432f2ad9d27"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+   "5aeaea7512d454b6ac952669dcb39cc87c44ead84d21fad04b6064e905b39dbd"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.raw",
+   "fe0f89c2f6e83b45a9230f56d652e2ae867e9bc394a32c6f9b214ee2c9fc1a4d"
+  ],
+  [
+   "co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+   "11a3d9bc7b213861390a8085a71c30977392c141a6e33285d15cd28b35c637d8"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0001_c0_preview.jpg",
+   "a64adaf85a89e43176b5bf3673cadf82ad7e92b58ebcd0798b66b608213fdd98"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0001_c1_preview.jpg",
+   "abaee98c4723186c1221b4017a056a9fab095e2389561ab68e549b58222cd8b0"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0002_c0_preview.jpg",
+   "ad48fc55a0ca7ecb4c8bf5a1642a9418decac47e2f436a879f12f42652e0719b"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0002_c1_preview.jpg",
+   "7b8ed6424701b2c8efcbc4ed97bd7400d51f5f708f6f87dbe7b494aa6a8fd125"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0003_c0_preview.jpg",
+   "d85dbb0917b0d20a40985588048d137a4f68a49173e70eee3a8b4f19b105806b"
+  ],
+  [
+   "co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0003_c1_preview.jpg",
+   "c0f361a4e8488f00e059315626f87926dd4509a2fb33e49ce2442606bba18367"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000002_thumb.jpg",
+   "4f6b1fe72d012c95f494141c7ef7b5081f9dc952821b655884c8fc89089beccd"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000003_thumb.jpg",
+   "22ff262df000d5fa68408ac3c96298f506ba1983d7c6f4f65760680a4c6cd793"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000005_thumb.jpg",
+   "503109178721d884f44ea89c9568a4c41b7b0da037c9ceafaecb164ad48c3cda"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000006_thumb.jpg",
+   "2c76360a611b9615af536f746bd5c7c4d466519230e18dddf9d05176ccbd4d67"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000008_thumb.jpg",
+   "c7e5334402779c82c3cb850f81d9ffe3796c6e9c67e84f23517cf40eb40003c7"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000009_thumb.jpg",
+   "a7b7279fef388c0080f4f1d562c263d61b1063f8c0a0ccbb964ede3e70d06494"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000b_thumb.jpg",
+   "47ebd8582fef6cc97e0cd6e6a6c056d75fd284c9915933f1a39a81a9b889c84b"
+  ],
+  [
+   "co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000d_thumb.jpg",
+   "3556ccc19cc095e9cab2dc0b7bc1617c9e62d641614467cc27250e92d97df6ce"
+  ]
+ ],
+ "journal": [
+  {
+   "actor": "admin",
+   "created_dirs": [
+    "<root>/co-ahr-con-caj080-car008/metadata",
+    "<root>/co-ahr-con-caj080-car008/thumbnails",
+    "<root>/co-ahr-con-caj080-car008/previews",
+    "<root>/co-ahr-con-caj080-car008/captures",
+    "<root>/co-ahr-con-caj080-car008"
+   ],
+   "images": [
+    {
+     "id": 1,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c0.CR2",
+     "record_id": 1
+    },
+    {
+     "id": 2,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c1.CR2",
+     "record_id": 1
+    },
+    {
+     "id": 3,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c0.CR2",
+     "record_id": 1
+    },
+    {
+     "id": 4,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c1.CR2",
+     "record_id": 1
+    },
+    {
+     "id": 5,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c0.CR2",
+     "record_id": 2
+    },
+    {
+     "id": 6,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c1.CR2",
+     "record_id": 2
+    },
+    {
+     "id": 7,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0004_c0.jpg",
+     "record_id": 3
+    },
+    {
+     "id": 8,
+     "new_file_path": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+     "old_file_path": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0005_c0.jpg",
+     "record_id": 4
+    }
+   ],
+   "moves": [
+    {
+     "image_id": 1,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c0.CR2"
+    },
+    {
+     "image_id": 1,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0001_c0_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0001_c0_preview.jpg"
+    },
+    {
+     "image_id": 1,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000002_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000002_thumb.jpg"
+    },
+    {
+     "image_id": 2,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c1.CR2"
+    },
+    {
+     "image_id": 2,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0001_c1_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0001_c1_preview.jpg"
+    },
+    {
+     "image_id": 2,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000003_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000003_thumb.jpg"
+    },
+    {
+     "image_id": 3,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c0.CR2"
+    },
+    {
+     "image_id": 3,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0002_c0_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0002_c0_preview.jpg"
+    },
+    {
+     "image_id": 3,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000005_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000005_thumb.jpg"
+    },
+    {
+     "image_id": 4,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c1.CR2"
+    },
+    {
+     "image_id": 4,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0002_c1_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0002_c1_preview.jpg"
+    },
+    {
+     "image_id": 4,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000006_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000006_thumb.jpg"
+    },
+    {
+     "image_id": 5,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c0.CR2"
+    },
+    {
+     "image_id": 5,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0003_c0_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0003_c0_preview.jpg"
+    },
+    {
+     "image_id": 5,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000008_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000008_thumb.jpg"
+    },
+    {
+     "image_id": 6,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c1.CR2"
+    },
+    {
+     "image_id": 6,
+     "kind": "preview",
+     "new": "<root>/co-ahr-con-caj080-car008/previews/co-ahr-con-caj080-car008-img_0003_c1_preview.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0003_c1_preview.jpg"
+    },
+    {
+     "image_id": 6,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000009_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/00000000000000000000000000000009_thumb.jpg"
+    },
+    {
+     "image_id": 7,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0004_c0.jpg"
+    },
+    {
+     "image_id": 7,
+     "kind": "buffer",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.raw",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0004_c0.raw"
+    },
+    {
+     "image_id": 7,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000b_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/0000000000000000000000000000000b_thumb.jpg"
+    },
+    {
+     "image_id": 8,
+     "kind": "master",
+     "new": "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0005_c0.jpg"
+    },
+    {
+     "image_id": 8,
+     "kind": "thumbnail",
+     "new": "<root>/co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000d_thumb.jpg",
+     "old": "<root>/co-ahr-con-caj80-car008/thumbnails/0000000000000000000000000000000d_thumb.jpg"
+    }
+   ],
+   "phase": "renaming",
+   "record_ids": [
+    1,
+    2,
+    3,
+    4
+   ],
+   "retired_row_ids": [
+    1,
+    2,
+    3,
+    4,
+    5,
+    6,
+    7,
+    8,
+    9,
+    10,
+    11,
+    12,
+    13,
+    14
+   ],
+   "run_id": "<run>",
+   "source_id": 1,
+   "source_root": "<root>/co-ahr-con-caj80-car008",
+   "source_stem": "co-ahr-con-caj80-car008",
+   "started_at": "<t>",
+   "target_id": 2,
+   "target_lines": [
+    {
+     "cameras": [
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 0,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 0,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      },
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 1,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 1,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      }
+     ],
+     "capture_id": "00000000-0000-0000-0000-000000000001",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "error": null,
+     "files": [
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+       "role": "left",
+       "rotate_deg": 0,
+       "sha256": "4cc1845904151a37842dc87b4b63d82e55bf41a7fc32032748d82f56a55ffb01"
+      },
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0001_c0_preview.jpg",
+       "role": "left_preview",
+       "rotate_deg": 0,
+       "sha256": "a64adaf85a89e43176b5bf3673cadf82ad7e92b58ebcd0798b66b608213fdd98"
+      },
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+       "role": "right",
+       "rotate_deg": 0,
+       "sha256": "4450152aa363bbfce976f076cdb48bb62cd9464510fb67fe16a3606f99142dd9"
+      },
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0001_c1_preview.jpg",
+       "role": "right_preview",
+       "rotate_deg": 0,
+       "sha256": "abaee98c4723186c1221b4017a056a9fab095e2389561ab68e549b58222cd8b0"
+      }
+     ],
+     "host": {
+      "hostname": "Juans-Mac-Mini.local",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit"
+     },
+     "pair_id": "co-ahr-con-caj080-car008-img_0001",
+     "project_name": "Fondo 10",
+     "sequence": null,
+     "status": "success",
+     "timestamp_utc": "<t>",
+     "timing": {},
+     "warnings": []
+    },
+    {
+     "cameras": [
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 0,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 0,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      },
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 1,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 1,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      }
+     ],
+     "capture_id": "00000000-0000-0000-0000-000000000004",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "error": null,
+     "files": [
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+       "role": "left",
+       "rotate_deg": 0,
+       "sha256": "e685497d15ca32f0d36cbac7c85ef642c2a7077a44d86ab276bc08ee19523de4"
+      },
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0002_c0_preview.jpg",
+       "role": "left_preview",
+       "rotate_deg": 0,
+       "sha256": "ad48fc55a0ca7ecb4c8bf5a1642a9418decac47e2f436a879f12f42652e0719b"
+      },
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+       "role": "right",
+       "rotate_deg": 0,
+       "sha256": "22ed52ad35651c719d3e3f3884182eed24cd88a106d8e362ee548b36c8b209bc"
+      },
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0002_c1_preview.jpg",
+       "role": "right_preview",
+       "rotate_deg": 0,
+       "sha256": "7b8ed6424701b2c8efcbc4ed97bd7400d51f5f708f6f87dbe7b494aa6a8fd125"
+      }
+     ],
+     "host": {
+      "hostname": "Juans-Mac-Mini.local",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit"
+     },
+     "pair_id": "co-ahr-con-caj080-car008-img_0002",
+     "project_name": "Fondo 10",
+     "sequence": null,
+     "status": "success",
+     "timestamp_utc": "<t>",
+     "timing": {},
+     "warnings": []
+    },
+    {
+     "cameras": [
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 0,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 0,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      },
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 1,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 1,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      }
+     ],
+     "capture_id": "00000000-0000-0000-0000-000000000007",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "error": null,
+     "files": [
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+       "role": "left",
+       "rotate_deg": 0,
+       "sha256": "2840fc732877fea15e01992110f473dd7abeec70c408e5b07a499200dc00bf53"
+      },
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+       "role": "right",
+       "rotate_deg": 0,
+       "sha256": "1a202cab2706a5e98fd50bdaeb7772adc2b0ed10422c590c30c6b432f2ad9d27"
+      }
+     ],
+     "host": {
+      "hostname": "Juans-Mac-Mini.local",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit"
+     },
+     "pair_id": "co-ahr-con-caj080-car008-img_0003",
+     "project_name": "Fondo 10",
+     "sequence": null,
+     "status": "success",
+     "timestamp_utc": "<t>",
+     "timing": {},
+     "warnings": []
+    },
+    {
+     "cameras": [
+      {
+       "camera_controls_metadata": null,
+       "camera_index": 0,
+       "config": {
+        "aperture": null,
+        "autofocus_on_capture": true,
+        "awb": "indoor",
+        "buffer_count": 2,
+        "camera_index": 0,
+        "denoise_frames": 10,
+        "encoding": "jpg",
+        "hflip": false,
+        "image_format": null,
+        "img_size": [
+         3840,
+         2160
+        ],
+        "iso": null,
+        "lens_position": null,
+        "nopreview": true,
+        "quality": 93,
+        "raw": false,
+        "rotate_deg": 0,
+        "shutter_speed": null,
+        "thumbnail": false,
+        "timeout": 50,
+        "vflip": false,
+        "zsl": false
+       },
+       "model": null,
+       "serial": null
+      }
+     ],
+     "capture_id": "00000000-0000-0000-0000-00000000000a",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "error": null,
+     "files": [
+      {
+       "bytes": 8,
+       "mimetype": "image/jpg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+       "role": "single",
+       "rotate_deg": 0,
+       "sha256": "5aeaea7512d454b6ac952669dcb39cc87c44ead84d21fad04b6064e905b39dbd"
+      },
+      {
+       "bytes": 11,
+       "mimetype": "application/octet-stream",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0004_c0.raw",
+       "role": "single_raw",
+       "rotate_deg": 0,
+       "sha256": "fe0f89c2f6e83b45a9230f56d652e2ae867e9bc394a32c6f9b214ee2c9fc1a4d"
+      }
+     ],
+     "host": {
+      "hostname": "Juans-Mac-Mini.local",
+      "machine": "arm64",
+      "platform": "macOS-27.2-arm64-arm-64bit"
+     },
+     "pair_id": null,
+     "project_name": "Fondo 10",
+     "sequence": null,
+     "status": "success",
+     "timestamp_utc": "<t>",
+     "timing": {},
+     "warnings": []
+    },
+    {
+     "capture_id": "00000000-0000-0000-0000-00000000000c",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "files": [
+      {
+       "bytes": 13,
+       "mimetype": "image/jpeg",
+       "relative_path": "captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+       "role": "single",
+       "sha256": "11a3d9bc7b213861390a8085a71c30977392c141a6e33285d15cd28b35c637d8"
+      }
+     ],
+     "record_type": "upload",
+     "timestamp_utc": "<t>"
+    },
+    {
+     "backfilled": true,
+     "capture_id": "00000000-0000-0000-0000-000000000007",
+     "computed_at": "<t>",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "files": [
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0003_c0_preview.jpg",
+       "role": "left_preview",
+       "sha256": "d85dbb0917b0d20a40985588048d137a4f68a49173e70eee3a8b4f19b105806b"
+      }
+     ],
+     "image_id": 5,
+     "record_type": "preview_digest"
+    },
+    {
+     "backfilled": true,
+     "capture_id": "00000000-0000-0000-0000-000000000007",
+     "computed_at": "<t>",
+     "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+     "files": [
+      {
+       "bytes": 16,
+       "mimetype": "image/jpeg",
+       "relative_path": "previews/co-ahr-con-caj080-car008-img_0003_c1_preview.jpg",
+       "role": "right_preview",
+       "sha256": "c0f361a4e8488f00e059315626f87926dd4509a2fb33e49ce2442606bba18367"
+      }
+     ],
+     "image_id": 6,
+     "record_type": "preview_digest"
+    }
+   ],
+   "target_root": "<root>/co-ahr-con-caj080-car008",
+   "target_stem": "co-ahr-con-caj080-car008",
+   "version": 1
+  }
+ ],
+ "manifests": {
+  "co-ahr-con-caj080-car008": [
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000001",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "4cc1845904151a37842dc87b4b63d82e55bf41a7fc32032748d82f56a55ffb01"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0001_c0_preview.jpg",
+      "role": "left_preview",
+      "rotate_deg": 0,
+      "sha256": "a64adaf85a89e43176b5bf3673cadf82ad7e92b58ebcd0798b66b608213fdd98"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "4450152aa363bbfce976f076cdb48bb62cd9464510fb67fe16a3606f99142dd9"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0001_c1_preview.jpg",
+      "role": "right_preview",
+      "rotate_deg": 0,
+      "sha256": "abaee98c4723186c1221b4017a056a9fab095e2389561ab68e549b58222cd8b0"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj080-car008-img_0001",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000004",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "e685497d15ca32f0d36cbac7c85ef642c2a7077a44d86ab276bc08ee19523de4"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0002_c0_preview.jpg",
+      "role": "left_preview",
+      "rotate_deg": 0,
+      "sha256": "ad48fc55a0ca7ecb4c8bf5a1642a9418decac47e2f436a879f12f42652e0719b"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "22ed52ad35651c719d3e3f3884182eed24cd88a106d8e362ee548b36c8b209bc"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0002_c1_preview.jpg",
+      "role": "right_preview",
+      "rotate_deg": 0,
+      "sha256": "7b8ed6424701b2c8efcbc4ed97bd7400d51f5f708f6f87dbe7b494aa6a8fd125"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj080-car008-img_0002",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "2840fc732877fea15e01992110f473dd7abeec70c408e5b07a499200dc00bf53"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "1a202cab2706a5e98fd50bdaeb7772adc2b0ed10422c590c30c6b432f2ad9d27"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj080-car008-img_0003",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-00000000000a",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+      "role": "single",
+      "rotate_deg": 0,
+      "sha256": "5aeaea7512d454b6ac952669dcb39cc87c44ead84d21fad04b6064e905b39dbd"
+     },
+     {
+      "bytes": 11,
+      "mimetype": "application/octet-stream",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0004_c0.raw",
+      "role": "single_raw",
+      "rotate_deg": 0,
+      "sha256": "fe0f89c2f6e83b45a9230f56d652e2ae867e9bc394a32c6f9b214ee2c9fc1a4d"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": null,
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-00000000000c",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "files": [
+     {
+      "bytes": 13,
+      "mimetype": "image/jpeg",
+      "relative_path": "captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+      "role": "single",
+      "sha256": "11a3d9bc7b213861390a8085a71c30977392c141a6e33285d15cd28b35c637d8"
+     }
+    ],
+    "record_type": "upload",
+    "timestamp_utc": "<t>"
+   },
+   {
+    "backfilled": true,
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "computed_at": "<t>",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "files": [
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0003_c0_preview.jpg",
+      "role": "left_preview",
+      "sha256": "d85dbb0917b0d20a40985588048d137a4f68a49173e70eee3a8b4f19b105806b"
+     }
+    ],
+    "image_id": 5,
+    "record_type": "preview_digest"
+   },
+   {
+    "backfilled": true,
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "computed_at": "<t>",
+    "copied_from": "co-ahr-con-caj80-car008/metadata/manifest.jsonl",
+    "files": [
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj080-car008-img_0003_c1_preview.jpg",
+      "role": "right_preview",
+      "sha256": "c0f361a4e8488f00e059315626f87926dd4509a2fb33e49ce2442606bba18367"
+     }
+    ],
+    "image_id": 6,
+    "record_type": "preview_digest"
+   }
+  ],
+  "co-ahr-con-caj80-car008": [
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000001",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0001_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "4cc1845904151a37842dc87b4b63d82e55bf41a7fc32032748d82f56a55ffb01"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0001_c0_preview.jpg",
+      "role": "left_preview",
+      "rotate_deg": 0,
+      "sha256": "a64adaf85a89e43176b5bf3673cadf82ad7e92b58ebcd0798b66b608213fdd98"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0001_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "4450152aa363bbfce976f076cdb48bb62cd9464510fb67fe16a3606f99142dd9"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0001_c1_preview.jpg",
+      "role": "right_preview",
+      "rotate_deg": 0,
+      "sha256": "abaee98c4723186c1221b4017a056a9fab095e2389561ab68e549b58222cd8b0"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj80-car008-img_0001",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000004",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0002_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "e685497d15ca32f0d36cbac7c85ef642c2a7077a44d86ab276bc08ee19523de4"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0002_c0_preview.jpg",
+      "role": "left_preview",
+      "rotate_deg": 0,
+      "sha256": "ad48fc55a0ca7ecb4c8bf5a1642a9418decac47e2f436a879f12f42652e0719b"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0002_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "22ed52ad35651c719d3e3f3884182eed24cd88a106d8e362ee548b36c8b209bc"
+     },
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0002_c1_preview.jpg",
+      "role": "right_preview",
+      "rotate_deg": 0,
+      "sha256": "7b8ed6424701b2c8efcbc4ed97bd7400d51f5f708f6f87dbe7b494aa6a8fd125"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj80-car008-img_0002",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     },
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 1,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 1,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0003_c0.CR2",
+      "role": "left",
+      "rotate_deg": 0,
+      "sha256": "2840fc732877fea15e01992110f473dd7abeec70c408e5b07a499200dc00bf53"
+     },
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0003_c1.CR2",
+      "role": "right",
+      "rotate_deg": 0,
+      "sha256": "1a202cab2706a5e98fd50bdaeb7772adc2b0ed10422c590c30c6b432f2ad9d27"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": "co-ahr-con-caj80-car008-img_0003",
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "cameras": [
+     {
+      "camera_controls_metadata": null,
+      "camera_index": 0,
+      "config": {
+       "aperture": null,
+       "autofocus_on_capture": true,
+       "awb": "indoor",
+       "buffer_count": 2,
+       "camera_index": 0,
+       "denoise_frames": 10,
+       "encoding": "jpg",
+       "hflip": false,
+       "image_format": null,
+       "img_size": [
+        3840,
+        2160
+       ],
+       "iso": null,
+       "lens_position": null,
+       "nopreview": true,
+       "quality": 93,
+       "raw": false,
+       "rotate_deg": 0,
+       "shutter_speed": null,
+       "thumbnail": false,
+       "timeout": 50,
+       "vflip": false,
+       "zsl": false
+      },
+      "model": null,
+      "serial": null
+     }
+    ],
+    "capture_id": "00000000-0000-0000-0000-00000000000a",
+    "error": null,
+    "files": [
+     {
+      "bytes": 8,
+      "mimetype": "image/jpg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0004_c0.jpg",
+      "role": "single",
+      "rotate_deg": 0,
+      "sha256": "5aeaea7512d454b6ac952669dcb39cc87c44ead84d21fad04b6064e905b39dbd"
+     },
+     {
+      "bytes": 11,
+      "mimetype": "application/octet-stream",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0004_c0.raw",
+      "role": "single_raw",
+      "rotate_deg": 0,
+      "sha256": "fe0f89c2f6e83b45a9230f56d652e2ae867e9bc394a32c6f9b214ee2c9fc1a4d"
+     }
+    ],
+    "host": {
+     "hostname": "Juans-Mac-Mini.local",
+     "machine": "arm64",
+     "platform": "macOS-27.2-arm64-arm-64bit"
+    },
+    "pair_id": null,
+    "project_name": "Fondo 10",
+    "sequence": null,
+    "status": "success",
+    "timestamp_utc": "<t>",
+    "timing": {},
+    "warnings": []
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-00000000000c",
+    "files": [
+     {
+      "bytes": 13,
+      "mimetype": "image/jpeg",
+      "relative_path": "captures/co-ahr-con-caj80-car008-img_0005_c0.jpg",
+      "role": "single",
+      "sha256": "11a3d9bc7b213861390a8085a71c30977392c141a6e33285d15cd28b35c637d8"
+     }
+    ],
+    "record_type": "upload",
+    "timestamp_utc": "<t>"
+   },
+   {
+    "backfilled": true,
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "computed_at": "<t>",
+    "files": [
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0003_c0_preview.jpg",
+      "role": "left_preview",
+      "sha256": "d85dbb0917b0d20a40985588048d137a4f68a49173e70eee3a8b4f19b105806b"
+     }
+    ],
+    "image_id": 5,
+    "record_type": "preview_digest"
+   },
+   {
+    "backfilled": true,
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "computed_at": "<t>",
+    "files": [
+     {
+      "bytes": 16,
+      "mimetype": "image/jpeg",
+      "relative_path": "previews/co-ahr-con-caj80-car008-img_0003_c1_preview.jpg",
+      "role": "right_preview",
+      "sha256": "c0f361a4e8488f00e059315626f87926dd4509a2fb33e49ce2442606bba18367"
+     }
+    ],
+    "image_id": 6,
+    "record_type": "preview_digest"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000001",
+    "from": "captures/co-ahr-con-caj80-car008-img_0001_c0.CR2",
+    "image_id": 1,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "4cc1845904151a37842dc87b4b63d82e55bf41a7fc32032748d82f56a55ffb01",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c0.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000001",
+    "from": "captures/co-ahr-con-caj80-car008-img_0001_c1.CR2",
+    "image_id": 2,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "4450152aa363bbfce976f076cdb48bb62cd9464510fb67fe16a3606f99142dd9",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c1.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000004",
+    "from": "captures/co-ahr-con-caj80-car008-img_0002_c0.CR2",
+    "image_id": 3,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "e685497d15ca32f0d36cbac7c85ef642c2a7077a44d86ab276bc08ee19523de4",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c0.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000004",
+    "from": "captures/co-ahr-con-caj80-car008-img_0002_c1.CR2",
+    "image_id": 4,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "22ed52ad35651c719d3e3f3884182eed24cd88a106d8e362ee548b36c8b209bc",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c1.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "from": "captures/co-ahr-con-caj80-car008-img_0003_c0.CR2",
+    "image_id": 5,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "2840fc732877fea15e01992110f473dd7abeec70c408e5b07a499200dc00bf53",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c0.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-000000000007",
+    "from": "captures/co-ahr-con-caj80-car008-img_0003_c1.CR2",
+    "image_id": 6,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "1a202cab2706a5e98fd50bdaeb7772adc2b0ed10422c590c30c6b432f2ad9d27",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c1.CR2"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-00000000000a",
+    "from": "captures/co-ahr-con-caj80-car008-img_0004_c0.jpg",
+    "image_id": 7,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "5aeaea7512d454b6ac952669dcb39cc87c44ead84d21fad04b6064e905b39dbd",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.jpg"
+   },
+   {
+    "capture_id": "00000000-0000-0000-0000-00000000000c",
+    "from": "captures/co-ahr-con-caj80-car008-img_0005_c0.jpg",
+    "image_id": 8,
+    "record_type": "relocation",
+    "relocated_at": "<t>",
+    "sha256": "11a3d9bc7b213861390a8085a71c30977392c141a6e33285d15cd28b35c637d8",
+    "to": "../co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0005_c0.jpg"
+   }
+  ]
+ },
+ "now": "<t>",
+ "result": {
+  "counter_after": 5,
+  "files_renamed": 23,
+  "images": 8,
+  "records": 4,
+  "recovery_pending": false,
+  "rows_retired": 14,
+  "source_id": 1,
+  "source_lines_appended": 8,
+  "target_id": 2,
+  "target_lines_appended": true,
+  "target_lines_pending": false
+ },
+ "rows": {
+  "collections": [
+   [
+    "1",
+    "Caja 80 carpeta 8",
+    "None",
+    "None",
+    "1",
+    "None",
+    "None",
+    "co-ahr-con-caj80-car008",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "5",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "False",
+    "False",
+    "None"
+   ],
+   [
+    "2",
+    "Caja 080 carpeta 008",
+    "None",
+    "None",
+    "2",
+    "None",
+    "None",
+    "co-ahr-con-caj080-car008",
+    "co-ahr-con-caj080-car008",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "5",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "False",
+    "False",
+    "None"
+   ]
+  ],
+  "offsite_objects": [
+   [
+    "1",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c0.CR2",
+    "c521ca5188a9758f6f82e4a0d9369f12b9b3c7c4",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "1",
+    "<t>"
+   ],
+   [
+    "10",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0003_c0_preview.jpg",
+    "84c4664ebb6d32ddc75555f0ade19e49b2e89dd8",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "5",
+    "<t>"
+   ],
+   [
+    "11",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c1.CR2",
+    "394fda9353e01aba005d0f7c280185e28d999192",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "6",
+    "<t>"
+   ],
+   [
+    "12",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0003_c1_preview.jpg",
+    "fd990d544aa731af4b218a31066e15e8c1d6a9ef",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "6",
+    "<t>"
+   ],
+   [
+    "13",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0004_c0.jpg",
+    "4ff161501986d6b62d6e15bd0e0a20a986e08474",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "7",
+    "<t>"
+   ],
+   [
+    "14",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0005_c0.jpg",
+    "42dfcfa5a7ff22e508faeabc4a943da65f7d8845",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "8",
+    "<t>"
+   ],
+   [
+    "2",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0001_c0_preview.jpg",
+    "bc5e756ce0f97d0cc204db6f31e1c2b37c018c3d",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "1",
+    "<t>"
+   ],
+   [
+    "3",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0001_c1.CR2",
+    "0edc5e579676843a9ca47a67e786a8e9dad02712",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "2",
+    "<t>"
+   ],
+   [
+    "4",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0001_c1_preview.jpg",
+    "9d394b8f488b84bc85ed1ce132c2ce2751d690d7",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "2",
+    "<t>"
+   ],
+   [
+    "5",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c0.CR2",
+    "423f49ac7b6c69c4ec0d0886bfe50cc3b489190a",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "3",
+    "<t>"
+   ],
+   [
+    "6",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0002_c0_preview.jpg",
+    "ec69142d862dece31b88250a90c83e61e32180a2",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "3",
+    "<t>"
+   ],
+   [
+    "7",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0002_c1.CR2",
+    "c47e6b716a4ce5865c79200839e3ffcafb4b54de",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "4",
+    "<t>"
+   ],
+   [
+    "8",
+    "None",
+    "preview",
+    "captua-test/co-ahr-con-caj80-car008/previews/co-ahr-con-caj80-car008-img_0002_c1_preview.jpg",
+    "ab7f8c02f295470b6185b9dae43f5f4745d232e9",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "4",
+    "<t>"
+   ],
+   [
+    "9",
+    "None",
+    "capture",
+    "captua-test/co-ahr-con-caj80-car008/captures/co-ahr-con-caj80-car008-img_0003_c0.CR2",
+    "62d4ff33d9c1c4637e295f8d670eecea71316d86",
+    "None",
+    "<t>",
+    "<t>",
+    "None",
+    "None",
+    "<t>",
+    "5",
+    "<t>"
+   ]
+  ],
+  "projects": [
+   [
+    "1",
+    "Fondo 10",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "False",
+    "None"
+   ],
+   [
+    "2",
+    "Fondo 13",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "False",
+    "None"
+   ]
+  ],
+  "record_images": [
+   [
+    "1",
+    "1",
+    "00000000-0000-0000-0000-000000000001",
+    "co-ahr-con-caj080-car008-img_0001",
+    "None",
+    "left",
+    "co-ahr-con-caj080-car008-img_0001_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000002_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "False",
+    "<t>",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "2",
+    "1",
+    "00000000-0000-0000-0000-000000000001",
+    "co-ahr-con-caj080-car008-img_0001",
+    "None",
+    "right",
+    "co-ahr-con-caj080-car008-img_0001_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0001_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000003_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "False",
+    "<t>",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "3",
+    "1",
+    "00000000-0000-0000-0000-000000000004",
+    "co-ahr-con-caj080-car008-img_0002",
+    "None",
+    "left",
+    "co-ahr-con-caj080-car008-img_0002_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000005_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "4",
+    "1",
+    "00000000-0000-0000-0000-000000000004",
+    "co-ahr-con-caj080-car008-img_0002",
+    "None",
+    "right",
+    "co-ahr-con-caj080-car008-img_0002_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0002_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000006_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "5",
+    "2",
+    "00000000-0000-0000-0000-000000000007",
+    "co-ahr-con-caj080-car008-img_0003",
+    "None",
+    "left",
+    "co-ahr-con-caj080-car008-img_0003_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c0.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000008_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "6",
+    "2",
+    "00000000-0000-0000-0000-000000000007",
+    "co-ahr-con-caj080-car008-img_0003",
+    "None",
+    "right",
+    "co-ahr-con-caj080-car008-img_0003_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0003_c1.CR2",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/00000000000000000000000000000009_thumb.jpg",
+    "8",
+    "CR2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "7",
+    "3",
+    "00000000-0000-0000-0000-00000000000a",
+    "co-ahr-con-caj080-car008-img_0004",
+    "None",
+    "single",
+    "co-ahr-con-caj080-car008-img_0004_c0.jpg",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0004_c0.jpg",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000b_thumb.jpg",
+    "8",
+    "JPG",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ],
+   [
+    "8",
+    "4",
+    "00000000-0000-0000-0000-00000000000c",
+    "co-ahr-con-caj080-car008-img_0005",
+    "None",
+    "single",
+    "co-ahr-con-caj080-car008-img_0005_c0.jpg",
+    "<root>/co-ahr-con-caj080-car008/captures/co-ahr-con-caj080-car008-img_0005_c0.jpg",
+    "<root>/co-ahr-con-caj080-car008/thumbnails/0000000000000000000000000000000d_thumb.jpg",
+    "13",
+    "JPG",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "None",
+    "True",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None"
+   ]
+  ],
+  "records": [
+   [
+    "1",
+    "ff. 1-2",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "2",
+    "captured",
+    "1",
+    "dual",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "<t>",
+    "None"
+   ],
+   [
+    "2",
+    "ff. 3-4",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "2",
+    "captured",
+    "2",
+    "dual",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "<t>",
+    "None"
+   ],
+   [
+    "3",
+    "f. 5",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "2",
+    "captured",
+    "3",
+    "single",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "<t>",
+    "None"
+   ],
+   [
+    "4",
+    "f. 6",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "2",
+    "captured",
+    "4",
+    "single",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "None",
+    "<t>",
+    "<t>",
+    "None"
+   ]
+  ]
+ }
+}

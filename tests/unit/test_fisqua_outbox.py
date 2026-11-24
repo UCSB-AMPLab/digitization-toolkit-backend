@@ -1576,3 +1576,29 @@ def test_each_call_builds_its_own_transport_from_the_pairing_it_reads_then(fisqu
     assert len(opened) == 2 and opened[0] is not opened[1]
     assert opened[0].is_closed and opened[1].is_closed
     assert second._token == OTHER_TOKEN
+
+
+@pytest.mark.unit
+def test_promotion_waits_while_an_adoption_journal_names_the_volume(client, db_session, vol, fisqua, monkeypatch,
+                                                                    tmp_path):
+    """A handover of a volume an unfinished adoption names stays waiting; once the journal is gone it is sent."""
+    import json
+
+    from app.core import config
+    from app.core.adopt_journal import journal_file
+
+    data = tmp_path / "adopt-data"
+    data.mkdir()
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(data))
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    transport = FakeTransport(sends=[_delivered()])
+    journal_file().write_text(json.dumps({"version": 1, "run_id": "kept", "source_id": -1,
+                                          "target_id": vol.col.id}))
+
+    _run(db_session, transport)
+
+    assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
+    journal_file().unlink()
+    _run(db_session, transport)
+    assert _rows(db_session, vol.col)[0].state == "delivered"

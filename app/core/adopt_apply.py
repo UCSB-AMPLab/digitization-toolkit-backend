@@ -62,7 +62,10 @@ lock taken is refused at once (`adoption_in_progress`). In this order:
 9. The rows are written: the records into the target with the sequences
    after the target's highest, in their listing order (as move-records
    assigns them), each image's filename, file_path, thumbnail_path and
-   pair_id, and the target's capture_counter. The source must then hold no
+   pair_id, the target's capture_counter, and the source's
+   captures_adopted_at, which closes it (app.models.collection; an undone
+   adoption leaves it null, a finished one, by recovery too, leaves it set,
+   since the commit decides both). The source must then hold no
    record (`source_records_changed` otherwise, once everything is put
    back). Then the commit, and the journal's phase `committed`.
 10. The target's lines are appended to the target's manifest, the journal's
@@ -103,6 +106,19 @@ A BaseException that is not an Exception (an interrupt) rolls the session
 back, touches no file, keeps the journal and propagates: what it leaves is
 what a killed process leaves, and startup recovery
 (app.core.adopt_journal.recover_adoption_at_startup) finishes or undoes it.
+
+Colour card shots move with the pages, in the same transaction and journal
+(app.core.adopt_captures.ShotRename). In order: step 7 also retires every
+colour_card_objects row of the source's shots (offsite_retired.
+retire_card_rows; one not verified refuses, nothing moved); step 8 makes
+the target's `calibration/` with its four directories and renames each
+shot's master, preview and `.raw` buffer after the pages' files; step 9
+moves the source's colour card sets to the target and writes each shot's
+filename, file_path, preview_filename and preview_path, and the source must
+then hold no set either. The source's relocation records and the target's
+lines carry the shots too (app.core.adopt_manifest). A source with no
+colour card set writes exactly what it wrote before: no shot key in the
+journal, the same moves, rows and lines.
 
 Version: 0.3.3
 """
@@ -177,7 +193,7 @@ class AdoptFailed(Exception):
 
 
 class _SourceChanged(Exception):
-    """The source still holds a record once its records were moved."""
+    """The source still holds a record or a colour card set once its records and sets were moved."""
 
 
 class _DestinationTaken(Exception):
@@ -258,7 +274,10 @@ def _adopt_locked(db: Session, source_id: int, target_id: int, *, actor, now: da
                             f"records={result['records']} images={result['images']} "
                             f"files_renamed={result['files_renamed']} rows_retired={result['rows_retired']} "
                             f"counter={result['counter_after']} "
-                            f"target_lines_appended={result['target_lines_appended']}"))
+                            + (f"colour_card_sets={result['colour_card_sets']} "
+                               f"colour_card_shots={result['colour_card_shots']} "
+                               if result["colour_card_sets"] else "")
+                            + f"target_lines_appended={result['target_lines_appended']}"))
     return result
 
 
@@ -339,11 +358,33 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
         db.rollback()
         raise AdoptRefused(409, ["offsite_rows_not_verified"], {"offsite_rows_not_verified": exc.unverified},
                            message=NOT_VERIFIED_MESSAGE) from exc
+    retired_cards = []
+    if plan.shot_renames:
+        try:
+            retired_cards = offsite_retired.retire_card_rows(db, [r.shot_id for r in plan.shot_renames], now=now)
+        except offsite_retired.CardRetireRefused as exc:
+            db.rollback()
+            raise AdoptRefused(409, ["offsite_rows_not_verified"], {"offsite_rows_not_verified": exc.unverified},
+                               message=NOT_VERIFIED_MESSAGE) from exc
 
     # 8 and 9. The journal, the directories, the files, the rows, then the commit.
+    #
+    # Shots, in the order pages have them: (a) the shots' offsite rows are retired above, in this
+    # transaction, uncommitted; (b) the journal lists every shot rename, the shots' and sets' ids and
+    # old and new paths, before the first rename; (c) the shots' files are renamed after the pages';
+    # (d) the sets and shots rows are written beside the records and images; (e) one commit lands all
+    # rows, the retirement included; (f) the journal is marked committed and the target's lines
+    # (with the shots' calibration lines) appended; (g) the upload queues each shot again on its own,
+    # since a shot with no row is pending (image_upload.colour_card_work), once the commit is visible.
+    # A failure before (e) puts every renamed file back and rolls back (a) and (d) together; a kill
+    # leaves the journal, and recovery decides by the records, checks the images' and the shots'
+    # rows against that decision, and renames every listed file forward or back. After (e) a
+    # failure leaves the adoption landed, and recovery only finishes (f). Nothing is queued before
+    # the commit, so a rolled-back adoption leaves no upload of a new key.
     moves = planned_moves(plan)
-    to_create = _dirs_to_create(tgt_root)
-    journal = _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, actor=actor, now=now)
+    to_create = _dirs_to_create(tgt_root, calibration=bool(plan.shot_renames))
+    journal = _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, actor=actor, now=now,
+                       retired_cards=retired_cards)
     try:
         adopt_journal.create_journal(journal)
     except adopt_journal.JournalTaken as exc:
@@ -358,14 +399,14 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
         raise
     moved: List[Tuple[Path, Path]] = []
     try:
-        _make_target_dirs(plan.target_stem)
+        _make_target_dirs(plan.target_stem, tgt_root if plan.shot_renames else None)
         # Again just before the first rename: a directory made a link elsewhere since the plan.
         outside = not_inside_storage(plan)
         if outside:
             raise _OutsideStorage(outside)
         _rename_all(moves, moved)
         adopt_journal.sync_journal_directories(journal)
-        _write_rows(db, plan, records, source_id, target_id)
+        _write_rows(db, plan, records, source_id, target_id, now=now)
     except Exception as exc:
         # The row locks are still held: the files go back before the rollback lets them go.
         not_restored = _undo(moved)
@@ -414,29 +455,37 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
                f"it at the next start from {adopt_journal.journal_file()}")
     return {
         "source_id": source_id, "target_id": target_id, "records": len(records), "images": len(plan.renames),
-        "files_renamed": len(moved), "rows_retired": len(retired), "counter_after": plan.counter_after,
+        "files_renamed": len(moved), "rows_retired": len(retired) + len(retired_cards),
+        "counter_after": plan.counter_after,
+        "colour_card_sets": len(plan.card_set_ids), "colour_card_shots": len(plan.shot_renames),
         "source_lines_appended": len(source_lines), "target_lines_appended": appended,
         "target_lines_pending": not appended, "recovery_pending": pending,
         "_source_stem": plan.source_stem, "_target_stem": plan.target_stem,
     }
 
 
-def _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, *, actor, now) -> dict:
+def _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, *, actor, now,
+             retired_cards=()) -> dict:
+    """The journal (app.core.adopt_journal); the shots' keys only when the source has colour card sets."""
     kinds = {}
     for r in plan.renames:
-        kinds[(r.old_path, r.new_path)] = ("master", r.image_id)
-        kinds[(r.old_preview_path, r.new_preview_path)] = ("preview", r.image_id)
-        kinds[(r.old_raw_buffer_path, r.new_raw_buffer_path)] = ("buffer", r.image_id)
-        kinds[(r.old_thumbnail_path, r.new_thumbnail_path)] = ("thumbnail", r.image_id)
+        kinds[(r.old_path, r.new_path)] = ("master", "image_id", r.image_id)
+        kinds[(r.old_preview_path, r.new_preview_path)] = ("preview", "image_id", r.image_id)
+        kinds[(r.old_raw_buffer_path, r.new_raw_buffer_path)] = ("buffer", "image_id", r.image_id)
+        kinds[(r.old_thumbnail_path, r.new_thumbnail_path)] = ("thumbnail", "image_id", r.image_id)
+    for r in plan.shot_renames:
+        kinds[(r.old_path, r.new_path)] = ("colour_card_shot", "shot_id", r.shot_id)
+        kinds[(r.old_preview_path, r.new_preview_path)] = ("colour_card_preview", "shot_id", r.shot_id)
+        kinds[(r.old_raw_buffer_path, r.new_raw_buffer_path)] = ("colour_card_buffer", "shot_id", r.shot_id)
     import uuid
 
-    return {
+    journal = {
         "version": adopt_journal.JOURNAL_VERSION, "run_id": uuid.uuid4().hex, "phase": "renaming",
         "source_id": plan.source_id, "source_stem": plan.source_stem,
         "target_id": plan.target_id, "target_stem": plan.target_stem,
         "actor": actor, "started_at": now.isoformat(),
-        "moves": [{"kind": kinds[(old, new)][0], "image_id": kinds[(old, new)][1], "old": str(old), "new": str(new)}
-                  for old, new in moves],
+        "moves": [{"kind": kinds[(old, new)][0], kinds[(old, new)][1]: kinds[(old, new)][2],
+                   "old": str(old), "new": str(new)} for old, new in moves],
         "images": [{"id": r.image_id, "record_id": r.record_id, "old_file_path": str(r.old_path),
                     "new_file_path": str(r.new_path)} for r in plan.renames],
         "record_ids": [rec.id for rec in records],
@@ -446,6 +495,15 @@ def _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, *
         "target_root": str(tgt_root),
         "target_lines": target_lines,
     }
+    if plan.card_set_ids:
+        journal["colour_card_set_ids"] = list(plan.card_set_ids)
+        journal["colour_card_shots"] = [
+            {"id": r.shot_id, "set_id": r.set_id, "old_file_path": str(r.old_path), "new_file_path": str(r.new_path),
+             "old_preview_path": str(r.old_preview_path) if r.old_preview_path else None,
+             "new_preview_path": str(r.new_preview_path) if r.new_preview_path else None}
+            for r in plan.shot_renames]
+        journal["retired_colour_card_row_ids"] = sorted(row.id for row in retired_cards)
+    return journal
 
 
 def _manifest_lines(db: Session, plan, src_root: Path, now: datetime) -> tuple:
@@ -479,9 +537,9 @@ def _append_source_lines(src_root: Path, lines: list) -> None:
 
 
 def planned_moves(plan) -> List[Tuple[Path, Path]]:
-    """Every (old, new) rename of the plan, in its image order: master, preview, buffer, thumbnail."""
+    """Every (old, new) rename of the plan: each image's master, preview, buffer and thumbnail, then each shot's."""
     moves = []
-    for r in plan.renames:
+    for r in list(plan.renames) + list(getattr(plan, "shot_renames", [])):
         for old, new in ((r.old_path, r.new_path), (r.old_preview_path, r.new_preview_path),
                          (r.old_raw_buffer_path, r.new_raw_buffer_path),
                          (r.old_thumbnail_path, r.new_thumbnail_path)):
@@ -494,22 +552,29 @@ def not_inside_storage(plan) -> list:
     """The refusal codes of adopt_captures.outside_storage for the plan's paths, read now; empty when none."""
     from app.core.adopt_captures import outside_storage
 
-    source, target = outside_storage(plan.source_stem, plan.target_stem, plan.renames)
+    source, target = outside_storage(plan.source_stem, plan.target_stem, plan.renames + plan.shot_renames)
     return (["source_outside_storage"] if source else []) + (["target_outside_storage"] if target else [])
 
 
-def _dirs_to_create(tgt_root: Path) -> List[Path]:
-    """The target's root and four directories that do not exist yet, deepest first."""
-    from app.core.paths import VOLUME_SUBDIRS
+def _dirs_to_create(tgt_root: Path, calibration: bool = False) -> List[Path]:
+    """The target's root and four directories, and its `calibration/` when shots move, not there yet; deepest first."""
+    from app.core.paths import CALIBRATION_DIR, VOLUME_SUBDIRS
 
     candidates = [tgt_root] + [tgt_root / d for d in VOLUME_SUBDIRS]
+    if calibration:
+        candidates.append(tgt_root / CALIBRATION_DIR)
     return list(reversed([p for p in candidates if not p.exists()]))
 
 
-def _make_target_dirs(stem: str) -> None:
+def _make_target_dirs(stem: str, calibration_root: Optional[Path] = None) -> None:
+    """The target's four directories, and `calibration/` under `calibration_root` when it is given."""
     from capture import project_manager
 
+    from app.core.paths import CALIBRATION_DIR
+
     project_manager.ensure_volume_dirs(stem)
+    if calibration_root is not None:
+        (calibration_root / CALIBRATION_DIR).mkdir(exist_ok=True)
 
 
 def _remove_created(created: List[Path]) -> None:
@@ -529,7 +594,7 @@ def _rename_all(moves: List[Tuple[Path, Path]], moved: List[Tuple[Path, Path]]) 
         moved.append((old, new))
 
 
-def _write_rows(db: Session, plan, records: list, source_id: int, target_id: int) -> None:
+def _write_rows(db: Session, plan, records: list, source_id: int, target_id: int, *, now: datetime) -> None:
     from app.core import record_sequence
     from app.models.collection import Collection
     from app.models.record import Record, RecordImage
@@ -549,9 +614,34 @@ def _write_rows(db: Session, plan, records: list, source_id: int, target_id: int
             if r.new_thumbnail_path is not None:
                 img.thumbnail_path = str(r.new_thumbnail_path)
     db.get(Collection, target_id).capture_counter = plan.counter_after
+    # The source is closed in this transaction (Collection.captures_adopted_at): an undone adoption leaves it open.
+    db.get(Collection, source_id).captures_adopted_at = now.replace(tzinfo=None)
+    if plan.card_set_ids:
+        _write_card_rows(db, plan, target_id)
     db.flush()
     if db.query(Record.id).filter(Record.collection_id == source_id).first() is not None:
         raise _SourceChanged("the source still holds a record once its records were moved")
+    if plan.card_set_ids:
+        from app.models.colour_card import ColourCardSet
+
+        if db.query(ColourCardSet.id).filter(ColourCardSet.collection_id == source_id).first() is not None:
+            raise _SourceChanged("the source still holds a colour card set once its sets were moved")
+
+
+def _write_card_rows(db: Session, plan, target_id: int) -> None:
+    """Move the source's colour card sets to the target, numbers kept, and give each shot its new names."""
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    for card_set in db.query(ColourCardSet).filter(ColourCardSet.id.in_(plan.card_set_ids)):
+        card_set.collection_id = target_id
+    by_id = {r.shot_id: r for r in plan.shot_renames}
+    ids = list(by_id)
+    for start in range(0, len(ids), 500):
+        for shot in db.query(ColourCardShot).filter(ColourCardShot.id.in_(ids[start:start + 500])):
+            r = by_id[shot.id]
+            shot.filename, shot.file_path = r.new_name, str(r.new_path)
+            if r.new_preview_path is not None:
+                shot.preview_filename, shot.preview_path = r.new_preview_path.name, str(r.new_preview_path)
 
 
 def _commit(db: Session, plan, source_id: int, target_id: int, moved: List[Tuple[Path, Path]],

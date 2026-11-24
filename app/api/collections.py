@@ -32,7 +32,7 @@ from app.core.record_status import record_bulk_status_changes
 from app.core.volume_stem import locked_volume_query
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
-from app.core.export_jobs import ExportBlockedError, export_jobs
+from app.core.export_jobs import ExportAdoptionUnfinished, ExportBlockedError, export_jobs
 from app.core.export_service import exported_records, run_export, workflow_blockers
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
@@ -580,6 +580,19 @@ def _rename_body(r) -> dict:
     }
 
 
+def _shot_rename_body(r) -> dict:
+    def text(path):
+        return str(path) if path is not None else None
+
+    return {
+        "shot_id": r.shot_id, "set_id": r.set_id, "camera_index": r.camera_index,
+        "old_name": r.old_name, "new_name": r.new_name, "old_path": str(r.old_path), "new_path": str(r.new_path),
+        "old_preview_path": text(r.old_preview_path), "new_preview_path": text(r.new_preview_path),
+        "old_raw_buffer_path": text(r.old_raw_buffer_path), "new_raw_buffer_path": text(r.new_raw_buffer_path),
+        "old_keys": dict(r.old_keys), "new_keys": dict(r.new_keys),
+    }
+
+
 @router.get("/{source_id}/adopt-into/{target_id}", response_model=AdoptPlanRead)
 def plan_adopt_into(
     source_id: int,
@@ -592,7 +605,8 @@ def plan_adopt_into(
 
     The plan (app.core.adopt_captures.plan_adopt_captures): every refusal
     with its details, the counts, the first `limit` renames and whether
-    more were left out, the entries no source image owns, the missing
+    more were left out, the colour card sets that move and every shot's
+    renames, the entries no source image or shot owns, the missing
     thumbnails and both projects. A volume that does not exist is a
     refusal in the plan, not a 404. Changes nothing.
     """
@@ -612,6 +626,8 @@ def plan_adopt_into(
         "renames": [_rename_body(r) for r in plan.renames[:limit]],
         "uncovered": plan.uncovered, "thumbnails_missing": plan.thumbnails_missing,
         "capture_lines": plan.capture_lines, "unaccounted_capture_lines": plan.unaccounted_capture_lines,
+        "colour_card_set_ids": plan.card_set_ids, "shot_bytes": plan.shot_bytes,
+        "shot_renames": [_shot_rename_body(r) for r in plan.shot_renames],
     }
 
 
@@ -1149,7 +1165,7 @@ def move_collection_records(
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
     # Neither out of nor into a volume an unfinished adoption names (app.core.adopt_journal).
-    from app.core.adopt_journal import refuse_if_journaled
+    from app.core.adopt_journal import refuse_if_adopted_away, refuse_if_journaled
     refuse_if_journaled([collection_id, target_collection_id])
 
     target = db.query(Collection).filter(Collection.id == target_collection_id).first()
@@ -1224,6 +1240,16 @@ def move_collection_records(
     sequences = next_sequences(db, target_collection_id, len(records))
     if sequences is None:
         raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
+    # Again, now the source's records and the target's row are locked: an adoption takes the same locks,
+    # so one that ran while this request waited for them has left its journal, if it kept one, by now.
+    # The check above only refuses early.
+    try:
+        refuse_if_journaled([collection_id, target_collection_id])
+        # Not into a volume an adoption closed (Collection.captures_adopted_at), read under the target's lock.
+        refuse_if_adopted_away(db, [target_collection_id])
+    except HTTPException:
+        db.rollback()
+        raise
 
     not_moved: List[str] = []
     moves: List = []
@@ -1267,7 +1293,7 @@ def delete_collection(
     found in its directory (one no row references, such as a file the volume
     layout migration left there) stays, with the directories above it, and is
     logged at WARNING. A volume whose captures were adopted away
-    (Collection.captures_adopted_away) is the one exception to the stem
+    (Collection.deletable_after_adoption) is the one exception to the stem
     refusal: it is deleted, its manifest moved to `.retired-manifests/`
     (storage_ops.retire_project_manifest), and its stem stays held by its
     retired offsite keys.
@@ -1306,8 +1332,8 @@ def delete_collection(
     refuse_if_journaled(collection_and_descendants(db, collection_id))
 
     # A volume that has captured keeps its row, so its stem is never issued again; the one exception is a
-    # volume whose captures were adopted away (Collection.captures_adopted_away), whose retired keys hold it.
-    adopted_away = collection.reserves_its_stem() and collection.captures_adopted_away()
+    # volume whose captures were adopted away (Collection.deletable_after_adoption), whose retired keys hold it.
+    adopted_away = collection.reserves_its_stem() and collection.deletable_after_adoption()
     if collection.reserves_its_stem() and not adopted_away:
         raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
 
@@ -1880,6 +1906,8 @@ def export_collection_bagit(
     # zip build happen in the job, surfaced via the status endpoint.
     try:
         job = export_jobs.start(collection_id, lambda j: run_export(j, collection_id))
+    except ExportAdoptionUnfinished as e:
+        raise HTTPException(status_code=409, detail={"code": "adoption_unfinished", "message": str(e)})
     except ExportBlockedError as e:
         raise HTTPException(status_code=409, detail=str(e))
     log_event(db, level="INFO", category="activity", action="export_started",

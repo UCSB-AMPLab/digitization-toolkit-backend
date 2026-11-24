@@ -24,6 +24,13 @@ to a temporary name, fsynced and renamed into place
      "created_dirs": the target directories the adoption makes, deepest first,
      "source_root", "target_root", "target_lines": the lines for the target's manifest}
 
+and, only when the source has colour card sets, `colour_card_set_ids`,
+`colour_card_shots` ([{"id", "set_id", "old_file_path", "new_file_path",
+"old_preview_path", "new_preview_path"}, ...]) and
+`retired_colour_card_row_ids`, with the shots' renames in `moves` after
+the images' (kinds `colour_card_shot`, `colour_card_preview`,
+`colour_card_buffer`, each with `shot_id` in place of `image_id`).
+
 `moves` is every rename the adoption makes, in order; it is written before
 the first, so it says what the adoption will do, not how far it got. The
 phase records the last step known to have finished; the database, not the
@@ -42,12 +49,15 @@ the target mean the commit landed, and all in the source mean it did not.
 The images' rows and the files are then checked against that decision,
 never used to make it:
 
-* Landed: every image row must hold its new path. Each file still at its
+* Landed: every image row must hold its new path, and so must every shot
+  row (its file and preview paths), with every colour card set in the
+  target. Each file still at its
   old path is renamed to its new one, the journal's directories are synced
   (sync_journal_directories), the target's lines its manifest does not yet
   hold are appended, the directories are synced again, and the journal is
   removed.
-* Not landed: every image row must hold its old path. Each file at its new
+* Not landed: every image row and shot row must hold its old paths, with
+  every colour card set in the source. Each file at its new
   path is renamed back to its old one, the directories the adoption made
   are removed when empty, the journal's directories are synced, and the
   journal is removed. The source's relocation records stay in its
@@ -351,6 +361,32 @@ def refuse_if_journaled(collection_ids: Iterable[Optional[int]]) -> None:
                                                      "message": unfinished_message()})
 
 
+ADOPTED_AWAY = "captures_adopted_away"
+ADOPTED_AWAY_MESSAGE = ("This volume's captures were moved into another volume. It takes no new captures or "
+                        "records; delete it.")
+
+
+def refuse_if_adopted_away(db, collection_ids: Iterable[Optional[int]]) -> None:
+    """409 `captures_adopted_away` when any of the volumes is closed by an adoption (Collection.captures_adopted_at).
+
+    Read with a statement of its own, so the value committed when the
+    caller took the volume's row lock is the one read, not one held in the
+    session. Each caller reads it after that lock, or, for a record's image,
+    after the record's lock, which an adoption holds on every record of its
+    source when it sets the column.
+    """
+    from fastapi import HTTPException
+
+    from app.models.collection import Collection
+
+    ids = [cid for cid in collection_ids if cid is not None]
+    if not ids:
+        return
+    closed = db.query(Collection.id).filter(Collection.id.in_(ids), Collection.captures_adopted_at.isnot(None)).first()
+    if closed is not None:
+        raise HTTPException(status_code=409, detail={"code": ADOPTED_AWAY, "message": ADOPTED_AWAY_MESSAGE})
+
+
 def _rename(src: Path, dst: Path) -> None:
     os.rename(src, dst)
 
@@ -389,6 +425,20 @@ def _lines_missing(target_root: Path, lines: list) -> list:
     return [line for line in lines if _canonical(line) not in present]
 
 
+def _card_rows(db: Session, journal: dict) -> tuple:
+    """({shot id: (file_path, preview_path)}, {set id: collection_id}) for the journal's colour card rows, read now."""
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    shot_ids = [sh["id"] for sh in journal.get("colour_card_shots") or []]
+    set_ids = list(journal.get("colour_card_set_ids") or [])
+    shots = {sid: (fp, pp) for sid, fp, pp in db.query(ColourCardShot.id, ColourCardShot.file_path,
+                                                        ColourCardShot.preview_path)
+             .filter(ColourCardShot.id.in_(shot_ids))} if shot_ids else {}
+    sets = dict(db.query(ColourCardSet.id, ColourCardSet.collection_id)
+                .filter(ColourCardSet.id.in_(set_ids)).all()) if set_ids else {}
+    return shots, sets
+
+
 def recover_adoption_at_startup(db: Session) -> Optional[dict]:
     """Finish or undo the adoption a journal records (module header); None when there is none.
 
@@ -424,6 +474,7 @@ def _recover(db: Session, journal: dict) -> dict:
     images = journal.get("images") or []
     ids = [i["id"] for i in images]
     rows = dict(db.query(RecordImage.id, RecordImage.file_path).filter(RecordImage.id.in_(ids)).all()) if ids else {}
+    shot_rows, set_homes = _card_rows(db, journal)
     db.rollback()
     new = bool(record_ids) and all(homes.get(r) == journal.get("target_id") for r in record_ids)
     old = bool(record_ids) and all(homes.get(r) == journal.get("source_id") for r in record_ids)
@@ -433,6 +484,14 @@ def _recover(db: Session, journal: dict) -> dict:
     contradicting = [i["id"] for i in images if rows.get(i["id"]) != i[wanted]]
     if contradicting:
         return _unfinished(db, journal, f"the rows of images {contradicting[:10]} contradict where the records are")
+    side = "new" if new else "old"
+    home = journal.get("target_id") if new else journal.get("source_id")
+    shots_off = [sh["id"] for sh in journal.get("colour_card_shots") or []
+                 if shot_rows.get(sh["id"]) != (sh[f"{side}_file_path"], sh[f"{side}_preview_path"])]
+    sets_off = [sid for sid in journal.get("colour_card_set_ids") or [] if set_homes.get(sid) != home]
+    if shots_off or sets_off:
+        return _unfinished(db, journal, f"the colour card shots {shots_off[:10]} or sets {sets_off[:10]} contradict "
+                                        "where the records are")
 
     moves = [(Path(m["old"]), Path(m["new"])) for m in journal.get("moves") or []]
     todo = []

@@ -86,33 +86,40 @@ class ReferenceCodeDiffersFromStemError(ValueError):
 
 
 def offsite_keys_under_stem(session, stem, collection=None) -> bool:
-    """Whether any offsite_objects key lies under `<tenant>/<stem>/`, for any tenant.
+    """Whether any offsite_objects or colour_card_objects key lies under `<tenant>/<stem>/`, for any tenant.
 
     A key holds the stem when its second path segment is the stem and
     something follows it: `<tenant>/<stem>/<rest>`. The tenant is not
     compared with CAPTUA_OFFSITE_TENANT, because keys under an earlier tenant,
     or kept while upload is disabled, name objects issued under the stem
     all the same. With `collection` given, a key whose image belongs to a
-    record in that volume is not counted. A key whose image was deleted
-    (record_image_id NULL, or an id no image has) always counts. Reads with
-    autoflush off, so it can run inside a flush.
+    record in that volume, or whose colour card shot belongs to one of its
+    sets, is not counted. A key whose image or shot was deleted or adopted
+    away (record_image_id or shot_id NULL, or an id no row has) always
+    counts. Reads with autoflush off, so it can run inside a flush.
     """
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
     from app.models.offsite_object import OffsiteObject
 
     if not stem:
         return False
     # The stem alphabet [a-z0-9-] holds no LIKE wildcard.
     query = select(OffsiteObject.object_key).where(OffsiteObject.object_key.like(f"%/{stem}/%"))
+    cards = select(ColourCardObject.object_key).where(ColourCardObject.object_key.like(f"%/{stem}/%"))
     if collection is not None and collection.id is not None:
         own = select(RecordImage.id).where(RecordImage.record_id == Record.id,
                                            Record.collection_id == collection.id)
         query = query.where((OffsiteObject.record_image_id.is_(None))
                             | (OffsiteObject.record_image_id.not_in(own)))
+        own_shots = select(ColourCardShot.id).where(ColourCardShot.set_id == ColourCardSet.id,
+                                                    ColourCardSet.collection_id == collection.id)
+        cards = cards.where((ColourCardObject.shot_id.is_(None)) | (ColourCardObject.shot_id.not_in(own_shots)))
     with session.no_autoflush:
-        for key in session.execute(query).scalars():
-            parts = key.split("/", 2)
-            if len(parts) == 3 and parts[0] and parts[1] == stem and parts[2]:
-                return True
+        for q in (query, cards):
+            for key in session.execute(q).scalars():
+                parts = key.split("/", 2)
+                if len(parts) == 3 and parts[0] and parts[1] == stem and parts[2]:
+                    return True
     return False
 
 
@@ -305,6 +312,14 @@ class Collection(Base):
     # switches out of offline mode and includes them.
     kept_on_unit = Column(Boolean, nullable=False, default=False, server_default=false())
 
+    # When an adoption moved the volume's captures into another volume (NEH-387,
+    # app.core.adopt_apply), written in the adoption's own transaction, so an
+    # undone adoption leaves it null. Once set the volume is closed: it takes no
+    # capture, colour card set or shot, record, record moved in, or image
+    # (app.core.adopt_journal.refuse_if_adopted_away), and exists to be deleted.
+    # Never cleared.
+    captures_adopted_at = Column(DateTime, nullable=True)
+
     # A testing volume (app.core.testing_space): testing work beside the
     # real work, never copied offsite, never sent to Fisqua and never
     # released into real work. Set at insert and never changed
@@ -437,22 +452,27 @@ class Collection(Base):
         """
         return self.filename_stem is not None and self.has_captured()
 
-    def captures_adopted_away(self) -> bool:
-        """Whether the volume's captures were adopted into another volume, so it may be deleted.
+    def deletable_after_adoption(self) -> bool:
+        """Whether a volume emptied by an adoption may be deleted although it reserves its stem.
 
-        A volume whose captures were adopted away (NEH-387, app.core.adopt_apply)
+        Whether the volume is closed is captures_adopted_at, which the
+        adoption records; this is the separate question of its deletion. A
+        volume whose captures were adopted away (NEH-387, app.core.adopt_apply)
         may be deleted although it reserves its stem: it has a stem, no
-        record, no image and no sub-volume, no adoption journal names it
+        record, no image, no sub-volume and no colour card set (so no shot)
+        of its own, no adoption journal names it
         (app.core.adopt_journal), and every offsite key under its stem
-        (`<any tenant>/<stem>/...`) is a retired row, of which there is at
-        least one: no row attached to an image, and no detached row that is
-        not retired. Deleting it does not free its stem: the retired keys
+        (`<any tenant>/<stem>/...`), in offsite_objects and in
+        colour_card_objects, is a retired row, of which there is at least
+        one: no row attached to an image or shot, and no detached row that
+        is not retired. Deleting it does not free its stem: the retired keys
         still hold it (offsite_keys_under_stem, _refuse_a_stem_held_offsite),
         so no volume can take it while one remains. DELETE /collections/{id}
         and the before-flush delete guard both apply this rule and no other
         exception to reserves_its_stem. Reads with autoflush off, so it can
         run inside a flush.
         """
+        from app.models.colour_card import ColourCardObject, ColourCardSet
         from app.models.offsite_object import OffsiteObject
 
         session = object_session(self)
@@ -468,13 +488,17 @@ class Collection(Base):
             if session.execute(select(Collection.id).where(Collection.parent_collection_id == self.id)
                                .limit(1)).first():
                 return False
+            if session.execute(select(ColourCardSet.id).where(ColourCardSet.collection_id == self.id)
+                               .limit(1)).first():
+                return False
             retired = []
-            query = select(OffsiteObject.object_key, OffsiteObject.retired_at).where(
-                OffsiteObject.object_key.like(f"%/{self.filename_stem}/%"))
-            for key, retired_at in session.execute(query):
-                parts = key.split("/", 2)
-                if len(parts) == 3 and parts[1] == self.filename_stem and parts[2]:
-                    retired.append(retired_at is not None)
+            for table in (OffsiteObject, ColourCardObject):
+                query = select(table.object_key, table.retired_at).where(
+                    table.object_key.like(f"%/{self.filename_stem}/%"))
+                for key, retired_at in session.execute(query):
+                    parts = key.split("/", 2)
+                    if len(parts) == 3 and parts[1] == self.filename_stem and parts[2]:
+                        retired.append(retired_at is not None)
         return bool(retired) and all(retired)
 
     @property
@@ -657,7 +681,7 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
     doomed = [obj for obj in list(session.deleted) if isinstance(obj, Collection)]
     doomed.extend(_orphaned_volumes(session))
     for obj in doomed:
-        if obj.reserves_its_stem() and not obj.captures_adopted_away():
+        if obj.reserves_its_stem() and not obj.deletable_after_adoption():
             raise StemReservedError(
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"

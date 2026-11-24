@@ -33,6 +33,7 @@ from tests.unit.test_image_upload import STEM, TENANT, _image, _rows, _run, _vol
 
 MIGRATION_FILE = "c8e0a2f4b6d9_add_offsite_object_retirement.py"
 TABLE_MIGRATION_FILE = "b8d2f4a6c1e3_add_offsite_objects.py"
+CARD_MIGRATION_FILE = "e7c3a9d1f5b2_add_colour_card_shots.py"
 PREVIOUS_HEAD = "e7c3a9d1f5b2"
 NEW_STEM = "xx-test-002"
 
@@ -67,13 +68,19 @@ def _run_op(engine, fn):
 
 
 def _table_before(engine, backend_root):
-    """record_images with two rows, and offsite_objects as the previous head leaves it, with one verified row."""
+    """record_images with two rows, offsite_objects as the previous head leaves it, with one verified row, and the
+    colour card tables of the previous head (collections and unit_settings as their neighbours)."""
     md = sa.MetaData()
     sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
+    sa.Table("collections", md, sa.Column("id", sa.Integer, primary_key=True))
+    sa.Table("unit_settings", md, sa.Column("id", sa.Integer, primary_key=True),
+             sa.Column("mode", sa.String(16), nullable=False))
     md.create_all(engine)
     with engine.begin() as conn:
         conn.execute(sa.text("INSERT INTO record_images (id) VALUES (1), (2)"))
+        conn.execute(sa.text("INSERT INTO collections (id) VALUES (1)"))
     _run_op(engine, _load(backend_root, TABLE_MIGRATION_FILE, "offsite_objects_table").upgrade)
+    _run_op(engine, _load(backend_root, CARD_MIGRATION_FILE, "colour_card_tables").upgrade)
     with engine.begin() as conn:
         conn.execute(sa.text(
             "INSERT INTO offsite_objects (record_image_id, kind, object_key, local_sha1, verified_at, created_at) "
@@ -150,6 +157,65 @@ def _exercise(engine, backend_root):
     assert "retired_at" in {c["name"] for c in sa.inspect(engine).get_columns("offsite_objects")}
 
 
+_CARD_INSERT = sa.text(
+    "INSERT INTO colour_card_objects (shot_id, kind, object_key, local_sha1, verified_at, retired_at, "
+    "retired_shot_id, skip_count, created_at) VALUES (:i, 'shot', :key, :s, :v, :ret, :reti, 0, CURRENT_TIMESTAMP)")
+
+
+def _shot_rows(engine):
+    with engine.begin() as conn:
+        conn.execute(sa.text("INSERT INTO colour_card_sets (id, collection_id, number, outcome, capture_mode, cameras, "
+                             "opened_at, completed_at) VALUES (1, 1, 1, 'taken', 'dual', '[]', CURRENT_TIMESTAMP, "
+                             "CURRENT_TIMESTAMP)"))
+        for i in (1, 2):
+            conn.execute(sa.text("INSERT INTO colour_card_shots (id, set_id, camera_index, capture_id, filename, "
+                                 "file_path, sha256, captured_at) VALUES (:i, 1, :c, :u, 'x', '/x', :h, "
+                                 "CURRENT_TIMESTAMP)"), {"i": i, "c": i - 1, "u": f"u{i}", "h": "a" * 64})
+
+
+@pytest.mark.unit
+def test_the_migration_retires_colour_card_objects_as_it_retires_offsite_objects(backend_root, tmp_path):
+    """colour_card_objects gains retired_at and retired_shot_id (FK to colour_card_shots, ON DELETE SET NULL),
+    indexed, and check_colour_card_object_retired; downgrade drops them and keeps every row."""
+    engine = sa.create_engine(f"sqlite:///{tmp_path / 'm.db'}")
+    try:
+        _table_before(engine, backend_root)
+        _shot_rows(engine)
+        mod = _load(backend_root, MIGRATION_FILE, "offsite_retirement")
+        _run_op(engine, mod.upgrade)
+
+        insp = sa.inspect(engine)
+        columns = {c["name"]: c for c in insp.get_columns("colour_card_objects")}
+        assert columns["retired_at"]["nullable"] and columns["retired_shot_id"]["nullable"]
+        assert "check_colour_card_object_retired" in {c["name"] for c in insp.get_check_constraints(
+            "colour_card_objects")}
+        assert ("colour_card_shots", ("retired_shot_id",), "SET NULL") in {
+            (f["referred_table"], tuple(f["constrained_columns"]), f["options"].get("ondelete"))
+            for f in insp.get_foreign_keys("colour_card_objects")}
+        assert "ix_colour_card_objects_retired_shot_id" in {i["name"] for i in insp.get_indexes("colour_card_objects")}
+        v = "2026-11-19 00:00:00"
+        with engine.begin() as conn:
+            conn.execute(_CARD_INSERT, dict(i=None, key="t/s/calibration/a", s="0" * 40, v=v, ret=v, reti=1))
+            conn.execute(_CARD_INSERT, dict(i=2, key="t/s/calibration/b", s="0" * 40, v=v, ret=None, reti=None))
+        for bad in (dict(i=1, key="t/s/calibration/c", s="0" * 40, v=v, ret=v, reti=1),        # attached
+                    dict(i=None, key="t/s/calibration/d", s="0" * 40, v=None, ret=v, reti=1)):  # not verified
+            with pytest.raises(IntegrityError), engine.begin() as conn:
+                conn.execute(_CARD_INSERT, bad)
+
+        _run_op(engine, mod.downgrade)
+        insp = sa.inspect(engine)
+        assert not {"retired_at", "retired_shot_id"} & {c["name"] for c in insp.get_columns("colour_card_objects")}
+        assert "check_colour_card_object_retired" not in {c["name"] for c in insp.get_check_constraints(
+            "colour_card_objects")}
+        with engine.connect() as conn:
+            assert sorted(conn.execute(sa.text("SELECT object_key FROM colour_card_objects")).scalars()) == [
+                "t/s/calibration/a", "t/s/calibration/b"]
+        _run_op(engine, mod.upgrade)
+        assert "retired_at" in {c["name"] for c in sa.inspect(engine).get_columns("colour_card_objects")}
+    finally:
+        engine.dispose()
+
+
 @pytest.mark.unit
 def test_the_migration_chains_onto_the_single_previous_head(backend_root):
     mod = _load(backend_root, MIGRATION_FILE, "offsite_retirement")
@@ -185,6 +251,7 @@ def test_the_migration_upgrades_and_downgrades_on_sqlite(backend_root, tmp_path)
 def test_the_model_matches_the_migration(backend_root, tmp_path):
     """The ORM table and the migrated one agree on columns, constraints, indexes and foreign keys."""
     from app.core.db import Base
+    import app.models.colour_card  # noqa: F401
     import app.models.offsite_object  # noqa: F401
     import app.models.record  # noqa: F401
 
@@ -193,22 +260,26 @@ def test_the_model_matches_the_migration(backend_root, tmp_path):
     try:
         md = sa.MetaData()
         sa.Table("record_images", md, sa.Column("id", sa.Integer, primary_key=True))
+        sa.Table("collections", md, sa.Column("id", sa.Integer, primary_key=True))
         md.create_all(a)
-        Base.metadata.tables["offsite_objects"].to_metadata(md).create(a)
+        for name in ("offsite_objects", "colour_card_sets", "colour_card_shots", "colour_card_objects"):
+            Base.metadata.tables[name].to_metadata(md)
+        md.create_all(a)
         _table_before(b, backend_root)
         _run_op(b, _load(backend_root, MIGRATION_FILE, "offsite_retirement").upgrade)
 
-        def shape(engine):
+        def shape(engine, t):
             insp = sa.inspect(engine)
             return (
-                sorted((c["name"], str(c["type"]), c["nullable"]) for c in insp.get_columns("offsite_objects")),
-                sorted(u["name"] for u in insp.get_unique_constraints("offsite_objects")),
-                sorted(c["name"] for c in insp.get_check_constraints("offsite_objects")),
-                sorted(i["name"] for i in insp.get_indexes("offsite_objects")),
+                sorted((c["name"], str(c["type"]), c["nullable"]) for c in insp.get_columns(t)),
+                sorted(u["name"] for u in insp.get_unique_constraints(t)),
+                sorted(c["name"] for c in insp.get_check_constraints(t)),
+                sorted(i["name"] for i in insp.get_indexes(t)),
                 sorted((f["referred_table"], tuple(f["constrained_columns"]), f["options"].get("ondelete"))
-                       for f in insp.get_foreign_keys("offsite_objects")),
+                       for f in insp.get_foreign_keys(t)),
             )
-        assert shape(a) == shape(b)
+        for name in ("offsite_objects", "colour_card_objects"):
+            assert shape(a, name) == shape(b, name), name
     finally:
         a.dispose()
         b.dispose()

@@ -432,6 +432,8 @@ def _stem_volume(db: Session, collection_id: int):
     from app.core.adopt_journal import journal_names_volume, unfinished_message
 
     collection = _volume(db, collection_id)
+    # An early refusal only. Each file is freed, marked freed or restored under its record's row lock, where
+    # the journal is read again (_lock_and_recheck): no file of a volume a journal names is touched.
     if journal_names_volume(collection.id):
         raise FreeRefused(unfinished_message(), detail={"code": ADOPTION_UNFINISHED})
     _require_own_folder(db, collection)
@@ -511,11 +513,22 @@ def _lock_and_recheck(db: Session, obj: _Object, *, freed: bool) -> bool:
     delete_record and delete_image take this same lock before they decide
     which files to unlink, and unlink only after their commit, so a delete
     and anything done here under the lock cannot interleave.
+
+    Raises FreeRefused (`adoption_unfinished`), with the transaction rolled
+    back, while an adoption's journal names the record's volume: read here,
+    under the lock an adoption takes on its source's records, before any
+    file is marked, unlinked or written back. Every free, mark-freed and
+    restore of a file passes here (_set_freed, _place), so none acts on a
+    volume whose files an unfinished adoption may have left at either name.
     """
+    from app.core.adopt_journal import journal_names_volume, unfinished_message
     from app.models.record import Record, RecordImage
 
     at_col, _ = _columns(obj.kind)
-    db.query(Record.id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
+    locked = db.query(Record.collection_id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
+    if locked is not None and journal_names_volume(locked[0]):
+        db.rollback()
+        raise FreeRefused(unfinished_message(), detail={"code": ADOPTION_UNFINISHED})
     row = (db.query(RecordImage.file_path, at_col)
            .filter(RecordImage.id == obj.image_id).one_or_none())
     return row is not None and row[0] == obj.file_path and (row[1] is not None) == freed
@@ -789,45 +802,63 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
     manifest = _RunManifest(stem, "freed")
     freed = []
-    for obj, size in hashed:
-        refusal = _listing_refusal(obj, listed.get(obj.key))
-        if refusal is not None:
-            refused.append(refusal)
-            continue
-        at = _now()
-        if not _set_freed(db, obj, at=at, size=size):
-            # Deleted, or its path changed, since the work list was read.
-            refused.append(obj.entry(reason="changed"))
-            continue
-        # The record's lock is released at that commit, so a delete can run
-        # between it and the unlink. The delete removes the row and then the
-        # same file; whichever unlink comes second finds nothing. Either way
-        # the row and the card agree, and only the report has to say which.
-        try:
-            obj.path.unlink()
-        except FileNotFoundError:
-            if not _image_exists(db, obj.image_id):
+    stopped = None
+    # The summary is logged however the run ends, so files freed before a refusal part-way (an adoption's
+    # journal read under a record's lock, _lock_and_recheck) or an error have their `volume_freed` event.
+    try:
+        for obj, size in hashed:
+            refusal = _listing_refusal(obj, listed.get(obj.key))
+            if refusal is not None:
+                refused.append(refusal)
+                continue
+            at = _now()
+            if not _set_freed(db, obj, at=at, size=size):
+                # Deleted, or its path changed, since the work list was read.
                 refused.append(obj.entry(reason="changed"))
                 continue
-        except OSError as exc:
-            logger.warning("Freed state set but %s could not be removed; clearing it: %s", obj.path, exc)
-            _set_freed(db, obj, at=None, size=None)
-            refused.append(obj.entry(reason="could_not_remove", error=str(exc)[:200]))
-            continue
-        entry = obj.entry(bytes=size, sha1=obj.sha1, freed_at=at.isoformat())
-        freed.append(entry)
-        manifest.write(entry)
+            # The record's lock is released at that commit, so a delete can run
+            # between it and the unlink. The delete removes the row and then the
+            # same file; whichever unlink comes second finds nothing. Either way
+            # the row and the card agree, and only the report has to say which.
+            try:
+                obj.path.unlink()
+            except FileNotFoundError:
+                if not _image_exists(db, obj.image_id):
+                    refused.append(obj.entry(reason="changed"))
+                    continue
+            except OSError as exc:
+                logger.warning("Freed state set but %s could not be removed; clearing it: %s", obj.path, exc)
+                _set_freed(db, obj, at=None, size=None)
+                refused.append(obj.entry(reason="could_not_remove", error=str(exc)[:200]))
+                continue
+            entry = obj.entry(bytes=size, sha1=obj.sha1, freed_at=at.isoformat())
+            freed.append(entry)
+            manifest.write(entry)
+    except Exception as exc:
+        stopped = exc
+        raise
+    finally:
+        total = sum(f["bytes"] for f in freed)
+        if freed or refused or stopped is not None:
+            _log(db, action=FREED_ACTION, level="WARN" if refused or stopped is not None else "INFO",
+                 actor=actor, stem=stem,
+                 detail=f"files={len(freed)} bytes={total} refused={len(refused)}"
+                        + (f" manifest={manifest.path.name}" if manifest.path else "")
+                        + (f" stopped: {_stop_reason(stopped)}" if stopped is not None else ""))
 
-    total = sum(f["bytes"] for f in freed)
-    if freed or refused:
-        _log(db, action=FREED_ACTION, level="WARN" if refused else "INFO", actor=actor, stem=stem,
-             detail=f"files={len(freed)} bytes={total} refused={len(refused)}"
-                    + (f" manifest={manifest.path.name}" if manifest.path else ""))
     return {"collection_id": collection_id, "filename_stem": stem,
             "freed": {"files": len(freed), "bytes": total},
             "files": freed, "refused": refused,
             "manifest": str(manifest.path) if manifest.path else None,
             "restorable": restore_available()}
+
+
+def _stop_reason(exc: BaseException) -> str:
+    """A refusal's code, or the error's type: what cut a free short, without paths."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict) and detail.get("code"):
+        return str(detail["code"])
+    return type(exc).__name__
 
 
 OFF_IN_THIS_MODE = "off_in_this_mode"
@@ -1291,6 +1322,8 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
         raise ValueError(f"Captua keeps the volume {stem!r} on the unit, so none of its files is marked freed")
     from app.core.adopt_journal import journal_names_volume
 
+    # An early refusal only: each row is marked under its record's lock, where the journal is read again
+    # (_lock_and_recheck).
     if journal_names_volume(collection.id):
         raise ValueError(f"an unfinished adoption names the volume {stem!r}, so none of its files is marked freed; "
                          "restart the backend to finish or undo it")

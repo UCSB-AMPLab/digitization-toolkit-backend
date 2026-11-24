@@ -654,6 +654,31 @@ def test_a_target_whose_counter_was_raised_is_refused(db_session, override_proje
     assert _plan(db_session, src, tgt).refusals == ["target_counter_raised"]
 
 
+def _card_set(db, vol, number=1, outcome=None):
+    """A colour card set of `vol`, open (`outcome` None), `taken` or `skipped`, with no shot."""
+    from app.models.colour_card import ColourCardSet
+
+    card_set = ColourCardSet(collection_id=vol.id, number=number, outcome=outcome, capture_mode="dual",
+                             cameras=[], opened_at=_now().replace(tzinfo=None),
+                             completed_at=None if outcome is None else _now().replace(tzinfo=None))
+    db.add(card_set)
+    db.commit()
+    return card_set
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("outcome", [None, "taken", "skipped"])
+def test_a_target_with_a_colour_card_set_is_refused(db_session, override_projects_root, tenant, outcome):
+    """A set opened, taken or skipped in the target makes it not empty; the dry run names the sets."""
+    src, tgt, _ = _default(db_session, override_projects_root)
+    card_set = _card_set(db_session, tgt, outcome=outcome)
+
+    plan = _plan(db_session, src, tgt)
+
+    assert plan.refusals == ["target_has_colour_card_sets"]
+    assert plan.details["target_has_colour_card_sets"] == [card_set.id]
+
+
 @pytest.mark.unit
 def test_a_target_with_an_offsite_key_under_its_stem_is_refused(db_session, override_projects_root, tenant):
     from app.models.offsite_object import OffsiteObject
@@ -1135,8 +1160,8 @@ def test_the_refusal_codes_are_in_this_order():
         "adoption_unfinished", "source_not_found", "target_not_found", "same_volume",
         "source_testing_volume", "target_testing_volume", "source_has_no_stem", "target_has_no_stem", "target_not_assigned", "target_withdrawn",
         "source_sent_to_fisqua", "target_sent_to_fisqua", "source_kept_on_unit", "target_kept_on_unit",
-        "source_has_sub_volumes", "source_has_no_images", "target_has_records", "target_has_images", "target_counter_raised",
-        "target_has_offsite_keys",
+        "source_has_sub_volumes", "source_has_no_images", "source_has_open_colour_card_set", "target_has_records", "target_has_images", "target_counter_raised",
+        "target_has_colour_card_sets", "target_has_offsite_keys",
         "offsite_tenant_not_configured", "storage_unavailable", "source_outside_storage",
         "target_outside_storage",
         "source_records_handed_over", "source_files_freed", "source_file_outside_own_folder",

@@ -251,6 +251,13 @@ def create_record(
 		sequences = next_sequences(db, rec_in.collection_id, 1)
 		if sequences is not None:
 			sequence = sequences[0]
+		# Not into a volume an adoption closed; read under the row lock next_sequences took.
+		from app.core.adopt_journal import refuse_if_adopted_away
+		try:
+			refuse_if_adopted_away(db, [rec_in.collection_id])
+		except HTTPException:
+			db.rollback()
+			raise
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
@@ -644,6 +651,13 @@ def update_record(
 		sequences = next_sequences(db, new_collection, 1)
 		if sequences is not None:
 			data["sequence"] = sequences[0]
+		# Not into a volume an adoption closed; read under the row lock next_sequences took.
+		from app.core.adopt_journal import refuse_if_adopted_away
+		try:
+			refuse_if_adopted_away(db, [new_collection])
+		except HTTPException:
+			db.rollback()
+			raise
 
 	for field, value in data.items():
 		setattr(rec, field, value)
@@ -766,9 +780,10 @@ async def add_image_to_record(
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
-	# Not into a volume an unfinished adoption names (app.core.adopt_journal).
-	from app.core.adopt_journal import refuse_if_journaled
+	# Not into a volume an unfinished adoption names, nor one an adoption closed (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_adopted_away, refuse_if_journaled
 	refuse_if_journaled([rec.collection_id])
+	refuse_if_adopted_away(db, [rec.collection_id])
 	# An excluded record (a Fisqua decision, contract 1.6) takes no image, as
 	# it takes no capture (app.api.cameras): the image would stay out of the
 	# export, and every later decision on the record would be skipped as

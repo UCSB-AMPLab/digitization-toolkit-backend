@@ -439,11 +439,36 @@ def summaries(db: Session, volumes) -> Dict[int, dict]:
 # ---------------------------------------------------------------------------
 
 def _locked_volume(db: Session, collection_id: int):
-    from app.core.volume_stem import locked_volume_query
+    """The volume's row, locked; 409 `adoption_unfinished` while an adoption's journal names it.
 
-    volume = locked_volume_query(db, collection_id).first()
+    Every change to a volume's sets and shots (open_set, skip, complete,
+    take_shot) starts here, so none runs on a volume whose shots an
+    unfinished adoption may be moving (app.core.adopt_journal). The journal
+    is read again once the lock is held, in the transaction the change
+    commits in: a request that waited for the lock while an adoption held it
+    sees the journal the adoption left. The read before the lock only
+    refuses early. A volume an adoption closed (Collection.captures_adopted_at)
+    is refused `captures_adopted_away`, read under the same lock: its next
+    set would be number 1 again, under a file name whose old key a retired
+    row holds, and it exists only to be deleted.
+    """
+    from app.core import volume_stem
+    from app.core.adopt_journal import refuse_if_adopted_away, refuse_if_journaled
+
+    refuse_if_journaled([collection_id])
+    volume = volume_stem.locked_volume_query(db, collection_id).first()
     if volume is None:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    try:
+        refuse_if_journaled([collection_id])
+    except HTTPException:
+        db.rollback()
+        raise
+    try:
+        refuse_if_adopted_away(db, [collection_id])
+    except HTTPException:
+        db.rollback()
+        raise
     return volume
 
 

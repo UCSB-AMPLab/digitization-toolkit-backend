@@ -28,8 +28,11 @@ same volume twice, or a source or target that is testing work
 `target_testing_volume`), ends the checks there: an adoption concerns real
 volumes only, and nothing moves between testing and real work. A source or target
 with a fisqua_outbox or fisqua_status row has been sent to Fisqua, and is
-refused. Without both stems, or without a projects root that can be
-written, no image is checked and no rename is built.
+refused. A target with a colour card set (app.models.colour_card), open,
+taken or skipped, is not empty, and is refused
+(`target_has_colour_card_sets`, with the sets' ids in `details`). Without
+both stems, or without a projects root that can be written, no image is
+checked and no rename is built.
 
 The record-state refusal is POST /collections/{id}/move-records' own
 (app.api.collections.move_collection_records, through
@@ -62,10 +65,11 @@ it is, and a missing one is derived again later, so it is reported
 (`thumbnails_missing`) and given no move.
 
 Every entry under the source's root that belongs to no source image (its
-master, preview, buffer or thumbnail) is listed in `uncovered`, by the
-directory it is in (`captures`, `previews`, `thumbnails`, `metadata`, or
-`other` for anything else at the root). One in `captures/` or `previews/`
-refuses the adoption; the rest are reported. `metadata/manifest.jsonl` is
+master, preview, buffer or thumbnail) or shot is listed in `uncovered`, by
+the directory it is in (`captures`, `previews`, `thumbnails`, `metadata`,
+`calibration`, or `other` for anything else at the root). One in
+`captures/`, `previews/` or `calibration/` refuses the adoption; the rest
+are reported. `metadata/manifest.jsonl` is
 the source's capture manifest and is never uncovered.
 
 The manifest is read with app.core.integrity.read_manifest_lines and
@@ -92,6 +96,32 @@ manifest's lines are copied into the target. A preview whose listed name is
 not that name refuses the adoption as `source_name_not_contract`, since the
 export takes a preview key only as `<capture name stem>_preview.jpg` and
 the plan keeps the listed name.
+
+The source's colour card sets (app.models.colour_card) are part of what is
+adopted. A source with an open set (no outcome yet) is refused
+(`source_has_open_colour_card_set`, the sets' ids in `details`): it is
+finished or skipped first. Every other set moves to the target with its
+number (`card_set_ids`); a skipped set has no shot. Each shot is planned as
+an image is (`shot_renames`, ShotRename): its master
+`<source stem>-cal_<nn>_c<n>.<ext>` in the source's `calibration/` becomes
+`<target stem>-cal_<nn>_c<n>.<ext>` in the target's, keeping the set
+number and the camera as written, with a RAW master's
+`<master stem>_preview.jpg` and a JPEG master's `.raw` buffer
+(colour_card._shot_files) renamed with it, and its new keys built by
+image_upload.calibration_key. The checks an image has apply to a shot,
+with `shot_id` in place of `image_id` in each detail: its name
+(`source_name_not_contract`), its folder (`source_file_outside_own_folder`),
+its files on disk (`source_file_missing`, kinds `colour_card_shot` and
+`colour_card_preview`), a verified colour_card_objects row for the shot and
+for a RAW shot's preview (`source_not_verified_offsite`, kinds `shot` and
+`preview`), the storage (`source_outside_storage`, `target_outside_storage`)
+and the new names (`new_name_collides`: a file there, a shot row holding the
+path, or a key taken). The shots' files are owned, so a file in
+`calibration/` no shot owns refuses as one in `captures/` does. A target
+with any key under its stem, a page's or a shot's, is refused
+(`target_has_offsite_keys`, app.models.collection.offsite_keys_under_stem).
+A source with no colour card set plans exactly what it planned without
+them.
 
 Version: 0.3.3
 """
@@ -123,10 +153,12 @@ REFUSAL_CODES = (
     "target_kept_on_unit",
     "source_has_sub_volumes",           # a collection has the source as its parent
     "source_has_no_images",             # the source holds no image at all
+    "source_has_open_colour_card_set",  # a colour card set of the source not yet taken or skipped
     "target_has_records",
     "target_has_images",
     "target_counter_raised",            # capture_counter above 0
-    "target_has_offsite_keys",          # an offsite_objects key `<any tenant>/<target stem>/...`
+    "target_has_colour_card_sets",      # a colour card set of the target, open, taken or skipped
+    "target_has_offsite_keys",          # a page's or a shot's offsite key `<any tenant>/<target stem>/...`
     "offsite_tenant_not_configured",    # no valid CAPTUA_OFFSITE_TENANT, so no new key can be built
     "storage_unavailable",              # the projects root cannot be written, so no new path can be built
     "source_outside_storage",           # a source directory or old path resolves outside the storage
@@ -150,7 +182,7 @@ REFUSAL_CODES = (
 MANIFEST_NAME = "manifest.jsonl"
 
 # The directories under a volume's root in which a file no source image owns refuses the adoption.
-_REFUSED_DIRS = ("captures", "previews")
+_REFUSED_DIRS = ("captures", "previews", "calibration")
 
 
 @dataclass
@@ -179,6 +211,32 @@ class ImageRename:
 
 
 @dataclass
+class ShotRename:
+    """One source colour card shot's names before and after; a path is None where the shot has no such file.
+
+    The path attributes are named as ImageRename's, so outside_storage and
+    the apply step read both alike; a shot has no thumbnail.
+    """
+    shot_id: int
+    set_id: int
+    camera_index: int
+    capture_id: str
+    old_name: str
+    new_name: str
+    old_path: Path
+    new_path: Path
+    old_preview_path: Optional[Path] = None
+    new_preview_path: Optional[Path] = None
+    old_raw_buffer_path: Optional[Path] = None
+    new_raw_buffer_path: Optional[Path] = None
+    old_thumbnail_path: Optional[Path] = None
+    new_thumbnail_path: Optional[Path] = None
+    sha256: Optional[str] = None
+    old_keys: dict = field(default_factory=dict)   # kind (`shot`, `preview`) -> the colour_card_objects key
+    new_keys: dict = field(default_factory=dict)   # kind -> the key the upload would write
+
+
+@dataclass
 class AdoptPlan:
     source_id: int
     target_id: int
@@ -200,6 +258,9 @@ class AdoptPlan:
     thumbnails_missing: list = field(default_factory=list)   # {image_id, path}
     capture_lines: int = 0                                   # capture lines in the source's manifest
     unaccounted_capture_lines: list = field(default_factory=list)   # their capture ids no image has
+    card_set_ids: list = field(default_factory=list)          # the source's colour card sets, which move
+    shot_renames: list = field(default_factory=list)          # ShotRename, by set number and camera
+    shot_bytes: int = 0                                       # bytes on disk of the shots' files
 
     @property
     def may_adopt(self) -> bool:
@@ -312,6 +373,7 @@ def _plan(db: Session, source_id: int, target_id: int) -> AdoptPlan:
 def _check_volumes(db: Session, plan: AdoptPlan, source, target) -> None:
     from app.core.image_upload import configured_tenant_or_none
     from app.models.collection import Collection, offsite_keys_under_stem
+    from app.models.colour_card import ColourCardSet
     from app.models.fisqua import FisquaOutbox, FisquaStatus
     from app.models.record import Record
 
@@ -341,12 +403,22 @@ def _check_volumes(db: Session, plan: AdoptPlan, source, target) -> None:
     if children:
         plan.refuse("source_has_sub_volumes")
         plan.details["source_has_sub_volumes"] = children
+    open_sets = [sid for (sid,) in db.query(ColourCardSet.id).filter(
+        ColourCardSet.collection_id == source.id, ColourCardSet.outcome.is_(None)).order_by(ColourCardSet.id)]
+    if open_sets:
+        plan.refuse("source_has_open_colour_card_set")
+        plan.details["source_has_open_colour_card_set"] = open_sets
     if db.query(Record.id).filter(Record.collection_id == target.id).first() is not None:
         plan.refuse("target_has_records")
     if target.has_images():
         plan.refuse("target_has_images")
     if (target.capture_counter or 0) > 0:
         plan.refuse("target_counter_raised")
+    card_sets = [sid for (sid,) in db.query(ColourCardSet.id).filter(ColourCardSet.collection_id == target.id)
+                 .order_by(ColourCardSet.id)]
+    if card_sets:
+        plan.refuse("target_has_colour_card_sets")
+        plan.details["target_has_colour_card_sets"] = card_sets
     if target.filename_stem and offsite_keys_under_stem(db, target.filename_stem):
         plan.refuse("target_has_offsite_keys")
     if configured_tenant_or_none() is None:
@@ -547,11 +619,13 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
             plan.refuse("source_not_verified_offsite", {"volume": source.id, "total": state["total"],
                                                         "verified": state["verified"]})
 
+    _plan_shots(db, plan, source, src_root, tgt_root, tenant, listings, owned)
+
     for named_by in thumbnails.values():
         if len(named_by) > 1:
             plan.refuse("source_thumbnail_shared", {"path": named_by[0][1],
                                                     "image_ids": sorted(i for i, _ in named_by)})
-    source_out, target_out = outside_storage(src_stem, tgt_stem, plan.renames)
+    source_out, target_out = outside_storage(src_stem, tgt_stem, plan.renames + plan.shot_renames)
     for path in source_out:
         plan.refuse("source_outside_storage", {"path": path})
     for path in target_out:
@@ -561,6 +635,7 @@ def _plan_images(db: Session, plan: AdoptPlan, source, target) -> None:
     highest = max((r.number for r in plan.renames), default=0)
     plan.counter_after = max(plan.counter_before, source.capture_counter or 0, highest)
     _check_collisions(db, plan, tgt_stem, tgt_captures, tgt_root)
+    _check_shot_collisions(db, plan)
 
 
 def outside_storage(src_stem: str, tgt_stem: str, renames: list) -> tuple:
@@ -673,12 +748,12 @@ def _raw_buffer(db: Session, listings: _Listings, master: Path, src_masters: lis
 
 
 def _uncovered(plan: AdoptPlan, src_root: Path, owned: set) -> None:
-    """List every entry under the source's root no source image owns, and refuse those in captures/ or previews/."""
-    from app.core.paths import METADATA_DIR, VOLUME_SUBDIRS
+    """List every entry under the source's root no source image or shot owns; refuse those in _REFUSED_DIRS."""
+    from app.core.paths import CALIBRATION_DIR, METADATA_DIR, VOLUME_SUBDIRS
 
     found = []
     for entry in _list_dir(src_root):
-        if entry.name in VOLUME_SUBDIRS and entry.is_dir():
+        if entry.name in VOLUME_SUBDIRS + (CALIBRATION_DIR,) and entry.is_dir():
             for inner in _list_dir(entry):
                 if entry.name == METADATA_DIR and inner.name == MANIFEST_NAME:
                     continue
@@ -738,3 +813,123 @@ def _check_collisions(db: Session, plan: AdoptPlan, tgt_stem: str, tgt_captures:
             plan.refuse("new_name_collides", {"image_id": r.image_id, "with": "plan",
                                               "record_image_id": seen[r.new_name.lower()]})
         seen.setdefault(r.new_name.lower(), r.image_id)
+
+
+def _shot_name(stem: str) -> "re.Pattern":
+    """`<stem>-cal_<nn>_c<n>.<ext>`, with the set number, the camera and the suffix as groups."""
+    return re.compile(r"^" + re.escape(stem) + r"-cal_(\d{2,})_c(\d+)(\.[A-Za-z0-9]+)$")
+
+
+def _plan_shots(db: Session, plan: AdoptPlan, source, src_root: Path, tgt_root: Path, tenant, listings, owned) -> None:
+    """Plan the source's colour card sets and shots (module header); adds their files to `owned`."""
+    from app.core import image_upload
+    from app.core.colour_card import _shot_files
+    from app.core.paths import CALIBRATION_DIR, raw_sidecar_of
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
+
+    sets = db.query(ColourCardSet).filter(ColourCardSet.collection_id == source.id).order_by(ColourCardSet.id).all()
+    plan.card_set_ids = [s.id for s in sets]
+    if not sets:
+        return
+    shots = (db.query(ColourCardShot).join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
+             .filter(ColourCardSet.collection_id == source.id)
+             .order_by(ColourCardSet.number, ColourCardShot.camera_index).all())
+    rows = {}
+    ids = [shot.id for shot in shots]
+    for start in range(0, len(ids), 500):
+        for row in db.query(ColourCardObject).filter(ColourCardObject.shot_id.in_(ids[start:start + 500])):
+            rows[(row.shot_id, row.kind)] = row
+    src_folder, tgt_folder = src_root / CALIBRATION_DIR, tgt_root / CALIBRATION_DIR
+    pattern = _shot_name(source.filename_stem)
+    for shot in shots:
+        master = Path(shot.file_path)
+        preview = Path(shot.preview_path) if shot.preview_path else None
+        listed = [listings.find(Path(p)) for p in _shot_files(shot) if p]
+        for p in listed:
+            if p is not None:
+                owned.add(_resolved(p))
+        for p in (master, preview):
+            if p is None:
+                continue
+            try:
+                outside = p.resolve().parent != src_folder.resolve()
+            except (OSError, ValueError):
+                outside = True
+            if outside:
+                plan.refuse("source_file_outside_own_folder", {"shot_id": shot.id, "path": str(p)})
+        if not _on_disk(master):
+            plan.refuse("source_file_missing", {"shot_id": shot.id, "kind": "colour_card_shot",
+                                                "path": shot.file_path})
+        if preview is not None and not _on_disk(preview):
+            plan.refuse("source_file_missing", {"shot_id": shot.id, "kind": "colour_card_preview",
+                                                "path": shot.preview_path})
+        for kind in ("shot", "preview") if preview is not None else ("shot",):
+            row = rows.get((shot.id, kind))
+            if row is None or row.verified_at is None:
+                plan.refuse("source_not_verified_offsite", {"shot_id": shot.id, "kind": kind})
+
+        m = pattern.match(shot.filename or "")
+        if m is None or master.name != shot.filename:
+            plan.refuse("source_name_not_contract", {"shot_id": shot.id, "filename": shot.filename})
+            continue
+        number, camera, suffix = m.group(1), m.group(2), m.group(3)
+        new_name = f"{plan.target_stem}-cal_{number}_c{camera}{suffix}"
+        new_master = tgt_folder / new_name
+        r = ShotRename(shot_id=shot.id, set_id=shot.set_id, camera_index=shot.camera_index,
+                       capture_id=shot.capture_id, old_name=shot.filename, new_name=new_name,
+                       old_path=master, new_path=new_master, sha256=shot.sha256,
+                       old_keys={kind: row.object_key for (sid, kind), row in sorted(rows.items())
+                                 if sid == shot.id})
+        if preview is not None:
+            if preview.name != shot.preview_filename or preview.name != f"{master.stem}_preview.jpg":
+                plan.refuse("source_name_not_contract", {"shot_id": shot.id, "filename": shot.preview_filename})
+            r.old_preview_path = preview
+            r.new_preview_path = tgt_folder / f"{new_master.stem}_preview.jpg"
+        buffer = listings.find(raw_sidecar_of(master)) if not master.name.lower().endswith(".raw") else None
+        if buffer is not None:
+            r.old_raw_buffer_path = buffer
+            r.new_raw_buffer_path = raw_sidecar_of(new_master).with_name(
+                _swap_prefix(buffer.name, master.stem, new_master.stem))
+        if tenant is not None:
+            r.new_keys["shot"] = image_upload.calibration_key(tenant, plan.target_stem, new_name)
+            if r.new_preview_path is not None:
+                r.new_keys["preview"] = image_upload.calibration_key(tenant, plan.target_stem,
+                                                                     r.new_preview_path.name)
+        plan.shot_bytes += sum(_size(p) for p in (master, preview, buffer))
+        plan.shot_renames.append(r)
+
+
+def _check_shot_collisions(db: Session, plan: AdoptPlan) -> None:
+    """Refuse every new shot name or key already taken: a file there, a shot row holding the path, or a key."""
+    from app.models.colour_card import ColourCardObject, ColourCardShot
+    from app.models.offsite_object import OffsiteObject
+
+    if not plan.shot_renames:
+        return
+    paths = [str(p) for r in plan.shot_renames for p in (r.new_path, r.new_preview_path, r.new_raw_buffer_path) if p]
+    keys = [k for r in plan.shot_renames for k in r.new_keys.values()]
+    held_paths, held_keys = {}, set()
+    for start in range(0, len(paths), 500):
+        chunk = paths[start:start + 500]
+        for shot_id, fp, pp in (db.query(ColourCardShot.id, ColourCardShot.file_path, ColourCardShot.preview_path)
+                                .filter(ColourCardShot.file_path.in_(chunk) | ColourCardShot.preview_path.in_(chunk))):
+            for p in (fp, pp):
+                if p:
+                    held_paths.setdefault(p, shot_id)
+    for start in range(0, len(keys), 500):
+        chunk = keys[start:start + 500]
+        held_keys.update(k for (k,) in db.query(ColourCardObject.object_key)
+                         .filter(ColourCardObject.object_key.in_(chunk)))
+        held_keys.update(k for (k,) in db.query(OffsiteObject.object_key).filter(OffsiteObject.object_key.in_(chunk)))
+    for r in plan.shot_renames:
+        for p in (r.new_path, r.new_preview_path, r.new_raw_buffer_path):
+            if p is None:
+                continue
+            if os.path.lexists(p):
+                plan.refuse("new_name_collides", {"shot_id": r.shot_id, "with": "file", "path": str(p)})
+            if str(p) in held_paths:
+                plan.refuse("new_name_collides", {"shot_id": r.shot_id, "with": "colour_card_shot",
+                                                  "colour_card_shot_id": held_paths[str(p)]})
+        for key in r.new_keys.values():
+            if key in held_keys:
+                plan.refuse("new_name_collides", {"shot_id": r.shot_id, "with": "offsite_key", "key": key})

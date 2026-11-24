@@ -63,6 +63,14 @@ with no image as a deleted image's object. `object_key` is unique and never
 changes. A shot's object stays in the bucket when the shot row goes, so the
 row keeps its key (`shot_id` set null).
 
+`retired_at` and `retired_shot_id`: set when an adoption moves the shot to
+another volume (app.core.adopt_apply, app.core.offsite_retired): the row is
+detached (`shot_id` null), keeps its key, and records when it was retired
+and the shot it was the key of (ON DELETE SET NULL, indexed). Only a
+verified row is retired (`check_colour_card_object_retired`). The shot then
+has no row of that kind, so the upload sends it again under the key its new
+name and volume give.
+
 `last_skip_reason` and `skip_count` are the reason the uploader last skipped
 the object for and how many consecutive runs skipped it for that reason
 (app.core.image_upload._note_card_skip): `staging_failed`, `file_unstable`,
@@ -92,6 +100,7 @@ OBJECT_REFUSAL_CHECK = (
     "(refused_at IS NULL AND refusal IS NULL) OR "
     "(refused_at IS NOT NULL AND refusal IS NOT NULL AND refusal IN ('remote_differs', 'fixity', "
     "'staging_failed', 'file_unstable', 'listed_without_sha1', 'unverified'))")
+OBJECT_RETIRED_CHECK = "retired_at IS NULL OR (shot_id IS NULL AND verified_at IS NOT NULL)"
 
 
 def _utcnow() -> datetime:
@@ -175,6 +184,10 @@ class ColourCardObject(Base):
     last_skip_reason = Column(String(20), nullable=True)
     skip_count = Column(Integer, nullable=False, default=0, server_default=text("0"))
     created_at = Column(DateTime, nullable=False, default=_utcnow)
+    retired_at = Column(DateTime, nullable=True)
+    retired_shot_id = Column(Integer, ForeignKey("colour_card_shots.id", ondelete="SET NULL",
+                                                 name="colour_card_objects_retired_shot_id_fkey"),
+                             nullable=True, index=True)
 
     __table_args__ = (
         UniqueConstraint("object_key", name="colour_card_objects_object_key_key"),
@@ -182,6 +195,7 @@ class ColourCardObject(Base):
         CheckConstraint(OBJECT_KIND_CHECK, name="check_colour_card_object_kind"),
         CheckConstraint(OBJECT_STATE_CHECK, name="check_colour_card_object_state"),
         CheckConstraint(OBJECT_REFUSAL_CHECK, name="check_colour_card_object_refusal"),
+        CheckConstraint(OBJECT_RETIRED_CHECK, name="check_colour_card_object_retired"),
     )
 
 
