@@ -36,6 +36,7 @@ if str(backend_dir) not in sys.path:
 
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
+from .backends.base import preview_request
 from .backends.errors import CameraNotConnectedError
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import (
@@ -818,6 +819,7 @@ def dual_capture_image(
     
     return _image_of(img1_path), _image_of(img2_path), record.capture_id, record.pair_id
     
+@preview_request()
 def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
     Capture a live preview frame and return JPEG bytes.

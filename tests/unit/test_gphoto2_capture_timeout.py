@@ -157,6 +157,8 @@ def _make_fake_gp(script):
                 raise outcome
 
         def wait_for_event(self, timeout_ms):
+            if script.trigger_calls == 0:
+                return GP_EVENT_TIMEOUT, None
             idx = min(script.wait_calls, len(script.events) - 1)
             script.wait_calls += 1
             script.wait_timeouts_ms.append(timeout_ms)
@@ -208,6 +210,8 @@ def _make_fake_gp(script):
 
 
 def _make_backend(monkeypatch, script):
+    monkeypatch.setattr(gb.GPhoto2Backend, "_load_pins", lambda self: None)
+    monkeypatch.setattr(gb.GPhoto2Backend, "_save_pins", lambda self: None)
     fake_gp = _make_fake_gp(script)
     monkeypatch.setattr(gb, "gp", fake_gp)
     monkeypatch.setattr(gb, "_GP_AVAILABLE", True)
