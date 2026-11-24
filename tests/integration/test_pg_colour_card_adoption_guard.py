@@ -40,6 +40,9 @@ def pg(monkeypatch, tmp_path):
 
     from app.core import colour_card, config
     from app.core.db import Base, DATABASE_URL
+    # Every table, so that create_all makes the ones a volume's commit reads (offsite_objects, the colour card's).
+    from app.models import (camera, capture_request, colour_card as _cc, fisqua, offsite_object,  # noqa: F401
+                            project_member, record, system_log, unit_settings, user)
     from app.models.collection import Collection
     from app.models.project import Project
 
