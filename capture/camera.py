@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple

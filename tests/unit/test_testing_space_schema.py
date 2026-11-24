@@ -20,7 +20,7 @@ This file covers what holds whatever routes later reach them:
 
     python -m pytest tests/unit/test_testing_space_schema.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util
@@ -232,7 +232,7 @@ def test_the_migration_follows_kept_on_unit(backend_root):
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    # The offsite retirement revision follows this one and is the head (test_offsite_retired_keys.py).
+    # The head is the offsite retirement revision (test_offsite_retired_keys.py), later in the chain than this one.
     assert REVISION in downs
     assert len(revisions - downs) == 1
 
@@ -459,7 +459,7 @@ def test_the_testing_role_is_valid_but_never_given_through_the_role_update():
     with pytest.raises(ValidationError):
         UserRoleUpdate(role="testing")
     with pytest.raises(ValidationError):
-        UserCreate(username="x", password="y", role="testing")
+        UserCreate(username="x", password="fake-pw-8", role="testing")
 
 
 @pytest.mark.unit

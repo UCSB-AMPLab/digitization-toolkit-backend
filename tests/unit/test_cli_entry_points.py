@@ -9,7 +9,7 @@ tests/conftest.py imports every model, which hides that failure in-process, so
 each command runs here in a fresh interpreter (cli_session_worker.py) against
 the SQLite file the db_session fixture has created.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 import json
 import os

@@ -1,4 +1,4 @@
-"""A volume's capture manifest for Fisqua (exchange contract 1.9; §4, artefact 2, as in 1.1).
+"""A volume's capture manifest for Fisqua (exchange contract 1.12; §4, artefact 2, as in 1.1).
 
 Built only from the catalogue (the volume, its records and their current
 images), the capture manifests (`metadata/manifest.jsonl`, read through
@@ -66,8 +66,30 @@ whose files are still on disk.
   filenameStem its Fisqua reference code, unchanged, and the unit's
   interface has no field for external_id (ruled). The download and the
   manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
-* The manifest always declares version 1.9, whatever its records and
+* The manifest always declares version 1.12, whatever its records and
   whatever CAPTUA_FISQUA_ROTATE_DEG; Fisqua reads any 1.x.
+* Colour card shots (contract 1.12 §13, app.core.colour_card). Every
+  volume carries `calibrationStatus`: `present` when the unit asks for
+  shots, no request was skipped and every page followed a taken set,
+  otherwise `skipped` (always `skipped`, with no `calibration`, while the
+  unit's setting is off). `calibration`, present when not empty, lists the shots of taken sets
+  whose objects are verified offsite and that apply to a page of this
+  manifest (colour_card.evaluate): `captureId`, `filename`,
+  `objectKey` (`<stem>/calibration/<filename>`), `sha256`,
+  `previewObjectKey` and `previewSha256` for a RAW shot, `rotateDeg` as
+  for a page, `camera` (`c<camera index>`, as in the file names),
+  `capturedAt`, `settings` (with the body that took it under `body`:
+  hardwareId, role, cameraIndex) and `appliesFromCaptureId`, the first page of the manifest
+  captured after the shot's set and no later than the next set. A shot no
+  page follows stays on the unit. The export is refused when a shot's name
+  is not one path segment of at most 200 bytes of UTF-8 under
+  `<stem>/calibration/` (`calibration_key`), or when a shot shares a
+  captureId, objectKey or previewObjectKey with a page or another shot
+  (`calibration_identity`), which Fisqua would refuse. A deliverable shot
+  that applies to a page and is not yet verified offsite is never left out:
+  the manifest is not built (CalibrationWaiting, `calibration_not_uploaded`)
+  and the outbox keeps the volume waiting. An undeliverable one is left out
+  and the volume is `skipped`.
 * `rotateDeg` (contract 1.5) is sent only when CAPTUA_FISQUA_ROTATE_DEG is
   on; off, no image carries the key. It is the image's recorded rotate_deg: the clockwise degrees
   that display it upright from its stored pixels, whatever EXIF Orientation
@@ -82,7 +104,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re
@@ -99,8 +121,8 @@ from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, i
 
 CONTRACT = "fisqua-captua-exchange"
 # One version for every manifest, with or without rotateDeg (config
-# FISQUA_ROTATE_DEG), an excluded record or a missing one.
-VERSION = "1.9"
+# FISQUA_ROTATE_DEG), an excluded record, a missing one or colour card shots.
+VERSION = "1.12"
 MISSING = "missing"
 ROTATE_DEGREES = (0, 90, 180, 270)
 KIND = "capture-manifest"
@@ -134,6 +156,9 @@ RULES = (
     "page_key_repeated",
     "sha256_missing",
     "preview_sha256_missing",
+    "calibration_key",
+    "calibration_identity",
+    "calibration_not_uploaded",
     "no_pages",
 )
 
@@ -170,6 +195,14 @@ class ManifestRefused(Exception):
     def message(self) -> str:
         return ("The capture manifest cannot be exported, because Fisqua would refuse it: "
                 + " ".join(p.message for p in self.problems))
+
+
+class CalibrationWaiting(ManifestRefused):
+    """The volume's manifest waits only for colour card shots still to be verified offsite (colour_card.evaluate).
+
+    The outbox leaves the volume waiting for it; the download answers it as
+    any refusal, with the rule `calibration_not_uploaded`.
+    """
 
 
 class _Collector:
@@ -354,6 +387,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
     file_form = re.compile(rf"^{re.escape(stem)}-img_\d{{4,}}_c\d+\.[A-Za-z0-9]+$") if stem else None
 
     page_keys: Dict[str, List[tuple]] = {}
+    emitted: List[dict] = []  # the image entries written, with their image ids, for the colour card shots
     out_records = []
     pages = 0
     open_missing = 0
@@ -381,6 +415,7 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
                                  file_form, found, page_keys)
             if entry is not None:
                 out_images.append(entry)
+                emitted.append({**entry, "_image_id": img.id})
         out_records.append(_record_entry(rec, out_images))
 
     for key, owners in page_keys.items():
@@ -397,7 +432,33 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             "Fisqua has no page to register. Hand over records with images."))
 
     problems.extend(_problems(found, tenant, stem))
+
+    # Colour card shots (contract 1.12 §13, app.core.colour_card): one
+    # evaluation gives what is carried, the status, and what is waited for.
+    from app.core import colour_card
+    evaluated = colour_card.evaluate(db, collection, tenant, emitted)
+    calibration_status, calibration = evaluated.status, evaluated.entries
+    if calibration:
+        key_problems, identity_problems = colour_card.manifest_problems(stem, calibration, emitted)
+        if key_problems:
+            problems.append(Problem(
+                "calibration_key",
+                f"{len(key_problems)} colour card shot(s) are not named as one path segment of at most "
+                f"{colour_card.MAX_NAME_BYTES} bytes under {stem}/calibration/: {'; '.join(key_problems[:_LIST_LIMIT])}. "
+                "Fisqua refuses the volume for it; take the shots again."))
+        if identity_problems:
+            problems.append(Problem(
+                "calibration_identity",
+                f"{len(identity_problems)} colour card shot(s) share an identity with a page or another shot: "
+                f"{'; '.join(identity_problems[:_LIST_LIMIT])}. Fisqua refuses the volume for it."))
+    if evaluated.waiting:
+        problems.append(Problem(
+            "calibration_not_uploaded",
+            f"{evaluated.waiting} object(s) of the volume's colour card shots are not yet verified in the offsite "
+            "bucket. Wait for the offsite upload to verify them, then export again."))
     if problems:
+        if [p.rule for p in problems] == ["calibration_not_uploaded"]:
+            raise CalibrationWaiting(problems)
         raise ManifestRefused(problems)
 
     stamp = (now or _now()).astimezone(timezone.utc)
@@ -420,6 +481,8 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             "stem": stem,
             "title": collection.name,
             "records": out_records,
+            "calibrationStatus": calibration_status,
+            **({"calibration": calibration} if calibration else {}),
         }],
     }
 

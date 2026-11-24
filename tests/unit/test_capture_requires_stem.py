@@ -13,7 +13,7 @@ nothing (NEH-166), so it is not refused.
 
 The hardware is stood in for as test_capture_counter_raised.py does.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import inspect

@@ -5,7 +5,7 @@ switch_mode_usb(1), extended the lens and went on reporting playback. A
 half-press of the shutter completed the switch without taking a picture, so
 the backend sends one before it gives up on the body.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

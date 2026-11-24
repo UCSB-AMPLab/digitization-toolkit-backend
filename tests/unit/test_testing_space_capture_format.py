@@ -18,7 +18,7 @@ D. A gphoto2 DSLR, through the routes, against tests/unit/test_gphoto2_stored_fo
 
     python -m pytest tests/unit/test_testing_space_capture_format.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import types

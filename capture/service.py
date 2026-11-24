@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 import sys
 from pathlib import Path
@@ -36,6 +36,7 @@ if str(backend_dir) not in sys.path:
 
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
+from .backends.base import preview_request
 from .backends.errors import CameraNotConnectedError
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import (
@@ -106,6 +107,8 @@ def canonical_backend_name(value: str) -> str:
     which object a caller consults. Each site reads its own object, and they
     agree because they normalise the same way.
     """
+    if value is None:
+        return ""
     return value.strip().lower()
 
 
@@ -124,6 +127,13 @@ def assert_camera_backend_configured() -> str:
     answer /health, and fail at the moment someone tried to photograph
     something.
     """
+    if settings.CAMERA_BACKEND is None:
+        # Unset and not yet resolved: the backend is being built without the
+        # lifespan (a hardware test, a script). The same order of choice is
+        # applied here, and writes the kind to this `settings`.
+        from app.core import camera_kind
+
+        camera_kind.apply_at_startup()
     configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
         # The RAW value, from THE SAME object the check above read. A freshly
@@ -165,6 +175,14 @@ def get_backend() -> CameraBackend:
         if _backend is None:
             _backend = get_camera_backend()
             subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+            # Only a driver that was built is remembered as the kind last
+            # used, the fallback of a later start (app.core.camera_kind).
+            try:
+                from app.core import camera_kind
+
+                camera_kind.driver_built(settings.CAMERA_BACKEND)
+            except Exception as exc:
+                subprocess_logger.warning(f"The camera kind in use could not be remembered ({exc!r})")
         return _backend
 
 
@@ -512,6 +530,29 @@ def single_capture_image(
     return _image_of(output_path), record.capture_id, record.pair_id
 
 
+def colour_card_capture(camera_config: CameraConfig, output_path: Path) -> tuple:
+    """Photograph a colour card with one camera into `output_path`, in a volume's calibration folder.
+
+    Through the configured backend, as a page is (capture_image), so the
+    backend's own lock on the camera is taken. The rotation is recorded on
+    every JPEG as for a page. No manifest line is written here: the caller
+    names the files and writes the shot's line (app.core.colour_card).
+
+    Returns (paths, metadata): every file the backend wrote, the master
+    first, and the backend's capture metadata or None.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = get_backend().capture_image(output_path, camera_config, False)
+    if isinstance(result, tuple) and len(result) == 2:
+        actual_path, metadata = result
+    else:
+        actual_path, metadata = result, None
+    paths = _capture_paths(actual_path)
+    _rotate_capture_files(paths, getattr(camera_config, "rotate_deg", 0))
+    return paths, metadata
+
+
 def _unlink_capture_output(path) -> None:
     """Remove image file(s) from a capture that was never written to the manifest.
 
@@ -778,6 +819,7 @@ def dual_capture_image(
     
     return _image_of(img1_path), _image_of(img2_path), record.capture_id, record.pair_id
     
+@preview_request()
 def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
     Capture a live preview frame and return JPEG bytes.

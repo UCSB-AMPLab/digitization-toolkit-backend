@@ -18,7 +18,7 @@ widgets it changed. The shutter is not fired: _PTPSession.capture is replaced
 by a stub that writes a `.cr2` when the body's imageformat widget is "RAW" or
 "RAW + L" and a `.jpg` otherwise, so a test sees the file type produced.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
@@ -145,6 +145,9 @@ def _fake_gp(rig):
         def set_port_info(self, info):
             self.port = info
 
+        def wait_for_event(self, timeout_ms):
+            return 1, None
+
         def init(self):
             pass
 
@@ -189,6 +192,7 @@ def _fake_gp(rig):
             return path
 
     return types.SimpleNamespace(
+        GP_EVENT_TIMEOUT=1, GP_EVENT_FILE_ADDED=2,
         GPhoto2Error=_GPhoto2Error,
         Camera=Camera,
         CameraAbilitiesList=AbilitiesList,
@@ -802,7 +806,7 @@ def test_a_system_log_write_that_raises_leaves_the_capture_as_it_is(
     produced = _record_capture(monkeypatch, backend, tmp_path, 0)
 
     assert produced.suffix == ".jpg" and produced.exists()
-    assert backend._sessions[0].imageformat_set is None
+    assert 0 not in backend._sessions
 
 
 @pytest.mark.unit

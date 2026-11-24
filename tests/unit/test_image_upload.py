@@ -13,7 +13,7 @@ test: .github/workflows/ci.yml installs a pinned one for these tests.
 
     python -m pytest tests/unit/test_image_upload.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import hashlib

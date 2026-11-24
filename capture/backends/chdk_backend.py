@@ -54,7 +54,7 @@ it (``gui_live.lua``, update_canvas_size and the put_to_cd_canvas call under
 it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import contextlib
@@ -1235,6 +1235,15 @@ class ChdkBackend(CameraBackend):
             key = self._indices.get(camera_index)
             return self._bodies.get(key) if key is not None else None
 
+    def held_zoom(self, camera_index):
+        """The zoom state held for the body at this index, without talking to the camera; None when no body holds it.
+
+        `{"zoom_step": step}`, the step the body last confirmed (None until
+        known). Read by the colour card check (app.core.colour_card).
+        """
+        body = self._body_at(camera_index)
+        return {"zoom_step": body.zoom_step} if body is not None else None
+
     def camera_model(self, camera_index):
         """The model of the body holding this index.
 
@@ -1363,6 +1372,7 @@ class ChdkBackend(CameraBackend):
             with self._map_lock:
                 if self._bodies.get(body.key) is body:
                     del self._bodies[body.key]
+                    self._published_body_count = len(self._bodies)
                     self._indices = {
                         index: key for index, key in self._indices.items()
                         if key != body.key
@@ -1745,6 +1755,7 @@ class ChdkBackend(CameraBackend):
                 if fresh:
                     with self._map_lock:
                         self._bodies[key] = body
+                        self._published_body_count = len(self._bodies)
 
             # Publishing is where a body changes index, and a capture that is
             # already running on one is using the index it had when it
@@ -4064,6 +4075,21 @@ class ChdkBackend(CameraBackend):
 
     def get_backend_name(self) -> str:
         return "chdk"
+
+    def held_body_count(self) -> "int | None":
+        """How many bodies this backend holds open, read from its map; nothing is sent to a camera, and nothing waits.
+
+        The lock is only tried: when it is taken, the count last published
+        with the map is given (None before the first).
+        """
+        if not self._map_lock.acquire(blocking=False):
+            return getattr(self, "_published_body_count", None)
+        try:
+            count = len(self._bodies)
+            self._published_body_count = count
+            return count
+        finally:
+            self._map_lock.release()
 
     def cleanup(self):
         """Close every open body, waiting for whatever is using it.

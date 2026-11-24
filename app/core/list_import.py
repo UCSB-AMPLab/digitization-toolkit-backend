@@ -53,7 +53,7 @@ create_volume, the steps an import takes for one item. Its done marks are
 keyed by each entry's itemId, since positions change between revisions;
 a file's list keeps them by position (done_key).
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations

@@ -9,7 +9,7 @@ Also covers concurrent saves: two CameraRegistry instances are constructed per r
 of the file. Without a reload-modify-save discipline under a shared lock, an
 instance that saves after another would silently clobber the other's change.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import threading
@@ -364,3 +364,44 @@ def test_swapping_roles_moves_the_default_and_keeps_a_saved_angle(tmp_path):
     CameraRegistry(registry_path=registry_path).set_roles(
         "body_c", "body_b", ports={}, backend="chdk", confirmed_by="op")
     assert angles() == {"body_a": 90, "body_b": 90, "body_c": 180}
+
+
+# Each device row carries its role's default as well as the effective angle,
+# so the capture screen can tell a turn that leaves a body 180 degrees from
+# the default its role expects.
+
+@pytest.mark.unit
+@pytest.mark.parametrize(
+    "role, expected",
+    [("left", 270), ("right", 90), (None, 90), ("", 90), ("LEFT", 90), (1, 90)],
+)
+def test_default_orientation_is_the_role_default(role, expected):
+    result = CameraRegistry.default_orientation(role)
+    assert result == expected
+    assert type(result) is int
+
+
+@pytest.mark.unit
+def test_device_rows_carry_the_role_default_whatever_is_saved():
+    from app.api.cameras import _device_infos
+
+    class _Reg:
+        def __init__(self, record):
+            self.record = record
+
+        def get_camera_by_id(self, hw_id):
+            return self.record
+
+    row = {"hardware_id": "hw", "index": 0, "model": "m"}
+
+    cases = [
+        ({"orientation": 90, "role": "left", "calibration": {}}, 270),
+        ({"orientation": None, "role": "left", "calibration": {}}, 270),
+        ({"orientation": 270, "role": "right", "calibration": {}}, 90),
+        ({"orientation": 180, "calibration": {}}, 90),
+        (None, 90),
+    ]
+    for record, expected in cases:
+        info = _device_infos([row], _Reg(record))[0]
+        assert info.default_orientation == expected, record
+        assert info.model_dump()["default_orientation"] == expected

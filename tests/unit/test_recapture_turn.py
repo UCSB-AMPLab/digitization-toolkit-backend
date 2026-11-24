@@ -17,7 +17,7 @@ The hardware is stood in for as tests/unit/test_capture_birth_and_retake.py does
 
 Run with: python -m pytest tests/unit/test_recapture_turn.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from datetime import datetime

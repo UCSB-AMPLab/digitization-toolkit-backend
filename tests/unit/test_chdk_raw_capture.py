@@ -13,6 +13,8 @@ CameraConfig. Test captures, the focus check and the live preview build
 their own configuration and stay on JPEG.
 
 Run with: python -m pytest tests/unit/test_chdk_raw_capture.py
+
+Version: 0.3.0
 """
 
 from pathlib import Path

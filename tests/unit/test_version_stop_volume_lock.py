@@ -12,6 +12,8 @@ CI runs on SQLite, which has no row locks: these tests show the order in
 which the locks are asked for, not that one transaction waits for another.
 
     python -m pytest tests/unit/test_version_stop_volume_lock.py
+
+Version: 0.3.0
 """
 
 import pytest

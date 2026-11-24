@@ -13,7 +13,7 @@
 
 Run with: python -m pytest tests/unit/test_handover_boundaries.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

@@ -17,7 +17,7 @@ The node check and the clock are module-level indirections
 (_port_node_exists, _monotonic), replaced here by a set of live ports and a
 counter, so nothing below sleeps or depends on timing.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
@@ -121,6 +121,9 @@ def _make_fake_gp(detector):
         def set_port_info(self, port_info):
             self.port = port_info.path
 
+        def wait_for_event(self, timeout_ms):
+            return 1, None
+
         def init(self):
             pass
 
@@ -151,6 +154,7 @@ def _make_fake_gp(detector):
             return types.SimpleNamespace(path=path)
 
     return types.SimpleNamespace(
+        GP_EVENT_TIMEOUT=1, GP_EVENT_FILE_ADDED=2,
         GPhoto2Error=GPhoto2Error,
         Camera=Camera,
         CameraAbilitiesList=CameraAbilitiesList,

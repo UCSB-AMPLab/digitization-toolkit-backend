@@ -11,7 +11,7 @@ them would lose what was recorded.
 
 Run with: python -m pytest tests/unit/test_missing_openings_migration.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util

@@ -5,7 +5,7 @@ run inside the same rollback-and-reject handling as the insert, so a lost
 connection there is reported as `refused_by_database` for that item, the
 other items are still created, and the report is stored.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

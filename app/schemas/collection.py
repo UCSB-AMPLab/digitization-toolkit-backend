@@ -132,8 +132,9 @@ class CollectionRead(CollectionBase):
     # Whether the volume keeps its row to keep its stem: it has a stem and
     # has captured, so DELETE refuses it even once its records are moved
     # out. Lets the interface warn before "move the records, then delete".
-    # Read-only. Costs an image query, and an offsite-object query when that
-    # finds no image, per volume that has a stem and a counter of 0.
+    # Read-only. Costs an image query, then a colour card shot query and an
+    # offsite-object query when those find nothing, per volume that has a
+    # stem and a counter of 0.
     stem_reserved: bool = False
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None
@@ -162,6 +163,17 @@ class CollectionRead(CollectionBase):
     # row itself is edited (renamed, re-described). Null when it has no records.
     # None unless the endpoint explicitly populates it (list).
     last_activity_at: Optional[datetime] = None
+    # The volume's colour card shots (app.core.colour_card.summaries):
+    # {"enabled": false} while the unit does not ask for them or the volume
+    # is testing work, else {"enabled": true, "status": "present" | "skipped"
+    # | "none", "sets": <taken sets>}. None unless the endpoint populates it
+    # (list and detail). Read from the database alone, in a fixed number of
+    # queries for the whole list: the status counts sets taken and skipped
+    # and pages before the first set, and looks at no file, so it can read
+    # `present` for a volume whose shot file has since gone missing.
+    # GET /collections/{id}/colour-card (each set's `delivery`) and the
+    # integrity check report that.
+    colour_card: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True

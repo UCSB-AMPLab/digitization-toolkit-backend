@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -756,9 +756,11 @@ async def add_image_to_record(
 	# by the image insert's foreign-key check (FOR KEY SHARE), after the
 	# volume: the opposite order to a retake, and the two deadlock on
 	# PostgreSQL.
-	# The testing account writes no file while free space is below the
-	# reserve kept for real work (app.core.testing_space).
-	from app.core import testing_space
+	# The testing account writes no file while free space is below its
+	# reserve, the larger of the testing and storage reserves
+	# (app.core.testing_space). Every other caller is checked against the
+	# storage reserve last, just before the file is written (below).
+	from app.core import storage_override, testing_space
 	if current_user.role == testing_space.TESTING_ROLE:
 		testing_space.refuse_below_reserve(db)
 	rec = _locked_record(db, rec_id, with_images=False)
@@ -828,6 +830,17 @@ async def add_image_to_record(
 	# without one is given its own.
 	if not capture_id:
 		capture_id = str(uuid.uuid4())
+
+	# The last refusal before the file is written, measured on the folder it is
+	# written to: free space below the space
+	# Captua keeps for its own work (app.core.storage_override), for every
+	# caller but the testing account. The number taken is rolled back.
+	if current_user.role != testing_space.TESTING_ROLE:
+		try:
+			storage_override.refuse_below_storage_reserve(uploads_dir)
+		except HTTPException:
+			db.rollback()
+			raise
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
@@ -1369,6 +1382,39 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def read_after_lock(db: Session, records, rejections: bool = False) -> None:
+	"""Read the images (and with `rejections`, the rejections) of records whose rows this transaction has locked.
+
+	A separate statement, issued once the locks are held, whose rows replace
+	whatever the session held for these records. On PostgreSQL under READ
+	COMMITTED, a locking statement that waited for another transaction's lock
+	re-reads the locked row once it has it, but rows it joins come from the
+	snapshot it started with: a retake that waited for another retake's commit
+	would see the images from before it, pass its checks on them, and leave
+	two sets current. So every path that locks records and decides something
+	from their images locks the rows alone and reads the images here.
+	"""
+	from sqlalchemy.orm.attributes import set_committed_value
+
+	records = list(records)
+	ids = [rec.id for rec in records]
+	if not ids:
+		return
+	images = {rec_id: [] for rec_id in ids}
+	for img in (db.query(RecordImage).filter(RecordImage.record_id.in_(ids))
+	            .order_by(RecordImage.id).populate_existing()):
+		images[img.record_id].append(img)
+	for rec in records:
+		set_committed_value(rec, "images", images[rec.id])
+	if rejections:
+		found = {rec_id: [] for rec_id in ids}
+		for rej in (db.query(RecordRejection).filter(RecordRejection.record_id.in_(ids))
+		            .order_by(RecordRejection.rejected_at.desc()).populate_existing()):
+			found[rej.record_id].append(rej)
+		for rec in records:
+			set_committed_value(rec, "rejections", found[rec.id])
+
+
 def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	"""Load a record with its row locked for the rest of the transaction.
 
@@ -1382,7 +1428,11 @@ def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	all, so the tests exercise the surrounding logic and cannot demonstrate the
 	locking. That is verified by reading the emitted SQL, not by the suite.
 	"""
-	return _locked_record_query(db, rec_id, with_images).first()
+	rec = _locked_record_query(db, rec_id, with_images).first()
+	# The images in a second statement, after the lock (read_after_lock).
+	if rec is not None and with_images:
+		read_after_lock(db, [rec])
+	return rec
 
 
 def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
@@ -1390,10 +1440,9 @@ def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
 	against the PostgreSQL dialect and read the lock clause off the SQL, which
 	is the only way to check it without a server — see
 	tests/unit/test_workflow_row_locking.py."""
-	query = db.query(Record)
-	if with_images:
-		query = query.options(joinedload(Record.images))
-	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+	# The record row alone, whatever `with_images` says: _locked_record reads
+	# the images in a statement of their own, once the lock is held.
+	return db.query(Record).filter(Record.id == rec_id).with_for_update(of=Record)
 
 
 def is_movable(rec: Record) -> bool:
@@ -1608,7 +1657,6 @@ def bulk_update_status(
 	# and cannot deadlock against each other.
 	records = (
 		db.query(Record)
-		.options(joinedload(Record.images))
 		.filter(Record.id.in_(payload.record_ids))
 		.order_by(Record.id)
 		.with_for_update(of=Record)
@@ -1616,6 +1664,8 @@ def bulk_update_status(
 	)
 	if not records:
 		raise HTTPException(status_code=404, detail="No matching records found")
+	# The images, which _apply_status_change checks, read after the locks.
+	read_after_lock(db, records)
 
 	skipped: list[int] = []
 	updated: list[Record] = []

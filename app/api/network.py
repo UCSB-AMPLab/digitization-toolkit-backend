@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 """The network screen's routes (NEH-253), over app.core.network.
 
 GET    /network/status              what the unit is connected to
@@ -38,26 +38,9 @@ from sqlalchemy.orm import Session
 from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core import network
+from app.core.validation_errors import plain_errors
 from app.core.audit import log_event
 from app.models.user import User
-
-def _plain_errors(errors) -> list[dict]:
-    """Validation errors as {loc, type, msg}: no `input` or `ctx`, no
-    unknown field's name in `loc`, and a `msg` that would repeat a submitted
-    value is replaced by the type."""
-    plain = []
-    for error in errors:
-        msg = str(error.get("msg", ""))
-        submitted = error.get("input")
-        if isinstance(submitted, (str, int, float)) and str(submitted) and str(submitted) in msg:
-            msg = str(error.get("type", "value_error"))
-        loc = list(error.get("loc", ()))
-        if error.get("type") == "extra_forbidden" and len(loc) > 1:
-            # The last element is the unknown field's name, which the client chose.
-            loc = loc[:-1]
-        plain.append({"loc": loc, "type": error.get("type"), "msg": msg})
-    return plain
-
 
 class _NetworkRoute(APIRoute):
     """Answers a validation error on a /network route without echoing the request."""
@@ -69,7 +52,7 @@ class _NetworkRoute(APIRoute):
             try:
                 return await handler(request)
             except RequestValidationError as exc:
-                return JSONResponse(status_code=422, content={"detail": _plain_errors(exc.errors())})
+                return JSONResponse(status_code=422, content={"detail": plain_errors(exc.errors())})
 
         return route_handler
 

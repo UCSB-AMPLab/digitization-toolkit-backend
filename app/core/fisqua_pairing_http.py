@@ -47,7 +47,7 @@ the target is the one a payload must carry. CAPTUA_FISQUA_PAIRING_BASE_URL
 replaces the address, for tests and development, under the rule of
 fisqua_outbox._usable_override; it does not change the environment.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

@@ -10,7 +10,7 @@ always queues its manifest, whatever the configuration.
 
     python -m pytest tests/unit/test_kept_on_unit.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import importlib.util

@@ -16,7 +16,7 @@ database.
 
     python -m pytest tests/unit/test_signout_ends_sessions.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import re
@@ -140,7 +140,8 @@ def test_after_signing_out_the_register_route_refuses_the_admins_token(client, d
     _logout(client, token)
     _real_auth()
     client.cookies.clear()
-    resp = client.post("/auth/register", json={"username": "nuevo", "password": "pw"}, headers=_bearer(token))
+    resp = client.post("/auth/register", json={"username": "nuevo", "password": "fake-pw-nuevo"},
+                       headers=_bearer(token))
     assert resp.status_code == 401, resp.text
     assert db_session.query(User).filter(User.username == "nuevo").first() is None
 

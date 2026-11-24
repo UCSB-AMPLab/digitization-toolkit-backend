@@ -6,7 +6,9 @@ superseded alike, at
     <tenant>/<stem>/captures/<file name>             the image as shot
     <tenant>/<stem>/previews/<stem>_preview.jpg      a RAW master's preview
 
-relative to OFFSITE_REMOTE. Thumbnails are never uploaded. The file name is
+relative to OFFSITE_REMOTE, and after them each taken colour card shot at
+`<tenant>/<stem>/calibration/<file name>` (see "Colour card shots" below).
+Thumbnails are never uploaded. The file name is
 the image's name on disk when this unit first uploads the object. An adopted
 object keeps the key it was found at, whose last segment may differ from the
 name on disk (a contract name given in the bucket to an image captured before
@@ -53,7 +55,7 @@ while it is uploaded. A renumber renames nothing. Where a hard link cannot
 be made (a file system without hard links), a copy is made there instead,
 and removed after the upload.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import argparse
@@ -86,6 +88,7 @@ from app.core.catalogue_backup import (
     transfer_lock,
 )
 from app.core.paths import (
+    CALIBRATION_DIR,
     CAPTURES_DIR,
     OFFSITE_STAGING_DIR,
     PREVIEWS_DIR,
@@ -398,6 +401,9 @@ class Work:
     kind: str
     stem: str
     master_path: str
+
+    def ident(self) -> dict:
+        return {"image_id": self.image_id, "kind": self.kind}
 
 
 def pending_work(db: Session) -> list:
@@ -862,7 +868,7 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
 
     try:
-        for item in pending_work(db):
+        for item in pending_work(db) + colour_card_work(db):
             if stop is not None and stop.is_set():
                 result.status = "stopped"
                 break
@@ -879,12 +885,14 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
                 logger.info("the unit is now in offline mode; image upload stopped")
                 break
             try:
-                _process(db, tenant, item, result)
+                if isinstance(item, CardWork):
+                    _process_card(db, tenant, item, result)
+                else:
+                    _process(db, tenant, item, result)
             except IntegrityError as exc:
                 db.rollback()
-                result.conflicts.append({"image_id": item.image_id, "kind": item.kind,
-                                         "error": str(exc.orig)[:200]})
-                logger.error("Image %s (%s) could not be recorded: %s", item.image_id, item.kind, exc.orig)
+                result.conflicts.append({**item.ident(), "error": str(exc.orig)[:200]})
+                logger.error("%s could not be recorded: %s", item.ident(), exc.orig)
     except VerificationUnavailable as exc:
         result.status = "aborted"
         result.error = str(exc)
@@ -908,6 +916,248 @@ def run_image_upload(db: Session, stop: Optional[threading.Event] = None) -> dic
         logger.log(logging.INFO if level == "INFO" else logging.WARNING,
                    "Image upload run %s: %s", result.status, counts)
     return result.as_dict()
+
+
+# ---------------------------------------------------------------------------
+# Colour card shots (app.core.colour_card)
+# ---------------------------------------------------------------------------
+#
+# Every shot of a taken set in a stemmed volume that is neither testing work
+# nor kept on the unit goes to the bucket, after the pages, at
+#
+#     <tenant>/<stem>/calibration/<file name>                 the shot
+#     <tenant>/<stem>/calibration/<file stem>_preview.jpg     a RAW shot's preview
+#
+# with the rules a page follows: the listing is read before (never
+# overwrite; an object with another SHA1 refuses the shot, `remote_differs`)
+# and after (verified only from a listing), the bytes are staged as a hard
+# link (or a copy), and a file whose sha256 is not the one its row took when
+# it was written is refused (`fixity`). The rows are colour_card_objects,
+# whose key never changes. Shots are never freed from the card.
+
+def calibration_key(tenant: str, stem: str, file_name: str) -> str:
+    return f"{tenant}/{stem}/{CALIBRATION_DIR}/{file_name}"
+
+
+@dataclass
+class CardWork:
+    shot_id: int
+    kind: str  # "shot" or "preview"
+
+    def ident(self) -> dict:
+        return {"colour_card_shot_id": self.shot_id, "kind": self.kind}
+
+
+def colour_card_work(db: Session) -> list:
+    """The colour card objects still to upload: each shot of a taken set, and a RAW shot's preview, in volume and set order."""
+    from app.models.collection import Collection
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
+
+    rows = (db.query(ColourCardShot.id, ColourCardShot.preview_path)
+            .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
+            .join(Collection, ColourCardSet.collection_id == Collection.id)
+            .filter(ColourCardSet.outcome == "taken", Collection.filename_stem.isnot(None),
+                    Collection.kept_on_unit.is_(False), Collection.testing.is_(False))
+            .order_by(Collection.id, ColourCardSet.number, ColourCardShot.camera_index).all())
+    if not rows:
+        return []
+    done = {(o.shot_id, o.kind) for o in db.query(ColourCardObject)
+            .filter(ColourCardObject.shot_id.in_([r[0] for r in rows]))
+            if not _pending(o)}
+    work = []
+    for shot_id, preview_path in rows:
+        if (shot_id, "shot") not in done:
+            work.append(CardWork(shot_id, "shot"))
+        if preview_path and (shot_id, "preview") not in done:
+            work.append(CardWork(shot_id, "preview"))
+    return work
+
+
+def _card_state(db: Session, shot_id: int) -> Optional[tuple]:
+    """The shot's file, digest and volume as committed now, or None if it is gone."""
+    from app.models.collection import Collection
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    return (db.query(ColourCardShot.file_path, ColourCardShot.sha256, ColourCardShot.filename,
+                     ColourCardShot.preview_path, ColourCardShot.preview_sha256, ColourCardShot.preview_filename,
+                     Collection.filename_stem, Collection.kept_on_unit, ColourCardSet.outcome)
+            .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
+            .join(Collection, ColourCardSet.collection_id == Collection.id)
+            .filter(ColourCardShot.id == shot_id).one_or_none())
+
+
+def _card_row(db: Session, shot_id: int, kind: str):
+    from app.models.colour_card import ColourCardObject
+
+    return (db.query(ColourCardObject)
+            .filter(ColourCardObject.shot_id == shot_id, ColourCardObject.kind == kind).one_or_none())
+
+
+def _claim_card(db: Session, row, item: CardWork, key: str, state: tuple, **fields):
+    """Write the shot's object row, only while the shot and its volume are as they were when it was read.
+
+    Every claim, whether or not the object already has a row, takes the
+    volume's row FOR SHARE and reads the shot's state again under it
+    (_card_state: the shot's file, digest and names, its preview's, the
+    volume's stem and kept_on_unit, and the set's outcome). A row that
+    exists is no evidence that this check was made: a row that only records
+    skips was written before any byte was read. So a keep on the unit
+    (kept_volumes.keep, FOR NO KEY UPDATE) and a claim take turns: a keep
+    committed first shows in the state and nothing is written
+    (_ImageMoved); a claim committed first is the row the keep then refuses
+    on (already_left_unit). The page's rule (_claim) is the same for a first
+    row; a page's row always holds its digest.
+    """
+    from app.models.collection import Collection
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    collection_id = (db.query(ColourCardSet.collection_id)
+                     .join(ColourCardShot, ColourCardShot.set_id == ColourCardSet.id)
+                     .filter(ColourCardShot.id == item.shot_id).scalar())
+    if collection_id is not None:
+        (db.query(Collection.id).filter(Collection.id == collection_id)
+         .with_for_update(read=True).one_or_none())
+    if collection_id is None or _card_state(db, item.shot_id) != state:
+        db.rollback()
+        raise _ImageMoved()
+    return _card_save(db, row, item, key, **fields)
+
+
+# Why the uploader last skipped a shot's object, recorded on its row
+# (colour_card_objects.last_skip_reason), one code per skip path of
+# _process_card that a later run can end the same way. A shot whose file is
+# missing is undeliverable already (app.core.colour_card), a key held by
+# another object is reported as a conflict, and a shot that changed while
+# read (a keep on the unit) is not counted.
+CARD_STAGING_FAILED = "staging_failed"            # no hard link and no copy could be made
+CARD_FILE_UNSTABLE = "file_unstable"              # its size or time changed while it was hashed
+CARD_LISTED_WITHOUT_SHA1 = "listed_without_sha1"  # an object is at the key, listed with no SHA1
+CARD_UNVERIFIED = "unverified"                    # uploaded, and the listing after did not show its SHA1
+# Consecutive runs skipping an object for one reason before it is refused for
+# that reason, so that it holds its volume no more. The page uploader skips a
+# page again on every run with no bound, so the bound is this module's own.
+SKIP_LIMIT = 10
+_CLEAR_SKIPS = {"last_skip_reason": None, "skip_count": 0}
+
+
+def _note_card_skip(db: Session, row, item: CardWork, key: str, state: tuple, reason: str, result: RunResult,
+                    local_sha1: Optional[str] = None) -> None:
+    """Count one more run that skipped the object for `reason`; at SKIP_LIMIT refuse it with that reason.
+
+    Another reason than the last starts the count again at 1. A new row is
+    written under the claim (_claim_card), so a keep committed meanwhile
+    leaves nothing written.
+    """
+    row = row if row is not None else _card_row(db, item.shot_id, item.kind)
+    count = (row.skip_count + 1) if row is not None and row.last_skip_reason == reason else 1
+    fields = {"last_skip_reason": reason, "skip_count": count}
+    if local_sha1 is not None and (row is None or row.local_sha1 is None):
+        fields["local_sha1"] = local_sha1
+    if count >= SKIP_LIMIT:
+        fields.update(refused_at=_now(), refusal=reason)
+    try:
+        _claim_card(db, row, item, key, state, **fields)
+    except _ImageMoved:
+        return
+    if count >= SKIP_LIMIT:
+        result.refused.append({**item.ident(), "reason": reason, "skipped_runs": count, "key": key})
+        logger.error("Refused %s (%s) after %d runs skipped it", key, reason, count)
+        _log(db, action=REFUSED_ACTION, level="ERR", subject=key, detail=f"{reason}: skipped {count} runs")
+
+
+def _card_save(db: Session, row, item: CardWork, key: str, **fields):
+    from app.models.colour_card import ColourCardObject
+
+    if row is None:
+        row = ColourCardObject(shot_id=item.shot_id, kind=item.kind, object_key=key, **fields)
+        db.add(row)
+    else:
+        for name, value in fields.items():
+            setattr(row, name, value)
+    db.commit()
+    return row
+
+
+def _process_card(db: Session, tenant: str, item: CardWork, result: RunResult) -> None:
+    """Upload, record or refuse one colour card object. Raises VerificationUnavailable and UploadFailed."""
+    from app.models.colour_card import ColourCardObject
+
+    row = _card_row(db, item.shot_id, item.kind)
+    if not _pending(row):
+        return
+    state = _card_state(db, item.shot_id)
+    db.commit()
+    if state is None or state.outcome != "taken" or state.filename_stem is None or state.kept_on_unit:
+        return
+    if item.kind == "shot":
+        stored, expected, name = state.file_path, state.sha256, state.filename
+    else:
+        stored, expected, name = state.preview_path, state.preview_sha256, state.preview_filename
+    path = resolve_within_storage(stored) if stored else None
+    if path is None or not path.is_file():
+        result.skipped.append({**item.ident(), "reason": "file not found", "path": stored})
+        return
+    key = row.object_key if row is not None else calibration_key(tenant, state.filename_stem, name)
+    staged = _stage(path)
+    if staged is None:
+        result.skipped.append({**item.ident(), "reason": "file could not be staged", "path": str(path)})
+        _note_card_skip(db, row, item, key, state, CARD_STAGING_FAILED, result)
+        return
+    try:
+        digests = stable_digests(staged.path)
+        if digests is None:
+            result.skipped.append({**item.ident(), "reason": "file changed while it was read", "path": str(path)})
+            _note_card_skip(db, row, item, key, state, CARD_FILE_UNSTABLE, result)
+            return
+        sha1, sha256 = digests
+        holder = db.query(ColourCardObject).filter(ColourCardObject.object_key == key).one_or_none()
+        if holder is not None and (row is None or holder.id != row.id):
+            result.conflicts.append({**item.ident(), "key": key, "held_by_colour_card_shot_id": holder.shot_id})
+            logger.error("Colour card shot %s (%s): key %s is already recorded; not uploaded",
+                         item.shot_id, item.kind, key)
+            return
+
+        def refuse(reason: str, detail: dict, remote_sha1: Optional[str] = None) -> None:
+            _claim_card(db, row, item, key, state, local_sha1=sha1, remote_sha1=remote_sha1,
+                        refused_at=_now(), refusal=reason)
+            result.refused.append({**item.ident(), "reason": reason, **detail})
+            text = "; ".join(f"{k} {v}" for k, v in detail.items())
+            logger.error("Refused %s (%s): %s", key, reason, text)
+            _log(db, action=REFUSED_ACTION, level="ERR", subject=key, detail=f"{reason}: {text}")
+
+        if expected and expected != sha256:
+            refuse("fixity", {"local_path": str(path), "local_sha256": sha256, "shot_sha256": expected, "key": key})
+            return
+        db.commit()
+        before = listed_object(key)
+        if before.present:
+            if before.sha1 is None:
+                result.skipped.append({**item.ident(), "reason": "listed with no SHA1", "key": key})
+                _note_card_skip(db, row, item, key, state, CARD_LISTED_WITHOUT_SHA1, result, local_sha1=sha1)
+                return
+            if before.sha1 == sha1:
+                _claim_card(db, row, item, key, state, local_sha1=sha1, verified_at=_now(), **_CLEAR_SKIPS)
+                result.already_present += 1
+                return
+            refuse("remote_differs", {"local_path": str(path), "local_sha1": sha1, "key": key,
+                                      "remote_sha1": before.sha1}, remote_sha1=before.sha1)
+            return
+        # The key is claimed, as a committed pending row, before the transfer starts (_claim_card).
+        row = _claim_card(db, row, item, key, state, local_sha1=sha1)
+        upload_file(staged.path, key)
+        row = _card_save(db, row, item, key, uploaded_at=_now())
+        after = listed_object(key)
+        if after.present and after.sha1 == sha1:
+            _card_save(db, row, item, key, verified_at=_now(), **_CLEAR_SKIPS)
+            result.uploaded += 1
+            return
+        result.unverified += 1
+        logger.warning("Uploaded %s, but the listing does not show sha1 %s; not verified", key, sha1)
+        _note_card_skip(db, row, item, key, state, CARD_UNVERIFIED, result)
+    except _ImageMoved:
+        result.skipped.append({**item.ident(), "reason": "shot changed while it was read"})
+    finally:
+        staged.release()
 
 
 # ---------------------------------------------------------------------------
@@ -1468,7 +1718,8 @@ def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
 # The received indicator, derived
 # ---------------------------------------------------------------------------
 
-def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) -> dict:
+def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None, *,
+                   real_released_only: bool = False, probe_previews: bool = True) -> dict:
     """Per stemmed volume: total, verified, pending, refused, last verification, refusals, freed.
 
     A volume's uploadable objects are each image's capture, and, for a RAW
@@ -1478,34 +1729,49 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
     verified too, since freeing needs a verified object. `kept_on_unit` is
     the volume's flag (app.core.kept_volumes); its counts are what they are,
     and callers decide what a kept volume's pending means.
+
+    With `real_released_only`, testing volumes and volumes kept on the unit
+    are left out of every query, so none of their files is looked for.
+
+    With `probe_previews` false no file is looked for: a current RAW image
+    whose preview has no row counts its preview as one more object still to
+    upload, so its volume is not received; a RAW image that is not current
+    and has no preview row counts no preview. This is the database-only
+    reading of the list of volumes that can be freed (offsite_free.freeable_volumes).
     """
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
     q = (db.query(RecordImage.id, RecordImage.file_path, Collection.id,
-                  RecordImage.master_freed_bytes, RecordImage.preview_freed_bytes)
+                  RecordImage.master_freed_bytes, RecordImage.preview_freed_bytes, RecordImage.is_current)
          .join(Record, RecordImage.record_id == Record.id)
          .join(Collection, Record.collection_id == Collection.id)
          .filter(Collection.filename_stem.isnot(None)))
+    # The offsite rows of those same images, in one query joined the same way,
+    # so the number of queries does not grow with the unit's images.
+    objects = (db.query(OffsiteObject)
+               .join(RecordImage, OffsiteObject.record_image_id == RecordImage.id)
+               .join(Record, RecordImage.record_id == Record.id)
+               .join(Collection, Record.collection_id == Collection.id)
+               .filter(Collection.filename_stem.isnot(None)))
     stemmed = db.query(Collection.id, Collection.kept_on_unit).filter(Collection.filename_stem.isnot(None))
     if collection_ids is not None:
         ids = list(collection_ids)
         q = q.filter(Collection.id.in_(ids))
+        objects = objects.filter(Collection.id.in_(ids))
         stemmed = stemmed.filter(Collection.id.in_(ids))
+    if real_released_only:
+        real = (Collection.testing.is_(False), Collection.kept_on_unit.is_(False))
+        q, objects, stemmed = q.filter(*real), objects.filter(*real), stemmed.filter(*real)
     images = q.all()
 
-    rows = {}
-    image_ids = [i for i, *_ in images]
-    for start in range(0, len(image_ids), 500):
-        chunk = image_ids[start:start + 500]
-        for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
-            rows[(row.record_image_id, row.kind)] = row
+    rows = {(row.record_image_id, row.kind): row for row in objects}
 
     out = {cid: {"total": 0, "verified": 0, "refused": 0, "last_verified_at": None, "refusals": [],
                  "freed_files": 0, "freed_bytes": 0, "kept_on_unit": bool(kept)}
            for cid, kept in stemmed.all()}
-    for image_id, file_path, cid, master_freed, preview_freed in images:
+    for image_id, file_path, cid, master_freed, preview_freed, is_current in images:
         state = out[cid]
         for freed_bytes in (master_freed, preview_freed):
             if freed_bytes is not None:
@@ -1515,6 +1781,9 @@ def _object_counts(db: Session, collection_ids: Optional[Iterable[int]] = None) 
         if is_raw_suffix(Path(file_path)):
             if (image_id, "preview") in rows:
                 kinds.append("preview")
+            elif not probe_previews:
+                if is_current:
+                    kinds.append("preview")
             else:
                 sidecar = local_file("preview", file_path)
                 if sidecar is not None and sidecar.is_file():

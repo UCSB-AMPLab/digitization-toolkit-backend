@@ -33,7 +33,7 @@ from tests.unit.test_image_upload import STEM, TENANT, _image, _rows, _run, _vol
 
 MIGRATION_FILE = "c8e0a2f4b6d9_add_offsite_object_retirement.py"
 TABLE_MIGRATION_FILE = "b8d2f4a6c1e3_add_offsite_objects.py"
-PREVIOUS_HEAD = "c8e2a4f6b0d1"
+PREVIOUS_HEAD = "e7c3a9d1f5b2"
 NEW_STEM = "xx-test-002"
 
 

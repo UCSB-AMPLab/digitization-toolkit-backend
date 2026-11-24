@@ -13,7 +13,7 @@ fails is NULL too, and never fails the capture.
 
 Run with: python -m pytest tests/unit/test_camera_model_recorded.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
@@ -190,6 +190,9 @@ def _fake_gp_for_session(widgets, fetches=None):
         def set_port_info(self, info):
             pass
 
+        def wait_for_event(self, timeout_ms):
+            return 1, None
+
         def init(self):
             pass
 
@@ -216,6 +219,7 @@ def _fake_gp_for_session(widgets, fetches=None):
             return object()
 
     return types.SimpleNamespace(
+        GP_EVENT_TIMEOUT=1, GP_EVENT_FILE_ADDED=2,
         GPhoto2Error=_FakeGPhoto2Error, Camera=Camera,
         CameraAbilitiesList=_List, PortInfoList=_List,
     )

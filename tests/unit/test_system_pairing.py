@@ -9,7 +9,7 @@ and scanned.
 
     python -m pytest tests/unit/test_system_pairing.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

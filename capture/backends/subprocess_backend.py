@@ -1,10 +1,11 @@
 """
 Subprocess-based camera backend using rpicam-still.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import subprocess
+import threading
 from pathlib import Path
 from typing import Optional
 
@@ -25,6 +26,15 @@ class RpicamBackend(CameraBackend):
             logger: Logger instance for logging operations.
         """
         super().__init__(logger)
+        # One rpicam-still per camera at a time, as the other drivers hold a
+        # lock per camera: a page capture and a colour card shot on the same
+        # camera take turns; captures on different cameras do not wait.
+        self._camera_locks: dict = {}
+        self._camera_locks_mutex = threading.Lock()
+
+    def _camera_lock(self, camera_index: int) -> threading.Lock:
+        with self._camera_locks_mutex:
+            return self._camera_locks.setdefault(camera_index, threading.Lock())
     
     def is_camera_connected(self, camera_index: int = 0) -> bool:
         """
@@ -118,13 +128,14 @@ class RpicamBackend(CameraBackend):
         
         self.logger.info("Executing command: %s", ' '.join(command))
         try:
-            result = subprocess.run(
-                command,
-                check=True,
-                capture_output=capture_output,
-                text=capture_output,
-                timeout=10
-            )
+            with self._camera_lock(camera_config.camera_index):
+                result = subprocess.run(
+                    command,
+                    check=True,
+                    capture_output=capture_output,
+                    text=capture_output,
+                    timeout=10
+                )
             self.logger.info(f"Image captured successfully: {output_path}")
             return str(output_path)
         except subprocess.CalledProcessError as e:

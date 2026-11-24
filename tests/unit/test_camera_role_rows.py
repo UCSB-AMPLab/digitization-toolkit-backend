@@ -6,7 +6,7 @@ card file for CHDK, the bindings pin for gphoto2. The guess is shown to the
 operator and nothing acts on it, so these tests also check that adding the
 fields changes no index, no pin and no claim.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

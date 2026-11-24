@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from typing import Optional
 from pydantic import AliasChoices, BaseModel, Field

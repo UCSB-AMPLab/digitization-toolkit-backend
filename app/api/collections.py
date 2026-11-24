@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
@@ -122,8 +122,7 @@ def _as_collection_create(payload: CollectionCreateRequest) -> CollectionCreate:
 
     A body with no stem and another invalid field is answered with the
     other field's error only, since FastAPI refuses it before this runs.
-    The `input` echoed in a stem error is the parsed body, not the bytes
-    sent.
+    The 422 carries each error's type, loc and msg only (app.main).
     """
     from fastapi.exceptions import RequestValidationError
     from pydantic import ValidationError
@@ -392,10 +391,13 @@ def list_collections(
             counts_by_id[collection_id] = count
             last_activity_by_id[collection_id] = last_activity
 
+    from app.core import colour_card
+    cards = colour_card.summaries(db, items)
     results = []
     for i in items:
         r = CollectionRead.model_validate(i)
         r.record_count = counts_by_id.get(i.id, 0)
+        r.colour_card = cards.get(i.id)
         # Left as None for a collection with no records: "never worked on" is
         # not the same as a date, and a caller listing volumes in progress needs
         # to tell them apart.
@@ -428,10 +430,14 @@ def get_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """Get a specific collection by ID."""
+    from app.core import colour_card
+
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    return CollectionRead.model_validate(collection)
+    read = CollectionRead.model_validate(collection)
+    read.colour_card = colour_card.summaries(db, [collection])[collection.id]
+    return read
 
 
 @router.get("/{collection_id}/offsite")
@@ -468,8 +474,12 @@ def get_collection_offsite_state(
 def _offsite_state(db: Session, collection) -> dict:
     from app.core.fisqua_outbox import volume_fisqua_state
     from app.core.image_upload import volume_upload_state
+    from app.core.offsite_free import restore_available
 
-    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id)}
+    # `restorable`: whether this unit can restore freed files (NEH-380), so the
+    # interface offers a restore only where one can run.
+    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id),
+            "restorable": restore_available()}
 
 
 # ==============================================================================
@@ -637,7 +647,9 @@ def adopt_into(
 # Freeing a received volume from the card, and restoring it (app.core.offsite_free)
 # ==============================================================================
 #
-# Under /{id}/offsite, beside the received indicator they depend on. GET of
+# Under /{id}/offsite, beside the received indicator they depend on. The dry
+# run, the free and a free job's status are the admin's and the operator's;
+# restore and a restore job's status are the admin's. GET of
 # /offsite/free is the dry run (it lists the bucket and changes nothing);
 # POST runs the free. Both POSTs answer 202 with a job to poll, as the export
 # does, because hashing a volume's masters outlasts the proxy's read timeout;
@@ -651,7 +663,7 @@ def _offsite_refused(exc) -> HTTPException:
 @router.get("/{collection_id}/offsite/free")
 def plan_free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
     """Dry run: which masters and previews freeing would remove, their count and bytes, and what it would refuse and why."""
@@ -671,10 +683,10 @@ def _job_body(collection_id: int, job) -> dict:
 @router.post("/{collection_id}/offsite/free", status_code=202)
 def free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
-    """Free the volume's masters and RAW previews from the card; thumbnails stay.
+    """Free the volume's masters and RAW previews from the card; thumbnails stay. Admin and operator.
 
     Refused with 409 when the volume has no stem, when not every one of its
     objects is verified in the bucket, while an export of it is queued or
@@ -700,7 +712,7 @@ def restore_collection(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
+    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place. Admin only.
 
     Refused with 409 when the volume has no stem, when no read remote is
     configured (CAPTUA_OFFSITE_READ_REMOTE), and while an export of it is
@@ -716,18 +728,28 @@ def restore_collection(
     return _job_body(collection_id, job)
 
 
+RESTORE_JOB_ADMIN_ONLY = "Only an administrator can read a restore job."
+
+
 @router.get("/{collection_id}/offsite/jobs/{job_id}")
 def offsite_job_status(
     collection_id: int,
     job_id: str,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
 ):
-    """The state of a free or restore job, with its result once done."""
+    """The state of a free or restore job, with its result once done.
+
+    Admin and operator for a free job; a restore job, which only an admin
+    starts, is the admin's alone: an operator is answered 403 for it, with
+    nothing of the job.
+    """
     from app.core.offsite_free import offsite_jobs
 
     job = offsite_jobs.get(job_id)
     if job is None or job.collection_id != collection_id:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.action == "restore" and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail=RESTORE_JOB_ADMIN_ONLY)
     return job.to_dict()
 
 
@@ -1319,6 +1341,10 @@ def delete_collection(
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
             raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
+        # The volume's colour card shots are removed with it, after the delete commits.
+        from app.core import colour_card
+        shot_files = {str(p) for p in colour_card.shot_file_paths(db, collection_id)}
+        left = [p for p in left if str(p.resolve()) not in shot_files]
         if left:
             logger.warning(
                 f"Deleting collection {collection_id}: {len(left)} file(s) no record references were left in "
@@ -1336,8 +1362,15 @@ def delete_collection(
     )
     deleted = dict(id=collection.id, name=collection.name, stem=collection.filename_stem,
                    project=collection.project_id, parent=collection.parent_collection_id)
+    # Its colour card sets and shots go with it, and their files once the delete commits.
+    from app.core import colour_card
+    card_files = colour_card.remove_volume_shots(db, collection_id)
     db.delete(collection)
     db.commit()
+    if card_files:
+        colour_card.remove_files(card_files)
+        if col_dir is not None:
+            remove_empty_dirs(col_dir)
     log_event(db, level="WARN", category="activity", action="collection_deleted",
               actor=current_user.username, subject=deleted["name"],
               detail=(f"id={deleted['id']}; stem {deleted['stem']!r}; project {deleted['project']}; "
@@ -1575,12 +1608,15 @@ def promote_collection(
     # be refused (records_captured).
     locked = (
         db.query(Record)
-        .options(joinedload(Record.images))
         .filter(Record.collection_id == collection_id)
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
+    # The images, which _apply_status_change checks, read after the locks
+    # (records.read_after_lock).
+    from app.api.records import read_after_lock
+    read_after_lock(db, locked)
     records = [
         rec for rec in locked
         if rec.status == "captured" and (rec.missing_side is None or rec.closed_reason is not None)
@@ -1829,12 +1865,14 @@ def export_collection_bagit(
 
     # A master freed from the card is in the bucket, not here, and a bag is
     # built from the card. 409: the volume's state, which a restore changes.
-    from app.core.offsite_free import FREED_EXPORT_MESSAGE
+    # `restorable` says whether a restore can bring them back to this unit (restore_available).
+    from app.core.offsite_free import FREED_EXPORT_MESSAGE, restore_available
     freed = [i.id for r in records for i in r.images if i.is_current and i.master_freed_at is not None]
     if freed:
         raise HTTPException(
             status_code=409,
-            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed},
+            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed,
+                    "restorable": restore_available()},
         )
 
     # One export per collection at a time: a retry returns the running job instead of

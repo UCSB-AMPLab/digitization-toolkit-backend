@@ -16,7 +16,7 @@ while the rest of the project is on the drive. Instead, everything that writes
 into the projects tree gets its root from writable_projects_dir, which raises
 StorageUnavailableError for such a root.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 import json
 import logging
@@ -205,3 +205,71 @@ def projects_root_usage(settings=None):
         return shutil.disk_usage(root), None
     except OSError:
         return None, "The storage path for projects cannot be read."
+
+
+# ---------------------------------------------------------------------------
+# The storage reserve
+# ---------------------------------------------------------------------------
+#
+# Free space Captua keeps for its own work (settings.STORAGE_RESERVE_GB): its
+# logs, its database, a restore's staging files, the export. The testing
+# space keeps a reserve of its own for real work (app.core.testing_space, set
+# in the unit's testing settings, at least 1 GB). A testing capture is refused
+# while free space is below the larger of the two reserves (code
+# `testing_reserve`), so the testing account never uses space real work is
+# refused; a real capture while free space is below the storage reserve (code
+# `storage_reserve`). Each caller is checked against exactly one rule: the
+# testing account early, with its other refusals; every other caller last,
+# just before the camera is triggered or the file written
+# (app.api.cameras._refuse_a_real_capture_below_the_storage_reserve, and the
+# image upload in app.api.records).
+
+STORAGE_RESERVE = "storage_reserve"
+STORAGE_RESERVE_MESSAGE = (
+    "The unit's storage is nearly full, and the space left is kept for Captua's own work. Captures "
+    "are refused until space is freed on the unit."
+)
+BYTES_PER_GB = 10 ** 9
+
+
+def storage_reserve_bytes(settings=None) -> int:
+    """The storage reserve in bytes; 0 when none is kept."""
+    if settings is None:
+        from app.core.config import settings
+    return max(0, int(settings.STORAGE_RESERVE_GB)) * BYTES_PER_GB
+
+
+def refuse_below_storage_reserve(destination) -> None:
+    """HTTPException 507 `storage_reserve` when free space where the write goes is below the reserve.
+
+    `destination` is the path the capture or upload retained for its write
+    (the projects root it read, or the volume's folder under it); its file
+    system is measured, never the active root read again here, so a drive
+    activated after the destination was retained does not change the answer.
+
+    Free space that cannot be read refuses nothing: the refusal always
+    states a figure. An override root that is not usable is refused by the
+    writer that comes before this check (writable_projects_dir, 503 or the
+    capture's success false). A reserve of 0 refuses nothing and reads
+    nothing. The detail carries `free_gb` (rounded down to one decimal,
+    testing_space.free_gb) and `reserve_gb`; the message names no figure.
+    """
+    from fastapi import HTTPException
+    from app.core.config import settings
+    from app.core.testing_space import free_gb
+
+    reserve = storage_reserve_bytes(settings)
+    if reserve == 0:
+        return
+    import shutil
+
+    try:
+        free = shutil.disk_usage(destination).free
+    except OSError:
+        return
+    if free >= reserve:
+        return
+    raise HTTPException(status_code=507, detail={
+        "code": STORAGE_RESERVE, "message": STORAGE_RESERVE_MESSAGE,
+        "free_gb": free_gb(free, read=False), "reserve_gb": int(settings.STORAGE_RESERVE_GB),
+    })

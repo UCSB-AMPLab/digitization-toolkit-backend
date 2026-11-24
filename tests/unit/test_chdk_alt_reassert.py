@@ -9,7 +9,7 @@ lens out and answered nothing until its battery was taken out. So a capture
 sends enter_alt() every time, and a preview sends it at most every
 _ALT_REASSERT_INTERVAL_S seconds.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest

@@ -9,7 +9,7 @@ The host a unit asks is fisqua_pairing_http.pairing_target. After a link
 the unit does not change its mode: nothing here or in the apply step
 switches it, and the card offers the existing switch (PUT /system/unit).
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

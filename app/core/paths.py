@@ -6,7 +6,7 @@ point inside the application's storage roots. A database row that points
 elsewhere (e.g. /etc/passwd, ~/.ssh/id_rsa, the project .env) must never be
 served, unlinked, or otherwise acted upon.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import os
@@ -40,7 +40,7 @@ PREVIEW_SIDECAR_SUFFIX = "_preview.jpg"
 RAW_SIDECAR_SUFFIX = ".raw"
 
 # A volume with a file name stem keeps its files in `<projects root>/<stem>/`,
-# in these four directories (capture.project_manager.volume_root). A volume
+# in these four directories, and its colour card shots in CALIBRATION_DIR (capture.project_manager.volume_root). A volume
 # without one keeps the name-based layout, `<project>/<name>/images/main/`,
 # with each sidecar beside its master and thumbnails in `images/thumbnails/`.
 CAPTURES_DIR = "captures"      # masters: CR2, or JPEG/TIFF
@@ -48,6 +48,10 @@ PREVIEWS_DIR = "previews"      # the `_preview.jpg` extracted from a RAW master
 THUMBNAILS_DIR = "thumbnails"
 METADATA_DIR = "metadata"      # the volume's manifest.jsonl
 VOLUME_SUBDIRS = (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR)
+# A volume's colour card shots (app.core.colour_card): `<stem>-cal_<nn>_c<n>.<ext>`
+# and, for a RAW master, its `_preview.jpg` beside it, never in previews/.
+# Created by the first shot, not with the four above; nothing else is kept in it.
+CALIBRATION_DIR = "calibration"
 
 # Directly under the projects root: the hard links the offsite upload copies
 # from (app.core.image_upload). Each is another name for an image already

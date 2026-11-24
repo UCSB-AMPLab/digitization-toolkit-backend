@@ -63,7 +63,25 @@ the only project when there is exactly one, else a project named
 `default`, created if there is none; the choice is stored and logged
 `default_project_set`. Nothing moves an existing volume.
 
-Version: 0.3.3
+**Language and capture key** (NEH-336). The unit's language
+(default_language, `es` until set) is read publicly through GET
+/auth/setup/status, and written by the registration that creates the first
+account (store_default_language, in that registration's transaction) and
+by an administrator (set_default_language), logged
+`unit_default_language_changed`. The capture key (capture_key, null for the
+frontend's built-in default) is one chord, validated by
+app.api.system.CaptureChord, written by an administrator or an operator
+(set_capture_key), logged `unit_capture_key_changed`. Both are in as_api.
+
+**Colour card shots** (NEH-340). Whether operators are asked for colour
+card shots (colour_card_shots, app.core.colour_card) is off on a unit that
+updates to the release that adds it, and turned on by the registration that
+creates the first account (store_colour_card_shots, in that registration's
+transaction), so a newly set-up unit asks. An administrator changes it
+(set_colour_card_shots); each change is logged
+`unit_colour_card_shots_changed`. In as_api as `colourCardShots`.
+
+Version: 0.3.0
 """
 
 from __future__ import annotations
@@ -268,6 +286,9 @@ def as_api(db: Session) -> dict:
         "prerequisites": prerequisites(),
         # NEH-320: the volumes Captua keeps on the unit, {id, name, files}.
         "keptVolumes": kept_volumes.kept_volumes(db),
+        "defaultLanguage": default_language(db),
+        "captureKey": capture_key(db),
+        "colourCardShots": colour_card_shots(db),
     }
 
 
@@ -557,6 +578,101 @@ def _resend_stored(db: Session, told: Optional[str], actor: Optional[str], trans
         logger.warning("%s", detail)
     audit.log_event(db, level="INFO" if ok else "WARN", category="system", action="unit_mode_resent",
                     actor=actor, detail=detail)
+
+
+# ---------------------------------------------------------------------------
+# The unit's language and capture key (NEH-336)
+# ---------------------------------------------------------------------------
+
+def default_language(db: Session) -> str:
+    """The unit's language, `es` or `en`; with no row yet, the default. Reads only."""
+    from app.models.unit_settings import DEFAULT_LANGUAGE
+
+    row = _row(db)
+    return row.default_language if row is not None and row.default_language else DEFAULT_LANGUAGE
+
+
+def capture_key(db: Session) -> Optional[dict]:
+    """The unit's capture chord, or None for the frontend's built-in default. Reads only."""
+    row = _row(db)
+    return row.capture_key if row is not None else None
+
+
+def lock_for_first_account(db: Session) -> None:
+    """Take the row FOR UPDATE (inserting it when missing) before the first account is counted again. Not committed.
+
+    app.api.auth.register holds it until the first account commits, so a
+    first registration in another process waits and then counts that
+    account. The caller holds no uncommitted change (_ensure_row).
+    """
+    _ensure_row(db)
+
+
+def store_default_language(db: Session, language: str, actor: Optional[str]) -> None:
+    """Write the unit's language to the row lock_for_first_account holds; committed with the caller's change."""
+    from app.models.unit_settings import LANGUAGES
+
+    if language not in LANGUAGES:
+        raise ValueError(f"unknown language {language!r}")
+    row = _row(db, lock=True)
+    if row.default_language == language:
+        return
+    _log_in_session(db, "unit_default_language_changed", f"{row.default_language} -> {language}", actor=actor)
+    row.default_language = language
+    row.updated_at = _now()
+    row.updated_by = actor
+
+
+def set_default_language(db: Session, language: str, actor: str) -> None:
+    """An administrator's change of the unit's language; commits."""
+    _ensure_row(db)
+    store_default_language(db, language, actor)
+    db.commit()
+
+
+def set_capture_key(db: Session, chord: Optional[dict], actor: str) -> None:
+    """Store the unit's capture chord (None for the built-in default); commits, logged when it changes.
+
+    `chord` has been validated (app.api.system.CaptureChord).
+    """
+    row = _ensure_row(db)
+    if row.capture_key == chord:
+        db.commit()
+        return
+    _log_in_session(db, "unit_capture_key_changed",
+                    "built-in default" if chord is None else f"set to {chord}", actor=actor)
+    row.capture_key = chord
+    row.updated_at = _now()
+    row.updated_by = actor
+    db.commit()
+
+
+# ---------------------------------------------------------------------------
+# Colour card shots (NEH-340, app.core.colour_card)
+# ---------------------------------------------------------------------------
+
+def colour_card_shots(db: Session) -> bool:
+    """Whether operators are asked for colour card shots; False with no row yet. Reads only."""
+    row = _row(db)
+    return bool(row.colour_card_shots) if row is not None else False
+
+
+def store_colour_card_shots(db: Session, on: bool, actor: Optional[str]) -> None:
+    """Write the setting to the row the caller holds FOR UPDATE; committed with the caller's change, logged when it changes."""
+    row = _row(db, lock=True)
+    if bool(row.colour_card_shots) == bool(on):
+        return
+    _log_in_session(db, "unit_colour_card_shots_changed", "on" if on else "off", actor=actor)
+    row.colour_card_shots = bool(on)
+    row.updated_at = _now()
+    row.updated_by = actor
+
+
+def set_colour_card_shots(db: Session, on: bool, actor: str) -> None:
+    """An administrator's change of the setting; commits."""
+    _ensure_row(db)
+    store_colour_card_shots(db, on, actor)
+    db.commit()
 
 
 # ---------------------------------------------------------------------------

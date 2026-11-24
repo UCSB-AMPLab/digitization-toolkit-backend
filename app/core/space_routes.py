@@ -31,7 +31,7 @@ tests/unit/test_testing_space_access.py walks the application's routes and
 fails when a route has no entry, an entry has no route, or a path, query
 or body field named like material is not declared as a target.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations
@@ -157,6 +157,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/cameras/capture/dual"): Entry(testing=True, targets=(
         _b("project_name", PROJECT_NAME), _b("record_id", RECORD), _b("collection_id", COLLECTION),
         _b("after_record_id", RECORD))),
+    # The answer is the stored capture's only when its record is in the caller's space; 404 otherwise.
+    ("GET", "/cameras/capture-requests/{client_capture_id}"): Entry(testing=True),
     ("POST", "/cameras/calibrate"): Entry(),
     ("POST", "/cameras/calibrate/white-balance"): Entry(),
     ("POST", "/cameras/calibrate/white-balance/manual"): Entry(),
@@ -203,6 +205,19 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/collections/{collection_id}/offsite/restore"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/offsite/jobs/{job_id}"): Entry(targets=(_COL,)),
     ("GET", "/collections/{collection_id}/capture-manifest"): Entry(targets=(_COL,)),
+    # Colour card shots (app.core.colour_card): a testing volume answers as not enabled.
+    ("GET", "/collections/{collection_id}/colour-card"): Entry(testing=True, admin_reads_testing=True,
+                                                               targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets"): Entry(testing=True, admin_reads_testing=True,
+                                                                     targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/shots"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/complete"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
+    ("POST", "/collections/{collection_id}/colour-card/skip"): Entry(testing=True, admin_reads_testing=True,
+                                                                     targets=(_COL,)),
+    ("GET", "/collections/{collection_id}/colour-card/shots/{shot_id}/preview"): Entry(
+        testing=True, admin_reads_testing=True, targets=(_COL,)),
     ("GET", "/collections/{collection_id}/hierarchy"): Entry(testing=True, admin_reads_testing=True,
                                                             targets=(_COL,)),
     ("PATCH", "/collections/{collection_id}"): Entry(testing=True, targets=(
@@ -249,8 +264,14 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/auth/users/{user_id}"): Entry(),
     ("PATCH", "/auth/users/{user_id}/role"): Entry(),
     ("PATCH", "/auth/users/{user_id}/active"): Entry(),
+    # An administrator gives another user a new password. The testing
+    # account's is set through /system/testing only, and a user id names
+    # no material.
+    ("PUT", "/auth/users/{user_id}/password"): Entry(),
     ("DELETE", "/auth/users/{user_id}"): Entry(),
     ("GET", "/users/me"): Entry(testing=True),
+    # The user's own language: a personal preference that names no material.
+    ("PUT", "/users/me/language"): Entry(testing=True),
 
     # The unit.
     ("GET", "/system/logs"): Entry(),
@@ -259,6 +280,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/system/catalogue-backup"): Entry(),
     ("GET", "/system/unit"): Entry(testing=True),
     ("PUT", "/system/unit"): Entry(),
+    # Admin and operator; not the testing account.
+    ("PUT", "/system/unit/capture-key"): Entry(),
     ("GET", "/system/testing"): Entry(),
     ("PUT", "/system/testing"): Entry(),
     ("PATCH", "/system/testing/account"): Entry(),
@@ -272,12 +295,17 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("POST", "/system/pairing/renew"): Entry(),
     ("DELETE", "/system/pairing"): Entry(),
     ("GET", "/system/storage"): Entry(),
+    # The real volumes that can be freed; the handler leaves testing volumes out.
+    ("GET", "/system/storage/freeable"): Entry(),
     ("GET", "/system/storage/devices"): Entry(),
     ("POST", "/system/storage/mount"): Entry(),
     ("DELETE", "/system/storage/mount"): Entry(),
     ("POST", "/system/storage/activate"): Entry(),
     ("DELETE", "/system/storage/activate"): Entry(),
     ("POST", "/system/power"): Entry(testing=True),
+    ("GET", "/system/camera-kind"): Entry(testing=True),
+    ("PUT", "/system/camera-kind"): Entry(),
+    ("DELETE", "/system/camera-kind"): Entry(),
 
     # Activity totals.
     ("GET", "/activity/collections"): Entry(lists="Collection", targets=(_q("project_id", PROJECT),)),

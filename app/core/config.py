@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 import logging
 import os
@@ -102,7 +102,14 @@ class Settings(BaseSettings):
     LOG_LEVEL: str = Field(default="INFO", validation_alias=_names("LOG_LEVEL"))
     
     PROJECTS_ROOT: str = ""
-    CAMERA_BACKEND: str = "picamera2"
+    # The camera driver: picamera2, subprocess, gphoto2 or chdk. Unset: the
+    # unit detects the kind of the cameras connected at start-up
+    # (app.core.camera_kind), and an administrator's stored choice wins over
+    # either.
+    CAMERA_BACKEND: Optional[str] = None
+    # Where the administrator's camera kind and the kind last used are kept
+    # (app.core.camera_kind). Empty: camera-kind.json in DATA_DIR.
+    CAMERA_KIND_FILE: str = Field(default="", validation_alias=_names("CAMERA_KIND_FILE"))
     SECRET_KEY: str = "dev-secret-change-me"
     # Per-unit token protecting first-user admin bootstrap over the network
     BOOTSTRAP_TOKEN: str = ""
@@ -112,6 +119,11 @@ class Settings(BaseSettings):
     EXPORTS_ROOT: str = Field(default="", validation_alias=_names("EXPORTS_DIR"))
     # Application-level cap on uploaded image size. Defends the SD even if nginx (client_max_body_size 100m) is not in front of the app. Enforced while streaming.
     MAX_UPLOAD_BYTES: int = Field(default=100 * 1024 * 1024, validation_alias=_names("MAX_UPLOAD_BYTES"))
+    # Free space, in GB of 10^9 bytes, that Captua keeps for its own work on the
+    # file system that holds the active projects root
+    # (app.core.storage_override.refuse_below_storage_reserve). Below it, captures
+    # and image uploads of real work are refused. 0 keeps no reserve.
+    STORAGE_RESERVE_GB: int = Field(default=2, ge=0, validation_alias=_names("STORAGE_RESERVE_GB"))
 
     # Offsite catalogue backup (NEH-249). Empty OFFSITE_REMOTE disables the
     # whole path, so a unit without provisioned credentials does nothing rather
@@ -192,7 +204,7 @@ class Settings(BaseSettings):
     FISQUA_TIMEOUT_SECONDS: float = Field(default=60.0, validation_alias=_names("FISQUA_TIMEOUT"))
     # On: each image in a capture manifest carries `rotateDeg`, its recorded
     # rotate_deg (clockwise from the stored pixels, EXIF ignored). Off: no
-    # image carries it. The manifest declares contract 1.9 either way
+    # image carries it. The manifest declares contract 1.12 either way
     # (app.core.capture_manifest). Fisqua staging reads rotateDeg; production
     # does not yet, and drops a key it does not know, so this stays off for
     # production until Fisqua reads it there.

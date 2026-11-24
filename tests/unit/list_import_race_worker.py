@@ -3,7 +3,7 @@
 Usage: python list_import_race_worker.py <import|import_noflock> <sqlite file> <sha256>
 CAPTUA_DATA_DIR comes from the environment. Prints one RESULT line.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 import os
 import sys

@@ -8,7 +8,7 @@ Modelled on test_orientation_route.py: a fake backend stands in for the
 process singleton, and the registry is a real CameraRegistry on the client
 fixture's projects root.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import json

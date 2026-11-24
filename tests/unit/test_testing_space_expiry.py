@@ -20,7 +20,7 @@ purge takes its locks, and the statement it sends to PostgreSQL is read
 
     python -m pytest tests/unit/test_testing_space_expiry.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import os

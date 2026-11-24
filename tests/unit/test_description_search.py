@@ -7,7 +7,7 @@ configuration stop and the hold the 1.8 lookup uses
 
     python -m pytest tests/unit/test_description_search.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import httpx

@@ -11,7 +11,7 @@ recorded, for every captured image, as `rotate_deg`:
 * in each `files` entry of the capture record in the volume's manifest
   (old records simply lack it),
 * on RecordImage, and so in the API,
-* in each image of the BagIt export's metadata.json (schema_version 2).
+* in each image of the BagIt export's metadata.json (schema_version 2 and later).
 
 Run with: python -m pytest tests/unit/test_master_orientation.py
 
@@ -272,7 +272,7 @@ def test_old_manifest_lines_without_the_field_still_index(tmp_path):
 
 
 @pytest.mark.unit
-def test_metadata_json_carries_the_rotation_under_schema_version_2():
+def test_metadata_json_carries_the_rotation_from_schema_version_2_on():
     from app.core import export_service
 
     def image(i, rotate_deg):
@@ -288,7 +288,7 @@ def test_metadata_json_carries_the_rotation_under_schema_version_2():
 
     payload = export_service._metadata_payload(coll, None, [rec], "20261024T000000Z")
 
-    assert payload["schema_version"] == export_service.METADATA_SCHEMA_VERSION == 2
+    assert payload["schema_version"] == export_service.METADATA_SCHEMA_VERSION == 3
     assert [i["rotate_deg"] for i in payload["records"][0]["images"]] == [90, None], \
         "an image from before the field, or an upload, has null"
 

@@ -1,7 +1,9 @@
 # Version: 0.3.0
 
 import hmac
+import ipaddress
 import logging
+import threading
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Security, Query, Header, Request, Response
 from fastapi.security import HTTPAuthorizationCredentials, HTTPBearer
@@ -11,7 +13,8 @@ from typing import List, Optional
 
 from app.api.deps import get_db_dependency
 from app.models.user import User
-from app.schemas.user import UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset, PasswordResetRequest, TokenRefresh
+from app.schemas.user import (LanguageUpdate, UserCreate, UserLogin, UserRead, UserRoleUpdate, PasswordReset,
+                              PasswordResetRequest, PasswordSet, TokenRefresh)
 from app.core.security import hash_password, verify_password, create_access_token, verify_access_token, needs_rehash
 from app.core.config import settings, is_dev_env
 from app.core.login_throttle import login_throttle
@@ -60,8 +63,9 @@ _optional_bearer = HTTPBearer(auto_error=False)
 # current value (_token_is_current). Raising token_version ends every
 # session of that user. Logout raises it for every role but testing
 # (end_sessions), set_user_active when it deactivates a user, and
-# reset_password with the user's own new password, each in one UPDATE that
-# adds one in the database; app.core.testing_space raises the testing
+# reset_password with the user's own new password, set_user_password with
+# the new password an administrator gives another user, each in one UPDATE
+# that adds one in the database; app.core.testing_space raises the testing
 # account's when it deactivates it or gives it a new password.
 # ---------------------------------------------------------------------------
 
@@ -170,11 +174,87 @@ def _authorize_bootstrap(provided_token: Optional[str], config=settings) -> None
         raise HTTPException(status_code=401, detail="Invalid or missing bootstrap token")
 
 
+# ---------------------------------------------------------------------------
+# The first account from the unit itself (NEH-336)
+#
+# The first account may be created without the bootstrap token when the
+# request comes from the unit itself: the kiosk's browser, which asks the
+# backend at http://127.0.0.1:8000 directly. Such a request is local
+# (request_is_local) when all three hold:
+#
+# * its socket peer, the ASGI scope's `client`, is 127.0.0.1 or ::1;
+# * it carries no forwarding header (FORWARDING_HEADERS). uvicorn's
+#   ProxyHeadersMiddleware, on by default, replaces `client` with the
+#   address X-Forwarded-For names, but only for a peer in
+#   FORWARDED_ALLOW_IPS (127.0.0.1 unless set), and leaves the header in
+#   the request. So a request whose `client` was taken from a header still
+#   carries that header and is refused, whatever FORWARDED_ALLOW_IPS says;
+#   one without any such header has the socket peer in `client`. A proxy on
+#   the unit, which connects from loopback and names its client in a
+#   header, is not local either. nginx connects from the Docker bridge
+#   (172.30.0.0/24), never from loopback, and sets X-Real-IP and
+#   X-Forwarded-For.
+# * its Host header names a loopback host (LOOPBACK_HOSTS), so a page of
+#   another site whose name was made to resolve to 127.0.0.1 in the kiosk's
+#   browser is not local.
+#
+# A request from anywhere else needs the token as before; once an account
+# exists, local or not, only an administrator creates accounts.
+# ---------------------------------------------------------------------------
+
+LOOPBACK_PEERS = frozenset({ipaddress.ip_address("127.0.0.1"), ipaddress.ip_address("::1")})
+LOOPBACK_HOSTS = frozenset({"127.0.0.1", "localhost", "::1"})
+FORWARDING_HEADERS = ("forwarded", "x-forwarded-for", "x-real-ip", "x-forwarded-host", "x-forwarded-proto")
+
+# Held from the count of accounts to the commit of the first one, so two
+# first registrations in this process create one account: the second
+# counts the first and is answered as any registration once an account
+# exists. On SQLite this lock is the only guard: SQLite ignores FOR UPDATE,
+# and without the lock two registrations both count no account and both
+# create an administrator. On PostgreSQL the unit's settings row, taken FOR
+# UPDATE (app.core.unit_mode.lock_for_first_account) before the second
+# count, is the guard across processes as well. The backend runs as one
+# process.
+_first_account_lock = threading.Lock()
+
+
+def _host_name(host_header: str) -> str:
+    """The host of a Host header without its port, lower case: `[::1]:8000` gives `::1`."""
+    host = host_header.strip().lower()
+    if host.startswith("["):
+        return host[1:].split("]", 1)[0]
+    return host.rsplit(":", 1)[0] if host.count(":") == 1 else host
+
+
+def request_is_local(request: Request) -> bool:
+    """Whether the request comes from the unit itself: a loopback peer, no forwarding header, a loopback host."""
+    client = request.scope.get("client")
+    if not client:
+        return False
+    try:
+        peer = ipaddress.ip_address(client[0])
+    except ValueError:
+        return False
+    if peer not in LOOPBACK_PEERS:
+        return False
+    if any(name in request.headers for name in FORWARDING_HEADERS):
+        return False
+    return _host_name(request.headers.get("host", "")) in LOOPBACK_HOSTS
+
+
 @router.get("/setup/status")
-def setup_status(db: Session = Depends(get_db_dependency)):
-    """Check whether initial setup is needed (no users exist yet). No auth required."""
+def setup_status(request: Request, db: Session = Depends(get_db_dependency)):
+    """Whether the unit has no account yet, whether this request is local, and the unit's language. No auth.
+
+    `local` is request_is_local: true only for a request from the unit
+    itself to its loopback address, never through nginx. `default_language`
+    is the unit's (`es` until set), read without writing anything.
+    """
+    from app.core import unit_mode
+
     needs_setup = db.query(User).count() == 0
-    return {"needs_setup": needs_setup}
+    return {"needs_setup": needs_setup, "local": request_is_local(request),
+            "default_language": unit_mode.default_language(db)}
 
 
 @router.post("/register", response_model=UserRead)
@@ -186,12 +266,33 @@ def register(
     background_tasks: BackgroundTasks = None,
     db: Session = Depends(get_db_dependency),
 ):
+    """Create an account: the first one (an administrator) without a session, every later one by an administrator.
+
+    The first account needs the bootstrap token, unless the request is
+    local (request_is_local). With `default_language`, the first account
+    sets the unit's language and takes it as its own; on any later account
+    `default_language` is ignored, and the account starts with no language.
+    """
+    with _first_account_lock:
+        return _register(payload, request, credentials, bootstrap_token, background_tasks, db)
+
+
+def _register(payload, request, credentials, bootstrap_token, background_tasks, db):
+    from app.core import unit_mode
+
     is_first_user = db.query(User).count() == 0
 
     if is_first_user:
-        # Unauthenticated first-user bootstrap requires a local bootstrap token
-        _authorize_bootstrap(bootstrap_token)
-    else:
+        # Unauthenticated first-user bootstrap requires a local bootstrap
+        # token, or a request from the unit itself.
+        if not request_is_local(request):
+            _authorize_bootstrap(bootstrap_token)
+        unit_mode.lock_for_first_account(db)
+        if db.query(User).count() != 0:
+            # Another process created the first account meanwhile.
+            db.rollback()
+            is_first_user = False
+    if not is_first_user:
         # After bootstrap, only admins may create accounts.
         raw_token, _ = _session_token(request, credentials)
         if not raw_token:
@@ -226,8 +327,14 @@ def register(
         email=payload.email,
         hashed_password=hash_password(payload.password),
         role=role,
+        language=payload.default_language if is_first_user else None,
     )
     db.add(user)
+    if is_first_user and payload.default_language is not None:
+        unit_mode.store_default_language(db, payload.default_language, actor=payload.username)
+    if is_first_user:
+        # A newly set-up unit asks for colour card shots (NEH-340).
+        unit_mode.store_colour_card_shots(db, True, actor=payload.username)
     db.commit()
     db.refresh(user)
     actor = caller.username if not is_first_user else "bootstrap"
@@ -270,19 +377,29 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
+THROTTLED_DETAIL = "Too many failed login attempts. Try again later."
+
+
+def _throttle_keys(username: str, request: Request) -> tuple[str, str]:
+    """The login throttle's keys for an account and the request's client: `user:<username>` and `ip:<address>`."""
+    return f"user:{username.strip().lower()}", f"ip:{_client_ip(request)}"
+
+
+def _throttled(retry: int) -> HTTPException:
+    """The 429 a throttled account or client is answered with, as POST /auth/login answers it."""
+    return HTTPException(status_code=429, detail=THROTTLED_DETAIL, headers={"Retry-After": str(retry)})
+
+
 @router.post("/login")
 def login(payload: UserLogin, request: Request, response: Response, db: Session = Depends(get_db_dependency)):
     # Throttle brute force per account and per client IP on the untrusted LAN.
-    ip = _client_ip(request)
-    acct_key = f"user:{payload.username.strip().lower()}"
-    ip_key = f"ip:{ip}"
+    acct_key, ip_key = _throttle_keys(payload.username, request)
 
     retry = login_throttle.retry_after(acct_key, ip_key)
     if retry > 0:
         log_event(db, level="WARN", category="access", action="login_throttled",
                   actor=payload.username, detail=f"locked; retry after {retry}s")
-        raise HTTPException(status_code=429, detail="Too many failed login attempts. Try again later.",
-                            headers={"Retry-After": str(retry)})
+        raise _throttled(retry)
 
     def refuse_credentials():
         login_throttle.record_failure(acct_key, ip_key)
@@ -434,17 +551,35 @@ def reset_password(
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     _refuse_testing_account(user, status=403)
 
+    # The current password counts against the login throttle as a sign-in
+    # does: while the account or the client is locked the route answers as
+    # POST /auth/login does without checking it, a wrong one is recorded
+    # against the same keys, and a change that is written clears them.
+    acct_key, ip_key = _throttle_keys(user.username, request)
+    retry = login_throttle.retry_after(acct_key, ip_key)
+    if retry > 0:
+        raise _throttled(retry)
     if not verify_password(payload.old_password, user.hashed_password):
+        login_throttle.record_failure(acct_key, ip_key)
         raise HTTPException(status_code=401, detail="Old password incorrect")
 
-    # The new password and the raise of token_version in one UPDATE: every
-    # session of the user ends, the one that sent this request included.
-    (db.query(User)
-       .filter(User.id == user.id)
-       .update({User.hashed_password: hash_password(payload.new_password),
-                User.token_version: User.token_version + 1},
-               synchronize_session=False))
+    # The new password and the raise of token_version in one UPDATE, so every
+    # session of the user ends, the one that sent this request included. It
+    # is written only under the session generation this request's token was
+    # checked against: a raise committed since (an administrator's new
+    # password, a deactivation, a sign-out) ends this session too, and then
+    # no row changes, nothing is written and the request is answered as any
+    # ended session is, with nothing counted in the throttle.
+    written = (db.query(User)
+                 .filter(User.id == user.id, User.token_version == int(token_payload.get("ver", 0)))
+                 .update({User.hashed_password: hash_password(payload.new_password),
+                          User.token_version: User.token_version + 1},
+                         synchronize_session=False))
+    if written != 1:
+        db.rollback()
+        raise HTTPException(status_code=401, detail="Invalid or expired token")
     db.commit()
+    login_throttle.reset(acct_key, ip_key)
     return {"detail": "password updated successfully"}
 
 
@@ -549,6 +684,25 @@ def get_me(current_user: User = Depends(get_current_user)):
     return UserRead.model_validate(current_user)
 
 
+@users_router.put("/me/language", response_model=UserRead)
+def set_my_language(
+    payload: LanguageUpdate,
+    current_user: User = Depends(get_current_user),
+    db: Session = Depends(get_db_dependency),
+):
+    """Set the signed-in user's own language, `es` or `en`. Any role, the testing account included.
+
+    A personal preference: it names no material and changes nothing of
+    anyone else. Returns the GET /users/me body.
+    """
+    (db.query(User)
+       .filter(User.id == current_user.id)
+       .update({User.language: payload.language}, synchronize_session=False))
+    db.commit()
+    db.refresh(current_user)
+    return UserRead.model_validate(current_user)
+
+
 # ---------------------------------------------------------------------------
 # User management (admin only)
 # ---------------------------------------------------------------------------
@@ -636,6 +790,60 @@ def set_user_active(
     db.commit()
     db.refresh(user)
     _operators_changed(background_tasks)
+    return UserRead.model_validate(user)
+
+
+USER_NOT_FOUND = "user_not_found"
+USER_NOT_FOUND_MESSAGE = "No user has this id."
+USE_OWN_PASSWORD_CHANGE = "use_own_password_change"
+USE_OWN_PASSWORD_CHANGE_MESSAGE = (
+    "This is your own account. You change your own password with your current password."
+)
+
+
+@router.put("/users/{user_id}/password", response_model=UserRead)
+def set_user_password(
+    user_id: int,
+    payload: PasswordSet,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Give another user a new password. Admin only; ends every session of that user.
+
+    The new password is held to the rule POST /auth/register holds a
+    password to (app.schemas.user.check_new_password, on PasswordSet as on
+    UserCreate) and hashed with hash_password. The hash and the raise of the user's token_version
+    are one UPDATE, so every token issued to them before is refused; no
+    other user's sessions change. Refused with {code, message} and nothing
+    written: 404 `user_not_found`; the testing account, 409 `testing_account`
+    (its password is set through /system/testing only); the administrator's
+    own account, 409 `use_own_password_change`: an administrator changes
+    their own password through POST /auth/password-reset, which needs the
+    current password.
+    An administrator may set another administrator's password. Logs
+    `user_password_set` with the administrator as actor and the user as
+    subject; neither the password nor its hash is returned or logged.
+    """
+    user = db.query(User).filter(User.id == user_id).first()
+    if not user:
+        raise HTTPException(status_code=404, detail={"code": USER_NOT_FOUND, "message": USER_NOT_FOUND_MESSAGE})
+    _refuse_testing_account(user)
+    if user.id == current_user.id:
+        raise HTTPException(status_code=409, detail={"code": USE_OWN_PASSWORD_CHANGE,
+                                                     "message": USE_OWN_PASSWORD_CHANGE_MESSAGE})
+    # Unconditional on the target's current hash and session generation: an
+    # administrator overrides whatever the user's password was, and a user's
+    # own change in flight is then refused by its own guarded UPDATE
+    # (reset_password).
+    (db.query(User)
+       .filter(User.id == user.id)
+       .update({User.hashed_password: hash_password(payload.new_password),
+                User.token_version: User.token_version + 1},
+               synchronize_session=False))
+    db.commit()
+    db.refresh(user)
+    log_event(db, level="INFO", category="access", action="user_password_set",
+              actor=current_user.username, subject=user.username)
     return UserRead.model_validate(user)
 
 

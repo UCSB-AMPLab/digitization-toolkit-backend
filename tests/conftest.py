@@ -1,7 +1,7 @@
 """
 Pytest configuration and fixtures for the Captua backend tests.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import os
@@ -280,14 +280,16 @@ def db_session(override_projects_root):
     # Import all models so their tables are registered on Base.metadata
     from app.models import (  # noqa: F401
         user, project, project_member, collection, record, camera, system_log,
-        offsite_object, fisqua, unit_settings,
+        offsite_object, fisqua, unit_settings, capture_request, colour_card,
     )
     
     temp_db = tempfile.NamedTemporaryFile(suffix=".db", delete=False)
     temp_db.close()  # release the handle; SQLite reopens the file by name
     test_db_url = f"sqlite:///{temp_db.name}"
     
-    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False})
+    # Parameters hidden, as app.core.db's engine hides them.
+    test_engine = create_engine(test_db_url, connect_args={"check_same_thread": False},
+                                hide_parameters=True)
     
     Base.metadata.create_all(test_engine)
     
@@ -368,15 +370,18 @@ def test_project(db_session, test_user):
 @pytest.fixture(autouse=True)
 def _clean_process_state():
     """Every test starts and ends with no unit work counted, no restart pending, no offsite block,
-    a clear restart latch and no shutdown begun: these are process-wide (app.core.unit_activity,
-    app.core.restart_latch), so one test's leftovers would otherwise reach the next."""
-    from app.core import restart_latch, unit_activity
+    a clear restart latch, no shutdown begun and no capture id in flight or closed: these are
+    process-wide (app.core.unit_activity, app.core.restart_latch, app.core.capture_requests), so
+    one test's leftovers would otherwise reach the next."""
+    from app.core import capture_requests, restart_latch, unit_activity
 
     unit_activity._reset_for_tests()
     restart_latch._reset_for_tests()
+    capture_requests._reset_for_tests()
     yield
     unit_activity._reset_for_tests()
     restart_latch._reset_for_tests()
+    capture_requests._reset_for_tests()
 
 
 @pytest.fixture(autouse=True)
@@ -425,3 +430,38 @@ def _no_real_chdk_keepalive_thread(request, monkeypatch):
     import capture.backends.chdk_backend as chdk_backend
 
     monkeypatch.setattr(chdk_backend, "_start_thread", _UnstartedThread)
+
+
+@pytest.fixture(autouse=True)
+def _camera_kind_isolated(monkeypatch, tmp_path_factory):
+    """No test reads or writes the unit's camera-kind store, or probes real hardware for cameras.
+
+    The store (app.core.camera_kind) is a file of this test's own, made
+    only when written; both detection probes find nothing unless a test
+    stubs them; and CAMERA_BACKEND is put back after the test on both live
+    settings objects, since the lifespan writes the kind it resolves there.
+    """
+    from app.core import camera_kind, config
+    from capture import service as capture_service
+
+    path = tmp_path_factory.mktemp("camera-kind") / "camera-kind.json"
+    monkeypatch.setattr(camera_kind, "store_path", lambda: path)
+    monkeypatch.setattr(camera_kind, "_libcamera_count", lambda: 0)
+    monkeypatch.setattr(camera_kind, "_canon_product_ids", lambda: [])
+    monkeypatch.setattr(camera_kind, "_in_effect", None)
+    monkeypatch.setattr(camera_kind, "_probe_failures", {}, raising=False)
+    monkeypatch.setattr(camera_kind, "_built_recorded", False, raising=False)
+    monkeypatch.setattr(camera_kind, "_applied_choice", None, raising=False)
+    monkeypatch.setattr(camera_kind, "_availability",
+                        lambda: {"picamera2": True, "gphoto2": True, "chdk": True}, raising=False)
+    monkeypatch.setattr(camera_kind, "_rpicam_available", lambda: True, raising=False)
+    for settings in {id(config.settings): config.settings, id(capture_service.settings): capture_service.settings}.values():
+        monkeypatch.setattr(settings, "CAMERA_BACKEND", settings.CAMERA_BACKEND)
+
+
+@pytest.fixture(autouse=True)
+def _gphoto2_init_backoff_isolated(monkeypatch):
+    """Each test owns its process-wide failed-init back-off state."""
+    from capture.backends import gphoto2_backend
+
+    monkeypatch.setattr(gphoto2_backend, "_init_backoff", {})

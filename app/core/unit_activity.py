@@ -39,7 +39,7 @@ Retry-After, on the camera routes and the offsite job routes alike.
 One backend process, as for the schedulers: nothing here is shared
 between processes.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import threading
@@ -131,6 +131,21 @@ def reserve_restart() -> bool:
             return False
         _restart_until = _clock() + RESTART_RESERVATION_SECONDS
         return True
+
+
+@contextmanager
+def no_restart_reserved() -> Iterator[None]:
+    """Hold the lock reservations are taken under, for the block; Refused if a restart is reserved.
+
+    Nothing can reserve a restart while the block runs, so a write made in
+    it cannot land during a reserved restart. The lock is re-entrant: the
+    block may call reserve_restart, release_restart and in_progress.
+    Keep the block short; camera work waits on the same lock to start and end.
+    """
+    with _lock:
+        if _pending_locked():
+            raise Refused()
+        yield
 
 
 def release_restart() -> None:

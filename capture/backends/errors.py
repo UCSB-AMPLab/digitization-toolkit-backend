@@ -14,7 +14,7 @@ and 404 for CameraNotConnectedError and every other RuntimeError.
 Backends may re-export from here for the sake of existing imports, but must
 not define their own copy.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 

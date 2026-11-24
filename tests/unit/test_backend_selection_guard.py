@@ -18,7 +18,7 @@ these tests run in CI whatever their names say.
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

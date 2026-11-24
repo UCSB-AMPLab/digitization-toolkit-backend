@@ -12,7 +12,7 @@ logged), and a different file under the id is refused as before. A corrected
 file under the same id then imports. A hash recorded by an earlier import is
 never removed; one that cannot be removed is logged with its path.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

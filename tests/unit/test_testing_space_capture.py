@@ -22,7 +22,7 @@ E. The whole story, from switching the space on to the zip, and what the
 
     python -m pytest tests/unit/test_testing_space_capture.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json

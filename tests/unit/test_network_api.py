@@ -6,7 +6,7 @@ thread body runs synchronously in the request.
 
     python -m pytest tests/unit/test_network_api.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest
@@ -411,11 +411,11 @@ def test_query_and_path_422s_carry_no_submitted_value(api):
 
 
 @pytest.mark.unit
-def test_other_routers_keep_the_default_422(client):
-    """The sanitising is scoped to /network: elsewhere FastAPI's body stands."""
+def test_other_routers_answer_the_same_plain_422(client):
+    """Every router answers a validation error without echoing the request (app.main)."""
     resp = client.post("/auth/login", json={"username": 5})
     assert resp.status_code == 422
-    assert any("input" in e for e in resp.json()["detail"])
+    assert all(set(e) == {"type", "loc", "msg"} for e in resp.json()["detail"])
 
 
 # ---------------------------------------------------------------------------

@@ -11,7 +11,7 @@ Opt-in, as tests/integration/test_pg_lock_order.py: skipped unless
 DATABASE_HOST is set and DATABASE_* reach a PostgreSQL server; the tables
 are created in a schema of their own, dropped afterwards.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import os
 import threading

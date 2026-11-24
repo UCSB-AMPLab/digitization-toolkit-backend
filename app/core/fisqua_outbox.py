@@ -99,7 +99,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import hashlib
@@ -953,6 +953,12 @@ def _promote(db: Session, row, result: _Run) -> None:
         with export_jobs.hold_for_reading([collection.id]):
             doc = capture_manifest.build_capture_manifest(db, collection, new_id=lambda: manifest_uuid)
     except FilesChanging:
+        db.rollback()
+        result.waiting += 1
+        return
+    except capture_manifest.CalibrationWaiting:
+        # Its colour card shots are still being uploaded: the evaluation that
+        # builds the manifest is the one that holds it (colour_card.evaluate).
         db.rollback()
         result.waiting += 1
         return

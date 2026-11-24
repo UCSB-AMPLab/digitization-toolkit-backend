@@ -19,7 +19,7 @@ USB, so the backend sends one script at a time under the body's lock and
 sends nothing more to a body in the same operation after a timeout or an
 error.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

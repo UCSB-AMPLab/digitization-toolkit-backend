@@ -5,7 +5,7 @@ The file is named as a single capture is, `<stem>-img_<nnnn>_c0.<ext>`
 Any other upload is refused with 409, on the same terms as a capture, before
 anything is written.
 
-Version: 0.2.1
+Version: 0.3.0
 """
 
 import io

@@ -13,7 +13,7 @@ None of them raises, and none of them talks to the device: pyusb reads the
 bus and the ports from its own enumeration record, and sysfs is a directory
 listing.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import os

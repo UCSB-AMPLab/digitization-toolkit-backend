@@ -1,6 +1,6 @@
 """In-process registry of background export jobs for the single-process appliance
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging

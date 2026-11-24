@@ -129,7 +129,7 @@ no other row lock in that transaction (its process-wide _queue_lock is a
 thread lock, not a row lock, and the settings row is not taken there), so
 it closes no cycle either.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from __future__ import annotations
@@ -220,7 +220,8 @@ def kept_volumes(db: Session) -> list:
     """Every kept volume but the testing ones as {id, name, files}, in id order; `files` is the count Captua would copy offsite.
 
     Files are counted as image_upload._object_counts counts a volume's
-    objects; a volume with no stem has none. Testing volumes are kept for
+    objects, with its taken colour card shots and their previews
+    (colour_card.uploadable_counts); a volume with no stem has none. Testing volumes are kept for
     good and are not listed.
     """
     from app.core.image_upload import _object_counts
@@ -231,8 +232,13 @@ def kept_volumes(db: Session) -> list:
             .order_by(Collection.id).all())
     if not rows:
         return []
+    from app.core.colour_card import uploadable_counts
+
     counts = _object_counts(db, [cid for cid, _ in rows])
-    return [{"id": cid, "name": name, "files": counts.get(cid, {}).get("total", 0)} for cid, name in rows]
+    # Its taken colour card shots are copied too once it is released.
+    shots = uploadable_counts(db, [cid for cid, _ in rows])
+    return [{"id": cid, "name": name, "files": counts.get(cid, {}).get("total", 0) + shots.get(cid, 0)}
+            for cid, name in rows]
 
 
 def _lock(db: Session, collection_id: int, *, share: bool = False):
@@ -329,7 +335,19 @@ def _has_left_unit(db: Session, collection) -> bool:
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
+
     collection_id = collection.id
+    # A colour card shot's object counts as a page's does; a row that only
+    # records skips (no local_sha1: its bytes were never read) does not.
+    shot_copied = (db.query(ColourCardObject.id)
+                   .join(ColourCardShot, ColourCardObject.shot_id == ColourCardShot.id)
+                   .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id)
+                   .filter(ColourCardSet.collection_id == collection_id, ColourCardObject.refused_at.is_(None),
+                           ColourCardObject.local_sha1.isnot(None))
+                   .first())
+    if shot_copied is not None:
+        return True
     copied = (db.query(OffsiteObject.id)
               .join(RecordImage, or_(OffsiteObject.record_image_id == RecordImage.id,
                                      OffsiteObject.retired_image_id == RecordImage.id))
@@ -346,6 +364,13 @@ def _has_left_unit(db: Session, collection) -> bool:
                           func.substr(OffsiteObject.object_key, 1, len(prefix)) == prefix)
                   .first())
         if orphan is not None:
+            return True
+        orphan_shot = (db.query(ColourCardObject.id)
+                       .filter(ColourCardObject.shot_id.is_(None), ColourCardObject.refused_at.is_(None),
+                               ColourCardObject.local_sha1.isnot(None),
+                               func.substr(ColourCardObject.object_key, 1, len(prefix)) == prefix)
+                       .first())
+        if orphan_shot is not None:
             return True
     sent = (db.query(FisquaOutbox.id)
             .filter(FisquaOutbox.collection_id == collection_id, FisquaOutbox.state.notin_(_NOT_SENT))

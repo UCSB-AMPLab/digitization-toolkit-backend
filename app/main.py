@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -20,6 +20,7 @@ from app.api.records import router as records_router
 from app.api.cameras import router as cameras_router
 from app.api.projects import router as projects_router
 from app.api.collections import router as collections_router
+from app.api.colour_card import router as colour_card_router
 from app.api.auth import router as auth_router, users_router
 from app.api.system import router as system_router
 from app.api.activity import router as activity_router
@@ -86,7 +87,12 @@ async def lifespan(app: FastAPI):
     # Imported inside the lifespan, as shutdown_backend is, so importing the
     # application does not pull in the capture stack.
     from capture.service import assert_camera_backend_configured
+    # Which kind of camera the unit drives: the administrator's stored
+    # choice, an explicit CAMERA_BACKEND, detection, or the kind last used
+    # (app.core.camera_kind), written where the guard and the drivers read it.
+    from app.core import camera_kind
 
+    camera_kind.apply_at_startup()
     camera_backend = assert_camera_backend_configured()
     # Finish or discard any project rename interrupted by a crash/power loss before serving requests
     from app.core.db import SessionLocal
@@ -197,6 +203,13 @@ app.add_middleware(
     allow_headers=["Authorization", "Content-Type", "X-Bootstrap-Token", "X-Requested-With"],
     expose_headers=["X-Capture-Seconds", "X-Capture-Bytes", "X-Focal-Length", "X-Page-Layout", "Retry-After"],
 )
+# The kiosk's first-run page, at http://localhost, asks the backend's
+# loopback address for GET /auth/setup/status and POST /auth/register, and
+# nothing else, without credentials (app.core.first_run_cors). Added after
+# CORSMiddleware so it runs before it.
+from app.core.first_run_cors import FirstRunCORSMiddleware
+
+app.add_middleware(FirstRunCORSMiddleware, configured_origins=settings.CORS_ORIGINS)
 
 # Every router runs the testing space's access rule (app.api.space), so a
 # route added to any of them later runs it too.
@@ -205,6 +218,7 @@ app.include_router(records_router, prefix="/records", tags=["records"], dependen
 app.include_router(cameras_router, prefix="/cameras", tags=["cameras"], dependencies=_SPACE)
 app.include_router(projects_router, prefix="/projects", tags=["projects"], dependencies=_SPACE)
 app.include_router(collections_router, prefix="/collections", tags=["collections"], dependencies=_SPACE)
+app.include_router(colour_card_router, prefix="/collections", tags=["colour-card"], dependencies=_SPACE)
 app.include_router(auth_router, prefix="/auth", tags=["auth"], dependencies=_SPACE)
 app.include_router(users_router, prefix="/users", tags=["users"], dependencies=_SPACE)
 app.include_router(system_router, prefix="/system", tags=["system"], dependencies=_SPACE)
@@ -250,6 +264,28 @@ async def reference_code_differs_from_stem(request: Request, exc: ReferenceCodeD
 
 
 from app.models.project import TestingSpaceError
+from app.schemas.user import PasswordRefused
+from fastapi.exceptions import RequestValidationError
+from app.core.validation_errors import plain_errors
+
+
+@app.exception_handler(RequestValidationError)
+async def validation_refused(request: Request, exc: RequestValidationError):
+    """Every router's 422 (app.core.validation_errors.plain_errors).
+
+    Errors raised at the request-validation boundary carry `type`, `loc` and
+    `msg` and no submitted value. A route's own HTTPException message may
+    name a non-credential parameter it refused (for example an unknown time
+    zone or a resolution). No credential, hash or token is ever placed in a
+    response or a log line.
+    """
+    return JSONResponse(status_code=422, content={"detail": plain_errors(exc.errors())})
+
+
+@app.exception_handler(PasswordRefused)
+async def password_refused(request: Request, exc: PasswordRefused):
+    """A new password the rule refuses (app.schemas.user.check_new_password): 422 with its code, never the password."""
+    return JSONResponse(status_code=422, content={"detail": exc.detail()})
 
 
 @app.exception_handler(TestingSpaceError)

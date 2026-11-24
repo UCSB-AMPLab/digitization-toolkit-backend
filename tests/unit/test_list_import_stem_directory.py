@@ -6,7 +6,7 @@ turns that refusal into a reject of that item with a fixed reason; the other
 items are still created. A list whose project name folds to an existing stem
 is refused whole, before any volume is written.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

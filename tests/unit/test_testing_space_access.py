@@ -25,7 +25,7 @@ G. The image file routes serve a testing image to the testing account and
 
     python -m pytest tests/unit/test_testing_space_access.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import ast
@@ -87,6 +87,7 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/cameras/test-capture/{camera_index}'): (('admin', 'operator'),),
     ('POST', '/cameras/capture'): (('admin', 'operator'),),
     ('POST', '/cameras/capture/dual'): (('admin', 'operator'),),
+    ('GET', '/cameras/capture-requests/{client_capture_id}'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate/white-balance'): (('admin', 'operator'),),
     ('POST', '/cameras/calibrate/white-balance/manual'): (('admin', 'operator'),),
@@ -118,11 +119,17 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/collections/{collection_id}/offsite'): (('admin', 'operator', 'reviewer'),),
     ('POST', '/collections/{collection_id}/release-from-unit'): (('admin',),),
     ('POST', '/collections/{collection_id}/keep-on-unit'): (('admin',),),
-    ('GET', '/collections/{collection_id}/offsite/free'): (('admin',),),
-    ('POST', '/collections/{collection_id}/offsite/free'): (('admin',),),
+    ('GET', '/collections/{collection_id}/offsite/free'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/offsite/free'): (('admin', 'operator'),),
     ('POST', '/collections/{collection_id}/offsite/restore'): (('admin',),),
-    ('GET', '/collections/{collection_id}/offsite/jobs/{job_id}'): (('admin',),),
+    ('GET', '/collections/{collection_id}/offsite/jobs/{job_id}'): (('admin', 'operator'),),
     ('GET', '/collections/{collection_id}/capture-manifest'): (('admin', 'operator'),),
+    ('GET', '/collections/{collection_id}/colour-card'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets/{set_id}/shots'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/sets/{set_id}/complete'): (('admin', 'operator'),),
+    ('POST', '/collections/{collection_id}/colour-card/skip'): (('admin', 'operator'),),
+    ('GET', '/collections/{collection_id}/colour-card/shots/{shot_id}/preview'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/collections/{collection_id}/hierarchy'): (('admin', 'operator', 'reviewer'),),
     ('PATCH', '/collections/{collection_id}'): (('admin', 'operator'),),
     ('POST', '/collections/{collection_id}/move-records'): (('admin', 'operator'),),
@@ -150,14 +157,17 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/auth/users/{user_id}'): (('admin',),),
     ('PATCH', '/auth/users/{user_id}/role'): (('admin',),),
     ('PATCH', '/auth/users/{user_id}/active'): (('admin',),),
+    ('PUT', '/auth/users/{user_id}/password'): (('admin',),),
     ('DELETE', '/auth/users/{user_id}'): (('admin',),),
     ('GET', '/users/me'): (),
+    ('PUT', '/users/me/language'): (),
     ('GET', '/system/logs'): (('admin',),),
     ('GET', '/system/integrity'): (('admin',),),
     ('GET', '/system/temperature'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/system/catalogue-backup'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/system/unit'): (('admin', 'operator', 'reviewer'),),
     ('PUT', '/system/unit'): (('admin',),),
+    ('PUT', '/system/unit/capture-key'): (('admin', 'operator'),),
     ('GET', '/system/testing'): (('admin',),),
     ('PUT', '/system/testing'): (('admin',),),
     ('PATCH', '/system/testing/account'): (('admin',),),
@@ -169,12 +179,16 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/system/pairing/renew'): (('admin',),),
     ('DELETE', '/system/pairing'): (('admin',),),
     ('GET', '/system/storage'): (('admin', 'operator', 'reviewer'),),
+    ('GET', '/system/storage/freeable'): (('admin', 'operator'),),
     ('GET', '/system/storage/devices'): (('admin',),),
     ('POST', '/system/storage/mount'): (('admin',),),
     ('DELETE', '/system/storage/mount'): (('admin',),),
     ('POST', '/system/storage/activate'): (('admin',),),
     ('DELETE', '/system/storage/activate'): (('admin',),),
     ('POST', '/system/power'): (),
+    ('GET', '/system/camera-kind'): (('admin', 'operator', 'reviewer'),),
+    ('PUT', '/system/camera-kind'): (('admin',),),
+    ('DELETE', '/system/camera-kind'): (('admin',),),
     ('GET', '/activity/collections'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/activity/daily'): (('admin', 'operator', 'reviewer'),),
     ('POST', '/imports/digitisation-list'): (('admin', 'operator'),),
@@ -299,10 +313,14 @@ CAMERA_SETTINGS_PATHS = {"/cameras/{id}", "/cameras/settings/{id}"}
 PATH_NOT_MATERIAL = {
     "camera_index": "a camera body's index on the unit",
     "job_id": "an export or offsite job; the handler answers 404 unless the job is the path's volume's",
+    "set_id": "a volume's set of colour card shots; the handler answers 404 unless it is the path's volume's",
+    "shot_id": "a colour card shot; the handler answers 404 unless it is of the path's volume",
     "user_id": "a user account",
     "list_id": "a digitisation list file",
     "position": "an item's position in a digitisation list file",
     "uuid": "a saved network connection",
+    "client_capture_id": "a client's id for one capture request; the lookup answers only a stored capture whose "
+                         "record is in the caller's space, and 404 for any other",
 }
 # Query and body fields that name material, and the kind each names.
 FIELD_MATERIAL = {
@@ -330,6 +348,10 @@ FIELD_NOT_MATERIAL = {
     "unitName": "the unit's name sent to Fisqua at pairing",
     "user_id": "a user account",
     "pair_id": "groups the images of one dual capture; nothing is looked up by it, on any route",
+    "client_capture_id": "a client's id for one capture request; the capture routes answer a stored capture "
+                         "only to a request of its kind, volume and space, and refuse any other naming nothing of it",
+    "expected_image_ids": "a retake's own record's current images, compared with the record named by record_id "
+                          "(itself a target); nothing is looked up by them",
     "filename_stem": "a volume's own stem, set on the volume itself; a stem another volume holds is refused "
                      "by the model's uniqueness check, not looked up",
 }
@@ -617,7 +639,9 @@ def _role_admitted(caller, key, entry):
     return all(caller in roles for roles in ROLE_LISTS_BEFORE[key])
 
 
-_DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x"}
+_DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x",
+               "set_id": "999999", "shot_id": "999999",
+               "client_capture_id": "00000000-0000-4000-8000-000000000000"}
 
 
 def _body_base(world, key, space, caller):
@@ -936,7 +960,8 @@ def test_the_testing_account_reads_its_own_profile_and_the_unit(world, client):
 @pytest.mark.unit
 def test_public_routes_and_missing_sessions_are_left_alone(world, client):
     assert client.get("/health").status_code == 200
-    assert client.get("/auth/setup/status").json() == {"needs_setup": False}
+    assert client.get("/auth/setup/status").json() == {"needs_setup": False, "local": False,
+                                                       "default_language": "es"}
     assert client.post("/auth/login", json={"username": "u-operator", "password": "wrong"}).status_code == 401
     assert client.post("/auth/refresh").status_code == 401
     assert client.post("/auth/logout", headers={"X-Requested-With": "x"}).status_code == 204
@@ -1589,6 +1614,18 @@ ADMIN_READS = {
     ("POST", "/collections/{collection_id}/usb-copy"): lambda w, r: r.status_code == 422,
     ("GET", "/collections/{collection_id}/usb-copy/status/{job_id}"): lambda w, r: (
         r.status_code, r.json()["detail"]) == (404, "USB copy not found"),
+    # Colour card shots (app.core.colour_card): a testing volume answers as not enabled. Exercised in
+    # tests/unit/test_colour_card.py.
+    ("GET", "/collections/{collection_id}/colour-card"): lambda w, r: r.json()["enabled"] is False,
+    ("POST", "/collections/{collection_id}/colour-card/sets"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/shots"): lambda w, r: r.status_code == 422,
+    ("POST", "/collections/{collection_id}/colour-card/sets/{set_id}/complete"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("POST", "/collections/{collection_id}/colour-card/skip"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (409, "colour_card_not_enabled"),
+    ("GET", "/collections/{collection_id}/colour-card/shots/{shot_id}/preview"): lambda w, r: (
+        r.status_code, r.json()["detail"]["code"]) == (404, "colour_card_shot_not_found"),
 }
 
 

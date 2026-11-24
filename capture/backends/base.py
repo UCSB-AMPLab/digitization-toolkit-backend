@@ -3,12 +3,32 @@ Abstract base class for camera backends.
 
 Defines the interface that all camera backend implementations must follow.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
+
+import contextvars
+from contextlib import contextmanager
 
 from abc import ABC, abstractmethod
 from typing import Optional
 from pathlib import Path
+
+
+_PREVIEW_REQUEST = contextvars.ContextVar("camera_preview_request", default=False)
+
+
+@contextmanager
+def preview_request():
+    """Every open caused by this preview request is non-resetting."""
+    token = _PREVIEW_REQUEST.set(True)
+    try:
+        yield
+    finally:
+        _PREVIEW_REQUEST.reset(token)
+
+
+def in_preview_request():
+    return _PREVIEW_REQUEST.get()
 
 
 # Capture formats, as CameraConfig.image_format and the settings route name

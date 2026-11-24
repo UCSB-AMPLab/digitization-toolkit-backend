@@ -18,7 +18,7 @@ for the image upload, `_wake`) events and a `_thread`:
 Each scheduler's start() returns early while its worker is alive, so
 with the reference kept no start() can add a second worker.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import threading

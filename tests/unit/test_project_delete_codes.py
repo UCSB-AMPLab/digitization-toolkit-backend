@@ -6,7 +6,7 @@ deletes nothing, and a delete of an empty project is unchanged.
 
     python -m pytest tests/unit/test_project_delete_codes.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import pytest

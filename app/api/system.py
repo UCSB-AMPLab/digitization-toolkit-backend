@@ -1,4 +1,4 @@
-# Version: 0.3.3
+# Version: 0.3.0
 
 import json
 import logging
@@ -6,12 +6,13 @@ import os
 import re
 import shutil
 import subprocess
+import threading
 from datetime import datetime
 from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
-from pydantic import BaseModel, ConfigDict, Field, StringConstraints, model_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
@@ -27,6 +28,7 @@ logger = logging.getLogger(__name__)
 
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
 allow_admin     = RoleChecker(["admin"])
+allow_contributor = RoleChecker(["admin", "operator"])
 
 # Single root-privileged entry point installed (root-owned, sudoers-whitelisted)
 # by the superproject setup. All privileged shell-outs go through this helper
@@ -180,6 +182,48 @@ class UnitUpdate(BaseModel):
     projectsEnabled: Optional[bool] = None
     # Leaving offline mode while volumes are kept on the unit (NEH-320).
     keptVolumes: Optional[Literal["include", "keep"]] = None
+    # The unit's language (NEH-336); null or absent leaves it.
+    defaultLanguage: Optional[Literal["es", "en"]] = None
+    # Whether operators are asked for colour card shots (NEH-340); null or absent leaves it.
+    colourCardShots: Optional[StrictBool] = None
+
+
+# The keys a capture chord may never be (the frontend's capture-key.ts):
+# a modifier on its own, a dead key, and a key the browser cannot name.
+UNBINDABLE_KEYS = frozenset({"Control", "Alt", "Shift", "Meta", "Dead", "Unidentified"})
+CHORD_KEY_MAX = 32
+
+
+class CaptureChord(BaseModel):
+    """One chord as the frontend stores it (CaptureChord in capture-key.ts): KeyboardEvent.key and four modifiers.
+
+    Strict: the modifiers are JSON booleans and the key a string of 1 to
+    CHORD_KEY_MAX characters, none a control character, that is not in
+    UNBINDABLE_KEYS; no other field.
+    """
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    key: str = Field(min_length=1, max_length=CHORD_KEY_MAX)
+    ctrl: bool
+    alt: bool
+    meta: bool
+    shift: bool
+
+    @field_validator("key")
+    @classmethod
+    def _bindable(cls, v: str) -> str:
+        if v in UNBINDABLE_KEYS:
+            raise ValueError("this key cannot start a capture on its own")
+        if any(ord(c) < 0x20 or ord(c) == 0x7F for c in v):
+            raise ValueError("the key holds a control character")
+        return v
+
+
+class CaptureKeyUpdate(BaseModel):
+    """The body of PUT /system/unit/capture-key: a chord, or null for the built-in default. Required."""
+    model_config = ConfigDict(extra="forbid")
+
+    capture_key: Optional[CaptureChord]
 
 
 @router.get("/unit")
@@ -200,6 +244,8 @@ def get_unit(
     A switch to fisqua also needs Fisqua to take the operators call.
     `keptVolumes` lists every volume Captua keeps on the unit (NEH-320) as
     {id, name, files}, `files` being the count it would copy offsite.
+    `colourCardShots` is whether operators are asked for colour card shots
+    (app.core.colour_card).
 
     The testing account receives the same keys, with the mode and the
     projects setting (`mode`, `projectsEnabled`) only: `projectsShown` is
@@ -240,14 +286,46 @@ def put_unit(
     switch (`kept_volumes_released`); `keep` leaves them kept
     (`kept_volumes_kept`). Into offline, or with no kept volume, it is
     ignored.
+
+    `defaultLanguage` (`es` or `en`) sets the unit's language, after any
+    change of mode has been stored; logged `unit_default_language_changed`.
+    `colourCardShots` (a JSON boolean) sets whether operators are asked for
+    colour card shots (app.core.colour_card), after the language; logged
+    `unit_colour_card_shots_changed`.
     """
     from app.core import unit_mode
 
-    try:
-        unit_mode.change(db, actor=current_user.username, mode=payload.mode,
-                         projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
-    except unit_mode.ModeRefused as exc:
-        raise HTTPException(status_code=409, detail=exc.detail())
+    mode_fields = (payload.mode, payload.projectsEnabled, payload.keptVolumes)
+    if any(v is not None for v in mode_fields) or (payload.defaultLanguage is None
+                                                   and payload.colourCardShots is None):
+        try:
+            unit_mode.change(db, actor=current_user.username, mode=payload.mode,
+                             projects_enabled=payload.projectsEnabled, kept=payload.keptVolumes)
+        except unit_mode.ModeRefused as exc:
+            raise HTTPException(status_code=409, detail=exc.detail())
+    if payload.defaultLanguage is not None:
+        unit_mode.set_default_language(db, payload.defaultLanguage, actor=current_user.username)
+    if payload.colourCardShots is not None:
+        unit_mode.set_colour_card_shots(db, payload.colourCardShots, actor=current_user.username)
+    return unit_mode.as_api(db)
+
+
+@router.put("/unit/capture-key")
+def put_capture_key(
+    payload: CaptureKeyUpdate,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """Set the unit's capture key, or clear it with null for the built-in default. Admin and operator.
+
+    The body is `{"capture_key": {key, ctrl, alt, meta, shift} | null}`
+    (CaptureChord). Returns the GET /system/unit body; logged
+    `unit_capture_key_changed` when the key changes.
+    """
+    from app.core import unit_mode
+
+    chord = payload.capture_key.model_dump() if payload.capture_key is not None else None
+    unit_mode.set_capture_key(db, chord, actor=current_user.username)
     return unit_mode.as_api(db)
 
 
@@ -613,9 +691,15 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
     when it is missing or not on a mounted drive (see
     storage_override.override_root_problem) the response says available:false
     and gives the reason in unavailable_reason, which is null otherwise.
+
+    `reserve_bytes` is the space Captua keeps for its own work
+    (settings.STORAGE_RESERVE_GB, storage_override.refuse_below_storage_reserve),
+    and `usable_free_bytes` the free space above it, never below 0; 0 when
+    the figures cannot be read.
     """
     from app.core.config import settings
-    from app.core.storage_override import get_storage_override_or_fallback, projects_root_usage
+    from app.core.storage_override import (
+        get_storage_override_or_fallback, projects_root_usage, storage_reserve_bytes)
 
     # A corrupt override reverts to internal storage; override_invalid flags the fallback for a UI warning.
     override, override_invalid = get_storage_override_or_fallback()
@@ -631,8 +715,11 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
             "free_bytes":         0,
             "available":          False,
             "unavailable_reason": reason,
+            "reserve_bytes":      reserve,
+            "usable_free_bytes":  0,
         }
 
+    reserve = storage_reserve_bytes(settings)
     usage, problem = projects_root_usage(settings)
     if usage is None:
         return unavailable(problem)
@@ -646,7 +733,25 @@ def get_storage_info(current_user: User = Depends(allow_read_only)):
         "free_bytes":         usage.free,
         "available":          True,
         "unavailable_reason": None,
+        "reserve_bytes":      reserve,
+        "usable_free_bytes":  max(0, usage.free - reserve),
     }
+
+
+@router.get("/storage/freeable")
+def list_freeable_volumes(
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency),
+):
+    """The real volumes freeing is on offer for, largest first, with what freeing each would remove.
+
+    From the database only (app.core.offsite_free.freeable_volumes): no
+    call to the bucket and no file read. `mode_allows` is false in offline
+    mode, where freeing is refused (`off_in_this_mode`).
+    """
+    from app.core.offsite_free import freeable_volumes
+
+    return freeable_volumes(db)
 
 
 @router.get("/storage/devices")
@@ -979,3 +1084,241 @@ def retired_offsite_keys(
     return {"note": RETIRED_KEYS_NOTE,
             "totals": {"keys": len(keys), "deletable": deletable, "not_deletable": len(keys) - deletable},
             "keys": keys}
+
+
+# ---------------------------------------------------------------------------
+# The kind of camera the unit drives (app.core.camera_kind)
+# ---------------------------------------------------------------------------
+
+_CAMERA_KIND_REFUSALS = {
+    "busy_capturing": "A capture is in progress; try again when it ends.",
+    "offsite_job_running": "A volume is being freed or restored; try again when it ends.",
+    "backend_restarting": "Captua is restarting; try again in a minute.",
+    "driver_unavailable": "This unit lacks the driver for that kind of camera.",
+}
+
+
+class CameraKindRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    kind: str
+
+    @field_validator("kind", mode="before")
+    @classmethod
+    def _known_kind(cls, value):
+        from app.core import camera_kind
+        from capture.service import canonical_backend_name
+
+        if not isinstance(value, str):
+            raise ValueError("kind must be one of " + ", ".join(camera_kind.KINDS))
+        kind = canonical_backend_name(value)
+        if kind not in camera_kind.KINDS:
+            raise ValueError("kind must be one of " + ", ".join(camera_kind.KINDS))
+        return kind
+
+
+def _camera_kind_refused(reason: str) -> HTTPException:
+    return HTTPException(status_code=409, detail={"code": reason, "message": _CAMERA_KIND_REFUSALS[reason]})
+
+
+# Held across each PUT and DELETE of the camera kind, so two changes are
+# made one after the other.
+_camera_kind_lock = threading.Lock()
+
+
+def _refuse_camera_work() -> None:
+    """409 while camera work or an offsite job is counted: what reserve_restart refuses on, checked without reserving.
+
+    Called inside unit_activity.no_restart_reserved, which has already
+    refused a reserved restart. Nothing can be counted or reserved while
+    that hold lasts, so reserve_restart, called later in the same hold,
+    admits what this admits.
+    """
+    from app.core import unit_activity
+
+    if unit_activity.in_progress(unit_activity.CAMERA):
+        raise _camera_kind_refused("busy_capturing")
+    if unit_activity.in_progress(unit_activity.OFFSITE_JOB):
+        raise _camera_kind_refused("offsite_job_running")
+
+
+def _store_or_500(change) -> None:
+    try:
+        change()
+    except Exception as exc:
+        logger.error("The camera kind could not be stored (%s)", type(exc).__name__)
+        raise HTTPException(status_code=500, detail="The camera kind could not be stored.") from None
+
+
+def _put_back(previous) -> None:
+    from app.core import camera_kind
+
+    try:
+        if previous is None:
+            camera_kind.clear_choice()
+        else:
+            camera_kind.store_choice(previous)
+    except Exception as exc:
+        logger.error("The camera kind stored before could not be put back (%s)", type(exc).__name__)
+
+
+def _change_camera_kind(change, *, restart: bool) -> str:
+    """Make `change` with no restart reserved, under the lock reservations are taken under; restart after it when asked.
+
+    In one hold of unit_activity's lock (no_restart_reserved): refuse a
+    reserved restart, and with `restart` camera work or an offsite job;
+    write the change; with `restart`, reserve the restart only now, after
+    the write, so a slow write cannot spend the reservation's window. A
+    change that cannot be written answers 500 with nothing reserved. A
+    reservation refused after the write (it cannot be, see
+    _refuse_camera_work) puts the stored choice back and answers 409.
+    The hold is left and the helper called next, with nothing between:
+    `restarting`, or `restart_needed` (no restart-backend verb, or it
+    failed) with the change kept and the reservation released, so the
+    unit's restart (POST /system/power) takes it up. Without `restart`:
+    the change only, `not_needed`.
+    """
+    from app.core import camera_kind, system_helper, unit_activity
+
+    try:
+        with unit_activity.no_restart_reserved():
+            if restart:
+                _refuse_camera_work()
+            previous = camera_kind.stored_choice()
+            _store_or_500(change)
+            if restart and not unit_activity.reserve_restart():
+                _put_back(previous)
+                raise _camera_kind_refused("backend_restarting")
+    except unit_activity.Refused:
+        raise _camera_kind_refused("backend_restarting") from None
+    if not restart:
+        return "not_needed"
+    restarting = False
+    try:
+        if not system_helper.supports(system_helper.RESTART_BACKEND):
+            logger.info("Camera kind stored; the system helper has no %s verb, so the unit must be restarted",
+                        system_helper.RESTART_BACKEND)
+            return "restart_needed"
+        if not system_helper.run(system_helper.RESTART_BACKEND):
+            return "restart_needed"
+        restarting = True
+        return "restarting"
+    finally:
+        if not restarting:
+            unit_activity.release_restart()
+
+
+# Whether a PUT or DELETE restarts, by the choice this process started with
+# (applied, camera_kind.applied_choice) and the kind in effect, A; B is
+# another kind. Pending after: the stored choice differs from applied.
+#
+#   applied  stored before  request    stored after  answer                      pending
+#   none     none           PUT A      A             not_needed (applied := A)   no
+#   none     none           PUT B      B             restarting/restart_needed   yes
+#   none     B              PUT B      B             restarting/restart_needed   yes
+#   none     B              PUT A      A             not_needed (applied := A)   no
+#   none     B              DELETE     none          not_needed                  no
+#   none     none           DELETE     none          not_needed                  no
+#   A        A              DELETE     none          restarting/restart_needed   yes
+#   A        none           DELETE     none          restarting/restart_needed   yes
+#   A        none           PUT A      A             not_needed                  no
+#   A        A              PUT B      B             restarting/restart_needed   yes
+#   A        A              PUT A      A             not_needed                  no
+#
+# A PUT of the kind in effect never needs a restart (the process already
+# runs it), and becomes the applied choice. Any other change that leaves the
+# stored choice different from applied restarts, again on each request.
+
+
+@router.get("/camera-kind")
+def get_camera_kind(current_user: User = Depends(allow_read_only)):
+    """Which kind of camera the unit drives and what is connected, for every role and the testing account.
+
+    The same object GET /cameras/capabilities carries beside its flags
+    (app.core.camera_kind.report), answered without building the camera
+    backend, so it is there when the backend cannot be built. A backend
+    already built is asked for its own count only for a kind whose probe
+    could not run.
+    """
+    from app.core import camera_kind
+    from capture import service as capture_service
+
+    return camera_kind.report(capture_service._backend)
+
+
+@router.put("/camera-kind")
+def put_camera_kind(
+    payload: CameraKindRequest,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Store the kind of camera the unit drives, and restart the backend to use it. Admin only.
+
+    `kind` is picamera2, gphoto2 or chdk, read as CAMERA_BACKEND is (case
+    and surrounding spaces ignored); anything else is 422. A kind whose
+    driver library this unit cannot import is 409 `driver_unavailable`,
+    with nothing stored or reserved. The stored
+    choice wins over CAMERA_BACKEND and over detection at every start
+    (app.core.camera_kind).
+
+    While a restart is reserved, every PUT is refused with 409
+    `backend_restarting` and nothing is stored, the kind in effect
+    included. The kind already in effect is stored and nothing is
+    restarted: `restart` is `not_needed`. Otherwise the restart is reserved as the
+    pairing restart reserves it (app.core.unit_activity): 409
+    `busy_capturing` while camera work runs, `offsite_job_running` while a
+    volume is freed or restored, `backend_restarting` while a restart is
+    pending, each with nothing stored. Then the choice is stored and the
+    helper's restart-backend verb run: `restart` is `restarting`, and the
+    client polls GET /health until the backend answers again, then
+    reloads; or `restart_needed` when the helper cannot restart it, with
+    the choice stored for the unit's next start.
+
+    Answer: {"kind": the kind stored, "configured": the kind in effect in
+    this process, "restart": "restarting" | "restart_needed" | "not_needed"}.
+    Logged `camera_kind_changed`.
+    """
+    from app.core import camera_kind
+    from app.core.audit import log_event
+
+    kind = payload.kind
+    if not camera_kind.driver_available(kind):
+        raise _camera_kind_refused("driver_unavailable")
+    configured = camera_kind.in_effect()["kind"]
+
+    def store():
+        camera_kind.store_choice(kind)
+        if kind == configured:
+            camera_kind.mark_stored(kind)
+
+    with _camera_kind_lock:
+        restart = _change_camera_kind(store, restart=kind != configured)
+    log_event(db, level="INFO", category="system", action="camera_kind_changed", actor=current_user.username,
+              subject=kind, detail=f"in effect {configured}; restart {restart}")
+    return {"kind": kind, "configured": configured, "restart": restart}
+
+
+@router.delete("/camera-kind")
+def delete_camera_kind(
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Clear the stored camera kind, so CAMERA_BACKEND or detection chooses it again, and restart. Admin only.
+
+    While a restart is reserved, 409 `backend_restarting`, with nothing
+    cleared. The choice is cleared; the backend is restarted when this
+    process started with a stored choice (the table above), with PUT's
+    refusals, and again on a repeated DELETE until a restart applies it;
+    otherwise `not_needed`. The kind last used is kept.
+    Answer: {"kind": null, "configured", "restart"}. Logged
+    `camera_kind_cleared`.
+    """
+    from app.core import camera_kind
+    from app.core.audit import log_event
+
+    configured = camera_kind.in_effect()["kind"]
+    with _camera_kind_lock:
+        restart = _change_camera_kind(camera_kind.clear_choice, restart=camera_kind.applied_choice() is not None)
+    log_event(db, level="INFO", category="system", action="camera_kind_cleared", actor=current_user.username,
+              detail=f"in effect {configured}; restart {restart}")
+    return {"kind": None, "configured": configured, "restart": restart}

@@ -11,7 +11,7 @@ clock.
 
 Run with: python -m pytest tests/unit/test_records_to_retake.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 from datetime import datetime

@@ -7,7 +7,7 @@ still answering after twelve minutes. So while the backend runs, every open
 body that has had no traffic for _KEEPALIVE_INTERVAL_S is sent one read, which
 switches no mode, sends no enter_alt() and changes no setting.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging

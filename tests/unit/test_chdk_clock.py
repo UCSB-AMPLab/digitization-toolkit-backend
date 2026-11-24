@@ -10,7 +10,7 @@ difference above _CLOCK_TOLERANCE_S is corrected with set_clock, and the
 clock is read back once. A camera that answers oddly never fails a capture;
 a wire failure or a timeout fails the operation as it does for the zoom.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import datetime

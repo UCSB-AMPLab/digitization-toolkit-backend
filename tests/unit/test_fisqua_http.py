@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import json
@@ -857,7 +857,7 @@ def test_turning_rotate_deg_on_clears_the_stop_and_resends_under_a_new_id(
     assert rows[1].manifest_id != refused.manifest_id
     sent = json.loads(server.requests[0].content)
     assert sent["id"] == rows[1].manifest_id
-    assert sent["version"] == "1.9"
+    assert sent["version"] == "1.12"
 
 
 @pytest.mark.unit

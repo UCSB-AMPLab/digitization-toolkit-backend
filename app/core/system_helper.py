@@ -12,7 +12,7 @@ helper. supports() reads the installed file for the verb's case label
 (`restart-backend)`) instead of calling it and reading the refusal. A
 helper that cannot be read counts as lacking the verb.
 
-Version: 0.3.3
+Version: 0.3.0
 """
 
 import logging
