@@ -100,6 +100,12 @@ async def lifespan(app: FastAPI):
     db = SessionLocal()
     try:
         reconcile_pending_rename(db)
+        # Finish or undo an adoption of captures a crash interrupted, before
+        # the layout migration's repair of volumes' manifests could copy the
+        # source's records into the target under their old names
+        # (app.core.adopt_journal).
+        from app.core.adopt_journal import recover_adoption_at_startup
+        recover_adoption_at_startup(db)
         # Move the files of each volume with a file name stem from the
         # name-based layout into `<stem>/`, completing a batch a crash
         # interrupted; a no-op once every such volume is done

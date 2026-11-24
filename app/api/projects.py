@@ -258,6 +258,10 @@ def add_record_to_project(
         except testing_space.SpaceRefused as exc:
             db.rollback()
             raise HTTPException(status_code=exc.status, detail=exc.detail())
+        # Not out of a volume an unfinished adoption names: its recovery
+        # decides by where the records are (app.core.adopt_journal).
+        from app.core.adopt_journal import refuse_if_journaled
+        refuse_if_journaled([r.collection_id])
         # A record whose images are in the bucket stays in its volume: their
         # keys are under the volume's stem and never change. Checked under the
         # record's lock, which the uploader takes before it writes a first

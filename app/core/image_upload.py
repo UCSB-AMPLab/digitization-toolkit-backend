@@ -1690,10 +1690,14 @@ STORED_OFFSITE_MESSAGE = (
 
 
 def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
-    """The ids, sorted, of those records with an image that has an offsite_objects row.
+    """The ids, sorted, of those records with an image that has an offsite_objects row, its own or retired.
 
-    Any row counts, verified, pending or refused: each holds a key under the
-    volume's stem that never changes, so such a record stays in its volume.
+    Any row of the image counts, verified, pending or refused: each holds a
+    key under the volume's stem that never changes, so such a record stays
+    in its volume. So does a row an adoption retired from the image
+    (retired_image_id, app.core.offsite_retired): until the upload under
+    the new key verifies, the image's bytes are offsite only under that
+    key, and once it does, the image has a row of its own again.
     """
     from app.models.offsite_object import OffsiteObject
     from app.models.record import RecordImage
@@ -1702,7 +1706,8 @@ def records_stored_offsite(db: Session, record_ids: Iterable[int]) -> list:
     if not ids:
         return []
     rows = (db.query(RecordImage.record_id)
-            .join(OffsiteObject, OffsiteObject.record_image_id == RecordImage.id)
+            .join(OffsiteObject, or_(OffsiteObject.record_image_id == RecordImage.id,
+                                     OffsiteObject.retired_image_id == RecordImage.id))
             .filter(RecordImage.record_id.in_(ids))
             .distinct()
             .all())

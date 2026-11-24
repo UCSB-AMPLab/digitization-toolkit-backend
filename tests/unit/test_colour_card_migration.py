@@ -185,8 +185,14 @@ def test_the_models_match_the_migration(backend_root, tmp_path):
                        for f in insp.get_foreign_keys(t)),
                 insp.get_pk_constraint(t)["constrained_columns"],
             )
+        def before_retirement(shape_):
+            # The retirement of colour_card_objects comes with the next revision, c8e0a2f4b6d9
+            # (tests/unit/test_offsite_retired_keys.py compares the model with the chain up to it).
+            return tuple(sorted(x for x in part if "retired" not in str(x)) if isinstance(part, list) else part
+                         for part in shape_)
+
         for name in TABLES:
-            assert shape(a, name) == shape(b, name), name
+            assert before_retirement(shape(a, name)) == shape(b, name), name
         col = Base.metadata.tables["unit_settings"].c.colour_card_shots
         mig = {c["name"]: c for c in sa.inspect(b).get_columns("unit_settings")}["colour_card_shots"]
         assert mig["nullable"] is False and col.nullable is False

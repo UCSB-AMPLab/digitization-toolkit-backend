@@ -224,7 +224,7 @@ def _exercise(engine, mod):
 
 
 @pytest.mark.unit
-def test_the_migration_follows_kept_on_unit_and_is_the_only_head(backend_root):
+def test_the_migration_follows_kept_on_unit(backend_root):
     mod = _load_migration(backend_root)
     assert mod.revision == REVISION and mod.down_revision == "b6d8f0a2c4e7"
     revisions, downs = set(), set()
@@ -232,7 +232,7 @@ def test_the_migration_follows_kept_on_unit_and_is_the_only_head(backend_root):
         text = path.read_text()
         revisions.add(re.search(r"^revision(?:: str)? = '(\w+)'", text, re.M).group(1))
         downs.update(re.findall(r"'(\w+)'", re.search(r"^down_revision[^=]*= (.*)$", text, re.M).group(1)))
-    # The head is now the languages and capture key revision (test_first_run.py), which follows this one.
+    # The head is the offsite retirement revision (test_offsite_retired_keys.py), later in the chain than this one.
     assert REVISION in downs
     assert len(revisions - downs) == 1
 

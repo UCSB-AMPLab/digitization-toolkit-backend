@@ -32,6 +32,8 @@ from sqlalchemy import create_engine  # noqa: E402
 from sqlalchemy.orm import sessionmaker  # noqa: E402
 from app.core.db import Base  # noqa: E402
 from app.models import user, project, project_member, collection, record, camera, system_log, offsite_object  # noqa: E402,F401
+# The stem checks of a new volume read colour_card_objects as well as offsite_objects (offsite_keys_under_stem).
+from app.models import colour_card  # noqa: E402,F401
 from app.models.unit_settings import UnitSettings  # noqa: E402
 
 engine = create_engine(f"sqlite:///{dbfile}")

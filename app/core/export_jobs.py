@@ -189,7 +189,14 @@ class ExportJobRegistry:
         already-running job so a retry never stacks a second export.
 
         Raises ExportBlockedError when a request holds the collection for file
-        changes (see `hold_for_file_changes`)."""
+        changes (see `hold_for_file_changes`), and ExportAdoptionUnfinished
+        while an adoption's journal names it (app.core.adopt_journal). The
+        journal is read here, under the lock an adoption's hold takes, so a
+        request that passed its route's early check before an adoption began
+        exports nothing once the adoption has returned with its journal
+        kept; while the adoption runs, its hold refuses the export."""
+        from app.core.adopt_journal import journal_names_volume, unfinished_message
+
         with self._lock:
             existing_id = self._active_by_collection.get(collection_id)
             existing = self._jobs.get(existing_id) if existing_id else None
@@ -197,6 +204,8 @@ class ExportJobRegistry:
                 return existing
             if self._held[collection_id] > 0:
                 raise ExportBlockedError(FILES_CHANGING_MESSAGE)
+            if journal_names_volume(collection_id):
+                raise ExportAdoptionUnfinished(unfinished_message())
             job = ExportJob(collection_id)
             self._jobs[job.id] = job
             self._active_by_collection[collection_id] = job.id
@@ -236,6 +245,10 @@ class ExportError(Exception):
 
 class ExportBlockedError(Exception):
     """An export was asked for while a request is moving the collection's files."""
+
+
+class ExportAdoptionUnfinished(ExportBlockedError):
+    """An export was asked for while an unfinished adoption's journal names the collection."""
 
 
 # Module-level singleton shared across requests in the single backend process

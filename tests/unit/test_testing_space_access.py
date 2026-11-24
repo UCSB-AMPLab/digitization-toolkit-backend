@@ -143,6 +143,8 @@ ROLE_LISTS_BEFORE = {
     ('POST', '/collections/{collection_id}/export'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/collections/{collection_id}/export/status/{job_id}'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/collections/{collection_id}/export/download'): (('admin', 'operator', 'reviewer'),),
+    ('GET', '/collections/{source_id}/adopt-into/{target_id}'): (('admin',),),
+    ('POST', '/collections/{source_id}/adopt-into/{target_id}'): (('admin',),),
     ('POST', '/collections/{collection_id}/usb-copy'): (('admin',),),
     ('GET', '/collections/{collection_id}/usb-copy/status/{job_id}'): (('admin',),),
     ('GET', '/auth/setup/status'): (),
@@ -171,6 +173,7 @@ ROLE_LISTS_BEFORE = {
     ('PATCH', '/system/testing/account'): (('admin',),),
     ('POST', '/system/testing/clear'): (('admin',),),
     ('GET', '/system/testing/usb'): (('admin',),),
+    ('GET', '/system/offsite/retired-keys'): (('admin',),),
     ('GET', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing/renew'): (('admin',),),
@@ -301,6 +304,8 @@ PATH_MATERIAL = {
     "rec_id": "record",
     "img_id": "image",
     "annotation_id": "annotation",
+    "source_id": "collection",
+    "target_id": "collection",
 }
 # `id` names a camera settings row on these routes; each row belongs to one image.
 CAMERA_SETTINGS_PATHS = {"/cameras/{id}", "/cameras/settings/{id}"}
@@ -2451,6 +2456,11 @@ IMAGE_PATH_WRITERS = {
     ("app/core/storage_ops.py", "reconcile_pending_rename"),  # an interrupted project rename completed
     ("app/core/volume_layout.py", "_execute"),          # the move into the stem layout
     ("app/api/projects.py", "_update_project_held"),    # a project rename's rebase
+    # An adoption's renames, built by its plan from the target's own directory; both volumes real work.
+    ("app/core/adopt_apply.py", "_write_rows"),
+    # The same adoption's colour card shots: a shot row's paths, built by the plan from the target's own
+    # `calibration/`; not an image row, matched by the attribute's name.
+    ("app/core/adopt_apply.py", "_write_card_rows"),
 }
 
 

@@ -82,7 +82,11 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	path. A request with a record_id must name the record's own volume: the
 	file is written under the volume the request names, while the record and
 	the counter raised are its own volume's. Called in each capture endpoint
-	before any camera is touched.
+	before any camera is touched. 409 too while an unfinished adoption's
+	journal names the volume (app.core.adopt_journal), or cannot be read:
+	its files may be at either of two names until startup recovery decides;
+	and 409 `captures_adopted_away` for a volume an adoption closed
+	(Collection.captures_adopted_at).
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
@@ -93,6 +97,12 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	# A testing volume a purge is removing takes no capture (app.core.testing_space).
 	from app.core.testing_space import refuse_volume_being_removed
 	refuse_volume_being_removed(volume)
+	from app.core import adopt_journal
+	if adopt_journal.journal_names_volume(collection_id):
+		raise HTTPException(status_code=409, detail={"code": "adoption_unfinished",
+		                                             "message": adopt_journal.unfinished_message()})
+	# A volume an adoption closed (Collection.captures_adopted_at) exists only to be deleted; read under its lock.
+	adopt_journal.refuse_if_adopted_away(db, [collection_id])
 	if retake_record is not None:
 		if retake_record.collection_id is None:
 			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)

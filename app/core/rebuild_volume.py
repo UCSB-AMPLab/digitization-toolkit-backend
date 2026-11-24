@@ -981,6 +981,12 @@ def rebuild_volume(db: Session, stem: str, bundle_dir: str, *, apply: bool = Fal
     if collection is None:
         db.rollback()
         raise RebuildRefused(f"no volume has the file name stem {stem!r}")
+    from app.core.adopt_journal import journal_names_volume
+
+    if journal_names_volume(collection.id):
+        db.rollback()
+        raise RebuildRefused(f"an unfinished adoption names the volume {stem!r}; restart the backend to finish "
+                             "or undo it first")
     db.commit()
     counter_after, planned = load_bundle(bundle_dir, stem)
     offset = _index_offset(planned)
@@ -1143,8 +1149,16 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         return report
 
     from app.core import audit, capture_counter
+    from app.core.adopt_journal import journal_names_volume
     from app.core.offsite_free import _RunManifest
     from capture.project_manager import ensure_volume_dirs
+
+    # Again, just before the first change (the counter's raise): the check in rebuild_volume is as old as the
+    # bundle's loading and the checks above, and an adoption that ran meanwhile may have kept its journal.
+    if journal_names_volume(collection_id):
+        db.rollback()
+        raise RebuildRefused(f"an unfinished adoption names the volume {stem!r}; restart the backend to finish "
+                             "or undo it first")
 
     # Before the first record, so that a capture into the volume during the
     # run takes counterAfter + 1 and never a planned number. A capture that

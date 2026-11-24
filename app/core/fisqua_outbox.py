@@ -913,13 +913,16 @@ def _kept_now(db: Session, collection_id: int) -> bool:
 def _promote(db: Session, row, result: _Run) -> None:
     """Move a waiting row to ready (or refused, when not exportable) once its volume's files are offsite.
 
-    A kept volume's row waits. The flag is read first without a lock and,
+    A kept volume's row waits, and so does one an unfinished adoption's
+    journal names (app.core.adopt_journal), read under the build's hold. The
+    flag is read first without a lock and,
     after the manifest is built and that read transaction ended, again with
     the volume's row FOR SHARE before each move out of waiting_for_upload
     (_kept_now), so a keep committed while the manifest was built leaves
     the row waiting.
     """
     from app.core import capture_manifest
+    from app.core.adopt_journal import journal_names_volume
     from app.core.export_jobs import FilesChanging, export_jobs
     from app.core.image_upload import volume_upload_state
     from app.models.collection import Collection
@@ -951,6 +954,13 @@ def _promote(db: Session, row, result: _Run) -> None:
     manifest_uuid = uuid.UUID(row.manifest_id)
     try:
         with export_jobs.hold_for_reading([collection.id]):
+            # Under the hold an adoption's own hold excludes: while an adoption runs this read is refused
+            # (FilesChanging), and one that returned with its journal kept is seen here, so no manifest is
+            # built from rows and files its startup recovery has still to finish or undo.
+            if journal_names_volume(collection.id):
+                db.rollback()
+                result.waiting += 1
+                return
             doc = capture_manifest.build_capture_manifest(db, collection, new_id=lambda: manifest_uuid)
     except FilesChanging:
         db.rollback()
