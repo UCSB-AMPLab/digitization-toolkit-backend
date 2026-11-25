@@ -12,13 +12,15 @@ from pathlib import Path
 from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
+from fastapi import Path as PathParam
 from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, field_validator, model_validator
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
 from app.api.deps import get_db_dependency
+from app.core.adoption_requests import REQUEST_ID_PATTERN as ADOPTION_REQUEST_ID_PATTERN
 from app.core.testing_space import (
-    MAX_EXPIRY_DAYS, MAX_RESERVE_GB, MIN_EXPIRY_DAYS, MIN_RESERVE_GB, USERNAME_MAX_LENGTH,
+    MAX_EXPIRY_DAYS, MAX_RESERVE_GB, MIN_EXPIRY_DAYS, MIN_RESERVE_GB, USERNAME_MAX_LENGTH, not_found_detail,
 )
 from app.models.system_log import SystemLog
 from app.models.user import User
@@ -1124,35 +1126,74 @@ def get_unfinished_adoption(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """The adoption whose journal is still on the unit, or {"unfinished": null}; admin only. Changes nothing.
+    """The adoption whose journal is still on the unit, or `unfinished` null; admin only. Changes nothing.
 
     The two volumes it names, whether it is running now or was left
     (`recovering`, `blocked`), why recovery stopped (a code and a sentence),
     each file at neither its old nor its new path with whether the unit can
-    bring it back, and whether a repair can run
-    (app.core.adopt_repair.report).
+    bring it back, whether a repair can run, and the journal's `run_id`
+    (app.core.adopt_repair.report). Beside it, `running`: null, or what holds
+    the adoption lock now (`request_id`, `source`, `target`, `started_at`,
+    `kind`: adoption, recovery or repair), read without taking the lock.
     """
     from app.core.adopt_repair import report
 
     return report(db)
 
 
+class AdoptionRepairRequest(BaseModel):
+    """The optional body of POST /system/adoption/repair: the run id of the journal the caller read."""
+    model_config = ConfigDict(extra="forbid")
+
+    run_id: Optional[str] = Field(default=None, max_length=64)
+
+
 @router.post("/adoption/repair")
 def repair_unfinished_adoption(
+    body: Optional[AdoptionRepairRequest] = None,
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
     """Fetch the files an unfinished adoption lacks from the bucket and run its recovery again; admin only.
 
-    Answers {"result": "finished" | "reverted" | "unfinished", ...}, or 409
-    with a code when it changed nothing (app.core.adopt_repair.repair).
+    Answers {"result": "finished" | "reverted" | "unfinished", "source",
+    "target", ...}, or 409 with a code when it changed nothing
+    (app.core.adopt_repair.repair). With `run_id` (the report's
+    `unfinished.run_id`), a journal with another run id, or none, is
+    refused with 409 `journal_changed` and nothing is repaired.
     """
     from app.core.adopt_repair import RepairRefused, repair
 
     try:
-        return repair(db, actor=current_user.username)
+        return repair(db, actor=current_user.username, run_id=body.run_id if body is not None else None)
     except RepairRefused as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail()) from exc
+
+
+@router.get("/adoption/requests/{request_id}")
+def get_adoption_request(
+    request_id: str = PathParam(..., pattern="^" + ADOPTION_REQUEST_ID_PATTERN + "$"),
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """The state of the adoption a client named with `request_id`; admin only.
+
+    {"state": "running" | "applied" | "refused" | "failed" | "reverted" |
+    "interrupted", "source_id", "target_id", "started_at", "ended_at"} with
+    `result` (applied), `status` and `detail` (refused), `message` and
+    `restored` (failed), and for an outcome recovery wrote or none
+    (`interrupted`), `journal_kept` (app.core.adoption_requests.state_of).
+    404 `not_found` with `state: "closed"` for an id no adoption recorded,
+    which this lookup closes: a POST with the id is then refused (409
+    `adoption_abandoned`) and never adopts, and every later lookup answers
+    the same (app.core.adoption_requests.lookup). A malformed id is a 422.
+    """
+    from app.core.adoption_requests import lookup
+
+    state = lookup(db, request_id.lower())
+    if state["state"] == "closed":
+        raise HTTPException(status_code=404, detail={**not_found_detail(), "state": "closed"})
+    return state
 
 
 # ---------------------------------------------------------------------------

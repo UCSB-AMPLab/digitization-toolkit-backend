@@ -264,6 +264,27 @@ class AdoptPlanRead(BaseModel):
     shot_bytes: int = 0
 
 
+class AdoptRequest(BaseModel):
+    """The optional body of POST /collections/{source}/adopt-into/{target}.
+
+    `client_request_id`: the client's id for this adoption, a UUID in its
+    canonical form, in either case, stored lowercase
+    (app.core.adoption_requests). A request repeating it is answered from
+    the recorded outcome and never starts a second adoption. None, or no
+    body, adopts as always.
+    """
+    model_config = {"extra": "forbid"}
+
+    client_request_id: Optional[str] = None
+
+    @field_validator("client_request_id")
+    @classmethod
+    def _check_client_request_id(cls, v: Optional[str]) -> Optional[str]:
+        from app.core.adoption_requests import validate
+
+        return validate(v)
+
+
 class AdoptResultRead(BaseModel):
     """What an adoption did (app.core.adopt_apply.adopt_captures)."""
     source_id: int

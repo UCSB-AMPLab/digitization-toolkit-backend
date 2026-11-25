@@ -29,7 +29,10 @@ and, only when the source has colour card sets, `colour_card_set_ids`,
 "old_preview_path", "new_preview_path"}, ...]) and
 `retired_colour_card_row_ids`, with the shots' renames in `moves` after
 the images' (kinds `colour_card_shot`, `colour_card_preview`,
-`colour_card_buffer`, each with `shot_id` in place of `image_id`).
+`colour_card_buffer`, each with `shot_id` in place of `image_id`); and
+`request_id` only when the adoption's request carried a client id
+(app.core.adoption_requests), which recovery uses to set that request's
+record `reverted` when it undoes the adoption.
 
 `moves` is every rename the adoption makes, in order; it is written before
 the first, so it says what the adoption will do, not how far it got. The
@@ -126,6 +129,86 @@ _last_recovery: Optional[dict] = None
 def last_recovery() -> Optional[dict]:
     """{"run_id", "outcome", "code", "reason"} of the last recovery in this process, or None."""
     return dict(_last_recovery) if _last_recovery else None
+
+
+# What holds ADOPTION_LOCK now, for app.core.adopt_repair.report, which never takes the lock: an adoption
+# (adopt_apply.adopt_captures), a recovery (recover_adoption_at_startup) or a repair (adopt_repair.repair)
+# publishes itself right after it takes the lock and withdraws right before it releases it. A storage switch
+# (storage_switch_guard) holds the lock and publishes nothing. The snapshot is a dict replaced whole, never
+# changed once published, under _RUNNING_LOCK, which is held for nothing but the replacement or the copy.
+RUNNING_KINDS = ("adoption", "recovery", "repair")
+
+# The client request id of the run holding ADOPTION_LOCK, for app.core.adoption_requests, which decides
+# `running` against `busy` by it: a plain attribute, assigned right after the lock is taken and reset in the
+# finally that releases it, so it cannot fail to be set as the snapshot can. None for a run with no id.
+lock_holder_request_id: Optional[str] = None
+_RUNNING_LOCK = threading.Lock()
+_running: Optional[dict] = None
+
+
+def publish_running(kind: str, *, request_id: Optional[str] = None, source_id=None, target_id=None,
+                    started_at: Optional[str] = None) -> None:
+    """Publish what took ADOPTION_LOCK; the caller holds it. Never raises: a failure is logged, the snapshot cleared."""
+    try:
+        from datetime import datetime, timezone
+
+        snapshot = {"kind": kind, "request_id": request_id, "source_id": source_id, "target_id": target_id,
+                    "started_at": started_at or datetime.now(timezone.utc).replace(tzinfo=None).isoformat()}
+        _set_running(snapshot)
+    except Exception:  # noqa: BLE001 - an observer: what holds the lock goes on whatever this does
+        _drop_running("published")
+
+
+def _set_running(value: Optional[dict]) -> None:
+    global _running
+
+    with _RUNNING_LOCK:
+        _running = value
+
+
+def _drop_running(what: str) -> None:
+    """After a failed write: the snapshot cleared by a plain assignment, and the failure logged, neither raising."""
+    global _running
+
+    _running = None
+    try:
+        logger.exception(f"Adoption lock: what holds it could not be {what}; it reads as nothing running")
+    except Exception:  # noqa: BLE001 - logging itself failed
+        pass
+
+
+def refine_running(journal) -> None:
+    """Add the volumes and the request id of the journal a recovery or a repair read to what it published.
+
+    Never raises: a failure is logged and the snapshot cleared.
+    """
+    try:
+        if not isinstance(journal, dict):
+            return
+        request_id = journal.get("request_id")
+        current = running()
+        if current is not None:
+            _set_running({**current, "source_id": journal.get("source_id"), "target_id": journal.get("target_id"),
+                          "request_id": request_id if isinstance(request_id, str) else None})
+    except Exception:  # noqa: BLE001 - an observer
+        _drop_running("refined")
+
+
+def clear_running() -> None:
+    """Withdraw what was published; the caller still holds ADOPTION_LOCK. Never raises."""
+    try:
+        _set_running(None)
+    except Exception:  # noqa: BLE001 - an observer
+        _drop_running("withdrawn")
+
+
+def running() -> Optional[dict]:
+    """A copy of what holds ADOPTION_LOCK now, as published, or None. Never raises: a failure reads as None."""
+    try:
+        with _RUNNING_LOCK:
+            return dict(_running) if _running is not None else None
+    except Exception:  # noqa: BLE001 - an observer
+        return None
 
 
 class JournalUnreadable(RuntimeError):
@@ -554,21 +637,29 @@ def recover_adoption_at_startup(db: Session) -> Optional[dict]:
     Never raises for a recovery that fails: the journal is kept, and an
     ERROR and an audit event say so.
     """
-    with ADOPTION_LOCK:
-        # What a killed repair staged goes first, with or without a journal (app.core.adopt_repair); a sweep
-        # that fails is logged and startup goes on.
-        try:
-            from app.core.adopt_repair import sweep_staging_at_startup
+    global lock_holder_request_id
 
-            sweep_staging_at_startup()
-        except Exception:
-            logger.exception("Adoption repair: the staging sweep at startup failed; startup goes on")
-        return recover_holding_lock(db)
+    with ADOPTION_LOCK:
+        # Inside the lock's `with`, so whatever raises here the lock is released; the publisher never raises.
+        try:
+            publish_running("recovery")
+            # What a killed repair staged goes first, with or without a journal (app.core.adopt_repair); a
+            # sweep that fails is logged and startup goes on.
+            try:
+                from app.core.adopt_repair import sweep_staging_at_startup
+
+                sweep_staging_at_startup()
+            except Exception:
+                logger.exception("Adoption repair: the staging sweep at startup failed; startup goes on")
+            return recover_holding_lock(db)
+        finally:
+            lock_holder_request_id = None
+            clear_running()
 
 
 def recover_holding_lock(db: Session) -> Optional[dict]:
     """recover_adoption_at_startup for a caller that already holds ADOPTION_LOCK (app.core.adopt_repair)."""
-    global _last_recovery
+    global _last_recovery, lock_holder_request_id
 
     run_id = None
     try:
@@ -579,11 +670,23 @@ def recover_holding_lock(db: Session) -> Optional[dict]:
         if journal is None:
             return None
         run_id = journal.get("run_id")
+        # The lock's holder now settles this journal's request; the caller's finally resets it.
+        lock_holder_request_id = journal.get("request_id") if isinstance(journal.get("request_id"), str) else None
+        refine_running(journal)
         try:
             result = _recover(db, journal)
         except Exception as exc:
             logger.exception("Adoption recovery failed; the journal is kept")
             result = _unfinished(db, journal, f"recovery failed: {exc}", FAILED)
+        # The request that started the adoption, when it carried an id (app.core.adoption_requests): an
+        # undone adoption's row is set `reverted`; a finished one's says `applied` from its own commit. An
+        # observer, which never raises; guarded here all the same, so recovery's result stands.
+        try:
+            from app.core.adoption_requests import end_from_recovery
+
+            end_from_recovery(journal, result)
+        except Exception:  # noqa: BLE001
+            logger.exception("Adoption recovery: the request's record could not be completed; recovery stands")
     _last_recovery = {"run_id": run_id, **result}
     return result
 

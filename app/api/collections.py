@@ -19,7 +19,7 @@ from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
 from app.schemas.collection import (
-    AdoptPlanRead, AdoptResultRead, CollectionCreate, CollectionCreateRequest, CollectionRead, CollectionUpdate,
+    AdoptPlanRead, AdoptRequest, AdoptResultRead, CollectionCreate, CollectionCreateRequest, CollectionRead, CollectionUpdate,
     CollectionWithChildren,
 )
 from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusChangeRead, ReorderRecords
@@ -641,6 +641,7 @@ def plan_adopt_into(
 def adopt_into(
     source_id: int,
     target_id: int,
+    body: Optional[AdoptRequest] = None,
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
@@ -654,15 +655,42 @@ def adopt_into(
     (app.core.space_routes); 503 when the bucket cannot be listed; 500 when it
     stopped after it began to rename, with `restored` saying whether every
     file is back where it was.
+
+    With `client_request_id` (app.core.adoption_requests): a repeat of an id
+    whose request ended answers that request's status and body again, and
+    one recorded for other volumes 409 `client_request_id_in_use`; an id a
+    lookup closed is refused with 409 `adoption_abandoned` and never adopts;
+    409
+    `adoption_in_progress` with `request_id` while it runs, and 409
+    `adoption_interrupted` with its `state` when it never answered. GET
+    /system/adoption/requests/{id} answers its outcome.
     """
+    from app.core import adoption_requests
     from app.core.adopt_apply import AdoptFailed, AdoptRefused, adopt_captures
 
+    request_id = body.client_request_id if body is not None else None
+    if request_id is not None:
+        replay = adoption_requests.stored(db, request_id, source_id, target_id)
+        if replay is not None:
+            return _replayed(replay)
     try:
-        return adopt_captures(db, source_id, target_id, actor=current_user.username)
+        return adopt_captures(db, source_id, target_id, actor=current_user.username, request_id=request_id)
+    except adoption_requests.AlreadyRecorded:
+        replay = adoption_requests.stored(db, request_id, source_id, target_id)
+        if replay is None:  # the row cannot go away: nothing removes one
+            raise
+        return _replayed(replay)
     except AdoptRefused as exc:
         raise HTTPException(status_code=exc.status_code, detail=jsonable_encoder(exc.as_detail()))
     except AdoptFailed as exc:
         raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+def _replayed(replay: dict):
+    """The recorded answer of an adoption request: its body for a 200, the same HTTPException otherwise."""
+    if replay["status"] == 200:
+        return replay["body"]
+    raise HTTPException(status_code=replay["status"], detail=replay["body"])
 
 
 # ==============================================================================

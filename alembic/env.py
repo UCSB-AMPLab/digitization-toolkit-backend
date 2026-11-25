@@ -28,6 +28,7 @@ import app.models.offsite_object  # noqa: F401
 import app.models.fisqua  # noqa: F401
 import app.models.unit_settings  # noqa: F401
 import app.models.capture_request  # noqa: F401
+import app.models.adoption_request  # noqa: F401
 import app.models.colour_card  # noqa: F401
 
 config = context.config
