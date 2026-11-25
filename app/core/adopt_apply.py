@@ -3,7 +3,11 @@
 adopt_captures does what app.core.adopt_captures.plan_adopt_captures plans,
 one adoption at a time on the unit: it runs under
 app.core.adopt_journal.ADOPTION_LOCK, and a second adoption that finds the
-lock taken is refused at once (`adoption_in_progress`). In this order:
+lock taken is refused at once (`adoption_in_progress`). Holding the lock,
+it publishes itself (adopt_journal.running), and a request that carries a
+client id is recorded before anything else and its outcome when it ends
+(app.core.adoption_requests); the journal then carries that id. In this
+order:
 
 1. Both volumes are held for file changes (export_jobs.hold_for_file_changes)
    until the end, so no export of either runs and the offsite upload reads
@@ -132,6 +136,7 @@ from pathlib import Path
 from typing import Callable, List, Optional, Tuple
 
 from fastapi import HTTPException
+from fastapi.encoders import jsonable_encoder
 from sqlalchemy.orm import Session
 
 from app.core import adopt_journal, offsite_retired
@@ -164,15 +169,17 @@ NOT_VERIFIED_MESSAGE = ("An offsite object of the source is not verified, so its
 class AdoptRefused(Exception):
     """The adoption was refused and nothing it changed is left changed; `codes` and `details` say why."""
 
-    def __init__(self, status_code: int, codes: list, details: Optional[dict] = None, message: str = REFUSED_MESSAGE):
+    def __init__(self, status_code: int, codes: list, details: Optional[dict] = None, message: str = REFUSED_MESSAGE,
+                 **extra):
         self.status_code = status_code
         self.codes = list(codes)
         self.details = dict(details or {})
         self.message = message
+        self.extra = extra
         super().__init__(f"{message} ({', '.join(self.codes)})")
 
     def as_detail(self) -> dict:
-        return {"message": self.message, "codes": self.codes, "details": self.details}
+        return {"message": self.message, "codes": self.codes, "details": self.details, **self.extra}
 
 
 class AdoptFailed(Exception):
@@ -237,28 +244,63 @@ def _append_target_lines(volume_root: Path, lines: list) -> None:
 
 def adopt_captures(db: Session, source_id: int, target_id: int, *, actor: Optional[str],
                    now: Optional[datetime] = None,
-                   list_target_prefix: Optional[Callable[[str, str], list]] = None) -> dict:
+                   list_target_prefix: Optional[Callable[[str, str], list]] = None,
+                   request_id: Optional[str] = None) -> dict:
     """Adopt the source volume's captures into the target (module header); return a summary.
 
     Raises AdoptRefused when nothing is left changed but the source's
     relocation records, and AdoptFailed when a step from the journal on
     failed. `list_target_prefix(tenant, stem)` lists the bucket under the
     target's stem (bucket_keys_under_stem by default).
+
+    Once the lock is taken, the run is published (adopt_journal.running)
+    until just before it is released. With `request_id` (a client's id,
+    app.core.adoption_requests), the request is recorded right after the
+    lock is taken, before anything else, and its outcome when it ends; the
+    journal carries the id. AlreadyRecorded when another request recorded
+    the id first: nothing else is done.
     """
-    from app.core import audit
+    from app.core import adoption_requests, audit
     from app.core.export_jobs import export_jobs
 
     now = now or datetime.now(timezone.utc)
     lister = list_target_prefix or bucket_keys_under_stem
     if not adopt_journal.ADOPTION_LOCK.acquire(blocking=False):
-        raise AdoptRefused(409, ["adoption_in_progress"], message=IN_PROGRESS_MESSAGE)
+        # A request with an id is told the id of the run holding the lock (None for a run without one).
+        running = adopt_journal.running() if request_id is not None else None
+        extra = {"request_id": running.get("request_id") if running else None} if request_id is not None else {}
+        raise AdoptRefused(409, ["adoption_in_progress"], message=IN_PROGRESS_MESSAGE, **extra)
     try:
-        return _adopt_locked(db, source_id, target_id, actor=actor, now=now, lister=lister)
+        adopt_journal.lock_holder_request_id = request_id
+        started_at = datetime.now(timezone.utc).replace(tzinfo=None)
+        adopt_journal.publish_running("adoption", request_id=request_id, source_id=source_id, target_id=target_id,
+                                      started_at=started_at.isoformat())
+        if request_id is None:
+            return _adopt_locked(db, source_id, target_id, actor=actor, now=now, lister=lister)
+        adoption_requests.begin(request_id, source_id, target_id, started_at)
+        try:
+            result = _adopt_locked(db, source_id, target_id, actor=actor, now=now, lister=lister,
+                                   request_id=request_id)
+        except AdoptRefused as exc:
+            adoption_requests.end(request_id, "refused", exc.status_code, lambda: jsonable_encoder(exc.as_detail()))
+            raise
+        except AdoptFailed as exc:
+            adoption_requests.end(request_id, "failed", exc.status_code, exc.as_detail)
+            raise
+        # `applied` was written in the adoption's own commit (_mark_applied); the flags known after it now.
+        adoption_requests.finish_applied(request_id, lambda: jsonable_encoder(result))
+        return result
     finally:
-        adopt_journal.ADOPTION_LOCK.release()
+        # Nested, so the release runs whatever the withdrawal does (it never raises).
+        try:
+            adopt_journal.clear_running()
+        finally:
+            adopt_journal.lock_holder_request_id = None
+            adopt_journal.ADOPTION_LOCK.release()
 
 
-def _adopt_locked(db: Session, source_id: int, target_id: int, *, actor, now: datetime, lister) -> dict:
+def _adopt_locked(db: Session, source_id: int, target_id: int, *, actor, now: datetime, lister,
+                  request_id: Optional[str] = None) -> dict:
     from app.core import audit
     from app.core.export_jobs import export_jobs
 
@@ -267,7 +309,7 @@ def _adopt_locked(db: Session, source_id: int, target_id: int, *, actor, now: da
             stack.enter_context(export_jobs.hold_for_file_changes(sorted({source_id, target_id}), HELD_MESSAGE))
         except HTTPException as exc:
             raise AdoptRefused(409, ["volume_held"], message=str(exc.detail)) from exc
-        result = _adopt_held(db, source_id, target_id, actor=actor, now=now, lister=lister)
+        result = _adopt_held(db, source_id, target_id, actor=actor, now=now, lister=lister, request_id=request_id)
     audit.log_event(db, level="INFO", category=CATEGORY, action=ACTION, actor=actor,
                     subject=result.pop("_target_stem"),
                     detail=(f"source={source_id} ({result.pop('_source_stem')}) target={target_id} "
@@ -318,7 +360,8 @@ def _lock(db: Session, source_id: int, target_id: int) -> list:
     raise AdoptRefused(409, ["source_records_changed"], message=CHANGED_MESSAGE)
 
 
-def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: datetime, lister) -> dict:
+def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: datetime, lister,
+                request_id: Optional[str] = None) -> dict:
     from app.core.adopt_captures import plan_adopt_captures
     from app.core.storage_ops import collection_root_dir
     from app.models.collection import Collection
@@ -385,6 +428,8 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
     to_create = _dirs_to_create(tgt_root, calibration=bool(plan.shot_renames))
     journal = _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, actor=actor, now=now,
                        retired_cards=retired_cards)
+    if request_id is not None:
+        journal["request_id"] = request_id
     try:
         adopt_journal.create_journal(journal)
     except adopt_journal.JournalTaken as exc:
@@ -407,6 +452,10 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
         _rename_all(moves, moved)
         adopt_journal.sync_journal_directories(journal)
         _write_rows(db, plan, records, source_id, target_id, now=now)
+        if request_id is not None:
+            # In this transaction: the request's row says `applied` exactly when this commit lands.
+            _mark_applied(db, request_id, _summary(plan, records, moved, retired, retired_cards, source_lines,
+                                                   appended=False, pending=True))
     except Exception as exc:
         # The row locks are still held: the files go back before the rollback lets them go.
         not_restored = _undo(moved)
@@ -453,15 +502,44 @@ def _adopt_held(db: Session, source_id: int, target_id: int, *, actor, now: date
         _audit(db, PENDING_ACTION, "WARN", journal,
                f"adopted; {'the target lines are pending; ' if not appended else ''}startup recovery finishes "
                f"it at the next start from {adopt_journal.journal_file()}")
+    return {**_summary(plan, records, moved, retired, retired_cards, source_lines, appended=appended,
+                       pending=pending),
+            "_source_stem": plan.source_stem, "_target_stem": plan.target_stem}
+
+
+def _summary(plan, records, moved, retired, retired_cards, source_lines, *, appended: bool, pending: bool) -> dict:
+    """The adoption's summary, as the POST answers it."""
     return {
-        "source_id": source_id, "target_id": target_id, "records": len(records), "images": len(plan.renames),
-        "files_renamed": len(moved), "rows_retired": len(retired) + len(retired_cards),
+        "source_id": plan.source_id, "target_id": plan.target_id, "records": len(records),
+        "images": len(plan.renames), "files_renamed": len(moved), "rows_retired": len(retired) + len(retired_cards),
         "counter_after": plan.counter_after,
         "colour_card_sets": len(plan.card_set_ids), "colour_card_shots": len(plan.shot_renames),
         "source_lines_appended": len(source_lines), "target_lines_appended": appended,
         "target_lines_pending": not appended, "recovery_pending": pending,
-        "_source_stem": plan.source_stem, "_target_stem": plan.target_stem,
     }
+
+
+class _RequestNotOpen(Exception):
+    """The request's row was not there with no outcome when the adoption came to mark it applied."""
+
+
+def _mark_applied(db: Session, request_id: str, summary: dict) -> None:
+    """Set the request's row `applied`, with the summary as known at the commit, in the adoption's transaction.
+
+    An UPDATE by request_id through the adoption's own session: the row was
+    inserted and committed by another session before the adoption began, so
+    this session sees it. Not an observer: anything it raises, and a row not
+    found with no outcome, fails the adoption, which is undone.
+    """
+    from app.core.adoption_requests import _now
+    from app.models.adoption_request import AdoptionRequest
+
+    updated = (db.query(AdoptionRequest)
+               .filter(AdoptionRequest.request_id == request_id, AdoptionRequest.outcome.is_(None))
+               .update({"outcome": "applied", "status": 200, "body": summary, "ended_at": _now()},
+                       synchronize_session=False))
+    if updated != 1:
+        raise _RequestNotOpen(f"the row of request {request_id} has an outcome already or is gone")
 
 
 def _journal(plan, records, retired, moves, to_create, tgt_root, target_lines, *, actor, now,

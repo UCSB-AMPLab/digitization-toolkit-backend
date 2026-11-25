@@ -8,6 +8,15 @@ journal names and why it is still there; repair answers
 POST /system/adoption/repair by fetching the files the recovery lacks and
 running that recovery again.
 
+Running now
+-----------
+`running` answers what holds ADOPTION_LOCK, from adopt_journal.running: the
+snapshot an adoption, a recovery or a repair publishes right after it takes
+the lock and withdraws right before it releases it. The report reads that
+snapshot and never takes the lock; an adoption is in it from the moment it
+takes the lock, before its journal exists. A storage switch holds the lock
+and is not in it.
+
 Running or left
 ---------------
 ADOPTION_LOCK is held by an adoption from before its journal is created to
@@ -133,6 +142,13 @@ the one switch that leads back to that root. Any field of a readable
 journal the report or the repair cannot read (_analyse) is reported as
 `journal_unreadable`, never raised out of the routes.
 
+With `run_id` (the report's `unfinished.run_id`, the journal's own run
+id), a journal in place with another run id, or none, or one that cannot
+be read, is refused at once with `journal_changed`, once both locks are
+taken, and nothing is repaired. Every refusal names the volumes of the
+journal read (`source` and `target`, each {id, name, filename_stem}, None
+when there is no readable journal), and so does the answer.
+
 The journal is then checked to be the one read (adopt_journal._require_own)
 and the startup recovery run under the same lock
 (adopt_journal.recover_holding_lock). Its result is the answer. Files
@@ -209,6 +225,8 @@ OTHER_FILESYSTEM_MESSAGE = ("The repair's staging directory is not on the file s
 AT_BOTH_MESSAGE = ("A file of the adoption is at both its old and its new path, and recovery stops on it whatever "
                    "is placed, so nothing was changed. Someone with access to the unit must decide which copy stays.")
 CHANGED_MESSAGE = "The adoption's journal changed during the repair. Nothing more was changed."
+RUN_CHANGED_MESSAGE = ("The unfinished adoption on the unit is not the one the request names, so nothing was "
+                       "repaired. Read the report again.")
 KEPT_MESSAGE = ("The recovery still stopped. The fetched files stay where they were placed: they are correct copies "
                 "at the names the records decide.")
 
@@ -299,15 +317,19 @@ def _read_settled():
 
 
 def report(db: Session) -> dict:
-    """GET /system/adoption (module header): {"unfinished": null} or what the journal names and why it stays.
+    """GET /system/adoption (module header): {"unfinished": null, "running": ...} or what the journal names and why.
+
+    `running` is what holds ADOPTION_LOCK now (_running), null when nothing
+    publishes itself there; `unfinished.run_id` is the journal's own run id.
 
     `repair_available` is exactly "precheck found no refusal", and
     `repair_refusal` is the refusal it found: the report and the repair ask
     the same function.
     """
+    now_running = _running(db)
     journal, running, unreadable = _read_settled()
     if journal is None and unreadable is None:
-        return {"unfinished": None}
+        return {"unfinished": None, "running": now_running}
     checked = precheck(db, None if unreadable is not None else journal, repair_running=_REPAIR_LOCK.locked(),
                        adoption_running=running)
     body = {"source": None, "target": None}
@@ -318,6 +340,8 @@ def report(db: Session) -> dict:
             db.rollback()
         if isinstance(journal.get("started_at"), str):
             body["started_at"] = journal["started_at"]
+    body["run_id"] = journal.get("run_id") if journal is not None and isinstance(journal.get("run_id"), str) \
+        else None
     if running:
         reason = RECOVERING
     elif checked.refusal in (adopt_journal.UNREADABLE, STORAGE_NOT_ACTIVE):
@@ -332,7 +356,25 @@ def report(db: Session) -> dict:
                 repair_refusal=checked.refusal, repair_available=checked.refusal is None)
     if checked.refusal == STORAGE_NOT_ACTIVE:
         body["journal_root"] = str(adopt_journal.journal_projects_root(journal))
-    return {"unfinished": body}
+    return {"unfinished": body, "running": now_running}
+
+
+def _running(db: Session) -> Optional[dict]:
+    """What holds ADOPTION_LOCK now, as it published itself (adopt_journal.running), with its volumes named.
+
+    Read from the published snapshot alone: the lock is never taken, and
+    the volumes are named with plain SELECTs.
+    """
+    run = adopt_journal.running()
+    if run is None:
+        return None
+    try:
+        source, target = _volume(db, run.get("source_id")), _volume(db, run.get("target_id"))
+    except Exception:  # noqa: BLE001 - a malformed id from a journal names no volume
+        db.rollback()
+        source = target = None
+    return {"request_id": run.get("request_id"), "kind": run.get("kind"), "started_at": run.get("started_at"),
+            "source": source, "target": target}
 
 
 def _last_code(journal: dict) -> str:
@@ -634,32 +676,78 @@ def _thumbnail_source(m: _Missing, kind: str, by_move: dict, by_missing: dict, w
 # The repair
 # ---------------------------------------------------------------------------
 
-def repair(db: Session, actor: Optional[str] = None) -> dict:
+def repair(db: Session, actor: Optional[str] = None, run_id: Optional[str] = None) -> dict:
     """POST /system/adoption/repair (module header); raises RepairRefused for the refusals.
 
     Both locks are taken without waiting, and whether each was taken goes to
-    precheck, which refuses on it as on every other check.
+    precheck, which refuses on it as on every other check. Holding
+    ADOPTION_LOCK, the repair publishes itself (adopt_journal.running).
+    With `run_id`, a journal with another run id, or none, is refused with
+    `journal_changed` before anything else is checked or done. Every
+    refusal raised once the journal was read names its volumes (`source`,
+    `target`, None when it names none or cannot be read), and so does the
+    answer.
     """
     got_repair = _REPAIR_LOCK.acquire(blocking=False)
-    got_adoption = got_repair and adopt_journal.ADOPTION_LOCK.acquire(blocking=False)
     try:
-        return _repair(db, actor, repair_running=not got_repair, adoption_running=got_repair and not got_adoption)
+        got_adoption = got_repair and adopt_journal.ADOPTION_LOCK.acquire(blocking=False)
+        try:
+            if got_adoption:
+                adopt_journal.publish_running("repair")   # never raises
+            return _repair(db, actor, repair_running=not got_repair,
+                           adoption_running=got_repair and not got_adoption, run_id=run_id)
+        finally:
+            if got_adoption:
+                # Nested, so the release runs whatever the withdrawal does (it never raises).
+                try:
+                    adopt_journal.clear_running()
+                finally:
+                    adopt_journal.lock_holder_request_id = None
+                    adopt_journal.ADOPTION_LOCK.release()
     finally:
-        if got_adoption:
-            adopt_journal.ADOPTION_LOCK.release()
         if got_repair:
             _REPAIR_LOCK.release()
 
 
-def _repair(db: Session, actor: Optional[str], *, repair_running: bool, adoption_running: bool) -> dict:
-    from app.core.export_jobs import export_jobs
+def _named(db: Session, journal) -> tuple:
+    """(source, target) of a journal read, each {id, name, filename_stem} or None."""
+    if not isinstance(journal, dict):
+        return None, None
+    try:
+        return _volume(db, journal.get("source_id")), _volume(db, journal.get("target_id"))
+    except Exception:  # noqa: BLE001 - a malformed id names no volume
+        db.rollback()
+        return None, None
 
+
+def _repair(db: Session, actor: Optional[str], *, repair_running: bool, adoption_running: bool,
+            run_id: Optional[str] = None) -> dict:
     try:
         journal = adopt_journal.read_journal()
     except adopt_journal.JournalUnreadable:
         journal = None
     else:
         journal = NO_JOURNAL if journal is None else journal
+    if not (repair_running or adoption_running):
+        adopt_journal.refine_running(journal)
+    source, target = _named(db, journal)
+    db.rollback()
+    try:
+        return _repair_read(db, actor, journal, repair_running=repair_running, adoption_running=adoption_running,
+                            run_id=run_id, named={"source": source, "target": target})
+    except RepairRefused as exc:
+        exc.extra.setdefault("source", source)
+        exc.extra.setdefault("target", target)
+        raise
+
+
+def _repair_read(db: Session, actor: Optional[str], journal, *, repair_running: bool, adoption_running: bool,
+                 run_id: Optional[str], named: dict) -> dict:
+    from app.core.export_jobs import export_jobs
+
+    if run_id is not None and not (repair_running or adoption_running) and \
+            (not isinstance(journal, dict) or journal.get("run_id") != run_id):
+        raise RepairRefused(409, "journal_changed", RUN_CHANGED_MESSAGE, reason="journal_changed")
     checked = precheck(db, journal, repair_running=repair_running, adoption_running=adoption_running)
     db.rollback()
     if checked.refusal is not None:
@@ -682,7 +770,7 @@ def _repair(db: Session, actor: Optional[str], *, repair_running: bool, adoption
             raise RepairRefused(409, "journal_changed", CHANGED_MESSAGE,
                                 fetched=[_entry(m) for m in placed]) from exc
         result = adopt_journal.recover_holding_lock(db)
-    return _answer(db, journal, actor, placed, result)
+    return {**_answer(db, journal, actor, placed, result), **named}
 
 
 def _entry(m: _Missing) -> dict:

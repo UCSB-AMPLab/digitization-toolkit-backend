@@ -88,7 +88,7 @@ def test_no_journal_reports_nothing_unfinished(client, db_session, override_proj
     r = client.get("/system/adoption")
 
     assert r.status_code == 200, r.text
-    assert r.json() == {"unfinished": None}
+    assert r.json() == {"unfinished": None, "running": None}
 
 
 @pytest.mark.unit
@@ -236,7 +236,7 @@ def test_a_running_adoption_is_reported_as_recovering_never_blocked(client, db_s
     assert (body["source"]["id"], body["target"]["id"]) == (src_id, tgt_id)
     assert repaired.status_code == 409 and repaired.json()["detail"]["code"] == "adoption_running"
     assert isinstance(outcome["result"], dict), outcome
-    assert client.get("/system/adoption").json() == {"unfinished": None}
+    assert client.get("/system/adoption").json() == {"unfinished": None, "running": None}
 
 
 @pytest.mark.unit
@@ -315,7 +315,7 @@ def test_a_master_lost_before_the_commit_is_fetched_to_its_old_path_and_the_adop
     assert not _journal().exists() and _no_part_files(root)
     [event] = _audit(db_session, "volume_captures_adoption_repaired")
     assert event.level == "WARN" and "reverted" in event.detail and lost.old_path.name in event.detail
-    assert client.get("/system/adoption").json() == {"unfinished": None}
+    assert client.get("/system/adoption").json() == {"unfinished": None, "running": None}
 
 
 @pytest.mark.unit
@@ -561,7 +561,7 @@ def test_with_nothing_missing_a_unit_without_a_read_remote_repairs_by_running_re
     assert r.status_code == 200, r.text
     assert (r.json()["result"], r.json()["fetched"], r.json()["derived"]) == ("finished", [], [])
     assert _inventory(root) == inventory and not _journal().exists()
-    assert client.get("/system/adoption").json() == {"unfinished": None}
+    assert client.get("/system/adoption").json() == {"unfinished": None, "running": None}
 
 
 @pytest.mark.unit

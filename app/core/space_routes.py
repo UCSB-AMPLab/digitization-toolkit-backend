@@ -293,6 +293,8 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     # An unfinished adoption of captures and its repair (app.core.adopt_repair). A testing volume is never adopted.
     ("GET", "/system/adoption"): Entry(),
     ("POST", "/system/adoption/repair"): Entry(),
+    # The outcome of an adoption a client named with its own id (app.core.adoption_requests).
+    ("GET", "/system/adoption/requests/{request_id}"): Entry(),
     ("GET", "/system/pairing"): Entry(),
     ("POST", "/system/pairing"): Entry(),
     ("POST", "/system/pairing/renew"): Entry(),

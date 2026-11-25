@@ -69,6 +69,7 @@ def init_db() -> None:
 	import app.models.fisqua         # noqa: F401
 	import app.models.unit_settings  # noqa: F401
 	import app.models.capture_request  # noqa: F401
+	import app.models.adoption_request  # noqa: F401
 	import app.models.colour_card  # noqa: F401
 
 	# Note: Tables are created via Alembic migrations, not create_all()

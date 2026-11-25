@@ -176,6 +176,7 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/system/offsite/retired-keys'): (('admin',),),
     ('GET', '/system/adoption'): (('admin',),),
     ('POST', '/system/adoption/repair'): (('admin',),),
+    ('GET', '/system/adoption/requests/{request_id}'): (('admin',),),
     ('GET', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing'): (('admin',),),
     ('POST', '/system/pairing/renew'): (('admin',),),
@@ -323,6 +324,7 @@ PATH_NOT_MATERIAL = {
     "uuid": "a saved network connection",
     "client_capture_id": "a client's id for one capture request; the lookup answers only a stored capture whose "
                          "record is in the caller's space, and 404 for any other",
+    "request_id": "a client's id for one adoption request; adoptions are an administrator's and real work only",
 }
 # Query and body fields that name material, and the kind each names.
 FIELD_MATERIAL = {
@@ -352,6 +354,9 @@ FIELD_NOT_MATERIAL = {
     "pair_id": "groups the images of one dual capture; nothing is looked up by it, on any route",
     "client_capture_id": "a client's id for one capture request; the capture routes answer a stored capture "
                          "only to a request of its kind, volume and space, and refuse any other naming nothing of it",
+    "client_request_id": "a client's id for one adoption request; a repeat is answered from the request recorded "
+                         "for it, which names the same route's volumes",
+    "run_id": "the run id of an adoption's journal, compared with the journal on the unit; nothing is looked up by it",
     "expected_image_ids": "a retake's own record's current images, compared with the record named by record_id "
                           "(itself a target); nothing is looked up by them",
     "filename_stem": "a volume's own stem, set on the volume itself; a stem another volume holds is refused "
@@ -643,7 +648,8 @@ def _role_admitted(caller, key, entry):
 
 _DUMMY_PATH = {"camera_index": "0", "job_id": "no-such-job", "list_id": "0", "position": "0", "uuid": "x",
                "set_id": "999999", "shot_id": "999999",
-               "client_capture_id": "00000000-0000-4000-8000-000000000000"}
+               "client_capture_id": "00000000-0000-4000-8000-000000000000",
+               "request_id": "00000000-0000-4000-8000-000000000000"}
 
 
 def _body_base(world, key, space, caller):
