@@ -4,15 +4,16 @@ The own password change asks for the current password, so a stolen
 session could otherwise guess it without limit. A wrong current password
 is recorded in app.core.login_throttle exactly as a failed sign-in is
 (record_failure with the account key `user:<username>` and the client's
-IP key), so failed changes and failed sign-ins add up. While either key is
-locked the route answers as POST /auth/login does, 429 "Too many failed
-login attempts. Try again later." with Retry-After, without checking the
-password; a correct current password clears both keys, as a successful
-sign-in does.
+IP key), so failed changes and failed sign-ins add up, under the same
+limits: 5 on the account, 20 on the machine. While either key is locked
+the route answers as POST /auth/login does, 429 with Retry-After and a
+`detail` that names the lock (`account_locked` or `machine_locked`),
+without checking the password; a correct current password clears the
+account's count and leaves the machine's, as a successful sign-in does.
 
     python -m pytest tests/unit/test_password_reset_throttle.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import pytest
@@ -108,7 +109,10 @@ def test_while_throttled_the_route_answers_as_login_does_and_does_not_check_the_
     resp = _reset(client, token, PASSWORD)
 
     assert resp.status_code == login.status_code == 429
-    assert resp.json() == login.json() == {"detail": "Too many failed login attempts. Try again later."}
+    assert resp.json() == login.json() == {"detail": {
+        "code": "account_locked",
+        "message": "Too many failed login attempts for this account. Try again later.",
+    }}
     assert resp.headers.get("Retry-After") and int(resp.headers["Retry-After"]) > 0
     assert checked == []
     assert _hash(db_session, user.id) == before
@@ -141,3 +145,35 @@ def test_another_accounts_count_is_its_own(client, db_session, monkeypatch):
     _reset(client, token, WRONG)
     assert auth_mod.login_throttle._state.get("user:ana", {}).get("failures")
     assert "user:luis" not in auth_mod.login_throttle._state
+
+
+@pytest.mark.unit
+def test_wrong_current_passwords_count_toward_the_machine_limit_of_twenty(client, db_session):
+    """Nineteen failures from one machine, sign-ins and changes, leave the change open; the twentieth locks the machine."""
+    _ordinary_user(db_session)
+    token = _token_for(client, "ana", PASSWORD)
+    for i in range(16):
+        assert _login(client, f"op{i % 4}", WRONG).status_code == 401
+    for _ in range(3):
+        assert _reset(client, token, WRONG).status_code == 401
+    assert _reset(client, token, WRONG).status_code == 401  # the twentieth; ana's fourth
+    resp = _reset(client, token, PASSWORD)
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["detail"] == {
+        "code": "machine_locked",
+        "message": "Too many failed login attempts from this machine. Try again later.",
+    }
+    assert int(resp.headers["Retry-After"]) > 0
+
+
+@pytest.mark.unit
+def test_a_written_change_does_not_clear_the_machine_count(client, db_session):
+    _ordinary_user(db_session)
+    token = _token_for(client, "ana", PASSWORD)
+    for i in range(19):
+        assert _login(client, f"op{i % 4}", WRONG).status_code == 401
+    assert _reset(client, token, PASSWORD).status_code == 200
+    assert _login(client, "op9", WRONG).status_code == 401  # the twentieth
+    resp = _login(client, "ana", NEW)
+    assert resp.status_code == 429, resp.text
+    assert resp.json()["detail"]["code"] == "machine_locked"
