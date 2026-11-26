@@ -1,8 +1,8 @@
-# Version: 0.2.0
+# Version: 0.3.0
 
 from __future__ import annotations
 from typing import Optional, List, Literal
-from pydantic import BaseModel, field_validator, model_validator
+from pydantic import BaseModel, Field, field_validator, model_validator
 from datetime import datetime
 # Aliased: `date` is already a field name on RecordBase (the free-text display
 # date), so importing the type under its own name would shadow it.
@@ -22,7 +22,14 @@ from datetime import date as dt_date
 # STATUS_TRANSITIONS below) — a plain status reset, not a recapture and not a
 # formal rejection, so it carries no reason and no rejection record. The
 # change itself is dated in record_status_changes, like every other.
-RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+#
+# "excluded" is Fisqua's third QC decision (contract 1.6): the opening is not
+# a page of the volume, such as a test shot of the rig or a duplicate. Only a
+# Fisqua decision sets it (app.core.fisqua_decisions, through
+# DECISION_TRANSITIONS below); no route offers it, so a request names one of
+# RequestedRecordStatus and a response may carry any RecordStatus.
+RequestedRecordStatus = Literal["captured", "in_review", "rejected", "approved"]
+RecordStatus = Literal["captured", "in_review", "rejected", "approved", "excluded"]
 
 # Allowed status transitions: (from_status, to_status) -> set of roles that can perform it.
 #
@@ -40,7 +47,7 @@ RecordStatus = Literal["captured", "in_review", "rejected", "approved"]
 #
 # - in_review -> rejected. Formal rejection is its own endpoint (POST
 #   /records/{id}/reject) with a mandatory predefined_reason. RecordStatusUpdate
-#   types its status as RecordStatus rather than a restricted literal, so this
+#   types its status as RequestedRecordStatus rather than a restricted literal, so this
 #   table is the only thing keeping the generic and bulk endpoints from writing
 #   "rejected" with no reason and no record_rejections row.
 # - in_review -> captured. Taking a handover back is a collection-level act
@@ -62,6 +69,20 @@ STATUS_TRANSITIONS: dict[tuple[str, str], set[str]] = {
 	("rejected", "captured"): {"operator", "admin"},
 }
 
+# The transitions a Fisqua decision may also take, as the reviewer
+# `Fisqua: <decidedBy>`, and no route: into "excluded" from in_review (from
+# approved or rejected the decision goes through in_review first, as approved
+# and rejected do), and out of it when a later decision approves or rejects
+# the record. excluded -> rejected is written by reject_locked_record, which
+# checks no table; it is listed so that the table names every way out.
+DECISION_TRANSITIONS: dict[tuple[str, str], set[str]] = {
+	**STATUS_TRANSITIONS,
+	("in_review", "excluded"): {"reviewer"},
+	("excluded", "in_review"): {"reviewer"},
+	("excluded", "approved"): {"reviewer"},
+	("excluded", "rejected"): {"reviewer"},
+}
+
 # The predefined rejection reasons. The first six mirror the list the
 # annotation feature's "Marcar error" uses client-side; the last three are
 # framing (a page cut off or badly framed), obstruction (a finger, weight or
@@ -81,6 +102,21 @@ PredefinedRejectionReason = Literal[
 # Which camera setup produced a document: one image, or an L+R pair fired
 # together on a single shutter press. Set once at capture time.
 CaptureMode = Literal["single", "dual"]
+# The page or pages of a dual opening never captured (records.missing_side):
+# "both" is a placeholder for a whole opening (contract 1.9 §10).
+MissingSide = Literal["left", "right", "both"]
+# The page a route or a Fisqua decision marks as missing on a dual record.
+MissingPage = Literal["left", "right"]
+# Why the operator closed a missing record without capturing it (records.closed_reason).
+ClosedReason = Literal["foliation_skip", "leaf_missing_from_volume", "captured_elsewhere", "other"]
+# Fisqua keeps notes to 2,000 characters (REJECTION_COMMENT_MAX_LENGTH below);
+# what a placeholder expects and every note on a missing record are held to the same.
+MISSING_TEXT_MAX_LENGTH = 2000
+MISSING_REQUEST_ID_MAX_LENGTH = 64
+MISSING_OPENINGS_MAX_COUNT = 50
+# Why a record is pending (app.core.recapture_turn.pending_reason): rejected,
+# prepared for retake with its rejected image still current, or missing a side.
+PendingReason = Literal["rejected", "prepared", "missing_side"]
 
 
 # ==============================================================================
@@ -253,6 +289,19 @@ class RecordRead(RecordBase):
 	created_by: Optional[str] = None
 	created_at: Optional[datetime]
 	modified_at: Optional[datetime]
+	# The page or pages of a dual opening never captured (records.missing_side):
+	# "left" or "right", whose one current image, if any, is the other page,
+	# or "both" for a placeholder, which has no image. Cleared by a dual
+	# capture into the record; None otherwise.
+	missing_side: Optional[MissingSide] = None
+	# What a placeholder should hold and a note on it; the Fisqua request it
+	# came from (kept after it is captured into); why it was closed without
+	# capturing, and the note on that.
+	missing_expected: Optional[str] = None
+	missing_note: Optional[str] = None
+	missing_request_id: Optional[str] = None
+	closed_reason: Optional[ClosedReason] = None
+	closed_note: Optional[str] = None
 	images: List[RecordImageRead] = []
 
 	class Config:
@@ -264,12 +313,12 @@ class RecordRead(RecordBase):
 # ==============================================================================
 
 class RecordStatusUpdate(BaseModel):
-	status: RecordStatus
+	status: RequestedRecordStatus
 
 
 class BulkStatusUpdate(BaseModel):
 	record_ids: List[int]
-	status: RecordStatus
+	status: RequestedRecordStatus
 
 	@field_validator("record_ids")
 	@classmethod
@@ -326,10 +375,10 @@ class RecordRejectionRead(BaseModel):
 
 
 class RecordToRetake(BaseModel):
-	"""A rejected record waiting to be retaken, with its volume and its latest rejection.
+	"""A pending record waiting to be retaken, with its volume, its latest rejection and why it waits.
 
 	The volume's fields are None for a record in no volume; the rejection's,
-	for a rejected record with no RecordRejection row.
+	for a record with no RecordRejection row, as a missing side has none.
 	"""
 	recordId: int
 	title: str
@@ -345,6 +394,48 @@ class RecordToRetake(BaseModel):
 	comment: Optional[str] = None
 	rejectedBy: Optional[str] = None
 	rejectedAt: Optional[datetime] = None
+	# Why it is pending, and for "missing_side" which page is missing (None otherwise).
+	pendingReason: PendingReason
+	missingSide: Optional[MissingSide] = None
+	# For a missing record: what it should hold, the note on it, and the
+	# Fisqua request it came from (records.missing_expected, missing_note,
+	# missing_request_id); None otherwise.
+	missingExpected: Optional[str] = None
+	missingNote: Optional[str] = None
+	requestId: Optional[str] = None
+
+
+# ==============================================================================
+# Openings and pages never captured (contract 1.9 §10)
+# ==============================================================================
+
+class MissingOpeningsCreate(BaseModel):
+	"""POST /collections/{id}/records/missing-opening: placeholders right after a record of the volume."""
+	afterRecordId: int
+	# How many openings are missing; one when null or absent.
+	count: Optional[int] = Field(default=None, ge=1, le=MISSING_OPENINGS_MAX_COUNT)
+	expected: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+	requestId: Optional[str] = Field(default=None, max_length=MISSING_REQUEST_ID_MAX_LENGTH)
+
+
+class MissingPageRequest(BaseModel):
+	"""POST /records/{id}/missing-page: the page of a dual record that was never captured."""
+	side: MissingPage
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+
+
+class CloseMissingRequest(BaseModel):
+	"""POST /records/{id}/close-missing: close a missing record without capturing it."""
+	reason: ClosedReason
+	note: Optional[str] = Field(default=None, max_length=MISSING_TEXT_MAX_LENGTH)
+
+	@model_validator(mode="after")
+	def _other_needs_a_note(self) -> "CloseMissingRequest":
+		# As a rejection's 'other': the note is the only record of why.
+		if self.reason == "other" and not (self.note or "").strip():
+			raise ValueError("Closing with reason 'other' needs a note saying why.")
+		return self
 
 
 class RecordStatusChangeRead(BaseModel):
@@ -356,6 +447,8 @@ class RecordStatusChangeRead(BaseModel):
 	to_status: RecordStatus
 	changed_by: Optional[str] = None
 	changed_at: datetime
+	# The note of a Fisqua exclusion; None for every other change.
+	note: Optional[str] = None
 
 	class Config:
 		from_attributes = True

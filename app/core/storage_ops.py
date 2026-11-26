@@ -5,9 +5,10 @@ These helpers keep the image files on disk consistent with the database when
 records are re-parented (move) or their container is removed (delete), and
 provide the guard that stops a delete from erasing files still referenced by surviving records.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
+import errno
 import glob
 import json
 import logging
@@ -18,13 +19,14 @@ from pathlib import Path
 from typing import Iterable, List, Optional, Tuple
 
 from fastapi import HTTPException
-from sqlalchemy.orm import Session
+from sqlalchemy import func, or_
+from sqlalchemy.orm import Session, object_session
 
 from app.core import config
 from app.models.collection import Collection
 from app.models.project import Project
 from app.models.record import Record, RecordImage
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import is_raw_suffix, preview_sidecar_of, raw_buffer_of, raw_sidecar_of, resolve_within_storage
 
 logger = logging.getLogger(__name__)
 
@@ -40,16 +42,23 @@ Relocation = Tuple[Path, str, int, str, str, str]
 
 
 class FixityIndexOnce:
-    """The capture manifests' FixityIndex under the active projects root, built on first use and kept."""
+    """The capture manifests' FixityIndex under the active projects root, built on first use and kept.
+
+    Built from the manifests of the space of the first image it is asked
+    for (app.core.testing_space.manifest_filter_for_images): the images of
+    one move are all in one space, since no move crosses spaces.
+    """
 
     def __init__(self) -> None:
         self._index = None
 
-    def __call__(self):
+    def __call__(self, img: Optional[RecordImage] = None):
         if self._index is None:
             from app.core.integrity import build_fixity_index
+            from app.core.testing_space import manifest_filter_for_images
 
-            self._index = build_fixity_index(config.settings.projects_dir.resolve())
+            projects_dir = config.settings.projects_dir.resolve()
+            self._index = build_fixity_index(projects_dir, include=manifest_filter_for_images([img], projects_dir))
         return self._index
 
 
@@ -74,7 +83,7 @@ def relocation_of(img: RecordImage, src: Path, dst: Path, fixity_index: FixityIn
     src, dst = src.resolve(), dst.resolve()
     if not dst.is_relative_to(root) or len(dst.relative_to(root).parts) < 2:
         return None
-    sha = fixity_index().expected(img.capture_id, img.id, src)
+    sha = fixity_index(img).expected(img.capture_id, img.id, src)
     if sha is None:
         logger.warning(f"No capture checksum is held for image {img.id} at {src}; "
                        f"no relocation record is written for its rename to {dst}")
@@ -299,6 +308,75 @@ def _raw_sidecar_to_carry(master: Path) -> Optional[Path]:
     return sidecar
 
 
+def _like_literal(text: str) -> str:
+    """`text` with the LIKE wildcards and the escape character escaped, for `ESCAPE '\\'`."""
+    return text.replace("\\", "\\\\").replace("%", "\\%").replace("_", "\\_")
+
+
+def rows_master_paths_named(db: Optional[Session], names: Iterable[str]) -> List[Path]:
+    """The stored master paths of the rows, in any record or volume, whose file name is one of `names`.
+
+    Names are compared case-insensitively, so a row that stored `F.RAW` is a
+    candidate for `f.raw`; whether it is the same file is for same_file to
+    say (raw_buffer_of), since a case-sensitive volume keeps the two apart.
+    The LIKE pattern escapes its wildcards, so `a_b%c.raw` matches only
+    itself, and the match is checked again on the name in Python. With no
+    session, there are none.
+    """
+    wanted = {n.casefold() for n in names if n}
+    if db is None or not wanted:
+        return []
+    clauses = [func.lower(RecordImage.file_path).like("%/" + _like_literal(n.lower()), escape="\\")
+               for n in wanted]
+    rows = db.query(RecordImage.file_path).filter(or_(*clauses)).all()
+    return sorted({Path(fp) for (fp,) in rows if fp and Path(fp).name.casefold() in wanted})
+
+
+def raw_buffer_candidate_names(buffer: Path) -> set:
+    """The names a row owning `buffer` could store: its own, and the name a symlink there points at."""
+    names = {buffer.name}
+    try:
+        names.add(Path(os.path.realpath(buffer)).name)
+    except (OSError, ValueError):
+        pass
+    return names
+
+
+def _raw_buffer_to_carry(master: Path, sibling_masters: set, db: Optional[Session] = None) -> Optional[Path]:
+    """The `.raw` sidecar that moves or is renamed with a JPEG `master`, or None (NEH-261).
+
+    A multi-format capture (Picamera2Backend with raw) writes the raw sensor
+    buffer beside its JPEG master under the same stem; it has no row, and
+    the delete paths find it by raw_buffer_of. It is carried when it is a
+    file inside the storage roots and raw_buffer_of grants it against the
+    record's siblings and every row `db` holds under the buffer's name
+    (rows_master_paths_named). The entry beside the master is what moves,
+    never the target of a symlink there.
+    """
+    candidate = raw_sidecar_of(master)
+    rows = list(sibling_masters) + rows_master_paths_named(db, raw_buffer_candidate_names(candidate))
+    buffer = raw_buffer_of(master, rows)
+    if buffer is None or not buffer.is_file() or resolve_within_storage(str(buffer)) is None:
+        return None
+    return buffer
+
+
+def _carry_sidecar(sidecar: Path, sidecar_dst: Path, master_dst: Path, src: Path,
+                   not_moved: Optional[List[str]], moved: Optional[List[Tuple[Path, Path]]]) -> None:
+    """Move a sidecar after its master; a failure is logged at WARNING and listed in `not_moved`, never raised."""
+    try:
+        if sidecar_dst.exists():
+            raise FileExistsError(errno.EEXIST, "name taken", str(sidecar_dst))
+        sidecar_dst.parent.mkdir(parents=True, exist_ok=True)
+        shutil.move(str(sidecar), str(sidecar_dst))
+        if moved is not None:
+            moved.append((sidecar, sidecar_dst))
+    except OSError as e:
+        logger.warning(f"Moved {src} to {master_dst} but its sidecar could not follow, left at {sidecar}: {e}")
+        if not_moved is not None:
+            not_moved.append(sidecar.name)
+
+
 def _name_taken(dst: Path, src: Path, sibling_masters: set) -> bool:
     """True if moving `src` to `dst` would clash with something already in dst's directory.
 
@@ -330,6 +408,12 @@ def relocate_image(
     fixity_index: Optional[FixityIndexOnce] = None,
 ) -> bool:
     """Move an image's file into `target_dir` and update its stored path.
+
+    A JPEG master's `.raw` sidecar (a multi-format capture, NEH-261) moves
+    with it the same way, to raw_sidecar_of the master's final path, so a
+    master renamed on a clash keeps its raw buffer under its new stem. A
+    `<stem>.raw` already in the target is a clash (`_name_taken`), so the
+    master is renamed rather than the buffer overwritten.
 
     A RAW master's `_preview.jpg` sidecar moves with it and is named and
     placed from the master's final path (preview_sidecar_of): beside the
@@ -380,6 +464,7 @@ def relocate_image(
             if resolved is not None:
                 sibling_masters.add(resolved)
     sidecar = _raw_sidecar_to_carry(src)
+    raw_buffer = _raw_buffer_to_carry(src, sibling_masters, object_session(img))
     if _name_taken(dst, src, sibling_masters):
         dst = target_dir / f"{src.stem}_{uuid.uuid4().hex[:8]}{src.suffix}"
 
@@ -407,6 +492,10 @@ def relocate_image(
             logger.warning(f"Moved {src} to {dst} but its preview sidecar could not follow, left at {sidecar}: {e}")
             if not_moved is not None:
                 not_moved.append(sidecar.name)
+
+    if raw_buffer is not None:
+        # Beside the master under its final stem, so a renamed master keeps it (raw_sidecar_of).
+        _carry_sidecar(raw_buffer, raw_sidecar_of(dst), dst, src, not_moved, moved)
 
     old_thumb = resolve_within_storage(img.thumbnail_path)
     img.thumbnail_path = None
@@ -748,7 +837,12 @@ def _rename_journal_file() -> Path:
 
 
 def write_rename_journal(project_id: int, old_name: str, new_name: str, old_root: Path, new_root: Path) -> None:
-    """Durably record intent to rename, before the on-disk move happens."""
+    """Durably record intent to rename, before the on-disk move happens.
+
+    The journal also records whether old_root existed then: a project with
+    no tree moves nothing, so a directory at new_root found later is not
+    its tree (reconcile_pending_rename).
+    """
     from capture.utils import atomic_write
 
     path = _rename_journal_file()
@@ -759,6 +853,7 @@ def write_rename_journal(project_id: int, old_name: str, new_name: str, old_root
         "new_name": new_name,
         "old_root": str(old_root),
         "new_root": str(new_root),
+        "old_root_existed": old_root.exists(),
     }, indent=2)
     atomic_write(path, lambda tmp: Path(tmp).write_text(payload, encoding="utf-8"))
 
@@ -783,8 +878,35 @@ def read_rename_journal() -> Optional[dict]:
         return None
 
 
+def _rename_not_completed(db: Session, j: dict, why: str) -> None:
+    """Log, as an error in the log and in system_logs, a journalled rename the recovery leaves as it is.
+
+    The journal is kept, so every startup checks it again until the
+    directories are put right by hand.
+    """
+    from app.models.system_log import SystemLog
+
+    detail = f"{why}; journal kept: {j['old_root']} -> {j['new_root']}"
+    logger.error("[ERROR] Project rename of project %s not completed after restart: %s", j["project_id"], detail)
+    db.add(SystemLog(level="ERR", category="system", action="project_rename_not_completed",
+                     subject=f"project {j['project_id']}", detail=detail[:500]))
+    db.commit()
+
+
 def reconcile_pending_rename(db: Session) -> None:
-    """Replay or discard a rename interrupted by a crash. Idempotent; safe at every startup."""
+    """Replay or discard a rename interrupted by a crash. Idempotent; safe at every startup.
+
+    A rename is never completed onto a directory that is not this
+    project's tree: one that another project's name maps to
+    (projects_sharing_directory), one that existed before the move (the
+    journal says old_root did not exist, so nothing moved there), or, when
+    the tree is still at old_root, one that exists already. In each of
+    those cases the database and the disk are left as they are, the
+    journal is kept, and the case is logged `project_rename_not_completed`
+    (_rename_not_completed).
+    """
+    from app.core.paths import project_dir_name
+
     j = read_rename_journal()
     if not j:
         return
@@ -797,10 +919,18 @@ def reconcile_pending_rename(db: Session) -> None:
         clear_rename_journal()
         return
 
+    taken = bool(projects_sharing_directory(db, j["new_name"], exclude_id=project.id))
+
     # DB already carries the new name, so the move preceded the commit and files
     # belong at new_root; repair only if a crash left them at old_root.
     if project.name == j["new_name"]:
-        if old_root.exists() and not new_root.exists():
+        if old_root.exists():
+            if new_root.exists():
+                _rename_not_completed(db, j, "both directories exist; the tree is not moved onto the new one")
+                return
+            if taken:
+                _rename_not_completed(db, j, f"another project's name maps to {project_dir_name(j['new_name'])}")
+                return
             try:
                 move_project_tree(old_root, new_root)
             except OSError:
@@ -812,6 +942,13 @@ def reconcile_pending_rename(db: Session) -> None:
     # DB still carries the old name: finish the DB side only if the files already moved.
     if project.name == j["old_name"]:
         if new_root.exists() and not old_root.exists():
+            if taken:
+                _rename_not_completed(db, j, f"another project's name maps to {project_dir_name(j['new_name'])}")
+                return
+            if not j.get("old_root_existed", True):
+                _rename_not_completed(db, j, "the project had no tree when the rename began, so the directory "
+                                             "at the new name is not its tree")
+                return
             project.name = j["new_name"]
             for img in db.query(RecordImage).all():
                 new_fp = rebase_stored_path(img.file_path, old_root, new_root)
@@ -828,3 +965,26 @@ def reconcile_pending_rename(db: Session) -> None:
 
     # Name matches neither side (renamed again since): the journal is stale.
     clear_rename_journal()
+
+
+def projects_sharing_directory(db: Session, name: str, exclude_id: Optional[int] = None) -> List[int]:
+    """The ids of the projects, other than `exclude_id`, whose directory is the one `name` would use."""
+    from app.core.paths import project_dir_name
+
+    directory = project_dir_name(name)
+    return [pid for pid, other in db.query(Project.id, Project.name).all()
+            if pid != exclude_id and project_dir_name(other) == directory]
+
+
+def refuse_taken_project_directory(db: Session, name: str, exclude_id: Optional[int] = None) -> None:
+    """ProjectDirectoryTaken when another project, testing or real, has the directory `name` would use.
+
+    A project's directory is project_dir_name of its name, which folds case,
+    accents and punctuation, so two different names can share one. Called
+    by POST /projects/, PUT /projects/{id} and the list import before a
+    project is created or renamed.
+    """
+    from app.core.project_names import ProjectDirectoryTaken
+
+    if projects_sharing_directory(db, name, exclude_id):
+        raise ProjectDirectoryTaken()

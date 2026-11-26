@@ -1,15 +1,17 @@
-# Version: 0.2.0
+# Version: 0.3.0
 
 from datetime import datetime, timezone
-from fastapi import APIRouter, Depends, HTTPException, Query, Response
+from fastapi import APIRouter, Depends, HTTPException, Path as PathParam, Query, Response
 from sqlalchemy.orm import Session
 from sqlalchemy.exc import IntegrityError
 from app.models.record import Record, RecordImage
 from typing import List, Literal, Optional
-from pydantic import BaseModel, field_validator
+from pydantic import BaseModel, ConfigDict, Field, StrictInt, field_validator, model_validator
 import logging
 
 from app.api.deps import get_db_dependency
+from app.core.project_names import display_project_name
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import get_current_user, RoleChecker
 from app.models.camera import CameraSettings
 from app.models.user import User
@@ -22,16 +24,38 @@ from app.core.volume_stem import RETAKE_STATUS_DETAIL, RETAKE_VOLUME_DETAIL, STE
 from app.core.paths import is_raw_suffix, preview_sidecar_of
 from app.core.storage_ops import resolve_project_name
 from app.core.db_errors import integrity_conflict
-from app.core.record_sequence import next_sequences
+from app.core.record_sequence import VOLUME_CHANGED_MESSAGE, VolumeChangedError, insert_after, lock_volume_records, next_sequences
 from app.core.record_status import change_record_status
 from app.core import recapture_turn
+from app.core import unit_activity
+from app.core import capture_requests
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
 
 allow_admin = RoleChecker(["admin"])
 allow_contributor = RoleChecker(["admin", "operator"])
+# Routes that take a picture or hold a camera busy carry this, so the
+# backend knows a camera is in use (app.core.unit_activity). A route
+# dependency rather than a parameter: the routes' signatures stay as they are.
+_CAMERA_BUSY = [Depends(unit_activity.tracked)]
 allow_read_only = RoleChecker(["admin", "operator", "reviewer"])
+
+
+RECORD_CHANGED_DETAIL = {
+	"code": "record_changed",
+	"message": "This record's current images are not the ones the retake names; it was changed elsewhere.",
+}
+
+# The most image ids a retake may name in expected_image_ids: a record holds
+# one current image, or two for a pair; the bound only keeps the body small.
+MAX_EXPECTED_IMAGE_IDS = 16
+
+
+PLACEHOLDER_NEEDS_DUAL_DETAIL = {
+	"code": "placeholder_needs_dual",
+	"message": "This record is a placeholder for a whole opening; capture it with both cameras.",
+}
 
 
 def _next_record_sequence(db: Session, collection_id: int) -> int:
@@ -58,7 +82,11 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	path. A request with a record_id must name the record's own volume: the
 	file is written under the volume the request names, while the record and
 	the counter raised are its own volume's. Called in each capture endpoint
-	before any camera is touched.
+	before any camera is touched. 409 too while an unfinished adoption's
+	journal names the volume (app.core.adopt_journal), or cannot be read:
+	its files may be at either of two names until startup recovery decides;
+	and 409 `captures_adopted_away` for a volume an adoption closed
+	(Collection.captures_adopted_at).
 	"""
 	if not collection_id:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
@@ -66,6 +94,15 @@ def _refuse_capture_without_volume_or_stem(db: Session, collection_id: Optional[
 	volume = locked_volume_query(db, collection_id).first()
 	if volume is None:
 		raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+	# A testing volume a purge is removing takes no capture (app.core.testing_space).
+	from app.core.testing_space import refuse_volume_being_removed
+	refuse_volume_being_removed(volume)
+	from app.core import adopt_journal
+	if adopt_journal.journal_names_volume(collection_id):
+		raise HTTPException(status_code=409, detail={"code": "adoption_unfinished",
+		                                             "message": adopt_journal.unfinished_message()})
+	# A volume an adoption closed (Collection.captures_adopted_at) exists only to be deleted; read under its lock.
+	adopt_journal.refuse_if_adopted_away(db, [collection_id])
 	if retake_record is not None:
 		if retake_record.collection_id is None:
 			raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
@@ -88,6 +125,32 @@ def _refuse_retake_out_of_the_operators_hands(retake_record: Optional[Record]) -
 		raise HTTPException(status_code=409, detail=RETAKE_STATUS_DETAIL)
 
 
+def _refuse_expected_images_without_a_record(expected_image_ids: Optional[List[int]], record_id: Optional[int]) -> None:
+	"""422 for expected_image_ids on a capture that retakes no record: they name what a retake replaces."""
+	if expected_image_ids is not None and not record_id:
+		raise HTTPException(
+			status_code=422,
+			detail="expected_image_ids names the images a retake replaces; it needs record_id.",
+		)
+
+
+def _refuse_a_retake_of_other_images(retake_record: Optional[Record], expected_image_ids: Optional[List[int]]) -> None:
+	"""409 record_changed for a retake whose expected_image_ids are not the record's current images.
+
+	A retake may name the images it replaces (NEH-388): the screen that sends
+	it read them, and another screen's retake can commit between that read
+	and this request. Compared as a set, under the record's lock, which every
+	path that changes which images are current takes, so the check still holds
+	at commit. Called with the other retake refusals, before any number is
+	taken or camera touched. Without the field, nothing is compared.
+	"""
+	if retake_record is None or expected_image_ids is None:
+		return
+	current = {img.id for img in retake_record.images if img.is_current}
+	if current != set(expected_image_ids):
+		raise HTTPException(status_code=409, detail=RECORD_CHANGED_DETAIL)
+
+
 def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_record: Optional[Record], user: User) -> bool:
 	"""409 for an operator's capture that would start a new volume during the recaptures turn.
 
@@ -97,10 +160,22 @@ def _refuse_a_new_volume_out_of_turn(db: Session, collection_id: int, retake_rec
 	after the record and volume locks, and held until the capture commits, so
 	the turn read here is still the turn when its new_volume_started event is
 	written and two operators cannot both start a volume on one completion
-	(app.core.recapture_turn). An admin may start one in any turn. Called
-	after the other refusals, before any number is taken or camera touched.
+	(app.core.recapture_turn). An admin may start one in any turn. A full
+	rescan is rework, not a new volume: its first capture is never refused,
+	takes no turn lock and returns False, so it writes no new_volume_started
+	and leaves the turn as it was. Called after the other refusals, before
+	any number is taken or camera touched.
+
+	The turn is real work's alone: a capture into a testing volume is never
+	refused for it, takes no turn lock and returns False, so it writes no
+	new_volume_started either.
 	"""
+	volume = db.get(Collection, collection_id)
+	if volume is not None and volume.testing:
+		return False
 	if retake_record is not None or not recapture_turn.volume_is_empty(db, collection_id):
+		return False
+	if recapture_turn.volume_is_full_rescan(volume):
 		return False
 	recapture_turn.lock_turn(db)
 	if user.role != "admin" and recapture_turn.turn(db)["state"] == "recaptures":
@@ -117,26 +192,101 @@ def _record_turn_events(db: Session, record: Record, starts_volume: bool, retook
 	its volume with none pending (app.core.recapture_turn), so once for each
 	time the volume reaches zero, and never for a status change alone. A retake takes the turn lock here, last of
 	its locks, so its event and a new volume's start are written in turn.
+
+	A full rescan not yet promoted writes no recapture_volume_completed: its
+	retakes are part of its capture, and its first promotion is what opens
+	a turn. Once it carries rescan_volume_completed, its retakes complete it
+	as any volume's do.
+
+	A capture into a testing volume writes no event and takes no turn lock:
+	the turn is real work's alone (app.core.recapture_turn).
 	"""
 	if not (starts_volume or retook_pending):
 		return
 	volume = db.get(Collection, record.collection_id)
+	if volume is None or volume.testing:
+		return
 	if starts_volume:
 		recapture_turn.record_event(db, recapture_turn.STARTED_ACTION, volume, user.username)
 		return
 	recapture_turn.lock_turn(db)
 	db.flush()  # the retaken record's new status and images, before the count
-	if recapture_turn.volume_pending(db, record.collection_id) == 0:
+	if recapture_turn.volume_pending(db, record.collection_id) == 0 and not (
+			recapture_turn.volume_is_full_rescan(volume)
+			and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
 		recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, user.username)
 
 
-def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int]) -> tuple[str, Optional[str], Optional[str]]:
+def _stored_capture_project_name(project_name: str, user: Optional[User]) -> str:
+	"""The stored name of the project a capture body names: the testing account sends a testing project's display name."""
+	from app.core.testing_space import TESTING_ROLE, stored_project_name
+
+	return stored_project_name(user is not None and user.role == TESTING_ROLE, project_name)
+
+
+def _refuse_a_project_name_outside_the_testing_space(db: Session, project_name: str, user: User) -> None:
+	"""404 not_found when the testing account's project_name names no testing project.
+
+	The testing account names a testing project by its display name
+	(app.core.testing_space._project_name_space); a name that names none,
+	a real project's included, is answered as material it does not reach,
+	before anything is locked or any camera touched. Every other caller's
+	name is left as it was.
+	"""
+	from app.core import testing_space
+
+	if user.role != testing_space.TESTING_ROLE:
+		return
+	stored = _stored_capture_project_name(project_name, user)
+	if db.query(Project.id).filter(Project.name == stored, Project.testing.is_(True)).first() is None:
+		raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+
+
+def _refuse_a_testing_capture_below_the_reserve(db: Session, user: User) -> None:
+	"""507 testing_reserve for the testing account while free space is below its reserve.
+
+	Its reserve is the larger of the testing reserve and the storage reserve
+	(app.core.testing_space.refuse_below_reserve). Called before any camera
+	is touched, any number taken or any file written. Every other caller is
+	checked by _refuse_a_real_capture_below_the_storage_reserve instead.
+	"""
+	from app.core import testing_space
+
+	if user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_below_reserve(db)
+
+
+def _refuse_a_real_capture_below_the_storage_reserve(db: Session, user: User, root) -> None:
+	"""507 storage_reserve for every caller but the testing account while free space is below the storage reserve.
+
+	The last refusal of a capture: called after every other check and after
+	the event's number is taken, immediately before the camera is triggered,
+	on `root`, the projects root the capture retained for its files,
+	so a request refused for anything else is answered as before. The
+	number taken is rolled back with the transaction
+	(app.core.storage_override.refuse_below_storage_reserve).
+	"""
+	from app.core import storage_override, testing_space
+
+	if user.role == testing_space.TESTING_ROLE:
+		return
+	try:
+		storage_override.refuse_below_storage_reserve(root)
+	except HTTPException:
+		db.rollback()
+		raise
+
+
+def _resolve_capture_target(db: Session, project_name: str, collection_id: Optional[int],
+                            user: Optional[User] = None) -> tuple[str, Optional[str], Optional[str]]:
 	"""Authoritative (project_name, collection_name, stem) for the on-disk capture path.
 
 	A volume with a file name stem captures into `<stem>/captures/`; one
 	without captures into its name-based directory under its project
 	(image_output_dir). Both are returned, with the stem None for a volume
-	without one; a project-level capture has neither.
+	without one; a project-level capture has neither. The project name is
+	the stored one; `project_name` is read as `user` sends it
+	(_stored_capture_project_name).
 	"""
 	if collection_id:
 		col = db.query(Collection).filter(Collection.id == collection_id).first()
@@ -146,7 +296,7 @@ def _resolve_capture_target(db: Session, project_name: str, collection_id: Optio
 		if not resolved:
 			raise HTTPException(status_code=422, detail=f"Collection {collection_id} is not attached to a project")
 		return resolved, col.name, col.filename_stem
-	project = db.query(Project).filter(Project.name == project_name).first()
+	project = db.query(Project).filter(Project.name == _stored_capture_project_name(project_name, user)).first()
 	if not project:
 		raise HTTPException(status_code=422, detail="project_name does not match a known project")
 	return project.name, None, None
@@ -190,10 +340,28 @@ class DeviceInfo(BaseModel):
 	# Calibration data (populated when calibrated=True)
 	lens_position: Optional[float] = None
 	awb_gains: Optional[List[float]] = None
-	orientation: Optional[int] = None  # Saved rotation for this body, if ever set (NEH-71)
+	# The body's effective clockwise rotation: the saved one, or, when none
+	# was ever saved, the default for the body's role: 270 left, 90 right, 90
+	# with no role (CameraRegistry.effective_orientation). Never null.
+	orientation: int = 90
+	# True when an orientation was saved for this body; False when
+	# `orientation` is the default.
+	orientation_saved: bool = False
+	# The default for the body's role, whatever is saved: 270 left, 90 right,
+	# 90 with no role (CameraRegistry.default_orientation). Never null.
+	default_orientation: int = 90
 	# Capabilities
 	has_aperture_control: bool = False
 	supports_zoom: bool = False  # True when ScalerCrop is available (picamera2 backend)
+	# Stepped optical zoom (CHDK backend only): how many steps the lens has,
+	# and the step the backend last confirmed on the camera. Null until the
+	# camera has reported them, and always null on other backends.
+	zoom_steps: Optional[int] = None
+	zoom_step: Optional[int] = None
+	# Seconds the camera's clock differs from the unit's at the last check,
+	# negative when the camera is behind. Null when not measured or not a CHDK
+	# camera. A live measurement: it is not stored.
+	clock_offset_s: Optional[float] = None
 	# Which pages this body shoots: "odd", "even", or null when it has no
 	# parity (CHDK backend only; the file that carries it lives on the card).
 	# Not a side of the table - left and right are the kiosk's swap toggle.
@@ -201,6 +369,30 @@ class DeviceInfo(BaseModel):
 	# Why this body may not capture, in words for the operator: two bodies on
 	# one parity, or a body with no identity. Null when it is ready.
 	error: Optional[str] = None
+	# The USB socket the body is plugged into, as a topology path ("1-1.2"),
+	# and the body's serial. Null where the backend cannot tell.
+	usb_port: Optional[str] = None
+	serial: Optional[str] = None
+	# The page this body photographs, "left" or "right", as stored in the
+	# camera registry, and whether the operator has confirmed it.
+	role: Optional[str] = None
+	role_confirmed: bool = False
+	usb_port_at_confirmation: Optional[str] = None
+	# The role the backend's current placement suggests ("own_txt" for a
+	# CHDK card parity, "gphoto2_pin" for a bindings pin). It is shown to the
+	# operator and nothing acts on it.
+	role_guess: Optional[str] = None
+	role_guess_source: Optional[str] = None
+	# Focus lock (CHDK backend only). focus_locked is null until the body is
+	# in shooting mode, then true while the camera holds a lock it confirmed.
+	# focus_distance is the distance in mm the camera reported for that lock.
+	# focus_stale is true when the zoom moved after the last lock, and
+	# focus_restore_failed when a stored distance was sent on entering
+	# shooting mode and the camera did not report it back.
+	focus_locked: Optional[bool] = None
+	focus_distance: Optional[int] = None
+	focus_stale: bool = False
+	focus_restore_failed: bool = False
 
 
 _VALID_ROTATIONS = (0, 90, 180, 270)
@@ -208,8 +400,22 @@ _VALID_ROTATIONS = (0, 90, 180, 270)
 
 def _validate_rotate_deg(v: Optional[int]) -> Optional[int]:
 	if v is not None and v not in _VALID_ROTATIONS:
-		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}; got {v}")
+		raise ValueError(f"rotate_deg must be one of {_VALID_ROTATIONS}")
 	return v
+
+
+# A UUID in its canonical 36-character form, in either case.
+_CLIENT_CAPTURE_ID_PATTERN = r"[0-9a-fA-F]{8}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{4}-[0-9a-fA-F]{12}"
+
+
+def _validate_client_capture_id(v: Optional[str]) -> Optional[str]:
+	"""None, or the id in lowercase: one id is one capture whatever case the client sends it in."""
+	import re
+	if v is None:
+		return None
+	if not re.fullmatch(_CLIENT_CAPTURE_ID_PATTERN, v):
+		raise ValueError("client_capture_id must be a UUID in its canonical 36-character form")
+	return v.lower()
 
 
 class CaptureRequest(BaseModel):
@@ -219,18 +425,29 @@ class CaptureRequest(BaseModel):
 	resolution: str = "medium"  # low, medium, high
 	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	# Clockwise rotation applied post-capture: 0, 90, 180, 270, or None.
-	# None (the default) leaves the registry's saved orientation from
+	# None (the default) leaves the body's effective orientation from
 	# default_camera_config_from_registry in place; an explicit value,
 	# including 0, overrides it (NEH-71).
 	rotate_deg: Optional[int] = None
 	record_id: Optional[int] = None  # Link to existing record, or create new if None
 	record_title: Optional[str] = None  # Used if creating new record
 	collection_id: Optional[int] = None  # Collection to link the record to
+	# The client's id for this capture (app.core.capture_requests): a request
+	# repeating it is answered from the saved capture. None captures as always.
+	client_capture_id: Optional[str] = None
+	# With record_id: the ids of the record's current images the retake
+	# replaces; refused with 409 record_changed when they are not (NEH-388).
+	expected_image_ids: Optional[List[int]] = Field(default=None, max_length=MAX_EXPECTED_IMAGE_IDS)
 
 	@field_validator("rotate_deg")
 	@classmethod
 	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
 		return _validate_rotate_deg(v)
+
+	@field_validator("client_capture_id")
+	@classmethod
+	def _check_client_capture_id(cls, v: Optional[str]) -> Optional[str]:
+		return _validate_client_capture_id(v)
 
 
 class DualCaptureRequest(BaseModel):
@@ -240,7 +457,7 @@ class DualCaptureRequest(BaseModel):
 	include_resolution_in_filename: bool = False  # true is refused with a 422: the contract fixes the name
 	stagger_ms: int = 20
 	# Clockwise rotation per camera: 0, 90, 180, 270, or None. None leaves the
-	# registry's saved orientation in place; an explicit value, including 0,
+	# body's effective orientation in place; an explicit value, including 0,
 	# overrides it (NEH-71 - see CaptureRequest.rotate_deg).
 	rotate_deg_cam0: Optional[int] = None
 	rotate_deg_cam1: Optional[int] = None
@@ -249,11 +466,27 @@ class DualCaptureRequest(BaseModel):
 	sequence: Optional[int] = None  # Page number/order
 	left_camera_index: int = 0  # Which camera index maps to the left page (0 or 1)
 	collection_id: Optional[int] = None  # Collection to link the record to
+	# Insert the new record right after this record of the volume, moving
+	# every later record's sequence up one, instead of after the highest
+	# (contract 1.9 §10.2). Not with record_id. Sent as afterRecordId.
+	after_record_id: Optional[int] = Field(default=None, alias="afterRecordId")
+	# As CaptureRequest.client_capture_id.
+	client_capture_id: Optional[str] = None
+	# With record_id: the ids of the record's current images the retake
+	# replaces; refused with 409 record_changed when they are not (NEH-388).
+	expected_image_ids: Optional[List[int]] = Field(default=None, max_length=MAX_EXPECTED_IMAGE_IDS)
+
+	model_config = ConfigDict(populate_by_name=True)
 
 	@field_validator("rotate_deg_cam0", "rotate_deg_cam1")
 	@classmethod
 	def _check_rotate_deg(cls, v: Optional[int]) -> Optional[int]:
 		return _validate_rotate_deg(v)
+
+	@field_validator("client_capture_id")
+	@classmethod
+	def _check_client_capture_id(cls, v: Optional[str]) -> Optional[str]:
+		return _validate_client_capture_id(v)
 
 
 class CaptureResponse(BaseModel):
@@ -265,6 +498,9 @@ class CaptureResponse(BaseModel):
 	image_ids: Optional[List[int]] = None
 	timing: Optional[dict] = None
 	error: Optional[str] = None
+	# True when the answer is a capture saved earlier under the request's
+	# client_capture_id, not a new picture (app.core.capture_requests).
+	replayed: Optional[bool] = None
 
 
 class CalibrationRequest(BaseModel):
@@ -305,13 +541,21 @@ class WhiteBalanceManualRequest(BaseModel):
 
 
 class DSLRSettingsResponse(BaseModel):
-	"""Current DSLR camera settings read via PTP."""
+	"""Current DSLR camera settings read via PTP.
+
+	image_format is the format a capture takes: on a gphoto2 DSLR what the
+	camera holds, on CHDK the stored format or JPEG. stored_image_format is
+	the format stored on the unit for the body at the index, null when none
+	is stored; on a DSLR a difference between the two shows that the camera
+	does not hold the chosen format.
+	"""
 	iso: Optional[str] = None
 	shutter_speed: Optional[str] = None
 	aperture: Optional[str] = None
 	image_format: Optional[str] = None
 	focus_mode: Optional[str] = None
 	flash_mode: Optional[str] = None
+	stored_image_format: Optional[str] = None
 
 
 class DSLRSettingsUpdate(BaseModel):
@@ -320,6 +564,146 @@ class DSLRSettingsUpdate(BaseModel):
 	shutter_speed: Optional[str] = None  # PTP shutterspeed e.g. "1/125"
 	aperture: Optional[str] = None       # PTP aperture e.g. "5.6"
 	image_format: Optional[str] = None   # "JPEG", "RAW", or "RAW+JPEG"
+
+
+def _takes_camera_settings(caps: dict) -> bool:
+	"""True when the settings route serves this backend.
+
+	A DSLR (dslr_settings) takes ISO, shutter speed, aperture and format; a
+	backend that reports image_formats without dslr_settings (CHDK) takes
+	the capture format alone.
+	"""
+	return bool(caps.get("dslr_settings") or caps.get("image_formats"))
+
+
+def _put_stored_image_format(config_dict: dict, camera_index: int) -> None:
+	"""Put the capture format the backend stores for this camera into config_dict.
+
+	On CHDK the format is stored per body by the settings route and is a
+	choice per capture, so a record capture carries it in its CameraConfig.
+	A backend that resolves the stored format itself, under its own camera
+	lock and for the body its session holds (resolves_capture_format: the
+	gphoto2 DSLR), gets nothing here, so a configuration built before a
+	rescan or a settings change cannot carry another body's format or an
+	older choice. A body with nothing stored, or with no identity of its
+	own, leaves config_dict as it is. Test captures, the focus check and
+	the live preview build their own configuration and do not call this. On
+	CHDK they capture JPEG. On a DSLR a test capture and the focus check go
+	through GPhoto2Backend.capture_image like any capture, so the body's
+	stored format is applied to them and the file they produce is checked
+	against it; the live preview takes no configuration and sets no format.
+
+	The backend is read as it stands, never constructed, as
+	capture.service.camera_model reads it: the format is stored on the
+	backend instance, so a backend not yet built holds none.
+	"""
+	import capture.service as capture_service
+	backend = capture_service._backend
+	if getattr(type(backend), "resolves_capture_format", False) is True:
+		return
+	stored = getattr(backend, "capture_image_format", None)
+	image_format = stored(camera_index) if callable(stored) else None
+	if isinstance(image_format, str):
+		config_dict["image_format"] = image_format
+
+
+def offered_capture_formats() -> Optional[List[str]]:
+	"""The capture formats the unit's cameras offer, as GET /cameras/capabilities reports them; None when unreadable.
+
+	Read from the active backend's capabilities (`image_formats`), the list
+	the capabilities route returns. An empty list is a backend that offers
+	no choice. None when the backend or its capabilities cannot be read.
+	"""
+	try:
+		from capture.service import get_backend
+		formats = get_backend().get_capabilities().get("image_formats")
+	except Exception as exc:
+		logger.warning(f"The camera capabilities could not be read for the capture formats: {exc}")
+		return None
+	return list(formats or [])
+
+
+def _testing_capture_format(db: Session, collection_id: Optional[int]) -> Optional[str]:
+	"""The capture format of a capture into this volume when it is testing work, else None.
+
+	A testing volume's format is its project's, the project found through
+	the volume (app.core.storage_ops.resolve_project, through its parents
+	for a sub-volume). A testing project whose format cannot be read, or a
+	project that cannot be found, gives JPEG.
+	"""
+	from app.core import storage_ops
+	from app.models.project import DEFAULT_TESTING_CAPTURE_FORMAT
+	from capture.backends.base import normalise_image_format
+
+	if not collection_id:
+		return None
+	volume = db.get(Collection, collection_id)
+	if volume is None or not volume.testing:
+		return None
+	project = storage_ops.resolve_project(db, volume)
+	image_format = normalise_image_format(project.capture_format) if project is not None else None
+	return image_format or DEFAULT_TESTING_CAPTURE_FORMAT
+
+
+def _put_capture_format(db: Session, config_dict: dict, camera_index: int, collection_id: Optional[int]) -> None:
+	"""Put the format a record capture takes into config_dict.
+
+	The order of precedence: for a capture into a testing volume, its
+	project's capture format (_testing_capture_format), put as the
+	capture's explicit format on every backend; otherwise the format the
+	backend stores for the body, where the route puts one
+	(_put_stored_image_format); otherwise nothing, and the backend decides
+	(on a gphoto2 DSLR, the format stored for the body its session holds).
+	A testing capture's format is the capture's alone: nothing is stored
+	for the body. On a gphoto2 DSLR it is written to the camera only when
+	the session holds a stored format for the body; the next capture without
+	an explicit format then sets the stored format again, since a format is
+	written whenever it differs from the one the session last set, and the
+	produced-file check compares the file with the explicit format. When the
+	session holds none, the explicit format is not written and the capture
+	is taken in the format the camera holds, unchecked
+	(GPhoto2Backend.capture_image).
+	"""
+	testing_format = _testing_capture_format(db, collection_id)
+	if testing_format is not None:
+		config_dict["image_format"] = testing_format
+		return
+	_put_stored_image_format(config_dict, camera_index)
+
+
+def _image_size_and_exif(master):
+	"""The size and EXIF to record for a captured master: (width, height, exif_dict).
+
+	Read with PIL from the master itself, except for a `.dng`, which is read
+	from its `_preview.jpg` (preview_sidecar_of). PIL opens a DNG as a TIFF
+	and reports its first directory, which in a CHDK DNG is the 128x96
+	thumbnail; the preview is the camera's JPEG of the same exposure, with
+	its full size and EXIF. A `.cr2` is read from the master, as before: PIL
+	reports a CR2's real size and its EXIF, while its preview is extracted
+	from the CR2 and may carry no EXIF. When the file cannot be read, a DNG's
+	preview included, nothing is recorded: (None, None, {}).
+	"""
+	from pathlib import Path
+	from PIL import Image
+	from PIL.ExifTags import TAGS
+
+	master = Path(master)
+	source = preview_sidecar_of(master) if master.suffix.lower() == ".dng" else master
+	exif_dict = {}
+	try:
+		with Image.open(source) as img:
+			width, height = img.size
+			try:
+				exif_data = img._getexif()
+				if exif_data:
+					for tag_id, value in exif_data.items():
+						exif_dict[TAGS.get(tag_id, tag_id)] = str(value)
+			except Exception:
+				pass  # No EXIF data or error reading
+	except Exception as e:
+		logger.warning(f"Could not extract image metadata for {master.name} from {source.name}: {e}")
+		return None, None, {}
+	return width, height, exif_dict
 
 
 def _get_camera_registry():
@@ -335,6 +719,11 @@ def _get_camera_registry():
 		return None
 
 
+# The role fields a registry record may carry; a device row reads them as None
+# when the registry is unavailable.
+_ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+
 def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	"""Enrich raw backend device dicts with registry calibration data.
 
@@ -342,18 +731,26 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 	DeviceInfo shape from the same backend dicts. A registry of None (import or
 	init failure) simply means nothing is enriched; enumeration still works.
 	"""
+	# Function-local, as every capture import in this file is: importing the
+	# capture package starts the camera service module.
+	from capture.camera_roles import confirmed_role
+	from capture.camera_registry import CameraRegistry
+
 	devices = []
 	for dev in raw_devices:
 		hw_id = dev["hardware_id"]
 		idx = dev["index"]
 
 		camera_data = registry.get_camera_by_id(hw_id) if registry else None
+		# The same keys CameraRegistry.get_role_record reads, taken from the
+		# record already fetched, each None when absent.
+		role_record = {key: (camera_data or {}).get(key) for key in _ROLE_RECORD_KEYS}
 		calibrated = False
 		machine_id = None
 		label = None
 		lens_position = None
 		awb_gains = None
-		orientation = None
+		stored_orientation = None
 
 		if camera_data:
 			focus_cal = camera_data.get("calibration", {}).get("focus", {})
@@ -364,10 +761,7 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			awb_raw = camera_data.get("calibration", {}).get("white_balance", {}).get("awb_gains")
 			if awb_raw:
 				awb_gains = list(awb_raw)
-			# Report only a supported angle; a malformed stored value is
-			# shown as unset so the UI never receives an angle it cannot use.
-			stored = camera_data.get("orientation")
-			orientation = stored if type(stored) is int and stored in _VALID_ROTATIONS else None
+			stored_orientation = camera_data.get("orientation")
 
 		devices.append(DeviceInfo(
 			hardware_id=hw_id,
@@ -379,11 +773,29 @@ def _device_infos(raw_devices, registry) -> List[DeviceInfo]:
 			calibrated=calibrated,
 			lens_position=lens_position,
 			awb_gains=awb_gains,
-			orientation=orientation,
+			# Always the effective angle; a malformed stored value reads as
+			# the default and counts as not saved.
+			orientation=CameraRegistry.effective_orientation(stored_orientation, role_record["role"]),
+			orientation_saved=CameraRegistry.is_valid_orientation(stored_orientation),
+			default_orientation=CameraRegistry.default_orientation(role_record["role"]),
 			has_aperture_control=dev.get("has_aperture_control", False),
 			supports_zoom=dev.get("supports_zoom", False),
+			zoom_steps=dev.get("zoom_steps"),
+			zoom_step=dev.get("zoom_step"),
+			clock_offset_s=dev.get("clock_offset_s"),
 			side=dev.get("side"),
 			error=dev.get("error"),
+			usb_port=dev.get("usb_port"),
+			serial=dev.get("serial"),
+			role=role_record["role"],
+			role_confirmed=confirmed_role(role_record) is not None,
+			usb_port_at_confirmation=role_record["usb_port_at_confirmation"],
+			role_guess=dev.get("role_guess"),
+			role_guess_source=dev.get("role_guess_source"),
+			focus_locked=dev.get("focus_locked"),
+			focus_distance=dev.get("focus_distance"),
+			focus_stale=dev.get("focus_stale", False),
+			focus_restore_failed=dev.get("focus_restore_failed", False),
 		))
 
 	return devices
@@ -411,7 +823,196 @@ def list_camera_devices(current_user: User = Depends(allow_read_only)):
 	return _device_infos(raw_devices, registry)
 
 
-@router.post("/rescan", response_model=List[DeviceInfo])
+# One flat sentence per camera_roles reason code, for the operator.
+CAMERA_SETUP_MESSAGES = {
+	"identity_missing": "Captua cannot identify this camera and cannot store a role for it.",
+	"identity_ambiguous": "Two connected cameras report the same identity, and Captua cannot store a role for either.",
+	"role_unconfirmed": "Captua has no confirmed role for this camera.",
+	"role_conflict": "Two cameras have the same confirmed role, and the operator must confirm which page each one photographs.",
+	"pair_changed": "The connected cameras are not the pair the operator last confirmed, and the operator must confirm their roles again.",
+	"port_changed": "This camera is in a different USB socket than when the operator confirmed its role, and the operator must confirm it again.",
+}
+
+
+class CameraSetupReason(BaseModel):
+	"""One reason the camera roles need the operator, with the bodies it concerns."""
+	code: str
+	message: str
+	hardware_ids: List[Optional[str]]
+
+
+class CameraSetupResponse(BaseModel):
+	"""Whether the operator must set or confirm the camera roles, and why."""
+	needs_setup: bool
+	reasons: List[CameraSetupReason]
+	confirmed_pair: Optional[dict] = None
+
+
+def _setup_report(raw_devices, registry) -> CameraSetupResponse:
+	"""Evaluate the stored roles against these device rows, for the operator.
+
+	GET /cameras/setup and PUT /cameras/roles both answer with this. A
+	registry of None reads as one with no roles and no confirmed pair.
+	"""
+	from capture.camera_roles import evaluate_setup
+
+	hardware_ids = [dev.get("hardware_id") for dev in raw_devices if dev.get("hardware_id")]
+	records = registry.get_role_records(hardware_ids) if registry else {}
+	confirmed_pair = registry.get_confirmed_pair() if registry else None
+
+	result = evaluate_setup(raw_devices, records, confirmed_pair)
+	return CameraSetupResponse(
+		needs_setup=result["needs_setup"],
+		reasons=[
+			CameraSetupReason(
+				code=reason["code"],
+				message=CAMERA_SETUP_MESSAGES[reason["code"]],
+				hardware_ids=reason["hardware_ids"],
+			)
+			for reason in result["reasons"]
+		],
+		confirmed_pair=confirmed_pair,
+	)
+
+
+@router.get("/setup", response_model=CameraSetupResponse)
+def get_camera_setup(current_user: User = Depends(allow_read_only)):
+	"""
+	Report whether the operator must set or confirm the camera roles.
+
+	A camera's role is the page it photographs, "left" or "right", stored in
+	the camera registry per body. This route compares the stored roles and
+	the pair last confirmed together with the bodies the backend lists now,
+	through capture.camera_roles.evaluate_setup. It reports only: nothing
+	here, and nothing in capture, acts on the result.
+
+	A backend that cannot list its devices is a 503, because an empty list
+	would report that no setup is needed.
+	"""
+	try:
+		from capture.service import get_backend
+		raw_devices = get_backend().list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the setup check failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	return _setup_report(raw_devices, _get_camera_registry())
+
+
+# The catalogued refusals of PUT /cameras/roles, each a flat sentence that
+# says who must do what.
+CAMERA_ROLES_REFUSALS = {
+	"camera_not_connected": "A camera in the request is not connected, and the operator must reload the camera list and choose the cameras again.",
+	"camera_identity_unusable": "Captua cannot identify a camera in the request, and the operator must give it an identity before setting its role.",
+}
+
+
+def _roles_refusal(code: str) -> HTTPException:
+	return HTTPException(status_code=409, detail={"code": code, "message": CAMERA_ROLES_REFUSALS[code]})
+
+
+class RoleBody(BaseModel):
+	"""One body named in a roles request, by the hardware id the client listed."""
+	hardware_id: str = Field(min_length=1)
+
+
+class CameraRolesRequest(BaseModel):
+	"""Request body for PUT /cameras/roles: the body for each page (NEH-342)."""
+	left: RoleBody
+	right: RoleBody
+
+	@model_validator(mode="after")
+	def _two_bodies(self):
+		if self.left.hardware_id == self.right.hardware_id:
+			raise ValueError("left and right must be two different cameras")
+		return self
+
+
+class CameraRolesResponse(BaseModel):
+	"""The device rows and the setup report after a roles write."""
+	devices: List[DeviceInfo]
+	setup: CameraSetupResponse
+
+
+@router.put("/roles", response_model=CameraRolesResponse)
+def set_camera_roles(
+	request: CameraRolesRequest,
+	current_user: User = Depends(allow_contributor),
+):
+	"""
+	Store which page each of two connected cameras photographs (NEH-342).
+
+	The operator names the body for the left page and the body for the right
+	page by hardware id. Both must be among the bodies the backend lists
+	now, each with an identity of its own: a body that is not listed is a
+	409 camera_not_connected, and a provisional body, a body with the
+	per-index placeholder id or a body whose identity another body shares
+	is a 409 camera_identity_unusable. A body the registry does not know is
+	registered first, as the orientation route registers one.
+
+	CameraRegistry.set_roles then writes both roles and the pair in one
+	replace of cameras.json, with each body's USB socket, the backend's name
+	and the operator's username. Two bodies that hold each other's roles
+	exchange them in one request. A registry that cannot be written raises
+	StorageUnavailableError, which the app answers with 503.
+
+	The answer is the device rows and the setup report, read from the
+	registry after the write, for the rows listed before it. A stored role
+	sets only the default orientation of a body with none saved
+	(CameraRegistry.effective_orientation); indexes, pins, card files and
+	capture placement do not read it.
+	"""
+	try:
+		from capture.camera_registry import CameraRegistry
+		from capture.camera_roles import has_identity
+		from capture.service import get_backend
+	except ImportError as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	try:
+		backend = get_backend()
+		raw_devices = backend.list_devices()
+	except Exception as exc:
+		logger.exception(f"Listing cameras for the roles write failed: {exc}")
+		raise HTTPException(status_code=503, detail=f"Camera listing failed: {exc}")
+
+	chosen = {"left": request.left.hardware_id, "right": request.right.hardware_id}
+	rows = {}
+	for role, hw_id in chosen.items():
+		matches = [dev for dev in raw_devices if dev.get("hardware_id") == hw_id]
+		if not matches:
+			raise _roles_refusal("camera_not_connected")
+		if len(matches) > 1 or not has_identity(matches[0]) or matches[0].get("identity_ambiguous"):
+			raise _roles_refusal("camera_identity_unusable")
+		rows[role] = matches[0]
+
+	registry = CameraRegistry()
+	for row in rows.values():
+		if registry.get_camera_by_id(row["hardware_id"]) is None:
+			# Registered under the identity checked above, with the info the
+			# backend reports for it, as the orientation route does.
+			info = {
+				"model": row.get("model"),
+				"serial": row.get("serial"),
+				"location": row.get("location"),
+			}
+			registry.register_resolved(row["hardware_id"], info, row["index"])
+
+	registry.set_roles(
+		chosen["left"],
+		chosen["right"],
+		ports={role: row.get("usb_port") for role, row in rows.items()},
+		backend=backend.get_backend_name(),
+		confirmed_by=current_user.username,
+	)
+
+	return CameraRolesResponse(
+		devices=_device_infos(raw_devices, registry),
+		setup=_setup_report(raw_devices, registry),
+	)
+
+
+@router.post("/rescan", response_model=List[DeviceInfo], dependencies=_CAMERA_BUSY)
 def rescan_camera_devices(current_user: User = Depends(allow_contributor)):
 	"""
 	Re-detect the attached cameras and drop any stale device sessions.
@@ -525,27 +1126,54 @@ def get_camera_capabilities(current_user: User = Depends(allow_read_only)):
 	available for specific backends (e.g. focus slider for picamera2,
 	ISO/shutter/aperture dropdowns for gphoto2 DSLRs).
 
+	Beside the flags, which kind of camera the unit drives and what is
+	connected (app.core.camera_kind.report): `configured`, the kind in
+	effect; `source`, why (`stored`, `environment`, `detected`,
+	`last_used`, `default`); `connected`, the cameras of each kind found
+	now, without claiming any; `detected`, the one kind connected, or null
+	for none or for more than one (`mixed`); `mismatch`, true when cameras
+	of another kind are connected and none of the kind in effect.
+
 	Example response:
 	    {
 	        "backend": "gphoto2",
 	        "live_preview": true,
+	        "continuous_preview": false,
 	        "focus_control": false,
 	        "live_controls": false,
 	        "zoom": false,
+	        "zoom_steps": false,
+	        "focus_lock": false,
 	        "autofocus_calibration": false,
-	        "dslr_settings": true
+	        "dslr_settings": true,
+	        "configured": "gphoto2",
+	        "source": "detected",
+	        "detected": "gphoto2",
+	        "connected": {"picamera2": 0, "gphoto2": 2, "chdk": 0},
+	        "mixed": false,
+	        "mismatch": false
 	    }
 	"""
 	try:
 		from capture.service import get_backend
+		from app.core import camera_kind
 		backend = get_backend()
 		caps = backend.get_capabilities()
-		return {"backend": backend.get_backend_name(), **caps}
+		return {"backend": backend.get_backend_name(), **caps, **camera_kind.report(backend)}
 	except HTTPException:
 		raise
 	except Exception as e:
 		logger.error(f"Failed to get capabilities: {e}")
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+
+# The preview route's answer for a camera that is connected but did not
+# deliver this frame, as against a 404 for one that is not connected.
+# Clients tell it from the 503 for a missing capture system by detail.code.
+PREVIEW_FRAME_FAILED_DETAIL = {
+	"code": "preview_frame_failed",
+	"message": "The camera is connected but did not send a preview frame.",
+}
 
 
 @router.get("/preview/{camera_index}")
@@ -562,14 +1190,19 @@ def get_camera_preview(
 	`resolution`, so it shows the field of view a capture at that resolution
 	would record, with no AF cycle and no denoise warmup.
 
-	Returns 422 for an unknown resolution, 404 when the requested camera is
-	not connected or the frame could not be captured (any RuntimeError from
-	the capture service), 500 on anything else.
+	Returns 422 for an unknown resolution, 503 with detail
+	PREVIEW_FRAME_FAILED_DETAIL when the backend reports a connected body
+	whose frame failed (PreviewFrameFailedError; the next poll may succeed),
+	404 for a camera that is not connected and for every other RuntimeError
+	from the capture service (the wrong body at the index included), and 500
+	on anything else. The status comes from the exception's class alone: the
+	backend is not asked again.
 	"""
 	from fastapi.responses import Response
 
 	try:
 		from capture.service import capture_preview_frame
+		from capture.backends.errors import PreviewFrameFailedError
 	except ImportError as e:
 		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
 
@@ -578,6 +1211,9 @@ def get_camera_preview(
 		return Response(content=jpeg_bytes, media_type="image/jpeg")
 	except ValueError as e:
 		raise HTTPException(status_code=422, detail=str(e))
+	except PreviewFrameFailedError as e:
+		logger.warning(f"Preview frame failed for connected camera {camera_index}: {e}")
+		raise HTTPException(status_code=503, detail=PREVIEW_FRAME_FAILED_DETAIL)
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
@@ -642,7 +1278,7 @@ def get_focus(
 		raise HTTPException(status_code=500, detail="Failed to get focus")
 
 
-@router.post("/focus/{camera_index}", response_model=FocusResponse)
+@router.post("/focus/{camera_index}", response_model=FocusResponse, dependencies=_CAMERA_BUSY)
 def set_focus(
 	camera_index: int,
 	request: FocusRequest,
@@ -664,6 +1300,79 @@ def set_focus(
 		raise HTTPException(status_code=500, detail="Failed to set focus")
 
 
+@router.post("/focus-lock/{camera_index}", dependencies=_CAMERA_BUSY)
+def lock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Autofocus a CHDK camera once and lock the focus there.
+
+	The camera focuses with a half-press of the shutter and locks, and the
+	backend reads back the distance it reports and stores it for the body,
+	which has it restored each time it enters shooting mode. A zoom move
+	afterwards releases the lock and clears the stored distance. Answers
+	{"detail": "Focus locked", "focus_distance": <mm>}. A backend without
+	focus lock answers 501, a camera that is not connected 404, and a camera
+	that did not confirm the lock 502 (a timeout, a wire failure, or no
+	distance reported).
+	"""
+	distance = _run_focus_lock(camera_index, lock=True)
+	return {"detail": "Focus locked", "focus_distance": distance}
+
+
+@router.delete("/focus-lock/{camera_index}")
+def unlock_camera_focus(
+	camera_index: int,
+	current_user: User = Depends(allow_contributor),
+):
+	"""Release a CHDK camera's focus lock and clear its stored distance.
+
+	The camera then autofocuses on every picture. Answers as the lock route
+	does, with {"detail": "Focus unlocked"} on success.
+	"""
+	_run_focus_lock(camera_index, lock=False)
+	return {"detail": "Focus unlocked"}
+
+
+def _run_focus_lock(camera_index: int, lock: bool) -> Optional[int]:
+	"""Lock or unlock a CHDK camera's focus, mapping failures to statuses."""
+	from app.core.storage_override import StorageUnavailableError
+
+	action = "lock_focus" if lock else "unlock_focus"
+	try:
+		from capture.service import get_backend, lock_focus, unlock_focus
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("focus_lock", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no focus lock; "
+				"focus lock applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import FocusFailedError
+
+	try:
+		if lock:
+			return lock_focus(camera_index)
+		unlock_focus(camera_index)
+		return None
+	except StorageUnavailableError:
+		raise
+	except FocusFailedError as e:
+		logger.error(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"{action} failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail=f"Failed to {action.replace('_', ' ')}")
+
+
 # ---------------------------------------------------------------------------
 # Camera settings / controls endpoint
 # ---------------------------------------------------------------------------
@@ -677,15 +1386,25 @@ class CameraSettingsRequest(BaseModel):
 	analogue_gain: Optional[float] = None     # Manual gain (ISO 100 ~ 1.0)
 	colour_gains: Optional[List[float]] = None  # Manual WB as [red_gain, blue_gain]
 	zoom_factor: Optional[float] = None       # ScalerCrop digital zoom (1.0 = full sensor)
+	zoom_step: Optional[StrictInt] = None     # Stepped optical zoom, 0 = widest (CHDK backend); a bool or a float is refused
 
 
-@router.post("/settings/{camera_index}")
+@router.post("/settings/{camera_index}", dependencies=_CAMERA_BUSY)
 def apply_camera_settings(
 	camera_index: int,
 	request: CameraSettingsRequest,
 	current_user: User = Depends(allow_contributor),
 ):
-	"""Apply live camera controls without triggering a capture."""
+	"""Apply live camera controls without triggering a capture.
+
+	zoom_step moves a CHDK body's optical zoom to that step and stores it for
+	the body, which applies it again each time the body enters record mode.
+	A backend without stepped zoom answers 501, a step outside the camera's
+	range 422 with the range in the detail, a camera that is not connected
+	404, and a camera that did not take the step 502 (a timeout, a wire
+	failure, a lens that reports another step, or no zoom steps reported). The response carries the step the camera
+	confirmed as "zoom_step".
+	"""
 	try:
 		from capture.service import set_camera_controls
 	except ImportError as e:
@@ -717,17 +1436,62 @@ def apply_camera_settings(
 			logger.exception(f"apply_zoom failed for camera {camera_index}: {e}")
 			raise HTTPException(status_code=500, detail="Failed to apply zoom")
 
+	# Stepped optical zoom is a CHDK body's own lens, set by step number; it
+	# is not the ScalerCrop zoom above.
+	applied: dict = {}
+	if request.zoom_step is not None:
+		applied["zoom_step"] = _apply_zoom_step(camera_index, request.zoom_step)
+
 	if not controls and request.zoom_factor is None:
+		if applied:
+			return {"detail": "Zoom step applied", **applied}
 		return {"detail": "No controls specified"}
 
 	try:
 		set_camera_controls(camera_index, controls)
-		return {"detail": "Controls applied", "controls": list(controls.keys())}
+		return {"detail": "Controls applied", "controls": list(controls.keys()), **applied}
 	except RuntimeError as e:
 		raise HTTPException(status_code=404, detail=str(e))
 	except Exception as e:
 		logger.exception(f"apply_camera_settings failed for camera {camera_index}: {e}")
 		raise HTTPException(status_code=500, detail="Failed to apply camera settings")
+
+
+def _apply_zoom_step(camera_index: int, step: int) -> int:
+	"""Set a stepped optical zoom step and return the step the camera confirmed."""
+	from app.core.storage_override import StorageUnavailableError
+
+	try:
+		from capture.service import apply_zoom_step, get_backend
+		backend = get_backend()
+	except Exception as e:
+		raise HTTPException(status_code=503, detail=f"Capture system not available: {e}")
+
+	if not backend.get_capabilities().get("zoom_steps", False):
+		raise HTTPException(
+			status_code=501,
+			detail=(
+				f"the {backend.get_backend_name()} backend has no stepped optical "
+				"zoom; zoom_step applies to CHDK cameras"
+			),
+		)
+
+	from capture.backends.chdk_backend import ZoomFailedError
+
+	try:
+		return apply_zoom_step(camera_index, step)
+	except ValueError as e:
+		raise HTTPException(status_code=422, detail=str(e))
+	except StorageUnavailableError:
+		raise
+	except ZoomFailedError as e:
+		logger.error(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=502, detail=str(e))
+	except RuntimeError as e:
+		raise HTTPException(status_code=404, detail=str(e))
+	except Exception as e:
+		logger.exception(f"apply_zoom_step failed for camera {camera_index}: {e}")
+		raise HTTPException(status_code=500, detail="Failed to apply zoom step")
 
 
 def _is_capture_timeout(exc: BaseException) -> bool:
@@ -753,10 +1517,85 @@ def _is_capture_timeout(exc: BaseException) -> bool:
 	return False
 
 
-@router.post("/test-capture/{camera_index}")
+def _focal_length_header(image_bytes: bytes) -> Optional[str]:
+	"""The EXIF FocalLength of a JPEG in millimetres, as "27" or "27.5".
+
+	None when the tag is absent, zero, not a finite number, or the EXIF (or
+	the image) cannot be read: the header is a hint for the Refocus dialog,
+	never a reason to fail the capture.
+	"""
+	import io
+	import math
+
+	try:
+		from PIL import Image
+
+		with Image.open(io.BytesIO(image_bytes)) as img:
+			exif = img.getexif()
+			# FocalLength (0x920A) lives in the Exif sub-IFD (0x8769).
+			value = exif.get_ifd(0x8769).get(0x920A)
+			if value is None:
+				value = exif.get(0x920A)
+		if value is None:
+			return None
+		millimetres = float(value)
+	except Exception:
+		return None
+	if not math.isfinite(millimetres) or millimetres <= 0:
+		return None
+	return f"{round(millimetres, 2):g}"
+
+
+def _round_fractions(value):
+	"""The value with every float rounded to 4 decimals, for a compact header."""
+	if isinstance(value, float):
+		return round(value, 4)
+	if isinstance(value, dict):
+		return {key: _round_fractions(item) for key, item in value.items()}
+	if isinstance(value, (list, tuple)):
+		return [_round_fractions(item) for item in value]
+	return value
+
+
+def _page_layout_header(
+	image_bytes: bytes, camera_index: int, resolution: str, page_side: str
+) -> Optional[str]:
+	"""The page layout of a test capture as compact JSON, for X-Page-Layout (NEH-343).
+
+	The rotation is the camera's effective orientation, the rotate_deg of
+	the config test_capture_bytes builds from the registry (the saved angle,
+	or the default for the body's role; CameraRegistry.effective_orientation): the
+	capture path records it only in the EXIF Orientation tag, so the pixels
+	are as the sensor delivered them. None when anything fails: the header
+	is a guide for the camera check screen, never a reason to fail the
+	capture, so the failure is logged as a warning and the header left out.
+	"""
+	import json
+
+	try:
+		from capture import page_layout
+		from capture.project_manager import default_camera_config_from_registry
+
+		config, _hw_id = default_camera_config_from_registry(camera_index, resolution)
+		rotation = config["rotate_deg"]
+		result = page_layout.analyse_page(image_bytes, rotation_deg=rotation, page_side=page_side)
+		# allow_nan=False: NaN and Infinity are not JSON, and JSON.parse refuses them.
+		return json.dumps(_round_fractions(result), separators=(",", ":"), allow_nan=False)
+	except Exception as exc:
+		logger.warning(
+			"Page layout analysis failed for test capture on camera %s: %s: %s",
+			camera_index, type(exc).__name__, exc,
+		)
+		return None
+
+
+@router.post("/test-capture/{camera_index}", dependencies=_CAMERA_BUSY)
 def test_capture(
 	camera_index: int,
 	resolution: str = Query("medium"),
+	focus_check: bool = Query(False),
+	layout: bool = Query(False),
+	page_side: Optional[Literal["left", "right"]] = Query(None),
 	current_user: User = Depends(allow_contributor),
 ):
 	"""
@@ -773,11 +1612,34 @@ def test_capture(
 	Checks the camera is connected before calling the service, mirroring
 	trigger_capture, rather than sniffing the RuntimeError message for
 	"not connected" after the fact.
+
+	focus_check=true is the Refocus dialog's picture, taken with the lenses
+	on autofocus (NEH-339). On the gphoto2 backend the capture then gets one
+	trigger attempt and _FOCUS_CHECK_DEADLINE_S (20 s) from the trigger to
+	the file instead of the normal retry and deadline policy, and a body
+	that does not deliver in that time - a busy trigger included - is a 504.
+	Every other backend accepts the flag and ignores it.
+
+	On success the response carries X-Capture-Seconds, X-Capture-Bytes and,
+	when the JPEG's EXIF has a usable FocalLength, X-Focal-Length in
+	millimetres ("27", "27.5"); it is left out otherwise.
+
+	layout=true with page_side ("left" or "right": which page of the open
+	book this camera photographs) adds X-Page-Layout, the result of
+	capture.page_layout.analyse_page on the returned picture as compact JSON
+	with fractions rounded to 4 decimals (NEH-343). layout=true without
+	page_side is a 422, refused before the camera is touched. The analysis
+	only reads the JPEG, so it works on every camera backend; when it fails
+	the header is left out and the capture is returned as usual. This route
+	is a plain def, so FastAPI runs it, the analysis included, in its
+	threadpool rather than on the event loop.
 	"""
 	from capture.camera import IMG_SIZES
 
 	if resolution not in IMG_SIZES:
 		raise HTTPException(status_code=422, detail=f"Invalid resolution: {resolution}")
+	if layout and page_side is None:
+		raise HTTPException(status_code=422, detail="layout=true needs page_side=left or page_side=right")
 
 	from capture.service import test_capture_bytes, is_camera_connected
 
@@ -785,7 +1647,9 @@ def test_capture(
 		raise HTTPException(status_code=404, detail=f"Camera {camera_index} is not connected")
 
 	try:
-		image_bytes, elapsed_time = test_capture_bytes(camera_index, resolution)
+		image_bytes, elapsed_time = test_capture_bytes(
+			camera_index, resolution, focus_check=focus_check
+		)
 	except RuntimeError as e:
 		if _is_capture_timeout(e):
 			raise HTTPException(status_code=504, detail=str(e))
@@ -796,17 +1660,50 @@ def test_capture(
 		logger.exception("Test capture failed")
 		raise HTTPException(status_code=500, detail="Test capture failed")
 
+	headers = {
+		"X-Capture-Seconds": f"{elapsed_time:.3f}",
+		"X-Capture-Bytes": str(len(image_bytes)),
+	}
+	focal_length = _focal_length_header(image_bytes)
+	if focal_length is not None:
+		headers["X-Focal-Length"] = focal_length
+	if layout:
+		page_layout = _page_layout_header(image_bytes, camera_index, resolution, page_side)
+		if page_layout is not None:
+			headers["X-Page-Layout"] = page_layout
+
 	return Response(
 		content=image_bytes,
 		media_type="image/jpeg",
-		headers={
-			"X-Capture-Seconds": f"{elapsed_time:.3f}",
-			"X-Capture-Bytes": str(len(image_bytes)),
-		},
+		headers=headers,
 	)
 
 
-@router.post("/capture", response_model=CaptureResponse)
+def _commit_capture(db: Session, request, kind: str, user: User) -> Optional[dict]:
+	"""Commit a capture; None when it committed.
+
+	The unique constraint on (client_capture_id, space) is the backstop for
+	a row committed by something the in-process claim does not see. When the
+	commit fails on it, the capture is rolled back (its files and manifest
+	line stay, as for any failed capture) and the request is answered from
+	the row that holds the id, or refused 409 when that row is not the
+	request's (app.core.capture_requests.answer_again). Any other IntegrityError
+	is raised to the handler, as before.
+	"""
+	try:
+		db.commit()
+		return None
+	except IntegrityError:
+		db.rollback()
+		stored = capture_requests.answer_again(db, request, kind, user)
+		if stored is None:
+			raise
+		logger.warning(f"client_capture_id {request.client_capture_id} was saved by another request; answering its capture")
+		return stored
+
+
+@router.post("/capture", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
+@capture_requests.answered_first("single")
 def trigger_capture(
 	request: CaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -816,6 +1713,9 @@ def trigger_capture(
 	Trigger a single image capture on the specified camera.
 	
 	Creates or links to existing Record, then creates RecordImage with capture manifest linkage.
+
+	A request with a client_capture_id is answered first from the capture
+	saved under it, if there is one (capture_requests.answered_first).
 	"""
 	# A missing retake record and a capture outside a stemmed volume are
 	# refused before any camera is touched. The retaken record is loaded
@@ -826,6 +1726,9 @@ def trigger_capture(
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
+	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
+	_refuse_a_testing_capture_below_the_reserve(db, current_user)
+	_refuse_expected_images_without_a_record(request.expected_image_ids, request.record_id)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
@@ -834,6 +1737,10 @@ def trigger_capture(
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
+	_refuse_a_retake_of_other_images(retake_record, request.expected_image_ids)
+	# A placeholder (contract 1.9 §10) is a whole opening: only a dual capture fills it.
+	if retake_record is not None and retake_record.missing_side == "both":
+		raise HTTPException(status_code=409, detail=PLACEHOLDER_NEEDS_DUAL_DETAIL)
 	# A retake is redone only in the mode the record was captured in.
 	if retake_record is not None and retake_record.capture_mode != "single":
 		raise HTTPException(
@@ -843,7 +1750,7 @@ def trigger_capture(
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
-		from capture.service import single_capture_image, is_camera_connected
+		from capture.service import single_capture_image, is_camera_connected, camera_model
 		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, IMG_SIZES, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
@@ -866,21 +1773,23 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
-		# NEH-71: omitted (None) leaves the registry's saved orientation from
+		# NEH-71: omitted (None) leaves the body's effective orientation from
 		# default_camera_config_from_registry in place; an explicit value,
 		# including 0, overrides it.
 		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
+		_put_capture_format(db, config_dict, request.camera_index, request.collection_id)
 		camera_config = CameraConfig(**config_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
 
 		# Read once: the number is checked against, and the image written
 		# under, the same root.
 		root = projects_root()
 		# One capture event: its number, in the transaction that writes its image.
 		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+		_refuse_a_real_capture_below_the_storage_reserve(db, current_user, root)
 
 		output_path, capture_id, pair_id = single_capture_image(
 			project_name=project_name,
@@ -897,24 +1806,7 @@ def trigger_capture(
 		from pathlib import Path
 		file_path = Path(output_path)
 		file_size = file_path.stat().st_size if file_path.exists() else 0
-		resolution_width = None
-		resolution_height = None
-		exif_dict = {}
-		
-		try:
-			with Image.open(output_path) as img:
-				resolution_width, resolution_height = img.size
-				# Extract EXIF data if available
-				try:
-					exif_data = img._getexif()
-					if exif_data:
-						for tag_id, value in exif_data.items():
-							tag_name = TAGS.get(tag_id, tag_id)
-							exif_dict[tag_name] = str(value)
-				except:
-					pass  # No EXIF data or error reading
-		except Exception as e:
-			logger.warning(f"Could not extract image metadata: {e}")
+		resolution_width, resolution_height, exif_dict = _image_size_and_exif(file_path)
 		
 		# Reuse the resolved project name so the DB record matches the on-disk tree
 		project = db.query(Project).filter(Project.name == project_name).first()
@@ -943,7 +1835,8 @@ def trigger_capture(
 			_supersede_current_images(record)
 		else:
 			record = Record(
-				title=request.record_title or f"{project_name} - {file_path.stem}",
+				# A record's title is read by callers: the project's display name.
+				title=request.record_title or f"{display_project_name(project_name)} - {file_path.stem}",
 				description=f"Captured at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
@@ -991,7 +1884,9 @@ def trigger_capture(
 		
 		cs = CameraSettings(
 			record_image_id=img.id,
-			camera_model=camera_config.__class__.__name__,
+			# From the backend's cached state for this index; None when it
+			# holds none (NEH-329). Never fails the capture.
+			camera_model=camera_model(camera_config.camera_index),
 			iso=None,
 			aperture=None,
 			focal_length=None,
@@ -1012,8 +1907,11 @@ def trigger_capture(
 			# when an operator promotes its volume; a captured one stays.
 			change_record_status(db, record, "captured", current_user.username)
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
+		capture_requests.store(db, request, "single", current_user, record.id, [img.id])
 
-		db.commit()
+		stored = _commit_capture(db, request, "single", current_user)
+		if stored is not None:
+			return CaptureResponse(**stored)
 		db.refresh(record)
 		db.refresh(img)
 
@@ -1034,7 +1932,8 @@ def trigger_capture(
 		return CaptureResponse(success=False, error=str(e))
 
 
-@router.post("/capture/dual", response_model=CaptureResponse)
+@router.post("/capture/dual", response_model=CaptureResponse, dependencies=_CAMERA_BUSY)
+@capture_requests.answered_first("dual")
 def trigger_dual_capture(
 	request: DualCaptureRequest,
 	current_user: User = Depends(allow_contributor),
@@ -1045,6 +1944,8 @@ def trigger_dual_capture(
 	
 	Used for book scanning where left and right pages are captured together.
 	Creates or links to existing Record, then creates two linked RecordImages.
+
+	A client_capture_id is answered first as in trigger_capture.
 	"""
 	# A missing retake record and a capture outside a stemmed volume are
 	# refused before any camera is touched. The retaken record is loaded
@@ -1055,14 +1956,41 @@ def trigger_dual_capture(
 	# path that takes both: the record's row here, then the volume's in
 	# _refuse_capture_without_volume_or_stem.
 	_refuse_resolution_in_filename(request.include_resolution_in_filename)
+	_refuse_a_project_name_outside_the_testing_space(db, request.project_name, current_user)
+	_refuse_a_testing_capture_below_the_reserve(db, current_user)
+	_refuse_expected_images_without_a_record(request.expected_image_ids, request.record_id)
+	if request.after_record_id is not None and request.record_id:
+		raise HTTPException(
+			status_code=422,
+			detail="afterRecordId inserts a new record; it cannot be combined with record_id, which recaptures one.",
+		)
 	retake_record = None
 	if request.record_id:
 		from app.api.records import _locked_record
 		retake_record = _locked_record(db, request.record_id)
 		if not retake_record:
 			raise HTTPException(status_code=404, detail=f"Record {request.record_id} not found")
+	if request.after_record_id is not None and request.collection_id:
+		# Inserting rewrites the volume's order, so the volume's records are
+		# locked and then its row (app.core.record_sequence), in the place a
+		# retake takes its record's lock: before the volume's row below.
+		try:
+			lock_volume_records(db, request.collection_id)
+		except VolumeChangedError:
+			db.rollback()
+			raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
 	_refuse_capture_without_volume_or_stem(db, request.collection_id, retake_record)
+	if request.after_record_id is not None:
+		after = db.get(Record, request.after_record_id)
+		if after is None:
+			raise HTTPException(status_code=404, detail=f"Record {request.after_record_id} not found")
+		if after.collection_id != request.collection_id:
+			raise HTTPException(
+				status_code=422,
+				detail=f"Record {request.after_record_id} is not in volume {request.collection_id}.",
+			)
 	_refuse_retake_out_of_the_operators_hands(retake_record)
+	_refuse_a_retake_of_other_images(retake_record, request.expected_image_ids)
 	# A retake is redone only in the mode the record was captured in.
 	if retake_record is not None and retake_record.capture_mode != "dual":
 		raise HTTPException(
@@ -1072,7 +2000,7 @@ def trigger_dual_capture(
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
-		from capture.service import dual_capture_image, is_camera_connected
+		from capture.service import dual_capture_image, is_camera_connected, camera_model
 		from capture.project_manager import projects_root
 		from capture.camera import CameraConfig, recorded_rotation
 		from capture.project_manager import default_camera_config_from_registry
@@ -1097,23 +2025,26 @@ def trigger_dual_capture(
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
 
 		# NEH-71: see trigger_capture - omitted (None) leaves the registry's
-		# saved orientation in place; an explicit value, including 0, overrides it.
+		# effective orientation in place; an explicit value, including 0, overrides it.
 		if request.rotate_deg_cam0 is not None:
 			config0_dict["rotate_deg"] = request.rotate_deg_cam0
 		if request.rotate_deg_cam1 is not None:
 			config1_dict["rotate_deg"] = request.rotate_deg_cam1
 
+		_put_capture_format(db, config0_dict, 0, request.collection_id)
+		_put_capture_format(db, config1_dict, 1, request.collection_id)
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
 		
 		# Resolve the path from collection_id via the DB
-		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id)
+		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
 
 		# Read once (see trigger_capture).
 		root = projects_root()
 		# One capture event for the pair: one number, which both images carry
 		# and which is their pair id.
 		filename_index = _take_filename_index(db, request.collection_id, stem, root)
+		_refuse_a_real_capture_below_the_storage_reserve(db, current_user, root)
 
 		# left_camera_index says which physical camera takes the left page;
 		# the manifest and the rows record the same roles.
@@ -1155,12 +2086,18 @@ def trigger_dual_capture(
 			from app.api.records import _supersede_current_images
 			_supersede_current_images(record)
 		else:
+			# After a given record (contract 1.9 §10.2), under the locks taken
+			# at the top; otherwise after the highest.
+			if request.after_record_id is not None:
+				sequence = insert_after(db, request.collection_id, request.after_record_id, 1)[0]
+			else:
+				sequence = _next_record_sequence(db, request.collection_id)
 			record = Record(
-				title=request.record_title or f"{project_name} - Dual capture",
+				title=request.record_title or f"{display_project_name(project_name)} - Dual capture",
 				description=f"Dual camera capture at {request.resolution} resolution",
 				project_id=effective_project_id,
 				collection_id=request.collection_id,
-				sequence=_next_record_sequence(db, request.collection_id),
+				sequence=sequence,
 				created_by=current_user.username,
 				capture_mode="dual",
 			)
@@ -1171,23 +2108,7 @@ def trigger_dual_capture(
 			file_path = Path(file_path_str)
 			file_size = file_path.stat().st_size if file_path.exists() else 0
 			
-			resolution_width = None
-			resolution_height = None
-			exif_dict = {}
-			
-			try:
-				with Image.open(file_path_str) as img:
-					resolution_width, resolution_height = img.size
-					try:
-						exif_data = img._getexif()
-						if exif_data:
-							for tag_id, value in exif_data.items():
-								tag_name = TAGS.get(tag_id, tag_id)
-								exif_dict[tag_name] = str(value)
-					except:
-						pass
-			except Exception as e:
-				logger.warning(f"Could not extract image metadata for {file_path}: {e}")
+			resolution_width, resolution_height, exif_dict = _image_size_and_exif(file_path)
 			
 			# Generate thumbnail alongside the captured images
 			# For a RAW master, use the _preview.jpg sidecar the backend extracted, if it exists
@@ -1228,7 +2149,9 @@ def trigger_dual_capture(
 			cam_config = cam0_config if camera_idx == 0 else cam1_config
 			cs = CameraSettings(
 				record_image_id=img.id,
-				camera_model=cam_config.__class__.__name__,
+				# The camera that took this image: path0 is cam0_config's
+				# capture and path1 cam1_config's, whichever page each is.
+				camera_model=camera_model(cam_config.camera_index),
 				iso=None,
 				aperture=None,
 				focal_length=None,
@@ -1251,9 +2174,24 @@ def trigger_dual_capture(
 		if is_recapture:
 			# As in trigger_capture: a rejected record returns to captured.
 			change_record_status(db, record, "captured", current_user.username)
+			# A missing record (contract 1.9 §10: a page or a whole opening
+			# never captured, a placeholder included) has both pages now: any
+			# lone image is superseded above, it keeps its sequence, and it is
+			# an ordinary dual record, sent with its volume's next handover.
+			# What it was expected to hold and its closing go with its missing
+			# side; the Fisqua request it came from stays, so the manifest
+			# still names it (app.core.capture_manifest).
+			record.missing_side = None
+			record.missing_expected = None
+			record.missing_note = None
+			record.closed_reason = None
+			record.closed_note = None
 		_record_turn_events(db, record, starts_volume, retook_pending, current_user)
+		capture_requests.store(db, request, "dual", current_user, record.id, [img0.id, img1.id])
 
-		db.commit()
+		stored = _commit_capture(db, request, "dual", current_user)
+		if stored is not None:
+			return CaptureResponse(**stored)
 		db.refresh(record)
 		
 		logger.info(
@@ -1276,7 +2214,33 @@ def trigger_dual_capture(
 		return CaptureResponse(success=False, error=str(e))
 
 
-@router.post("/calibrate", response_model=CalibrationResponse)
+@router.get("/capture-requests/{client_capture_id}", response_model=None)
+def get_capture_request(
+	client_capture_id: str = PathParam(..., pattern="^" + _CLIENT_CAPTURE_ID_PATTERN + "$"),
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency),
+):
+	"""The state of a client_capture_id in the caller's space.
+
+	200 with the capture saved under it, as a repeated request is answered,
+	and `in_progress` false; 200 `{"in_progress": true}` while a request
+	with it is running; 410 `capture_no_longer_stored` when a capture was
+	saved under it and its record or an image has been deleted since; 404
+	when no capture was saved under it in the caller's space, after which
+	the id is closed (app.core.capture_requests). A malformed id is a 422.
+	"""
+	from app.core.testing_space import not_found_detail
+
+	state = capture_requests.lookup(db, client_capture_id.lower(), capture_requests.space_of(current_user))
+	if state is None:
+		raise HTTPException(status_code=404, detail=not_found_detail())
+	if state["in_progress"]:
+		return state
+	return {**CaptureResponse(**{k: v for k, v in state.items() if k != "in_progress"}).model_dump(),
+			"in_progress": False}
+
+
+@router.post("/calibrate", response_model=CalibrationResponse, dependencies=_CAMERA_BUSY)
 def calibrate_camera(
 	request: CalibrationRequest,
 	current_user: User = Depends(allow_contributor)
@@ -1340,12 +2304,14 @@ def calibrate_camera(
 			distance_meters=result.get("distance_meters"),
 			af_time=result.get("af_time"),
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"Autofocus calibration failed: {e}")
 		return CalibrationResponse(success=False, error=str(e))
 
 
-@router.post("/calibrate/white-balance", response_model=WhiteBalanceCalibrationResponse)
+@router.post("/calibrate/white-balance", response_model=WhiteBalanceCalibrationResponse, dependencies=_CAMERA_BUSY)
 def calibrate_white_balance(
 	request: WhiteBalanceCalibrationRequest,
 	current_user: User = Depends(allow_contributor)
@@ -1405,6 +2371,8 @@ def calibrate_white_balance(
 			colour_temperature=result.get("colour_temperature"),
 			converged=result.get("converged"),
 		)
+	except HTTPException:
+		raise
 	except Exception as e:
 		logger.exception(f"White balance calibration failed: {e}")
 		return WhiteBalanceCalibrationResponse(success=False, error=str(e))
@@ -1478,7 +2446,7 @@ def get_dslr_settings(
 	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
-	if not caps.get("dslr_settings"):
+	if not _takes_camera_settings(caps):
 		raise HTTPException(
 			status_code=501,
 			detail="Active camera backend does not support DSLR settings.",
@@ -1490,7 +2458,7 @@ def get_dslr_settings(
 		raise HTTPException(status_code=502, detail=str(e))
 
 
-@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse)
+@router.put("/dslr/{camera_index}/settings", response_model=DSLRSettingsResponse, dependencies=_CAMERA_BUSY)
 def apply_dslr_settings(
 	camera_index: int,
 	request: DSLRSettingsUpdate,
@@ -1499,28 +2467,47 @@ def apply_dslr_settings(
 	"""
 	Apply DSLR settings (ISO, shutter speed, aperture, image format) to the
 	given camera via PTP.  Only fields present in the request body are applied;
-	omitted fields are left at their current camera value.
+	omitted fields are left at their current camera value. On a gphoto2 DSLR
+	a 200 for an image format means one of two things. For a body the unit
+	identifies, the camera holds the format and it is stored for the body.
+	For a body it cannot identify (no serial, or one another body answers
+	to), the camera holds the format and nothing is stored, which the
+	response shows with stored_image_format null. In every other outcome the
+	camera is set back to the format it held before the request and the
+	answer is 502, whose detail says whether it was set back
+	(GPhoto2Backend.apply_dslr_settings).
 
 	Returns HTTP 501 when the active backend does not support DSLR settings.
 	"""
 	from capture.service import get_backend
 	backend = get_backend()
 	caps = backend.get_capabilities()
-	if not caps.get("dslr_settings"):
+	if not _takes_camera_settings(caps):
 		raise HTTPException(
 			status_code=501,
 			detail="Active camera backend does not support DSLR settings.",
 		)
-	if request.image_format is not None and request.image_format not in ("JPEG", "RAW", "RAW+JPEG"):
-		raise HTTPException(
-			status_code=422,
-			detail=f"image_format must be one of JPEG, RAW, RAW+JPEG; got {request.image_format!r}",
-		)
+	from capture.backends.base import IMAGE_FORMATS, normalise_image_format
+	settings = request.model_dump(exclude_none=True)
+	offered = caps.get("image_formats") or IMAGE_FORMATS
+	if request.image_format is not None:
+		# The old name RAW is taken as RAW+JPEG (capture.backends.base).
+		image_format = normalise_image_format(request.image_format)
+		if image_format is None or image_format not in offered:
+			raise HTTPException(
+				status_code=422,
+				detail=f"image_format must be one of {', '.join(offered)}; got {request.image_format!r}",
+			)
+		settings["image_format"] = image_format
+	if not caps.get("dslr_settings"):
+		others = sorted(name for name in settings if name != "image_format")
+		if others:
+			raise HTTPException(
+				status_code=422,
+				detail=f"This camera takes only image_format here, not {', '.join(others)}",
+			)
 	try:
-		updated = backend.apply_dslr_settings(
-			camera_index,
-			request.model_dump(exclude_none=True),
-		)
+		updated = backend.apply_dslr_settings(camera_index, settings)
 		return DSLRSettingsResponse(**updated)
 	except RuntimeError as e:
 		raise HTTPException(status_code=502, detail=str(e))
@@ -1623,10 +2610,12 @@ def create_camera_settings(
 def list_camera_settings(
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency)
 ):
-	items = db.query(CameraSettings).offset(skip).limit(limit).all()
+	"""The camera settings rows of the images of the caller's space (app.core.testing_space.scope_query)."""
+	items = scope_query(db.query(CameraSettings), CameraSettings, current_user, space).offset(skip).limit(limit).all()
 	return [CameraSettingsRead.model_validate(i) for i in items]
 
 

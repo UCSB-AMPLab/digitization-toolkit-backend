@@ -8,12 +8,13 @@ files on disk, spot-checks file bytes against the capture-time manifest hashes,
 and reports parentless records. It is strictly read-only: it never moves,
 deletes, or rewrites anything.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import hashlib
 import json
 import logging
+import os
 import random
 import re
 from dataclasses import dataclass, field
@@ -23,7 +24,11 @@ from typing import Dict, List, Optional, Set, Tuple
 from sqlalchemy.orm import Session
 
 from app.core import config
-from app.core.paths import OFFSITE_STAGING_DIR, RAW_SUFFIXES, is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import (
+    ADOPTION_REPAIR_STAGING_DIR, OFFSITE_STAGING_DIR, RAW_SUFFIXES, FileIdentities, is_raw_suffix,
+    preview_sidecar_of, raw_buffer_of, raw_sidecar_of,
+    resolve_within_storage,
+)
 from app.models.record import Record, RecordImage
 
 logger = logging.getLogger(__name__)
@@ -60,11 +65,11 @@ def _scan_roots() -> List[Path]:
 
 
 def _iter_image_files(root: Path):
-    """Yield original image files under root, skipping derived thumbnails and the offsite upload's staged links."""
+    """Yield original image files under root, skipping derived thumbnails and the staged files of the offsite upload and of an adoption's repair."""
     for p in root.rglob("*"):
         if "thumbnails" in p.parts:
             continue
-        if p.relative_to(root).parts[:1] == (OFFSITE_STAGING_DIR,):
+        if p.relative_to(root).parts[:1] in ((OFFSITE_STAGING_DIR,), (ADOPTION_REPAIR_STAGING_DIR,)):
             continue
         if p.is_file() and p.suffix.lower() in IMAGE_EXTS:
             yield p
@@ -87,6 +92,10 @@ class FixityIndex:
     # Absolute paths of RAW previews the manifests give a digest for: a
     # capture record's `<role>_preview` entries and `preview_digest` records.
     previews: Set[str] = field(default_factory=set)
+    # Absolute paths the manifests' colour card lines name
+    # (capture.manifestHandler.CALIBRATION_RECORD_TYPE). A shot's file is
+    # known through its row, never through its line.
+    calibration: Set[str] = field(default_factory=set)
 
     def expected(self, capture_id: Optional[str], image_id: Optional[int], resolved: Path) -> Optional[str]:
         """The sha256 an image's file should have, or None if none can be resolved.
@@ -128,7 +137,7 @@ def read_manifest_lines(path: Path) -> Tuple[List[str], int]:
     return lines, undecodable
 
 
-def build_fixity_index(projects_dir: Path) -> FixityIndex:
+def build_fixity_index(projects_dir: Path, include=None) -> FixityIndex:
     """Index every metadata/manifest.jsonl under `projects_dir`: each project's, and each stemmed volume's.
 
     A capture record's paths are relative to the directory that holds its
@@ -173,15 +182,29 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
     preview of `to`, and keeps its digest. Those are applied after the
     masters' chains, swept the same way, so a preview renamed twice, by
     records in any order or in different manifests, resolves.
+
+    A JPEG master's `.raw` buffer (a multi-format capture, NEH-261) is
+    followed by the same rule: every relocation record of a JPEG master is
+    also read as one for the buffer raw_sidecar_of names beside it, which
+    keeps its capture-time digest. It is not a preview.
+
+    With `include` (app.core.testing_space.manifest_filter), a manifest for
+    which include(manifest) is false is not read: a check made for one
+    volume reads the manifests of that volume's space only. Without it,
+    every manifest is read, as the whole-card integrity report and the
+    startup layout migration read them.
     """
-    from capture.manifestHandler import PREVIEW_DIGEST_RECORD_TYPE
+    from capture.manifestHandler import CALIBRATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE
     index = FixityIndex()
     if not projects_dir.exists():
         return index
     chains: List[List[Tuple[str, str, str]]] = []  # per manifest, in line order: (capture_id, from abs, to abs)
     preview_moves: List[Tuple[str, str, str]] = []  # (capture_id, preview of from, preview of to), absolute
+    raw_moves: List[Tuple[str, str, str]] = []  # (capture_id, raw buffer of from, raw buffer of to), absolute
 
     for manifest in _manifests(projects_dir):
+        if include is not None and not include(manifest):
+            continue
         project_root = manifest_base(manifest, projects_dir)
         try:
             lines, unparsed = read_manifest_lines(manifest)
@@ -205,6 +228,7 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                 continue
             if rec.get("record_type") == "relocation":
                 _note_preview_move(preview_moves, cid, project_root, rec.get("from"), rec.get("to"))
+                _note_raw_buffer_move(raw_moves, cid, project_root, rec.get("from"), rec.get("to"))
                 image_id, sha = rec.get("image_id"), rec.get("sha256")
                 if isinstance(image_id, int) and sha:
                     key = (cid, image_id)
@@ -220,6 +244,15 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
                         chain.append((cid, str((project_root / frm).resolve()), str((project_root / to).resolve())))
                     except OSError:
                         pass
+                continue
+            if rec.get("record_type") == CALIBRATION_RECORD_TYPE:
+                # A colour card shot: never a capture, and its digest is its row's.
+                for f in rec.get("files", []) or []:
+                    if isinstance(f, dict) and f.get("relative_path"):
+                        try:
+                            index.calibration.add(str((project_root / f["relative_path"]).resolve()))
+                        except OSError:
+                            pass
                 continue
             backfilled = rec.get("record_type") == PREVIEW_DIGEST_RECORD_TYPE
             if not backfilled:
@@ -259,22 +292,33 @@ def build_fixity_index(projects_dir: Path) -> FixityIndex:
         if not changed:
             break
 
-    for _ in range(len(preview_moves) + 1):
+    _follow_sidecar_moves(index, preview_moves, previews=True)
+    _follow_sidecar_moves(index, raw_moves, previews=False)
+    return index
+
+
+def _follow_sidecar_moves(index: FixityIndex, moves: List[Tuple[str, str, str]], previews: bool) -> None:
+    """Give each sidecar's new path the digest its old path has, sweeping until nothing changes (build_fixity_index).
+
+    `previews` says the sidecars are RAW previews, whose paths also go into
+    index.previews; a JPEG master's `.raw` buffer is not a preview.
+    """
+    for _ in range(len(moves) + 1):
         changed = False
-        for cid, frm, to in preview_moves:
+        for cid, frm, to in moves:
             # By path, then by name under the capture id, as a master is
             # found: the record's paths may predate an SD re-clone.
             sha = index.by_path.get(cid, {}).get(frm) or index.by_name.get(cid, {}).get(Path(frm).name)
             if not sha:
                 continue
-            if index.by_path.get(cid, {}).get(to) != sha or to not in index.previews:
+            if index.by_path.get(cid, {}).get(to) != sha or (previews and to not in index.previews):
                 index.by_path.setdefault(cid, {})[to] = sha
                 index.by_name.setdefault(cid, {})[Path(to).name] = sha
-                index.previews.add(to)
+                if previews:
+                    index.previews.add(to)
                 changed = True
         if not changed:
             break
-    return index
 
 
 def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
@@ -289,6 +333,25 @@ def _note_preview_move(moves: list, cid: str, project_root: Path, frm, to) -> No
     except OSError:
         return
     moves.append((cid, str(preview_sidecar_of(src)), str(preview_sidecar_of(dst))))
+
+
+def _note_raw_buffer_move(moves: list, cid: str, project_root: Path, frm, to) -> None:
+    """Record that a JPEG master's relocation from `frm` to `to` moved its `.raw` buffer too (NEH-261).
+
+    The same rule as _note_preview_move: app.core.storage_ops.relocate_image
+    and the layout migration move the buffer to the name raw_sidecar_of
+    derives from the master's new path and write a record for the master only.
+    """
+    if not (isinstance(frm, str) and isinstance(to, str) and frm and to):
+        return
+    if is_raw_suffix(Path(frm)) or is_raw_suffix(Path(to)):
+        return
+    try:
+        src = (project_root / frm).resolve()
+        dst = (project_root / to).resolve()
+    except OSError:
+        return
+    moves.append((cid, str(raw_sidecar_of(src)), str(raw_sidecar_of(dst))))
 
 
 RETIRED_MANIFESTS_DIR = ".retired-manifests"
@@ -325,8 +388,19 @@ def manifest_base(manifest: Path, projects_dir: Path) -> Path:
     return manifest.parent.parent
 
 
-def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]:
+def capture_record_lines(projects_dir: Path, capture_ids: Set[str],
+                         volume_root: Optional[Path] = None, include=None) -> List[str]:
     """The capture records of `capture_ids`, as their manifest lines, one per capture.
+
+    With `volume_root` (a stemmed volume's `<stem>/`), a capture whose
+    record in that volume's own manifest names only files under that
+    volume gets that record, and no other manifest's, whether or not it is
+    marked `copied_from`: an adoption's copies (app.core.adopt_manifest)
+    name the files under their new names there, while the layout
+    migration's copies name the files where they were captured, outside
+    the volume (`../<project>/...`), and so do not take the place of the
+    capture-time record. Without it, or for any other capture, the rule
+    below holds.
 
     Read from every manifest build_fixity_index reads. A volume captured
     before it had a stem has its earlier capture records in its project's
@@ -339,13 +413,17 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
     are left out: they are the appliance's own bookkeeping, of files renamed
     after capture and of preview digests computed after it. Manifests are
     read in path order and each in line order. Unreadable manifests and
-    lines that are not JSON objects are skipped.
+    lines that are not JSON objects are skipped. With `include`, a manifest
+    for which include(manifest) is false is not read.
     """
     from capture.manifestHandler import is_capture_record
 
-    originals: List[Tuple[str, str]] = []
-    copies: List[Tuple[str, str]] = []
+    found: List[Tuple[str, str, bool, bool]] = []   # (capture id, line, a copy, the volume's own naming only its files)
+    own_manifest = str((volume_root / "metadata" / "manifest.jsonl").resolve()) if volume_root is not None else None
     for manifest in sorted(_manifests(projects_dir)):
+        if include is not None and not include(manifest):
+            continue
+        in_volume = own_manifest is not None and str(manifest.resolve()) == own_manifest
         try:
             lines, _ = read_manifest_lines(manifest)
         except OSError:
@@ -359,20 +437,36 @@ def capture_record_lines(projects_dir: Path, capture_ids: Set[str]) -> List[str]
             except json.JSONDecodeError:
                 continue
             if (is_capture_record(entry) and entry.get("capture_id") in capture_ids):
-                (copies if "copied_from" in entry else originals).append((entry["capture_id"], stripped))
+                found.append((entry["capture_id"], stripped, "copied_from" in entry,
+                              in_volume and _names_only_files_under(entry)))
+    owned = {cid for cid, _, _, own in found if own}
     kept: List[str] = []
     kept_lines: Set[str] = set()
     seen: Set[str] = set()
-    for cid, line in originals:
-        if line not in kept_lines:
+    for cid, line, copy, own in found:
+        if (own if cid in owned else not copy) and line not in kept_lines:
             kept_lines.add(line)
             kept.append(line)
-        seen.add(cid)
-    for cid, line in copies:
-        if cid not in seen:
+            seen.add(cid)
+    for cid, line, copy, _ in found:
+        if copy and cid not in seen:
             kept.append(line)
             seen.add(cid)
     return kept
+
+
+def _names_only_files_under(entry: dict) -> bool:
+    """Whether a capture record names at least one file and every path it names stays under its manifest's base."""
+    paths = [f.get("relative_path") for f in entry.get("files") or [] if isinstance(f, dict)]
+    if not paths:
+        return False
+    for rel in paths:
+        if not isinstance(rel, str) or not rel or Path(rel).is_absolute():
+            return False
+        normal = Path(os.path.normpath(rel))
+        if normal.parts[:1] == ("..",):
+            return False
+    return True
 
 
 def _build_manifest_index(projects_dir: Path) -> Tuple[Dict[str, Dict[str, str]], Dict[str, Dict[str, str]]]:
@@ -395,9 +489,14 @@ def verify_images_against_manifest(images) -> List[dict]:
     checked against its upload record. A missing file is skipped too; it is
     a separate failure the caller handles. So is a master freed from the
     card (app.core.offsite_free): its bytes are in the bucket, verified by
-    SHA1 when it was freed. Read-only.
+    SHA1 when it was freed. Read-only. Only the manifests of the images'
+    space are read (app.core.testing_space.manifest_filter_for_images).
     """
-    index = build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter_for_images
+
+    images = list(images)
+    projects_dir = config.settings.projects_dir.resolve()
+    index = build_fixity_index(projects_dir, include=manifest_filter_for_images(images, projects_dir))
     mismatches: List[dict] = []
     for img in images:
         if not img.capture_id or getattr(img, "master_freed_at", None) is not None:
@@ -505,7 +604,25 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         for k in known
         if is_raw_suffix(Path(k)) and Path(k).is_file()
     }
+    row_masters = FileIdentities(img.file_path for img in images if img.file_path)
+    known |= {
+        # A JPEG master's `.raw` buffer (a multi-format capture, NEH-261) has
+        # no row; a move or rename carries it to the master's new stem, where
+        # no manifest names it, so it is known through its master in the
+        # same way, through raw_buffer_of: a `.raw` some row has as its own
+        # master is known as that row's, not as a buffer.
+        str(raw_buffer_of(Path(k), row_masters))
+        for k in known
+        if raw_buffer_of(Path(k), row_masters) is not None and Path(k).is_file()
+    }
     known |= kept_previews
+    # Colour card shots (app.core.colour_card): each shot's master, its RAW
+    # preview and a multi-format capture's `.raw` buffer are known through
+    # the shot's row; a row whose master is gone is reported. The shots'
+    # manifest lines make nothing known (FixityIndex.calibration).
+    card_known, missing_card_files, card_shots = _colour_card_files(db)
+    known |= card_known
+    card_mismatches: List[dict] = []
 
     # files -> rows: image files known to neither the database nor the manifest
     orphan_files: List[str] = []
@@ -544,6 +661,16 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
                 })
                 continue
             eligible.append((img, resolved, expected))
+        # Every colour card shot's master and preview on disk joins the same
+        # list (_colour_card_hash_targets), so one budget, max_hash_checks,
+        # bounds every file this check reads. The sample is drawn uniformly
+        # from the one combined list, the pages' own rule, so each file, page
+        # or shot, is as likely to be hashed as any other on every run, and
+        # neither kind can starve the other over repeated runs. Finding the
+        # files (a row's path, whether it exists) reads no contents and stays
+        # outside the budget, as it does for pages (missing_files,
+        # missing_colour_card_files).
+        eligible.extend(_colour_card_hash_targets(db))
 
         hashes_eligible = len(eligible)
         to_hash = eligible
@@ -556,6 +683,12 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
             except OSError:
                 continue
             hashes_checked += 1
+            if isinstance(img, _ShotFile):
+                if actual != expected:
+                    card_mismatches.append({"colour_card_shot_id": img.shot_id, "kind": img.kind,
+                                            "file_path": img.file_path, "expected_sha256": expected,
+                                            "actual_sha256": actual})
+                continue
             if actual != expected:
                 manifest_mismatches.append({
                     "record_image_id": img.id,
@@ -583,6 +716,9 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "manifest_mismatches": len(manifest_mismatches),
         "manifest_missing_entry": len(manifest_missing_entry),
         "orphan_records": len(orphan_records),
+        "colour_card_shots": card_shots,
+        "missing_colour_card_files": len(missing_card_files),
+        "colour_card_mismatches": len(card_mismatches),
     }
     # "ok" reflects hard divergences (data loss or corruption). Missing thumbnails
     # are regenerable and a missing manifest entry is often benign (an image
@@ -590,6 +726,8 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
     # are reported but do not by themselves fail the check.
     summary["ok"] = (
         summary["missing_files"] == 0
+        and summary["missing_colour_card_files"] == 0
+        and summary["colour_card_mismatches"] == 0
         and summary["orphan_files"] == 0
         and summary["manifest_mismatches"] == 0
     )
@@ -603,4 +741,55 @@ def run_integrity_check(db: Session, verify_hashes: bool = True,
         "manifest_mismatches": manifest_mismatches,
         "manifest_missing_entry": manifest_missing_entry,
         "orphan_records": orphan_records,
+        "missing_colour_card_files": missing_card_files,
+        "colour_card_mismatches": card_mismatches,
     }
+
+
+@dataclass(frozen=True)
+class _ShotFile:
+    """A colour card shot's file in the integrity check's hash list."""
+    shot_id: int
+    kind: str  # "shot" or "preview"
+    file_path: str
+
+
+def _colour_card_hash_targets(db: Session) -> List[Tuple]:
+    """(_ShotFile, resolved path, recorded sha256) for every shot master and preview on disk; no file is read."""
+    from app.models.colour_card import ColourCardShot
+
+    out: List[Tuple] = []
+    for shot in db.query(ColourCardShot).all():
+        for kind, stored, expected in (("shot", shot.file_path, shot.sha256),
+                                       ("preview", shot.preview_path, shot.preview_sha256)):
+            path = resolve_within_storage(stored) if stored else None
+            if path is None or not path.is_file() or not expected:
+                continue  # a missing file is reported under missing_colour_card_files
+            out.append((_ShotFile(shot.id, kind, stored), path, expected))
+    return out
+
+
+def _colour_card_files(db: Session) -> Tuple[Set[str], List[dict], int]:
+    """(known paths, missing, count) for the colour card shots: what each shot's row makes known, and each file it names that is gone (`kind` shot or preview)."""
+    from app.models.colour_card import ColourCardSet, ColourCardShot
+
+    known: Set[str] = set()
+    missing: List[dict] = []
+    rows = (db.query(ColourCardShot, ColourCardSet.collection_id)
+            .join(ColourCardSet, ColourCardShot.set_id == ColourCardSet.id).all())
+    for shot, collection_id in rows:
+        # Every file the row names: its master and, when it has one, its preview.
+        for kind, stored in (("shot", shot.file_path), ("preview", shot.preview_path)):
+            if kind == "preview" and not stored:
+                continue
+            path = resolve_within_storage(stored)
+            if path is None or not path.exists():
+                missing.append({"colour_card_shot_id": shot.id, "collection_id": collection_id, "kind": kind,
+                                "file_path": stored})
+                continue
+            known.add(str(path))
+            if kind == "shot" and not is_raw_suffix(path):
+                buffer = raw_sidecar_of(path)
+                if buffer.is_file():
+                    known.add(str(buffer))
+    return known, missing, len(rows)

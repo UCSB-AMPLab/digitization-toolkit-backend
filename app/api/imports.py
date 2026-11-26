@@ -6,34 +6,41 @@ copy), so the interface can send the file the operator picked unchanged.
 GET /imports/digitisation-list/{list_id}/report returns the latest stored
 import report for a list, and GET /imports/digitisation-lists every imported
 list with its items and the volume each one names. The import itself is
-app/core/list_import.py.
+app/core/list_import.py. The digitisation queue synced with Fisqua
+(app/core/fisqua_queue.py) is one more list there, with `source` `queue`.
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import hashlib
 import json
 import logging
 import uuid
+from typing import Optional
 
-from fastapi import APIRouter, Depends, File, HTTPException, UploadFile
-from pydantic import BaseModel, StrictBool
+from fastapi import APIRouter, Depends, File, Form, HTTPException, UploadFile
+from pydantic import BaseModel, StrictBool, StrictStr
 from fastapi.responses import JSONResponse, Response
 from sqlalchemy.orm import Session
 
 from app.api.activity import status_counts
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
 from app.core.audit import log_event
+from app.core.project_names import ProjectDirectoryTaken
 from app.core.list_import import (
     ListHashNotRecorded,
     ProjectLockUnavailable,
     ListIdReused,
     ListUnverifiable,
     ListRefused,
+    ListItemIdDiffers,
+    ListItemIdRequired,
     ListItemNotFound,
     ListUnreadable,
     ProjectNeedsAdmin,
+    done_key,
     import_list,
     parse_list_file,
     latest_report,
@@ -81,6 +88,7 @@ def _read_capped(upload: UploadFile) -> bytes:
 @router.post("/digitisation-list", status_code=200)
 def import_digitisation_list(
     file: UploadFile = File(..., description="A digitisation-list JSON file (exchange contract 1.1, artefact 1)"),
+    kept_on_unit: bool = Form(False, description="Keep the list's volumes on the unit (NEH-320); admin only"),
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
@@ -99,7 +107,26 @@ def import_digitisation_list(
     whether the report was also kept on the unit for
     GET /imports/digitisation-list/{list_id}/report, and `listStored`
     whether the uploaded file was kept for GET /imports/digitisation-lists.
+
+    In fisqua mode (app.core.unit_mode) volumes come from Fisqua's queue:
+    an operator is refused with a 403, code `volumes_from_fisqua`, before
+    the file is read; an admin's import goes ahead, the fallback while the
+    link is down, and is logged `list_import_override`. While projects are
+    hidden the volumes go into the unit's default project, and no admin is
+    needed for it.
+
+    `kept_on_unit` (NEH-320, app.core.kept_volumes): in offline mode every
+    volume is kept on the unit whatever is sent; in backup and fisqua mode
+    an admin may ask for it (the report's `keptOnUnit`; in fisqua mode the
+    override's log line says so), and from anyone else it is a 403
+    (`kept_on_unit_admin_only`) with nothing written.
     """
+    from app.core import kept_volumes, unit_mode
+
+    from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
+    if from_fisqua and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail={"code": unit_mode.VOLUMES_FROM_FISQUA,
+                                                     "message": unit_mode.VOLUMES_FROM_FISQUA_MESSAGE})
     raw = _read_capped(file)
     try:
         document = parse_list_file(raw)
@@ -109,7 +136,12 @@ def import_digitisation_list(
     try:
         report = import_list(db, document, current_user.username,
                              may_create_project=current_user.role == "admin",
-                             file_sha256=hashlib.sha256(raw).hexdigest(), raw=raw)
+                             file_sha256=hashlib.sha256(raw).hexdigest(), raw=raw,
+                             kept_on_unit=kept_on_unit, is_admin=current_user.role == "admin")
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    except ProjectDirectoryTaken as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
     except ListRefused as exc:
         raise HTTPException(status_code=422, detail=str(exc))
     except ProjectNeedsAdmin as exc:
@@ -128,11 +160,21 @@ def import_digitisation_list(
         detail=(f"list {report['listId']}: {report['created']} created, "
                 f"{report['skipped']} skipped" + ("" if stored else "; report not stored")),
     )
+    if from_fisqua:
+        codes = ", ".join(f"{v['referenceCode']} (volume {v['captuaCollectionId']})" for v in report["volumes"])
+        log_event(
+            db, level="INFO", category="activity", action="list_import_override",
+            actor=current_user.username, subject=report["listName"],
+            detail=f"list {report['listId']} imported in fisqua mode: {report['created']} created"
+                   + (f": {codes}" if codes else "")
+                   + ("; kept on the unit" if report.get("keptOnUnit") else ""),
+        )
     return JSONResponse(content=report)
 
 
 @router.get("/digitisation-lists")
 def list_digitisation_lists(
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
@@ -147,14 +189,31 @@ def list_digitisation_lists(
     GET /activity/collections gives them; both null when there is no such
     volume, when the stem is not one the import accepts (it is then not
     looked up), and for an item that repeats a stem an earlier item of the
-    same list, by position in the file, already gave. `projectId` is that
+    same list, by position in the file, already gave (a withdrawn queue
+    entry yields to a live one for the same stem, wherever it stands). `projectId` is that
     volume's own project_id, null with it. `doneMark` is {by, at} when a
     person has marked the item done
     (PUT /imports/digitisation-lists/{list_id}/items/{position}/done),
     otherwise null; a missing or damaged done.json reads as no marks. A
     list whose stored file is missing or unreadable, which is every list
     imported before the file was kept, has `items: []` and
-    `listFileMissing: true`. Reads only.
+    `listFileMissing: true`.
+
+    Each list also has `source`: `queue` for the digitisation queue synced
+    with Fisqua (contract 1.7), `file` for an imported file. Each item also
+    has `assignee` (the queue entry's unit username, or null; null for a
+    file's item), `withdrawn` (true for a queue entry Fisqua withdrew) and
+    `queueHidden`, true when the item's volume was taken off Cola by a
+    withdrawn entry (collections.queue_hidden_at), which a file's item for
+    the same volume shows too; `itemId`, the queue entry's id (null for a
+    file's item); and `retakes`, a spot-recapture entry's
+    [{captuaRecordId, pairId, side}], [] otherwise. A queue item's
+    `doneMark` is kept by its itemId, so it follows the entry from one
+    revision to the next; a file's by its position. Reads only.
+
+    An item is joined only to a volume of the caller's space
+    (app.core.testing_space.scope_query); one whose volume is in the other
+    space has `collectionId`, `projectId` and `status` null, as with no volume.
     """
     lists = stored_lists()
     # A stem the import would refuse is never bound: psycopg refuses a NUL
@@ -162,34 +221,44 @@ def list_digitisation_lists(
     stems = {item["filenameStem"] for entry in lists for item in entry["items"]
              if stem_is_well_formed(item["filenameStem"])}
     volume_of: dict[str, tuple[int, int | None]] = {}
+    hidden: set[int] = set()
     if stems:
-        volume_of = {
-            stem: (cid, pid)
-            for stem, cid, pid in db.query(Collection.filename_stem, Collection.id, Collection.project_id)
-            .filter(Collection.filename_stem.in_(stems))
-            .all()
-        }
+        rows = scope_query(db.query(Collection.filename_stem, Collection.id, Collection.project_id,
+                                    Collection.queue_hidden_at)
+                           .filter(Collection.filename_stem.in_(stems)),
+                           Collection, current_user, space).all()
+        volume_of = {stem: (cid, pid) for stem, cid, pid, _ in rows}
+        hidden = {cid for _, cid, _, hidden_at in rows if hidden_at is not None}
     counts = status_counts(db, sorted({cid for cid, _ in volume_of.values()}))
     for entry in lists:
         marks = entry.pop("doneMarks")
-        first_position: dict[str, int] = {}
+        # The item a stem's volume is joined to: the first, by position in
+        # the file, that is not withdrawn; a withdrawn entry only when no
+        # live entry of the list names the stem.
+        first_position: dict[str, tuple[bool, int]] = {}
         for item in entry["items"]:
             stem = item["filenameStem"]
             if stem_is_well_formed(stem):
-                first_position[stem] = min(first_position.get(stem, item["position"]), item["position"])
+                rank = (item["withdrawn"], item["position"])
+                first_position[stem] = min(first_position.get(stem, rank), rank)
         for item in entry["items"]:
             stem = item["filenameStem"]
-            first = stem_is_well_formed(stem) and first_position[stem] == item["position"]
+            first = stem_is_well_formed(stem) and first_position[stem][1] == item["position"]
             cid, pid = volume_of.get(stem, (None, None)) if first else (None, None)
             item["collectionId"] = cid
             item["projectId"] = pid
             item["status"] = counts[cid].model_dump() if cid is not None else None
-            item["doneMark"] = marks.get(item["position"])
+            item["doneMark"] = marks.get(done_key(entry["listId"], item))
+            item["queueHidden"] = cid in hidden
     return JSONResponse(content=lists)
 
 
 class DoneRequest(BaseModel):
     done: StrictBool
+    # The itemId of the queue entry meant, checked against the item at the
+    # position (a later revision may have moved it). Required for the
+    # digitisation queue, unused for a file's list.
+    itemId: Optional[StrictStr] = None
 
 
 @router.put("/digitisation-lists/{list_id}/items/{position}/done")
@@ -205,10 +274,16 @@ def mark_list_item_done(
     Record counts cannot tell whether a spot recapture, a rescan or a
     completion is finished, so a person confirms it. `position` is the
     item's position in the stored list file, as GET
-    /imports/digitisation-lists gives it. Returns `listId`, `position` and
-    `doneMark` ({by, at}, or null once removed). A 422 when the list id is
-    not a UUID or the body is not {"done": true|false}; a 404 when no
-    stored list file of this id has an item at that position; a 503 when
+    /imports/digitisation-lists gives it. In the digitisation queue the
+    mark is kept by the item's itemId, so it stays with the entry when a
+    later revision moves it; the body must carry that `itemId` (a 422
+    without it), and if the item now at the position is another entry the
+    answer is a 409. Nothing changes in either case. A file's list takes
+    no itemId. Returns `listId`, `position`, `itemId` (null for a
+    file's item) and `doneMark` ({by, at}, or null once removed). A 422
+    when the list id is not a UUID or the body is not {"done": true|false,
+    "itemId"?: string}; a 404 when no stored list file of this id has an
+    item at that position; a 503 when
     the mark cannot be written, in which case nothing has changed.
     """
     try:
@@ -216,9 +291,16 @@ def mark_list_item_done(
     except ValueError:
         raise HTTPException(status_code=422, detail="The list id is not a UUID.")
     try:
-        item, mark = set_done_mark(list_id, position, payload.done, current_user.username)
+        item, mark = set_done_mark(list_id, position, payload.done, current_user.username,
+                                   item_id=payload.itemId)
     except ListItemNotFound:
         raise HTTPException(status_code=404, detail="No stored list of this id has an item at this position.")
+    except ListItemIdRequired:
+        raise HTTPException(status_code=422, detail="A mark on the digitisation queue must name the entry's "
+                                                    "itemId.")
+    except ListItemIdDiffers:
+        raise HTTPException(status_code=409, detail="The item at this position is another queue entry now. "
+                                                    "Reload the queue and try again.")
     except OSError:
         logger.exception("Could not write the done marks of list %s", list_id)
         raise HTTPException(status_code=503, detail="Captua could not save the mark on the unit. Try again.")
@@ -237,7 +319,7 @@ def mark_list_item_done(
         subject=list_name,
         detail=f"list {list_id}: item {position} ({item['referenceCode']})",
     )
-    return {"listId": list_id, "position": position, "doneMark": mark}
+    return {"listId": list_id, "position": position, "itemId": item.get("itemId"), "doneMark": mark}
 
 
 @router.get("/digitisation-list/{list_id}/report")

@@ -1,10 +1,11 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from datetime import datetime, timezone
-from sqlalchemy import event, inspect as sa_inspect, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, select, text
+from sqlalchemy import event, inspect as sa_inspect, Boolean, Column, Integer, String, Text, Date, DateTime, ForeignKey, JSON, CheckConstraint, UniqueConstraint, exists, false, select, text
 from sqlalchemy.orm import Session, relationship, validates, object_session
 
 from app.core.db import Base
+from app.models.project import TestingSpaceError, refuse_testing_change
 from app.models.record import ImmutableFieldError, Record, RecordImage
 
 
@@ -85,33 +86,40 @@ class ReferenceCodeDiffersFromStemError(ValueError):
 
 
 def offsite_keys_under_stem(session, stem, collection=None) -> bool:
-    """Whether any offsite_objects key lies under `<tenant>/<stem>/`, for any tenant.
+    """Whether any offsite_objects or colour_card_objects key lies under `<tenant>/<stem>/`, for any tenant.
 
     A key holds the stem when its second path segment is the stem and
     something follows it: `<tenant>/<stem>/<rest>`. The tenant is not
     compared with CAPTUA_OFFSITE_TENANT, because keys under an earlier tenant,
     or kept while upload is disabled, name objects issued under the stem
     all the same. With `collection` given, a key whose image belongs to a
-    record in that volume is not counted. A key whose image was deleted
-    (record_image_id NULL, or an id no image has) always counts. Reads with
-    autoflush off, so it can run inside a flush.
+    record in that volume, or whose colour card shot belongs to one of its
+    sets, is not counted. A key whose image or shot was deleted or adopted
+    away (record_image_id or shot_id NULL, or an id no row has) always
+    counts. Reads with autoflush off, so it can run inside a flush.
     """
+    from app.models.colour_card import ColourCardObject, ColourCardSet, ColourCardShot
     from app.models.offsite_object import OffsiteObject
 
     if not stem:
         return False
     # The stem alphabet [a-z0-9-] holds no LIKE wildcard.
     query = select(OffsiteObject.object_key).where(OffsiteObject.object_key.like(f"%/{stem}/%"))
+    cards = select(ColourCardObject.object_key).where(ColourCardObject.object_key.like(f"%/{stem}/%"))
     if collection is not None and collection.id is not None:
         own = select(RecordImage.id).where(RecordImage.record_id == Record.id,
                                            Record.collection_id == collection.id)
         query = query.where((OffsiteObject.record_image_id.is_(None))
                             | (OffsiteObject.record_image_id.not_in(own)))
+        own_shots = select(ColourCardShot.id).where(ColourCardShot.set_id == ColourCardSet.id,
+                                                    ColourCardSet.collection_id == collection.id)
+        cards = cards.where((ColourCardObject.shot_id.is_(None)) | (ColourCardObject.shot_id.not_in(own_shots)))
     with session.no_autoflush:
-        for key in session.execute(query).scalars():
-            parts = key.split("/", 2)
-            if len(parts) == 3 and parts[0] and parts[1] == stem and parts[2]:
-                return True
+        for q in (query, cards):
+            for key in session.execute(q).scalars():
+                parts = key.split("/", 2)
+                if len(parts) == 3 and parts[0] and parts[1] == stem and parts[2]:
+                    return True
     return False
 
 
@@ -127,6 +135,12 @@ class StemDirectoryCollisionError(ValueError):
 
 class StemIsProjectDirectoryError(StemDirectoryCollisionError):
     """The stem is the directory name of a project."""
+
+
+def stem_is_project_directory_message(stem: str) -> str:
+    """The refusal of a stem that is a project's directory name. It names the stem sent, never the project."""
+    return (f"The file name stem {stem} is the directory of a project; "
+            "a volume's files and a project's tree cannot share it.")
 
 
 class StemDirectoryOccupiedError(StemDirectoryCollisionError):
@@ -189,9 +203,7 @@ def stem_directory_conflict(session, stem=None, project_name=None, collection=No
         if stem is not None:
             for (name,) in session.query(Project.name).all():
                 if project_dir_name(name) == stem:
-                    return StemIsProjectDirectoryError(
-                        f"The file name stem {stem} is the directory of project {name!r}; "
-                        "a volume's files and a project's tree cannot share it.")
+                    return StemIsProjectDirectoryError(stem_is_project_directory_message(stem))
             if _stem_directory_is_someone_elses(session, stem, collection):
                 return StemDirectoryOccupiedError(
                     f"The directory {stem} already exists in the projects root and holds files that are "
@@ -199,6 +211,13 @@ def stem_directory_conflict(session, stem=None, project_name=None, collection=No
         if project_name is not None:
             directory = project_dir_name(project_name)
             if session.query(Collection.id).filter(Collection.filename_stem == directory).first() is not None:
+                # The name as the caller sent it: a testing project's without the
+                # prefix, and its directory, which carries the prefix, not named.
+                from app.core.project_names import display_project_name
+                shown = display_project_name(project_name)
+                if shown != project_name:
+                    return ProjectNameIsStemError(
+                        f"The project name {shown!r} would use the directory of a volume's file name stem.")
                 return ProjectNameIsStemError(
                     f"The project name {project_name!r} would use the directory {directory}, "
                     "which is a volume's file name stem.")
@@ -276,6 +295,42 @@ class Collection(Base):
     created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
     updated_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), onupdate=lambda: datetime.now(timezone.utc))
 
+    # The digitisation queue synced with Fisqua (contract 1.7,
+    # app.core.fisqua_queue), and set only by that sync. assignee_username
+    # is the unit username the queue entry is assigned to, as users.username
+    # holds it (not a foreign key: Fisqua may name a user deleted since).
+    # queue_hidden_at is when a withdrawn entry took the volume off Cola,
+    # which only happens while the volume has no records; a later entry
+    # for the same reference code clears it.
+    assignee_username = Column(String(150), nullable=True)
+    queue_hidden_at = Column(DateTime, nullable=True)
+
+    # Whether Captua keeps the volume on the unit (NEH-320, app.core.kept_volumes):
+    # while true, none of its images is copied offsite and none of its Fisqua
+    # manifests is promoted or sent. Set at creation in offline mode, or by an
+    # admin; cleared by an admin, or for every kept volume when an admin
+    # switches out of offline mode and includes them.
+    kept_on_unit = Column(Boolean, nullable=False, default=False, server_default=false())
+
+    # When an adoption moved the volume's captures into another volume (NEH-387,
+    # app.core.adopt_apply), written in the adoption's own transaction, so an
+    # undone adoption leaves it null. Once set the volume is closed: it takes no
+    # capture, colour card set or shot, record, record moved in, or image
+    # (app.core.adopt_journal.refuse_if_adopted_away), and exists to be deleted.
+    # Never cleared.
+    captures_adopted_at = Column(DateTime, nullable=True)
+
+    # A testing volume (app.core.testing_space): testing work beside the
+    # real work, never copied offsite, never sent to Fisqua and never
+    # released into real work. Set at insert and never changed
+    # (_testing_is_fixed_at_insert); at insert it is the volume's project's,
+    # or its parent's (_a_volume_follows_its_project_or_parent). A testing
+    # volume is always kept on the unit (_a_testing_volume_stays_kept, and
+    # check_collection_testing_kept in the database).
+    testing = Column(Boolean, nullable=False, default=False, server_default=false())
+    # When a testing volume is due to be removed; null for every other volume.
+    testing_expires_at = Column(DateTime, nullable=True)
+
     # Relationships
     project = relationship("Project", back_populates="collections")
     parent_collection = relationship("Collection", remote_side=[id], back_populates="child_collections")
@@ -352,7 +407,7 @@ class Collection(Base):
 
     def has_captured(self) -> bool:
         """Whether the volume has ever captured: capture_counter above zero, any image,
-        or an offsite object keyed under its stem.
+        a colour card shot, or an offsite object keyed under its stem.
 
         The counter keeps the answer after the volume's records are deleted or
         moved out. next_capture_number raises it for each capture and upload
@@ -366,7 +421,26 @@ class Collection(Base):
         if (self.capture_counter or 0) > 0 or self.has_images():
             return True
         session = object_session(self)
-        return session is not None and offsite_keys_under_stem(session, self.filename_stem)
+        if session is None:
+            return False
+        return self.has_colour_card_shots() or offsite_keys_under_stem(session, self.filename_stem)
+
+    def has_colour_card_shots(self) -> bool:
+        """Whether a colour card shot of the volume exists, in any set (app.core.colour_card).
+
+        Its files are named after the stem and keyed under it offsite, so it
+        fixes the stem as a capture does. A shot removed with its open set
+        when the request was skipped leaves nothing named after the stem,
+        and counts no more. Read with autoflush off.
+        """
+        from app.models.colour_card import ColourCardSet, ColourCardShot
+
+        session = object_session(self)
+        if self.id is None or session is None:
+            return False
+        with session.no_autoflush:
+            return session.execute(select(exists().where(
+                ColourCardShot.set_id == ColourCardSet.id, ColourCardSet.collection_id == self.id))).scalar()
 
     def reserves_its_stem(self) -> bool:
         """Whether the volume has a stem and has captured, so its row must be kept.
@@ -378,10 +452,78 @@ class Collection(Base):
         """
         return self.filename_stem is not None and self.has_captured()
 
+    def deletable_after_adoption(self) -> bool:
+        """Whether a volume emptied by an adoption may be deleted although it reserves its stem.
+
+        Whether the volume is closed is captures_adopted_at, which the
+        adoption records; this is the separate question of its deletion. A
+        volume whose captures were adopted away (NEH-387, app.core.adopt_apply)
+        may be deleted although it reserves its stem: it has a stem, no
+        record, no image, no sub-volume and no colour card set (so no shot)
+        of its own, no adoption journal names it
+        (app.core.adopt_journal), and every offsite key under its stem
+        (`<any tenant>/<stem>/...`), in offsite_objects and in
+        colour_card_objects, is a retired row, of which there is at least
+        one: no row attached to an image or shot, and no detached row that
+        is not retired. Deleting it does not free its stem: the retired keys
+        still hold it (offsite_keys_under_stem, _refuse_a_stem_held_offsite),
+        so no volume can take it while one remains. DELETE /collections/{id}
+        and the before-flush delete guard both apply this rule and no other
+        exception to reserves_its_stem. Reads with autoflush off, so it can
+        run inside a flush.
+        """
+        from app.models.colour_card import ColourCardObject, ColourCardSet
+        from app.models.offsite_object import OffsiteObject
+
+        session = object_session(self)
+        if session is None or self.id is None or not self.filename_stem:
+            return False
+        from app.core.adopt_journal import journal_names_volume
+
+        if journal_names_volume(self.id):
+            return False
+        with session.no_autoflush:
+            if session.execute(select(Record.id).where(Record.collection_id == self.id).limit(1)).first():
+                return False
+            if session.execute(select(Collection.id).where(Collection.parent_collection_id == self.id)
+                               .limit(1)).first():
+                return False
+            if session.execute(select(ColourCardSet.id).where(ColourCardSet.collection_id == self.id)
+                               .limit(1)).first():
+                return False
+            retired = []
+            for table in (OffsiteObject, ColourCardObject):
+                query = select(table.object_key, table.retired_at).where(
+                    table.object_key.like(f"%/{self.filename_stem}/%"))
+                for key, retired_at in session.execute(query):
+                    parts = key.split("/", 2)
+                    if len(parts) == 3 and parts[1] == self.filename_stem and parts[2]:
+                        retired.append(retired_at is not None)
+        return bool(retired) and all(retired)
+
     @property
     def stem_reserved(self) -> bool:
         """reserves_its_stem() as an attribute, for CollectionRead."""
         return self.reserves_its_stem()
+
+    @validates("testing", include_removes=True)
+    def _testing_is_fixed_at_insert(self, key, value, is_remove):
+        return refuse_testing_change(self, value, is_remove)
+
+    @validates("kept_on_unit", include_removes=True)
+    def _a_testing_volume_stays_kept(self, key, value, is_remove):
+        """Refuse clearing kept_on_unit on a stored testing volume.
+
+        A testing volume is never released into real work, so its flag stays
+        set. Before insert the flag is free; the flush that inserts a testing
+        volume sets it (_a_volume_follows_its_project_or_parent). An ORM
+        attribute guard; check_collection_testing_kept refuses the same in
+        the database, for `query().update()` and raw SQL.
+        """
+        if sa_inspect(self).has_identity and self.testing and (is_remove or not value):
+            raise TestingSpaceError(
+                f"collections.kept_on_unit stays set on a testing volume (volume {self.id})")
+        return value
 
     @validates("capture_counter", include_removes=True)
     def _capture_counter_never_decreases(self, key, value, is_remove):
@@ -455,6 +597,11 @@ class Collection(Base):
         CheckConstraint(
             'capture_counter >= 0',
             name='check_collection_capture_counter'
+        ),
+        # A testing volume is always kept on the unit.
+        CheckConstraint(
+            'NOT testing OR kept_on_unit',
+            name='check_collection_testing_kept'
         ),
         CheckConstraint(
             _EXTERNAL_ID_TRIMMED_POSTGRES,
@@ -534,7 +681,7 @@ def _refuse_to_delete_a_reserved_stem(session, flush_context, instances):
     doomed = [obj for obj in list(session.deleted) if isinstance(obj, Collection)]
     doomed.extend(_orphaned_volumes(session))
     for obj in doomed:
-        if obj.reserves_its_stem():
+        if obj.reserves_its_stem() and not obj.deletable_after_adoption():
             raise StemReservedError(
                 f"collections.filename_stem is reserved: volume {obj.id} has captured "
                 f"under it and cannot be deleted"
@@ -614,12 +761,134 @@ def _refuse_a_stem_that_is_a_project_directory(session, flush_context, instances
     for stem, volume in new_stems.items():
         error = stem_directory_conflict(session, stem=stem, collection=volume)
         if error is None and stem in new_dirs:
-            error = StemIsProjectDirectoryError(
-                f"The file name stem {stem} is the directory of project {new_dirs[stem].name!r}; "
-                "a volume's files and a project's tree cannot share it.")
+            error = StemIsProjectDirectoryError(stem_is_project_directory_message(stem))
         if error is not None:
             raise error
     for directory, project in new_dirs.items():
         error = stem_directory_conflict(session, project_name=project.name)
         if error is not None:
             raise error
+
+
+def _expected_testing(session, volume, seen=None) -> bool:
+    """Whether `volume`'s project, or its parent volume, is testing work.
+
+    A parent or a project in the same flush is read from its object; one not
+    yet given `testing` (still None before its insert) is read as its column
+    default, false, for a project, and for a volume as its own project's or
+    parent's in turn. Read without a lock: `testing` never changes after
+    insert.
+    """
+    from app.models.project import Project
+
+    seen = seen if seen is not None else set()
+    if id(volume) in seen:
+        return False
+    seen.add(id(volume))
+    parent = _pending_target(session, volume, "parent_collection", "parent_collection_id", Collection)
+    if parent is not None:
+        if parent.testing is not None:
+            return bool(parent.testing)
+        return _expected_testing(session, parent, seen)
+    project = _pending_target(session, volume, "project", "project_id", Project)
+    return bool(project.testing) if project is not None and project.testing is not None else False
+
+
+def _pending_target(session, volume, relationship_name, column_name, cls):
+    """The parent (or project) `volume` will have once flushed, through the relationship or the id.
+
+    An object assigned to the relationship since the load wins; then a
+    changed id; then the relationship cleared; then the stored id, or the
+    loaded relationship of a volume that has no id set.
+    """
+    attrs = sa_inspect(volume).attrs
+    relationship = attrs[relationship_name].history
+    if relationship.added:
+        return relationship.added[0]
+    target_id = getattr(volume, column_name)
+    if attrs[column_name].history.has_changes():
+        return session.get(cls, target_id) if target_id is not None else None
+    if relationship.deleted:
+        return None
+    if target_id is not None:
+        return session.get(cls, target_id)
+    return getattr(volume, relationship_name)
+
+
+@event.listens_for(Session, "before_flush")
+def _a_volume_follows_its_project_or_parent(session, flush_context, instances):
+    """Give a new volume its project's or its parent's `testing`; refuse one that differs.
+
+    Covers every writer through the ORM. A new volume with `testing` unset
+    takes the value of its parent volume, or of its project for a top-level
+    volume; one given a different value raises TestingSpaceError. A new
+    testing volume is kept on the unit, whatever kept_on_unit it was given:
+    a testing volume is always kept.
+
+    A stored volume given another parent or project through the ORM is
+    refused the same way when the new one's `testing` differs from its own.
+    The routes refuse such a move first, with a 409 `cross_space`
+    (app.core.testing_space.refuse_cross_space); POST
+    /projects/{id}/move-collections moves volumes with `query().update()`,
+    which goes around this, and refuses the move itself.
+    """
+    for obj in list(session.new):
+        if not isinstance(obj, Collection):
+            continue
+        expected = _expected_testing(session, obj)
+        if obj.testing is None:
+            obj.testing = expected
+        elif bool(obj.testing) != expected:
+            raise TestingSpaceError(
+                f"A volume's testing is its project's or its parent's: volume {obj.name!r} "
+                f"asked for {bool(obj.testing)}, its {'parent' if obj.parent_collection_id or obj.parent_collection else 'project'} "
+                f"is {expected}")
+        if obj.testing and not obj.kept_on_unit:
+            obj.kept_on_unit = True
+    for obj in list(session.dirty):
+        if not isinstance(obj, Collection) or obj in session.new:
+            continue
+        attrs = sa_inspect(obj).attrs
+        if not any(attrs[name].history.has_changes() for name in
+                   ("project_id", "parent_collection_id", "project", "parent_collection")):
+            continue
+        if bool(obj.testing) != _expected_testing(session, obj):
+            raise TestingSpaceError(
+                f"A volume cannot move between testing and real work (volume {obj.id})")
+
+
+@event.listens_for(Session, "before_flush")
+def _a_volumes_codes_are_in_its_spaces_namespace(session, flush_context, instances):
+    """Refuse a flush that gives a volume a stem, a reference code or (a real one) a name outside its space's namespace.
+
+    A testing volume's filename_stem and external_id, when set, begin with
+    app.core.project_names.TESTING_PREFIX (code `testing_name_required`);
+    a real volume's, and a real volume's name, never do, in any capitals,
+    accents or width (code `name_reserved`). Registered after _a_volume_follows_its_project_or_parent,
+    so a new volume's `testing` is already its project's or its parent's.
+    Only a new volume or a changed stem or external_id is checked.
+    `query().update()` and raw SQL go around it.
+    """
+    from app.core import testing_space
+
+    for obj in list(session.new) + list(session.dirty):
+        if not isinstance(obj, Collection):
+            continue
+        attrs = sa_inspect(obj).attrs
+        testing = bool(obj.testing) if obj.testing is not None else _expected_testing(session, obj)
+        # The reference code first, as the list import checks an item. A
+        # real volume's name is checked too: a volume without a stem keeps
+        # its files in a directory named after it, under its project's
+        # (capture.project_manager.collection_capture_root). A testing
+        # volume's name is free: its directory is its stem's, or inside
+        # its testing project's.
+        for field in ("external_id", "filename_stem", "name"):
+            if field == "name" and testing:
+                continue
+            if obj not in session.new and not attrs[field].history.has_changes():
+                continue
+            code = testing_space.namespace_problem(testing, getattr(obj, field))
+            if code is not None:
+                raise TestingSpaceError(
+                    f"{testing_space.NAMESPACE_MESSAGES[code]} (collections.{field})", code=code,
+                    field=f"collections.{field}")

@@ -9,30 +9,46 @@ copied server-side into the bucket under contract names, at
 `<tenant>/<stem>/captures/<stem>-img_<nnnn>_c<n>.jpg`, and never come to the
 card. This command gives an empty volume the records it would have had if
 Captua had captured those openings, one dual record per pair, as
-app.api.cameras.trigger_dual_capture writes one, and a single record for an
-image left without a partner, with each master stored offsite and freed from
-birth, so the volume can be handed over, reviewed in Fisqua and its rejected
+app.api.cameras.trigger_dual_capture writes one, a single record for an
+image left without a partner, and a dual record with one image for an
+opening only one camera photographed, with each master stored offsite and
+freed from birth, so the volume can be handed over, reviewed in Fisqua and its rejected
 pages retaken from the unit like any other.
 
 The bundle is a directory with
 
-* `plan.json`: `{"stem", "counterAfter", "records": [...]}`, each record with
-  `ordinal` (its position and its file name index; its sequence),
-  `captureId`, `pairId`, `mode` (`dual` or `single`), `capturedAt`,
-  `capturedAtSource` and `images`, each image with `volumeOrder`,
-  `filename`, `role` and `rotateDeg`. It decides records, names, ids, dates,
-  roles and rotation. A dual record has one `left` image named
+* `plan.json`: `{"stem", "counterAfter", "indexOffset", "records": [...]}`,
+  each record with `ordinal` (its position: its sequence), `captureId`,
+  `pairId`, `mode` (`dual` or `single`), `capturedAt`, `capturedAtSource`
+  and `images`, each image with `volumeOrder`, `filename`, `role` and
+  `rotateDeg`. It decides records, names, ids, dates, roles and rotation.
+  `indexOffset` K, a whole number from 0 to MAX_CAPTURE_NUMBER, is 0 when
+  absent: a record's file name index `<nnnn>` is its ordinal + K. A volume
+  rebuilt for the first time has none. A volume whose earlier records were
+  deleted to be rebuilt again takes the highest number they used, so the new
+  files are numbered after the old ones and no key in the bucket is named
+  twice; the records' sequences are still 1 to N. A dual record has one `left` image named
   `<stem>-img_<nnnn>_c0.jpg` (camera 0, the even image) and one `right`
   image named `..._c1.jpg` (camera 1, the odd image), and its filename
   index `<stem>-img_<nnnn>` as its pair id, as capture gives a dual capture
   one (capture.service.dual_capture_image); a single record has one
-  `single` image named `..._c0.jpg`, and a null pair id.
+  `single` image named `..._c0.jpg`, and a null pair id. A dual record may
+  also carry `missingSide`, `left` or `right`: the page of the opening
+  that was never photographed. It then has exactly one image, the other
+  page: the `right` image `_c1` when the left is missing, the `left` image
+  `_c0` when the right is missing, with its filename index as its pair id
+  as any dual record. The record is written with records.missing_side set,
+  which makes it pending (app.core.recapture_turn) until a dual retake
+  writes both pages. No other record carries `missingSide`.
 * `images.jsonl`: one line per source image, with `volumeOrder`,
   `sourceKey`, `bytes`, `sha256`, `sha1`, `width`, `height`, `format`, the
   EXIF facts and `thumbnail`, a path relative to the bundle to a ready 600px
   thumbnail, made upright (from the pixels rotated by the plan's rotateDeg)
   as app.core.thumbnail makes one, and copied as it is. It decides bytes,
-  digests, size and thumbnails.
+  digests, size and thumbnails. A line may also carry `sourceBucket`, the
+  bucket its sourceKey is in, one of SOURCE_BUCKETS; a line without one
+  names `zasqua-transition`, so a bundle written before the field existed
+  reads as it did.
 
 `rotateDeg` is authoritative: a camera pointing straight down cannot tell
 which way is up, so the EXIF Orientation the cameras wrote is close to
@@ -44,30 +60,41 @@ them. The EXIF Orientation is recorded as provenance only.
 The bundle is refused when the two files do not name the same images; when a
 volumeOrder, a file name, a capture id, a pair id or an ordinal repeats; when
 a dual record does not have exactly one `left` image named `_c0` and one
-`right` image named `_c1` for its ordinal, or a pair id other than its
-filename index (a UUID included); when a single record does not have exactly
+`right` image named `_c1` for its file name index, or a pair id other than its
+filename index (a UUID included); when a dual record's `missingSide` is
+neither absent, null, `left` nor `right`, or it misses a side and does not
+have exactly one image, on the other side, named for that side's camera;
+when a single record carries a `missingSide`, does not have exactly
 one `single` image named `_c0`, or has a pair id; when a rotateDeg is not 0, 90, 180 or 270; when the ordinals are not 1
-to N; or when a sourceKey repeats. The plan shape of 0.1, one entry per
-image, is not read: no unit ran it but the bench.
+to N; when indexOffset is present and not a whole number from 0 to
+MAX_CAPTURE_NUMBER (null included); when a sourceBucket is not one of SOURCE_BUCKETS; or when a sourceKey
+repeats. The plan shape of 0.1, one entry per image, is not read: no unit
+ran it but the bench.
 
 Nothing is written unless every precondition holds:
 
 * the volume with the stem exists, is in a project, and has no records, no
-  images and a capture counter of 0. A rerun finds the counter an earlier
+  images and a capture counter of at most indexOffset: 0 for a volume never
+  captured, up to K for one whose earlier records were deleted, the volume
+  row kept with its counter. A rerun finds the counter an earlier
   run raised: equal to counterAfter, with records that run made, each
   whole, and nothing else; or above it, when an operator has captured into
   the volume since, and then each record not of the bundle must carry
-  numbers above counterAfter (a counter above 0 and below counterAfter is
-  refused);
+  numbers above counterAfter (a counter above indexOffset and below
+  counterAfter is refused);
 * offsite is configured (a remote and a valid tenant);
 * a fresh listing of `<tenant>/<stem>/captures/` (a listing: the unit's key
   cannot read) shows every planned key, both files of each pair, with the
   planned SHA1 and size;
-* `counterAfter` is at least the number of records;
+* `counterAfter` is at least indexOffset plus the number of records, the
+  highest planned file name index;
 * no planned master is on the card, no other offsite row holds a planned
   key, no image elsewhere carries a planned capture id, and the volume's
-  manifest holds no capture but this bundle's and those numbered above
-  counterAfter.
+  manifest holds no capture but this bundle's, those numbered above
+  counterAfter, and, with an indexOffset, those whose files are all
+  numbered from 1 to indexOffset and whose capture id no image on the unit
+  carries: the lines of the records the rebuild replaced, which the
+  append-only manifest keeps as history.
 
 An applied run holds an flock on `<stem>/metadata/.rebuild.lock` from its
 checks to its end, and refuses to start while another run holds it.
@@ -86,10 +113,12 @@ ordinal order, is written whole or not at all:
    record's capture id and pair id, one file per image (its role, path,
    bytes, sha256 and rotation), `cameras: []`, `timestamp_utc` from
    capturedAt and a `provenance` object: `rebuiltFrom`, naming for each
-   file the source object and its EXIF Orientation, and `capturedAtSource`;
+   file the source object (its bucket and key) and its EXIF Orientation,
+   `capturedAtSource`, and `missingSide` for a record that misses a side
+   (its line lists its one file);
    a rerun does not append a line a capture id already has;
 3. in one transaction, the record (dual or single, captured, sequence =
-   ordinal), its images (the canonical paths of the absent masters, each
+   ordinal, whatever the indexOffset, missing_side as planned), its images (the canonical paths of the absent masters, each
    master freed with the listed size, the shared capture id and pair id,
    each image's role and rotation) and a verified offsite row per image at
    the planned key with the planned SHA1, committed through
@@ -122,7 +151,14 @@ before the commit, so no other path can hold or wait on its lock, and the
 record-before-volume order of paths that lock existing records is not
 crossed. No database transaction stays open across the listing or a file copy.
 
-Version: 0.2.0
+Deleting a volume's records before a rebuild with an indexOffset (not done
+here) leaves their offsite rows, each keeping its key with record_image_id
+set NULL (offsite_objects' ON DELETE SET NULL), their capture lines in the
+manifest, and their offsite-freed lines. None blocks the run when K is at
+least the highest number the old records used: their keys then carry numbers
+1 to K, and the planned ones K + 1 on.
+
+Version: 0.3.0
 """
 
 import argparse
@@ -149,7 +185,10 @@ logger = logging.getLogger(__name__)
 CATEGORY = "system"
 REBUILT_ACTION = "volume_rebuilt"
 FREED_METHOD = "rebuild"
-SOURCE_BUCKET = "zasqua-transition"
+SOURCE_BUCKET = "zasqua-transition"  # an images.jsonl line's bucket when it names none
+# The buckets a source image may be read from: last year's transition copies,
+# and the AHR preservation bags.
+SOURCE_BUCKETS = frozenset({"zasqua-transition", "zasqua-preservation"})
 ROTATIONS = (0, 90, 180, 270)
 MODES = ("dual", "single")
 # The roles of a record's images, in the order they are written, and the
@@ -157,6 +196,8 @@ MODES = ("dual", "single")
 # names them (app.api.cameras.trigger_dual_capture), and a single one.
 ROLES = {"dual": ("left", "right"), "single": ("single",)}
 CAMERA_FOR_ROLE = {"left": 0, "right": 1, "single": 0}
+# A dual record's missingSide, and the role of its one image.
+OTHER_SIDE = {"left": "right", "right": "left"}
 _SHA1 = re.compile(r"^[0-9a-f]{40}$")
 _SHA256 = re.compile(r"^[0-9a-f]{64}$")
 
@@ -180,6 +221,7 @@ class PlannedImage:
     role: str
     rotate_deg: int
     source_key: str
+    source_bucket: str  # one of SOURCE_BUCKETS
     size: int
     sha256: str
     sha1: str
@@ -198,6 +240,8 @@ class Planned:
     captured_at: datetime  # aware, UTC
     captured_at_source: Optional[str]
     images: List[PlannedImage] = field(default_factory=list)  # in ROLES order
+    missing_side: Optional[str] = None  # "left" or "right" for a dual opening that misses that page
+    number: int = 0  # its file name index: ordinal + indexOffset (set by load_bundle)
 
 
 # ---------------------------------------------------------------------------
@@ -266,12 +310,15 @@ def _repeats(entries: list, field: str, key: str = "volumeOrder") -> List[dict]:
             for e in entries if e[field] is not None and seen[e[field]] > 1]
 
 
-def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
-    """The first reason a plan record (with a valid ordinal) is refused, or None; the record parsed into `e`."""
+def _record_problem(stem: str, ordinal: int, e: dict, offset: int = 0) -> Optional[dict]:
+    """The first reason a plan record (with a valid ordinal) is refused, or None; the record parsed into `e`.
+
+    Its file names and pair id carry its file name index, ordinal + `offset`.
+    """
     from app.core.capture_naming import capture_filename_index
 
     base = {"ordinal": ordinal}
-    index = capture_filename_index(stem, ordinal)
+    index = capture_filename_index(stem, ordinal + offset)
     mode, capture_id, pair_id = e.get("mode"), e.get("captureId"), e.get("pairId")
     if mode not in MODES:
         return {**base, "reason": "mode_invalid", "value": mode}
@@ -289,8 +336,14 @@ def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
     for img in images:
         if not _is_int(img.get("volumeOrder")) or img["volumeOrder"] < 1:
             return {**base, "reason": "volume_order_invalid", "value": img.get("volumeOrder")}
+    missing = e.get("missingSide")
+    if missing is not None and (mode != "dual" or not isinstance(missing, str) or missing not in OTHER_SIDE):
+        return {**base, "reason": "missing_side_invalid", "value": missing}
     roles = sorted(str(img.get("role")) for img in images)
-    if roles != sorted(ROLES[mode]):
+    if missing is not None:
+        if roles != [OTHER_SIDE[missing]]:
+            return {**base, "reason": "missing_side_images_invalid", "missingSide": missing, "roles": roles}
+    elif roles != sorted(ROLES[mode]):
         return {**base, "reason": f"{mode}_{'roles' if mode == 'dual' else 'images'}_invalid", "roles": roles}
     for img in images:
         wanted = f"{index}_c{CAMERA_FOR_ROLE[img['role']]}.jpg"
@@ -305,7 +358,11 @@ def _record_problem(stem: str, ordinal: int, e: dict) -> Optional[dict]:
 
 
 def load_bundle(bundle_dir: str, stem: str) -> tuple:
-    """(counterAfter, [Planned] in ordinal order) from a bundle. Raises RebuildRefused."""
+    """(counterAfter, [Planned] in ordinal order) from a bundle. Raises RebuildRefused.
+
+    Each Planned's `number` is its file name index, its ordinal plus the
+    plan's indexOffset (0 when the plan has none).
+    """
     from app.core.capture_naming import MAX_CAPTURE_NUMBER
 
     bundle = Path(bundle_dir)
@@ -324,6 +381,12 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
     if not _is_int(counter_after) or not 0 <= counter_after <= MAX_CAPTURE_NUMBER:
         raise RebuildRefused(f"plan.json's counterAfter {counter_after!r} is not a whole number "
                              f"from 0 to {MAX_CAPTURE_NUMBER}")
+    # Absent for a volume rebuilt for the first time; a volume whose earlier
+    # records were deleted names its new files after their numbers.
+    offset = plan.get("indexOffset", 0)
+    if not _is_int(offset) or not 0 <= offset <= MAX_CAPTURE_NUMBER:
+        raise RebuildRefused(f"plan.json's indexOffset {offset!r} is not a whole number from 0 to "
+                             f"{MAX_CAPTURE_NUMBER}", [{"reason": "index_offset_invalid", "value": offset}])
     entries = plan.get("records")
     if not isinstance(entries, list) or not entries:
         raise RebuildRefused("plan.json has no records (the plan shape of 0.1, one entry per image, "
@@ -339,14 +402,15 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         if not _is_int(ordinal) or not 1 <= ordinal <= MAX_CAPTURE_NUMBER:
             problems.append({"index": index, "reason": "ordinal_invalid", "value": ordinal})
             continue
-        problem = _record_problem(stem, ordinal, e)
+        problem = _record_problem(stem, ordinal, e, offset)
         if problem is not None:
             problems.append(problem)
             continue
         source = e.get("capturedAtSource")
         records.append({"ordinal": ordinal, "captureId": e["captureId"], "pairId": e.get("pairId"),
                         "mode": e["mode"], "at": _captured_at(e["capturedAt"]),
-                        "source": source if isinstance(source, str) else None})
+                        "source": source if isinstance(source, str) else None,
+                        "missingSide": e.get("missingSide")})
         images.extend({"ordinal": ordinal, "volumeOrder": i["volumeOrder"], "filename": i["filename"],
                        "role": i["role"], "rotate": i["rotateDeg"]} for i in e["images"])
     if problems:
@@ -379,6 +443,7 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
         sha256 = line.get("sha256").lower() if isinstance(line.get("sha256"), str) else None
         size, width, height = line.get("bytes"), line.get("width"), line.get("height")
         thumb_rel, source_key = line.get("thumbnail"), line.get("sourceKey")
+        source_bucket = line.get("sourceBucket", SOURCE_BUCKET)
         reason = None
         if not sha1 or not _SHA1.match(sha1):
             reason = "sha1_invalid"
@@ -392,6 +457,8 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
             reason = "not_a_jpeg"
         elif not isinstance(source_key, str) or not source_key:
             reason = "source_key_missing"
+        elif not isinstance(source_bucket, str) or source_bucket not in SOURCE_BUCKETS:
+            reason = "source_bucket_invalid"
         elif not isinstance(thumb_rel, str) or not thumb_rel or Path(thumb_rel).is_absolute():
             reason = "thumbnail_invalid"
         thumb = None
@@ -406,7 +473,7 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
             problems.append({"volumeOrder": order, "reason": reason})
             continue
         facts[order] = {"sha1": sha1, "sha256": sha256, "bytes": size, "width": width, "height": height,
-                        "thumbnail": thumb, "sourceKey": source_key,
+                        "thumbnail": thumb, "sourceKey": source_key, "sourceBucket": source_bucket,
                         "orientation": line.get("exifOrientation")}
     if problems:
         raise RebuildRefused(f"images.jsonl has {len(problems)} invalid or repeated line(s)", problems)
@@ -425,14 +492,20 @@ def load_bundle(bundle_dir: str, stem: str) -> tuple:
     for i in images:
         f = facts[i["volumeOrder"]]
         by_record.setdefault(i["ordinal"], []).append(PlannedImage(
-            i["volumeOrder"], i["filename"], i["role"], i["rotate"], f["sourceKey"], f["bytes"], f["sha256"],
-            f["sha1"], f["width"], f["height"], f["thumbnail"], f["orientation"]))
+            i["volumeOrder"], i["filename"], i["role"], i["rotate"], f["sourceKey"], f["sourceBucket"],
+            f["bytes"], f["sha256"], f["sha1"], f["width"], f["height"], f["thumbnail"], f["orientation"]))
     out = []
     for r in sorted(records, key=lambda r: r["ordinal"]):
         order = ROLES[r["mode"]]
         out.append(Planned(r["ordinal"], r["captureId"], r["pairId"], r["mode"], r["at"], r["source"],
-                           sorted(by_record[r["ordinal"]], key=lambda i: order.index(i.role))))
+                           sorted(by_record[r["ordinal"]], key=lambda i: order.index(i.role)),
+                           r["missingSide"], r["ordinal"] + offset))
     return counter_after, out
+
+
+def _index_offset(planned: List[Planned]) -> int:
+    """The plan's indexOffset: the same for every record, the amount its file name index exceeds its ordinal."""
+    return planned[0].number - planned[0].ordinal
 
 
 def _all_images(planned: List[Planned]) -> List[tuple]:
@@ -503,6 +576,7 @@ def _differences(p: Planned, rec, imgs: list, rows: Dict[tuple, object], line: O
         ("capture_mode", rec.capture_mode == p.mode),
         ("status", rec.status == "captured"),
         ("sequence", rec.sequence == p.ordinal),
+        ("missing_side", rec.missing_side == p.missing_side),
     ) if not ok]
     by_role = {img.role: img for img in imgs}
     if len(imgs) != len(p.images) or set(by_role) != {i.role for i in p.images}:
@@ -544,7 +618,7 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
     Its pair id; each file entry (path, sha256, bytes, rotation), named
     after its role; its timestamp_utc against capturedAt in UTC; and its
     provenance (capturedAtSource, and each file's rebuiltFrom bucket,
-    sourceKey and EXIF Orientation), each named on its own.
+    sourceKey and EXIF Orientation, and its missingSide), each named on its own.
     """
     if line is None:
         return ["manifest.missing"]
@@ -568,12 +642,13 @@ def _line_differences(p: Planned, line: Optional[dict]) -> List[str]:
     provenance = line.get("provenance") if isinstance(line.get("provenance"), dict) else {}
     checks.append(("manifest.provenance.capturedAtSource",
                    "capturedAtSource" in provenance and provenance["capturedAtSource"] == p.captured_at_source))
+    checks.append(("manifest.provenance.missingSide", provenance.get("missingSide") == p.missing_side))
     sources = provenance.get("rebuiltFrom")
     sources = {s.get("role"): s for s in sources if isinstance(s, dict)} if isinstance(sources, list) else {}
     for want in p.images:
         s = sources.get(want.role, {})
         checks += [
-            (f"manifest.provenance.{want.role}.bucket", s.get("bucket") == SOURCE_BUCKET),
+            (f"manifest.provenance.{want.role}.bucket", s.get("bucket") == want.source_bucket),
             (f"manifest.provenance.{want.role}.key", s.get("key") == want.source_key),
             (f"manifest.provenance.{want.role}.exifOrientation",
              "exifOrientation" in s and s["exifOrientation"] == want.exif_orientation),
@@ -660,6 +735,18 @@ def _captures_since_raise(stem: str, others: List[dict], counter_after: int, cou
             if n is None or not counter_after < n <= counter:
                 return False
     return True
+
+
+def _capture_ids_held(db: Session, capture_ids: List[str]) -> set:
+    """The capture ids of `capture_ids` that an image on the unit, in any volume, still carries."""
+    from app.models.record import RecordImage
+
+    held = set()
+    for start in range(0, len(capture_ids), 500):
+        held |= {cid for (cid,) in db.query(RecordImage.capture_id).filter(
+            RecordImage.capture_id.in_(capture_ids[start:start + 500]))}
+    db.commit()
+    return held
 
 
 def _resequence_others(db: Session, collection_id: int, planned: List[Planned]) -> List[dict]:
@@ -762,10 +849,12 @@ def _capture_line(p: Planned, project_name: str) -> str:
         cameras=[],
     ).to_dict()
     record["provenance"] = {
-        "rebuiltFrom": [{"role": img.role, "bucket": SOURCE_BUCKET, "key": img.source_key,
+        "rebuiltFrom": [{"role": img.role, "bucket": img.source_bucket, "key": img.source_key,
                          "exifOrientation": img.exif_orientation} for img in p.images],
         "capturedAtSource": p.captured_at_source,
     }
+    if p.missing_side is not None:
+        record["provenance"]["missingSide"] = p.missing_side
     return json.dumps(record, ensure_ascii=False)
 
 
@@ -892,9 +981,19 @@ def rebuild_volume(db: Session, stem: str, bundle_dir: str, *, apply: bool = Fal
     if collection is None:
         db.rollback()
         raise RebuildRefused(f"no volume has the file name stem {stem!r}")
+    from app.core.adopt_journal import journal_names_volume
+
+    if journal_names_volume(collection.id):
+        db.rollback()
+        raise RebuildRefused(f"an unfinished adoption names the volume {stem!r}; restart the backend to finish "
+                             "or undo it first")
     db.commit()
     counter_after, planned = load_bundle(bundle_dir, stem)
-    if counter_after < len(planned):
+    offset = _index_offset(planned)
+    if counter_after < offset + len(planned):
+        if offset:
+            raise RebuildRefused(f"plan.json's counterAfter {counter_after} is below its indexOffset {offset} "
+                                 f"plus its number of records {len(planned)}, its highest file name index")
         raise RebuildRefused(f"plan.json's counterAfter {counter_after} is below its number of records "
                              f"{len(planned)}, its highest ordinal")
     tenant = _offsite_tenant()
@@ -939,17 +1038,20 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
     paths = {img.filename: str(volume_dir / CAPTURES_DIR / img.filename) for _, img in _all_images(planned)}
 
     # The counter is raised to counterAfter before the first record, so it is
-    # 0 before any run, counterAfter after one, or above it by the captures
-    # an operator has taken into the volume since.
+    # at most the indexOffset (0 without one) before any run, counterAfter
+    # after one, or above it by the captures an operator has taken into the
+    # volume since. counterAfter is above the offset (rebuild_volume).
+    offset = _index_offset(planned)
     in_manifest = _manifest_captures(volume_dir)
     done, others, differ = _done(db, collection_id, planned, keys, paths, in_manifest)
     if differ:
         raise RebuildRefused(f"{len(differ)} record(s) an earlier run wrote differ from the plan and the bundle; "
                              "a record is never skipped as done unless it agrees with them", differ)
-    if counter_before == 0:
+    if counter_before <= offset:
         if others or done:
+            reason = "records_with_counter_0" if counter_before == 0 else "records_with_counter_within_offset"
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make",
-                                 others or [{"reason": "records_with_counter_0", "records": len(done)}])
+                                 others or [{"reason": reason, "records": len(done)}])
     elif counter_before == counter_after:
         if others:
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make", others)
@@ -959,9 +1061,10 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         if others and not _captures_since_raise(stem, others, counter_after, counter_before):
             raise RebuildRefused(f"volume {stem!r} already has records this bundle did not make", others)
     else:
-        raise RebuildRefused(f"the capture counter of volume {stem!r} is {counter_before}; a rebuild needs a "
-                             f"volume that has never captured, or one an earlier run raised to {counter_after}",
-                             others)
+        first = ("a volume that has never captured" if not offset
+                 else f"an emptied volume whose counter is at most its indexOffset {offset}")
+        raise RebuildRefused(f"the capture counter of volume {stem!r} is {counter_before}; a rebuild needs "
+                             f"{first}, or one an earlier run raised to {counter_after}", others)
 
     todo = [p for p in planned if p.capture_id not in done]
     todo_images = _all_images(todo)
@@ -991,17 +1094,25 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
         raise RebuildRefused("a planned key or capture id is already recorded on this unit", taken)
 
     by_id = {p.capture_id: p for p in planned}
+    held_ids = _capture_ids_held(db, [cid for cid in in_manifest if cid not in by_id]) if offset else set()
     stray = []
     for cid, entry in in_manifest.items():
         p = by_id.get(cid)
         files = entry.get("files") or []
         if p is None:
             # A capture taken after an earlier run raised the counter (or one
-            # whose commit failed) carries a number above counterAfter.
+            # whose commit failed) carries a number above counterAfter. With
+            # an indexOffset, a line numbered at most the offset belongs to a
+            # record the rebuild replaces, deleted before it; the manifest is
+            # append-only and keeps it as history, once no image on the unit
+            # carries its capture id.
             numbers = [_capture_number(stem, Path(str(f.get("relative_path", ""))).name)
                        for f in files if isinstance(f, dict)]
-            if (counter_before < counter_after or not numbers
-                    or not all(n is not None and n > counter_after for n in numbers)):
+            numbered = bool(numbers) and all(n is not None for n in numbers)
+            since_raise = counter_before >= counter_after and numbered and all(n > counter_after for n in numbers)
+            replaced = (offset > 0 and numbered and all(1 <= n <= offset for n in numbers)
+                        and cid not in held_ids)
+            if not (since_raise or replaced):
                 stray.append({"capture_id": cid, "reason": "manifest_capture_not_planned"})
         elif cid not in done and _line_differences(p, entry):
             # A line a failed commit left: the append-only manifest keeps it, so it must be the plan's.
@@ -1020,6 +1131,7 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
 
     report = {"filename_stem": stem, "collection_id": collection_id, "bundle": str(bundle_dir),
               "applied": apply, "records": len(planned), "images": len(_all_images(planned)),
+              "index_offset": offset,
               "created": [], "skipped": [],
               "counter_before": counter_before, "counter_after": max(counter_before, counter_after),
               "freed_bytes": sum(sizes[keys[img.filename]] for _, img in todo_images), "manifest": None,
@@ -1032,12 +1144,21 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
                                       "record_id": done[p.capture_id]["record_id"]})
     if not apply:
         report["created"] = [{"ordinal": p.ordinal, "mode": p.mode, "capture_id": p.capture_id,
-                              "pair_id": p.pair_id, "files": files(p)} for p in todo]
+                              "pair_id": p.pair_id, "missing_side": p.missing_side, "files": files(p)}
+                             for p in todo]
         return report
 
     from app.core import audit, capture_counter
+    from app.core.adopt_journal import journal_names_volume
     from app.core.offsite_free import _RunManifest
     from capture.project_manager import ensure_volume_dirs
+
+    # Again, just before the first change (the counter's raise): the check in rebuild_volume is as old as the
+    # bundle's loading and the checks above, and an adoption that ran meanwhile may have kept its journal.
+    if journal_names_volume(collection_id):
+        db.rollback()
+        raise RebuildRefused(f"an unfinished adoption names the volume {stem!r}; restart the backend to finish "
+                             "or undo it first")
 
     # Before the first record, so that a capture into the volume during the
     # run takes counterAfter + 1 and never a planned number. A capture that
@@ -1082,8 +1203,8 @@ def _run(db: Session, *, apply: bool, stem: str, bundle_dir: str, counter_after:
                                               keys[img.filename], img.sha1, sizes[keys[img.filename]],
                                               created["freed_at"]))
         report["created"].append({"ordinal": p.ordinal, "mode": p.mode, "capture_id": p.capture_id,
-                                  "pair_id": p.pair_id, "files": files(p), "record_id": created["record_id"],
-                                  "image_ids": created["image_ids"]})
+                                  "pair_id": p.pair_id, "missing_side": p.missing_side, "files": files(p),
+                                  "record_id": created["record_id"], "image_ids": created["image_ids"]})
     report["manifest"] = str(freed_manifest.path) if freed_manifest.path else None
     report["resequenced"] = _resequence_others(db, collection_id, planned)
     db.expire_all()
@@ -1130,6 +1251,7 @@ def _write_record(db: Session, p: Planned, *, collection_id: int, stem: str, pro
             collection_id=collection_id,
             sequence=p.ordinal,
             capture_mode=p.mode,
+            missing_side=p.missing_side,
             created_at=p.captured_at,
         )
         db.add(record)

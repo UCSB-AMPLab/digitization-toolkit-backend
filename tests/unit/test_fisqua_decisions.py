@@ -10,7 +10,7 @@ cannot apply are skipped and reported.
 
     python -m pytest tests/unit/test_fisqua_decisions.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import json
@@ -298,8 +298,9 @@ def test_other_without_a_note_is_skipped(client, db_session, handed):
     assert _refresh(db_session, b).status == "approved"
     state = _decisions_state(client, vol.col)
     assert state["skipped"] == [{"captua_record_id": a.id, "reason": "other_without_note"}]
-    assert state["counts"] == {"approved": 1, "rejected": 0, "unchanged": 0, "skipped": 1,
-                               "rotations": 0, "rotations_skipped": 0}
+    assert state["counts"] == {"approved": 1, "rejected": 0, "excluded": 0, "unchanged": 0, "skipped": 1,
+                               "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
+                               "requests_skipped": 0, "reopened": 0}
 
 
 @pytest.mark.unit
@@ -394,8 +395,9 @@ def test_the_offsite_state_shows_the_applied_set(client, db_session, handed):
     assert state["decided_at"].startswith("2026-10-25T10:00:00")
     assert state["applied_at"] is not None
     assert state["stale"] is False
-    assert state["counts"] == {"approved": 1, "rejected": 1, "unchanged": 0, "skipped": 0,
-                               "rotations": 1, "rotations_skipped": 0}
+    assert state["counts"] == {"approved": 1, "rejected": 1, "excluded": 0, "unchanged": 0, "skipped": 0,
+                               "rotations": 1, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
+                               "requests_skipped": 0, "reopened": 0}
     assert state["skipped"] == []
 
 
@@ -937,3 +939,481 @@ def test_the_default_reviewer_name_is_kept_as_given(db_session, handed):
     [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
     assert rej.rejected_by == "Fisqua: Fisqua reviewer"
     assert _history(db_session, a)[-1][2] == "Fisqua: Fisqua reviewer"
+
+
+# ---------------------------------------------------------------------------
+# Excluded (contract 1.6): an opening that is not a page of the volume
+# ---------------------------------------------------------------------------
+
+def _exclude(rec, **extra):
+    return {"captuaRecordId": rec.id, "decision": "excluded", "decidedBy": "Ana Gómez",
+            "decidedAt": "2026-10-25T09:00:00Z", **extra}
+
+
+@pytest.mark.unit
+def test_an_exclusion_excludes_the_record_names_the_reviewer_and_makes_no_rejection(client, db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, note="duplicate of 0003")])
+    _poll(db_session, fake)
+    rec = _refresh(db_session, a)
+    assert rec.status == "excluded"
+    assert _refresh(db_session, b).status == "in_review"
+    assert _history(db_session, a)[-1] == ("in_review", "excluded", "Fisqua: Ana Gómez")
+    assert db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).count() == 0
+    assert all(img.rejection_id is None for img in rec.images)
+    state = _decisions_state(client, vol.col)
+    assert state["counts"] == {"approved": 0, "rejected": 0, "excluded": 1, "unchanged": 0, "skipped": 0,
+                               "rotations": 0, "rotations_skipped": 0, "missing_pages": 0, "placeholders": 0,
+                               "requests_skipped": 0, "reopened": 0}
+    assert state["skipped"] == []
+    # The record reads back with its status, and so does its history.
+    body = _as(client, "reviewer").get(f"/records/{a.id}").json()
+    assert body["status"] == "excluded"
+    changes = _as(client, "reviewer").get(f"/collections/{vol.col.id}/status-changes")
+    assert changes.status_code == 200, changes.text
+    assert ("in_review", "excluded") in [(c["from_status"], c["to_status"]) for c in changes.json()]
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_rotations_listed_as_none_applies(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, rotations=[]), _exclude(b, rotations=None)])
+    _poll(db_session, fake)
+    assert (_refresh(db_session, a).status, _refresh(db_session, b).status) == ("excluded", "excluded")
+
+
+@pytest.mark.unit
+def test_an_exclusion_overrides_a_local_approval_through_in_review(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    assert _as(client, "reviewer").patch(f"/records/{a.id}/status", json={"status": "approved"}).status_code == 200
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "excluded"
+    assert [h[:2] for h in _history(db_session, a)][-2:] == [("approved", "in_review"), ("in_review", "excluded")]
+
+
+@pytest.mark.unit
+def test_an_exclusion_overrides_a_rejection_through_in_review(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_reject(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "excluded"
+    assert [h[:2] for h in _history(db_session, a)][-2:] == [("rejected", "in_review"), ("in_review", "excluded")]
+
+
+@pytest.mark.unit
+def test_an_exclusion_repeated_in_a_later_set_is_unchanged(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    history = _history(db_session, a)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _history(db_session, a) == history
+    assert _decisions_state(client, vol.col)["counts"]["unchanged"] == 1
+
+
+@pytest.mark.unit
+def test_a_later_approval_restores_an_excluded_record(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_approve(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "approved"
+    assert _history(db_session, a)[-1] == ("excluded", "approved", "Fisqua: Ana Gómez")
+
+
+@pytest.mark.unit
+def test_a_later_rejection_of_an_excluded_record_applies_normally(db_session, handed):
+    from app.models.record import RecordRejection
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    _decide(fake, row, [_reject(a, reason="glare", note="reflejo")], decisions_id="d-2")
+    _poll(db_session, fake)
+    rec = _refresh(db_session, a)
+    assert rec.status == "rejected"
+    [rej] = db_session.query(RecordRejection).filter(RecordRejection.record_id == a.id).all()
+    assert (rej.predefined_reason, rej.comment, rej.rejected_by) == ("glare", "reflejo", "Fisqua: Ana Gómez")
+    assert all(img.rejection_id == rej.id for img in rec.images if img.is_current)
+    assert _history(db_session, a)[-1] == ("excluded", "rejected", "Fisqua: Ana Gómez")
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_a_reason_is_refused_for_that_record_only(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, reason="blur"), _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_reason"}]
+
+
+@pytest.mark.unit
+def test_an_exclusion_with_rotations_is_refused_for_that_record_only(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    left = next(i for i in a.images if i.role == "left")
+    _decide(fake, row, [_exclude(a, rotations=[{"captureId": left.capture_id, "role": "left", "quarterTurns": 1}]),
+                        _approve(b)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert all(i.rotation_correction_quarter_turns is None for i in _refresh(db_session, a).images)
+    assert _refresh(db_session, b).status == "approved"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_decision"}]
+
+
+@pytest.mark.unit
+def test_an_exclusion_leaves_an_earlier_rotation_correction_as_it_is(db_session, handed):
+    vol, (a, b), row, fake = handed
+    left = next(i for i in a.images if i.role == "left")
+    _decide(fake, row, [_approve(a, rotations=[{"captureId": left.capture_id, "role": "left", "quarterTurns": 1}])])
+    _poll(db_session, fake)
+    _decide(fake, row, [_exclude(a)], decisions_id="d-2")
+    _poll(db_session, fake)
+    images = {i.role: i for i in _refresh(db_session, a).images}
+    assert images["left"].rotation_correction_quarter_turns == 1
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["maybe", "Excluded", "EXCLUDED", "", None, 1])
+def test_any_other_decision_value_is_still_invalid(client, db_session, handed, value):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [{"captuaRecordId": a.id, "decision": value, "decidedBy": "Ana", "rotations": []}])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "invalid_decision"}]
+
+
+@pytest.mark.unit
+def test_the_contract_names_the_excluded_decision():
+    import app.core.fisqua_contract as fc
+    assert fc.DECISION_EXCLUDED == "excluded"
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("role", ["reviewer", "admin", "operator"])
+def test_the_reviewer_and_operator_routes_do_not_offer_excluded(client, db_session, handed, role):
+    vol, (a, b), row, fake = handed
+    api = _as(client, role)
+    assert api.patch(f"/records/{a.id}/status", json={"status": "excluded"}).status_code == 422
+    resp = api.post("/records/bulk-status", json={"record_ids": [b.id], "status": "excluded"})
+    assert resp.status_code == 422
+    assert (_refresh(db_session, a).status, _refresh(db_session, b).status) == ("in_review", "in_review")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("target", ["in_review", "approved", "captured"])
+def test_no_route_moves_an_excluded_record(client, db_session, handed, target):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a)])
+    _poll(db_session, fake)
+    resp = _as(client, "admin").patch(f"/records/{a.id}/status", json={"status": target})
+    assert resp.status_code == 422, resp.text
+    assert _refresh(db_session, a).status == "excluded"
+    resp = _as(client, "admin").post(f"/records/{a.id}/reject", json={"predefined_reason": "blur"})
+    assert resp.status_code == 422
+    assert _refresh(db_session, a).status == "excluded"
+
+
+def _notes(db, rec):
+    from app.models.record import RecordStatusChange
+    return [(h.from_status, h.to_status, h.note) for h in
+            db.query(RecordStatusChange).filter(RecordStatusChange.record_id == rec.id)
+            .order_by(RecordStatusChange.id)]
+
+
+@pytest.mark.unit
+def test_an_exclusions_note_is_kept_on_its_status_change(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    assert _as(client, "reviewer").patch(f"/records/{a.id}/status", json={"status": "approved"}).status_code == 200
+    _decide(fake, row, [_exclude(a, note="  duplicate of 0003 "), _exclude(b)])
+    _poll(db_session, fake)
+    # Only the change into excluded carries it; the step through in_review does not.
+    assert _notes(db_session, a)[-2:] == [("approved", "in_review", None),
+                                          ("in_review", "excluded", "duplicate of 0003")]
+    assert _notes(db_session, b)[-1] == ("in_review", "excluded", None)
+    changes = _as(client, "reviewer").get(f"/collections/{vol.col.id}/status-changes").json()
+    shown = {(c["record_id"], c["to_status"]): c["note"] for c in changes}
+    assert shown[(a.id, "excluded")] == "duplicate of 0003"
+    assert shown[(a.id, "approved")] is None
+
+
+@pytest.mark.unit
+def test_an_approval_and_a_rejection_keep_no_note_on_their_status_change(db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_approve(a, note="bien"), _reject(b, note="borroso")])
+    _poll(db_session, fake)
+    assert _notes(db_session, a)[-1] == ("in_review", "approved", None)
+    assert _notes(db_session, b)[-1] == ("in_review", "rejected", None)
+
+
+@pytest.mark.unit
+def test_an_exclusion_note_over_2000_characters_is_skipped_not_cut(client, db_session, handed):
+    vol, (a, b), row, fake = handed
+    _decide(fake, row, [_exclude(a, note="x" * 2001), _exclude(b, note="y" * 2000)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, a).status == "in_review"
+    assert _notes(db_session, b)[-1] == ("in_review", "excluded", "y" * 2000)
+    assert _decisions_state(client, vol.col)["skipped"] == [{"captua_record_id": a.id, "reason": "note_too_long"}]
+
+
+# ---------------------------------------------------------------------------
+# Contract 1.9 §10.4: missing_page decisions and missing_opening requests
+# ---------------------------------------------------------------------------
+
+@pytest.fixture
+def handed_one_sided(client, db_session, vol, fisqua):
+    """A volume of a pair, a dual record with only its left image, and a single record, handed over and delivered."""
+    pair = vol.record(status="captured", sequence=1)
+    lone = vol.record(status="captured", sequence=2, layout=("left",))
+    lone.capture_mode = "dual"
+    single = vol.record(status="captured", sequence=3, layout=("single",))
+    db_session.commit()
+    _handover(client, vol.col)
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[0]
+    assert row.state == "delivered"
+    fake = Fisqua(vol.col.filename_stem)
+    fake.status = {"volumeId": "fq-v1", "manifestId": row.manifest_id, "state": "review_pending", "problems": []}
+    return vol, (pair, lone, single), row, fake
+
+
+def _missing_page(rec, side, **extra):
+    return {"captuaRecordId": rec.id, "decision": "missing_page", "side": side, "decidedBy": "Ana Gómez",
+            "decidedAt": "2026-10-25T09:00:00Z", **extra}
+
+
+def _request(after, request_id="req-1", count=1, **extra):
+    return {"requestId": request_id, "kind": "missing_opening", "afterRecordId": after, "count": count,
+            "expected": "f. 12r-12v", "note": "falta un folio", "requestedBy": "Ana Gómez",
+            "requestedAt": "2026-10-25T09:30:00Z", **extra}
+
+
+def _decide_with(fake, row, records, requests, decisions_id="d-1"):
+    _decide(fake, row, records, decisions_id)
+    fake.decisions["requests"] = requests
+
+
+def _volume_order(db, vol):
+    from app.models.record import Record
+    db.expire_all()
+    return [(r.id, r.sequence, r.missing_side) for r in
+            db.query(Record).filter(Record.collection_id == vol.col.id).order_by(Record.sequence, Record.id)]
+
+
+@pytest.mark.unit
+def test_a_missing_page_decision_marks_the_record(client, db_session, handed_one_sided):
+    from app.core import recapture_turn
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide(fake, row, [_missing_page(lone, "right")])
+    _poll(db_session, fake)
+    rec = _refresh(db_session, lone)
+    # Back to captured, so an operator can capture into it (contract 1.9 §10.4).
+    assert (rec.missing_side, rec.status) == ("right", "captured")
+    assert recapture_turn.record_is_pending(rec)
+    state = _decisions_state(client, vol.col)
+    assert state["counts"]["missing_pages"] == 1 and state["skipped"] == []
+
+
+@pytest.mark.unit
+def test_a_missing_page_that_cannot_apply_is_skipped(client, db_session, handed_one_sided):
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide(fake, row, [_missing_page(single, "right"), _missing_page(lone, "both"), _missing_page(lone, None)])
+    _poll(db_session, fake)
+    assert [_refresh(db_session, r).missing_side for r in (pair, lone, single)] == [None, None, None]
+    state = _decisions_state(client, vol.col)
+    assert state["counts"]["missing_pages"] == 0
+    assert state["skipped"] == [
+        {"captua_record_id": single.id, "reason": "missing_page_single_record"},
+        {"captua_record_id": lone.id, "reason": "invalid_side"},
+        {"captua_record_id": lone.id, "reason": "invalid_side"},
+    ]
+    assert state["counts"]["skipped"] == 3
+
+
+@pytest.mark.unit
+def test_a_repeated_missing_page_set_waits_for_the_handover_the_first_queued(client, db_session, handed_one_sided):
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide(fake, row, [_missing_page(lone, "right")])
+    _poll(db_session, fake)
+    _decide(fake, row, [_missing_page(lone, "right")], decisions_id="d-2")
+    result = _poll(db_session, fake)
+    assert result["decisions_applied"] == 0
+    rec = _refresh(db_session, lone)
+    assert (rec.missing_side, rec.status) == ("right", "captured")
+    assert _decisions_state(client, vol.col)["decisions_id"] == "d-1"
+
+
+@pytest.mark.unit
+def test_a_request_makes_placeholders_after_the_record_and_shifts_the_rest(client, db_session, handed_one_sided):
+    from app.models.record import Record
+    from app.models.system_log import SystemLog
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide_with(fake, row, [], [_request(pair.id, count=2)])
+    _poll(db_session, fake)
+
+    order = _volume_order(db_session, vol)
+    assert [(rid, seq) for rid, seq, _ in order][0] == (pair.id, 1)
+    made = [rid for rid, _, side in order if side == "both"]
+    assert len(made) == 2
+    assert order == [(pair.id, 1, None), (made[0], 2, "both"), (made[1], 3, "both"),
+                     (lone.id, 4, None), (single.id, 5, None)]
+    for rid in made:
+        rec = db_session.get(Record, rid)
+        assert (rec.status, rec.capture_mode, rec.images) == ("captured", "dual", [])
+        assert (rec.missing_expected, rec.missing_note, rec.missing_request_id) == (
+            "f. 12r-12v", "falta un folio", "req-1")
+    state = _decisions_state(client, vol.col)
+    assert state["counts"]["placeholders"] == 2
+    [event] = db_session.query(SystemLog).filter(SystemLog.action == "missing_openings_marked").all()
+    assert "requestId=req-1" in event.detail and "Ana Gómez" in event.detail
+    assert "2026-10-25T09:30:00Z" in event.detail
+    [applied] = db_session.query(SystemLog).filter(SystemLog.action == "fisqua_decisions_applied").all()
+    assert "placeholders=2" in applied.detail and "missing_pages=0" in applied.detail
+
+
+@pytest.mark.unit
+def test_a_request_with_no_count_makes_one_and_goes_after_an_excluded_record(client, db_session, handed_one_sided):
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide(fake, row, [_exclude(lone)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, lone).status == "excluded"
+    _decide_with(fake, row, [], [_request(lone.id, count=None)], decisions_id="d-2")
+    _poll(db_session, fake)
+    order = _volume_order(db_session, vol)
+    assert [side for _, _, side in order] == [None, None, "both", None]
+    assert order[1][0] == lone.id
+
+
+@pytest.mark.unit
+def test_each_request_is_applied_once(client, db_session, handed_one_sided):
+    from app.models.record import Record
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide_with(fake, row, [], [_request(pair.id)])
+    _poll(db_session, fake)
+    # The placeholder handed the volume over again; Fisqua answers that manifest next.
+    _send(db_session, Server(_ok()))
+    row = _rows(db_session, vol.col)[-1]
+    assert row.state == "delivered"
+    fake.status["manifestId"] = row.manifest_id
+    _decide_with(fake, row, [], [_request(single.id), _request(single.id, request_id="req-2")], decisions_id="d-2")
+    _poll(db_session, fake)
+    db_session.expire_all()
+    carried = sorted(r.missing_request_id for r in db_session.query(Record).filter(Record.missing_side == "both"))
+    assert carried == ["req-1", "req-2"]
+    state = _decisions_state(client, vol.col)
+    assert state["counts"]["placeholders"] == 1
+    assert state["request_skips"] == [{"request_id": "req-1", "reason": "already_applied"}]
+
+
+@pytest.mark.unit
+def test_a_request_that_cannot_apply_is_skipped_with_a_reason(client, db_session, handed_one_sided,
+                                                              override_projects_root):
+    from tests.unit.test_capture_manifest_export import Volume
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    other = Volume(db_session, override_projects_root, stem="xx-test-002", name="Otro", external_id="xx-test-002")
+    theirs = other.record(status="captured")
+    before = _volume_order(db_session, vol)
+    _decide_with(fake, row, [], [
+        _request(pair.id, request_id="r-kind", kind="missing_page"),
+        _request(999999, request_id="r-unknown"),
+        _request(theirs.id, request_id="r-other"),
+        _request(pair.id, request_id="r-zero", count=0),
+        _request(pair.id, request_id="r-many", count=51),
+        _request(pair.id, request_id="r-text", count="2"),
+        _request(pair.id, request_id="r-bool", count=True),
+        _request(pair.id, request_id=None),
+        _request(pair.id, request_id="x" * 65),
+        _request(pair.id, request_id="r-long", note="n" * 2001),
+        "not an object",
+    ])
+    _poll(db_session, fake)
+    assert _volume_order(db_session, vol) == before
+    state = _decisions_state(client, vol.col)
+    assert state["counts"]["placeholders"] == 0
+    assert state["request_skips"] == [
+        {"request_id": "r-kind", "reason": "invalid_kind"},
+        {"request_id": "r-unknown", "reason": "not_in_volume"},
+        {"request_id": "r-other", "reason": "not_in_volume"},
+        {"request_id": "r-zero", "reason": "invalid_count"},
+        {"request_id": "r-many", "reason": "invalid_count"},
+        {"request_id": "r-text", "reason": "invalid_count"},
+        {"request_id": "r-bool", "reason": "invalid_count"},
+        {"request_id": None, "reason": "invalid_request_id"},
+        {"request_id": "x" * 64, "reason": "invalid_request_id"},
+        {"request_id": "r-long", "reason": "text_too_long"},
+        {"request_id": None, "reason": "invalid_request"},
+    ]
+
+
+@pytest.mark.unit
+def test_requests_and_decisions_apply_together(client, db_session, handed_one_sided):
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    _decide_with(fake, row, [_approve(pair), _missing_page(lone, "right")], [_request(pair.id)])
+    _poll(db_session, fake)
+    assert _refresh(db_session, pair).status == "approved"
+    assert _refresh(db_session, lone).missing_side == "right"
+    counts = _decisions_state(client, vol.col)["counts"]
+    assert (counts["approved"], counts["missing_pages"], counts["placeholders"]) == (1, 1, 1)
+
+
+@pytest.mark.unit
+def test_a_set_with_requests_locks_the_volumes_records_then_its_row(client, db_session, handed_one_sided,
+                                                                      monkeypatch):
+    from app.core import fisqua_decisions, record_sequence
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    calls = []
+    real_volume, real_records = record_sequence.lock_volume_records, fisqua_decisions._lock_records
+
+    def spy_volume(db, collection_id):
+        calls.append(("volume", collection_id))
+        return real_volume(db, collection_id)
+
+    def spy_records(db, ids):
+        calls.append(("records", tuple(ids)))
+        return real_records(db, ids)
+
+    monkeypatch.setattr(record_sequence, "lock_volume_records", spy_volume)
+    monkeypatch.setattr(fisqua_decisions, "_lock_records", spy_records)
+    _decide_with(fake, row, [_approve(pair)], [_request(pair.id)])
+    _poll(db_session, fake)
+    # The volume's records and row first, then the decided records (already
+    # held), then the volume again for the placeholders, under the same locks.
+    assert calls[0] == ("volume", vol.col.id)
+    assert calls[1] == ("records", (pair.id,))
+    assert all(c == ("volume", vol.col.id) for c in calls[2:]) and len(calls) >= 3
+    assert _refresh(db_session, pair).status == "approved"
+
+
+@pytest.mark.unit
+def test_the_contract_names_the_1_9_decision_and_request():
+    from app.core import fisqua_contract as fc
+    assert fc.DECISION_MISSING_PAGE == "missing_page"
+    assert fc.F_REQUESTS == "requests"
+    assert fc.REQUEST_MISSING_OPENING == "missing_opening"
+    assert (fc.F_REQUEST_ID, fc.F_REQUEST_KIND, fc.F_AFTER_RECORD_ID, fc.F_COUNT, fc.F_EXPECTED,
+            fc.F_REQUESTED_BY, fc.F_REQUESTED_AT) == (
+        "requestId", "kind", "afterRecordId", "count", "expected", "requestedBy", "requestedAt")
+
+
+
+@pytest.mark.unit
+def test_a_missing_page_set_locks_the_volume_before_any_status_change(client, db_session, handed_one_sided,
+                                                                      monkeypatch):
+    from app.api import records as records_api
+    from app.core import volume_stem
+    vol, (pair, lone, single), row, fake = handed_one_sided
+    order = []
+    real_volume, real_status = volume_stem.locked_volume_query, records_api.change_record_status
+    monkeypatch.setattr(volume_stem, "locked_volume_query",
+                        lambda db, cid: (order.append("volume"), real_volume(db, cid))[1])
+    monkeypatch.setattr(records_api, "change_record_status",
+                        lambda *a, **k: (order.append("status"), real_status(*a, **k))[1])
+    _decide(fake, row, [_approve(pair), _missing_page(lone, "right")])
+    _poll(db_session, fake)
+    assert _refresh(db_session, lone).status == "captured"
+    assert "status" in order and order.index("volume") < order.index("status")

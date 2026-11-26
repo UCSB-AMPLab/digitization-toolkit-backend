@@ -1,0 +1,9 @@
+wlan0:wifi:connected:preconfigured
+br-48302f0ff872:bridge:connected (externally):br-48302f0ff872
+docker0:bridge:connected (externally):docker0
+lo:loopback:connected (externally):lo
+p2p-dev-wlan0:wifi-p2p:disconnected:
+eth0:ethernet:unavailable:
+veth37af6af:ethernet:unmanaged:
+vethb724665:ethernet:unmanaged:
+vethc9ca4a4:ethernet:unmanaged:

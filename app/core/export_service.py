@@ -1,7 +1,7 @@
 """The work a background export job runs: validate, check disk, stream the bag,
 prune old zips. Runs in a worker thread with its own DB session.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import json
@@ -38,13 +38,45 @@ FREE_SPACE_MARGIN = 100 * 1024 * 1024
 #    that display it upright, or null for an upload or an image captured
 #    before the rotation was recorded. A RAW master is bagged as the camera
 #    wrote it, so this is where its rotation is.
-METADATA_SCHEMA_VERSION = 2
+# 3: `colour_card`, the volume's colour card shots (app.core.colour_card):
+#    {"status", "sets": [{"number", "capture_mode", "completed_at", "shots":
+#    [{"camera_index", "role", "capture_id", "filename", "sha256",
+#    "preview_filename", "preview_sha256", "rotate_deg", "captured_at",
+#    "settings"}]}]}, the taken sets only; each shot and its preview are in
+#    the bag's `calibration/` folder.
+METADATA_SCHEMA_VERSION = 3
 
 
 def source_organization(project) -> str:
     """The bag's Source-Organization: the project's name, or the software's
     name for a collection with no project."""
     return project.name if project else "Captua"
+
+
+NOTHING_TO_EXPORT_MESSAGE = "Collection has nothing to export: no record has a current image."
+
+
+def _closed_without_image(record) -> bool:
+    """A missing record closed without capturing that has no current image (contract 1.9 §10.3)."""
+    return (getattr(record, "missing_side", None) is not None
+            and getattr(record, "closed_reason", None) is not None
+            and not any(i.is_current for i in getattr(record, "images", [])))
+
+
+def exported_records(records) -> list:
+    """The records an export bags: every one but those Fisqua excluded and closed placeholders.
+
+    An excluded record (contract 1.6) is not a page of the volume, such as a
+    test shot of the rig or a duplicate, so it is skipped: it neither blocks
+    the export nor enters the bag. So is a missing record closed without
+    capturing that has no current image (contract 1.9 §10.3: it never
+    becomes a page); one with an image is bagged once approved, as any
+    record. The bag is built from these, and the worker's re-check reads
+    them again; workflow_blockers is given the records before this filter,
+    so it can tell an operator why a volume of closed placeholders has
+    nothing to export.
+    """
+    return [r for r in records if r.status != "excluded" and not _closed_without_image(r)]
 
 
 def workflow_blockers(records) -> tuple[str, list[int]] | None:
@@ -63,9 +95,23 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
     An empty collection is reported here too, so the worker does not bag a
     collection whose last record was deleted after the request and write
     `"records": []` into the metadata.
+
+    Given every record of the collection; it leaves out excluded ones itself
+    (contract 1.6), so a collection of excluded records only has no records
+    to export. A missing record closed without capturing that has no current
+    image (contract 1.9 §10.3) blocks neither check: it never becomes a page. A
+    collection left with no record holding a current image has nothing to
+    export (NOTHING_TO_EXPORT_MESSAGE), reported after the handover and
+    approval checks.
     """
+    records = [r for r in records if r.status != "excluded"]
     if not records:
         return ("Collection has no records to export.", [])
+    # A missing record closed without capturing, with no current image,
+    # never becomes a page (contract 1.9 §10.3), so it waits for no review
+    # (exported_records leaves it out already). One with an image needs
+    # approval like any record.
+    records = [r for r in records if not _closed_without_image(r)]
     not_handed_over = [r.id for r in records if r.status == "captured"]
     if not_handed_over:
         return (
@@ -78,6 +124,8 @@ def workflow_blockers(records) -> tuple[str, list[int]] | None:
             f"Cannot export: {len(non_approved)} record(s) are not approved yet: {non_approved}",
             non_approved,
         )
+    if not any(i.is_current for r in records for i in getattr(r, "images", [])):
+        return (NOTHING_TO_EXPORT_MESSAGE, [])
     return None
 
 
@@ -109,6 +157,7 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     )
     # Re-checked here, not just at request time. Nothing is built before this.
     blocker = workflow_blockers(records)
+    records = exported_records(records)
     if blocker:
         message, blocking_ids = blocker
         raise ExportError(message, detail={"blocking_record_ids": blocking_ids})
@@ -134,9 +183,11 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     # the request. A freed master is stored offsite, not missing.
     freed = [i.id for rec in records for i in rec.images if i.is_current and i.master_freed_at is not None]
     if freed:
-        from app.core.offsite_free import FREED_EXPORT_MESSAGE
+        from app.core.offsite_free import FREED_EXPORT_MESSAGE, restore_available
+        # `restorable`: whether a restore can bring the masters back to this unit.
         raise ExportError(FREED_EXPORT_MESSAGE.format(n=len(freed)),
-                          detail={"reason": "freed_files", "freed_image_ids": freed})
+                          detail={"reason": "freed_files", "freed_image_ids": freed,
+                                  "restorable": restore_available()})
 
     for idx, rec in enumerate(records):
         seq_label = f"{idx + 1:04d}"
@@ -161,6 +212,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             detail={"reason": "missing_files", "missing_image_ids": [m["record_image_id"] for m in missing], "missing": missing},
         )
 
+    # The volume's colour card shots, beside the records in `calibration/`.
+    card_files, card_sets = _colour_card_payload(db, collection)
+
     # From here to the end of the write, a planned source can be moved,
     # renamed or deleted (the routes that do it hold the collection against
     # exports, but a file can still go by other means: a drive pulled, a file
@@ -171,7 +225,9 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
         _fixity_gate([img for _, _, img in to_copy])
 
         # Refuse to start if the exports filesystem can't hold the archive.
-        total_src = sum(resolved.stat().st_size for _, resolved, _ in to_copy)
+        # The colour card shots and their previews go into the archive too.
+        total_src = (sum(resolved.stat().st_size for _, resolved, _ in to_copy)
+                     + sum(source.stat().st_size for source, _rel in card_files))
         free = shutil.disk_usage(exports_dir).free
         if free < total_src + FREE_SPACE_MARGIN:
             raise ExportError(
@@ -195,6 +251,8 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             .populate_existing()
             .all()
         )
+        # A record excluded since the gate leaves this set, so the states differ.
+        rechecked = exported_records(rechecked)
         now_state = {rec.id: (rec.status, rec.sequence,
                               tuple(sorted(i.id for i in rec.images if i.is_current)))
                      for rec in rechecked}
@@ -211,12 +269,14 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
             )
 
         metadata_payload = _metadata_payload(collection, project, records, timestamp)
+        from app.core import colour_card
+        metadata_payload["colour_card"] = {"status": colour_card.status(db, collection), "sets": card_sets}
         blobs = [(json.dumps(metadata_payload, indent=2, ensure_ascii=False).encode("utf-8"), "metadata.json")]
         manifest_blob = _filtered_manifest_blob(db, collection, records)
         if manifest_blob:
             blobs.append((manifest_blob, "metadata/manifest.jsonl"))
 
-        payload_files = [(resolved, rel) for rel, resolved, _ in to_copy]
+        payload_files = [(resolved, rel) for rel, resolved, _ in to_copy] + card_files
         bag_info = {
             "Source-Organization": source_organization(project),
             "External-Description": collection.description or collection.name,
@@ -248,6 +308,54 @@ def _do_export(db, job: ExportJob, collection_id: int) -> None:
     job.zip_filename = zip_path.name
     _prune_exports(exports_dir, collection_id)
     logger.info(f"BagIt export created: {zip_path} ({zip_path.stat().st_size} bytes)")
+
+
+def _colour_card_payload(db, collection) -> tuple:
+    """([(source, `calibration/<name>`)], sets for metadata.json) of the volume's taken colour card shots.
+
+    Each shot and its RAW preview must be on disk with the sha256 its row took
+    when it was written; otherwise the export is refused, as for a page.
+    """
+    import hashlib
+
+    from app.core import colour_card
+    from app.core.paths import CALIBRATION_DIR
+
+    files, sets, missing, mismatched = [], {}, [], []
+    for card_set, shot in colour_card._taken_shots(db, collection.id):
+        entry = sets.setdefault(card_set.id, {
+            "number": card_set.number, "capture_mode": card_set.capture_mode,
+            "completed_at": card_set.completed_at.isoformat() if card_set.completed_at else None, "shots": []})
+        entry["shots"].append({
+            "camera_index": shot.camera_index, "role": shot.role, "capture_id": shot.capture_id,
+            "filename": shot.filename, "sha256": shot.sha256, "preview_filename": shot.preview_filename,
+            "preview_sha256": shot.preview_sha256, "rotate_deg": shot.rotate_deg,
+            "captured_at": shot.captured_at.isoformat() if shot.captured_at else None, "settings": shot.settings})
+        for stored, name, sha in ((shot.file_path, shot.filename, shot.sha256),
+                                  (shot.preview_path, shot.preview_filename, shot.preview_sha256)):
+            if not stored:
+                continue
+            resolved = resolve_within_storage(stored)
+            if resolved is None or not resolved.is_file():
+                missing.append(shot.id)
+                continue
+            h = hashlib.sha256()
+            with open(resolved, "rb") as fh:
+                for chunk in iter(lambda: fh.read(1024 * 1024), b""):
+                    h.update(chunk)
+            if sha and h.hexdigest() != sha:
+                mismatched.append(shot.id)
+                continue
+            files.append((resolved, f"{CALIBRATION_DIR}/{name}"))
+    if missing:
+        raise ExportError(f"{len(set(missing))} colour card shot(s) are missing from disk.",
+                          detail={"reason": "missing_colour_card_files",
+                                  "missing_colour_card_shot_ids": sorted(set(missing))})
+    if mismatched:
+        raise ExportError(f"{len(set(mismatched))} colour card shot(s) fail their checksum (possible corruption).",
+                          detail={"reason": "checksum_mismatch",
+                                  "mismatched_colour_card_shot_ids": sorted(set(mismatched))})
+    return files, list(sets.values())
 
 
 def _fixity_gate(images) -> None:
@@ -341,21 +449,30 @@ def _metadata_payload(collection, project, records, timestamp) -> dict:
 
 
 def _filtered_manifest_blob(db, collection, records):
-    """The capture records of this collection's current images, from every capture manifest.
+    """The capture records of this collection's current images, from every capture manifest of its space.
 
     The records are found the way the fixity gate finds checksums
     (app.core.integrity): in any manifest under the active projects root,
     the project's or the volume's own, so a volume migrated into its stem
     layout, whose earlier captures are recorded in its project's manifest
     and later ones in `<stem>/metadata/manifest.jsonl`, has all of them in
-    its bag. Relocation records are the appliance's own bookkeeping of files
-    renamed after capture; the bag names its files itself, so only the
-    capture records go into it.
+    its bag. A capture whose record in the volume's own manifest names only
+    files under the volume takes that record (an adopted volume's copies:
+    integrity.capture_record_lines). Relocation records are the appliance's
+    own bookkeeping of files renamed after capture; the bag names its files
+    itself, so only the capture records go into it.
     """
     capture_ids = {img.capture_id for rec in records for img in rec.images if img.is_current and img.capture_id}
     if not capture_ids:
         return None
-    kept = capture_record_lines(config.settings.projects_dir.resolve(), capture_ids)
+    # Only the manifests of the volume's own space are read
+    # (app.core.testing_space.manifest_space), whatever capture ids its
+    # images carry: a real volume's bag never holds a testing capture's line.
+    from app.core.testing_space import manifest_filter
+    projects_dir = config.settings.projects_dir.resolve()
+    own = projects_dir / collection.filename_stem if collection.filename_stem else None
+    kept = capture_record_lines(projects_dir, capture_ids, volume_root=own,
+                                include=manifest_filter(db, bool(collection.testing), projects_dir))
     return ("\n".join(kept) + "\n").encode("utf-8") if kept else None
 
 

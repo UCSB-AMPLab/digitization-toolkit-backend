@@ -10,7 +10,8 @@ The rules:
 
 * **Only a received volume.** Every uploadable object of the volume must be
   verified (image_upload.volume_upload_state). Review state and Fisqua play
-  no part.
+  no part. A volume Captua keeps on the unit (app.core.kept_volumes) is
+  refused (`kept_on_unit`), by the free, its dry run and mark-freed.
 * **A RAW preview needs its sha256 first.** One whose capture manifests
   carry no sha256 for it (in its capture record, or a `preview_digest`
   record from `backfill-preview-digests`) stays on the card, reported as
@@ -70,7 +71,14 @@ the hold, the listing) and run the rest as a background job.
 files already removed by hand: an absent file whose verified object a fresh
 listing shows with the row's SHA1. It never deletes.
 
-Version: 0.2.0
+In offline mode (app.core.unit_mode) the bucket copy is not kept up, so no
+file on the unit is removed on its account: freeing and mark-freed are
+refused (409, code `off_in_this_mode`, for the route; ValueError for the
+command). Reading from the bucket changes nothing on either side, so
+restore and the dry run are allowed in every mode, as are the adopt
+commands of app.core.image_upload.
+
+Version: 0.3.0
 """
 
 import json
@@ -92,6 +100,7 @@ from sqlalchemy.orm import Session
 
 from app.core import config
 from app.core.catalogue_backup import VerificationUnavailable, _rclone_argv, row_sha1, transfer_lock
+from app.core import unit_activity
 from app.core.paths import METADATA_DIR
 from app.core.storage_override import StorageUnavailableError
 
@@ -134,6 +143,11 @@ NOT_IN_OWN_FOLDER_MESSAGE = (
     "why (for example, the folder already holds files that are not this volume's); once "
     "that is cleared and Captua has restarted, the volume can be freed."
 )
+KEPT_ON_UNIT = "kept_on_unit"
+KEPT_MESSAGE = (
+    "Captua keeps this volume on the unit and copies none of its files offsite, so none of them "
+    "can be freed from the card."
+)
 HOLD_MESSAGE = (
     "Offsite uploads are on hold on this unit while it is being upgraded, so no "
     "files can be freed from the card. Try again once the upgrade has finished."
@@ -145,20 +159,41 @@ FREED_FILE_MESSAGE = (
     "This file is stored offsite and has been freed from the card to make room. "
     "An admin can restore the volume to bring it back."
 )
+# The same, on a unit that cannot read the bucket (restore_available false).
+FREED_FILE_NOT_RESTORABLE_MESSAGE = (
+    "This file is stored offsite and has been freed from the card to make room. "
+    "It cannot be brought back to this unit from the app."
+)
+
+
+def restore_available() -> bool:
+    """Whether a restore would not be refused for lack of a read remote (CAPTUA_OFFSITE_READ_REMOTE).
+
+    The one condition _prepare_restore refuses NO_READ_REMOTE_MESSAGE on. A
+    unit whose key can upload and list but not read has none: freeing is
+    still allowed there, and every answer about freed files says so.
+    """
+    return bool(config.settings.OFFSITE_READ_REMOTE.strip())
 FREED_EXPORT_MESSAGE = (
     "{n} file(s) of this volume are stored offsite and freed from the card. "
     "Restore the volume before exporting it."
 )
 
 
+# The detail code of a free or restore refused while an adoption's journal names the volume.
+ADOPTION_UNFINISHED = "adoption_unfinished"
+
+
 class FreeRefused(Exception):
     """A free, a dry run or a restore that cannot start; the route answers status_code with message."""
 
-    def __init__(self, message: str, status_code: int = 409, detail: Optional[dict] = None):
+    def __init__(self, message: str, status_code: int = 409, detail: Optional[dict] = None,
+                 headers: Optional[dict] = None):
         super().__init__(message)
         self.message = message
         self.status_code = status_code
         self.detail = detail or {}
+        self.headers = headers
 
     def as_detail(self) -> dict:
         return {"message": self.message, **self.detail}
@@ -189,8 +224,10 @@ def freed_detail(db: Session, image, kind: str) -> dict:
            .filter(OffsiteObject.record_image_id == image.id, OffsiteObject.kind == kind)
            .scalar())
     freed_at = freed_at_of(image, kind)
+    restorable = restore_available()
     return {
-        "message": FREED_FILE_MESSAGE,
+        "message": FREED_FILE_MESSAGE if restorable else FREED_FILE_NOT_RESTORABLE_MESSAGE,
+        "restorable": restorable,
         "stored_offsite": True,
         "image_id": image.id,
         "kind": kind,
@@ -304,10 +341,13 @@ def _listings(keys: Iterable[str]) -> dict:
     return out
 
 
-def _fixity_index():
+def _fixity_index(db: Session, collection):
     from app.core.integrity import build_fixity_index
 
-    return build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter
+
+    projects_dir = config.settings.projects_dir.resolve()
+    return build_fixity_index(projects_dir, include=manifest_filter(db, bool(collection.testing), projects_dir))
 
 
 def _digest_refusal(obj: _Object, index) -> Optional[dict]:
@@ -381,8 +421,21 @@ def _require_own_folder(db: Session, collection) -> None:
 
 
 def _stem_volume(db: Session, collection_id: int):
-    """The volume, refused unless it has a stem and every image is in `<stem>/`."""
+    """The volume, refused unless it has a stem and every image is in `<stem>/`.
+
+    Refused too while an adoption's journal names the volume
+    (app.core.adopt_journal.journal_names_volume): its files may be at
+    either of two names until startup recovery decides, and a file freed
+    meanwhile would be at neither. Every free, its dry run, its job and a
+    restore start here.
+    """
+    from app.core.adopt_journal import journal_names_volume, unfinished_message
+
     collection = _volume(db, collection_id)
+    # An early refusal only. Each file is freed, marked freed or restored under its record's row lock, where
+    # the journal is read again (_lock_and_recheck): no file of a volume a journal names is touched.
+    if journal_names_volume(collection.id):
+        raise FreeRefused(unfinished_message(), detail={"code": ADOPTION_UNFINISHED})
     _require_own_folder(db, collection)
     return collection
 
@@ -390,6 +443,11 @@ def _stem_volume(db: Session, collection_id: int):
 def _require_received(db: Session, collection) -> None:
     from app.core.image_upload import volume_upload_state
 
+    if collection.kept_on_unit:
+        # Kept on the unit (app.core.kept_volumes): nothing of it is copied
+        # offsite, so nothing of it is freed, whatever its rows say.
+        db.commit()
+        raise FreeRefused(KEPT_MESSAGE, detail={"code": KEPT_ON_UNIT})
     state = volume_upload_state(db, collection)
     db.commit()
     if not state["received"]:
@@ -455,11 +513,22 @@ def _lock_and_recheck(db: Session, obj: _Object, *, freed: bool) -> bool:
     delete_record and delete_image take this same lock before they decide
     which files to unlink, and unlink only after their commit, so a delete
     and anything done here under the lock cannot interleave.
+
+    Raises FreeRefused (`adoption_unfinished`), with the transaction rolled
+    back, while an adoption's journal names the record's volume: read here,
+    under the lock an adoption takes on its source's records, before any
+    file is marked, unlinked or written back. Every free, mark-freed and
+    restore of a file passes here (_set_freed, _place), so none acts on a
+    volume whose files an unfinished adoption may have left at either name.
     """
+    from app.core.adopt_journal import journal_names_volume, unfinished_message
     from app.models.record import Record, RecordImage
 
     at_col, _ = _columns(obj.kind)
-    db.query(Record.id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
+    locked = db.query(Record.collection_id).filter(Record.id == obj.record_id).with_for_update().one_or_none()
+    if locked is not None and journal_names_volume(locked[0]):
+        db.rollback()
+        raise FreeRefused(unfinished_message(), detail={"code": ADOPTION_UNFINISHED})
     row = (db.query(RecordImage.file_path, at_col)
            .filter(RecordImage.id == obj.image_id).one_or_none())
     return row is not None and row[0] == obj.file_path and (row[1] is not None) == freed
@@ -552,7 +621,7 @@ def plan_free(db: Session, collection_id: int) -> dict:
     finally:
         hold.release()
     files, refused = [], []
-    index = _fixity_index()
+    index = _fixity_index(db, collection)
     for obj in objects:
         refusal = (_layout_refusal(obj) or _digest_refusal(obj, index)
                    or _listing_refusal(obj, listed.get(obj.key)))
@@ -566,6 +635,115 @@ def plan_free(db: Session, collection_id: int) -> dict:
         "collection_id": collection_id, "filename_stem": collection.filename_stem,
         "would_free": {"files": len(files), "bytes": sum(f["bytes"] for f in files)},
         "files": files, "refused": refused, "local_sha1_checked": False,
+        "restorable": restore_available(),
+    }
+
+
+# ---------------------------------------------------------------------------
+# The volumes that can be freed
+# ---------------------------------------------------------------------------
+
+def free_on_offer(state: dict) -> bool:
+    """Whether freeing is offered for a volume, from its _object_counts state.
+
+    Every object verified offsite (`received`) and some verified file still
+    on the card (more verified than freed), and the volume not kept on the
+    unit: the rule the volume page offers the free by (offsiteOffer in the
+    interface). The free itself checks again (_require_received and the rest).
+    """
+    return bool(state["received"]) and not state["kept_on_unit"] and state["verified"] > state["freed_files"]
+
+
+def freeable_volumes(db: Session) -> dict:
+    """Every real volume freeing is on offer for, with the files and bytes freeing would remove, largest first.
+
+    Read in a fixed number of queries whatever the unit holds:
+    image_upload._object_counts for the rule (free_on_offer), on the real
+    volumes not kept on the unit only, so no file of a testing or kept volume
+    is looked for; then one aggregate over the verified objects still on the
+    card. The aggregate leaves out a volume with any image whose stored path
+    is under the projects root but outside `<stem>/`, the name-based layout
+    _require_own_folder refuses, compared as stored strings against the
+    projects root as configured and as resolved. A path that reaches the
+    root only through a symlink is not caught here; the free still refuses it. A
+    master's bytes are its `record_images.file_size`, stored when it was
+    captured or uploaded. No column holds a RAW preview's size, and no file
+    is read for it here: a preview, and a master whose size was not stored,
+    is counted in `files` and in `unmeasured_files`, and adds nothing to
+    `bytes`, so `bytes` can fall short of what the dry run measures on the
+    card. Testing volumes and volumes kept on the unit are never listed.
+
+    The list is the conservative, database-only reading: it never looks at
+    the card. A volume with a current RAW image whose preview has no offsite
+    row is taken as still uploading and left out (_object_counts with
+    `probe_previews` false), although the volume page, which looks for the
+    preview file, may still offer to free it.
+
+    Colour card shots (app.core.colour_card) are never freed and never
+    counted here: they have their own objects (colour_card_objects), which
+    no query of this module reads.
+
+    `mode_allows` is false in offline mode, where freeing is refused
+    (`off_in_this_mode`). `restorable` is restore_available(), once for the
+    unit. `jobs` lists the free jobs queued or running on the unit
+    (`collection_id`, `job_id`, `state`), from offsite_jobs; restore jobs are
+    not listed, and no result is carried.
+    """
+    from sqlalchemy import and_, case, exists, func, literal, or_
+    from sqlalchemy.orm import aliased
+
+    from app.core import unit_mode
+    from app.core.image_upload import _object_counts
+    from app.models.collection import Collection
+    from app.models.offsite_object import OffsiteObject
+    from app.models.record import Record, RecordImage
+
+    offered = {cid for cid, state in _object_counts(db, real_released_only=True, probe_previews=False).items()
+               if free_on_offer(state)}
+    # The name-based layout, as image_in_old_layout reads it, from the stored path.
+    image, record = aliased(RecordImage), aliased(Record)
+    path = image.file_path
+    roots = {str(config.settings.projects_dir).rstrip("/"), str(config.settings.projects_dir.resolve()).rstrip("/")}
+    # One predicate: an image is in its volume's own folder when its stored path
+    # starts with `<root>/<stem>/` for the root as configured or as resolved;
+    # a volume is left out when some image is under the projects root (either
+    # spelling) and in its own folder under neither.
+    in_root, in_own = [], []
+    for root in sorted(roots):
+        in_root.append(func.substr(path, 1, len(root) + 1) == root + "/")
+        own = literal(root + "/").concat(Collection.filename_stem).concat("/")
+        in_own.append(func.substr(path, 1, func.length(own)) == own)
+    old_layout = exists().where(record.collection_id == Collection.id, image.record_id == record.id,
+                                or_(*in_root), ~or_(*in_own))
+    on_card = or_(and_(OffsiteObject.kind == "capture", RecordImage.master_freed_at.is_(None)),
+                  and_(OffsiteObject.kind == "preview", RecordImage.preview_freed_at.is_(None)))
+    master = OffsiteObject.kind == "capture"
+    rows = (db.query(Collection.id, Collection.project_id, Collection.name, Collection.filename_stem,
+                     func.count(OffsiteObject.id),
+                     func.coalesce(func.sum(case((master, func.coalesce(RecordImage.file_size, 0)), else_=0)), 0),
+                     func.coalesce(func.sum(case((or_(~master, RecordImage.file_size.is_(None)), 1), else_=0)), 0))
+            .join(Record, Record.collection_id == Collection.id)
+            .join(RecordImage, RecordImage.record_id == Record.id)
+            .join(OffsiteObject, OffsiteObject.record_image_id == RecordImage.id)
+            .filter(Collection.filename_stem.isnot(None), Collection.testing.is_(False),
+                    Collection.kept_on_unit.is_(False), OffsiteObject.verified_at.isnot(None), on_card,
+                    ~old_layout)
+            .group_by(Collection.id, Collection.project_id, Collection.name, Collection.filename_stem)
+            .all())
+    mode_allows = unit_mode.offsite_on(db)
+    db.commit()
+    volumes = [{"collection_id": cid, "project_id": project_id, "name": name, "filename_stem": stem,
+                "files": int(files), "bytes": int(size), "unmeasured_files": int(unmeasured)}
+               for cid, project_id, name, stem, files, size, unmeasured in rows if cid in offered and files]
+    volumes.sort(key=lambda v: (-v["bytes"], -v["files"], v["name"], v["collection_id"]))
+    return {
+        "volumes": volumes,
+        "total": {"volumes": len(volumes), "files": sum(v["files"] for v in volumes),
+                  "bytes": sum(v["bytes"] for v in volumes),
+                  "unmeasured_files": sum(v["unmeasured_files"] for v in volumes)},
+        "mode_allows": mode_allows,
+        "restorable": restore_available(),
+        "jobs": offsite_jobs.active("free"),
     }
 
 
@@ -594,10 +772,10 @@ def _stable_sha1(path: Path) -> Optional[str]:
 
 def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str]) -> dict:
     """Hash, list again, and free what passes. Runs under the caller's hold."""
-    _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
+    collection = _stem_volume(db, collection_id)  # again, in the job: the request's check is a moment old
     objects = _objects(db, collection_id, freed=False)
     refused, hashed = [], []
-    index = _fixity_index()
+    index = _fixity_index(db, collection)
     for obj in objects:
         refusal = _layout_refusal(obj) or _digest_refusal(obj, index)
         if refusal is not None:
@@ -624,44 +802,79 @@ def _free_work(db: Session, collection_id: int, stem: str, actor: Optional[str])
 
     manifest = _RunManifest(stem, "freed")
     freed = []
-    for obj, size in hashed:
-        refusal = _listing_refusal(obj, listed.get(obj.key))
-        if refusal is not None:
-            refused.append(refusal)
-            continue
-        at = _now()
-        if not _set_freed(db, obj, at=at, size=size):
-            # Deleted, or its path changed, since the work list was read.
-            refused.append(obj.entry(reason="changed"))
-            continue
-        # The record's lock is released at that commit, so a delete can run
-        # between it and the unlink. The delete removes the row and then the
-        # same file; whichever unlink comes second finds nothing. Either way
-        # the row and the card agree, and only the report has to say which.
-        try:
-            obj.path.unlink()
-        except FileNotFoundError:
-            if not _image_exists(db, obj.image_id):
+    stopped = None
+    # The summary is logged however the run ends, so files freed before a refusal part-way (an adoption's
+    # journal read under a record's lock, _lock_and_recheck) or an error have their `volume_freed` event.
+    try:
+        for obj, size in hashed:
+            refusal = _listing_refusal(obj, listed.get(obj.key))
+            if refusal is not None:
+                refused.append(refusal)
+                continue
+            at = _now()
+            if not _set_freed(db, obj, at=at, size=size):
+                # Deleted, or its path changed, since the work list was read.
                 refused.append(obj.entry(reason="changed"))
                 continue
-        except OSError as exc:
-            logger.warning("Freed state set but %s could not be removed; clearing it: %s", obj.path, exc)
-            _set_freed(db, obj, at=None, size=None)
-            refused.append(obj.entry(reason="could_not_remove", error=str(exc)[:200]))
-            continue
-        entry = obj.entry(bytes=size, sha1=obj.sha1, freed_at=at.isoformat())
-        freed.append(entry)
-        manifest.write(entry)
+            # The record's lock is released at that commit, so a delete can run
+            # between it and the unlink. The delete removes the row and then the
+            # same file; whichever unlink comes second finds nothing. Either way
+            # the row and the card agree, and only the report has to say which.
+            try:
+                obj.path.unlink()
+            except FileNotFoundError:
+                if not _image_exists(db, obj.image_id):
+                    refused.append(obj.entry(reason="changed"))
+                    continue
+            except OSError as exc:
+                logger.warning("Freed state set but %s could not be removed; clearing it: %s", obj.path, exc)
+                _set_freed(db, obj, at=None, size=None)
+                refused.append(obj.entry(reason="could_not_remove", error=str(exc)[:200]))
+                continue
+            entry = obj.entry(bytes=size, sha1=obj.sha1, freed_at=at.isoformat())
+            freed.append(entry)
+            manifest.write(entry)
+    except Exception as exc:
+        stopped = exc
+        raise
+    finally:
+        total = sum(f["bytes"] for f in freed)
+        if freed or refused or stopped is not None:
+            _log(db, action=FREED_ACTION, level="WARN" if refused or stopped is not None else "INFO",
+                 actor=actor, stem=stem,
+                 detail=f"files={len(freed)} bytes={total} refused={len(refused)}"
+                        + (f" manifest={manifest.path.name}" if manifest.path else "")
+                        + (f" stopped: {_stop_reason(stopped)}" if stopped is not None else ""))
 
-    total = sum(f["bytes"] for f in freed)
-    if freed or refused:
-        _log(db, action=FREED_ACTION, level="WARN" if refused else "INFO", actor=actor, stem=stem,
-             detail=f"files={len(freed)} bytes={total} refused={len(refused)}"
-                    + (f" manifest={manifest.path.name}" if manifest.path else ""))
     return {"collection_id": collection_id, "filename_stem": stem,
             "freed": {"files": len(freed), "bytes": total},
             "files": freed, "refused": refused,
-            "manifest": str(manifest.path) if manifest.path else None}
+            "manifest": str(manifest.path) if manifest.path else None,
+            "restorable": restore_available()}
+
+
+def _stop_reason(exc: BaseException) -> str:
+    """A refusal's code, or the error's type: what cut a free short, without paths."""
+    detail = getattr(exc, "detail", None)
+    if isinstance(detail, dict) and detail.get("code"):
+        return str(detail["code"])
+    return type(exc).__name__
+
+
+OFF_IN_THIS_MODE = "off_in_this_mode"
+# Freeing removes the unit's copy because the bucket keeps one. In offline mode
+# the bucket copy is no longer kept up, so no local copy is removed or marked
+# removed; reading from the bucket (restore, the dry run) stays allowed.
+OFFLINE_MESSAGE = ("The unit is in offline mode, so the bucket copy is not kept up and no file on the unit is "
+                   "freed or marked freed. Switch to a mode with the offsite copy to free space.")
+
+
+def _refuse_offline(db: Session) -> None:
+    """FreeRefused (409, code off_in_this_mode) in offline mode (app.core.unit_mode); backup and fisqua pass."""
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        raise FreeRefused(OFFLINE_MESSAGE, detail={"code": OFF_IN_THIS_MODE, "mode": unit_mode.mode(db)})
 
 
 def _prepare_free(db: Session, collection_id: int):
@@ -674,6 +887,7 @@ def _prepare_free(db: Session, collection_id: int):
     """
     from app.core import offsite_hold
 
+    _refuse_offline(db)
     if offsite_hold.is_held():
         raise FreeRefused(HOLD_MESSAGE, detail={"hold_file": str(offsite_hold.hold_file())})
     collection = _stem_volume(db, collection_id)
@@ -706,6 +920,10 @@ def read_remote_path(key: str) -> str:
     return f"{config.settings.OFFSITE_READ_REMOTE.strip().rstrip('/')}/{key.strip('/')}"
 
 
+# rclone's exit codes for a source directory or file that is not there.
+ABSENT_RETURN_CODES = (3, 4)
+
+
 def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
     """`rclone copyto` one object from the read remote to `dest`; an error message, or None on success.
 
@@ -715,6 +933,11 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
     rclone transfer runs at a time and the unit's link carries the same
     load whichever way the bytes go.
     """
+    return _copy_result(key, dest)[1]
+
+
+def _copy_result(key: str, dest: Path) -> tuple:
+    """(rclone's return code or None when it did not run to an end, error message or None) of _copy_from_bucket."""
     argv = _rclone_argv("copyto", read_remote_path(key), str(dest), "--inplace",
                         "--bwlimit", config.settings.OFFSITE_BWLIMIT)
     try:
@@ -722,12 +945,13 @@ def _copy_from_bucket(key: str, dest: Path) -> Optional[str]:
             result = subprocess.run(argv, capture_output=True, text=True, stdin=subprocess.DEVNULL,
                                     timeout=_COPY_TIMEOUT_SECONDS)
     except subprocess.TimeoutExpired:
-        return f"the copy of {key} did not finish within {_COPY_TIMEOUT_SECONDS}s"
+        return None, f"the copy of {key} did not finish within {_COPY_TIMEOUT_SECONDS}s"
     except OSError as exc:
-        return f"rclone could not be started ({argv[0]}): {exc}"
+        return None, f"rclone could not be started ({argv[0]}): {exc}"
     if result.returncode != 0:
-        return f"the copy of {key} failed (rc={result.returncode}): {(result.stderr or result.stdout or '').strip()[:300]}"
-    return None
+        return result.returncode, (f"the copy of {key} failed (rc={result.returncode}): "
+                                   f"{(result.stderr or result.stdout or '').strip()[:300]}")
+    return 0, None
 
 
 def _fsync_file(path: Path) -> None:
@@ -872,8 +1096,9 @@ def _prepare_restore(db: Session, collection_id: int):
     from app.core.storage_override import refuse_writes_under_unusable_root
     from capture.project_manager import volume_root
 
+    # Not refused in offline mode: restore reads from the bucket and sends nothing out.
     collection = _stem_volume(db, collection_id)
-    if not config.settings.OFFSITE_READ_REMOTE.strip():
+    if not restore_available():
         raise FreeRefused(NO_READ_REMOTE_MESSAGE)
     # StorageUnavailableError, which the app answers with 503, as it does for
     # every other writer; each file is checked again before it is written.
@@ -904,6 +1129,9 @@ class OffsiteJob:
         self.error: Optional[str] = None
         self.created_at = time.time()
         self.finished_at: Optional[float] = None
+        # Counted as offsite work in progress (app.core.unit_activity) from
+        # its reservation until its thread ends or it is discarded.
+        self.counted = False
 
     def to_dict(self) -> dict:
         return {"job_id": self.id, "collection_id": self.collection_id, "action": self.action,
@@ -925,6 +1153,12 @@ class OffsiteJobRegistry:
 
     Finished jobs are dropped FINISHED_JOB_TTL after they end, when the next
     job is reserved; a queued or running job is never dropped.
+
+    Each job is counted as offsite work in progress (app.core.unit_activity)
+    from its reservation until its thread ends, so a running job prevents a
+    restart and pairing waits for it; a reservation is refused with 503
+    `backend_restarting` while a restart is pending or pairing is applying
+    a link.
     """
 
     def __init__(self):
@@ -947,20 +1181,40 @@ class OffsiteJobRegistry:
             active = self._jobs.get(self._active.get(collection_id))
             if active is not None and active.state in ("queued", "running"):
                 raise FreeRefused(JOB_RUNNING_MESSAGE, detail={"job_id": active.id})
+            try:
+                unit_activity.enter(unit_activity.OFFSITE_JOB)
+            except unit_activity.Refused:
+                raise FreeRefused(unit_activity.REFUSAL_MESSAGE, status_code=503,
+                                  detail={"code": unit_activity.BACKEND_RESTARTING},
+                                  headers={"Retry-After": str(unit_activity.RETRY_AFTER_SECONDS)}) from None
             job = OffsiteJob(collection_id, action)
+            job.counted = True
             self._jobs[job.id] = job
             self._active[collection_id] = job.id
             return job
+
+    def _uncount(self, job: OffsiteJob) -> None:
+        with self._lock:
+            counted, job.counted = job.counted, False
+        if counted:
+            unit_activity.leave(unit_activity.OFFSITE_JOB)
 
     def discard(self, job: OffsiteJob) -> None:
         with self._lock:
             self._jobs.pop(job.id, None)
             if self._active.get(job.collection_id) == job.id:
                 del self._active[job.collection_id]
+        self._uncount(job)
 
     def get(self, job_id: str) -> Optional[OffsiteJob]:
         with self._lock:
             return self._jobs.get(job_id)
+
+    def active(self, action: str) -> list:
+        """The jobs of `action` queued or running, as {collection_id, job_id, state}; no result."""
+        with self._lock:
+            return [{"collection_id": j.collection_id, "job_id": j.id, "state": j.state}
+                    for j in self._jobs.values() if j.action == action and j.state in ("queued", "running")]
 
     def run(self, job: OffsiteJob, work: Callable[[], dict], hold: _Hold) -> None:
         def target():
@@ -987,6 +1241,7 @@ class OffsiteJobRegistry:
                 with self._lock:
                     if self._active.get(job.collection_id) == job.id:
                         del self._active[job.collection_id]
+                self._uncount(job)
 
         try:
             threading.Thread(target=target, name=f"offsite-{job.action}", daemon=True).start()
@@ -1014,24 +1269,30 @@ def _in_own_session(fn: Callable[[Session], dict]) -> Callable[[], dict]:
 def start_free(db: Session, collection_id: int, actor: Optional[str]) -> OffsiteJob:
     """Check what can be refused now, then free in the background. Raises FreeRefused."""
     job = offsite_jobs.reserve(collection_id, "free")
+    # Every exit after the reservation releases it: a refusal or any error
+    # here discards the job, and run() releases it when its thread ends (or
+    # discards it when the thread cannot be started).
     try:
         collection, hold = _prepare_free(db, collection_id)
+        stem = collection.filename_stem
     except BaseException:
         offsite_jobs.discard(job)
         raise
-    stem = collection.filename_stem
     offsite_jobs.run(job, _in_own_session(lambda s: _free_work(s, collection_id, stem, actor)), hold)
     return job
 
 
 def start_restore(db: Session, collection_id: int, actor: Optional[str]) -> OffsiteJob:
     job = offsite_jobs.reserve(collection_id, "restore")
+    # Every exit after the reservation releases it: a refusal or any error
+    # here discards the job, and run() releases it when its thread ends (or
+    # discards it when the thread cannot be started).
     try:
         collection, hold = _prepare_restore(db, collection_id)
+        stem = collection.filename_stem
     except BaseException:
         offsite_jobs.discard(job)
         raise
-    stem = collection.filename_stem
     offsite_jobs.run(job, _in_own_session(lambda s: _restore_work(s, collection_id, stem, actor)), hold)
     return job
 
@@ -1052,16 +1313,30 @@ def mark_freed(db: Session, stem: str, *, apply: bool = False) -> dict:
     Runs in a process of its own, outside the backend's hold, so each file's
     absence is checked again right before its row is written. Raises
     ValueError for an unknown stem and VerificationUnavailable when a
-    listing does not answer.
+    listing does not answer, and ValueError in offline mode (app.core.unit_mode)
+    and for a volume kept on the unit (app.core.kept_volumes).
     """
     from app.core.image_upload import local_file
     from app.models.collection import Collection
     from app.models.offsite_object import OffsiteObject
     from app.models.record import Record, RecordImage
 
+    from app.core import unit_mode
+
+    if not unit_mode.offsite_on(db):
+        raise ValueError("the unit is in offline mode, so mark-freed, which lists the bucket, is refused")
     collection = db.query(Collection).filter(Collection.filename_stem == stem).one_or_none()
     if collection is None:
         raise ValueError(f"no volume has the file name stem {stem!r}")
+    if collection.kept_on_unit:
+        raise ValueError(f"Captua keeps the volume {stem!r} on the unit, so none of its files is marked freed")
+    from app.core.adopt_journal import journal_names_volume
+
+    # An early refusal only: each row is marked under its record's lock, where the journal is read again
+    # (_lock_and_recheck).
+    if journal_names_volume(collection.id):
+        raise ValueError(f"an unfinished adoption names the volume {stem!r}, so none of its files is marked freed; "
+                         "restart the backend to finish or undo it")
 
     absent, unaccounted = [], []
     rows = (db.query(RecordImage.id, RecordImage.record_id, RecordImage.file_path,

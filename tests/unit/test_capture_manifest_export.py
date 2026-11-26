@@ -11,7 +11,7 @@ uploader leaves them.
 
     python -m pytest tests/unit/test_capture_manifest_export.py
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import hashlib
@@ -247,7 +247,7 @@ def test_envelope(client, vol):
     assert resp.status_code == 200, resp.text
     doc = resp.json()
     assert doc["contract"] == "fisqua-captua-exchange"
-    assert doc["version"] == "1.1"
+    assert doc["version"] == "1.12"
     assert doc["kind"] == "capture-manifest"
     assert UUID4.match(doc["id"])
     assert re.match(r"^\d{4}-\d{2}-\d{2}T\d{2}:\d{2}:\d{2}Z$", doc["generatedAt"])
@@ -794,7 +794,7 @@ def fisqua_registration_problems(doc, slug):
     page_key_re = re.compile(r"^[A-Za-z0-9_-][A-Za-z0-9._-]*$")
     if doc.get("contract") != "fisqua-captua-exchange":
         out.append("contract")
-    if doc.get("version") != "1.1":
+    if doc.get("version") != "1.12":
         out.append("version")
     if doc.get("kind") != "capture-manifest":
         out.append("kind")
@@ -832,7 +832,7 @@ def fisqua_registration_problems(doc, slug):
         for r in v["records"]:
             if not isinstance(r["captuaRecordId"], int) or not isinstance(r["sequence"], int):
                 out.append("record shape")
-            if r["status"] not in ("captured", "in_review", "approved", "rejected"):
+            if r["status"] not in ("captured", "in_review", "approved", "rejected", "excluded", "missing"):
                 out.append("status")
             if not (r["rejectionNote"] is None or isinstance(r["rejectionNote"], str)):
                 out.append("rejectionNote")
@@ -1038,7 +1038,7 @@ def test_rotate_deg_is_off_by_default():
 
 
 @pytest.mark.unit
-def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_1_1(client, vol):
+def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_still_1_9(client, vol):
     rec = vol.record(layout=("left", "right"))
     left, right = sorted(rec.images, key=lambda i: i.role)
     _rotate(left, 90)
@@ -1046,14 +1046,14 @@ def test_with_rotate_deg_off_no_image_carries_it_and_the_version_is_1_1(client, 
     resp = _export(client, vol.col)
     assert resp.status_code == 200, resp.text
     doc = resp.json()
-    assert doc["version"] == "1.1"
+    assert doc["version"] == "1.12"
     assert "rotateDeg" not in resp.text
     assert all(set(i) == {"captureId", "pairId", "filename", "role", "objectKey", "sha256"}
                for i in _images(doc))
 
 
 @pytest.mark.unit
-def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_5(client, vol, rotate_deg):
+def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_9(client, vol, rotate_deg):
     rec = vol.record(layout=("left", "right"))
     left, right = sorted(rec.images, key=lambda i: i.role)
     _rotate(left, 90)
@@ -1064,7 +1064,7 @@ def test_with_rotate_deg_on_each_rotated_image_carries_it_and_the_version_is_1_5
     single = vol.record(layout=("single",)).images[0]
     _rotate(single, 270)
     doc = _export(client, vol.col).json()
-    assert doc["version"] == "1.5"
+    assert doc["version"] == "1.12"
     by_id = {i["captureId"] + i["role"]: i for i in _images(doc)}
     out_left = by_id[left.capture_id + "left"]
     out_right = by_id[right.capture_id + "right"]
@@ -1083,7 +1083,7 @@ def test_with_rotate_deg_on_an_image_with_no_rotation_has_no_key(client, vol, ro
     _rotate(left, 90)
     assert right.rotate_deg is None
     doc = _export(client, vol.col).json()
-    assert doc["version"] == "1.5"
+    assert doc["version"] == "1.12"
     out_left, out_right = doc["volumes"][0]["records"][0]["images"]
     assert out_left["rotateDeg"] == 90
     assert "rotateDeg" not in out_right
@@ -1110,3 +1110,364 @@ def test_with_rotate_deg_on_a_rebuilt_jpeg_carries_its_recorded_rotation_not_its
     monkeypatch.setattr(Image, "open", no_read)
     [out] = _images(_export(client, vol.col).json())
     assert out["rotateDeg"] == 180
+
+
+# ---------------------------------------------------------------------------
+# Excluded (contract 1.6): listed with its status and images, not a page
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_an_excluded_record_is_listed_with_its_status_and_images_and_is_not_a_page(client, vol):
+    page = vol.record(status="in_review", sequence=1)
+    out = vol.record(status="excluded", sequence=2)
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    records = resp.json()["volumes"][0]["records"]
+    assert [(r["captuaRecordId"], r["status"]) for r in records] == [(page.id, "in_review"), (out.id, "excluded")]
+    assert records[1]["rejectionNote"] is None
+    assert sorted(i["role"] for i in records[1]["images"]) == ["left", "right"]
+
+
+@pytest.mark.unit
+def test_a_volume_with_one_excluded_record_among_in_review_ones_exports(client, vol):
+    vol.record(status="in_review", sequence=1)
+    vol.record(status="excluded", sequence=2)
+    vol.record(status="in_review", sequence=3)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_an_excluded_record_gets_no_roles_check(client, vol):
+    vol.record(status="in_review", sequence=1)
+    vol.record(status="excluded", sequence=2, layout=("left", "left"))
+    bare = vol.record(status="excluded", sequence=3)
+    vol.supersede(bare)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_whose_records_are_all_excluded_has_no_pages(client, vol):
+    vol.record(status="excluded", sequence=1)
+    vol.record(status="excluded", sequence=2)
+    problems = _refusal(_export(client, vol.col))
+    assert list(problems) == ["no_pages"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rotate", [False, True])
+def test_the_version_is_1_9_with_or_without_an_exclusion_and_rotate_deg(client, vol, monkeypatch, rotate):
+    from app.core import config
+    monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", rotate)
+    vol.record(status="in_review", sequence=1)
+    assert _export(client, vol.col).json()["version"] == "1.12"
+    vol.record(status="excluded", sequence=2)
+    assert _export(client, vol.col).json()["version"] == "1.12"
+
+
+# ---------------------------------------------------------------------------
+# Contract 1.9: a record that misses a side or a whole opening is listed as
+# `missing`, open or closed; a closed one with an image is a page once handed over.
+# ---------------------------------------------------------------------------
+
+def _missing_side(vol, side="left", status="captured", closed=None, note=None):
+    """A dual record with its one image, the page opposite `side`, as app.core.rebuild_volume writes one."""
+    rec = vol.record(status=status, layout=("right",) if side == "left" else ("left",))
+    rec.capture_mode = "dual"
+    rec.missing_side = side
+    rec.closed_reason = closed
+    rec.closed_note = note
+    vol.db.commit()
+    vol.db.refresh(rec)
+    return rec
+
+
+def _placeholder(vol, status="captured", closed=None, note=None, request_id=None, sequence=None):
+    """A placeholder: a dual record with no image that misses both pages."""
+    from app.models.record import Record
+    rec = Record(title="p", collection_id=vol.col.id, status=status, capture_mode="dual",
+                 sequence=sequence or len(vol.col.records) + 1, missing_side="both",
+                 closed_reason=closed, closed_note=note, missing_request_id=request_id)
+    vol.db.add(rec)
+    vol.db.commit()
+    vol.db.refresh(rec)
+    vol.db.refresh(vol.col)
+    return rec
+
+
+def _listed(doc):
+    return [r["captuaRecordId"] for r in doc["volumes"][0]["records"]]
+
+
+def _entry(doc, rec):
+    [entry] = [r for r in doc["volumes"][0]["records"] if r["captuaRecordId"] == rec.id]
+    return entry
+
+
+@pytest.mark.unit
+def test_the_left_out_rule_is_gone():
+    from app.core import capture_manifest
+    assert not hasattr(capture_manifest, "_left_on_the_unit")
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_an_open_record_missing_a_side_is_listed_as_missing_with_its_one_image(client, vol, side):
+    a = vol.record(status="in_review")
+    missing = _missing_side(vol, side)
+    b = vol.record(status="in_review")
+
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert _listed(doc) == [a.id, missing.id, b.id]
+    entry = _entry(doc, missing)
+    assert entry["status"] == "missing" and entry["missingSide"] == side
+    assert [i["role"] for i in entry["images"]] == ["right" if side == "left" else "left"]
+    assert "closedReason" not in entry and "closedNote" not in entry and "requestId" not in entry
+    assert "missingSide" not in _entry(doc, a)
+
+
+@pytest.mark.unit
+def test_an_open_placeholder_is_listed_with_no_image_and_does_not_refuse(client, vol):
+    a = vol.record(status="in_review")
+    hole = _placeholder(vol)
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    entry = _entry(resp.json(), hole)
+    assert (entry["status"], entry["missingSide"], entry["images"]) == ("missing", "both", [])
+    assert entry["sequence"] == hole.sequence
+    assert _listed(resp.json()) == [a.id, hole.id]
+
+
+@pytest.mark.unit
+def test_a_closed_placeholder_carries_why_and_is_not_a_page(client, vol):
+    a = vol.record(status="in_review")
+    hole = _placeholder(vol, status="in_review", closed="foliation_skip")
+    doc = _export(client, vol.col).json()
+    entry = _entry(doc, hole)
+    assert (entry["status"], entry["missingSide"], entry["closedReason"]) == ("missing", "both", "foliation_skip")
+    assert "closedNote" not in entry
+    noted = _placeholder(vol, status="in_review", closed="other", note="dos folios 12")
+    entry = _entry(_export(client, vol.col).json(), noted)
+    assert (entry["closedReason"], entry["closedNote"]) == ("other", "dos folios 12")
+    assert len(_images(doc)) == len(a.images)
+
+
+@pytest.mark.unit
+def test_a_volume_of_closed_placeholders_only_has_no_pages(client, vol):
+    _placeholder(vol, status="in_review", closed="foliation_skip")
+    assert list(_refusal(_export(client, vol.col))) == ["no_pages"]
+
+
+@pytest.mark.unit
+def test_an_open_missing_records_image_is_not_a_page_but_the_record_holds_no_pages_off(client, vol):
+    # Amended §10.3: a delivery whose records are all missing is accepted while
+    # one is open, so the unit no longer refuses it for no_pages.
+    _missing_side(vol, "left")
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_closed_missing_records_image_handed_over_is_a_page(client, vol):
+    rec = _missing_side(vol, "left", status="in_review", closed="leaf_missing_from_volume")
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    entry = _entry(resp.json(), rec)
+    assert (entry["status"], entry["closedReason"], len(entry["images"])) == ("missing", "leaf_missing_from_volume", 1)
+
+
+@pytest.mark.unit
+def test_a_closed_record_still_captured_has_not_been_handed_over(client, vol):
+    vol.record(status="in_review")
+    closed = _placeholder(vol, closed="captured_elsewhere")
+    problems = _refusal(_export(client, vol.col))
+    assert problems["records_captured"]["record_ids"] == [closed.id]
+
+
+@pytest.mark.unit
+def test_an_ordinary_captured_record_beside_an_open_missing_one_still_refuses(client, vol):
+    vol.record(status="in_review")
+    missing = _missing_side(vol)
+    hole = _placeholder(vol)
+    c = vol.record(status="captured")
+    problems = _refusal(_export(client, vol.col))
+    assert problems["records_captured"]["record_ids"] == [c.id]
+    assert missing.id not in problems["records_captured"]["record_ids"]
+    assert hole.id not in problems["records_captured"]["record_ids"]
+
+
+@pytest.mark.unit
+def test_an_excluded_missing_record_keeps_excluded_and_carries_its_missing_fields(client, vol):
+    vol.record(status="in_review")
+    rec = _missing_side(vol, "right", status="excluded", closed="other", note="duplicado")
+    entry = _entry(_export(client, vol.col).json(), rec)
+    assert (entry["status"], entry["missingSide"], entry["closedReason"], entry["closedNote"]) == (
+        "excluded", "right", "other", "duplicado")
+    open_ = _missing_side(vol, "left", status="excluded")
+    entry = _entry(_export(client, vol.col).json(), open_)
+    assert (entry["status"], entry["missingSide"]) == ("excluded", "left") and "closedReason" not in entry
+
+
+@pytest.mark.unit
+def test_the_request_id_travels_on_the_placeholder_and_after_it_is_captured_into(client, vol, db_session):
+    vol.record(status="in_review")
+    hole = _placeholder(vol, request_id="req-7")
+    assert _entry(_export(client, vol.col).json(), hole)["requestId"] == "req-7"
+
+    vol.capture(hole, ("left", "right"))
+    hole.missing_side = None
+    hole.status = "in_review"
+    db_session.commit()
+    entry = _entry(_export(client, vol.col).json(), hole)
+    assert entry["status"] == "in_review" and entry["requestId"] == "req-7"
+    assert "missingSide" not in entry
+    assert sorted(i["role"] for i in entry["images"]) == ["left", "right"]
+
+
+@pytest.mark.unit
+def test_once_recaptured_and_handed_over_it_is_an_ordinary_record(client, vol, db_session):
+    from app.models.record import Record
+
+    a = vol.record(status="captured")
+    missing = _missing_side(vol)
+    api = _as(client, "operator")
+    assert api.post(f"/collections/{vol.col.id}/promote").json()["promoted"] == 1
+    assert _entry(_export(client, vol.col).json(), missing)["status"] == "missing"
+
+    # The retake: both pages, the lone image superseded, the side cleared, as trigger_dual_capture does.
+    vol.supersede(missing)
+    vol.capture(missing, ("left", "right"))
+    missing.missing_side = None
+    db_session.commit()
+    resp = api.post(f"/collections/{vol.col.id}/promote")
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["promoted"] == 1
+
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    doc = resp.json()
+    assert _listed(doc) == [a.id, missing.id]
+    db_session.expire_all()
+    current = [i for i in db_session.get(Record, missing.id).images if i.is_current]
+    entry = _entry(doc, missing)
+    assert entry["status"] == "in_review" and "missingSide" not in entry
+    assert sorted(i["role"] for i in entry["images"]) == ["left", "right"]
+    assert {i["captureId"] for i in entry["images"]} == {i.capture_id for i in current}
+
+
+@pytest.mark.unit
+def test_the_records_and_their_images_are_read_in_one_statement(client, vol, db_session):
+    # A missing page committed between two reads could pair a record's old
+    # status with only its surviving image; one statement sees one instant.
+    from sqlalchemy import event
+    vol.record(status="in_review")
+    vol.record(status="in_review", layout=("single",))
+    _missing_side(vol, "left", status="in_review", closed="foliation_skip")
+    engine = db_session.get_bind()
+    statements = []
+
+    def count(conn, cursor, statement, *args):
+        statements.append(statement)
+
+    event.listen(engine, "before_cursor_execute", count)
+    try:
+        resp = _export(client, vol.col)
+    finally:
+        event.remove(engine, "before_cursor_execute", count)
+    assert resp.status_code == 200, resp.text
+    touching = [s for s in statements if "record_images" in s and "offsite_objects" not in s]
+    assert len(touching) == 1, touching
+    assert "FROM records" in touching[0]
+
+
+# ---------------------------------------------------------------------------
+# Contract 1.9 amendments (§9.2, §10.3): no_pages and missing_side_contradicted
+# ---------------------------------------------------------------------------
+
+@pytest.mark.unit
+def test_a_volume_whose_only_record_is_open_missing_builds(client, vol):
+    rec = _missing_side(vol, "left")
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    assert _entry(resp.json(), rec)["status"] == "missing"
+
+
+@pytest.mark.unit
+def test_an_open_missing_record_among_excluded_ones_builds(client, vol):
+    vol.record(status="excluded")
+    _missing_side(vol, "right")
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_of_open_placeholders_only_builds(client, vol):
+    _placeholder(vol)
+    _placeholder(vol)
+    assert _export(client, vol.col).status_code == 200
+
+
+@pytest.mark.unit
+def test_a_volume_of_closed_imageless_placeholders_only_has_no_pages(client, vol):
+    _placeholder(vol, status="in_review", closed="foliation_skip")
+    _placeholder(vol, status="in_review", closed="captured_elsewhere")
+    assert list(_refusal(_export(client, vol.col))) == ["no_pages"]
+
+
+def _contradicted(vol, side, layout, status="in_review"):
+    rec = vol.record(status=status, layout=layout)
+    rec.capture_mode = "dual"
+    rec.missing_side = side
+    vol.db.commit()
+    vol.db.refresh(rec)
+    return rec
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side, layout", [
+    ("both", ("left",)),
+    ("both", ("left", "right")),
+    ("both", ("single",)),
+    ("left", ("left",)),
+    ("left", ("left", "right")),
+    ("right", ("right",)),
+    ("right", ("left", "right")),
+])
+def test_a_missing_record_whose_images_contradict_its_side_is_refused(client, vol, side, layout):
+    # Fisqua's missing-side (amended §9.2): an image on the missing side, or any image with both.
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, layout)
+    problems = _refusal(_export(client, vol.col))
+    assert problems["missing_side_contradicted"]["record_ids"] == [rec.id]
+    assert f"record {rec.id}" in problems["missing_side_contradicted"]["message"]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_missing_side_with_no_image_at_all_builds(client, vol, side):
+    # Fisqua accepts it (§9.2 names no such case), so the unit does not refuse it.
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, ("left",))
+    vol.supersede(rec)
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    entry = _entry(resp.json(), rec)
+    assert (entry["status"], entry["missingSide"], entry["images"]) == ("missing", side, [])
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("side", ["left", "right"])
+def test_a_single_image_on_a_record_missing_one_side_is_not_refused_for_its_side(client, vol, side):
+    vol.record(status="in_review")
+    rec = _contradicted(vol, side, ("single",))
+    resp = _export(client, vol.col)
+    assert resp.status_code == 200, resp.text
+    assert [i["role"] for i in _entry(resp.json(), rec)["images"]] == ["single"]
+
+
+@pytest.mark.unit
+def test_consistent_missing_records_are_not_refused_for_their_side(client, vol):
+    vol.record(status="in_review")
+    _missing_side(vol, "left")
+    _missing_side(vol, "right", status="in_review", closed="leaf_missing_from_volume")
+    _placeholder(vol)
+    assert _export(client, vol.col).status_code == 200

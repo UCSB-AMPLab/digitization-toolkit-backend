@@ -9,13 +9,14 @@ handed to the transport, with backoff on errors.
 
     python -m pytest tests/unit/test_fisqua_outbox.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
 import uuid
 from datetime import datetime, timedelta, timezone
 
+import httpx
 import pytest
 
 from tests.unit.test_capture_manifest_export import TENANT, Volume, _as, tenant, vol  # noqa: F401
@@ -183,10 +184,15 @@ def test_a_handover_enqueues_a_row_waiting_for_upload(client, db_session, vol, f
 
 
 @pytest.mark.unit
-def test_no_row_without_fisqua_configured(client, db_session, vol):
+def test_a_handover_without_fisqua_configured_queues_a_row_that_waits(client, db_session, vol):
+    # NEH-320: queued whatever the configuration; nothing is sent while unconfigured.
     vol.record(status="captured")
     assert _handover(client, vol.col)["promoted"] == 1
-    assert _rows(db_session, vol.col) == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
+    transport = FakeTransport(sends=[_delivered()])
+    assert _run(db_session, transport)["status"] == "disabled"
+    assert transport.sent == []
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
 
 
 @pytest.mark.unit
@@ -203,7 +209,11 @@ def test_a_half_configured_fisqua_is_not_configured(client, db_session, vol, mon
     monkeypatch.setattr(config.settings, "OFFSITE_TENANT", tenant_value)
     vol.record(status="captured")
     _handover(client, vol.col)
-    assert _rows(db_session, vol.col) == []
+    # NEH-320: the row is queued all the same, and waits.
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
+    transport = FakeTransport(sends=[_delivered()])
+    assert _run(db_session, transport)["status"] == "disabled"
+    assert transport.sent == []
 
 
 @pytest.mark.unit
@@ -366,13 +376,17 @@ def test_a_handover_while_unconfigured_still_supersedes_the_queued_row(client, d
 
     monkeypatch.setattr(config.settings, "FISQUA_ENV", "")
     vol.record(status="captured")
-    _handover(client, vol.col)  # unconfigured: no new row, the queued one is superseded
+    _handover(client, vol.col)  # unconfigured: the queued one is superseded, a new one queued (NEH-320)
+    rows = _rows(db_session, vol.col)
+    assert [r.state for r in rows] == ["withdrawn", "superseded", "waiting_for_upload"]
+    newest = rows[-1].manifest_id
     monkeypatch.setattr(config.settings, "FISQUA_ENV", ENV)
 
+    # Configured again: only the newest handover's manifest is sent.
     transport = FakeTransport(sends=[_delivered()])
     _run(db_session, transport)
-    assert transport.sent == []
-    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn", "superseded"]
+    assert [m["id"] for m in transport.sent] == [newest]
+    assert [r.state for r in _rows(db_session, vol.col)] == ["withdrawn", "superseded", "delivered"]
 
 
 @pytest.mark.unit
@@ -715,7 +729,8 @@ def test_a_malformed_token_leaves_fisqua_unconfigured_and_is_reported(client, db
     assert fisqua_configured() is False
     vol.record(status="captured")
     _handover(client, vol.col)
-    assert _rows(db_session, vol.col) == []
+    # NEH-320: queued all the same; nothing is sent while unconfigured.
+    assert [r.state for r in _rows(db_session, vol.col)] == ["waiting_for_upload"]
     resp = _as(client, "admin").get("/system/catalogue-backup")
     fq = resp.json()["fisqua"]
     assert fq["configured"] is False and fq["token_invalid"] is True
@@ -726,6 +741,21 @@ def test_a_malformed_token_leaves_fisqua_unconfigured_and_is_reported(client, db
 def test_a_well_formed_token_is_not_reported_invalid(client, fisqua):
     fq = _as(client, "admin").get("/system/catalogue-backup").json()["fisqua"]
     assert fq["configured"] is True and fq["token_invalid"] is False
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode,allows", [("offline", False), ("backup", False), ("fisqua", True)])
+def test_the_unit_summary_says_whether_the_mode_allows_the_link(client, db_session, fisqua, mode, allows):
+    """NEH-319: `mode_allows` follows unit_mode.link_on; `configured` stays the configuration's answer."""
+    from app.core.fisqua_outbox import unit_fisqua_summary
+    from app.models.unit_settings import UnitSettings
+    db_session.add(UnitSettings(id=1, mode=mode, projects_enabled=False))
+    db_session.commit()
+
+    assert unit_fisqua_summary(db_session)["mode_allows"] is allows
+    fq = _as(client, "admin").get("/system/catalogue-backup").json()["fisqua"]
+    assert fq["mode_allows"] is allows
+    assert fq["configured"] is True and fq["environment"] == ENV
 
 
 @pytest.mark.unit
@@ -1028,6 +1058,12 @@ def test_the_status_scheduler_polls_on_its_own_interval(fisqua, monkeypatch):
     assert config.settings.FISQUA_POLL_INTERVAL_SECONDS == 600
     seen = []
     monkeypatch.setattr(fisqua_outbox, "poll_fisqua_status", lambda db: seen.append(1) or {"status": "done"})
+    # The queue sync and the users sent at start run in the same thread; no call leaves the test.
+    from app.core import fisqua_queue
+    queued = []
+    monkeypatch.setattr(fisqua_queue, "sync_fisqua_queue", lambda db: queued.append(1) or {"status": "unchanged"})
+    started = []
+    monkeypatch.setattr(fisqua_queue, "send_operators", lambda db: started.append(1) or {"status": "sent"})
     monkeypatch.setattr(config.settings, "OFFSITE_BACKUP_DELAY_SECONDS", 0)
     monkeypatch.setattr(config.settings, "FISQUA_POLL_INTERVAL_SECONDS", 0.05)
     import time
@@ -1036,6 +1072,8 @@ def test_the_status_scheduler_polls_on_its_own_interval(fisqua, monkeypatch):
     time.sleep(0.3)
     scheduler.stop()
     assert len(seen) >= 2
+    assert len(queued) >= 2
+    assert started == [1]
 
 
 @pytest.mark.unit
@@ -1408,3 +1446,159 @@ def test_a_non_version_configuration_error_with_a_waiting_manifest_takes_the_con
     assert transport.sent == []
     # Not a version stop: the manifest is built, and waits for the configuration to change.
     assert _rows(db_session, vol.col)[0].state == "ready"
+
+
+# ---------------------------------------------------------------------------
+# Every transport the backend builds is closed when its call ends
+# ---------------------------------------------------------------------------
+
+class _Boom(BaseException):
+    """Not an Exception, so no handler in the code under test swallows it."""
+
+
+class _Pool:
+    """Hands out stand-in transports and counts how many were opened and closed."""
+
+    def __init__(self):
+        self.opened = []
+
+    def open(self, bypass_mode=False):
+        transport = _Counted(bypass_mode)
+        self.opened.append(transport)
+        return transport
+
+    @property
+    def closed(self):
+        return [t for t in self.opened if t.closes]
+
+
+class _Counted:
+    def __init__(self, bypass_mode):
+        self.bypass_mode = bypass_mode
+        self.closes = 0
+
+    def close(self):
+        self.closes += 1
+
+    def _answer(self, *args, **kwargs):
+        from app.core.fisqua_outbox import TransportResult
+        return TransportResult(outcome="error", error="no answer")
+
+    send_manifest = get_status = get_decisions = put_operators = get_queue = _answer
+    post_queue_ack = get_description = search_descriptions = _answer
+
+
+def _paths():
+    from app.core import fisqua_outbox, fisqua_queue, unit_mode
+    return {
+        "outbox": lambda db: fisqua_outbox.run_fisqua_outbox(db),
+        "status poll": lambda db: fisqua_outbox.poll_fisqua_status(db),
+        "operators": lambda db: fisqua_queue.send_operators(db),
+        "operators with a mode": lambda db: fisqua_queue.send_operators_with_mode(db, "fisqua"),
+        "queue": lambda db: fisqua_queue.sync_fisqua_queue(db),
+        "reference code": lambda db: unit_mode.check_reference_code(db, "xx-test-901"),
+        "description search": lambda db: unit_mode.search_descriptions(db, "tomo"),
+    }
+
+
+@pytest.fixture
+def pool(fisqua, monkeypatch):
+    from app.core import fisqua_outbox, fisqua_queue
+    monkeypatch.setattr(fisqua_queue, "_operators", fisqua_queue._OperatorsState())
+    pool = _Pool()
+    monkeypatch.setattr(fisqua_outbox, "get_transport", lambda bypass_mode=False: pool.open(bypass_mode))
+    return pool
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", list(_paths()))
+def test_a_transport_the_call_builds_is_closed_when_the_call_ends(pool, db_session, path):
+    try:
+        _paths()[path](db_session)
+    except Exception:
+        pass
+    assert len(pool.opened) == 1
+    assert [t.closes for t in pool.opened] == [1]
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("path", list(_paths()))
+def test_a_transport_the_call_builds_is_closed_when_the_call_raises(pool, db_session, monkeypatch, path):
+    from app.core import fisqua_outbox
+
+    class Raising:
+        def cooling(self, *a, **k):
+            raise _Boom()
+
+        take = cooling_for = cool_down = cooling
+
+    def boom(*a, **k):
+        raise _Boom()
+
+    monkeypatch.setattr(fisqua_outbox, "call_budget", Raising())
+    monkeypatch.setattr(fisqua_outbox, "_rebuild_stale_retest", boom)
+    with pytest.raises(_Boom):
+        _paths()[path](db_session)
+    assert len(pool.opened) == 1
+    assert [t.closes for t in pool.opened] == [1]
+
+
+@pytest.mark.unit
+def test_a_transport_the_caller_passes_in_is_left_open(pool, db_session):
+    from app.core import fisqua_queue
+    given = _Counted(False)
+    fisqua_queue.send_operators(db_session, transport=given)
+    fisqua_queue.sync_fisqua_queue(db_session, transport=given)
+    assert pool.opened == []
+    assert given.closes == 0
+
+
+@pytest.mark.unit
+def test_each_call_builds_its_own_transport_from_the_pairing_it_reads_then(fisqua, db_session, monkeypatch):
+    from pydantic import SecretStr
+
+    from app.core import config, fisqua_outbox
+    opened = []
+    real_client = httpx.Client
+
+    class Client(real_client):
+        def __init__(self, *args, **kwargs):
+            kwargs["transport"] = httpx.MockTransport(lambda request: httpx.Response(500))
+            super().__init__(*args, **kwargs)
+            opened.append(self)
+
+    monkeypatch.setattr(httpx, "Client", Client)
+    first = fisqua_outbox.get_transport()
+    first.close()
+    monkeypatch.setattr(config.settings, "FISQUA_TOKEN", SecretStr(OTHER_TOKEN))
+    second = fisqua_outbox.get_transport()
+    second.close()
+    assert len(opened) == 2 and opened[0] is not opened[1]
+    assert opened[0].is_closed and opened[1].is_closed
+    assert second._token == OTHER_TOKEN
+
+
+@pytest.mark.unit
+def test_promotion_waits_while_an_adoption_journal_names_the_volume(client, db_session, vol, fisqua, monkeypatch,
+                                                                    tmp_path):
+    """A handover of a volume an unfinished adoption names stays waiting; once the journal is gone it is sent."""
+    import json
+
+    from app.core import config
+    from app.core.adopt_journal import journal_file
+
+    data = tmp_path / "adopt-data"
+    data.mkdir()
+    monkeypatch.setattr(config.settings, "DATA_DIR", str(data))
+    vol.record(status="captured")
+    _handover(client, vol.col)
+    transport = FakeTransport(sends=[_delivered()])
+    journal_file().write_text(json.dumps({"version": 1, "run_id": "kept", "source_id": -1,
+                                          "target_id": vol.col.id}))
+
+    _run(db_session, transport)
+
+    assert _rows(db_session, vol.col)[0].state == "waiting_for_upload"
+    journal_file().unlink()
+    _run(db_session, transport)
+    assert _rows(db_session, vol.col)[0].state == "delivered"

@@ -210,6 +210,9 @@ def _make_fake_gp(claims, detector, bodies):
         def set_port_info(self, port_info):
             self.port = port_info.path
 
+        def wait_for_event(self, timeout_ms):
+            return 1, None
+
         def init(self):
             self._initialized = True
             claims.claim(self.port)
@@ -254,6 +257,7 @@ def _make_fake_gp(claims, detector, bodies):
             return _PortInfo(path)
 
     return types.SimpleNamespace(
+        GP_EVENT_TIMEOUT=1, GP_EVENT_FILE_ADDED=2,
         GPhoto2Error=GPhoto2Error,
         Camera=Camera,
         CameraAbilitiesList=CameraAbilitiesList,
@@ -519,11 +523,11 @@ def test_a_learned_serial_is_published_only_after_the_claim_is_released(monkeypa
             "the map moved A onto its pinned index before the claim was released"
         )
     finally:
-        # Unbounded join: the prober can only be blocked on the exit gate,
-        # freed by release.set().
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert results["connected"] is True
@@ -689,16 +693,16 @@ def test_a_port_held_by_a_busy_index_is_refused_not_stolen(monkeypatch):
 
         with pytest.raises(RuntimeError) as excinfo:
             backend.capture_preview(0)
-        assert "still held by index 2" in str(excinfo.value), str(excinfo.value)
+        assert "already in use. Wait and try again." in str(excinfo.value), str(excinfo.value)
         assert claims.live_by_port[PORT_C] == 1, (
             "the refused open claimed the body anyway"
         )
     finally:
-        # Unbounded join: rescan's reconcile loop can only be blocked on
-        # lock 2, freed by the release below.
+        # Gates are released before bounded joins verify every worker has stopped.
         lock_2.release()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert session_c.close_calls == 1
@@ -763,10 +767,11 @@ def test_a_port_held_by_a_free_index_is_reclaimed_before_the_open(monkeypatch):
             f"two claims were live on C at once ({claims.max_live_by_port})"
         )
     finally:
-        # Unbounded join: rescan is blocked only on the gate above.
+        # The released gate lets rescan finish before the bounded join.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert [d["index"] for d in rescan_result["devices"]] == [0, 1]
@@ -1050,7 +1055,8 @@ def test_identification_never_opens_a_port_another_index_still_holds(monkeypatch
     finally:
         lock_1.release()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert results["connected"] is True
@@ -1084,7 +1090,7 @@ def _refused_at_zero(backend, claims):
     """capture_preview(0) must refuse, and must not claim C a second time."""
     with pytest.raises(RuntimeError) as excinfo:
         backend.capture_preview(0)
-    assert "still held by index 2" in str(excinfo.value), str(excinfo.value)
+    assert "already in use. Wait and try again." in str(excinfo.value), str(excinfo.value)
     assert claims.init_by_port[PORT_C] == 1, (
         "the open went ahead against a claim that is not in self._sessions"
     )
@@ -1133,10 +1139,11 @@ def test_a_session_still_being_opened_holds_its_port(monkeypatch):
         _repacked_to_zero(backend)
         _refused_at_zero(backend, claims)
     finally:
-        # Unbounded join: the opener can only be blocked on the gate above.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     # The body it opened belongs to index 0 by the time it comes back, so the
     # open is refused on identity - and that path has to give the claim back,
@@ -1185,10 +1192,11 @@ def test_a_session_still_closing_holds_its_port(monkeypatch):
 
         _refused_at_zero(backend, claims)
     finally:
-        # Unbounded join: the closer can only be blocked on the exit gate.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert backend.capture_preview(0) == b"jpeg-preview-bytes"
@@ -1229,10 +1237,11 @@ def test_a_brief_read_in_flight_holds_its_port(monkeypatch):
         _repacked_to_zero(backend)
         _refused_at_zero(backend, claims)
     finally:
-        # Unbounded join: the enumerator can only be blocked on the exit gate.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert backend.capture_preview(0) == b"jpeg-preview-bytes"
@@ -1355,11 +1364,11 @@ def test_two_saves_leave_the_newest_pins_on_disk(monkeypatch, bindings_dir):
         second.start()
         started.append(second)
     finally:
-        # Unbounded joins: the first save is blocked on the gate, the second
-        # on the save lock the first holds.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert _read_bindings(bindings_dir)["pins"] == {"0": SERIAL_A, "1": SERIAL_B}, (

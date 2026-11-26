@@ -24,7 +24,7 @@ Run with, for example:
   DATABASE_HOST=localhost DATABASE_PORT=5432 DATABASE_USER=... DATABASE_PASSWORD=... \
   DATABASE_NAME=... python -m pytest tests/integration/test_pg_lock_order.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import io
 import os
@@ -53,10 +53,7 @@ def pg(monkeypatch, tmp_path):
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.orm import sessionmaker
 
-    from app.core.db import Base, DATABASE_URL
-    from app.models import (  # noqa: F401
-        user, project, project_member, collection, record, camera, system_log,
-    )
+    from app.core.db import Base, DATABASE_URL, init_db
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record
@@ -75,6 +72,9 @@ def pg(monkeypatch, tmp_path):
     engine = create_engine(DATABASE_URL, connect_args={"options": f"-csearch_path={schema}"})
     Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     try:
+        # init_db imports every model module, so create_all makes every table,
+        # including those the flush hooks read (offsite_objects for a stem).
+        init_db()
         Base.metadata.create_all(engine)
         with Session() as db:
             p = Project(name="P")

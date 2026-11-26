@@ -20,7 +20,7 @@ fakes here model the two windows that make this delicate:
 Both are counted in PTP claims: at no point may two claims on one body be live
 at once.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import logging
@@ -174,6 +174,9 @@ def _make_fake_gp(claims, detector):
         def set_port_info(self, port_info):
             self.port = port_info.path
 
+        def wait_for_event(self, timeout_ms):
+            return 1, None
+
         def init(self):
             self._initialized = True
             claims.claim()
@@ -210,6 +213,7 @@ def _make_fake_gp(claims, detector):
             return _PortInfo(path)
 
     return types.SimpleNamespace(
+        GP_EVENT_TIMEOUT=1, GP_EVENT_FILE_ADDED=2,
         GPhoto2Error=GPhoto2Error,
         Camera=Camera,
         CameraAbilitiesList=CameraAbilitiesList,
@@ -230,6 +234,7 @@ def _make_session_cls(fake_gp, gate=None, entered=None):
 
         def __init__(self, port, model, logger):
             self.port = port
+            self.serial = SERIAL_BY_PORT.get(port, "")
             self.model = model
             self._logger = logger
             self._cam = None
@@ -393,15 +398,11 @@ def test_rescan_publishes_the_map_before_it_waits_on_a_paused_open(monkeypatch):
             "have reconciled the session that was still opening"
         )
     finally:
-        # Unbounded joins: the opener can only be blocked on the session-
-        # constructor gate (freed by release.set()), and the rescanner can
-        # only be blocked on lock 0 (freed once the opener leaves), so both
-        # terminate before the monkeypatch teardown runs. A bounded join
-        # would only attempt cleanup; a worker still running past it could
-        # then execute against a torn-down module state.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert not opener.is_alive() and not rescanner.is_alive()
@@ -476,13 +477,11 @@ def test_overlapping_rescans_serialise_and_publish_in_order(monkeypatch):
             f"(autodetect calls: {detector.calls})"
         )
     finally:
-        # Unbounded joins: each rescan can only be blocked inside autodetect
-        # (freed by gate.set()) or waiting on the rescan lock (freed once the
-        # first rescan finishes), so both terminate before the monkeypatch
-        # teardown runs.
+        # Gates are released before bounded joins verify every worker has stopped.
         gate.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert detector.calls == 3
@@ -502,7 +501,31 @@ def test_overlapping_rescans_serialise_and_publish_in_order(monkeypatch):
 # (e) the _get_or_open_session fast path
 # ----------------------------------------------------------------------
 
-def test_open_session_fast_path_validates_the_cached_session_against_the_map(monkeypatch):
+def test_unidentified_session_reopens_positionally_after_reenumeration(monkeypatch):
+    """Without a serial or a pin, the published slot remains positional."""
+    claims = _Claims()
+    detector = _Detector([(MODEL, PORT_0)])
+    fake_gp = _make_fake_gp(claims, detector)
+    session_cls = _make_session_cls(fake_gp)
+
+    class UnidentifiedSession(session_cls):
+        def __init__(self, *args, **kwargs):
+            super().__init__(*args, **kwargs)
+            self.serial = ""
+
+    backend = _make_backend(monkeypatch, fake_gp, UnidentifiedSession)
+    first = backend._get_or_open_session(0)
+    assert not backend._pins
+    detector.results = [(MODEL, PORT_0_NEW)]
+    backend._refresh_port_map()
+    second = backend._get_or_open_session(0)
+    assert second is not first and second.port == PORT_0_NEW
+    assert first.close_calls == 1 and claims.init_calls == 2
+    assert not backend._pins and claims.live == 1
+    backend._close_session(0)
+
+
+def test_pinned_session_fast_path_identifies_a_new_address_before_reopening(monkeypatch):
     claims = _Claims()
     detector = _Detector([(MODEL, PORT_0)])
     fake_gp = _make_fake_gp(claims, detector)
@@ -519,6 +542,11 @@ def test_open_session_fast_path_validates_the_cached_session_against_the_map(mon
     # The body re-enumerates; the map is refreshed without a rescan.
     detector.results = [(MODEL, PORT_0_NEW)]
     backend._refresh_port_map()
+    # The serial pins this body; an unidentified address cannot occupy its slot.
+    with pytest.raises(gb.CameraNotConnectedError):
+        backend._get_or_open_session(0)
+    backend._identify_unknown_ports()
+    backend._republish_port_map()
 
     reopened = backend._get_or_open_session(0)
 
@@ -526,7 +554,7 @@ def test_open_session_fast_path_validates_the_cached_session_against_the_map(mon
     assert s0.close_calls == 1, "the stale session was reused instead of closed"
     assert reopened.port == PORT_0_NEW
     assert backend._sessions[0] is reopened
-    assert claims.init_calls == 2
+    assert claims.init_calls == 3
     assert claims.live == 1
 
 
@@ -592,11 +620,11 @@ def test_list_devices_paused_across_a_rescan_does_not_close_the_fresh_session(mo
         fresh["session"] = backend._get_or_open_session(0)
         assert fresh["session"].port == PORT_0_NEW
     finally:
-        # Unbounded join: the enumerator can only be blocked on the lock-0
-        # gate, freed by release.set(); nothing else holds it up.
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert not enumerator.is_alive()
@@ -649,7 +677,7 @@ def test_rescan_reconcile_honours_a_refresh_that_lands_before_it_runs(monkeypatc
         # Only rescan's own reconcile-loop entry to lock 0 pauses - the
         # nested list_devices() call rescan makes for its return value comes
         # after and passes straight through.
-        if not paused["done"]:
+        if idx == 0 and not paused["done"]:
             paused["done"] = True
             entered.set()
             if not release.wait(timeout=30):
@@ -686,16 +714,18 @@ def test_rescan_reconcile_honours_a_refresh_that_lands_before_it_runs(monkeypatc
         # the body is actually still on its original port and republishes
         # that - the newest map disagrees with rescan's own stale snapshot.
         detector.results = [(MODEL, PORT_0)]
+        # The live session identifies the returning address before publication.
+        backend._learn_serial(0, PORT_0, s0.serial)
         backend._refresh_port_map()
         assert backend._port_map == {0: (MODEL, PORT_0)}, (
             "the concurrent refresh did not take effect"
         )
     finally:
-        # Unbounded join: rescan's reconcile loop can only be blocked on
-        # lock 0, freed by release.set().
+        # Gates are released before bounded joins verify every worker has stopped.
         release.set()
         for thread in started:
-            thread.join()
+            thread.join(timeout=5)
+            assert not thread.is_alive(), thread.name
 
     assert not errors, errors
     assert not rescanner.is_alive()
@@ -711,3 +741,67 @@ def test_rescan_reconcile_honours_a_refresh_that_lands_before_it_runs(monkeypatc
     assert [d["port"] for d in devices] == [PORT_0], (
         "the returned enumeration does not reflect the newest published map"
     )
+
+
+# ----------------------------------------------------------------------
+# (h) the port map logs only when it changes
+# ----------------------------------------------------------------------
+
+def _info_lines(caplog, fragment):
+    return [
+        r.getMessage()
+        for r in caplog.records
+        if r.levelno == logging.INFO and fragment in r.getMessage()
+    ]
+
+
+def test_unchanged_port_map_logs_detected_cameras_once(monkeypatch, caplog):
+    backend, _claims, _detector, _cls = _two_body_backend(monkeypatch)
+
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 0: {MODEL} on {PORT_0}",
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1}",
+    ]
+
+
+def test_camera_moving_to_another_port_logs_its_new_line_once(monkeypatch, caplog):
+    backend, _claims, detector, _cls = _two_body_backend(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        caplog.clear()
+        detector.results = [(MODEL, PORT_0), (MODEL, PORT_1_NEW)]
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1_NEW}",
+    ]
+    assert _info_lines(caplog, "no longer detected") == []
+
+
+def test_camera_disappearing_logs_one_line_and_reappearing_logs_detected(
+    monkeypatch, caplog
+):
+    backend, _claims, detector, _cls = _two_body_backend(monkeypatch)
+    with caplog.at_level(logging.INFO, logger="test-gphoto2-rescan"):
+        backend._refresh_port_map()
+        caplog.clear()
+        detector.results = [(MODEL, PORT_0)]
+        backend._refresh_port_map()
+        backend._refresh_port_map()
+
+        assert _info_lines(caplog, "no longer detected") == [
+            f"[gphoto2] Camera 1: {MODEL} on {PORT_1} is no longer detected",
+        ]
+        assert _info_lines(caplog, "Detected camera") == []
+
+        detector.results = [(MODEL, PORT_0), (MODEL, PORT_1)]
+        backend._refresh_port_map()
+
+    assert _info_lines(caplog, "Detected camera") == [
+        f"[gphoto2] Detected camera 1: {MODEL} on {PORT_1}",
+    ]

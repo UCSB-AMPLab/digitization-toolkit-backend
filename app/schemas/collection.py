@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.3
 
 from typing import Optional, Dict, Any, List
 from pydantic import BaseModel, Field, field_validator, model_validator
@@ -75,6 +75,11 @@ class CollectionCreate(VolumeIdentityFields, CollectionBase):
     project_id: Optional[int] = Field(None, description="Parent project (for top-level collections)")
     parent_collection_id: Optional[int] = Field(None, description="Parent collection (for nested subcollections)")
     created_by: Optional[str] = None
+    # Keep the new volume on the unit (NEH-320): Captua copies none of its
+    # images offsite and sends none of its manifests to Fisqua until an
+    # admin releases it. Only an admin may set it; in offline mode every new
+    # volume is kept whatever is sent.
+    kept_on_unit: Optional[bool] = None
 
     class Config:
         json_schema_extra = {
@@ -87,6 +92,21 @@ class CollectionCreate(VolumeIdentityFields, CollectionBase):
                 "archival_metadata": {"box_number": "42", "shelf_location": "A-3-2"}
             }
         }
+
+
+class CollectionCreateRequest(CollectionCreate):
+    """The body POST /collections/ reads: CollectionCreate with `filename_stem` optional.
+
+    The testing account sends no stem: every testing volume is given one by
+    the backend (app.core.testing_space.series_stem). Every other caller's
+    body is validated again as CollectionCreate by the route, so a body
+    without a stem is still a 422 for it, with the errors pydantic gives.
+    """
+    filename_stem: Optional[str] = Field(
+        None, max_length=FILENAME_STEM_MAX_LENGTH, pattern=FILENAME_STEM_PATTERN,
+        description=("Lowercase slug the volume's image file names are built from, e.g. co-ahrb-aht-003; "
+                     "required for every caller but the testing account, which sends none"),
+    )
 
 
 class CollectionUpdate(VolumeIdentityFields):
@@ -112,11 +132,33 @@ class CollectionRead(CollectionBase):
     # Whether the volume keeps its row to keep its stem: it has a stem and
     # has captured, so DELETE refuses it even once its records are moved
     # out. Lets the interface warn before "move the records, then delete".
-    # Read-only. Costs an image query, and an offsite-object query when that
-    # finds no image, per volume that has a stem and a counter of 0.
+    # Read-only. Costs an image query, then a colour card shot query and an
+    # offsite-object query when those find nothing, per volume that has a
+    # stem and a counter of 0.
     stem_reserved: bool = False
     project_id: Optional[int] = None
     parent_collection_id: Optional[int] = None
+    # Set only by the queue sync with Fisqua (app.core.fisqua_queue), and
+    # read-only here: the unit username the volume's queue entry is
+    # assigned to, and when a withdrawn entry hid it from Cola.
+    assignee_username: Optional[str] = None
+    queue_hidden_at: Optional[datetime] = None
+    # Read-only here (NEH-320): whether Captua keeps the volume on the unit.
+    # Set at creation, by POST /collections/{id}/keep-on-unit, and cleared by
+    # POST /collections/{id}/release-from-unit or a switch out of offline mode.
+    kept_on_unit: bool = False
+    # Read-only: when an adoption moved the volume's captures into another
+    # volume, which closes it (Collection.captures_adopted_at); null otherwise.
+    captures_adopted_at: Optional[datetime] = None
+    # Whether an unfinished adoption's journal names the volume
+    # (app.core.adopt_journal.journal_names_volume), which refuses most
+    # changes to it. False unless the endpoint populates it (list and detail).
+    adoption_unfinished: bool = False
+    # Read-only (app.core.testing_space): whether the volume is testing work,
+    # and when it is due to be removed (its last capture plus the term, naive
+    # UTC); null for every real volume.
+    testing: bool = False
+    testing_expires_at: Optional[datetime] = None
     created_by: Optional[str] = None
     created_at: datetime
     updated_at: Optional[datetime] = None
@@ -128,6 +170,17 @@ class CollectionRead(CollectionBase):
     # row itself is edited (renamed, re-described). Null when it has no records.
     # None unless the endpoint explicitly populates it (list).
     last_activity_at: Optional[datetime] = None
+    # The volume's colour card shots (app.core.colour_card.summaries):
+    # {"enabled": false} while the unit does not ask for them or the volume
+    # is testing work, else {"enabled": true, "status": "present" | "skipped"
+    # | "none", "sets": <taken sets>}. None unless the endpoint populates it
+    # (list and detail). Read from the database alone, in a fixed number of
+    # queries for the whole list: the status counts sets taken and skipped
+    # and pages before the first set, and looks at no file, so it can read
+    # `present` for a volume whose shot file has since gone missing.
+    # GET /collections/{id}/colour-card (each set's `delivery`) and the
+    # integrity check report that.
+    colour_card: Optional[Dict[str, Any]] = None
 
     class Config:
         from_attributes = True
@@ -139,3 +192,111 @@ class CollectionWithChildren(CollectionRead):
 
     class Config:
         from_attributes = True
+
+
+class AdoptRenameRead(BaseModel):
+    """One source image's names before and after an adoption (app.core.adopt_captures.ImageRename)."""
+    image_id: int
+    record_id: int
+    is_current: bool
+    number: int
+    old_name: str
+    new_name: str
+    old_path: str
+    new_path: str
+    old_preview_path: Optional[str] = None
+    new_preview_path: Optional[str] = None
+    old_raw_buffer_path: Optional[str] = None
+    new_raw_buffer_path: Optional[str] = None
+    old_thumbnail_path: Optional[str] = None
+    new_thumbnail_path: Optional[str] = None
+    old_pair_id: Optional[str] = None
+    new_pair_id: Optional[str] = None
+    capture_id: Optional[str] = None
+    old_keys: Dict[str, str] = {}
+    new_keys: Dict[str, str] = {}
+
+
+class AdoptShotRenameRead(BaseModel):
+    """One source colour card shot's names before and after an adoption (app.core.adopt_captures.ShotRename)."""
+    shot_id: int
+    set_id: int
+    camera_index: int
+    old_name: str
+    new_name: str
+    old_path: str
+    new_path: str
+    old_preview_path: Optional[str] = None
+    new_preview_path: Optional[str] = None
+    old_raw_buffer_path: Optional[str] = None
+    new_raw_buffer_path: Optional[str] = None
+    old_keys: Dict[str, str] = {}
+    new_keys: Dict[str, str] = {}
+
+
+class AdoptPlanRead(BaseModel):
+    """The dry run of an adoption: the plan, with the first `limit` renames."""
+    source_id: int
+    target_id: int
+    may_adopt: bool
+    refusals: List[str]
+    details: Dict[str, Any]
+    source_stem: Optional[str] = None
+    target_stem: Optional[str] = None
+    source_project_id: Optional[int] = None
+    target_project_id: Optional[int] = None
+    project_changes: bool
+    records: int
+    images_current: int
+    images_superseded: int
+    bytes: Dict[str, int]
+    counter_before: int
+    counter_after: int
+    renames_count: int
+    renames_truncated: bool
+    renames: List[AdoptRenameRead]
+    uncovered: List[Dict[str, str]]
+    thumbnails_missing: List[Dict[str, Any]]
+    capture_lines: int
+    unaccounted_capture_lines: List[str]
+    colour_card_set_ids: List[int] = []
+    shot_renames: List[AdoptShotRenameRead] = []
+    shot_bytes: int = 0
+
+
+class AdoptRequest(BaseModel):
+    """The optional body of POST /collections/{source}/adopt-into/{target}.
+
+    `client_request_id`: the client's id for this adoption, a UUID in its
+    canonical form, in either case, stored lowercase
+    (app.core.adoption_requests). A request repeating it is answered from
+    the recorded outcome and never starts a second adoption. None, or no
+    body, adopts as always.
+    """
+    model_config = {"extra": "forbid"}
+
+    client_request_id: Optional[str] = None
+
+    @field_validator("client_request_id")
+    @classmethod
+    def _check_client_request_id(cls, v: Optional[str]) -> Optional[str]:
+        from app.core.adoption_requests import validate
+
+        return validate(v)
+
+
+class AdoptResultRead(BaseModel):
+    """What an adoption did (app.core.adopt_apply.adopt_captures)."""
+    source_id: int
+    target_id: int
+    records: int
+    images: int
+    files_renamed: int
+    rows_retired: int
+    counter_after: int
+    colour_card_sets: int = 0
+    colour_card_shots: int = 0
+    source_lines_appended: int
+    target_lines_appended: bool
+    target_lines_pending: bool
+    recovery_pending: bool

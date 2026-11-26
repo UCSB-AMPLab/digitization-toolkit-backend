@@ -1,0 +1,64 @@
+Nov 11 09:44:27.997628 captua NetworkManager[854]: <info>  [1794419067.9975] audit: op="connection-add" uuid="4ca2b089-87ae-422a-86f8-27ec0dbb2ec2" name="captua-t6" pid=3110900 uid=1000 result="success"
+Nov 11 09:44:28.149738 captua NetworkManager[854]: <info>  [1794419068.1497] agent-manager: agent[a68875d2455a5fcb,:1.918/nmcli-connect/1000]: agent registered
+Nov 11 09:44:28.152251 captua NetworkManager[854]: <info>  [1794419068.1522] device (wlan2): Activation: starting connection 'captua-t6' (4ca2b089-87ae-422a-86f8-27ec0dbb2ec2)
+Nov 11 09:44:28.152329 captua NetworkManager[854]: <info>  [1794419068.1523] audit: op="connection-activate" uuid="4ca2b089-87ae-422a-86f8-27ec0dbb2ec2" name="captua-t6" pid=3110918 uid=1000 result="success"
+Nov 11 09:44:28.152413 captua NetworkManager[854]: <info>  [1794419068.1524] device (wlan2): state change: disconnected -> prepare (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:28.152651 captua NetworkManager[854]: <info>  [1794419068.1526] manager: NetworkManager state is now CONNECTING
+Nov 11 09:44:28.152862 captua NetworkManager[854]: <info>  [1794419068.1528] device (wlan2): state change: prepare -> config (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:28.153117 captua NetworkManager[854]: <info>  [1794419068.1531] device (wlan2): Activation: (wifi) access point 'captua-t6' has security, but secrets are required.
+Nov 11 09:44:28.153129 captua NetworkManager[854]: <info>  [1794419068.1531] device (wlan2): state change: config -> need-auth (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:28.154160 captua NetworkManager[854]: <info>  [1794419068.1541] device (wlan2): state change: need-auth -> prepare (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:28.154374 captua NetworkManager[854]: <info>  [1794419068.1543] device (wlan2): state change: prepare -> config (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:28.154626 captua NetworkManager[854]: <info>  [1794419068.1546] device (wlan2): Activation: (wifi) connection 'captua-t6' has security, and secrets exist.  No new secrets needed.
+Nov 11 09:44:28.154641 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'ssid' value 'captua-eap-test'
+Nov 11 09:44:28.154651 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'scan_ssid' value '1'
+Nov 11 09:44:28.154659 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'bgscan' value 'simple:30:-65:300'
+Nov 11 09:44:28.154673 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'key_mgmt' value 'WPA-EAP FT-EAP FT-EAP-SHA384 WPA-EAP-SHA256'
+Nov 11 09:44:28.154687 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'password' value '<hidden>'
+Nov 11 09:44:28.154697 captua NetworkManager[854]: <info>  [1794419068.1546] Config: added 'eap' value 'PEAP'
+Nov 11 09:44:28.154704 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'fragment_size' value '1266'
+Nov 11 09:44:28.154714 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'phase2' value 'auth=MSCHAPV2'
+Nov 11 09:44:28.154723 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'ca_cert' value '/tmp/captua-eap-test/other-ca.pem'
+Nov 11 09:44:28.154738 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'domain_suffix_match' value 'test.example.edu'
+Nov 11 09:44:28.154747 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'identity' value 'tester@example.edu'
+Nov 11 09:44:28.154753 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'anonymous_identity' value 'anonymous@example.edu'
+Nov 11 09:44:28.154760 captua NetworkManager[854]: <info>  [1794419068.1547] Config: added 'proactive_key_caching' value '1'
+Nov 11 09:44:36.550183 captua NetworkManager[854]: <info>  [1794419076.5501] device (wlan2): supplicant interface state: scanning -> disconnected
+Nov 11 09:44:36.550206 captua NetworkManager[854]: <info>  [1794419076.5501] device (p2p-dev-wlan2): supplicant management interface state: scanning -> disconnected
+Nov 11 09:44:37.171836 captua NetworkManager[854]: <info>  [1794419077.1718] device (wlan2): supplicant interface state: disconnected -> scanning
+Nov 11 09:44:37.171856 captua NetworkManager[854]: <info>  [1794419077.1718] device (p2p-dev-wlan2): supplicant management interface state: disconnected -> scanning
+Nov 11 09:44:47.188925 captua wpa_supplicant[855]: wlan2: SME: Trying to authenticate with 02:00:00:00:00:00 (SSID='captua-eap-test' freq=2437 MHz)
+Nov 11 09:44:47.189368 captua wpa_supplicant[855]: wlan2: Trying to associate with 02:00:00:00:00:00 (SSID='captua-eap-test' freq=2437 MHz)
+Nov 11 09:44:47.189746 captua NetworkManager[854]: <info>  [1794419087.1897] device (wlan2): supplicant interface state: scanning -> associating
+Nov 11 09:44:47.189758 captua NetworkManager[854]: <info>  [1794419087.1897] device (p2p-dev-wlan2): supplicant management interface state: scanning -> associating
+Nov 11 09:44:47.193843 captua wpa_supplicant[855]: wlan2: Associated with 02:00:00:00:00:00
+Nov 11 09:44:47.193888 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-STARTED EAP authentication started
+Nov 11 09:44:47.193970 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-SUBNET-STATUS-UPDATE status=0
+Nov 11 09:44:47.194271 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-PROPOSED-METHOD vendor=0 method=25
+Nov 11 09:44:47.194976 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-METHOD EAP vendor 0 method 25 (PEAP) selected
+Nov 11 09:44:47.199610 captua NetworkManager[854]: <info>  [1794419087.1995] device (wlan2): supplicant interface state: associating -> associated
+Nov 11 09:44:47.199624 captua NetworkManager[854]: <info>  [1794419087.1996] device (p2p-dev-wlan2): supplicant management interface state: associating -> associated
+Nov 11 09:44:47.200607 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-PEER-CERT depth=1 subject='/CN=Captua EAP Test CA' hash=81f3a91e00c6caf7da9187ca7cf92ab34aeed07c91516cbc96c12ddbbb353b1f
+Nov 11 09:44:47.200848 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-PEER-CERT depth=0 subject='/CN=radius.test.example.edu' hash=3b4f37b7f2a7c3a819433c66a84b354b0d3b6a592a3115e2427e75a5d0d4890e
+Nov 11 09:44:47.201017 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-PEER-ALT depth=0 DNS:radius.test.example.edu
+Nov 11 09:44:47.201126 captua wpa_supplicant[855]: TLS: Certificate verification failed, error 19 (self-signed certificate in certificate chain) depth 1 for '/CN=Captua EAP Test CA'
+Nov 11 09:44:47.201184 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-TLS-CERT-ERROR reason=1 depth=1 subject='/CN=Captua EAP Test CA' err='self-signed certificate in certificate chain'
+Nov 11 09:44:47.201266 captua wpa_supplicant[855]: SSL: SSL3 alert: write (local SSL3 detected an error):fatal:unknown CA
+Nov 11 09:44:47.201345 captua wpa_supplicant[855]: OpenSSL: openssl_handshake - SSL_connect error:0A000086:SSL routines::certificate verify failed
+Nov 11 09:44:47.201622 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-EAP-FAILURE EAP authentication failed
+Nov 11 09:44:47.252644 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-DISCONNECTED bssid=02:00:00:00:00:00 reason=23
+Nov 11 09:44:47.252652 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="captua-eap-test" auth_failures=1 duration=10 reason=AUTH_FAILED
+Nov 11 09:44:47.252667 captua wpa_supplicant[855]: wlan2: CTRL-EVENT-SSID-TEMP-DISABLED id=0 ssid="captua-eap-test" auth_failures=2 duration=32 reason=CONN_FAILED
+Nov 11 09:44:47.258217 captua NetworkManager[854]: <info>  [1794419087.2581] device (wlan2): supplicant interface state: associated -> disconnected
+Nov 11 09:44:47.258241 captua NetworkManager[854]: <info>  [1794419087.2582] device (p2p-dev-wlan2): supplicant management interface state: associated -> disconnected
+Nov 11 09:44:47.358079 captua NetworkManager[854]: <info>  [1794419087.3580] device (wlan2): supplicant interface state: disconnected -> scanning
+Nov 11 09:44:47.358091 captua NetworkManager[854]: <info>  [1794419087.3580] device (p2p-dev-wlan2): supplicant management interface state: disconnected -> scanning
+Nov 11 09:44:53.505978 captua NetworkManager[854]: <warn>  [1794419093.5059] device (wlan2): Activation: (wifi) association took too long
+Nov 11 09:44:53.505998 captua NetworkManager[854]: <info>  [1794419093.5059] device (wlan2): state change: config -> need-auth (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:53.506431 captua NetworkManager[854]: <warn>  [1794419093.5064] device (wlan2): Activation: (wifi) asking for new secrets
+Nov 11 09:44:53.511218 captua NetworkManager[854]: <warn>  [1794419093.5111] device (wlan2): no secrets: No agents were available for this request.
+Nov 11 09:44:53.511235 captua NetworkManager[854]: <info>  [1794419093.5112] device (wlan2): state change: need-auth -> failed (reason 'no-secrets', sys-iface-state: 'managed')
+Nov 11 09:44:53.511511 captua NetworkManager[854]: <info>  [1794419093.5115] manager: NetworkManager state is now CONNECTED_SITE
+Nov 11 09:44:53.511730 captua NetworkManager[854]: <warn>  [1794419093.5117] device (wlan2): Activation: failed for connection 'captua-t6'
+Nov 11 09:44:53.512010 captua NetworkManager[854]: <info>  [1794419093.5119] device (wlan2): state change: failed -> disconnected (reason 'none', sys-iface-state: 'managed')
+Nov 11 09:44:53.512157 captua wpa_supplicant[855]: wlan2: Reject scan trigger since one is already pending

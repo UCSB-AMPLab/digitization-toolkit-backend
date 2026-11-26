@@ -7,9 +7,14 @@ nowhere else.
 The unit's token is 64 lowercase hex characters (TOKEN_PATTERN); beyond
 that shape it is opaque to the unit, sent as it is and never parsed.
 
-Contract 1.2 is approved (archiving 5e480b7, §9).
+Contract 1.2 is approved (archiving 5e480b7, §9). The QC decisions include
+1.6's exclusion and 1.9's missing page and requests. The digitisation queue
+(contract 1.7) follows: the unit's users, the queue and its
+acknowledgement, the operators PUT carrying the unit's mode. The reference
+code lookup (contract 1.8) and the description search (contract 1.10)
+are at the end.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import re
@@ -63,6 +68,13 @@ RULE_RUN_STARTED = "run-started"  # 409: a newer manifest for a volume a run has
 # manifest's objectKey or previewObjectKey, captureId, role, and kind
 # ("capture" or "preview").
 RULE_OBJECT_MISSING = "object-missing"
+# Contract 1.9 (§9.2): 422, two records share a `sequence`; 422, a missing
+# record's images contradict its missingSide. The unit acts on neither by
+# name: each is a plain refusal of that manifest, with its problems kept,
+# and the unit's own checks (capture_manifest: sequence_repeated,
+# missing_side_contradicted) catch both before a manifest is sent.
+RULE_SEQUENCE = "sequence"
+RULE_MISSING_SIDE = "missing-side"
 F_OBJECT_KEY = "objectKey"
 F_KIND = "kind"
 # Not Fisqua's: the problems the unit records for a 413 or a 400 with no problems in it.
@@ -140,10 +152,186 @@ F_QUARTER_TURNS = "quarterTurns"
 
 DECISION_APPROVED = "approved"
 DECISION_REJECTED = "rejected"
+# Contract 1.6: an opening that is not a page of the volume (a test shot of
+# the rig, a duplicate). It carries no reason, no side and no rotations, and
+# asks for no retake; a later approved or rejected decision restores it.
+DECISION_EXCLUDED = "excluded"
 ROTATION_ROLES = ("single", "left", "right")
 QUARTER_TURNS = (1, 2, 3)
+
+# Contract 1.9 §10.4: the opening lacks a page. Carries `side` (F_SIDE),
+# "left" or "right", which the unit marks missing on the record
+# (app.api.records.mark_missing_page).
+DECISION_MISSING_PAGE = "missing_page"
+MISSING_PAGE_SIDES = ("left", "right")
+
+# Contract 1.9 §10.4: the decisions answer's `requests`, openings Fisqua asks
+# the unit to add as placeholders after a record.
+F_REQUESTS = "requests"
+F_REQUEST_ID = "requestId"
+F_REQUEST_KIND = "kind"
+F_AFTER_RECORD_ID = "afterRecordId"
+F_COUNT = "count"
+F_EXPECTED = "expected"
+F_REQUESTED_BY = "requestedBy"
+F_REQUESTED_AT = "requestedAt"
+REQUEST_MISSING_OPENING = "missing_opening"
 
 # The rejection reasons are Captua's own list,
 # app.schemas.record.PREDEFINED_REJECTION_REASONS, the nine of §8; a
 # decision is checked with RecordRejectRequest, as POST /records/{id}/reject
 # checks a reviewer's (app.core.fisqua_decisions).
+
+
+# ---------------------------------------------------------------------------
+# The digitisation queue (contract 1.7)
+# ---------------------------------------------------------------------------
+
+# PUT, the unit's whole list of users who capture: {"operators": [...]}.
+OPERATORS_PATH = "/api/capture/v1/operators"
+F_OPERATORS = "operators"
+F_USERNAME = "username"
+F_DISPLAY_NAME = "displayName"
+F_OPERATOR_ROLE = "role"
+F_ACTIVE = "active"
+# Fisqua takes at most this many in one PUT.
+MAX_OPERATORS = 1000
+# Rules of a 422 to the PUT (each problem also has message and path).
+OPERATOR_RULES = ("malformed", "shape", "duplicate-username")
+# The unit roles sent; reviewers cannot capture and are left out.
+OPERATOR_ROLES = ("admin", "operator")
+
+# GET, with If-None-Match: "<revision>"; 304 when nothing changed.
+QUEUE_PATH = "/api/capture/v1/queue"
+IF_NONE_MATCH_HEADER = "If-None-Match"
+ETAG_HEADER = "ETag"
+F_REVISION = "revision"
+F_LIST_NAME = "listName"
+F_ITEMS = "items"
+F_ITEM_ID = "itemId"
+F_ASSIGNEE = "assignee"
+F_WITHDRAWN = "withdrawn"
+# On a spot-recapture entry only: [{"captuaRecordId", "pairId", "side"}], side left, right or both.
+F_RETAKES = "retakes"
+F_PAIR_ID = "pairId"
+F_SIDE = "side"
+
+# POST {"revision", "applied": [{"itemId", "collectionId"}], "skipped": [{"itemId", "reason"}]}.
+QUEUE_ACK_PATH = "/api/capture/v1/queue/ack"
+F_APPLIED = "applied"
+F_SKIPPED = "skipped"
+F_COLLECTION_ID = "collectionId"
+# A 2xx to the ack: {"recorded": n, "unknown": [itemId]}; unknown ids are not sent again.
+F_RECORDED = "recorded"
+F_UNKNOWN = "unknown"
+# A 422 to the ack with this rule: the revision is malformed or later than
+# Fisqua's. The owed ack is dropped and the queue asked for afresh.
+RULE_REVISION = "revision"
+# The unit's mode (NEH-311), in the operators PUT beside `operators`:
+# `offline`, `backup` or `fisqua` (app.core.unit_mode.MODES). Fisqua shows
+# it on its Scanner screen, and warns on its queue screen when it is not
+# `fisqua`.
+F_MODE = "mode"
+
+
+# ---------------------------------------------------------------------------
+# The reference code lookup (contract 1.8)
+# ---------------------------------------------------------------------------
+
+# GET, with the reference code encoded as one path segment, as
+# encodeURIComponent encodes it (fisqua_http.encode_segment). 200
+# {referenceCode, title, level, dates: {display, start, end}} for any
+# description with that code in the workspace, published or not; 404 with
+# this rule when the workspace holds no such code. A bare 404 (an unknown
+# host, or digitisation turned off) or a 405 means this Fisqua has no 1.8.
+# 401, 403 and 429 as on the other link routes, sharing their rate limit.
+DESCRIPTIONS_PATH = "/api/capture/v1/descriptions/{ref}"
+RULE_UNKNOWN_REFERENCE_CODE = "unknown-reference-code"
+F_REFERENCE_CODE = "referenceCode"
+F_TITLE = "title"
+F_LEVEL = "level"
+F_DATES = "dates"
+
+
+# ---------------------------------------------------------------------------
+# The description search (contract 1.10)
+# ---------------------------------------------------------------------------
+
+# GET with the query in SEARCH_QUERY_PARAM, beside the 1.8 lookup's path.
+# 200 {results: [...]}: at most SEARCH_MAX_RESULTS entries, each in the
+# 1.8 answer's shape (referenceCode, title, level, dates). 400 with this
+# rule at the top level for a q under SEARCH_MIN_CHARS characters after
+# trimming. A bare 404, or a 405, means this Fisqua has no 1.10. 401, 403
+# and 429 as on the other link routes; each search takes one of the
+# link's CALLS_PER_MINUTE.
+DESCRIPTION_SEARCH_PATH = "/api/capture/v1/descriptions"
+SEARCH_QUERY_PARAM = "q"
+SEARCH_MIN_CHARS = 3
+SEARCH_MAX_RESULTS = 20
+# The search's own connect and read timeout, in seconds, much shorter than
+# the link's FISQUA_TIMEOUT_SECONDS: the admin is waiting at the form, and
+# a stalled Fisqua must not hold the request (or a worker) for a minute.
+SEARCH_TIMEOUT_SECONDS = 5.0
+# Calls of the minute a search leaves to others: the decisions reads'
+# reserve, and LOOKUP_RESERVED_CALLS for the 1.8 lookup an admin's save runs.
+# Past it a search answers 429 and the save can still check its code.
+LOOKUP_RESERVED_CALLS = 5
+SEARCH_RESERVED_CALLS = DECISIONS_RESERVED_CALLS + LOOKUP_RESERVED_CALLS
+RULE_QUERY_TOO_SHORT = "query-too-short"
+F_RESULTS = "results"
+F_DATES_DISPLAY = "display"
+F_DATES_START = "start"
+F_DATES_END = "end"
+
+
+# ---------------------------------------------------------------------------
+# Pairing (contract 1.11, §12)
+# ---------------------------------------------------------------------------
+
+# The two routes are called on the main address of the environment, not
+# the tenant's host, with no token. Every answer is a JSON object; a 404
+# from the codes route whose body is not one means a Fisqua without 1.11
+# (§12.3).
+PAIRING_HOSTS = {
+    "production": "https://fisqua.org",
+    "staging": "https://staging.fisqua.org",
+}
+PAIRING_CODES_PATH = "/api/capture/v1/pairing/codes"
+PAIRING_COLLECT_PATH = "/api/capture/v1/pairing/collect"
+# The codes request.
+F_UNIT_NAME = "unitName"
+F_DEVICE_ID = "deviceId"
+F_CURRENT_TENANT = "currentTenant"
+UNIT_NAME_MAX_CHARS = 64
+# The codes answer (201) and the collect request.
+F_CODE = "code"
+F_COLLECT_SECRET = "collectSecret"
+F_EXPIRES_IN_SECONDS = "expiresInSeconds"
+F_POLL_SECONDS = "pollSeconds"
+COLLECT_SECRET_PATTERN = re.compile(r"^[0-9a-f]{64}$")
+# The collect answer's `state` (202, 410, 404).
+PAIRING_WAITING = "waiting"
+PAIRING_EXPIRED = "expired"
+PAIRING_COLLECTED = "collected"
+PAIRING_UNKNOWN = "unknown"
+# The rules of 400, 429, 503 and 405.
+RULE_UNIT_NAME = "unit-name"
+RULE_DEVICE_ID = "device-id"
+RULE_CURRENT_TENANT = "current-tenant"
+RULE_RATE_LIMITED = "rate-limited"
+RULE_BUSY = "busy"
+RULE_METHOD = "method"
+# The collect payload (200). Each value is a string; the keys are objects
+# holding two.
+F_TENANT = "tenant"
+F_ENVIRONMENT = "environment"
+F_TOKEN = "token"
+F_BUCKET = "bucket"
+F_WRITE_KEY = "writeKey"
+F_READ_KEY = "readKey"
+F_KEY_ID = "keyId"
+F_APPLICATION_KEY = "applicationKey"
+F_AGE_RECIPIENT = "ageRecipient"
+PAYLOAD_STRINGS = (F_TENANT, F_ENVIRONMENT, F_TOKEN, F_BUCKET, F_AGE_RECIPIENT)
+PAYLOAD_KEYS = (F_WRITE_KEY, F_READ_KEY)
+PAYLOAD_KEY_FIELDS = (F_KEY_ID, F_APPLICATION_KEY)

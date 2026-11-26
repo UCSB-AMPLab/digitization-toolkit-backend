@@ -1,4 +1,4 @@
-"""A volume's capture manifest for Fisqua (exchange contract 1.1, §4, artefact 2).
+"""A volume's capture manifest for Fisqua (exchange contract 1.12; §4, artefact 2, as in 1.1).
 
 Built only from the catalogue (the volume, its records and their current
 images), the capture manifests (`metadata/manifest.jsonl`, read through
@@ -26,15 +26,72 @@ whose files are still on disk.
   out of the manifest (§3: retakes stay in the volume and take the next
   number; §4: the new manifest replaces the volume's page list).
 * Every record of the volume is listed, whatever its status (§8, ruled
-  2026-10-17: the manifest carries every record's status).
+  2026-10-17: the manifest carries every record's status), in the order of
+  its `sequence` (§10.2).
+* A record that is missing (records.missing_side: a page, or a whole
+  opening, never captured; contract 1.9 §10.1) is listed with `status`
+  "missing", whatever its status on the unit but excluded, which keeps
+  "excluded" (contract 1.6), and `missingSide` ("left",
+  "right" or "both"), with its current images: the other page's for a side,
+  none for a placeholder. Once the operator has closed it without capturing,
+  it also carries `closedReason` and, when she wrote one, `closedNote`. An
+  open one stays captured on the unit (promotion leaves it there) and does
+  not refuse the export as a captured record does; a closed one is promoted
+  like any record, and one still captured does refuse it. An open missing
+  record's images are listed, so they must pass every image check (uploaded,
+  digests, a preview for a RAW) like any listed image, and the export
+  refuses otherwise; the record holds its volume in Fisqua anyway (§10.3).
+  A captured-into
+  placeholder is an ordinary record again and carries no `missingSide`.
+* `requestId` is carried by a record made from a Fisqua request (§10.4,
+  records.missing_request_id), whatever its status, after it is captured
+  into as well (_request_id).
+* Pages are the images of records `in_review` or `approved` (HANDED_OVER),
+  except a missing record's: those are pages only once it is closed and
+  handed over (§10.3: a closed one with an image needs approval in capture
+  QC like any opening). An open missing record's image, and a placeholder,
+  are not pages, and a missing record with no image is not refused for it.
+  A volume with no page is refused (no_pages) only when no record is
+  missing and open: Fisqua accepts such a delivery, which the open record
+  holds (§10.3, amended). A missing record whose current images contradict
+  its side is refused (missing_side_contradicted) exactly as Fisqua refuses
+  it (`missing-side`, §9.2): an image on the missing side, or any image with
+  "both". Nothing stricter, so the unit never refuses what Fisqua accepts.
+  A record `excluded` by a Fisqua decision (contract 1.6) is listed with
+  that status and its current images, so Fisqua keeps its decision, but it
+  is not a page and its roles are not checked; a volume whose records are
+  all excluded has no pages and is refused.
 * `externalId` is the volume's recorded reference code (collections.external_id)
   or, when none is recorded, its stem: contract 1.2 §8 makes a volume's
   filenameStem its Fisqua reference code, unchanged, and the unit's
   interface has no field for external_id (ruled). The download and the
   manifest sent to Fisqua (app.core.fisqua_outbox) carry the same value.
+* The manifest always declares version 1.12, whatever its records and
+  whatever CAPTUA_FISQUA_ROTATE_DEG; Fisqua reads any 1.x.
+* Colour card shots (contract 1.12 §13, app.core.colour_card). Every
+  volume carries `calibrationStatus`: `present` when the unit asks for
+  shots, no request was skipped and every page followed a taken set,
+  otherwise `skipped` (always `skipped`, with no `calibration`, while the
+  unit's setting is off). `calibration`, present when not empty, lists the shots of taken sets
+  whose objects are verified offsite and that apply to a page of this
+  manifest (colour_card.evaluate): `captureId`, `filename`,
+  `objectKey` (`<stem>/calibration/<filename>`), `sha256`,
+  `previewObjectKey` and `previewSha256` for a RAW shot, `rotateDeg` as
+  for a page, `camera` (`c<camera index>`, as in the file names),
+  `capturedAt`, `settings` (with the body that took it under `body`:
+  hardwareId, role, cameraIndex) and `appliesFromCaptureId`, the first page of the manifest
+  captured after the shot's set and no later than the next set. A shot no
+  page follows stays on the unit. The export is refused when a shot's name
+  is not one path segment of at most 200 bytes of UTF-8 under
+  `<stem>/calibration/` (`calibration_key`), or when a shot shares a
+  captureId, objectKey or previewObjectKey with a page or another shot
+  (`calibration_identity`), which Fisqua would refuse. A deliverable shot
+  that applies to a page and is not yet verified offsite is never left out:
+  the manifest is not built (CalibrationWaiting, `calibration_not_uploaded`)
+  and the outbox keeps the volume waiting. An undeliverable one is left out
+  and the volume is `skipped`.
 * `rotateDeg` (contract 1.5) is sent only when CAPTUA_FISQUA_ROTATE_DEG is
-  on, and then the manifest is version 1.5; off, it is version 1.1 with no
-  such key. It is the image's recorded rotate_deg: the clockwise degrees
+  on; off, no image carries the key. It is the image's recorded rotate_deg: the clockwise degrees
   that display it upright from its stored pixels, whatever EXIF Orientation
   the file carries (Captua never turns pixels; the rebuilt 2022-24 JPEGs of
   app.core.rebuild_volume carry wrong tags and the right rotate_deg). It
@@ -47,7 +104,7 @@ The export is refused, with every problem named, when Fisqua's registration
 reject the volume for a reason the unit can know, or when the keys are not
 of the form §4 gives them. The checks are listed in RULES.
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import re
@@ -57,15 +114,16 @@ from datetime import datetime, timezone
 from pathlib import Path
 from typing import Callable, Dict, List, Optional
 
-from sqlalchemy.orm import Session, selectinload
+from sqlalchemy.orm import Session, joinedload
 
 from app.core import config
 from app.core.paths import CAPTURES_DIR, PREVIEW_SIDECAR_SUFFIX, PREVIEWS_DIR, is_raw_suffix, preview_sidecar_of
 
 CONTRACT = "fisqua-captua-exchange"
-VERSION = "1.1"
-# The version when images carry rotateDeg (config FISQUA_ROTATE_DEG).
-ROTATE_DEG_VERSION = "1.5"
+# One version for every manifest, with or without rotateDeg (config
+# FISQUA_ROTATE_DEG), an excluded record, a missing one or colour card shots.
+VERSION = "1.12"
+MISSING = "missing"
 ROTATE_DEGREES = (0, 90, 180, 270)
 KIND = "capture-manifest"
 EXPORT_ACTION = "capture_manifest_exported"
@@ -87,6 +145,7 @@ RULES = (
     "sequence_missing",
     "sequence_repeated",
     "roles_invalid",
+    "missing_side_contradicted",
     "capture_id_missing",
     "not_uploaded",
     "preview_not_uploaded",
@@ -97,6 +156,9 @@ RULES = (
     "page_key_repeated",
     "sha256_missing",
     "preview_sha256_missing",
+    "calibration_key",
+    "calibration_identity",
+    "calibration_not_uploaded",
     "no_pages",
 )
 
@@ -133,6 +195,14 @@ class ManifestRefused(Exception):
     def message(self) -> str:
         return ("The capture manifest cannot be exported, because Fisqua would refuse it: "
                 + " ".join(p.message for p in self.problems))
+
+
+class CalibrationWaiting(ManifestRefused):
+    """The volume's manifest waits only for colour card shots still to be verified offsite (colour_card.evaluate).
+
+    The outbox leaves the volume waiting for it; the download answers it as
+    any refusal, with the rule `calibration_not_uploaded`.
+    """
 
 
 class _Collector:
@@ -178,6 +248,62 @@ def _rejection_note(record) -> Optional[str]:
     return comment or latest.predefined_reason
 
 
+def _is_missing(rec) -> bool:
+    """Whether the record is listed as missing: a page or an opening never captured (records.missing_side)."""
+    return rec.missing_side is not None
+
+
+def _is_open_missing(rec) -> bool:
+    """Whether the record is missing and not closed: pending, and left captured on the unit by promotion."""
+    return rec.missing_side is not None and rec.closed_reason is None
+
+
+def _contradicts_its_side(rec, imgs) -> bool:
+    """Whether a missing record's current images contradict its missing side (Fisqua's `missing-side`, §9.2).
+
+    Exactly Fisqua's two clauses, and no more, so the unit never refuses a
+    handover Fisqua would accept: an image on the missing side, or any image
+    with "both". An excluded record is listed as excluded, not missing, and
+    is not checked.
+    """
+    if rec.missing_side is None or rec.status == "excluded":
+        return False
+    if rec.missing_side == "both":
+        return bool(imgs)
+    return any(i.role == rec.missing_side for i in imgs)
+
+
+def _request_id(rec) -> Optional[str]:
+    """The Fisqua request id the record carries in the manifest, if any (module header).
+
+    Every record with records.missing_request_id set carries it, captured
+    into or not; pending Fisqua's confirmation of that, this is the one
+    place to change it.
+    """
+    return rec.missing_request_id
+
+
+def _record_entry(rec, out_images) -> dict:
+    entry = {
+        "captuaRecordId": rec.id,
+        "sequence": rec.sequence,
+        # An exclusion keeps its 1.6 meaning: excluded, with its missing fields.
+        "status": MISSING if _is_missing(rec) and rec.status != "excluded" else rec.status,
+        "rejectionNote": _rejection_note(rec),
+        "images": out_images,
+    }
+    if _is_missing(rec):
+        entry["missingSide"] = rec.missing_side
+        if rec.closed_reason is not None:
+            entry["closedReason"] = rec.closed_reason
+            if rec.closed_note is not None:
+                entry["closedNote"] = rec.closed_note
+    request_id = _request_id(rec)
+    if request_id is not None:
+        entry["requestId"] = request_id
+    return entry
+
+
 def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] = None,
                            new_id: Callable[[], uuid.UUID] = uuid.uuid4) -> dict:
     """The capture manifest of one volume, or ManifestRefused naming every problem (module header)."""
@@ -214,9 +340,14 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             "no_project",
             "The volume is not in a project, and the manifest names its project. Move the volume into a project."))
 
+    # The records, their images and their rejections in one statement, so a
+    # record's status and its current images are read at one instant: a page
+    # marked missing (app.api.records.mark_missing_page) committed between
+    # two reads could pair an old approved status with only its surviving
+    # image, listing that image as a page and leaving out missingSide.
     records = (
         db.query(Record)
-        .options(selectinload(Record.images), selectinload(Record.rejections))
+        .options(joinedload(Record.images), joinedload(Record.rejections))
         .filter(Record.collection_id == collection.id)
         .order_by(Record.sequence.nulls_last(), Record.id)
         .all()
@@ -225,7 +356,9 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
 
     by_sequence: Dict[int, List[int]] = {}
     for rec in records:
-        if rec.status == "captured":
+        # An open missing record stays captured on the unit; it is listed as
+        # missing and does not hold the export back (module header).
+        if rec.status == "captured" and not _is_open_missing(rec):
             found.add("records_captured", rec.id)
         if rec.sequence is None:
             found.add("sequence_missing", rec.id)
@@ -245,24 +378,36 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
         chunk = image_ids[start:start + 500]
         for row in db.query(OffsiteObject).filter(OffsiteObject.record_image_id.in_(chunk)):
             rows[(row.record_image_id, row.kind)] = row
-    index = build_fixity_index(config.settings.projects_dir.resolve())
+    from app.core.testing_space import manifest_filter
+    projects_dir = config.settings.projects_dir.resolve()
+    index = build_fixity_index(projects_dir, include=manifest_filter(db, bool(collection.testing), projects_dir))
 
     capture_prefix = f"{tenant}/{stem}/{CAPTURES_DIR}/" if tenant and stem else None
     preview_prefix = f"{tenant}/{stem}/{PREVIEWS_DIR}/" if tenant and stem else None
     file_form = re.compile(rf"^{re.escape(stem)}-img_\d{{4,}}_c\d+\.[A-Za-z0-9]+$") if stem else None
 
     page_keys: Dict[str, List[tuple]] = {}
+    emitted: List[dict] = []  # the image entries written, with their image ids, for the colour card shots
     out_records = []
     pages = 0
+    open_missing = 0
     for rec in records:
         imgs = current[rec.id]
         layout = tuple(sorted(i.role or "" for i in imgs))
-        if imgs and layout not in VALID_LAYOUTS:
+        # An excluded record is not a page, so its roles are not checked; a
+        # missing one may have no image at all (module header).
+        if imgs and rec.status != "excluded" and layout not in VALID_LAYOUTS:
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: {', '.join(i.role or 'no role' for i in imgs)}")
-        elif not imgs and rec.status in HANDED_OVER:
+        elif not imgs and rec.status in HANDED_OVER and not _is_missing(rec):
             found.add("roles_invalid", rec.id, note=f"record {rec.id}: no image")
-        if imgs and rec.status in HANDED_OVER:
+        if imgs and rec.status in HANDED_OVER and not _is_open_missing(rec):
             pages += len(imgs)
+        if _contradicts_its_side(rec, imgs):
+            found.add("missing_side_contradicted", rec.id,
+                      note=f"record {rec.id}: misses {rec.missing_side}, has "
+                           f"{', '.join(i.role or 'no role' for i in imgs) or 'no image'}")
+        if _is_open_missing(rec) and rec.status != "excluded":
+            open_missing += 1
 
         out_images = []
         for img in imgs:
@@ -270,33 +415,56 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
                                  file_form, found, page_keys)
             if entry is not None:
                 out_images.append(entry)
-        out_records.append({
-            "captuaRecordId": rec.id,
-            "sequence": rec.sequence,
-            "status": rec.status,
-            "rejectionNote": _rejection_note(rec),
-            "images": out_images,
-        })
+                emitted.append({**entry, "_image_id": img.id})
+        out_records.append(_record_entry(rec, out_images))
 
     for key, owners in page_keys.items():
         if len(owners) > 1:
             for rid, iid in owners:
                 found.add("page_key_repeated", rid, iid, note=key)
 
-    if pages == 0:
+    # Fisqua accepts a delivery with no page while one record is an open
+    # missing one, which holds the volume (contract 1.9 §10.3, amended).
+    if pages == 0 and open_missing == 0:
         problems.append(Problem(
             "no_pages",
-            "No record under review or approved has an image, so Fisqua has no page to register. "
-            "Hand over records with images."))
+            "No record under review or approved has an image, and no record is missing and open, so "
+            "Fisqua has no page to register. Hand over records with images."))
 
     problems.extend(_problems(found, tenant, stem))
+
+    # Colour card shots (contract 1.12 §13, app.core.colour_card): one
+    # evaluation gives what is carried, the status, and what is waited for.
+    from app.core import colour_card
+    evaluated = colour_card.evaluate(db, collection, tenant, emitted)
+    calibration_status, calibration = evaluated.status, evaluated.entries
+    if calibration:
+        key_problems, identity_problems = colour_card.manifest_problems(stem, calibration, emitted)
+        if key_problems:
+            problems.append(Problem(
+                "calibration_key",
+                f"{len(key_problems)} colour card shot(s) are not named as one path segment of at most "
+                f"{colour_card.MAX_NAME_BYTES} bytes under {stem}/calibration/: {'; '.join(key_problems[:_LIST_LIMIT])}. "
+                "Fisqua refuses the volume for it; take the shots again."))
+        if identity_problems:
+            problems.append(Problem(
+                "calibration_identity",
+                f"{len(identity_problems)} colour card shot(s) share an identity with a page or another shot: "
+                f"{'; '.join(identity_problems[:_LIST_LIMIT])}. Fisqua refuses the volume for it."))
+    if evaluated.waiting:
+        problems.append(Problem(
+            "calibration_not_uploaded",
+            f"{evaluated.waiting} object(s) of the volume's colour card shots are not yet verified in the offsite "
+            "bucket. Wait for the offsite upload to verify them, then export again."))
     if problems:
+        if [p.rule for p in problems] == ["calibration_not_uploaded"]:
+            raise CalibrationWaiting(problems)
         raise ManifestRefused(problems)
 
     stamp = (now or _now()).astimezone(timezone.utc)
     return {
         "contract": CONTRACT,
-        "version": ROTATE_DEG_VERSION if config.settings.FISQUA_ROTATE_DEG else VERSION,
+        "version": VERSION,
         "kind": KIND,
         "id": str(new_id()),
         "generatedAt": stamp.strftime("%Y-%m-%dT%H:%M:%SZ"),
@@ -313,6 +481,8 @@ def build_capture_manifest(db: Session, collection, *, now: Optional[datetime] =
             "stem": stem,
             "title": collection.name,
             "records": out_records,
+            "calibrationStatus": calibration_status,
+            **({"calibration": calibration} if calibration else {}),
         }],
     }
 
@@ -470,6 +640,10 @@ def _problems(found: _Collector, tenant: Optional[str], stem: Optional[str]) -> 
             f"{len(n)} image(s) are stored offsite under names not of the form "
             f"{stem}-img_<nnnn>_c<n>.<ext> (records {_ids(r)}): {'; '.join(n[:_LIST_LIMIT])}. "
             "Offsite keys never change, so those records have to be captured again."),
+        "missing_side_contradicted": lambda r, n: (
+            f"{len(r)} missing record(s) have current images that contradict the side they miss: "
+            f"{'; '.join(n[:_LIST_LIMIT])}. A record missing a side has no image of that side, and "
+            "one missing both has none. Capture the opening again, or correct the missing page."),
         "page_key_repeated": lambda r, n: (
             f"More than one image is stored under the name {', '.join(n[:_LIST_LIMIT])} "
             f"(records {_ids(r)}), and Fisqua names each page by it. Those records have to be captured again."),

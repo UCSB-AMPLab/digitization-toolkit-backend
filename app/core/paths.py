@@ -6,9 +6,10 @@ point inside the application's storage roots. A database row that points
 elsewhere (e.g. /etc/passwd, ~/.ssh/id_rsa, the project .env) must never be
 served, unlinked, or otherwise acted upon.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
+import os
 from pathlib import Path
 from typing import Optional
 
@@ -34,8 +35,12 @@ RAW_SUFFIXES = frozenset(f".{ext}" for ext in (
 # What the RAW backend appends to a master's stem to name its preview sidecar.
 PREVIEW_SIDECAR_SUFFIX = "_preview.jpg"
 
+# The suffix of the raw sensor buffer Picamera2Backend writes beside a JPEG
+# master when a raw stream is requested (NEH-261).
+RAW_SIDECAR_SUFFIX = ".raw"
+
 # A volume with a file name stem keeps its files in `<projects root>/<stem>/`,
-# in these four directories (capture.project_manager.volume_root). A volume
+# in these four directories, and its colour card shots in CALIBRATION_DIR (capture.project_manager.volume_root). A volume
 # without one keeps the name-based layout, `<project>/<name>/images/main/`,
 # with each sidecar beside its master and thumbnails in `images/thumbnails/`.
 CAPTURES_DIR = "captures"      # masters: CR2, or JPEG/TIFF
@@ -43,11 +48,23 @@ PREVIEWS_DIR = "previews"      # the `_preview.jpg` extracted from a RAW master
 THUMBNAILS_DIR = "thumbnails"
 METADATA_DIR = "metadata"      # the volume's manifest.jsonl
 VOLUME_SUBDIRS = (CAPTURES_DIR, PREVIEWS_DIR, THUMBNAILS_DIR, METADATA_DIR)
+# A volume's colour card shots (app.core.colour_card): `<stem>-cal_<nn>_c<n>.<ext>`
+# and, for a RAW master, its `_preview.jpg` beside it, never in previews/.
+# Created by the first shot, not with the four above; nothing else is kept in it.
+CALIBRATION_DIR = "calibration"
 
 # Directly under the projects root: the hard links the offsite upload copies
 # from (app.core.image_upload). Each is another name for an image already
 # under a volume, so the integrity check does not count it as a file.
 OFFSITE_STAGING_DIR = ".captua-offsite-staging"
+
+# Directly under the projects root, flat: the files a repair of an unfinished
+# adoption fetches or derives before it renames them into their volumes
+# (app.core.adopt_repair). Removed whole by every repair and at every start.
+# A volume's stem cannot begin with a dot (FILENAME_STEM_PATTERN) and a
+# project's directory has its leading dots stripped (project_dir_name), so
+# no volume or project is ever given this name.
+ADOPTION_REPAIR_STAGING_DIR = ".captua-adoption-repair"
 
 
 def project_dir_name(project_name: str) -> str:
@@ -92,6 +109,97 @@ def preview_sidecar_of(master: Path) -> Path:
     if master.parent.name == CAPTURES_DIR:
         return master.parent.parent / PREVIEWS_DIR / name
     return master.with_name(name)
+
+
+def raw_sidecar_of(master: Path) -> Path:
+    """The `<stem>.raw` sidecar a JPEG master names (NEH-261).
+
+    A multi-format capture (Picamera2Backend with raw) writes the JPEG master
+    and its raw sensor buffer in the same directory, under the same stem. The
+    JPEG is the record's image; the raw file has no row of its own and is
+    found from the master by this name. Pure path arithmetic, as
+    preview_sidecar_of is: nothing is checked on disk, and a master that is
+    itself a `.raw` file names itself.
+    """
+    return master.with_suffix(RAW_SIDECAR_SUFFIX)
+
+
+def _identity(path) -> "tuple | None":
+    """A file's (device, inode), following symlinks, or None when it cannot be stat'ed."""
+    try:
+        st = os.stat(path)
+    except (OSError, ValueError):
+        return None
+    return (st.st_dev, st.st_ino)
+
+
+def same_file(a, b) -> bool:
+    """os.path.samefile, with any OSError (a missing file, a broken link) read as not the same."""
+    try:
+        return os.path.samefile(a, b)
+    except (OSError, ValueError):
+        return False
+
+
+class FileIdentities:
+    """The identities of many files, for asking whether a path is one of them as same_file would answer.
+
+    Built once from a full row set (the layout migration, the integrity
+    scan), so that each question costs one stat rather than one per row. The
+    identity is the (st_dev, st_ino) pair os.path.samefile compares; a path
+    that cannot be stat'ed has none and is held by nothing.
+    """
+
+    def __init__(self, paths):
+        self._ids = {i for i in (_identity(p) for p in paths) if i is not None}
+
+    def holds(self, path) -> bool:
+        i = _identity(path)
+        return i is not None and i in self._ids
+
+
+def raw_buffer_of(master: Path, row_masters) -> "Path | None":
+    """The `.raw` sidecar `master` may claim, or None (NEH-261).
+
+    A `<stem>.raw` beside `master` is a multi-format capture's raw buffer,
+    and so a sidecar of `master`, only when all of these hold:
+
+    - `master` is not itself a RAW master. `.raw` is also a RAW master's
+      suffix, so `f.CR2` claims no `f.raw`.
+    - The `.raw` exists. One that does not is nothing to carry or delete.
+    - No row has it as its own master, whatever record or volume the row
+      is in. This is decided by file identity, as os.path.samefile decides
+      it, never by comparing path strings: a case-insensitive volume (an
+      exFAT drive, APFS by default) makes `F.RAW` and `f.raw` one file, a
+      case-sensitive one (ext4) keeps them two, and a directory symlink in
+      either path changes the string but not the file.
+
+    `row_masters` is the stored master paths of the rows that could own the
+    `.raw` (FileIdentities, or any iterable of paths). A caller that cannot
+    pass every row passes at least the record's siblings and every row whose
+    stored file name is the `.raw`'s name, or the name its symlink points
+    at, compared case-insensitively (app.core.storage_ops.rows_master_paths_named).
+    That set is complete for every master path the app writes: masters are
+    files the app created under its own names, so a row that owns this file
+    stores it under one of those names. A row whose stored master is a
+    file-level symlink to the `.raw` under some other name is not found;
+    the app never writes such a path, and no provision is made for one.
+
+    Returns the `.raw` path beside `master`, not resolved: a caller that
+    moves or unlinks it acts on that entry, never on what a symlink there
+    points at.
+    """
+    if is_raw_suffix(master):
+        return None
+    buffer = raw_sidecar_of(master)
+    if _identity(buffer) is None:
+        return None
+    if isinstance(row_masters, FileIdentities):
+        if row_masters.holds(buffer):
+            return None
+    elif any(same_file(buffer, m) for m in row_masters):
+        return None
+    return buffer
 
 
 def storage_roots() -> list[Path]:

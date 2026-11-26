@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 import sys
 from pathlib import Path
@@ -36,6 +36,8 @@ if str(backend_dir) not in sys.path:
 
 from .utils import setup_rotating_logger, atomic_write
 from .camera import CameraConfig, IMG_SIZES
+from .backends.base import preview_request
+from .backends.errors import CameraNotConnectedError
 from .manifestHandler import generate_manifest_record, append_manifest_record
 from .backends import (
     CameraBackend,
@@ -105,6 +107,8 @@ def canonical_backend_name(value: str) -> str:
     which object a caller consults. Each site reads its own object, and they
     agree because they normalise the same way.
     """
+    if value is None:
+        return ""
     return value.strip().lower()
 
 
@@ -123,6 +127,13 @@ def assert_camera_backend_configured() -> str:
     answer /health, and fail at the moment someone tried to photograph
     something.
     """
+    if settings.CAMERA_BACKEND is None:
+        # Unset and not yet resolved: the backend is being built without the
+        # lifespan (a hardware test, a script). The same order of choice is
+        # applied here, and writes the kind to this `settings`.
+        from app.core import camera_kind
+
+        camera_kind.apply_at_startup()
     configured = canonical_backend_name(settings.CAMERA_BACKEND)
     if configured not in _BACKEND_CONSTRUCTORS:
         # The RAW value, from THE SAME object the check above read. A freshly
@@ -164,6 +175,14 @@ def get_backend() -> CameraBackend:
         if _backend is None:
             _backend = get_camera_backend()
             subprocess_logger.info(f"Initialized camera backend: {_backend.get_backend_name()}")
+            # Only a driver that was built is remembered as the kind last
+            # used, the fallback of a later start (app.core.camera_kind).
+            try:
+                from app.core import camera_kind
+
+                camera_kind.driver_built(settings.CAMERA_BACKEND)
+            except Exception as exc:
+                subprocess_logger.warning(f"The camera kind in use could not be remembered ({exc!r})")
         return _backend
 
 
@@ -222,6 +241,27 @@ def is_camera_connected(camera_index: int = 0) -> bool:
     return backend.is_camera_connected(camera_index)
 
 
+def camera_model(camera_index: int) -> Optional[str]:
+    """The model of the camera at this index, for CameraSettings, or None.
+
+    Asks the backend the capture just used and never constructs one: with no
+    backend there is no camera to name. Never raises - a lookup that fails is
+    logged and is None, so recording the model cannot fail a capture.
+    """
+    from .backends.base import normalise_camera_model
+
+    backend = _backend
+    if backend is None:
+        return None
+    try:
+        return normalise_camera_model(backend.camera_model(camera_index))
+    except Exception as exc:
+        subprocess_logger.warning(
+            f"Could not read the model of camera {camera_index}: {exc!r}"
+        )
+        return None
+
+
 # EXIF Orientation tag values for clockwise rotations.
 # The pixel data is never modified; viewers that honour EXIF display the page upright.
 _EXIF_ORIENTATION_FOR_DEG = {
@@ -278,6 +318,18 @@ def _capture_paths(actual_path) -> list[Path]:
     if isinstance(actual_path, (tuple, list)):
         return [Path(str(p)) for p in actual_path]
     return [Path(str(actual_path))]
+
+
+def _image_of(actual_path) -> str:
+    """The path a capture's callers record as its image: the JPEG of a multi-format capture.
+
+    A multi-format capture reports (jpeg_path, raw_path). The JPEG is the
+    record's image and the raw file its sidecar, found again from the JPEG by
+    app.core.paths.raw_sidecar_of, so the tuple goes no further than the
+    manifest record and single_capture_image and dual_capture_image hand
+    their callers one path (NEH-261).
+    """
+    return str(_capture_paths(actual_path)[0])
 
 
 def _rotate_capture_files(paths: list[Path], rotate_deg: int) -> None:
@@ -423,7 +475,9 @@ def single_capture_image(
         root (Path): The projects root, read once by the caller; read here when not given.
     Returns:
         tuple: (output_path, capture_id, pair_id) - path to image and manifest IDs.
-            pair_id is None: a single capture has no pair.
+            output_path is one path: for a multi-format capture, the JPEG,
+            whose raw sidecar raw_sidecar_of names. pair_id is None: a single
+            capture has no pair.
     """
     if not filename_index:
         raise ValueError("single_capture_image needs a filename_index; there is no timestamp fallback")
@@ -473,7 +527,30 @@ def single_capture_image(
         f"Single capture: cam{camera_config.camera_index}={elapsed_time:.3f}s, capture_id={record.capture_id}"
     )
     
-    return output_path, record.capture_id, record.pair_id
+    return _image_of(output_path), record.capture_id, record.pair_id
+
+
+def colour_card_capture(camera_config: CameraConfig, output_path: Path) -> tuple:
+    """Photograph a colour card with one camera into `output_path`, in a volume's calibration folder.
+
+    Through the configured backend, as a page is (capture_image), so the
+    backend's own lock on the camera is taken. The rotation is recorded on
+    every JPEG as for a page. No manifest line is written here: the caller
+    names the files and writes the shot's line (app.core.colour_card).
+
+    Returns (paths, metadata): every file the backend wrote, the master
+    first, and the backend's capture metadata or None.
+    """
+    output_path = Path(output_path)
+    output_path.parent.mkdir(parents=True, exist_ok=True)
+    result = get_backend().capture_image(output_path, camera_config, False)
+    if isinstance(result, tuple) and len(result) == 2:
+        actual_path, metadata = result
+    else:
+        actual_path, metadata = result, None
+    paths = _capture_paths(actual_path)
+    _rotate_capture_files(paths, getattr(camera_config, "rotate_deg", 0))
+    return paths, metadata
 
 
 def _unlink_capture_output(path) -> None:
@@ -492,12 +569,16 @@ def _unlink_capture_output(path) -> None:
                 pass
 
 
-def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[bytes, float]:
+def test_capture_bytes(
+    camera_index: int,
+    resolution: str = "medium",
+    focus_check: bool = False,
+) -> tuple[bytes, float]:
     """Take a real still for the dashboard's "Probar camaras" button and return it inline.
 
     Exercises the same shutter/autofocus/backend path as POST /capture -
     same registry-driven CameraConfig (default_camera_config_from_registry,
-    so a saved orientation still applies) and the same
+    so the body's effective orientation applies) and the same
     get_backend().capture_image() call - but the file never lands under the
     projects root: it is written to a throwaway temp directory that is
     always removed before returning, and no manifest record is ever
@@ -507,6 +588,10 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     Args:
         camera_index: The index of the camera to test.
         resolution: Resolution preset (see capture.camera.IMG_SIZES).
+        focus_check: Ask the backend for a focus-check capture (one trigger
+            attempt, a short deadline; NEH-339). Passed only to a backend
+            whose class sets supports_focus_check = True (GPhoto2Backend);
+            every other backend captures as usual.
 
     Returns:
         tuple: (jpeg_bytes, elapsed_seconds) - elapsed_seconds times only the
@@ -531,8 +616,15 @@ def test_capture_bytes(camera_index: int, resolution: str = "medium") -> tuple[b
     try:
         output_path = Path(tmpdir) / f"test_cam{camera_index}.jpg"
 
+        backend = get_backend()
+        # The class, not the instance: getattr on a mock instance is truthy.
+        if focus_check and getattr(type(backend), "supports_focus_check", False) is True:
+            capture_kwargs = {"focus_check": True}
+        else:
+            capture_kwargs = {}
+
         start_time = time.perf_counter()
-        result = get_backend().capture_image(output_path, camera_config)
+        result = backend.capture_image(output_path, camera_config, **capture_kwargs)
         elapsed_time = time.perf_counter() - start_time
 
         # Result is a (path_or_paths, metadata) pair from the picamera2,
@@ -600,6 +692,8 @@ def dual_capture_image(
             as the caller records them in the database. ["left", "right"] when not given.
     Returns:
         tuple: (path1, path2, capture_id, pair_id) - paths to images and manifest IDs.
+            Each path is one path: for a multi-format capture, the JPEG, whose
+            raw sidecar raw_sidecar_of names.
         
     Example:
         cam1 = CameraConfig(camera_index=0, vflip=True, awb="auto")
@@ -723,8 +817,9 @@ def dual_capture_image(
         f"stagger={stagger_ms}ms, capture_id={record.capture_id}, pair_id={record.pair_id}"
     )
     
-    return img1_path, img2_path, record.capture_id, record.pair_id
+    return _image_of(img1_path), _image_of(img2_path), record.capture_id, record.pair_id
     
+@preview_request()
 def capture_preview_frame(camera_index: int, resolution: str = "medium") -> bytes:
     """
     Capture a live preview frame and return JPEG bytes.
@@ -753,7 +848,9 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
 
     Raises:
         ValueError: If ``resolution`` is not a known IMG_SIZES key.
-        RuntimeError: If the camera is not connected or capture fails.
+        CameraNotConnectedError: If the camera is not connected.
+        RuntimeError: If capture fails; PreviewFrameFailedError when the
+            backend reports a connected body whose frame failed.
     """
     img_size = IMG_SIZES.get(resolution)
     if img_size is None:
@@ -762,7 +859,7 @@ def capture_preview_frame(camera_index: int, resolution: str = "medium") -> byte
         )
 
     if not is_camera_connected(camera_index):
-        raise RuntimeError(f"Camera {camera_index} is not connected")
+        raise CameraNotConnectedError(f"Camera {camera_index} is not connected")
 
     backend = get_backend()
 
@@ -961,6 +1058,66 @@ def apply_zoom(camera_index: int, zoom_factor: float) -> None:
         )
 
     backend.apply_zoom(camera_index, zoom_factor)
+
+
+def apply_zoom_step(camera_index: int, step: int) -> int:
+    """Move the optical zoom of *camera_index* to *step*, and store it.
+
+    Only a backend that reports the "zoom_steps" capability (CHDK) has
+    stepped optical zoom; it validates the step against the camera's own
+    range, confirms it, and stores it per body.
+
+    Returns the step the camera confirmed.
+
+    Raises ValueError for a step outside the camera's range, and
+    RuntimeError if the camera is unavailable, the backend has no stepped
+    zoom, or the camera did not confirm the step.
+    """
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("zoom_steps", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support stepped optical zoom"
+        )
+
+    return backend.set_zoom_step(camera_index, step)
+
+
+def _focus_lock_backend(camera_index: int):
+    """The backend, once the camera is connected and the backend can lock focus."""
+    if not is_camera_connected(camera_index):
+        raise RuntimeError(f"Camera {camera_index} is not connected")
+
+    backend = get_backend()
+    if not backend.get_capabilities().get("focus_lock", False):
+        raise RuntimeError(
+            f"{backend.get_backend_name()} backend does not support focus lock"
+        )
+    return backend
+
+
+def lock_focus(camera_index: int) -> int:
+    """Autofocus *camera_index* once, lock the focus, and store the distance.
+
+    Only a backend that reports the "focus_lock" capability (CHDK) can do
+    this; it reads the distance back from the camera and stores it per body.
+
+    Returns the distance in mm the camera reported.
+
+    Raises RuntimeError if the camera is unavailable, the backend has no
+    focus lock, or the camera did not confirm the lock.
+    """
+    return _focus_lock_backend(camera_index).lock_focus(camera_index)
+
+
+def unlock_focus(camera_index: int) -> None:
+    """Release the focus lock of *camera_index* and clear its stored distance.
+
+    The camera then autofocuses on every picture. Raises as lock_focus does.
+    """
+    _focus_lock_backend(camera_index).unlock_focus(camera_index)
 
 
 def main():

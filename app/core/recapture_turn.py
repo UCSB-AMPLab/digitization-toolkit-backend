@@ -3,38 +3,80 @@
 Finishing every recapture of one volume opens the turn for one new volume (a
 volume with no records); the first capture into a new volume returns the turn
 to recaptures. Turns do not accumulate, and the turn belongs to the unit, not
-to a user. Two system-log events carry the state, so no migration is needed:
+to a user. Three system-log events carry the state, so no migration is needed:
 
   recapture_volume_completed  a retake left its volume with no pending record
+  rescan_volume_completed     a full rescan was sent to review for the first time
   new_volume_started          a capture created the first record of a volume
 
-A record is pending while its status is rejected, or while it is captured
-and a current image still carries a rejection_id: the state the
+A full rescan is a volume whose queue action (fisqua.action in
+custom_attributes, written by the list import and the queue sync) is
+"full-rescan": it redoes a volume digitised before, so it is rework, not new
+material. Its first capture is never refused for the turn and writes no
+new_volume_started, so it leaves the turn as it was; until its first
+promotion, finishing its retakes writes no recapture_volume_completed either,
+so a rescan earns one turn, not two. After it, its retakes earn turns as any
+volume's do. Sending it to review
+(POST /collections/{id}/promote, app/api/collections.py) completes it as
+finishing a volume's recaptures does, and opens the turn for one new volume.
+It is sent to review when none of its records is left captured, through
+whichever route moved the last one: POST /collections/{id}/promote, PATCH
+/records/{id}/status or POST /records/bulk-status, each of which calls
+award_rescan_turns. The first time that holds, rescan_volume_completed is
+written, and never again, so taking the volume back and sending it again
+opens no second turn.
+
+A record is pending while its status is rejected; while it is captured
+and a current image still carries a rejection_id, the state the
 prepare-for-retake transition (PATCH /records/{id}/status, rejected ->
-captured) leaves it in until a capture replaces the image. pending_clause and
-record_is_pending are that one definition, used by the summary, the turn,
-the completion test and the promotion refusal.
+captured) leaves it in until a capture replaces the image; or while it is
+missing (records.missing_side: a page, or a whole opening, never captured;
+contract 1.9 §10), open (no records.closed_reason) and not excluded, until
+a dual capture into it writes both images and clears it, or the operator
+closes it (POST /records/{id}/close-missing). A closed record is not
+pending: it stays in its volume and is promoted like a captured record.
+pending_clause and record_is_pending are that one definition, used by the
+summary, the to-retake list, the turn and the completion test.
+pending_reason names which of the three holds.
+
+The promotion refusal counts only the first two (retake_clause,
+volume_retakes_pending): an open missing record does not hold its volume
+back. Promotion and the status routes leave it captured on the unit, and
+send the volume's other records (app.api.collections.promote_collection);
+its volume's manifest lists it as missing (app.core.capture_manifest).
 
 The turn is "free" when no record is pending; otherwise "new" when the
-newest completion is newer than the newest start, else "recaptures". Newer
+newest completion, of either kind, is newer than the newest start, else
+"recaptures". Newer
 means a higher system_logs id, not a later created_at: both events are
 inserted while lock_turn is held, so their ids are in the order the turn
 changed, while created_at defaults to the start of each transaction.
 
 The capture endpoints (app/api/cameras.py) refuse an operator's capture that
 would start a new volume during the recaptures turn; an admin's is let
-through. They take lock_turn before reading the turn or writing either event,
+through, and a full rescan's is never refused. They take lock_turn before reading the turn or writing either event,
 after the record and volume row locks they already hold, so two operators
 cannot both start a new volume on one completion. Promotion of a volume with
-any pending record is refused separately (app/api/collections.py).
+a record waiting for a retake is refused separately (app/api/collections.py). The
+routes that send a full rescan to review hold their record locks, then take
+the volume's row, then lock_turn (award_rescan_turns): the order of every
+path that takes lock_turn.
 
-Version: 0.2.0
+The turn is real work's alone (app.core.testing_space). A testing record
+is never pending for the turn (pending_records), no event is written for a
+testing volume (record_event, the one writer of the three events). A capture into a testing volume is never refused for the turn
+and takes no turn lock (app.api.cameras), closing a testing record writes
+no completion (app.api.records.close_missing_record), and no testing
+volume is a full rescan for the turn (lock_rescan_volumes).
+
+Version: 0.3.0
 """
 from datetime import datetime, timezone
+import json
 import re
 from typing import Optional
 
-from sqlalchemy import and_, exists, func, or_, text
+from sqlalchemy import and_, case, exists, func, or_, text
 from sqlalchemy.orm import Session
 
 from app.models.collection import Collection
@@ -43,7 +85,11 @@ from app.models.system_log import SystemLog
 
 
 COMPLETED_ACTION = "recapture_volume_completed"
+RESCAN_COMPLETED_ACTION = "rescan_volume_completed"
 STARTED_ACTION = "new_volume_started"
+_COMPLETION_ACTIONS = (COMPLETED_ACTION, RESCAN_COMPLETED_ACTION)
+
+FULL_RESCAN = "full-rescan"
 
 # Any constant serves, as long as nothing else on the database takes the same
 # advisory lock; no other code in Captua takes one.
@@ -71,27 +117,84 @@ def lock_turn(db: Session) -> None:
 		db.execute(text("SELECT pg_advisory_xact_lock(:key)"), {"key": _TURN_LOCK_KEY})
 
 
-def pending_clause(record=Record):
-	"""SQL for "this record is pending"; `record` may be an alias of Record."""
-	marked = exists().where(
+REJECTED = "rejected"
+PREPARED = "prepared"
+MISSING_SIDE = "missing_side"
+
+
+def _marked(record):
+	return exists().where(
 		RecordImage.record_id == record.id,
 		RecordImage.is_current.is_(True),
 		RecordImage.rejection_id.isnot(None),
 	)
-	return or_(record.status == "rejected", and_(record.status == "captured", marked))
+
+
+def retake_clause(record=Record):
+	"""SQL for "this record waits for the retake of a rejection": rejected, or prepared for retake."""
+	return or_(record.status == "rejected", and_(record.status == "captured", _marked(record)))
+
+
+def open_missing_clause(record=Record):
+	"""SQL for "this record is missing and open": a missing side, and not closed without capturing."""
+	return and_(record.missing_side.isnot(None), record.closed_reason.is_(None))
+
+
+def is_open_missing(rec: Record) -> bool:
+	"""The same test as open_missing_clause, on a loaded record."""
+	return rec.missing_side is not None and rec.closed_reason is None
+
+
+def missing_side_clause(record=Record):
+	"""SQL for "this record is missing, open and not excluded"."""
+	return and_(open_missing_clause(record), record.status != "excluded")
+
+
+def pending_clause(record=Record):
+	"""SQL for "this record is pending"; `record` may be an alias of Record."""
+	return or_(retake_clause(record), missing_side_clause(record))
+
+
+def pending_reason_clause(record=Record):
+	"""SQL for why a pending record is pending: REJECTED, PREPARED or MISSING_SIDE (NULL when it is not).
+
+	In that order: a rejected record that also misses a side is named rejected.
+	"""
+	return case(
+		(record.status == "rejected", REJECTED),
+		(and_(record.status == "captured", _marked(record)), PREPARED),
+		(missing_side_clause(record), MISSING_SIDE),
+		else_=None,
+	)
+
+
+def pending_reason(rec: Record) -> Optional[str]:
+	"""The same test as pending_reason_clause, on a loaded record."""
+	if rec.status == "rejected":
+		return REJECTED
+	if rec.status == "captured" and any(img.is_current and img.rejection_id is not None for img in rec.images):
+		return PREPARED
+	if is_open_missing(rec) and rec.status != "excluded":
+		return MISSING_SIDE
+	return None
 
 
 def record_is_pending(rec: Record) -> bool:
 	"""The same test as pending_clause, on a loaded record."""
-	if rec.status == "rejected":
-		return True
-	return rec.status == "captured" and any(
-		img.is_current and img.rejection_id is not None for img in rec.images)
+	return pending_reason(rec) is not None
 
 
 def pending_records(db: Session) -> int:
-	"""How many records are pending on the unit."""
-	return db.query(func.count(Record.id)).filter(pending_clause()).scalar() or 0
+	"""How many records of real work are pending on the unit: the count the turn is read from."""
+	return db.query(func.count(Record.id)).filter(pending_clause(), real_work_clause()).scalar() or 0
+
+
+def real_work_clause():
+	"""SQL for "this record is real work", not testing work (app.core.testing_space.testing_clause)."""
+	from sqlalchemy import not_
+	from app.core.testing_space import testing_clause
+
+	return not_(testing_clause(Record))
 
 
 def volume_pending(db: Session, collection_id: int) -> int:
@@ -103,15 +206,104 @@ def volume_pending(db: Session, collection_id: int) -> int:
 	)
 
 
+def volume_retakes_pending(db: Session, collection_id: int) -> int:
+	"""How many records of the volume wait for the retake of a rejection; what refuses its promotion."""
+	return (
+		db.query(func.count(Record.id))
+		.filter(Record.collection_id == collection_id, retake_clause())
+		.scalar() or 0
+	)
+
+
 def volume_is_empty(db: Session, collection_id: int) -> bool:
 	"""Whether the volume has no record. Read under the volume's row lock, which every path adding a record takes."""
 	return db.query(Record.id).filter(Record.collection_id == collection_id).first() is None
 
 
-def _newest(db: Session, action: str) -> Optional[SystemLog]:
+def volume_is_full_rescan(volume: Collection) -> bool:
+	"""Whether the volume's queue action is a full rescan.
+
+	True only when custom_attributes parse as a JSON object whose `fisqua` is
+	an object with action exactly "full-rescan". Absent, unparsable or any
+	other value is not a rescan, so such a volume takes the turn as any new
+	volume does.
+	"""
+	try:
+		attrs = json.loads(volume.custom_attributes or "")
+	except ValueError:
+		return False
+	if not isinstance(attrs, dict):
+		return False
+	fisqua = attrs.get("fisqua")
+	return isinstance(fisqua, dict) and fisqua.get("action") == FULL_RESCAN
+
+
+def has_event(db: Session, action: str, collection_id: int) -> bool:
+	"""Whether a turn event of this kind was ever recorded for the volume.
+
+	Matched on the detail record_event writes, "collection_id=<id> ...", with
+	the space, so volume 1 does not match volume 10's events.
+	"""
+	return db.query(SystemLog.id).filter(
+		SystemLog.action == action,
+		SystemLog.detail.like(f"collection\\_id={collection_id} %", escape="\\"),
+	).first() is not None
+
+
+def lock_rescan_volumes(db: Session, collection_ids) -> list:
+	"""Lock the rows of the full rescans among the volumes, in id order; return their ids.
+
+	Called by the routes that move records out of captured, after their
+	record locks and before any status change, with the volumes the changes
+	will touch; award_rescan_turns then takes the ids it returns. Volumes
+	that are not full rescans are dropped before any lock, so they take
+	none. Taking a rescan's row here, before the status changes write their
+	history rows (which take a key share lock on the volume), means two
+	requests over one rescan queue on its row instead of each holding a key
+	share lock and waiting for the other's to upgrade.
+	"""
+	from app.core import volume_stem
+
+	with db.no_autoflush:
+		rescans = sorted({
+			cid for cid in collection_ids
+			if cid is not None and (volume := db.get(Collection, cid)) is not None
+			and not volume.testing and volume_is_full_rescan(volume)
+		})
+	for cid in rescans:
+		volume_stem.locked_volume_query(db, cid).first()
+	return rescans
+
+
+def award_rescan_turns(db: Session, rescans: list, actor: Optional[str]) -> None:
+	"""Write rescan_volume_completed for each locked rescan that is now sent to review.
+
+	`rescans` is what lock_rescan_volumes returned before the caller's status
+	changes. A volume is due when it carries no such event yet, has at least
+	one record and none left captured. The caller's status changes are
+	flushed first, so every key share lock their history rows take on any
+	volume is held before the turn lock; then the turn lock, once. The order
+	on every path is records, then the rescans' rows in id order, then the
+	turn lock, and a path holding the turn lock never waits for a volume row,
+	so this cannot deadlock against a retake, which holds its volume's row
+	and then asks for the turn.
+	"""
+	if not rescans:
+		return
+	db.flush()
+	lock_turn(db)
+	for cid in rescans:
+		if has_event(db, RESCAN_COMPLETED_ACTION, cid):
+			continue
+		statuses = [s for (s,) in db.query(Record.status).filter(Record.collection_id == cid).distinct()]
+		if statuses and "captured" not in statuses:
+			record_event(db, RESCAN_COMPLETED_ACTION, db.get(Collection, cid), actor)
+
+
+def _newest(db: Session, *actions: str) -> Optional[SystemLog]:
 	return (
 		db.query(SystemLog)
-		.filter(SystemLog.action == action)
+		.filter(SystemLog.action.in_(actions))
 		.order_by(SystemLog.id.desc())
 		.first()
 	)
@@ -120,7 +312,8 @@ def _newest(db: Session, action: str) -> Optional[SystemLog]:
 def turn(db: Session, pending: Optional[int] = None) -> dict:
 	"""The turn as GET /records/to-retake/summary gives it: {"state", "unlockedBy"}.
 
-	`pending` is the unit's rejected count, when the caller has it already.
+	`pending` is the unit's pending count of real work (pending_records),
+	when the caller has it already.
 	unlockedBy names the volume whose completion opened a "new" turn, by its
 	current name; a volume deleted since keeps the name the event recorded.
 	"""
@@ -128,7 +321,7 @@ def turn(db: Session, pending: Optional[int] = None) -> dict:
 		pending = pending_records(db)
 	if pending == 0:
 		return {"state": "free", "unlockedBy": None}
-	completed = _newest(db, COMPLETED_ACTION)
+	completed = _newest(db, *_COMPLETION_ACTIONS)
 	started = _newest(db, STARTED_ACTION)
 	if completed is None or (started is not None and started.id > completed.id):
 		return {"state": "recaptures", "unlockedBy": None}
@@ -145,11 +338,14 @@ def turn(db: Session, pending: Optional[int] = None) -> dict:
 
 
 def record_event(db: Session, action: str, volume: Collection, actor: Optional[str]) -> None:
-	"""Add one of the two turn events to the caller's transaction, which commits it with the capture.
+	"""Add one of the three turn events to the caller's transaction, which commits it with the capture.
 
 	Not app.core.audit.log_event, which commits at once: the event must stand
 	or fall with the capture that caused it, and be inserted under lock_turn.
+	Nothing is written for a testing volume: the turn is real work's alone.
 	"""
+	if volume.testing:
+		return
 	db.add(SystemLog(
 		level="INFO",
 		category="capture",

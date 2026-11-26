@@ -17,7 +17,7 @@ every (re)configure, ``apply_zoom`` crops inside it, and a still waits for a
 frame actually exposed at it. Bench testing on the appliance confirms the
 band.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import os
@@ -51,7 +51,7 @@ if sys.platform == "linux":
 
 
 
-from .base import CameraBackend
+from .base import CameraBackend, normalise_camera_model
 from ..camera import CameraConfig, IMG_SIZES
 from ..utils import atomic_write
 
@@ -182,6 +182,24 @@ class Picamera2Backend(CameraBackend):
             self._camera_info = Picamera2.global_camera_info()
         return self._camera_info
     
+    def held_body_count(self) -> Optional[int]:
+        """How many cameras the cached global_camera_info() lists, or None before it is cached; nothing is enumerated."""
+        info = getattr(self, "_camera_info", None)
+        return None if info is None else len(info)
+
+    def camera_model(self, camera_index: int) -> Optional[str]:
+        """The camera's Model from the cached global_camera_info(), if cached.
+
+        The cache is filled by the first is_camera_connected() or
+        list_devices() call and never refreshed, so a capture has normally
+        filled it already. When it is still empty this returns None rather
+        than call global_camera_info(), which asks libcamera.
+        """
+        info = self._camera_info
+        if info is None or camera_index < 0 or camera_index >= len(info):
+            return None
+        return normalise_camera_model(info[camera_index].get("Model"))
+
     def _get_camera(self, camera_index: int) -> Picamera2:
         """
         Get or create a Picamera2 instance for the given camera index.
@@ -694,8 +712,10 @@ class Picamera2Backend(CameraBackend):
                     # Raw buffer contains full sensor data for archival preservation
                     # JPEG provides quick viewing/preview
                     
-                    # Generate raw filename (.raw extension for now due to picamera2 DNG bug)
-                    raw_path = Path(str(output_path).rsplit('.', 1)[0] + '.raw')
+                    # Generate raw filename (.raw extension for now due to picamera2 DNG bug).
+                    # The name is the one the delete paths derive (raw_sidecar_of).
+                    from app.core.paths import raw_sidecar_of
+                    raw_path = raw_sidecar_of(Path(output_path))
                     
                     # Save JPEG first (durable: temp + fsync + atomic replace)
                     atomic_write(output_path, lambda tmp: request.save("main", tmp))
@@ -834,9 +854,12 @@ class Picamera2Backend(CameraBackend):
     def get_capabilities(self) -> dict:
         return {
             "live_preview": True,
+            "continuous_preview": True,
             "focus_control": True,
             "live_controls": True,
             "zoom": True,
+            "zoom_steps": False,
+            "focus_lock": False,
             "autofocus_calibration": True,
             "dslr_settings": False,
         }

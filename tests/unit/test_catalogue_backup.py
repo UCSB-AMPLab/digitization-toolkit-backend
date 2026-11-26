@@ -23,7 +23,7 @@ is the production path.
 
     python -m pytest tests/unit/test_catalogue_backup.py
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import errno
@@ -638,6 +638,24 @@ def test_the_status_endpoint_is_read_only(offsite, reader_client):
         response = getattr(reader_client, method)("/system/catalogue-backup")
         assert response.status_code == 405, (method, response.status_code)
 
+
+@pytest.mark.unit
+@pytest.mark.parametrize("mode,allows", [("offline", False), ("backup", True), ("fisqua", True)])
+def test_the_status_endpoint_says_whether_the_mode_allows_the_dump(offsite, reader_client, db_session, mode, allows):
+    """NEH-319: the top-level `mode_allows` follows unit_mode.offsite_on; `enabled` stays the configuration's answer."""
+    from app.models.unit_settings import UnitSettings
+    row = db_session.get(UnitSettings, 1)
+    if row is None:
+        db_session.add(UnitSettings(id=1, mode=mode, projects_enabled=False))
+    else:
+        row.mode = mode
+    db_session.commit()
+
+    body = reader_client.get("/system/catalogue-backup").json()
+    assert body["mode_allows"] is allows
+    assert body["enabled"] is True
+    assert body["images"]["mode_allows"] is allows
+
 @pytest.fixture
 def rclone(offsite, monkeypatch):
     """Capture every rclone call the real transport makes, and answer listings.
@@ -719,10 +737,15 @@ def test_the_object_is_age_ciphertext_for_the_configured_recipient(offsite, db_s
     "ssh-ed25519 AAAAC3NzaC1lZDI1NTE5AAAAIOMqqnkVzrm0SdG6UOoqKLsabgH5C9okWi0dh2l9GKJl",
 ])
 def test_no_dump_is_uploaded_without_a_valid_recipient(offsite, db_session, monkeypatch, caplog, recipient):
+    """A unit stored in backup mode whose recipient is then lost or mistyped: without a stored
+    mode the unit would start offline (app.core.unit_mode.inferred) and take no dump at all."""
     from app.core.config import settings
     from app.models.system_log import SystemLog
+    from app.models.unit_settings import UnitSettings
 
     cb = offsite.module
+    db_session.add(UnitSettings(id=1, mode="backup", projects_enabled=False))
+    db_session.commit()
     monkeypatch.setattr(settings, "OFFSITE_DUMP_RECIPIENT", recipient, raising=False)
 
     with caplog.at_level(logging.ERROR, logger="app.core.catalogue_backup"):

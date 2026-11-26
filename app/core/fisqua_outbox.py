@@ -8,7 +8,10 @@ app.core.fisqua_contract. Here:
 
 * **Enqueue at handover** (enqueue_handover). A handover that promotes at
   least one record adds a `waiting_for_upload` row in the same transaction,
-  with a fresh manifest id, when Fisqua is configured. A volume's reference
+  with a fresh manifest id, whatever the configuration and the mode
+  (NEH-320): the row waits until the unit is in fisqua mode with Fisqua
+  configured, so whether a volume reaches Fisqua no longer depends on the
+  configuration at handover time. A volume's reference
   code is its recorded external_id, else its stem
   (capture_manifest.reference_code); a volume whose recorded external_id is
   not its stem is `refused` (`not_exportable`) at once, with the problem
@@ -20,7 +23,10 @@ app.core.fisqua_contract. Here:
   already delivered or refused, is left as it is: nothing is sent to Fisqua
   on a take-back, and Fisqua replaces an older manifest with a newer one
   until a run has started on it, after which it refuses the newer one.
-* **Promotion to ready** (run_fisqua_outbox). A `waiting_for_upload` row is
+* **Promotion to ready** (run_fisqua_outbox). A row of a volume Captua
+  keeps on the unit (kept_on_unit, app.core.kept_volumes) is never
+  promoted: it stays `waiting_for_upload`, neither superseded nor refused,
+  until an admin releases the volume. Any other `waiting_for_upload` row is
   promoted once the volume is received (app.core.image_upload's received
   indicator: every object verified in the bucket). The manifest is built
   then, under export_jobs.hold_for_reading, with the row's manifest id, and
@@ -70,6 +76,14 @@ app.core.fisqua_contract. Here:
   applied nor one already seen stale has its QC decisions read and applied
   (§9.5, app.core.fisqua_decisions), within the same tick, the same
   transport rules and the same hold.
+* **The digitisation queue** (contract 1.7, app.core.fisqua_queue): each
+  scheduler tick, after the status poll, sends the unit's users when due
+  and polls, applies and acknowledges the queue, through the same
+  transport, call budget, configuration stop and hold.
+* **The unit's mode** (app.core.unit_mode). The send pass and the poll
+  make no call outside fisqua mode. Handovers still queue their rows while
+  Fisqua is configured, whatever the mode, and those rows wait until the
+  unit returns to fisqua.
 
 Every state change is a conditional UPDATE on the state the worker read, so
 a take-back or a new handover committed while the worker runs is not
@@ -85,7 +99,7 @@ every error text, and the settings hold it as a SecretStr. The unit-level
 configuration error keeps only a short fingerprint of the configuration
 (environment, base URL, token) that failed.
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import hashlib
@@ -105,6 +119,8 @@ from sqlalchemy.orm import Session
 
 from app.core import config, offsite_hold
 from app.core import fisqua_contract as fc
+
+from app.core.scheduler_control import StoppableWorker
 
 logger = logging.getLogger(__name__)
 
@@ -173,8 +189,8 @@ _LOOPBACK_HOSTS = ("127.0.0.1", "localhost", "::1")
 _warned_overrides: set = set()
 
 
-def _usable_override(value: str) -> Optional[str]:
-    """CAPTUA_FISQUA_BASE_URL when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
+def _usable_override(value: str, name: str = "CAPTUA_FISQUA_BASE_URL") -> Optional[str]:
+    """The override `name` when it is https://, or http:// to a loopback host (tests); else None, with a warning."""
     from urllib.parse import urlsplit
 
     try:
@@ -188,8 +204,8 @@ def _usable_override(value: str) -> Optional[str]:
         return value.rstrip("/")
     if value not in _warned_overrides:
         _warned_overrides.add(value)
-        logger.warning("CAPTUA_FISQUA_BASE_URL %r is ignored: it must be https://, or http:// to 127.0.0.1, "
-                       "localhost or [::1] for tests; the environment's host is used", value)
+        logger.warning("%s %r is ignored: it must be https://, or http:// to 127.0.0.1, "
+                       "localhost or [::1] for tests; the environment's host is used", name, value)
     return None
 
 
@@ -215,9 +231,9 @@ def config_fingerprint() -> str:
     read), so that an update, or failing that a restart, clears a stop for
     a manifest Fisqua could not read (reason `version`); a retest that
     Fisqua accepts clears it too, without any change here
-    (_retest_version_stop). CAPTUA_FISQUA_ROTATE_DEG picks the contract
-    version the manifests are written in (app.core.capture_manifest), so
-    changing it clears a version stop in the same way. Neither the token nor
+    (_retest_version_stop). CAPTUA_FISQUA_ROTATE_DEG decides whether the
+    manifests carry rotateDeg (app.core.capture_manifest), so changing it
+    clears a version stop in the same way. Neither the token nor
     a full hash of it is kept anywhere.
     """
     from app.core import version
@@ -288,6 +304,8 @@ class TransportResult:
     volumes: Optional[list] = None
     # config_error: `token`, `not_found` or `redirect`.
     reason: Optional[str] = None
+    # get_queue: the ETag of a 200, without its quotes.
+    etag: Optional[str] = None
 
 
 class FisquaTransport(Protocol):
@@ -296,6 +314,19 @@ class FisquaTransport(Protocol):
     def get_status(self, refs: list) -> TransportResult: ...
 
     def get_decisions(self, ref: str) -> TransportResult: ...
+
+    # Contract 1.7 (app.core.fisqua_queue).
+    def put_operators(self, body: dict) -> TransportResult: ...
+
+    def get_queue(self, revision: Optional[str]) -> TransportResult: ...
+
+    def post_queue_ack(self, body: dict) -> TransportResult: ...
+
+    # Contract 1.8 (app.core.unit_mode.check_reference_code).
+    def get_description(self, ref: str) -> TransportResult: ...
+
+    # Contract 1.10 (app.core.unit_mode.search_descriptions).
+    def search_descriptions(self, q: str) -> TransportResult: ...
 
 
 class NullTransport:
@@ -310,15 +341,56 @@ class NullTransport:
     def get_decisions(self, ref: str) -> TransportResult:
         return TransportResult(outcome="error", error="Fisqua is not configured")
 
+    def put_operators(self, body: dict) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
 
-def get_transport() -> FisquaTransport:
-    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured."""
+    def get_queue(self, revision: Optional[str]) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def post_queue_ack(self, body: dict) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def get_description(self, ref: str) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+    def search_descriptions(self, q: str) -> TransportResult:
+        return TransportResult(outcome="error", error="Fisqua is not configured")
+
+
+def get_transport(bypass_mode: bool = False) -> FisquaTransport:
+    """The HTTPS transport to the configured Fisqua, or NullTransport when it is not configured.
+
+    Its every request is refused outside fisqua mode (fisqua_http.HttpFisquaTransport)
+    unless `bypass_mode`, which only app.core.unit_mode asks for.
+    """
     url = base_url()
     if url is None:
         return NullTransport()
     from app.core.fisqua_http import HttpFisquaTransport
 
-    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS)
+    return HttpFisquaTransport(url, _token(), timeout=config.settings.FISQUA_TIMEOUT_SECONDS,
+                               bypass_mode=bypass_mode)
+
+
+def close_transport(transport) -> None:
+    """Close a transport a call obtained for itself, when the call ends. Never raises.
+
+    Every call that obtains its own transport (one from get_transport, its
+    caller having passed none) closes it in a finally, and a transport a
+    caller passes in is left open for that caller. The backend keeps no
+    client for the process: a unit's pairing can change while the process
+    runs, and a client kept across calls could be used for the old pairing.
+    A transport closed after each call has no state to invalidate, and is
+    safe on the scheduler thread and on request threads. An object without
+    a close() (NullTransport, a test stand-in) is left as it is.
+    """
+    close = getattr(transport, "close", None)
+    if close is None:
+        return
+    try:
+        close()
+    except Exception:
+        logger.exception("Closing the Fisqua transport raised")
 
 
 # ---------------------------------------------------------------------------
@@ -571,6 +643,11 @@ class CallBudget:
             until = self._clock() + max(0.0, float(seconds))
             self._cool_until = max(getattr(self, "_cool_until", 0.0), until)
 
+    def cooling_for(self) -> float:
+        """The seconds left of the latest Retry-After; 0 when it has passed."""
+        with self._lock:
+            return max(0.0, getattr(self, "_cool_until", float("-inf")) - self._clock())
+
     def cooling(self) -> bool:
         """Whether a Retry-After from a status or decisions answer has not yet passed."""
         with self._lock:
@@ -612,8 +689,9 @@ def enqueue_handover(db: Session, collection):
     """Queue a new manifest for a volume just handed over; supersede its unsent ones.
 
     Does not commit: the caller commits it with the handover. Returns the new
-    row, or None when Fisqua is not configured (the unsent rows are
-    superseded all the same).
+    row, queued whatever the configuration (NEH-320): on a unit without
+    Fisqua configured, or outside fisqua mode, it waits, and nothing is sent
+    (run_fisqua_outbox answers `disabled` or `off_in_this_mode`).
     """
     from app.models.fisqua import FisquaOutbox
 
@@ -627,8 +705,6 @@ def enqueue_handover(db: Session, collection):
         .execution_options(synchronize_session=False)
     )
     _cancel_sending(db, collection.id, "superseded")
-    if not fisqua_configured():
-        return None
     row = FisquaOutbox(collection_id=collection.id, manifest_id=str(uuid.uuid4()),
                        stem=collection.filename_stem, state="waiting_for_upload", attempts=0,
                        created_at=_now())
@@ -638,6 +714,59 @@ def enqueue_handover(db: Session, collection):
         row.last_error = problem["message"]
     db.add(row)
     return row
+
+
+def handed_over_before(db: Session, collection_id: Optional[int]) -> bool:
+    """Whether the volume has been handed over to Fisqua before: it has an outbox row, whatever its state."""
+    from app.models.fisqua import FisquaOutbox
+
+    if collection_id is None:
+        return False
+    return db.query(FisquaOutbox.id).filter(FisquaOutbox.collection_id == collection_id).first() is not None
+
+
+def hand_over_again_after_missing_change(db: Session, collection_id: Optional[int]):
+    """Queue a new handover after a volume's missing records changed, when one is due (contract 1.9 §10.4).
+
+    Called in the transaction of a change to a volume's missing records:
+    placeholders inserted (POST /collections/{id}/records/missing-opening or
+    a Fisqua request), a page marked missing (POST /records/{id}/missing-page
+    or a Fisqua decision), or a missing record closed (POST
+    /records/{id}/close-missing), after that path's record locks, as
+    promotion queues its handover after its own. It takes the volume's row
+    first (app.core.volume_stem.locked_volume_query), so two changes on one
+    volume take turns. Due when the volume has
+    been handed over before (it has an outbox row) and now holds no captured
+    record other than open missing ones, which the manifest lists as
+    missing, and no record waiting for a retake, which would refuse its
+    promotion (app.core.recapture_turn.retake_clause). Then it is
+    enqueue_handover, as promotion does. Does not commit. Returns the new
+    row, or None when none was queued.
+    """
+    from app.core.recapture_turn import open_missing_clause, retake_clause
+    from app.models.collection import Collection
+    from app.models.record import Record
+
+    from app.core import volume_stem
+
+    if collection_id is None:
+        return None
+    # The volume's row, after the caller's record locks, so two missing
+    # changes on one volume take turns and only one queues a live handover.
+    # The routes and apply_decisions take it before any status change, so
+    # here it is usually held already; kept for callers that came without it.
+    volume_stem.locked_volume_query(db, collection_id).first()
+    if not handed_over_before(db, collection_id):
+        return None
+    db.flush()
+    held = db.query(Record.id).filter(
+        Record.collection_id == collection_id,
+        ((Record.status == "captured") & ~open_missing_clause()) | retake_clause(),
+    ).first()
+    collection = db.get(Collection, collection_id)
+    if held is not None or collection is None:
+        return None
+    return enqueue_handover(db, collection)
 
 
 def _reference_problem(collection) -> Optional[dict]:
@@ -762,14 +891,48 @@ class _Run:
         return dict(self.__dict__)
 
 
+def _kept_now(db: Session, collection_id: int) -> bool:
+    """Whether the volume is kept on the unit, read with its row FOR SHARE in a new transaction (NEH-320).
+
+    Taken just before a waiting row is moved out of waiting_for_upload; the
+    move's commit ends the lock. A keep (app.core.kept_volumes.keep, which
+    takes the volume FOR NO KEY UPDATE) either committed before this read
+    and is seen, or waits for the move's commit and then finds the row moved
+    (a manifest on its way, so the keep is refused as already_left_unit).
+    One collection row only, taken before the outbox row's update, so it
+    cannot close a cycle with the lockers in kept_volumes' "Lock order".
+    A volume deleted meanwhile counts as kept: nothing is moved.
+    """
+    from app.models.collection import Collection
+
+    kept = (db.query(Collection.kept_on_unit).filter(Collection.id == collection_id)
+            .with_for_update(read=True).first())
+    return kept is None or bool(kept.kept_on_unit)
+
+
 def _promote(db: Session, row, result: _Run) -> None:
+    """Move a waiting row to ready (or refused, when not exportable) once its volume's files are offsite.
+
+    A kept volume's row waits, and so does one an unfinished adoption's
+    journal names (app.core.adopt_journal), read under the build's hold. The
+    flag is read first without a lock and,
+    after the manifest is built and that read transaction ended, again with
+    the volume's row FOR SHARE before each move out of waiting_for_upload
+    (_kept_now), so a keep committed while the manifest was built leaves
+    the row waiting.
+    """
     from app.core import capture_manifest
+    from app.core.adopt_journal import journal_names_volume
     from app.core.export_jobs import FilesChanging, export_jobs
     from app.core.image_upload import volume_upload_state
     from app.models.collection import Collection
 
     collection = db.get(Collection, row.collection_id)
     if collection is None:
+        return
+    if collection.kept_on_unit:
+        # Kept on the unit (app.core.kept_volumes): the row waits, whatever the volume's state.
+        result.waiting += 1
         return
     state = volume_upload_state(db, collection)
     if state["uploadable"] and not state["received"]:
@@ -778,6 +941,10 @@ def _promote(db: Session, row, result: _Run) -> None:
     problem = _reference_problem(collection)
     if problem is not None:
         db.rollback()
+        if _kept_now(db, row.collection_id):
+            db.rollback()
+            result.waiting += 1
+            return
         if _move(db, row.id, "waiting_for_upload", state="refused", refusal="not_exportable",
                  problems=[problem], last_error=problem["message"]):
             result.not_exportable += 1
@@ -787,13 +954,30 @@ def _promote(db: Session, row, result: _Run) -> None:
     manifest_uuid = uuid.UUID(row.manifest_id)
     try:
         with export_jobs.hold_for_reading([collection.id]):
+            # Under the hold an adoption's own hold excludes: while an adoption runs this read is refused
+            # (FilesChanging), and one that returned with its journal kept is seen here, so no manifest is
+            # built from rows and files its startup recovery has still to finish or undo.
+            if journal_names_volume(collection.id):
+                db.rollback()
+                result.waiting += 1
+                return
             doc = capture_manifest.build_capture_manifest(db, collection, new_id=lambda: manifest_uuid)
     except FilesChanging:
         db.rollback()
         result.waiting += 1
         return
+    except capture_manifest.CalibrationWaiting:
+        # Its colour card shots are still being uploaded: the evaluation that
+        # builds the manifest is the one that holds it (colour_card.evaluate).
+        db.rollback()
+        result.waiting += 1
+        return
     except capture_manifest.ManifestRefused as exc:
         db.rollback()
+        if _kept_now(db, row.collection_id):
+            db.rollback()
+            result.waiting += 1
+            return
         if _move(db, row.id, "waiting_for_upload", state="refused", refusal="not_exportable",
                  problems=[p.as_dict() for p in exc.problems], last_error=scrub(exc.message)):
             result.not_exportable += 1
@@ -801,6 +985,10 @@ def _promote(db: Session, row, result: _Run) -> None:
                            row.manifest_id, collection.id, ", ".join(p.rule for p in exc.problems))
         return
     db.rollback()  # end the build's read transaction
+    if _kept_now(db, row.collection_id):
+        db.rollback()
+        result.waiting += 1
+        return
     sent_ref = (doc.get("volumes") or [{}])[0].get("externalId")
     if _move(db, row.id, "waiting_for_upload", state="ready", manifest=doc,
              reference_code=sent_ref[:255] if isinstance(sent_ref, str) and sent_ref else None):
@@ -886,7 +1074,10 @@ def _resend_version_refusals(db: Session) -> int:
     how many were handed over again.
     """
     again = 0
-    for row, collection in _version_refused_volumes(db):
+    for row, _ in _version_refused_volumes(db):
+        collection = _lock_version_refused(db, row.collection_id, row.id)
+        if collection is None:
+            continue
         enqueue_handover(db, collection)
         db.commit()
         again += 1
@@ -901,7 +1092,6 @@ def _version_refused_volumes(db: Session) -> list:
 
     from app.models.collection import Collection
     from app.models.fisqua import FisquaOutbox
-    from app.models.record import Record
 
     newest = (db.query(FisquaOutbox.collection_id, func.max(FisquaOutbox.id))
               .group_by(FisquaOutbox.collection_id).subquery())
@@ -913,13 +1103,60 @@ def _version_refused_volumes(db: Session) -> list:
     for row in rows:
         if not _version_refusal(row.problems):
             continue
-        captured = db.query(Record.id).filter(Record.collection_id == row.collection_id,
-                                              Record.status == "captured").first()
         collection = db.get(Collection, row.collection_id)
-        if captured is not None or collection is None:
+        if _holds_captured(db, row.collection_id) or collection is None:
             continue
         found.append((row, collection))
     return found
+
+
+def _holds_captured(db: Session, collection_id: int) -> bool:
+    """Whether the volume holds a captured record other than an open missing one.
+
+    An open missing record (a page or an opening never captured, and not
+    closed) stays captured on the unit until it is captured into or closed,
+    and the manifest lists it as missing (capture_manifest), so it does not
+    hold the volume back. A closed one is promoted like any record, so while
+    it is captured it does.
+    """
+    from app.core.recapture_turn import open_missing_clause
+    from app.models.record import Record
+
+    return db.query(Record.id).filter(Record.collection_id == collection_id,
+                                      Record.status == "captured",
+                                      ~open_missing_clause()).first() is not None
+
+
+def _lock_version_refused(db: Session, collection_id: int, row_id: int):
+    """The volume FOR UPDATE, if row_id is still its newest row and it still qualifies; else None, after a rollback.
+
+    _version_refused_volumes chose the volume without a lock. A handover
+    takes the volume's row before its outbox rows
+    (app.core.volume_stem.locked_volume_query), and enqueue_handover then
+    updates those rows and inserts one whose key takes the volume's row FOR
+    KEY SHARE; taken in this order here too, the two cannot deadlock. Under
+    the lock the choice is made again: the volume's newest outbox row is
+    still that version refusal, and it holds no captured record other than
+    open missing ones. A handover or a capture committed since the choice
+    stands for the volume instead, so it is skipped.
+    """
+    from sqlalchemy import func
+
+    from app.core import volume_stem
+    from app.models.fisqua import FisquaOutbox
+
+    collection = volume_stem.locked_volume_query(db, collection_id).first()
+    newest = None
+    if collection is not None:
+        newest_id = (db.query(func.max(FisquaOutbox.id))
+                     .filter(FisquaOutbox.collection_id == collection_id).scalar())
+        newest = (db.query(FisquaOutbox.state, FisquaOutbox.refusal, FisquaOutbox.problems)
+                  .filter(FisquaOutbox.id == newest_id).first() if newest_id == row_id else None)
+    if (newest is None or newest.state != "refused" or newest.refusal != "fisqua"
+            or not _version_refusal(newest.problems) or _holds_captured(db, collection_id)):
+        db.rollback()
+        return None
+    return collection
 
 
 def _retest_candidates(db: Session, retest_row: Optional[int]) -> list:
@@ -1027,6 +1264,9 @@ def _retest_version_stop(db: Session, transport, clock: Callable[[], datetime], 
     row = None
     for kind, row_id, collection in _retest_candidates(db, retest_row):
         if kind == "hand_over":
+            collection = _lock_version_refused(db, collection.id, row_id)
+            if collection is None:
+                continue
             new = enqueue_handover(db, collection)
             db.commit()
             if new is None:
@@ -1107,6 +1347,13 @@ def _send(db: Session, row, transport, clock: Callable[[], datetime], result: _R
             logger.info("Fisqua accepted manifest %s of volume %s: %s",
                         row.manifest_id, row.collection_id, answer.status or "no state given")
         result.delivered += 1
+    elif answer.outcome == "off_in_this_mode":
+        # The transport refused it for the unit's mode, and sent nothing: it
+        # goes back to ready, without an attempt counted, and is sent once
+        # the unit is back in fisqua mode.
+        _end_send(db, row.id, state="ready", attempts=attempts - 1)
+        result.status = "off_in_this_mode"
+        return False
     elif answer.outcome == "config_error":
         # Not this manifest's fault: it goes back to ready, to be sent as it
         # is once the configuration is changed.
@@ -1154,7 +1401,8 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
     """One pass: recover, promote, send. Never raises; the caller gets counts and a status.
 
     Statuses: "rate_limited" (the shared call_budget was spent: the rest is
-    sent at a later pass), "disabled" (Fisqua not configured), "held" (the offsite upload
+    sent at a later pass), "disabled" (Fisqua not configured), "off_in_this_mode" (the
+    unit is not in fisqua mode, app.core.unit_mode: nothing is promoted or sent), "held" (the offsite upload
     hold exists, app.core.offsite_hold: nothing is promoted or sent, and no
     call is made), "no_transport" (rows are promoted, nothing is sent), "config_error" (Fisqua refused the
     configuration: rows are promoted, nothing is sent until it changes), "done",
@@ -1164,85 +1412,100 @@ def run_fisqua_outbox(db: Session, *, transport: Optional[FisquaTransport] = Non
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    # Outside fisqua mode the link makes no call (app.core.unit_mode); the
+    # rows stay as they are and go out if the unit returns to fisqua.
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     # Promotion too: while the hold exists the one-time commands are still
     # completing the objects' state, and a volume can read as received, or
     # not exportable, on what they have not yet written.
     if offsite_hold.held("fisqua outbox"):
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
+    owned = transport is None
     transport = transport if transport is not None else get_transport()
-    if clock is None:
-        fixed = _naive(now)
-        clock = (lambda: fixed) if fixed is not None else _now
-    now = _naive(clock())
-    result = _Run()
+    try:
+        if clock is None:
+            fixed = _naive(now)
+            clock = (lambda: fixed) if fixed is not None else _now
+        now = _naive(clock())
+        result = _Run()
 
-    def stopping() -> bool:
-        if stop is not None and stop.is_set():
-            result.status = "stopped"
-            return True
-        return False
+        def stopping() -> bool:
+            if stop is not None and stop.is_set():
+                result.status = "stopped"
+                return True
+            # A switch out of fisqua mode stops the pass before the next row.
+            if not unit_mode.link_on(db):
+                result.status = unit_mode.OFF_STATUS
+                return True
+            return False
 
-    with _step_lock:
-        try:
-            # Only this step sends, and one at a time, so a row found
-            # `sending` was left by a run that did not finish. Fisqua may or
-            # may not have it; it is sent again with the same manifest id,
-            # and Fisqua answers a repeated id with its original answer.
-            for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
-                _end_send(db, row_id, state="failed", next_attempt_at=now,
-                          last_error="interrupted while sending")
+        with _step_lock:
+            try:
+                # Only this step sends, and one at a time, so a row found
+                # `sending` was left by a run that did not finish. Fisqua may or
+                # may not have it; it is sent again with the same manifest id,
+                # and Fisqua answers a repeated id with its original answer.
+                for (row_id,) in db.query(FisquaOutbox.id).filter(FisquaOutbox.state == "sending").all():
+                    _end_send(db, row_id, state="failed", next_attempt_at=now,
+                              last_error="interrupted while sending")
 
-            # Read the stop first: an update that cleared a version stop
-            # leaves its retest row to be built again.
-            config_error()
-            _rebuild_stale_retest(db)
+                # Read the stop first: an update that cleared a version stop
+                # leaves its retest row to be built again.
+                config_error()
+                _rebuild_stale_retest(db)
 
-            # Not `stop`: that is the caller's shutdown event, which stopping() reads.
-            unit_stop = config_error()
-            if unit_stop is not None and unit_stop.get("reason") == fc.VERSION_REASON:
-                # Nothing is built under the software Fisqua could not read,
-                # but the one manifest of a retest, once an interval.
-                if not _retest_version_stop(db, transport, clock, result, stopping):
-                    if result.status != "stopped":
-                        result.status = "config_error"
+                # Not `stop`: that is the caller's shutdown event, which stopping() reads.
+                unit_stop = config_error()
+                if unit_stop is not None and unit_stop.get("reason") == fc.VERSION_REASON:
+                    # Nothing is built under the software Fisqua could not read,
+                    # but the one manifest of a retest, once an interval.
+                    if not _retest_version_stop(db, transport, clock, result, stopping):
+                        if result.status not in ("stopped", "off_in_this_mode"):
+                            result.status = "config_error"
+                        return result.as_dict()
+                    unit_stop = None
+                if unit_stop is None:
+                    _resend_version_refusals(db)
+
+                for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
+                            .order_by(FisquaOutbox.id).all()):
+                    if stopping():
+                        return result.as_dict()
+                    _promote(db, row, result)
+
+                if isinstance(transport, NullTransport):
+                    result.status = "no_transport"
                     return result.as_dict()
-                unit_stop = None
-            if unit_stop is None:
-                _resend_version_refusals(db)
-
-            for row in (db.query(FisquaOutbox).filter(FisquaOutbox.state == "waiting_for_upload")
-                        .order_by(FisquaOutbox.id).all()):
-                if stopping():
+                if config_error() is not None:
+                    result.status = "config_error"
                     return result.as_dict()
-                _promote(db, row, result)
 
-            if isinstance(transport, NullTransport):
-                result.status = "no_transport"
-                return result.as_dict()
-            if config_error() is not None:
-                result.status = "config_error"
-                return result.as_dict()
-
-            due = (db.query(FisquaOutbox)
-                   .filter((FisquaOutbox.state == "ready")
-                           | ((FisquaOutbox.state == "failed") & (FisquaOutbox.next_attempt_at <= now)))
-                   .order_by(FisquaOutbox.id).limit(fc.MAX_SENDS_PER_PASS).all())
-            # At most MAX_SENDS_PER_PASS (the contract's calls a minute); the
-            # rest are sent on the next pass.
-            for row in due:
-                if stopping():
-                    return result.as_dict()
-                if not call_budget.take():
-                    result.status = "rate_limited"
-                    break
-                if not _send(db, row, transport, clock, result):
-                    break
-        except Exception:
-            db.rollback()
-            logger.exception("The Fisqua outbox step raised")
-            result.status = "error"
-    _log_pass(result)
-    return result.as_dict()
+                due = (db.query(FisquaOutbox)
+                       .filter((FisquaOutbox.state == "ready")
+                               | ((FisquaOutbox.state == "failed") & (FisquaOutbox.next_attempt_at <= now)))
+                       .order_by(FisquaOutbox.id).limit(fc.MAX_SENDS_PER_PASS).all())
+                # At most MAX_SENDS_PER_PASS (the contract's calls a minute); the
+                # rest are sent on the next pass.
+                for row in due:
+                    if stopping():
+                        return result.as_dict()
+                    if not call_budget.take():
+                        result.status = "rate_limited"
+                        break
+                    if not _send(db, row, transport, clock, result):
+                        break
+            except Exception:
+                db.rollback()
+                logger.exception("The Fisqua outbox step raised")
+                result.status = "error"
+        _log_pass(result)
+        return result.as_dict()
+    finally:
+        if owned:
+            close_transport(transport)
 
 
 def _log_pass(result: "_Run") -> None:
@@ -1326,106 +1589,125 @@ def poll_fisqua_status(db: Session, *, transport: Optional[FisquaTransport] = No
     """Ask Fisqua for every volume not yet final, in batches; keep each answer. Never raises.
 
     Answers "held", with no call, while the offsite upload hold exists
-    (app.core.offsite_hold).
+    (app.core.offsite_hold), and "off_in_this_mode", with no call, outside
+    fisqua mode (app.core.unit_mode).
     """
     from app.models.fisqua import FisquaOutbox
 
     if not fisqua_configured():
         return {"status": "disabled"}
+    from app.core import unit_mode
+
+    if not unit_mode.link_on(db):
+        return unit_mode.off(db)
     if offsite_hold.held("fisqua status poll"):
         return {"status": "held", "hold_file": str(offsite_hold.hold_file())}
+    owned = transport is None
     transport = transport if transport is not None else get_transport()
-    if isinstance(transport, NullTransport):
-        return {"status": "no_transport"}
-    now = _naive(now) or _now()
-    result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "changed": 0, "recovered": 0,
-              "decisions_fetched": 0, "decisions_applied": 0, "decisions_stale": 0}
-    with _step_lock:
-        try:
-            if config_error() is not None:
-                return {**result, "status": "config_error"}
-            # Fisqua asked the unit to wait (Retry-After on a status or
-            # decisions answer); sends keep their own per-row backoff.
-            if call_budget.cooling():
-                return {**result, "status": "cooling_down"}
-            wanted = volumes_to_poll(db)
-            db.rollback()
-            global _status_cursor
-            refs = sorted(wanted)
-            if _status_cursor is not None:
-                from bisect import bisect_right
-                at = bisect_right(refs, _status_cursor)
-                refs = refs[at:] + refs[:at]
-            result["asked"] = len(refs)
-            # {collection id: (ref, decisionsId)} for each entry offering a set.
-            offered = {}
-            for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
-                chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
-                if not call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
-                    result["status"] = "rate_limited"
-                    break
-                result["calls"] += 1
-                _status_cursor = chunk[-1]
-                try:
-                    answer = transport.get_status(chunk)
-                except Exception as exc:
-                    answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
-                answer = _redacted(answer)
-                if answer.outcome == "config_error":
-                    record_config_error(answer.status_code, answer.reason, now)
+    try:
+        if isinstance(transport, NullTransport):
+            return {"status": "no_transport"}
+        now = _naive(now) or _now()
+        result = {"status": "done", "asked": 0, "calls": 0, "answered": 0, "changed": 0, "recovered": 0,
+                  "decisions_fetched": 0, "decisions_applied": 0, "decisions_stale": 0}
+        with _step_lock:
+            try:
+                if config_error() is not None:
                     return {**result, "status": "config_error"}
-                if answer.outcome != "status":
-                    logger.warning("Asking Fisqua for the status of %s volume(s) failed: %s",
-                                   len(chunk), scrub(answer.error or answer.outcome))
-                    if answer.retry_after is not None:
-                        call_budget.cool_down(answer.retry_after)
-                        return {**result, "status": "cooling_down"}
-                    result["status"] = "error"
-                    continue
-                for entry in answer.volumes or []:
-                    ref = entry.get(fc.F_REF)
-                    if ref not in wanted or ref not in chunk:
-                        continue
-                    cid, _manifest_id = wanted[ref]
-                    manifest_id = entry.get(fc.F_MANIFEST_ID)
-                    manifest_id = manifest_id if isinstance(manifest_id, str) else None
-                    state = entry.get(fc.F_STATE)
-                    problems = entry.get(fc.F_PROBLEMS)
-                    if _keep_status(db, cid, manifest_id, state if isinstance(state, str) else None,
-                                    _parse_time(entry.get(fc.F_ENTERED_AT)),
-                                    problems if problems else None, now):
-                        result["changed"] += 1
-                    result["answered"] += 1
-                    decisions_id = entry.get(fc.F_DECISIONS_ID)
-                    if isinstance(decisions_id, str) and decisions_id:
-                        offered[cid] = (ref, decisions_id)
-                        _keep_offered(db, cid, decisions_id[:255])
-                    # Recover a lost answer only when Fisqua accepted the
-                    # manifest. One it refused is left failed and sent again
-                    # with the same id: Fisqua replays its stored answer, and
-                    # the refusal takes the one path every refusal takes
-                    # (_send), object-missing incident included.
-                    if manifest_id is not None and state != fc.STATE_REFUSED:
-                        lost = (db.query(FisquaOutbox.id)
-                                .filter(FisquaOutbox.collection_id == cid,
-                                        FisquaOutbox.manifest_id == manifest_id,
-                                        FisquaOutbox.state == "failed")
-                                .scalar())
+                # Fisqua asked the unit to wait (Retry-After on a status or
+                # decisions answer); sends keep their own per-row backoff.
+                if call_budget.cooling():
+                    return {**result, "status": "cooling_down"}
+                wanted = volumes_to_poll(db)
+                db.rollback()
+                global _status_cursor
+                refs = sorted(wanted)
+                if _status_cursor is not None:
+                    from bisect import bisect_right
+                    at = bisect_right(refs, _status_cursor)
+                    refs = refs[at:] + refs[:at]
+                result["asked"] = len(refs)
+                # {collection id: (ref, decisionsId)} for each entry offering a set.
+                offered = {}
+                for start in range(0, len(refs), fc.MAX_REFS_PER_CALL):
+                    chunk = refs[start:start + fc.MAX_REFS_PER_CALL]
+                    # A switch out of fisqua mode stops the poll before the next call.
+                    if not unit_mode.link_on(db):
                         db.rollback()
-                        volume_id = entry.get(fc.F_VOLUME_ID)
-                        if lost is not None and _move(
-                                db, lost, "failed", state="delivered", delivered_at=now,
-                                response=entry, last_error=None, next_attempt_at=None,
-                                external_id=str(volume_id) if volume_id not in (None, "") else None):
-                            result["recovered"] += 1
-            if _fetch_decisions(db, transport, offered, now, result) is False:
-                return {**result, "status": "config_error"}
-        except Exception:
-            db.rollback()
-            logger.exception("The Fisqua status poll raised")
-            result["status"] = "error"
-    _log_poll(result)
-    return result
+                        return {**result, "status": unit_mode.OFF_STATUS}
+                    if not call_budget.take(reserve=fc.DECISIONS_RESERVED_CALLS):
+                        result["status"] = "rate_limited"
+                        break
+                    result["calls"] += 1
+                    _status_cursor = chunk[-1]
+                    try:
+                        answer = transport.get_status(chunk)
+                    except Exception as exc:
+                        answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
+                    answer = _redacted(answer)
+                    if answer.outcome == "off_in_this_mode":
+                        return {**result, "status": "off_in_this_mode"}
+                    if answer.outcome == "config_error":
+                        record_config_error(answer.status_code, answer.reason, now)
+                        return {**result, "status": "config_error"}
+                    if answer.outcome != "status":
+                        logger.warning("Asking Fisqua for the status of %s volume(s) failed: %s",
+                                       len(chunk), scrub(answer.error or answer.outcome))
+                        if answer.retry_after is not None:
+                            call_budget.cool_down(answer.retry_after)
+                            return {**result, "status": "cooling_down"}
+                        result["status"] = "error"
+                        continue
+                    for entry in answer.volumes or []:
+                        ref = entry.get(fc.F_REF)
+                        if ref not in wanted or ref not in chunk:
+                            continue
+                        cid, _manifest_id = wanted[ref]
+                        manifest_id = entry.get(fc.F_MANIFEST_ID)
+                        manifest_id = manifest_id if isinstance(manifest_id, str) else None
+                        state = entry.get(fc.F_STATE)
+                        problems = entry.get(fc.F_PROBLEMS)
+                        if _keep_status(db, cid, manifest_id, state if isinstance(state, str) else None,
+                                        _parse_time(entry.get(fc.F_ENTERED_AT)),
+                                        problems if problems else None, now):
+                            result["changed"] += 1
+                        result["answered"] += 1
+                        decisions_id = entry.get(fc.F_DECISIONS_ID)
+                        if isinstance(decisions_id, str) and decisions_id:
+                            offered[cid] = (ref, decisions_id)
+                            _keep_offered(db, cid, decisions_id[:255])
+                        # Recover a lost answer only when Fisqua accepted the
+                        # manifest. One it refused is left failed and sent again
+                        # with the same id: Fisqua replays its stored answer, and
+                        # the refusal takes the one path every refusal takes
+                        # (_send), object-missing incident included.
+                        if manifest_id is not None and state != fc.STATE_REFUSED:
+                            lost = (db.query(FisquaOutbox.id)
+                                    .filter(FisquaOutbox.collection_id == cid,
+                                            FisquaOutbox.manifest_id == manifest_id,
+                                            FisquaOutbox.state == "failed")
+                                    .scalar())
+                            db.rollback()
+                            volume_id = entry.get(fc.F_VOLUME_ID)
+                            if lost is not None and _move(
+                                    db, lost, "failed", state="delivered", delivered_at=now,
+                                    response=entry, last_error=None, next_attempt_at=None,
+                                    external_id=str(volume_id) if volume_id not in (None, "") else None):
+                                result["recovered"] += 1
+                if not unit_mode.link_on(db):
+                    db.rollback()
+                    return {**result, "status": unit_mode.OFF_STATUS}
+                if _fetch_decisions(db, transport, offered, now, result) is False:
+                    return {**result, "status": "config_error"}
+            except Exception:
+                db.rollback()
+                logger.exception("The Fisqua status poll raised")
+                result["status"] = "error"
+        _log_poll(result)
+        return result
+    finally:
+        if owned:
+            close_transport(transport)
 
 
 def _log_poll(result: dict) -> None:
@@ -1468,7 +1750,13 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     if _decisions_cursor is not None:
         at = bisect_right([ref for _cid, (ref, _d) in order], _decisions_cursor)
         order = order[at:] + order[:at]
+    from app.core import unit_mode
+
     for cid, (ref, decisions_id) in order:
+        if not unit_mode.link_on(db):
+            db.rollback()
+            result["status"] = unit_mode.OFF_STATUS
+            break
         status = db.get(FisquaStatus, cid)
         seen = (status.decisions_id, status.decisions_stale_id) if status is not None else (None, None)
         db.rollback()
@@ -1484,6 +1772,9 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
         except Exception as exc:
             answer = TransportResult(outcome="error", error=f"{type(exc).__name__}: {exc}")
         answer = _redacted(answer)
+        if answer.outcome == "off_in_this_mode":
+            result["status"] = "off_in_this_mode"
+            break
         if answer.outcome == "config_error":
             record_config_error(answer.status_code, answer.reason, now)
             return False
@@ -1509,17 +1800,20 @@ def _fetch_decisions(db: Session, transport, offered: dict, now: datetime, resul
     return True
 
 
-class FisquaStatusScheduler:
+class FisquaStatusScheduler(StoppableWorker):
     """Polls Fisqua every FISQUA_POLL_INTERVAL_SECONDS (ten minutes), in a thread of its own.
 
-    A tick with no volume to ask for makes no call, so the poll runs only
-    while some sent volume is not final.
+    A tick's status poll with no volume to ask for makes no call, so it
+    asks only while some sent volume is not final. Each tick then runs the
+    digitisation queue's sync (app.core.fisqua_queue), which asks for the
+    queue every tick; the unit's users are sent when the thread starts.
     """
 
     def __init__(self) -> None:
         self._stop = threading.Event()
         self._thread: Optional[threading.Thread] = None
         self.last_result: Optional[dict] = None
+        self.last_queue_result: Optional[dict] = None
 
     def start(self) -> bool:
         if not fisqua_configured():
@@ -1534,14 +1828,21 @@ class FisquaStatusScheduler:
 
     def stop(self, timeout: float = 5.0) -> None:
         self._stop.set()
-        thread, self._thread = self._thread, None
+        thread = self._thread
         if thread is not None and thread.is_alive():
             thread.join(timeout=timeout)
+        # A worker still alive is kept, so worker_alive() and wait_stopped()
+        # never report a live thread as gone.
+        if thread is not None and not thread.is_alive() and self._thread is thread:
+            self._thread = None
 
     def is_running(self) -> bool:
         return self._thread is not None and self._thread.is_alive()
 
     def _loop(self) -> None:
+        # The unit's users go to Fisqua at start (contract 1.7), before the
+        # first poll; a failure is retried at the next tick.
+        self.send_operators_at_start()
         if self._stop.wait(config.settings.OFFSITE_BACKUP_DELAY_SECONDS):
             return
         while True:
@@ -1549,18 +1850,38 @@ class FisquaStatusScheduler:
             if self._stop.wait(config.settings.FISQUA_POLL_INTERVAL_SECONDS):
                 return
 
+    def send_operators_at_start(self) -> None:
+        from app.core.db import SessionLocal
+        from app.core.fisqua_queue import send_operators
+
+        db = SessionLocal()
+        try:
+            send_operators(db)
+        except Exception:
+            logger.exception("Sending the unit's users to Fisqua at start raised")
+        finally:
+            db.close()
+
     def tick(self) -> Optional[dict]:
         from app.core.db import SessionLocal
+        from app.core.fisqua_queue import sync_fisqua_queue
 
         db = SessionLocal()
         try:
             self.last_result = poll_fisqua_status(db)
-            return self.last_result
         except Exception:
             logger.exception("Scheduled Fisqua status poll raised")
-            return None
+            self.last_result = None
+        try:
+            # The digitisation queue, with the status poll (contract 1.7).
+            self.last_queue_result = sync_fisqua_queue(db)
+        except Exception:
+            db.rollback()
+            logger.exception("Scheduled Fisqua queue sync raised")
+            self.last_queue_result = None
         finally:
             db.close()
+        return self.last_result
 
 
 fisqua_status_scheduler = FisquaStatusScheduler()
@@ -1612,13 +1933,22 @@ def volume_fisqua_state(db: Session, collection_id: int) -> Optional[dict]:
     }
 
 
-def unit_fisqua_summary() -> dict:
-    """The unit-level Fisqua state for the system panel: configured, environment, configuration error, last runs."""
+def unit_fisqua_summary(db: Session) -> dict:
+    """The unit-level Fisqua state for the system panel: configured, environment, configuration error, last runs.
+
+    `configured` is the configuration's answer (fisqua_configured) and
+    `mode_allows` the unit mode's (unit_mode.link_on: fisqua mode only), so a
+    unit configured for Fisqua but in offline or backup mode answers
+    configured true and mode_allows false, and calls Fisqua for nothing
+    (NEH-319). `db` is the caller's session; none is opened here.
+    """
+    from app.core import unit_mode
     from app.core.image_upload import image_upload_scheduler
 
     configured = fisqua_configured()
     return {
         "configured": configured,
+        "mode_allows": unit_mode.link_on(db),
         # A token is set but is not of the contract's shape; its value is never shown.
         "token_invalid": token_invalid(),
         "environment": fisqua_environment() if configured else None,

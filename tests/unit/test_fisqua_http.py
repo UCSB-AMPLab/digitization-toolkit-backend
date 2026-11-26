@@ -7,7 +7,7 @@ token never reaches a log, a row or a response.
 
     python -m pytest tests/unit/test_fisqua_http.py
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import json
@@ -396,7 +396,7 @@ def test_the_fingerprint_is_of_env_base_url_and_token_together(fisqua, monkeypat
 
 @pytest.mark.unit
 def test_the_fingerprint_changes_with_the_rotate_deg_setting(fisqua, monkeypatch):
-    """CAPTUA_FISQUA_ROTATE_DEG picks the contract version the manifests are written in."""
+    """CAPTUA_FISQUA_ROTATE_DEG decides whether the manifests carry rotateDeg."""
     from app.core import config
     from app.core.fisqua_outbox import config_fingerprint
     monkeypatch.setattr(config.settings, "FISQUA_ROTATE_DEG", False)
@@ -857,7 +857,7 @@ def test_turning_rotate_deg_on_clears_the_stop_and_resends_under_a_new_id(
     assert rows[1].manifest_id != refused.manifest_id
     sent = json.loads(server.requests[0].content)
     assert sent["id"] == rows[1].manifest_id
-    assert sent["version"] == "1.5"
+    assert sent["version"] == "1.12"
 
 
 @pytest.mark.unit
@@ -1219,4 +1219,60 @@ def test_a_retest_answered_with_a_token_error_is_built_again_after_an_update(db_
     sent = json.loads(request.content)
     assert sent["id"] != old_id
     assert sent["generatedBy"]["systemVersion"].startswith("0.1.1")
+    assert config_error() is None
+
+
+@pytest.mark.unit
+def test_a_version_refused_volume_with_a_record_missing_a_side_is_resent(
+        client, db_session, queued, monkeypatch):
+    # A record missing a side stays captured on the unit until it is
+    # recaptured and is left out of the handover, so it must not hold back the
+    # resend after a version stop clears.
+    from app.core import config
+    _send(db_session, Server(_version_refusal()))
+    # Only its right image: a record missing left with a left image is refused
+    # by the unit itself (missing_side_contradicted).
+    rec = queued.record(status="captured", layout=("right",))
+    rec.capture_mode = "dual"
+    rec.missing_side = "left"
+    db_session.commit()
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server)
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused", "delivered"]
+
+
+@pytest.mark.unit
+def test_a_version_refused_volume_with_a_closed_record_still_captured_is_not_resent(
+        client, db_session, queued, monkeypatch):
+    # A closed missing record is promoted like any captured one, so while it
+    # is captured the volume has not been handed over again.
+    from app.core import config
+    from app.models.record import Record
+    _send(db_session, Server(_version_refusal()))
+    rec = Record(title="p", collection_id=queued.col.id, status="captured", capture_mode="dual",
+                 sequence=99, missing_side="both", closed_reason="foliation_skip")
+    db_session.add(rec)
+    db_session.commit()
+
+    monkeypatch.setattr(config.settings, "app_version", "0.1.1")
+    server = Server(_ok())
+    _send(db_session, server)
+    assert server.requests == []
+    assert [r.state for r in _rows(db_session, queued.col)] == ["refused"]
+
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("rule", ["sequence", "missing-side"])
+def test_a_1_9_refusal_is_a_plain_refusal_with_its_problems_kept(db_session, queued, rule):
+    from app.core import fisqua_contract as fc
+    from app.core.fisqua_outbox import config_error
+    assert rule in (fc.RULE_SEQUENCE, fc.RULE_MISSING_SIDE)
+    problem = {"rule": rule, "message": "refused", "captuaRecordId": 1}
+    _send(db_session, Server(httpx.Response(422, json={"problems": [problem]})))
+    row = _rows(db_session, queued.col)[0]
+    assert (row.state, row.refusal) == ("refused", "fisqua")
+    assert row.problems == [problem]
     assert config_error() is None

@@ -54,10 +54,14 @@ it (``gui_live.lua``, update_canvas_size and the put_to_cd_canvas call under
 it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import contextlib
+import datetime
+import errno
+import inspect
+import io
 import os
 import secrets
 import struct
@@ -84,9 +88,12 @@ except ImportError:
     pychdk = None  # type: ignore[assignment]
     _PYCHDK_AVAILABLE = False
 
-from .base import CameraBackend
+from .base import (
+    IMAGE_FORMATS, CameraBackend, normalise_camera_model, normalise_image_format,
+)
 from .errors import CaptureTimeoutError
 from ..utils import atomic_write
+from . import usb_topology
 
 
 # --- CHDK live view protocol (core/live_view.h) ----------------------------
@@ -157,16 +164,355 @@ SIDE_FILE = "A/OWN.TXT"
 # which parity the operator sees on the left is the kiosk's swap toggle.
 _SIDE_INDEX = {"even": 0, "odd": 1}
 
+# The role each parity suggests to the operator in the device list. Nothing
+# places, gates or files a capture by it.
+_ROLE_GUESS_BY_SIDE = {"even": "left", "odd": "right"}
+
 # PTP_RC_GeneralError. A download of a file the card does not have comes back
 # with this, and only this means "no such file"; any other response code is a
 # body that has gone wrong and is evicted rather than read as unassigned.
 _PTP_GENERAL_ERROR = 0x2002
+
+# Model names by USB product id, for bodies whose USB product string is
+# generic. The A2500 reports "Canon Digital Camera"; its pictures' EXIF says
+# "Canon PowerShot A2500". Only the A2500 has been verified on hardware, so it
+# is the only entry. Add another model here only after checking its EXIF name
+# on a body.
+_MODEL_BY_PRODUCT_ID = {
+    0x3271: "Canon PowerShot A2500",
+}
 
 # What remote capture returns, and so the only output name this backend can
 # honour. The capture service picks the name and guarantees it is free; a
 # name that would have to be changed here is refused rather than written
 # somewhere nothing checked.
 _CAPTURE_SUFFIXES = (".jpg", ".jpeg")
+
+# The capture formats are base.IMAGE_FORMATS, where the rule is stated. On a
+# CHDK body JPEG is remote capture's JPEG, and RAW+JPEG (or its old name RAW)
+# is the DNG pychdk assembles from the camera's DNG header and raw data,
+# saved as `<name>.dng` in place of the `.jpg` name the capture service chose
+# (as the gphoto2 backend saves a `.cr2`), with the camera's own JPEG of the
+# same exposure as its `_preview.jpg`. A CHDK DNG carries only a 128x96
+# thumbnail, so the preview cannot come from the DNG. Any other value is
+# refused, never taken as one of the two.
+#
+# The format is a choice per capture, not a setting on the camera. The
+# settings route stores it per body here (apply_dslr_settings), and the record
+# capture routes put it in the capture's CameraConfig. A CameraConfig without
+# one captures a JPEG.
+_IMAGE_FORMATS = IMAGE_FORMATS
+_DNG_SUFFIX = ".dng"
+
+# The first pychdk release whose shoot() takes jpeg=True, which returns the
+# DNG and the JPEG of one exposure from one capture script. 0.1.3 has dng
+# but not jpeg, and a unit not yet updated may still have it. Whether the installed library has it is read from the
+# signature of shoot() on the body's device, which costs nothing on the wire.
+_PYCHDK_DNG_VERSION = "0.1.4"
+
+# A DNG is a TIFF file and begins with a TIFF byte-order mark and the number
+# 42. pychdk refuses raw data whose length differs from the header's byte
+# count; a file under _DNG_MIN_BYTES is refused here as well. A CHDK DNG
+# header (1,344 bytes on an A2500) and its 128x96 RGB thumbnail come to about
+# 38 KB, and the raw data of an A2500 is 24,724,224 bytes, so the limit
+# refuses a file that is little more than a header and is far below any raw
+# data.
+_TIFF_SIGNATURES = (b"II*\x00", b"MM\x00*")
+_DNG_MIN_BYTES = 1024 * 1024
+
+# Record mode on a body that switch_mode_usb(1) left in playback. On
+# 12 November 2026 two A2500 bodies under CHDK 1.5.1 accepted
+# switch_mode_usb(1), extended the lens and went on reporting playback. A
+# half-press of the shutter, click("shoot_half"), sent by hand completed the
+# switch on those bodies without taking a picture. The condition was not tied
+# to how the body was switched on, and the same bodies later hung and needed
+# their batteries taken out, so it may belong to that fault. The half-press
+# costs nothing on a body already in record mode. After it, get_mode() is
+# polled every _RECORD_MODE_POLL_INTERVAL_S for up to
+# _RECORD_MODE_HALF_PRESS_WAIT_S.
+_RECORD_MODE_HALF_PRESS_WAIT_S = 4.0
+_RECORD_MODE_POLL_INTERVAL_S = 0.5
+_HALF_PRESS_LUA = 'click("shoot_half")'
+
+# ALT mode is entered before the switch to record mode. Spreads, the earlier
+# scanner software (spreadsplug/dev/chdkcamera.py), sends enter_alt() and then
+# switch_mode('record') every time it prepares a camera, with the comment "Try
+# to go into alt mode to prevent weird behaviour", and leaves the camera in
+# ALT mode. CHDK's "Disable LCD Off" setting defaults to "Alt", which blocks
+# the camera's power saving while ALT mode is on. On 12 November 2026 two
+# A2500 bodies outside ALT mode, with Canon's "Auto Power Down" on, switched
+# themselves off about three minutes after the last capture.
+#
+# Measured on the same day: with Canon's "Auto Power Down" on, two A2500
+# bodies freshly put into ALT mode by enter_alt() stayed on through seven idle
+# minutes with no USB traffic and then captured normally. The same bodies,
+# after an operator had gone through the camera menus (which takes a body out
+# of ALT mode; the backend had not sent enter_alt() again because
+# in_record_mode was already set), behaved as follows about three minutes after
+# the last capture: one switched itself off, and the other stayed attached to
+# USB with its lens out and answered nothing until its battery was taken out.
+# So ALT mode is asserted again during a session. Every still capture sends
+# enter_alt() before the shot, except one that _ensure_record_mode has just
+# sent it for. A preview sends it at most every _ALT_REASSERT_INTERVAL_S
+# seconds per body, and a capture counts for that timer.
+_ENTER_ALT_LUA = "enter_alt()"
+_ALT_REASSERT_INTERVAL_S = 30.0
+
+# Idle keep-alive. Measured on 14 November 2026 on an A2500 under CHDK with
+# Canon's "Auto Power Down" on: a body switched on and left alone in playback
+# mode, never opened by the backend, left USB exactly five minutes after
+# power-on, twice (19:34:20 to 19:39:19, and 19:47:00 to 19:52:00), and the
+# USB recording shows no traffic to it in either window. The same body in the
+# same state, sent one Lua read a minute (get_mode() and get_vbatt()), was
+# still answering after twelve minutes, with its lens retracted. So USB
+# traffic resets the camera's power-down timer.
+#
+# A thread of the backend's own wakes every _KEEPALIVE_INTERVAL_S and sends
+# _KEEPALIVE_LUA to each open body that has had no traffic for at least that
+# long. The read switches no mode, sends no enter_alt() and changes no
+# setting. Any request to a body counts as traffic, so a body in use gets no
+# keep-alive. A body whose lock is held is skipped for that tick and never
+# waited on. A read that fails or times out evicts the body as a failed
+# capture does, and nothing more is sent to it until a scan opens it again.
+#
+# A body attached but never opened is opened by the keep-alive. Each tick
+# first reads which CHDK bodies are attached from the USB descriptors the
+# host already holds (_attached_usb_keys), which sends nothing to any camera.
+# On 14 November 2026 the USB recording of an open body on bus 1 showed 24
+# packets a minute to it with the presence scan and 24 without it.
+# When a body is attached and not open, and every open body has been idle for
+# _KEEPALIVE_INTERVAL_S, the tick runs one enumeration, the same one a device
+# listing runs, layout and all. A body with recent traffic means the scanner
+# is in use, and the next device listing will open the new body. Before the
+# enumeration every open body's lock is tried without waiting; if one is
+# held, the scan is left to the next tick and the address is not marked. A
+# request that starts between that probe and the enumeration still makes the
+# enumeration wait for it, as a device listing would. Each (bus, device
+# number) is tried once, whatever the outcome, and the address of a body
+# closed after any failure, by the keep-alive, by a request or by an
+# enumeration's checks, is marked as tried too; an operator's listing or
+# rescan still reopens it. On 14 November 2026 a body whose
+# card read timed out at opening (21:19:35) switched itself off at 21:23:57,
+# five minutes after the last request it answered (21:18:57), so a request
+# that times out does not reset the camera's timer and trying it every minute
+# keeps nothing alive. A body that leaves and comes back has a new device
+# number and is tried again.
+#
+# The rule: the keep-alive opens only the addresses it chose this tick, and
+# sends PTP commands only to bodies that are open. Every PTP command goes
+# through a body's ChdkDevice, a ChdkDevice is made only in _open_body, and
+# _open_body is called only from _enumerate, for a body that is not open.
+# The keep-alive's read goes only to open bodies. Its enumeration is given
+# `only`, the addresses its presence scan found attached, not open and not
+# tried, and opens an address only if it is in `only` and, read under
+# _map_lock at the moment of opening, still not in _keepalive_tried. The
+# chosen addresses are marked tried only after the enumeration, so an
+# address in `only` is in the tried set at that moment only if a failure
+# closed it in between: an operator's listing opened it and a request
+# evicted it. A body evicted at any time, or closed by this enumeration's
+# get_version check, is open or tried when the tick chooses, and so is not
+# in `only`, or is caught by the check at opening. The rest of the
+# enumeration touches only open bodies: a body that left the bus is closed,
+# an open one is checked with get_version (_still_answering) and has its card
+# read only if it has not been read, and the layout is published under the
+# locks of open bodies. What the enumeration does send to every attached
+# device, a tried one included, is pychdk.list_devices' read of the USB
+# serial, a string-descriptor request outside PTP.
+#
+# The parentheses keep the script to one return value, so the camera posts
+# one answer and _run_lua reads it; Lua's get_mode() returns three.
+#
+# A body in record mode with ALT on left USB about 35 minutes after its last
+# capture on the same day, with no traffic. That case is not explained, and
+# whether this keep-alive prevents it has not been measured.
+_KEEPALIVE_INTERVAL_S = 60.0
+_KEEPALIVE_LUA = "return (get_mode())"
+# How long cleanup waits for the keep-alive thread to end. A tick in progress
+# finishes the read it is on, which takes at most _SCRIPT_END_WAIT_S for a
+# running script and _LUA_TIMEOUT_S for the read, and sends nothing after the
+# stop is set.
+_KEEPALIVE_JOIN_S = 25.0
+
+# Optical zoom. Measured on 12 November 2026 on an A2500 under CHDK 1.5.1:
+# get_zoom_steps() returns 64, get_zoom() returns 0 at the widest, and
+# set_zoom(n) moves the lens and takes one to a few seconds. Spreads, the
+# earlier scanner software (spreadsplug/dev/chdkcamera.py, _set_zoom), set the
+# zoom once per start with set_zoom(level) after the switch to record mode and
+# refused a level at or above get_zoom_steps(). Here the step is stored per
+# body in the camera registry and applied each time a body enters record mode.
+#
+# On the same day a second Lua script sent while an earlier one was still
+# running, and commands sent to a body that had just timed out, knocked a
+# camera off USB. Every zoom script runs under the body's lock and waits for
+# its result before the next is sent, set_zoom has a timeout long enough for
+# the lens to travel, and after a timeout or an error nothing more is sent to
+# that body in the same operation.
+_GET_ZOOM_STEPS_LUA = "return get_zoom_steps()"
+_GET_ZOOM_LUA = "return get_zoom()"
+_SET_ZOOM_TIMEOUT_S = 15.0
+
+# The camera's clock. A CHDK camera writes its own clock into each picture's
+# EXIF, and on 12 November 2026 two A2500 bodies under CHDK 1.5.1 were about
+# two minutes behind the unit. After record mode is confirmed the backend
+# reads the clock with one script that returns one string, and sets it when
+# it differs from the unit's local time by more than this many seconds.
+# set_clock(year, month, day, hour, minute, second) is CHDK's documented
+# signature; its duration and precision on this build have not been measured.
+_CLOCK_TOLERANCE_S = 5.0
+_READ_CLOCK_LUA = (
+    'local t=os.date("*t"); '
+    'return string.format("%04d-%02d-%02d %02d:%02d:%02d", '
+    "t.year,t.month,t.day,t.hour,t.min,t.sec)"
+)
+_CLOCK_FORMAT = "%Y-%m-%d %H:%M:%S"
+
+# One script at a time. CHDK runs one script at a time, and its ExecuteScript
+# kills a running script unless the request carries PTP_CHDK_SCRIPT_FL_NOKILL
+# (0x100 in CHDK's core/ptp.h; pychdk 0.1.3 names it ScriptFlag.NOKILL), in
+# which case the camera refuses the new script instead.
+#
+# What happened on 12 November 2026, from a USB recording of an A2500 under
+# CHDK 1.5.1 driven through pychdk 0.1.3: the capture script
+# (init_usb_capture(1) ... shoot()) was still running on the camera for a
+# short while after the host had received the picture's last chunk, and
+# pychdk's shoot() returns as soon as the data is in. The backend sent its
+# next script, enter_alt(), 0.2 s after the last chunk, while that capture
+# script was still running, and CHDK killed it. The next shot's picture then
+# arrived with the camera's per-shot remote-capture state not reset: its first
+# chunk came flagged last (response parameters 1461760/0/17920, that is
+# more=0 with a seek to offset 17920). pychdk stopped there, zero-filled the
+# first 17920 bytes and returned 1,479,680 bytes, and the backend logged
+# "remote capture ok". The next three captures each received one leftover
+# chunk of that picture within 0.3 s, with no exposure, and were logged as ok
+# too. Of 257 captures that day, the only ones affected were those where a
+# running script was killed right after capture data; every healthy capture
+# had at least 2.5 s before the next script.
+#
+# So every script the backend sends goes through _script, which reads the
+# script status first and waits while a script is running, for up to
+# _SCRIPT_END_WAIT_S. That check is the only place a script is waited for
+# before another is sent. A whole capture returns as soon as its picture has
+# passed the completeness check, without waiting for its script to end: on
+# two A2500 bodies one camera's capture script ended about 0.5 s after its
+# data and the other's at once, and waiting there made every pair about
+# 0.5 s slower even when pairs were seconds apart. The next script sent to
+# that body waits instead. Status reads are not scripts and are always
+# allowed, as are RemoteCaptureIsReady and RemoteCaptureGetData.
+_SCRIPT_NOKILL = 0x100
+_SCRIPT_POLL_INTERVAL_S = 0.1
+_SCRIPT_END_WAIT_S = 10.0
+# A wait for a running script longer than this is logged as a warning.
+_SCRIPT_SLOW_WAIT_S = 2.0
+# How long a Lua script the backend sends is waited on, and how often its
+# status is read meanwhile. These are pychdk 0.1.3's execute_lua_wait
+# defaults, which the backend used before it sent scripts itself.
+_LUA_TIMEOUT_S = 10.0
+_LUA_POLL_INTERVAL_S = 0.05
+# CHDK's script message types (ptp_chdk_script_msg_type, core/ptp.h).
+_MSG_ERR = 1
+_MSG_RET = 2
+
+# A refused picture leaves the camera's capture state unknown, so before the
+# body is used again the backend drains it: it waits for any script to end,
+# reads and discards remote-capture data while the camera offers any (at most
+# _DRAIN_MAX_CHUNKS chunks and _DRAIN_WAIT_S seconds), and then sends
+# init_usb_capture(0) to clear the camera's capture state. A body that cannot
+# be drained is dropped.
+_DRAIN_MAX_CHUNKS = 8
+_DRAIN_WAIT_S = 10.0
+_REMOTE_CAP_JPEG = 0x01
+_CLEAR_CAPTURE_LUA = "init_usb_capture(0)"
+
+# A JPEG begins with the start-of-image marker and ends with the end-of-image
+# marker. The 16:53 picture began with 17920 zero bytes.
+_JPEG_START = b"\xff\xd8"
+_JPEG_END = b"\xff\xd9"
+# The Canon maker note (EXIF tag 0x927C) carries the image file number as tag
+# 0x0008, a LONG; on 12 November 2026 two consecutive A2500 pictures carried
+# 1490830 and 1490831.
+_EXIF_IFD = 0x8769
+_EXIF_MAKE = 0x010F
+_EXIF_MAKER_NOTE = 0x927C
+_CANON_FILE_NUMBER = 0x0008
+
+# Focus lock. An A2500 has no AF/MF switch, so it autofocuses on every
+# picture, and on a blank page it focuses on the scanner's glass. Spreads
+# (spreadsplug/dev/chdkcamera.py, _set_focus) locked the focus with one
+# script: a half-press held for a second, which focuses, then set_aflock(1).
+# It set a fixed distance with a second script, which holds the half-press,
+# presses the left key and sets the lock, followed 0.25 s later by
+# set_focus(distance). It unlocked with set_aflock(0). The backend sends the
+# same scripts.
+#
+# Measured on 12 November 2026 on an A2500 under CHDK 1.5.1: set_aflock,
+# get_focus and get_focus_mode exist, and get_focus() answered 1489 and 1557,
+# a distance in mm. At zoom step 30 the lock script took 1.4 s, get_focus()
+# then answered 813, and it still answered 813 after five remote captures. A
+# capture with the lock held took 3.0 s, against 3.5 s without it. Not
+# measured: whether set_focus moves the lens on this model, so whether a
+# restore after a restart works, and what get_focus_mode() answers. So the
+# backend reads get_focus() after every lock and restore and counts the focus
+# as locked only on the answer it gets.
+#
+# Every focus script goes through _send_lua, so it is sent only once no other
+# script is running, and the backend waits for it to end before it sends the
+# next. The lock and restore scripts run for over a second on the camera, so
+# they have the same 15 s timeout as set_zoom. After a timeout or an error
+# nothing more is sent to the body in the same operation.
+_FOCUS_LOCK_LUA = (
+    "press('shoot_half'); sleep(1000); release('shoot_half'); set_aflock(1);"
+)
+_FOCUS_RESTORE_LUA = (
+    "press('shoot_half'); sleep(1000); click('left'); set_aflock(1); "
+    "release('shoot_half');"
+)
+_FOCUS_UNLOCK_LUA = "set_aflock(0)"
+_GET_FOCUS_LUA = "return get_focus()"
+_FOCUS_SCRIPT_TIMEOUT_S = 15.0
+# Spreads waited this long between the restore script and set_focus.
+_FOCUS_RESTORE_PAUSE_S = 0.25
+# How far, as a fraction of the stored distance, the distance get_focus()
+# reports after a restore may differ from it and still count as restored.
+# This is a first value. It has not been measured on hardware.
+_FOCUS_RESTORE_TOLERANCE = 0.05
+
+# How pychdk 0.1.3's switch_mode says the camera never reported record mode.
+# It raises a plain RuntimeError, as it does for a script that would not
+# start or one that failed, so the message is the only thing that tells this
+# failure from the others.
+_PYCHDK_DID_NOT_SWITCH = "The camera did not switch to record mode"
+
+# Every wait in this module goes through this name, so a test can record the
+# waits instead of spending them.
+_sleep = time.sleep
+_monotonic = time.monotonic
+# The unit's local wall-clock time. The camera keeps local time with no zone,
+# so this is what its clock is compared with and set to. A test replaces it.
+_now = datetime.datetime.now
+
+
+def _attached_usb_keys():
+    """(bus, device number) of every attached Canon PTP device.
+
+    pychdk's list_devices reads each device's USB serial, which is a string
+    descriptor request sent to the camera. This reads only the device and
+    configuration descriptors through pychdk's own find_ptp_devices, and
+    libusb answers those from what the host read at enumeration, without a
+    request to the device. A test replaces the backend's _presence_scan.
+    """
+    from pychdk.usb_transport import CANON_VENDOR_ID, find_ptp_devices
+
+    return [
+        (device.bus, device.address)
+        for device in find_ptp_devices(vendor_id=CANON_VENDOR_ID)
+    ]
+
+
+def _start_thread(target, name):
+    """Start a daemon thread running target. A test replaces this."""
+    thread = threading.Thread(target=target, name=name, daemon=True)
+    thread.start()
+    return thread
 
 # The route that writes a parity, named in every message that asks the
 # operator to fix one.
@@ -433,6 +779,176 @@ def _name_failure(exc):
     return type(exc).__name__
 
 
+def _shoot_takes_jpeg(shoot):
+    """True when this shoot() takes dng and jpeg, as pychdk 0.1.4 and later do."""
+    try:
+        parameters = inspect.signature(shoot).parameters
+    except (TypeError, ValueError):
+        return False
+    return "dng" in parameters and "jpeg" in parameters
+
+
+def _is_dng_error(exc):
+    """True when exc is pychdk's DngError: the DNG parts could not be assembled.
+
+    Looked up on the module at the time of the call, because pychdk 0.1.3 has
+    no such class and the backend imports no name from the library.
+    """
+    dng_error = getattr(pychdk, "DngError", None)
+    return isinstance(dng_error, type) and isinstance(exc, dng_error)
+
+
+def _dng_problem(dng):
+    """Say what is wrong with a DNG from the camera, or None when it is whole."""
+    if dng[:4] not in _TIFF_SIGNATURES:
+        return (
+            "the DNG does not begin with a TIFF signature (it begins with "
+            f"{bytes(dng[:4]).hex(' ').upper()})"
+        )
+    if len(dng) < _DNG_MIN_BYTES:
+        return (
+            f"the DNG is {len(dng)} bytes, too small to hold raw data"
+        )
+    return None
+
+
+class _BodyGoneError(RuntimeError):
+    """An operation failed because its body has left the bus.
+
+    The body has already been dropped when this is raised. `identity` is the
+    body's hardware id, or None when it had none, so the caller can tell
+    whether the body now at the index is the same camera.
+    """
+
+    identity = None
+
+
+class _IdentityChangedError(RuntimeError):
+    """The body locked for a retry is not the one the retry was meant for."""
+
+
+class IncompleteCaptureError(RuntimeError):
+    """The camera delivered a picture that is not whole, and it was not saved.
+
+    The message says what was wrong and names the port. The capture is not
+    retried: the operator has to see that it failed and take it again.
+    """
+
+
+class _ScriptStillRunningError(TimeoutError):
+    """A script was still running on the camera when the wait for it ran out.
+
+    A TimeoutError, so a capture reports it as a capture timeout and every
+    operation evicts the body as it does for any other timeout.
+    """
+
+
+def _canon_file_number(image):
+    """The Canon image file number in a JPEG's EXIF maker note, or None.
+
+    Pillow opens the JPEG lazily and reads only its header segments, so this
+    does not decode the picture. A picture with no EXIF, one that is not from
+    a Canon camera, or one whose maker note has no tag 0x0008 of type LONG
+    gives None.
+    """
+    try:
+        from PIL import Image
+
+        with Image.open(io.BytesIO(image)) as picture:
+            exif = picture.getexif()
+            make = exif.get(_EXIF_MAKE)
+            note = exif.get_ifd(_EXIF_IFD).get(_EXIF_MAKER_NOTE)
+            endian = getattr(exif, "endian", None) or "<"
+    except Exception:
+        return None
+    if isinstance(make, bytes):
+        make = make.decode("ascii", errors="ignore")
+    if not isinstance(make, str) or not make.strip().lower().startswith("canon"):
+        return None
+    if not isinstance(note, bytes) or len(note) < 2:
+        return None
+    try:
+        (count,) = struct.unpack_from(endian + "H", note, 0)
+        for entry in range(count):
+            offset = 2 + 12 * entry
+            if offset + 12 > len(note):
+                return None
+            tag, kind, number, value = struct.unpack_from(
+                endian + "HHII", note, offset
+            )
+            if tag == _CANON_FILE_NUMBER and kind == 4 and number == 1:
+                return value
+    except struct.error:
+        return None
+    return None
+
+
+class ZoomFailedError(RuntimeError):
+    """The camera did not take a requested zoom step.
+
+    Raised by set_zoom_step for a wire failure, a timeout, a camera that
+    reports another step afterwards, and a camera that reported no zoom
+    steps. Its own class because the route answers it with a 502, and a
+    camera that is not connected with a 404.
+    """
+
+
+class _ZoomNotConfirmedError(ZoomFailedError):
+    """The camera answered after set_zoom and reported another step.
+
+    The conversation completed, so the body is in a known state and need not
+    be dropped for this alone; the step it reports is recorded on the body.
+    """
+
+
+class FocusFailedError(RuntimeError):
+    """The camera did not lock, or unlock, its focus.
+
+    Raised by lock_focus for a wire failure, a timeout, and a camera that
+    answers get_focus() with no positive integer after the lock script, and
+    by unlock_focus for a wire failure or a timeout. Its own class because
+    the routes answer it with a 502, and a camera that is not connected with
+    a 404.
+    """
+
+
+def _is_focus_distance(value):
+    """True for a positive int that is not a bool: a distance in mm."""
+    return type(value) is int and value > 0
+
+
+def _is_stored_focus(value):
+    """True for a stored focus: {"distance": mm, "zoom_step": step}.
+
+    The same rule as CameraRegistry.is_valid_focus, which writes it; kept
+    here so reading needs no registry import.
+    """
+    return (
+        type(value) is dict
+        and set(value) == {"distance", "zoom_step"}
+        and _is_focus_distance(value["distance"])
+        and type(value["zoom_step"]) is int
+        and value["zoom_step"] >= 0
+    )
+
+
+def _open_camera_registry():
+    """Open the camera registry at its default path.
+
+    An error opening it propagates; _stored_zoom_step catches it and
+    _store_zoom_step does not. Function-local import: capture.camera_registry reaches capture.service,
+    which builds this backend, so a module-level import would be circular.
+    """
+    from capture.camera_registry import CameraRegistry
+
+    return CameraRegistry()
+
+
+def _is_gone_from_the_bus(exc):
+    """True for a pyusb error whose errno is ENODEV: the device is not there."""
+    return getattr(exc, "errno", None) == errno.ENODEV
+
+
 def _shutter_seconds(value):
     """Read a CameraConfig shutter speed as seconds, or None if it says nothing.
 
@@ -494,6 +1010,71 @@ class _ChdkBody:
         # Record mode is switched once per body: a viewport and a remote
         # capture both need it, and the switch costs seconds.
         self.in_record_mode = False
+        # When ALT mode was last asserted, by _monotonic; None on a body that
+        # has not had it asserted since it was opened.
+        self.alt_asserted_at = None
+        # When the backend last talked to the body, by _monotonic; set by
+        # _note_traffic. The keep-alive reads it to tell an idle body from a
+        # busy one.
+        self.last_traffic_at = None
+        # Optical zoom. zoom_steps is get_zoom_steps(), read once after the
+        # body first reaches record mode; None until then, or when the camera
+        # does not answer a positive integer. zoom_step is the step the
+        # backend last read back with get_zoom(); None until known.
+        self.zoom_steps = None
+        self.zoom_step = None
+        # The camera's clock, minus the unit's, in seconds, as last measured;
+        # None until measured. clock_checked is True once the clock has been
+        # read on this open body, so it is read once per open.
+        self.clock_offset_s = None
+        self.clock_checked = False
+        # The Canon image file number of the last picture saved from this
+        # body, when its EXIF carried one; None otherwise.
+        self.last_file_number = None
+        # Focus lock. focus_locked is None until the body reaches record
+        # mode, then True while the backend holds a lock the camera
+        # confirmed and False otherwise. focus_distance is the distance in mm
+        # get_focus() answered for that lock, or None. focus_stale is set
+        # when the zoom moved after the last lock, or when a stored focus was
+        # taken at a step other than the one the camera reports on opening.
+        # focus_restore_failed is set when a stored focus was sent on
+        # entering record mode and the camera did not report it back.
+        #
+        # The rule these fields keep: the camera holds no focus lock that
+        # focus_locked does not report, and a stored focus is restored only
+        # when the camera reports the zoom step stored with it. The stored
+        # focus is one registry value, {"distance": mm, "zoom_step": step},
+        # so the distance cannot be read with any step but its own. Every
+        # write:
+        #   zoom_step: _read_zoom only, from get_zoom(), called by
+        #     _settle_zoom and _move_zoom.
+        #   focus_locked / focus_distance / focus_restore_failed:
+        #     _settle_opened_body (False, after set_aflock(0)),
+        #     _settle_focus (restore), _drop_focus_after_zoom,
+        #     _lock_focus_once (confirmed, or released after an
+        #     unconfirmed readback), _unlock_focus_once.
+        #   focus_stale: _settle_focus (stored step differs from the
+        #     reported one), _drop_focus_after_zoom, _lock_focus_once and
+        #     _unlock_focus_once (cleared).
+        #   stored focus: _store_focus from _lock_focus_once (with the
+        #     reported step; not stored when none was reported), and
+        #     _clear_stored_focus from _set_zoom_step_once (the reported
+        #     step changed) and _unlock_focus_once.
+        # set_aflock(0) is sent when the body first reaches record mode,
+        # before any other zoom or focus script, so the camera's lock is
+        # known after opening. A body opened by a focus lock or unlock
+        # request has no stored focus restored, since the request replaces
+        # or removes it. Every set_aflock(1) - the lock and the
+        # restore script - is followed in the same operation by a confirmed
+        # get_focus(), by set_aflock(0), or by eviction; every step change
+        # reported by get_zoom() in a zoom request is followed by
+        # set_aflock(0) or eviction. Not covered: a zoom changed with the
+        # camera's own buttons is not seen until the next get_zoom(), so a
+        # lock can be held, and reported, at a step it was not taken at.
+        self.focus_locked = None
+        self.focus_distance = None
+        self.focus_stale = False
+        self.focus_restore_failed = False
         # Live view instrumentation. The geometry is logged on the first frame
         # only; the rate every _FRAME_LOG_INTERVAL frames.
         self.geometry_logged = False
@@ -510,7 +1091,15 @@ class _ChdkBody:
 
     @property
     def serial(self):
-        return self.info.serial_num or None
+        """The USB serial with NUL characters and surrounding whitespace removed.
+
+        pychdk 0.1.3 returns the A2500's serial with a trailing NUL byte. The
+        raw value cannot be stored in a PostgreSQL text column, so every
+        reader of the serial uses this property and none reads
+        info.serial_num. None means the body reports no serial.
+        """
+        cleaned = (self.info.serial_num or "").replace("\x00", "").strip()
+        return cleaned or None
 
     @property
     def port(self):
@@ -602,6 +1191,39 @@ class ChdkBackend(CameraBackend):
         # Re-entrant so an assignment can republish through rescan() without
         # handing the lock over in between.
         self._layout_lock = threading.RLock()
+        # Opens the camera registry, where a body's stored zoom step lives.
+        # A test replaces it; a factory that returns None means no registry,
+        # so nothing is read or stored.
+        self._registry_factory = _open_camera_registry
+        # hardware id -> the capture format chosen for that body (one of
+        # _IMAGE_FORMATS, or None for none), guarded by _map_lock. The
+        # registry holds the choice; this is its cache, filled from the
+        # registry the first time an enumeration finds the body and written
+        # through by apply_dslr_settings. Keyed by identity, so a rescan that
+        # moves a body to another index, or drops and reopens it, keeps its
+        # choice. Nothing is sent to the camera.
+        self._image_formats: dict = {}
+        # Held across a capture format's registry read or write and the cache
+        # update that goes with it, so the last request to write the registry
+        # is the last to set the cache, and a load never caches a value older
+        # than one a request has set. Its own lock rather than the body's: the
+        # body's lock is held through a capture, and a settings request must
+        # not wait for one. Taken before _map_lock, never while holding a
+        # body's lock or _map_lock.
+        self._image_format_lock = threading.Lock()
+        # The idle keep-alive (see _KEEPALIVE_INTERVAL_S). The thread lives as
+        # long as the backend: started here, stopped and joined by cleanup.
+        self._keepalive_stop = threading.Event()
+        # The presence scan, and the (bus, device number) of every body the
+        # keep-alive has tried to open and of every body evicted after a
+        # failure, guarded by _map_lock. Each tick drops the addresses no
+        # longer on the bus.
+        self._presence_scan = _attached_usb_keys
+        self._keepalive_tried: set = set()
+        self._presence_failing = False
+        self._keepalive_thread = _start_thread(
+            self._keepalive_loop, "chdk-keepalive"
+        )
 
     # ------------------------------------------------------------------
     # Bodies
@@ -612,6 +1234,28 @@ class ChdkBackend(CameraBackend):
         with self._map_lock:
             key = self._indices.get(camera_index)
             return self._bodies.get(key) if key is not None else None
+
+    def held_zoom(self, camera_index):
+        """The zoom state held for the body at this index, without talking to the camera; None when no body holds it.
+
+        `{"zoom_step": step}`, the step the body last confirmed (None until
+        known). Read by the colour card check (app.core.colour_card).
+        """
+        body = self._body_at(camera_index)
+        return {"zoom_step": body.zoom_step} if body is not None else None
+
+    def camera_model(self, camera_index):
+        """The model of the body holding this index.
+
+        _ChdkBody.model starts as the table's name for the product id, else
+        the USB product string, else the product id label, read once in
+        _open_body. The EXIF model of each saved picture replaces it after
+        every capture (_take_model_from_picture). Nothing here
+        talks to the camera or scans the bus: an index no open body holds,
+        including every index before the first scan, is None.
+        """
+        body = self._body_at(camera_index)
+        return normalise_camera_model(body.model) if body is not None else None
 
     def _open_body(self, info):
         """Open one camera and read enough of it to name it. None on failure."""
@@ -625,6 +1269,8 @@ class ChdkBackend(CameraBackend):
             )
             return None
         body = _ChdkBody(info, device, self._read_model(device, info))
+        # Opening the device is a conversation with the camera.
+        self._note_traffic(body)
         if key in self._evicted:
             self._evicted.discard(key)
             self.logger.info(
@@ -632,6 +1278,10 @@ class ChdkBackend(CameraBackend):
                 "failure; re-enumeration recovered it"
             )
         return body
+
+    def _note_traffic(self, body):
+        """Record that the backend has just talked to this body."""
+        body.last_traffic_at = _monotonic()
 
     def _is_the_same_body(self, body, info):
         """Is the camera at this address the one this session was opened on?
@@ -670,12 +1320,15 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] {body.port}: stopped answering "
                     f"({_name_failure(exc)}); opening it again"
                 )
+                self._mark_failed(body.key)
                 self._close_body(body, "it stopped answering")
                 return False
+            self._note_traffic(body)
         return True
 
     def _read_model(self, device, info):
-        """The body's model, from its USB product string if it answers one.
+        """The body's model: the table's name for its product id, else its USB
+        product string if it answers one.
 
         pyusb reads string descriptors over the wire and can fail or answer
         nothing, so the product id stands in. This is for people to read -
@@ -683,12 +1336,15 @@ class ChdkBackend(CameraBackend):
         it: the hardware id is built from the product id instead, so a
         failed read costs a name and never an identity.
         """
+        known = _MODEL_BY_PRODUCT_ID.get(info.product_id)
+        if known:
+            return known
         try:
             product = getattr(device._usb_device, "product", None)
         except Exception:
             product = None
         if product:
-            return str(product).strip()
+            return str(product).replace("\x00", "").strip()
         return f"Canon {info.product_id:#06x}"
 
     def _close_body(self, body, reason):
@@ -716,6 +1372,7 @@ class ChdkBackend(CameraBackend):
             with self._map_lock:
                 if self._bodies.get(body.key) is body:
                     del self._bodies[body.key]
+                    self._published_body_count = len(self._bodies)
                     self._indices = {
                         index: key for index, key in self._indices.items()
                         if key != body.key
@@ -723,9 +1380,23 @@ class ChdkBackend(CameraBackend):
             self.logger.info(f"[chdk] {body.port}: closed ({reason})")
 
     def _evict(self, body, reason):
-        """Drop a body that has stopped answering, so the next scan re-opens it."""
+        """Drop a body that has stopped answering, so the next scan re-opens it.
+
+        The keep-alive does not reopen it (see _KEEPALIVE_INTERVAL_S); a device
+        listing or a rescan does.
+        """
         self._evicted.add(body.key)
+        self._mark_failed(body.key)
         self._close_body(body, reason)
+
+    def _mark_failed(self, key):
+        """Mark an address the keep-alive must not open (see _KEEPALIVE_INTERVAL_S).
+
+        Called for every body closed after a failure. A device listing or a
+        rescan still opens it.
+        """
+        with self._map_lock:
+            self._keepalive_tried.add(key)
 
     def _is_absent(self, exc):
         """True when a download failed because the card has no such file."""
@@ -772,6 +1443,7 @@ class ChdkBackend(CameraBackend):
             try:
                 raw = body.device.download_file(SIDE_FILE)
             except Exception as exc:
+                self._note_traffic(body)
                 if self._is_absent(exc):
                     body.side = None
                     body.camera_id = None
@@ -787,6 +1459,7 @@ class ChdkBackend(CameraBackend):
                     f"({exc!r}); dropping the body"
                 )
                 return False
+            self._note_traffic(body)
             side, camera_id = pychdk.parse_own_txt(raw)
             body.side = side.lower() if side else None
             body.camera_id = camera_id
@@ -965,7 +1638,11 @@ class ChdkBackend(CameraBackend):
             "location": f"USB {body.port}",
             "port": body.port,
             "has_aperture_control": False,
+            # supports_zoom is the Pi cameras' digital ScalerCrop zoom. A CHDK
+            # body has stepped optical zoom instead, reported by these two.
             "supports_zoom": False,
+            "zoom_steps": body.zoom_steps,
+            "zoom_step": body.zoom_step,
             "side": body.side,
             "provisional": provisional,
             # Another connected body answers to this one's hardware id, so
@@ -974,10 +1651,32 @@ class ChdkBackend(CameraBackend):
             # operator repairs it.
             "identity_ambiguous": body.identity_clash is not None,
             "error": self._row_error(body),
+            # The USB socket the body is plugged into, as a topology path
+            # ("1-1.2"), from pyusb's enumeration record. None where pyusb
+            # cannot say.
+            "usb_port": usb_topology.from_pyusb_device(
+                getattr(body.device, "_usb_device", None)
+            ),
+            # The role the card parity suggests: EVEN shoots the left page
+            # and ODD the right. It is shown to the operator as a starting
+            # point and nothing acts on it.
+            "role_guess": _ROLE_GUESS_BY_SIDE.get(body.side),
+            "role_guess_source": "own_txt" if body.side in _ROLE_GUESS_BY_SIDE else None,
+            "focus_locked": body.focus_locked,
+            "focus_distance": body.focus_distance,
+            "focus_stale": body.focus_stale,
+            "focus_restore_failed": body.focus_restore_failed,
+            "clock_offset_s": body.clock_offset_s,
         }
 
-    def _enumerate(self, reread):
+    def _enumerate(self, reread, only=None):
         """Scan the bus, reconcile the open bodies with it, and lay them out.
+
+        `only`, when given, is the set of (bus, device number) addresses this
+        enumeration may open, and it opens no other; an address in it is
+        also left closed if it is in _keepalive_tried when it would be
+        opened. Only the keep-alive passes it (see _KEEPALIVE_INTERVAL_S).
+        Without it, every body on the bus that is not open is opened.
 
         Bodies that have left are closed and dropped; bodies that are new are
         opened and read; bodies that were already open keep their device, and
@@ -1019,6 +1718,13 @@ class ChdkBackend(CameraBackend):
                 if body is not None and not self._still_answering(body):
                     body = None
                 fresh = body is None
+                if fresh and only is not None:
+                    with self._map_lock:
+                        allowed = (
+                            key in only and key not in self._keepalive_tried
+                        )
+                    if not allowed:
+                        continue
                 if fresh:
                     body = self._open_body(info)
                     if body is None:
@@ -1033,6 +1739,7 @@ class ChdkBackend(CameraBackend):
                             # every connection check scanning the bus for a
                             # body that will not answer.
                             self._evicted.discard(key)
+                            self._mark_failed(key)
                             self._close_body(
                                 body, "its card could not be read again"
                             )
@@ -1048,6 +1755,7 @@ class ChdkBackend(CameraBackend):
                 if fresh:
                     with self._map_lock:
                         self._bodies[key] = body
+                        self._published_body_count = len(self._bodies)
 
             # Publishing is where a body changes index, and a capture that is
             # already running on one is using the index it had when it
@@ -1088,6 +1796,7 @@ class ChdkBackend(CameraBackend):
                 self._evicted &= set(present)
                 self._scanned = True
 
+            self._load_image_formats()
             self._log_enumeration(rows)
             return rows
 
@@ -1159,7 +1868,9 @@ class ChdkBackend(CameraBackend):
             return False
 
     @contextlib.contextmanager
-    def _in_use(self, camera_index, operation, refuse_unusable):
+    def _in_use(
+        self, camera_index, operation, refuse_unusable, expect_identity=None
+    ):
         """Hold the body at this index, having checked it is still that body.
 
         Resolving an index to a body and acquiring that body's lock are two
@@ -1180,6 +1891,9 @@ class ChdkBackend(CameraBackend):
             camera_index: Which body, as the device list numbers them.
             operation: Named in the message when the body has moved.
             refuse_unusable: Apply the capture refusal rules.
+            expect_identity: Set only for a retry. The hardware id the body
+                must have, checked on the body actually locked, after the
+                lock is taken.
 
         Yields:
             The body, with its lock held.
@@ -1212,6 +1926,11 @@ class ChdkBackend(CameraBackend):
                     "waiting, so it was refused rather than run on the wrong "
                     "body. Reload the device list and try again."
                 )
+            if expect_identity is not None and body.hardware_id != expect_identity:
+                raise _IdentityChangedError(
+                    f"Camera {camera_index} is {body.port}, which is not the "
+                    f"body ({expect_identity}) this {operation} was retried for"
+                )
             if not body.device.is_connected:
                 raise RuntimeError(
                     f"Camera {camera_index} ({body.port}) is no longer "
@@ -1223,13 +1942,89 @@ class ChdkBackend(CameraBackend):
                     raise RuntimeError(
                         f"Camera {camera_index} may not capture: {refusal}"
                     )
-            yield body
+            try:
+                yield body
+            finally:
+                # Whatever the operation sent, it was traffic to the body,
+                # and the keep-alive leaves the body alone for an interval.
+                self._note_traffic(body)
+
+    def _retry_once_if_gone(self, camera_index, operation, run):
+        """Run `run(expect_identity)`; if its body had left the bus, retry once.
+
+        A camera that restarts with its USB cable connected leaves the bus
+        and returns at a new device number. The first request after that
+        fails on the old session with ENODEV, after which the body has been
+        dropped. This rescans once, and when the body now at the index has the
+        same hardware identity as the one that failed, runs `run` once more,
+        passing that identity so the retry checks it again on the body it
+        locks (a layout can be published between this check and the lock).
+
+        The first error is raised when there is no identity, when the rescan
+        fails, when the body at the index is not the same one, when the
+        locked body is not the same one, and when the retry fails with
+        another _BodyGoneError. Any other exception from the retry
+        propagates as itself. No lock is held here: the failed body's lock
+        was released when `run` raised.
+        """
+        try:
+            return run(None)
+        except _BodyGoneError as gone:
+            if gone.identity is None:
+                raise
+            self.logger.info(
+                f"[chdk] camera {camera_index}: {operation} failed because "
+                f"the body left the bus; rescanning once for {gone.identity}"
+            )
+            try:
+                self.rescan()
+            except Exception as exc:
+                self.logger.error(
+                    f"[chdk] camera {camera_index}: rescan after a body left "
+                    f"the bus failed: {exc!r}"
+                )
+                raise gone
+            current = self._body_at(camera_index)
+            if current is None or current.hardware_id != gone.identity:
+                self.logger.info(
+                    f"[chdk] camera {camera_index}: not retrying {operation}, "
+                    f"{gone.identity} is not the body at that index now"
+                )
+                raise gone
+            self.logger.info(
+                f"[chdk] camera {camera_index}: retrying {operation} on "
+                f"{current.port}"
+            )
+            try:
+                return run(gone.identity)
+            except (_BodyGoneError, _IdentityChangedError):
+                raise gone
 
     def capture_image(
         self,
         output_path: Path,
         camera_config,
         capture_output: bool = False,
+    ) -> str:
+        """Capture one still over USB; see _capture_image_once.
+
+        A body that has left the bus is replaced and the capture retried
+        once, by _retry_once_if_gone.
+        """
+        camera_index = getattr(camera_config, "camera_index", 0)
+        return self._retry_once_if_gone(
+            camera_index, "capture",
+            lambda expect: self._capture_image_once(
+                output_path, camera_config, capture_output, expect
+            ),
+        )
+
+    def _capture_image_once(
+        self,
+        output_path: Path,
+        camera_config,
+        capture_output: bool = False,
+        expect_identity=None,
     ) -> str:
         """Capture one still over USB and write it to output_path.
 
@@ -1238,29 +2033,47 @@ class ChdkBackend(CameraBackend):
         both faster and one less thing to go wrong in the field. The body has
         to be in record mode for that, which is done once and remembered.
 
-        Only the two DSLR-ish fields of CameraConfig mean anything here -
-        shutter speed and ISO - and either may be left alone. Everything else
-        is picamera2's and is ignored.
+        Three fields of CameraConfig mean anything here: shutter speed and
+        ISO, either of which may be left alone, and image_format (see
+        _IMAGE_FORMATS). Everything else is picamera2's and is ignored.
+
+        With image_format "RAW+JPEG" the DNG is written as `<name>.dng` beside the
+        name given, and the camera's JPEG of the same exposure as its
+        `_preview.jpg` (app.core.paths.preview_sidecar_of), preview first;
+        see _write_raw_capture.
 
         Args:
-            output_path: Destination for the JPEG, written exactly as given.
-                A name that is not a JPEG is refused: remote capture returns
-                nothing else, and renaming it here would put the file where
-                the capture service never checked for a collision.
+            output_path: Destination for the JPEG, written exactly as given,
+                or the name whose suffix a DNG replaces. A name that is not
+                a JPEG is refused: the capture service names a capture
+                `.jpg`, and checks that name for a collision under every
+                suffix (capture_name_taken).
             camera_config: CameraConfig; camera_index routes it.
             capture_output: Unused - kept for interface compatibility.
 
         Returns:
-            Tuple of (path string, None), the shape the capture service reads.
+            Tuple of (path string, None), the shape the capture service
+            reads. The path is the DNG's for a RAW capture.
 
         Raises:
             CaptureTimeoutError: The camera never delivered the bytes.
-            RuntimeError: Anything else - a body that is refused, or an
-                output name this backend cannot honour.
+            IncompleteCaptureError: The camera delivered a picture, or a DNG
+                and its JPEG, that is not whole; nothing was written.
+            RuntimeError: Anything else - a body that is refused, an output
+                name or a format this backend cannot honour, or RAW asked of
+                a pychdk older than _PYCHDK_DNG_VERSION.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
         shutter = _shutter_seconds(getattr(camera_config, "shutter_speed", None))
         iso = getattr(camera_config, "iso", None)
+        asked = getattr(camera_config, "image_format", None)
+        image_format = normalise_image_format(asked)
+        if asked is not None and image_format is None:
+            raise RuntimeError(
+                f"A CHDK camera captures {' or '.join(_IMAGE_FORMATS)}, not "
+                f"{asked}. Choose one of those for this camera."
+            )
+        raw = image_format == "RAW+JPEG"
         destination = Path(output_path)
         if destination.suffix.lower() not in _CAPTURE_SUFFIXES:
             raise RuntimeError(
@@ -1273,7 +2086,20 @@ class ChdkBackend(CameraBackend):
                 "would not have been checked."
             )
 
-        with self._in_use(camera_index, "capture", refuse_unusable=True) as body:
+        with self._in_use(
+            camera_index, "capture", refuse_unusable=True,
+            expect_identity=expect_identity,
+        ) as body:
+            if raw and not _shoot_takes_jpeg(body.device.shoot):
+                # Refused before anything is sent: the body is untouched and
+                # stays open for a JPEG capture.
+                raise RuntimeError(
+                    f"RAW capture on {body.port} needs pychdk "
+                    f"{_PYCHDK_DNG_VERSION} or later, whose shoot() returns "
+                    "the DNG and the JPEG of one exposure. The installed "
+                    "pychdk does not have it. Capture in JPEG, or update "
+                    "pychdk."
+                )
             started = time.perf_counter()
             # The mode switch is part of the capture and fails the same way:
             # on a cold start it is the likeliest thing to time out, and it
@@ -1281,11 +2107,35 @@ class ChdkBackend(CameraBackend):
             # generic failure.
             stage = "switching to record mode"
             try:
-                self._ensure_record_mode(body)
+                just_sent = self._ensure_record_mode(body)
+                if not just_sent:
+                    stage = "entering ALT mode"
+                    self._assert_alt(body)
                 stage = "remote capture"
-                image = body.device.shoot(
-                    stream=True, shutter_speed=shutter, market_iso=iso
-                )
+                # pychdk's shoot() sends the capture script itself, without
+                # the NOKILL flag, so the status check in _script is the only
+                # guard on it. shoot() returns once the data is in, and the
+                # capture script can still be running then; the next script
+                # sent to this body waits for it in _script.
+                # A RAW capture returns a DngCapture of two bytes objects;
+                # it is read by attribute, so no pychdk name is imported.
+                if raw:
+                    shot = self._script(
+                        body, "the capture script",
+                        lambda: body.device.shoot(
+                            stream=True, dng=True, jpeg=True,
+                            shutter_speed=shutter, market_iso=iso,
+                        ),
+                    )
+                    dng, image = shot.dng, shot.jpeg
+                else:
+                    dng = None
+                    image = self._script(
+                        body, "the capture script",
+                        lambda: body.device.shoot(
+                            stream=True, shutter_speed=shutter, market_iso=iso
+                        ),
+                    )
             except TimeoutError as exc:
                 elapsed = time.perf_counter() - started
                 self.logger.error(
@@ -1297,6 +2147,15 @@ class ChdkBackend(CameraBackend):
                     f"{body.port}: {stage} timed out after {elapsed:.1f}s"
                 ) from exc
             except Exception as exc:
+                if stage == "remote capture" and _is_dng_error(exc):
+                    # Every part arrived and the DNG could not be assembled
+                    # from them: the same state as a picture that is not
+                    # whole, and cleared the same way.
+                    self._refuse_picture(
+                        camera_index, body, None,
+                        f"its raw data could not be assembled into a DNG "
+                        f"({exc})",
+                    )
                 elapsed = time.perf_counter() - started
                 named = _name_failure(exc)
                 self.logger.error(
@@ -1307,14 +2166,20 @@ class ChdkBackend(CameraBackend):
                 # error, anything else - the conversation broke in the middle
                 # and what the camera is doing now is unknown. The body is
                 # dropped and the next scan opens it again.
+                identity = body.hardware_id
                 self._evict(body, f"{stage} failed with {named}")
-                raise RuntimeError(
+                error = (
+                    _BodyGoneError if _is_gone_from_the_bus(exc) else RuntimeError
+                )(
                     f"CHDK capture failed on {body.port} during {stage} with "
                     f"{named}: {exc}"
-                ) from exc
+                )
+                if isinstance(error, _BodyGoneError):
+                    error.identity = identity
+                raise error from exc
 
             elapsed = time.perf_counter() - started
-            if not image:
+            if not image or (raw and not dng):
                 self.logger.error(
                     f"[chdk] body {camera_index} ({body.port}): remote capture "
                     f"returned no bytes after {elapsed:.2f}s"
@@ -1331,17 +2196,359 @@ class ChdkBackend(CameraBackend):
                     f"CHDK capture on {body.port} returned no image data"
                 )
 
-            atomic_write(
-                destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
+            problem = _dng_problem(dng) if raw else None
+            if problem is not None:
+                self._refuse_picture(camera_index, body, dng, problem)
+            problem, file_number = self._picture_problem(body, image)
+            if problem is not None:
+                self._refuse_picture(camera_index, body, image, problem)
+
+            if raw:
+                master = destination.with_suffix(_DNG_SUFFIX)
+                picture_path = self._write_raw_capture(master, dng, image)
+                self.logger.info(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"ok, DNG of {len(dng)} bytes and JPEG of {len(image)} "
+                    f"bytes in {elapsed:.2f}s from shutter to disk, saved as "
+                    f"{master.name} with {picture_path.name}"
+                )
+            else:
+                master = picture_path = destination
+                atomic_write(
+                    destination, lambda tmp: Path(tmp).write_bytes(bytes(image))
+                )
+                self.logger.info(
+                    f"[chdk] body {camera_index} ({body.port}): remote capture "
+                    f"ok, {len(image)} bytes in {elapsed:.2f}s from shutter to "
+                    f"disk, saved as {destination.name}"
+                )
+            body.last_file_number = file_number
+            self._take_model_from_picture(body, picture_path)
+            return str(master), None
+
+    def _write_raw_capture(self, master, dng, jpeg):
+        """Write a RAW capture's preview and then its DNG master. Returns the preview's path.
+
+        Each file is written atomically. The preview goes first. A failure
+        writing the DNG removes the preview again and propagates, so a
+        failure leaves neither file. A crash between the two leaves a lone
+        `_preview.jpg`: a derived file in the sidecar directory, which
+        capture_name_taken counts (so its name is not given out again) and
+        the integrity check reports as a preview whose master is gone. The
+        other order would leave a lone `.dng` among the masters, where it
+        reads as a capture whose preview is missing, and a CHDK DNG has no
+        preview of its own to make one from.
+        """
+        # Function-local, as in the gphoto2 backend: a module-level app
+        # import from here is circular through capture.service.
+        from app.core.paths import preview_sidecar_of
+
+        preview = preview_sidecar_of(master)
+        atomic_write(preview, lambda tmp: Path(tmp).write_bytes(bytes(jpeg)))
+        try:
+            atomic_write(master, lambda tmp: Path(tmp).write_bytes(bytes(dng)))
+        except BaseException:
+            with contextlib.suppress(OSError):
+                preview.unlink()
+            raise
+        return preview
+
+    def _picture_problem(self, body, image):
+        """Say what is wrong with a picture, or None when it is whole.
+
+        Returns (problem, file_number). problem is a plain sentence fragment
+        or None; file_number is the Canon image file number read from the
+        picture's EXIF, or None when it cannot be read.
+
+        pychdk 0.1.3 keeps only a count of the chunks a capture arrived in
+        (last_capture_chunks), not their sizes, seek positions or "more"
+        flags, so the backend cannot check that the chunks covered the whole
+        file. A picture assembled around a hole at its start begins with the
+        zero bytes pychdk filled the hole with, so the start marker check
+        refuses it. A hole further in, between a whole header and a whole
+        tail, is not detected here.
+        """
+        if image[:2] != _JPEG_START:
+            return (
+                "it does not begin with the JPEG start marker FF D8 (it "
+                f"begins with {image[:2].hex(' ').upper()}), so the camera "
+                "sent it without its beginning",
+                None,
             )
+        if image[-2:] != _JPEG_END:
+            return (
+                "it does not end with the JPEG end marker FF D9, so the "
+                "camera sent it without its end",
+                None,
+            )
+        file_number = _canon_file_number(image)
+        if (
+            file_number is not None
+            and body.last_file_number is not None
+            and file_number == body.last_file_number
+        ):
+            return (
+                f"it carries the same image file number, {file_number}, as "
+                "the previous picture from this camera",
+                file_number,
+            )
+        return None, file_number
+
+    def _refuse_picture(self, camera_index, body, image, problem):
+        """Log a picture that is not whole, drain the body, and raise.
+
+        `image` is the refused file's bytes (a JPEG, or the DNG of a RAW
+        capture), or None when the library could not assemble one. Nothing
+        is written. The body is drained so that the next capture
+        starts clean, or dropped when it cannot be drained. The capture is
+        not retried.
+
+        Raises:
+            IncompleteCaptureError: Always.
+        """
+        chunks = getattr(body.device, "last_capture_chunks", None)
+        received = "no file" if image is None else f"{len(image)} bytes"
+        self.logger.error(
+            f"[chdk] body {camera_index} ({body.port}): remote capture "
+            f"refused, {problem}: {received} in {chunks} chunk(s) "
+            "(pychdk 0.1.3 reports only the number of chunks); nothing was "
+            "saved"
+        )
+        drained = self._drain_capture(camera_index, body)
+        message = (
+            f"The picture from {body.port} is not whole: {problem}. It was "
+            "not saved. Take the picture again."
+        )
+        if not drained:
+            message += (
+                " The camera's capture state could not be cleared, so the "
+                "camera was disconnected; it is opened again on the next scan."
+            )
+        raise IncompleteCaptureError(message)
+
+    def _drain_capture(self, camera_index, body):
+        """Clear what a refused capture left on the camera. False if it could not.
+
+        Only requests that are not scripts are used until no script is
+        running: the script status is read until no script runs (for up to
+        _SCRIPT_END_WAIT_S), and remote-capture data is read and discarded
+        while the camera reports any ready, at most _DRAIN_MAX_CHUNKS chunks
+        and for at most _DRAIN_WAIT_S seconds. Then init_usb_capture(0) is sent through
+        _script to clear the camera's capture state. A failure of any step
+        drops the body.
+        """
+        discarded = []
+        try:
+            self._wait_for_no_script(body)
+            chdk = body.device._chdk
+            started = _monotonic()
+            while True:
+                ready, status = chdk.remote_capture_is_ready()
+                if not ready:
+                    break
+                if (
+                    len(discarded) >= _DRAIN_MAX_CHUNKS
+                    or _monotonic() - started >= _DRAIN_WAIT_S
+                ):
+                    raise RuntimeError(
+                        "the camera still offered capture data after "
+                        f"{len(discarded)} chunks had been discarded"
+                    )
+                wanted = (
+                    _REMOTE_CAP_JPEG if status & _REMOTE_CAP_JPEG
+                    else status & -status
+                )
+                data, more, position = chdk.remote_capture_get_chunk(wanted)
+                discarded.append((len(data), more, position))
+            self._send_lua(body, _CLEAR_CAPTURE_LUA)
+        except Exception as exc:
+            named = _name_failure(exc)
+            self.logger.error(
+                f"[chdk] body {camera_index} ({body.port}): clearing the "
+                f"camera's capture state failed with {named}: {exc}; "
+                f"discarded chunks (size, more, seek): {discarded}"
+            )
+            self._evict(body, f"clearing the capture state failed with {named}")
+            return False
+        self.logger.warning(
+            f"[chdk] body {camera_index} ({body.port}): capture state cleared; "
+            f"discarded chunks (size, more, seek): {discarded}"
+        )
+        return True
+
+    # ------------------------------------------------------------------
+    # Scripts
+    # ------------------------------------------------------------------
+
+    def _wait_for_no_script(self, body, limit=_SCRIPT_END_WAIT_S):
+        """Read the script status until no script is running on the body.
+
+        The status is read every _SCRIPT_POLL_INTERVAL_S for up to `limit`
+        seconds. A read is not a script, so it never disturbs one. Callers
+        hold the body's lock.
+
+        Returns:
+            (reads, seconds): how many status reads it took, and how long.
+
+        Raises:
+            _ScriptStillRunningError: A script is still running at the end.
+        """
+        chdk = body.device._chdk
+        started = _monotonic()
+        deadline = started + limit
+        most = int(round(limit / _SCRIPT_POLL_INTERVAL_S)) + 1
+        reads = 0
+        while True:
+            running, _ = chdk.get_script_status()
+            reads += 1
+            if not running:
+                return reads, _monotonic() - started
+            if reads >= most or _monotonic() >= deadline:
+                raise _ScriptStillRunningError(
+                    f"a script was still running on the camera after "
+                    f"{limit:.1f}s"
+                )
+            _sleep(_SCRIPT_POLL_INTERVAL_S)
+
+    def _script(self, body, what, send):
+        """Send one script to the body, once no script is running on it.
+
+        Every script the backend sends goes through here: the Lua it sends
+        itself (by way of _send_lua) and the scripts pychdk's shoot() and
+        switch_mode() send. `what` names the script for the log. The script
+        status is read once, and while a script is running it is read again
+        every _SCRIPT_POLL_INTERVAL_S for up to _SCRIPT_END_WAIT_S. A wait is
+        logged at debug, or at warning when it took more than
+        _SCRIPT_SLOW_WAIT_S. A script still running at the end fails the
+        operation as a timeout does, and `send` is not called.
+
+        This is where the capture script that a previous capture left
+        running is waited for: a capture returns as soon as its picture is
+        whole.
+
+        Returns:
+            Whatever `send` returns.
+        """
+        reads, waited = self._wait_for_no_script(body)
+        if reads > 1:
+            line = (
+                f"[chdk] {body.port}: waited {waited:.2f}s ({reads} status "
+                f"reads) for a running script to end before sending {what}"
+            )
+            if waited > _SCRIPT_SLOW_WAIT_S:
+                self.logger.warning(line)
+            else:
+                self.logger.debug(line)
+        try:
+            return send()
+        finally:
+            self._note_traffic(body)
+
+    def _send_lua(self, body, code, timeout=_LUA_TIMEOUT_S):
+        """Run one Lua script with the NOKILL flag and return its result.
+
+        This does what pychdk 0.1.3's lua_execute does (execute_lua_wait:
+        clear stale messages, start the script, wait for its RET message),
+        with two differences: the script is started with NOKILL, so a camera
+        that is still running a script refuses this one instead of killing
+        the other, and the waits go through _sleep and _monotonic.
+
+        Returns:
+            The script's first return value, or None when it ended without
+            one.
+
+        Raises:
+            _ScriptStillRunningError: A script was running and did not end.
+            RuntimeError: The camera refused the script or reported an error.
+            TimeoutError: The script did not finish within `timeout`.
+        """
+        return self._script(
+            body, code, lambda: self._run_lua(body, code, timeout)
+        )
+
+    def _run_lua(self, body, code, timeout):
+        chdk = body.device._chdk
+        chdk.drain_messages()
+        script_id = chdk.execute_script(code, flags=_SCRIPT_NOKILL)
+        deadline = _monotonic() + timeout
+        # A bound on reads as well as on time, so a clock that does not move
+        # cannot keep this loop going.
+        most = int(round(timeout / _LUA_POLL_INTERVAL_S)) + 1
+        reads = 0
+        while True:
+            running, has_messages = chdk.get_script_status()
+            reads += 1
+            if has_messages:
+                message = chdk.read_script_message()
+                if message.script_id == script_id:
+                    if message.msg_type == _MSG_RET:
+                        return message.value
+                    if message.msg_type == _MSG_ERR:
+                        raise RuntimeError(
+                            f"Script error in {code!r}: {message.value}"
+                        )
+            elif not running:
+                return None
+            if reads >= most or _monotonic() >= deadline:
+                raise TimeoutError(
+                    f"Script {code!r} did not complete within {timeout}s"
+                )
+            if not has_messages:
+                _sleep(_LUA_POLL_INTERVAL_S)
+
+    def _take_model_from_picture(self, body, path):
+        """Set the body's model from the EXIF Model tag of the picture just saved.
+
+        The picture names the camera better than the USB descriptors do: the
+        A2500's USB product string is the generic "Canon Digital Camera". The
+        tag is cleaned and passed through normalise_camera_model; a file with
+        no EXIF, an unreadable file or a placeholder value changes nothing.
+        The capture service reads camera_model after capture_image returns,
+        so the first picture's recorded model is this one. Nothing here may
+        fail the capture.
+        """
+        try:
+            from PIL import Image
+
+            with Image.open(path) as picture:
+                raw = picture.getexif().get(0x0110)
+        except Exception as exc:
+            self.logger.debug(
+                f"[chdk] {body.port}: no EXIF model read from {path.name}: "
+                f"{exc!r}"
+            )
+            return
+        if isinstance(raw, bytes):
+            raw = raw.decode("ascii", errors="ignore")
+        if not isinstance(raw, str):
+            return
+        model = normalise_camera_model(raw.replace("\x00", "").strip())
+        if model is None:
+            self.logger.debug(
+                f"[chdk] {body.port}: EXIF model of {path.name} names no camera"
+            )
+            return
+        if model != body.model:
             self.logger.info(
-                f"[chdk] body {camera_index} ({body.port}): remote capture ok, "
-                f"{len(image)} bytes in {elapsed:.2f}s from shutter to disk, "
-                f"saved as {destination.name}"
+                f"[chdk] {body.port}: model is {model!r} by the EXIF of "
+                f"{path.name} (was {body.model!r})"
             )
-            return str(destination), None
+            body.model = model
 
     def capture_preview(self, camera_index: int) -> bytes:
+        """Return one live-preview JPEG frame; see _capture_preview_once.
+
+        A body that has left the bus is replaced and the request retried
+        once, by _retry_once_if_gone.
+        """
+        return self._retry_once_if_gone(
+            camera_index, "preview",
+            lambda expect: self._capture_preview_once(camera_index, expect),
+        )
+
+    def _capture_preview_once(
+        self, camera_index: int, expect_identity=None
+    ) -> bytes:
         """Return one live-preview JPEG frame from the body at this index.
 
         The capture service routes every non-picamera2 backend here, so this
@@ -1359,10 +2566,20 @@ class ChdkBackend(CameraBackend):
             RuntimeError: No body at this index, or the frame could not be
                 fetched or decoded.
         """
-        with self._in_use(camera_index, "preview", refuse_unusable=False) as body:
+        with self._in_use(
+            camera_index, "preview", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
             stage = "switching to record mode"
             try:
-                self._ensure_record_mode(body)
+                just_sent = self._ensure_record_mode(body)
+                if not just_sent and (
+                    body.alt_asserted_at is None
+                    or _monotonic() - body.alt_asserted_at
+                    >= _ALT_REASSERT_INTERVAL_S
+                ):
+                    stage = "entering ALT mode"
+                    self._assert_alt(body)
                 stage = "live view"
                 frame = body.device._chdk.get_display_data(LV_TFR_VIEWPORT)
             except Exception as exc:
@@ -1371,11 +2588,17 @@ class ChdkBackend(CameraBackend):
                     f"[chdk] body {camera_index} ({body.port}): {stage} failed "
                     f"with {named}: {exc}"
                 )
+                identity = body.hardware_id
                 self._evict(body, f"{stage} failed with {named}")
-                raise RuntimeError(
+                error = (
+                    _BodyGoneError if _is_gone_from_the_bus(exc) else RuntimeError
+                )(
                     f"CHDK preview failed on {body.port} during {stage} with "
                     f"{named}: {exc}"
-                ) from exc
+                )
+                if isinstance(error, _BodyGoneError):
+                    error.identity = identity
+                raise error from exc
 
             try:
                 jpeg, info = encode_viewport_jpeg(frame)
@@ -1442,29 +2665,69 @@ class ChdkBackend(CameraBackend):
         body.interval_count = 0
         body.interval_worst = 0.0
 
-    def _ensure_record_mode(self, body):
+    def _assert_alt(self, body):
+        """Send enter_alt() and note when. A failure propagates and notes nothing."""
+        self._send_lua(body, _ENTER_ALT_LUA)
+        body.alt_asserted_at = _monotonic()
+
+    def _ensure_record_mode(self, body, restore_focus=True):
         """Put the body in record mode once, and confirm it got there.
 
         A viewport and a remote capture both need record mode, and the switch
         drives the lens, so it is done once per body rather than per frame -
-        which is exactly why it has to be confirmed. pychdk 0.1.3's
-        switch_mode polls get_mode itself and raises once its retries run
-        out, so a switch that never arrived reaches this method as an
-        exception. pychdk 0.1.2 does not: its loop runs out and reports that
-        the same way it reports success, by returning nothing, which leaves
-        every later capture and live view running from playback with the
-        flag set here suppressing any further attempt. The second read below
-        guards against a library that returns without the camera having
-        arrived.
+        which is exactly why it has to be confirmed.
 
-        So the camera is asked directly. The question is Lua, not uBASIC, and
-        the two read opposite ways round: CHDK's Lua get_mode() returns three
-        values - is_record, is_video, mode - and the first of them is true in
-        record and false in play. The library returns the script's first
-        return value, so what comes back here is is_record, and a truthy
-        answer is the camera confirming it arrived. The flag is set only on
-        that answer, so a switch that did not arrive is tried again by the
-        next capture instead of being remembered as done.
+        On 12 November 2026 two A2500 bodies under CHDK 1.5.1 accepted
+        switch_mode_usb(1), extended the lens and went on reporting playback.
+        A half-press of the shutter (click("shoot_half")) sent by hand
+        completed the switch on those bodies without taking a picture. The
+        condition was not tied to how the body was switched on, and the same
+        bodies later hung and needed their batteries taken out, so it may
+        belong to that fault. A half-press sent to a body already in record
+        mode costs nothing.
+
+        So the switch is asked for first, and a half-press is sent only when
+        it has not arrived. pychdk 0.1.3's switch_mode polls get_mode itself
+        and raises a RuntimeError once its retries run out; that error, and
+        only that one, is taken to mean the switch has not arrived. pychdk
+        0.1.2 does not raise: its loop runs out and returns as it does on
+        success, so the camera is asked directly afterwards as well. Any
+        other failure of the switch - a transport error, a timeout, a script
+        that would not run - propagates unchanged and no half-press is sent.
+
+        After the half-press, get_mode is polled for a bounded time. If the
+        body is still in playback at the end of it, the error tells the
+        operator to switch the camera off and on again, and to take the
+        battery out if it does not respond to its buttons.
+
+        The question is Lua, not uBASIC, and the two read opposite ways
+        round: CHDK's Lua get_mode() returns three values - is_record,
+        is_video, mode - and the first of them is true in record and false in
+        play. The library returns the script's first return value, so what
+        comes back here is is_record, and a truthy answer is the camera
+        confirming it arrived. The flag is set only on that answer, so a
+        switch that did not arrive is tried again by the next capture instead
+        of being remembered as done.
+
+        Before the switch, enter_alt() is sent, as Spreads did (see
+        _ENTER_ALT_LUA). With ALT mode on, two A2500 bodies with Canon's
+        "Auto Power Down" on stayed on through seven idle minutes (measured
+        on 12 November 2026). Returns True when this call sent enter_alt(),
+        and False when the body was already in record mode and nothing was
+        sent; the capture and preview paths use that to avoid sending it
+        twice.
+
+        Once record mode is confirmed, _settle_opened_body releases any
+        focus lock, settles the zoom and restores the stored focus if it
+        applies. A failure there is a failure of this method like any other.
+        With restore_focus False the stored focus is not restored; a focus
+        lock or unlock request passes it, since it replaces or removes the
+        stored focus, and a restore that fails would drop the body before
+        the request is sent. The body is in record mode afterwards either
+        way, so the opening steps do not run again for it.
+        _settle_clock then reads the camera's clock and sets it from the
+        unit's when they differ by more than _CLOCK_TOLERANCE_S; a timeout or
+        a wire failure there fails this method in the same way.
 
         Callers hold the body's lock, and call this inside their own failure
         handling: a mode switch that times out is a capture timeout, and one
@@ -1472,17 +2735,809 @@ class ChdkBackend(CameraBackend):
         conversation.
         """
         if body.in_record_mode:
-            return
-        body.device.switch_mode("record")
-        is_record = body.device.lua_execute("return get_mode()")
-        if not is_record:
-            raise RuntimeError(
-                f"{body.port}: the camera is still in play mode after being "
-                "switched to record, so it can neither capture nor show a "
-                "live view"
+            return False
+        # A failure here propagates like a failure of the switch, and no
+        # switch is attempted after it.
+        self._assert_alt(body)
+        try:
+            # pychdk's switch_mode() sends switch_mode_usb itself, without
+            # the NOKILL flag, so the status check in _script is the only
+            # guard on it.
+            self._script(
+                body, "switch_mode_usb(1)",
+                lambda: body.device.switch_mode("record"),
             )
-        body.in_record_mode = True
-        self.logger.info(f"[chdk] {body.port}: switched to record mode")
+        except RuntimeError as exc:
+            if not str(exc).startswith(_PYCHDK_DID_NOT_SWITCH):
+                raise
+            not_arrived = exc
+        else:
+            not_arrived = None
+            if self._send_lua(body, "return get_mode()"):
+                body.in_record_mode = True
+                self.logger.info(f"[chdk] {body.port}: switched to record mode")
+                self._settle_opened_body(body, restore_focus)
+                self._settle_clock(body)
+                return True
+
+        self._send_lua(body, _HALF_PRESS_LUA)
+        waited = 0.0
+        while waited < _RECORD_MODE_HALF_PRESS_WAIT_S:
+            _sleep(_RECORD_MODE_POLL_INTERVAL_S)
+            waited += _RECORD_MODE_POLL_INTERVAL_S
+            if self._send_lua(body, "return get_mode()"):
+                body.in_record_mode = True
+                self.logger.info(
+                    f"[chdk] {body.port}: switched to record mode after a "
+                    f"half-press of the shutter ({waited:.1f}s after it)"
+                )
+                self._settle_opened_body(body, restore_focus)
+                self._settle_clock(body)
+                return True
+
+        raise RuntimeError(
+            f"{body.port}: the camera did not enter shooting mode, so it can "
+            "neither capture nor show a live view. Switch the camera off "
+            "and on again. If it does not respond to its buttons, take the "
+            "battery out and put it back."
+        ) from not_arrived
+
+    def _settle_opened_body(self, body, restore_focus=True):
+        """Release the focus lock, then settle the zoom and the focus.
+
+        Called by _ensure_record_mode once, when the body first reaches
+        record mode after it was opened. set_aflock(0) is sent before any
+        other zoom or focus script, so whatever lock the camera kept across
+        the close is gone and focus_locked False is true of the camera.
+        Then _settle_zoom moves the lens to its stored step and
+        _settle_focus restores the stored focus if it was taken at the step
+        the camera now reports; with restore_focus False, _settle_focus is
+        not called and no focus script is sent after set_aflock(0). A
+        failure of set_aflock(0) propagates before anything else is sent,
+        and the caller drops the body.
+        """
+        self._send_lua(body, _FOCUS_UNLOCK_LUA)
+        body.focus_locked = False
+        self._settle_zoom(body)
+        if restore_focus:
+            self._settle_focus(body)
+
+    # ------------------------------------------------------------------
+    # Optical zoom
+    # ------------------------------------------------------------------
+
+    def _read_zoom(self, body):
+        """Ask the camera for its zoom step; record and return it.
+
+        The answer is recorded as body.zoom_step when it is an int, and as
+        None otherwise. Callers hold the body's lock.
+        """
+        answer = self._send_lua(body, _GET_ZOOM_LUA)
+        body.zoom_step = answer if type(answer) is int else None
+        return body.zoom_step
+
+    def _move_zoom(self, body, step):
+        """Send set_zoom(step), then read the step back.
+
+        _send_lua waits for set_zoom to finish before it returns, and _script
+        reads the script status before the read-back, so the read-back is
+        never sent while set_zoom is still running. A timeout
+        or an error from either script propagates and nothing more is sent.
+
+        Raises:
+            _ZoomNotConfirmedError: The camera reports another step.
+        """
+        self._send_lua(body, f"set_zoom({step})", timeout=_SET_ZOOM_TIMEOUT_S)
+        reported = self._read_zoom(body)
+        if reported != step:
+            raise _ZoomNotConfirmedError(
+                f"{body.port}: the lens was sent to zoom step {step} and the "
+                f"camera reports step {reported}"
+            )
+        self.logger.info(f"[chdk] {body.port}: zoom step {step} confirmed")
+
+    def _stored_zoom_step(self, body):
+        """The zoom step stored for this body, or None.
+
+        A body with no identity has nothing stored, and an ambiguous one has
+        an identity that another body answers to, so neither is looked up. A
+        registry that cannot be opened or read is logged and treated as
+        holding nothing: the camera is left where its lens is.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            return None
+        try:
+            registry = self._registry_factory()
+            entry = registry.get_camera_by_id(hardware_id) if registry else None
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: could not read the stored zoom step "
+                f"({exc!r}); the lens is left where it is"
+            )
+            return None
+        return entry.get("zoom_step") if entry else None
+
+    def _settle_zoom(self, body):
+        """Read the zoom steps and step, and apply the stored step if any.
+
+        Called by _settle_opened_body, after the focus lock has been
+        released. The number of steps is read once per body. A camera that
+        does not answer it with a positive integer gets no further zoom
+        scripts, and body.zoom_step stays None. A stored step outside
+        0..steps-1 is ignored with a warning. A stored step that differs
+        from the current one is sent and read back; a camera that reports
+        another step is logged with a warning and the operation carries on
+        at the step it reports. A timeout or a wire failure propagates.
+
+        No lock is held during the move, so none is released here. The
+        stored focus is not cleared: this move restores the stored step and
+        is not a zoom change, and _settle_focus compares the focus's own
+        step with the step the camera reports.
+        """
+        stored = self._stored_zoom_step(body)
+        if body.zoom_steps is None:
+            answer = self._send_lua(body, _GET_ZOOM_STEPS_LUA)
+            if type(answer) is not int or answer <= 0:
+                self.logger.warning(
+                    f"[chdk] {body.port}: get_zoom_steps() answered "
+                    f"{answer!r}, not a positive integer; the zoom is not "
+                    "read or set on this body"
+                )
+                return
+            body.zoom_steps = answer
+            self.logger.info(f"[chdk] {body.port}: {answer} zoom steps")
+        current = self._read_zoom(body)
+        if stored is None:
+            return
+        if type(stored) is not int or not 0 <= stored < body.zoom_steps:
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored zoom step {stored!r} is not "
+                f"between 0 and {body.zoom_steps - 1}; it is ignored and the "
+                "lens is left where it is"
+            )
+            return
+        if stored == current:
+            return
+        try:
+            self._move_zoom(body, stored)
+        except _ZoomNotConfirmedError:
+            # The camera answered, so the body is in a known state; the
+            # capture or preview goes on at the step it reports. A wire
+            # failure or a timeout is not caught here.
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored zoom step is {stored} and "
+                f"the camera reports step {body.zoom_step} after set_zoom; "
+                "carrying on at the reported step"
+            )
+
+    # ------------------------------------------------------------------
+    # The camera's clock
+    # ------------------------------------------------------------------
+
+    def _read_camera_clock(self, body):
+        """Read the camera's clock; return (raw answer, datetime or None).
+
+        The datetime is None when the answer is not a string in the format
+        _READ_CLOCK_LUA returns, or names a date that does not exist.
+        """
+        raw = self._send_lua(body, _READ_CLOCK_LUA)
+        if not isinstance(raw, str):
+            return raw, None
+        try:
+            return raw, datetime.datetime.strptime(raw.strip(), _CLOCK_FORMAT)
+        except ValueError:
+            return raw, None
+
+    def _settle_clock(self, body):
+        """Read the camera's clock once per open body; set it when it is off.
+
+        Called by _ensure_record_mode after the zoom is settled. The clock is
+        read with one script and compared with the unit's local time taken
+        as the answer arrives. A difference above _CLOCK_TOLERANCE_S is
+        corrected with set_clock, using the unit's local time taken just
+        before sending, and the clock is read back once. If the difference
+        after setting is still above the tolerance, a warning gives both
+        times; there is no retry. An answer that cannot be read as a date is
+        logged with a warning, nothing is set, and the operation carries on.
+        A timeout or a wire failure in either script propagates, as it does
+        for the zoom. body.clock_offset_s holds the last difference measured.
+        """
+        if body.clock_checked:
+            return
+        raw, camera = self._read_camera_clock(body)
+        unit = _now()
+        body.clock_checked = True
+        if camera is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: the camera's clock answered {raw!r}, "
+                "which is not a date; the clock is not set"
+            )
+            return
+        offset = (camera - unit).total_seconds()
+        body.clock_offset_s = offset
+        if abs(offset) <= _CLOCK_TOLERANCE_S:
+            return
+        sent = _now()
+        self._send_lua(
+            body,
+            f"set_clock({sent.year}, {sent.month}, {sent.day}, "
+            f"{sent.hour}, {sent.minute}, {sent.second})",
+        )
+        raw_after, camera_after = self._read_camera_clock(body)
+        unit_after = _now()
+        if camera_after is None:
+            body.clock_offset_s = None
+            self.logger.warning(
+                f"[chdk] {body.port}: the clock was {camera:%Y-%m-%d %H:%M:%S}, "
+                f"{offset:+.1f}s from the unit, and was sent set_clock; the "
+                f"read-back answered {raw_after!r}, which is not a date"
+            )
+            return
+        after = (camera_after - unit_after).total_seconds()
+        body.clock_offset_s = after
+        self.logger.info(
+            f"[chdk] {body.port}: the clock was {camera:%Y-%m-%d %H:%M:%S}, "
+            f"{offset:+.1f}s from the unit; after set_clock it is "
+            f"{after:+.1f}s from the unit"
+        )
+        if abs(after) > _CLOCK_TOLERANCE_S:
+            self.logger.warning(
+                f"[chdk] {body.port}: the clock reads "
+                f"{camera_after:%Y-%m-%d %H:%M:%S} after set_clock, and the "
+                f"unit's time is {unit_after:%Y-%m-%d %H:%M:%S}; the camera "
+                "did not take the new time"
+            )
+
+    def set_zoom_step(self, camera_index: int, step: int) -> int:
+        """Move the lens of the body at this index to a zoom step; see
+        _set_zoom_step_once.
+
+        A body that has left the bus is replaced and the request retried
+        once, by _retry_once_if_gone, as for a capture and a preview: a
+        camera that has just restarted is when an operator adjusts its zoom.
+        A body that left the bus and was not retried, or failed again, is
+        reported as a ZoomFailedError like any other failed conversation.
+        """
+        try:
+            return self._retry_once_if_gone(
+                camera_index, "zoom",
+                lambda expect: self._set_zoom_step_once(camera_index, step, expect),
+            )
+        except _BodyGoneError as gone:
+            raise ZoomFailedError(str(gone)) from gone
+
+    def _set_zoom_step_once(self, camera_index, step, expect_identity=None):
+        """Move the lens of the body at this index to a zoom step, and store it.
+
+        The body is put in record mode first, which reads its zoom steps and
+        applies any step already stored. The step is then checked against
+        the range the camera reported, sent, and read back. The registry
+        stores it under the body's hardware id only after the camera has
+        confirmed it. A body with no identity, or an ambiguous one, is
+        zoomed and nothing is stored.
+
+        A failure on the wire - a timeout, a transport error, a script error
+        - drops the body like a failed capture, and nothing more is sent to
+        it. A camera that answers with another step is not dropped; the step
+        it reports is recorded on the body.
+
+        When the step the camera reports differs from the step the body had
+        before, confirmed or not, the lens moved and any focus is out of
+        date: _drop_focus_after_zoom sends set_aflock(0) whatever the body's
+        flags say, and the stored focus is cleared, so reopening after a
+        zoom change restores nothing. An unconfirmed step is then raised and
+        not stored. A failure of set_aflock(0) is a failure of this method:
+        the body is dropped and nothing is written to the registry. A
+        registry write that fails propagates.
+
+        Args:
+            camera_index: Which body, as the device list numbers them.
+            step: The zoom step, 0 at the widest.
+            expect_identity: Set only for a retry; see _in_use.
+
+        Returns:
+            The step the camera confirmed.
+
+        Raises:
+            ValueError: The step is not an int in 0..zoom_steps-1. The
+                message names the valid range.
+            ZoomFailedError: The body has no zoom steps, the conversation
+                failed, or the camera did not confirm.
+            _BodyGoneError: The body left the bus; set_zoom_step retries.
+            RuntimeError: No body at the index.
+        """
+        with self._in_use(
+            camera_index, "zoom", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
+            try:
+                self._ensure_record_mode(body)
+            except Exception as exc:
+                self._zoom_failed(body, camera_index, "switching to record mode", exc)
+            steps = body.zoom_steps
+            if steps is None:
+                raise ZoomFailedError(
+                    f"Camera {camera_index} ({body.port}) did not report how "
+                    "many zoom steps it has, so no zoom step can be set on it"
+                )
+            if type(step) is not int or not 0 <= step < steps:
+                raise ValueError(
+                    f"zoom step must be an integer from 0 to {steps - 1} on "
+                    f"camera {camera_index}; got {step!r}"
+                )
+            previous = body.zoom_step
+            not_confirmed = None
+            try:
+                self._move_zoom(body, step)
+            except _ZoomNotConfirmedError as exc:
+                not_confirmed = exc
+            except Exception as exc:
+                self._zoom_failed(body, camera_index, "setting the zoom", exc)
+            # A focus lock taken at another step no longer holds. That is so
+            # whenever the camera reports a step other than the one before,
+            # whether or not it is the step asked for. A lens that stayed
+            # where it was leaves the lock and the stored focus alone.
+            if body.zoom_step != previous:
+                try:
+                    self._drop_focus_after_zoom(body)
+                except Exception as exc:
+                    self._zoom_failed(
+                        body, camera_index, "unlocking the focus after the zoom",
+                        exc,
+                    )
+                self._clear_stored_focus(body)
+            if not_confirmed is None:
+                self._store_zoom_step(body, camera_index, step)
+            if not_confirmed is not None:
+                raise not_confirmed
+            return step
+
+    def _zoom_failed(self, body, camera_index, stage, exc):
+        """Log a failed zoom conversation, drop the body, and raise.
+
+        The conversation broke and the camera's state is unknown, so the body
+        is evicted and the next scan opens it again; nothing more is sent to
+        it here.
+        """
+        named = _name_failure(exc)
+        self.logger.error(
+            f"[chdk] body {camera_index} ({body.port}): {stage} failed with "
+            f"{named}: {exc}"
+        )
+        identity = body.hardware_id
+        self._evict(body, f"{stage} failed with {named}")
+        error = (
+            _BodyGoneError if _is_gone_from_the_bus(exc) else ZoomFailedError
+        )(
+            f"CHDK zoom failed on {body.port} during {stage} with {named}: {exc}"
+        )
+        if isinstance(error, _BodyGoneError):
+            error.identity = identity
+        raise error from exc
+
+    def _store_zoom_step(self, body, camera_index, step):
+        """Write a confirmed step to the registry under the body's identity.
+
+        A body that is not yet registered is registered first, as the
+        orientation route does. A registry write that fails propagates.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            self.logger.info(
+                f"[chdk] {body.port}: zoom step {step} set and not stored; "
+                "this body has no identity of its own to store it under"
+            )
+            return
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: zoom step {step} set and not stored; "
+                "the camera registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            registry.register_resolved(
+                hardware_id,
+                {
+                    "model": body.model,
+                    "serial": body.serial,
+                    "location": f"USB {body.port}",
+                    "id": body.port,
+                    "index": camera_index,
+                },
+                camera_index,
+            )
+        registry.update_zoom_step(hardware_id, step)
+        self.logger.info(
+            f"[chdk] {body.port}: zoom step {step} stored for {hardware_id}"
+        )
+
+    # ------------------------------------------------------------------
+    # Focus lock
+    # ------------------------------------------------------------------
+
+    def _read_focus(self, body):
+        """Ask the camera for its focus distance and return the answer as given."""
+        return self._send_lua(body, _GET_FOCUS_LUA)
+
+    def _stored_focus(self, body):
+        """The focus stored for this body, as (distance, zoom_step), or None.
+
+        A body with no identity has nothing stored, and an ambiguous one has
+        an identity that another body answers to, so neither is looked up. A
+        registry that cannot be opened or read is logged and treated as
+        holding nothing: the camera autofocuses on every picture. A stored
+        value that is not a distance and a zoom step - among them a bare
+        distance, which earlier builds of this branch wrote under another
+        key and which no release wrote - is ignored with a warning and
+        treated as absent.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            return None
+        try:
+            registry = self._registry_factory()
+            entry = registry.get_camera_by_id(hardware_id) if registry else None
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: could not read the stored focus "
+                f"({exc!r}); the camera autofocuses on every picture"
+            )
+            return None
+        stored = entry.get("focus") if entry else None
+        if stored is None:
+            return None
+        if not _is_stored_focus(stored):
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored focus {stored!r} is not a "
+                "distance and a zoom step; it is ignored and the camera "
+                "autofocuses on every picture"
+            )
+            return None
+        return stored["distance"], stored["zoom_step"]
+
+    def _settle_focus(self, body):
+        """Restore the body's stored focus, if it applies at this step.
+
+        Called by _settle_opened_body once the lock has been released and
+        the zoom settled. With nothing stored, no script is sent and the
+        camera autofocuses on every picture.
+
+        A stored focus is restored only when the camera has reported a zoom
+        step (body.zoom_step, from get_zoom()) equal to the step stored with
+        the distance. Otherwise nothing is sent, the focus is marked stale,
+        and the stored focus is kept for an opening at that step.
+
+        Otherwise the restore script is sent, then set_focus(distance) once
+        it has returned, then get_focus(). When the camera reports a distance
+        within _FOCUS_RESTORE_TOLERANCE of the stored one, the focus counts
+        as locked. When it does not, or reports no positive integer, a
+        warning is logged, set_aflock(0) is sent so the camera does not shoot
+        at a focus nobody confirmed, focus_restore_failed is set, and the
+        operation carries on; the stored focus is kept. A timeout or a wire
+        failure propagates.
+        """
+        stored = self._stored_focus(body)
+        if stored is None:
+            return
+        distance, step = stored
+        if body.zoom_step != step:
+            body.focus_stale = True
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored focus {distance} mm was taken "
+                f"at zoom step {step} and the camera reports step "
+                f"{body.zoom_step}; it is not restored and the camera "
+                "autofocuses on every picture"
+            )
+            return
+        self._send_lua(body, _FOCUS_RESTORE_LUA, timeout=_FOCUS_SCRIPT_TIMEOUT_S)
+        _sleep(_FOCUS_RESTORE_PAUSE_S)
+        self._send_lua(
+            body, f"set_focus({distance})", timeout=_FOCUS_SCRIPT_TIMEOUT_S
+        )
+        reported = self._read_focus(body)
+        if (
+            _is_focus_distance(reported)
+            and abs(reported - distance) <= _FOCUS_RESTORE_TOLERANCE * distance
+        ):
+            body.focus_locked = True
+            body.focus_distance = reported
+            body.focus_restore_failed = False
+            self.logger.info(
+                f"[chdk] {body.port}: focus restored at {reported} mm "
+                f"(stored {distance} mm at zoom step {step})"
+            )
+            return
+        self.logger.warning(
+            f"[chdk] {body.port}: the stored focus distance is {distance} mm "
+            f"and the camera reports {reported!r} after set_focus; the lock "
+            "is released and the camera autofocuses on every picture"
+        )
+        self._send_lua(body, _FOCUS_UNLOCK_LUA)
+        body.focus_distance = None
+        body.focus_restore_failed = True
+
+    def _drop_focus_after_zoom(self, body):
+        """Release the focus lock after the camera reported a new zoom step.
+
+        Called by _set_zoom_step_once once the camera has reported a step
+        other than the one before. set_aflock(0) is sent whatever the
+        body's flags say, since the camera may hold a lock the backend did
+        not take. The focus is marked stale when the body had a focus to
+        lose: a confirmed lock, a failed restore, a focus already stale, or
+        a stored focus. A body that never had one is not marked stale.
+        The caller clears the stored focus. A failure of set_aflock(0)
+        propagates and changes nothing on the body.
+        """
+        had_focus = (
+            body.focus_locked is True
+            or body.focus_restore_failed
+            or body.focus_stale
+            or self._stored_focus(body) is not None
+        )
+        self._send_lua(body, _FOCUS_UNLOCK_LUA)
+        body.focus_locked = False
+        body.focus_distance = None
+        body.focus_stale = bool(had_focus)
+        body.focus_restore_failed = False
+        self.logger.info(
+            f"[chdk] {body.port}: the zoom moved, so the focus lock is "
+            "released and the stored focus cleared"
+        )
+
+    def lock_focus(self, camera_index: int) -> int:
+        """Autofocus the body at this index once and lock it; see
+        _lock_focus_once.
+
+        A body that has left the bus is replaced and the request retried
+        once, by _retry_once_if_gone, as for set_zoom_step. A body that left
+        the bus and was not retried, or failed again, is reported as a
+        FocusFailedError.
+        """
+        try:
+            return self._retry_once_if_gone(
+                camera_index, "focus lock",
+                lambda expect: self._lock_focus_once(camera_index, expect),
+            )
+        except _BodyGoneError as gone:
+            raise FocusFailedError(str(gone)) from gone
+
+    def _lock_focus_once(self, camera_index, expect_identity=None):
+        """Autofocus the body at this index once, lock it, and store the distance.
+
+        The body is put in record mode first, which settles its zoom; the
+        stored focus is not restored, since this lock replaces it. ALT mode is then asserted as a capture
+        asserts it, set_aflock(0) is sent, then the lock script, and
+        get_focus() is read. The lock counts only when the camera answers a
+        positive integer. The registry stores the distance together with
+        the zoom step the camera last reported, under the body's hardware
+        id; a body with no identity, or an ambiguous one, is locked and
+        nothing is stored. A body whose camera has reported no zoom step
+        (body.zoom_step None) is locked and reported, and nothing is stored,
+        since a restore needs the step.
+
+        A timeout or a wire failure drops the body, and nothing more is sent
+        to it. A camera that answers get_focus() with no positive integer
+        ran set_aflock(1) and answered, so it is sent set_aflock(0) at once
+        and holds no lock; a failure of that release drops the body. The
+        body then reports no lock and no distance, and the stored focus is
+        kept.
+
+        Args:
+            camera_index: Which body, as the device list numbers them.
+            expect_identity: Set only for a retry; see _in_use.
+
+        Returns:
+            The distance get_focus() answered, in mm.
+
+        Raises:
+            FocusFailedError: The conversation failed, or the camera did not
+                report a distance.
+            _BodyGoneError: The body left the bus; lock_focus retries.
+            RuntimeError: No body at the index.
+        """
+        with self._in_use(
+            camera_index, "focus lock", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
+            stage = "switching to record mode"
+            try:
+                just_sent = self._ensure_record_mode(body, restore_focus=False)
+                if not just_sent:
+                    stage = "entering ALT mode"
+                    self._assert_alt(body)
+                # A half-press while the lock is held does not focus again,
+                # so any lock is released first: an earlier lock, one
+                # restored by an earlier operation, or one left by a readback that failed on the wire. It
+                # is sent whatever the flags say.
+                stage = "releasing the focus lock"
+                self._send_lua(body, _FOCUS_UNLOCK_LUA)
+                stage = "locking the focus"
+                self._send_lua(
+                    body, _FOCUS_LOCK_LUA, timeout=_FOCUS_SCRIPT_TIMEOUT_S
+                )
+                stage = "reading the focus"
+                reported = self._read_focus(body)
+            except Exception as exc:
+                self._focus_failed(body, camera_index, stage, exc)
+            if not _is_focus_distance(reported):
+                # The lock script ran and the camera answered, so the lock
+                # nobody confirmed is released now. The stored focus is
+                # kept, as when a restore fails, and focus_stale is left as
+                # it was.
+                self.logger.error(
+                    f"[chdk] body {camera_index} ({body.port}): get_focus() "
+                    f"answered {reported!r} after the lock script; the lock "
+                    "is released"
+                )
+                try:
+                    self._send_lua(body, _FOCUS_UNLOCK_LUA)
+                except Exception as exc:
+                    self._focus_failed(
+                        body, camera_index,
+                        "releasing the unconfirmed focus lock", exc,
+                    )
+                body.focus_locked = False
+                body.focus_distance = None
+                raise FocusFailedError(
+                    f"{body.port}: the camera ran the focus lock script and "
+                    f"answered get_focus() with {reported!r}, not a distance, "
+                    "so the lock was not confirmed and has been released. "
+                    "The camera autofocuses on every picture."
+                )
+            body.focus_locked = True
+            body.focus_distance = reported
+            body.focus_stale = False
+            body.focus_restore_failed = False
+            self.logger.info(
+                f"[chdk] {body.port}: focus locked at {reported} mm"
+            )
+            if body.zoom_step is None:
+                self.logger.info(
+                    f"[chdk] {body.port}: focus distance {reported} not "
+                    "stored; the camera has reported no zoom step to store "
+                    "it with"
+                )
+            else:
+                self._store_focus(body, reported, body.zoom_step, camera_index)
+            return reported
+
+    def unlock_focus(self, camera_index: int) -> None:
+        """Release the focus lock of the body at this index; see
+        _unlock_focus_once. Retried once for a body that left the bus, as
+        lock_focus is.
+        """
+        try:
+            return self._retry_once_if_gone(
+                camera_index, "focus unlock",
+                lambda expect: self._unlock_focus_once(camera_index, expect),
+            )
+        except _BodyGoneError as gone:
+            raise FocusFailedError(str(gone)) from gone
+
+    def _unlock_focus_once(self, camera_index, expect_identity=None):
+        """Send set_aflock(0) to the body at this index and clear its focus.
+
+        The body is put in record mode first, as for a lock, without
+        restoring the stored focus. A restore that fails drops the body and
+        keeps the stored focus, and a capture on that body fails the same
+        way, so the unlock is how the operator removes it. Afterwards the
+        camera autofocuses on every picture. The flags are cleared and the
+        stored focus removed once the camera has taken set_aflock(0). A
+        timeout or a wire failure drops the body and keeps the stored
+        focus.
+
+        Raises:
+            FocusFailedError: The conversation failed.
+            _BodyGoneError: The body left the bus; unlock_focus retries.
+            RuntimeError: No body at the index.
+        """
+        with self._in_use(
+            camera_index, "focus unlock", refuse_unusable=False,
+            expect_identity=expect_identity,
+        ) as body:
+            stage = "switching to record mode"
+            try:
+                self._ensure_record_mode(body, restore_focus=False)
+                stage = "unlocking the focus"
+                self._send_lua(body, _FOCUS_UNLOCK_LUA)
+            except Exception as exc:
+                self._focus_failed(body, camera_index, stage, exc)
+            body.focus_locked = False
+            body.focus_distance = None
+            body.focus_stale = False
+            body.focus_restore_failed = False
+            self.logger.info(f"[chdk] {body.port}: focus unlocked")
+            self._clear_stored_focus(body)
+
+    def _focus_failed(self, body, camera_index, stage, exc):
+        """Log a failed focus conversation, drop the body, and raise.
+
+        The conversation broke and the camera's state is unknown, so the body
+        is evicted and the next scan opens it again; nothing more is sent to
+        it here.
+        """
+        named = _name_failure(exc)
+        self.logger.error(
+            f"[chdk] body {camera_index} ({body.port}): {stage} failed with "
+            f"{named}: {exc}"
+        )
+        identity = body.hardware_id
+        self._evict(body, f"{stage} failed with {named}")
+        error = (
+            _BodyGoneError if _is_gone_from_the_bus(exc) else FocusFailedError
+        )(
+            f"CHDK focus lock failed on {body.port} during {stage} with "
+            f"{named}: {exc}"
+        )
+        if isinstance(error, _BodyGoneError):
+            error.identity = identity
+        raise error from exc
+
+    def _store_focus(self, body, distance, zoom_step, camera_index):
+        """Write a confirmed distance and its zoom step to the registry.
+
+        The two are written as one value, so neither is stored without the
+        other. A body that is not yet registered is registered first, as for
+        a zoom step. A body with no identity, or an ambiguous one, has
+        nothing stored. A registry write that fails propagates.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            self.logger.info(
+                f"[chdk] {body.port}: focus distance {distance} not stored; "
+                "this body has no identity of its own to store it under"
+            )
+            return
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: focus distance {distance} not stored; "
+                "the camera registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            registry.register_resolved(
+                hardware_id,
+                {
+                    "model": body.model,
+                    "serial": body.serial,
+                    "location": f"USB {body.port}",
+                    "id": body.port,
+                    "index": camera_index,
+                },
+                camera_index,
+            )
+        registry.update_focus(hardware_id, distance, zoom_step)
+        self.logger.info(
+            f"[chdk] {body.port}: focus {distance} mm at zoom step {zoom_step} "
+            f"stored for {hardware_id}"
+        )
+
+    def _clear_stored_focus(self, body):
+        """Remove the stored focus of this body from the registry.
+
+        A body with no identity, or an ambiguous one, has nothing stored,
+        and a body the registry does not know has nothing to remove; nothing
+        is written for either. A registry write that fails propagates.
+        """
+        hardware_id = body.hardware_id
+        if hardware_id is None or body.identity_clash:
+            return
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: stored focus not cleared; the camera "
+                "registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            return
+        registry.clear_focus(hardware_id)
+        self.logger.info(
+            f"[chdk] {body.port}: stored focus cleared for {hardware_id}"
+        )
 
     def assign_side(self, camera_index: int, side: str) -> list:
         """Write a page parity onto the card of the body at this index.
@@ -1672,15 +3727,369 @@ class ChdkBackend(CameraBackend):
     def get_capabilities(self) -> dict:
         return {
             "live_preview": True,
+            "continuous_preview": False,
             "focus_control": False,
             "live_controls": False,
             "zoom": False,
+            "zoom_steps": True,
+            "focus_lock": True,
             "autofocus_calibration": False,
             "dslr_settings": False,
+            "image_formats": list(_IMAGE_FORMATS),
         }
+
+    # ------------------------------------------------------------------
+    # Capture format
+    # ------------------------------------------------------------------
+
+    def capture_image_format(self, camera_index):
+        """The capture format stored for the body at this index, or None.
+
+        None when nothing is stored, when no body holds the index, and for a
+        body with no identity or an ambiguous one. The record capture routes
+        put the answer in the capture's CameraConfig.
+        """
+        body = self._body_at(camera_index)
+        if body is None or body.hardware_id is None or body.identity_clash:
+            return None
+        with self._map_lock:
+            return self._image_formats.get(body.hardware_id)
+
+    def _load_image_formats(self):
+        """Read the stored capture format of every open body not yet cached.
+
+        Called at the end of each enumeration. A body is read once per
+        backend; after that the cache answers, and apply_dslr_settings keeps
+        it equal to the registry.
+        """
+        with self._map_lock:
+            bodies = list(self._bodies.values())
+        for body in bodies:
+            hardware_id = body.hardware_id
+            if hardware_id is None or body.identity_clash:
+                continue
+            with self._image_format_lock:
+                with self._map_lock:
+                    if hardware_id in self._image_formats:
+                        continue
+                stored = self._stored_image_format(body)
+                with self._map_lock:
+                    self._image_formats[hardware_id] = stored
+
+    def _stored_image_format(self, body):
+        """The capture format stored in the registry for this body, or None.
+
+        A registry that cannot be opened or read is logged and treated as
+        holding nothing, as is a stored value normalise_image_format does not
+        recognise: the body captures JPEG. A stored RAW, the old name, is read
+        as RAW+JPEG.
+        """
+        try:
+            registry = self._registry_factory()
+            entry = registry.get_camera_by_id(body.hardware_id) if registry else None
+        except Exception as exc:
+            self.logger.warning(
+                f"[chdk] {body.port}: could not read the stored capture format "
+                f"({exc!r}); the camera captures JPEG"
+            )
+            return None
+        stored = entry.get("image_format") if entry else None
+        if stored is None:
+            return None
+        image_format = normalise_image_format(stored)
+        if image_format is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: the stored capture format {stored!r} is "
+                f"not one of {', '.join(_IMAGE_FORMATS)}; it is ignored and "
+                "the camera captures JPEG"
+            )
+            return None
+        return image_format
+
+    def get_dslr_settings(self, camera_index):
+        """The settings route's view of a CHDK body: its capture format alone.
+
+        The other fields are None: a CHDK body's shutter speed and ISO are not
+        read back from the camera. image_format is "JPEG" when nothing is
+        stored, which is what a capture then takes.
+
+        Raises:
+            RuntimeError: No body holds the index.
+        """
+        if self._body_at(camera_index) is None:
+            raise RuntimeError(f"No CHDK camera is open at index {camera_index}")
+        return self._format_settings(camera_index)
+
+    def apply_dslr_settings(self, camera_index, settings):
+        """Store the capture format for the body at this index.
+
+        Only image_format is taken, and only a value normalise_image_format
+        recognises; the old name RAW is stored as RAW+JPEG.
+        Nothing is sent to the camera. The value is written to the camera
+        registry under the body's hardware id, registering the body first
+        when the registry does not know it, and then to the cache. With no
+        registry available it is kept in memory only, with a warning, and a
+        backend restart loses it. A body with no identity, or one another
+        body answers to, cannot hold one: such a body is refused for capture
+        in any case, and a value kept for it could not follow it once it has
+        an identity.
+
+        Returns:
+            The settings as get_dslr_settings reports them.
+
+        Raises:
+            RuntimeError: Another setting was given, the format is not one
+                this backend captures, no body holds the index, or the body
+                has no identity of its own.
+        """
+        others = sorted(
+            name for name, value in settings.items()
+            if value is not None and name != "image_format"
+        )
+        if others:
+            raise RuntimeError(
+                f"A CHDK camera takes only image_format here, not "
+                f"{', '.join(others)}"
+            )
+        asked = settings.get("image_format")
+        image_format = normalise_image_format(asked)
+        if asked is not None and image_format is None:
+            raise RuntimeError(
+                f"A CHDK camera captures {' or '.join(_IMAGE_FORMATS)}, not "
+                f"{asked}"
+            )
+        body = self._body_at(camera_index)
+        if body is None:
+            raise RuntimeError(f"No CHDK camera is open at index {camera_index}")
+        if body.hardware_id is None or body.identity_clash:
+            raise RuntimeError(
+                f"The camera on {body.port} has no identity of its own yet, so "
+                "a capture format cannot be kept for it"
+            )
+        if image_format is not None:
+            with self._image_format_lock:
+                self._store_image_format(body, camera_index, image_format)
+                with self._map_lock:
+                    self._image_formats[body.hardware_id] = image_format
+            self.logger.info(
+                f"[chdk] {body.port}: capture format set to {image_format}"
+            )
+        return self._format_settings(camera_index)
+
+    def _store_image_format(self, body, camera_index, image_format):
+        """Write the capture format to the registry, as _store_zoom_step writes a step.
+
+        A registry write that fails propagates, and the cache is then left
+        as it was.
+        """
+        hardware_id = body.hardware_id
+        registry = self._registry_factory()
+        if registry is None:
+            self.logger.warning(
+                f"[chdk] {body.port}: capture format {image_format} kept in "
+                "memory only; the camera registry is not available"
+            )
+            return
+        if registry.get_camera_by_id(hardware_id) is None:
+            registry.register_resolved(
+                hardware_id,
+                {
+                    "model": body.model,
+                    "serial": body.serial,
+                    "location": f"USB {body.port}",
+                    "id": body.port,
+                    "index": camera_index,
+                },
+                camera_index,
+            )
+        registry.update_image_format(hardware_id, image_format)
+
+    def _format_settings(self, camera_index):
+        return {
+            "iso": None,
+            "shutter_speed": None,
+            "aperture": None,
+            "image_format": self.capture_image_format(camera_index) or "JPEG",
+            "focus_mode": None,
+            "flash_mode": None,
+            # The format stored for the body, None when none is: what
+            # image_format reports when one is stored.
+            "stored_image_format": self.capture_image_format(camera_index),
+        }
+
+    # ------------------------------------------------------------------
+    # Idle keep-alive
+    # ------------------------------------------------------------------
+
+    def _keepalive_loop(self):
+        """The keep-alive thread: one tick per _KEEPALIVE_INTERVAL_S until stopped.
+
+        An exception from a tick is logged and the loop goes on to the next
+        one, so one bad tick never ends the keep-alive for the rest of the
+        session.
+        """
+        while not self._keepalive_stop.wait(_KEEPALIVE_INTERVAL_S):
+            try:
+                self._keepalive_tick()
+            except Exception as exc:
+                self.logger.error(f"[chdk] keep-alive tick failed: {exc!r}")
+
+    def _keepalive_tick(self):
+        """Open an attached body that is not open, then read every idle body.
+
+        See _open_unopened_bodies for the first part. The reads stop before
+        the next body once cleanup has asked the thread to stop.
+        """
+        try:
+            self._open_unopened_bodies()
+        except Exception as exc:
+            self.logger.error(
+                f"[chdk] keep-alive: opening an unopened body failed: {exc!r}"
+            )
+        with self._map_lock:
+            bodies = [self._bodies[key] for key in sorted(self._bodies)]
+        for body in bodies:
+            if self._keepalive_stop.is_set():
+                return
+            self._keep_alive(body)
+
+    def _open_unopened_bodies(self):
+        """Run one enumeration for a body that is attached and not open.
+
+        Only when the presence scan finds such a body at an address the
+        keep-alive has not tried, and every open body is idle. The address
+        is marked tried before the enumeration, whatever comes of it. The
+        enumeration runs under the layout lock with the stop checked inside
+        it, so none starts once cleanup has begun.
+        """
+        try:
+            attached = set(self._presence_scan())
+        except Exception as exc:
+            if not self._presence_failing:
+                self._presence_failing = True
+                self.logger.warning(
+                    f"[chdk] keep-alive: could not read which cameras are "
+                    f"attached ({exc!r}); open cameras are still kept awake"
+                )
+            return
+        self._presence_failing = False
+        with self._map_lock:
+            self._keepalive_tried &= attached
+            bodies = [self._bodies[key] for key in sorted(self._bodies)]
+            untried = sorted(
+                attached - set(self._bodies) - self._keepalive_tried
+            )
+        if not untried:
+            return
+        if not all(self._is_idle(body) for body in bodies):
+            return
+        with self._layout_lock:
+            if self._keepalive_stop.is_set():
+                return
+            if not self._no_body_in_use(bodies):
+                return
+            ports = ", ".join(
+                f"usb:{bus:03d},{address:03d}" for bus, address in untried
+            )
+            self.logger.info(
+                f"[chdk] keep-alive: {ports} attached and not open; "
+                "enumerating to open it"
+            )
+            try:
+                self._enumerate(reread=False, only=frozenset(untried))
+            finally:
+                # Marked whatever the outcome, and only now: an address in
+                # the tried set during the enumeration is one a failure
+                # closed after this tick chose it.
+                with self._map_lock:
+                    self._keepalive_tried.update(untried)
+
+    def _no_body_in_use(self, bodies):
+        """True when every one of these bodies' locks is free right now.
+
+        Each lock is tried without waiting and released again at once. A
+        held lock is a request in progress, and an enumeration would wait
+        for it.
+        """
+        for body in bodies:
+            lock = body.lock
+            if not lock.acquire(blocking=False):
+                return False
+            lock.release()
+        return True
+
+    def _is_idle(self, body):
+        """True when nothing has been sent to the body for an interval."""
+        last = body.last_traffic_at
+        return last is None or _monotonic() - last >= _KEEPALIVE_INTERVAL_S
+
+    def _keep_alive(self, body):
+        """Send one read to this body if it is idle and nobody is using it.
+
+        The body's lock is tried without waiting: a body whose lock is held
+        is in use, and is skipped until the next tick. With the lock held the
+        body is checked again - still in the map, still connected, still
+        idle - because a request or a close can finish between the snapshot
+        and the lock. A read that fails or times out is logged once at
+        WARNING and the body is evicted, as a failed capture's is; nothing
+        more is sent to it.
+        """
+        if not self._is_idle(body):
+            return
+        if not body.lock.acquire(blocking=False):
+            return
+        try:
+            with self._map_lock:
+                current = self._bodies.get(body.key) is body
+            if not current or not body.device.is_connected:
+                return
+            if not self._is_idle(body):
+                return
+            try:
+                self._send_lua(body, _KEEPALIVE_LUA)
+            except Exception as exc:
+                failure = (
+                    "timed out" if isinstance(exc, TimeoutError)
+                    else f"failed with {_name_failure(exc)}"
+                )
+                self.logger.warning(
+                    f"[chdk] {body.port}: keep-alive read {failure} ({exc}); "
+                    "the body is closed until a scan opens it again"
+                )
+                self._evict(body, f"keep-alive read {failure}")
+        finally:
+            body.lock.release()
+
+    def _stop_keepalive(self):
+        """Stop the keep-alive thread and wait up to _KEEPALIVE_JOIN_S for it."""
+        self._keepalive_stop.set()
+        thread = self._keepalive_thread
+        if thread is None or thread is threading.current_thread():
+            return
+        thread.join(_KEEPALIVE_JOIN_S)
+        if thread.is_alive():
+            self.logger.warning(
+                f"[chdk] the keep-alive thread had not ended "
+                f"{_KEEPALIVE_JOIN_S:.0f}s after it was stopped"
+            )
 
     def get_backend_name(self) -> str:
         return "chdk"
+
+    def held_body_count(self) -> "int | None":
+        """How many bodies this backend holds open, read from its map; nothing is sent to a camera, and nothing waits.
+
+        The lock is only tried: when it is taken, the count last published
+        with the map is given (None before the first).
+        """
+        if not self._map_lock.acquire(blocking=False):
+            return getattr(self, "_published_body_count", None)
+        try:
+            count = len(self._bodies)
+            self._published_body_count = count
+            return count
+        finally:
+            self._map_lock.release()
 
     def cleanup(self):
         """Close every open body, waiting for whatever is using it.
@@ -1703,7 +4112,13 @@ class ChdkBackend(CameraBackend):
         scanned is part of that: the next question about a camera looks at
         the hardware again rather than reporting the rig it has just closed
         as absent.
+
+        The keep-alive thread is stopped first, and not started again: an
+        idle body of a backend that has been cleaned up gets no keep-alive.
+        shutdown_backend drops the backend after this, and the next one
+        built starts its own.
         """
+        self._stop_keepalive()
         with self._layout_lock:
             while True:
                 with self._map_lock:

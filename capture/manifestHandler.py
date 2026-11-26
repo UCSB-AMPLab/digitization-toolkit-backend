@@ -356,10 +356,19 @@ RELOCATION_RECORD_TYPE = "relocation"
 # captured before capture recorded them (app.core.preview_digests).
 PREVIEW_DIGEST_RECORD_TYPE = "preview_digest"
 
+# A colour card shot (app.core.colour_card), written when the shot is taken:
+# `{"record_type": "calibration", "capture_id", "timestamp_utc", "set_number",
+# "camera_index", "files": [...], "cameras": [...], "settings"}`, its files'
+# paths relative to the volume's `<stem>/` (`calibration/<name>`). A shot is
+# not a page: no record or image row is ever made from this line.
+CALIBRATION_RECORD_TYPE = "calibration"
+
 # Records that carry a capture id but are not capture records: the fixity
 # index reads them, but the export bag, the startup repair of a volume's
-# manifest and the index's set of captured ids do not count them.
-NON_CAPTURE_RECORD_TYPES = frozenset({RELOCATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE})
+# manifest, a rebuild from disk and the index's set of captured ids do not
+# count them.
+NON_CAPTURE_RECORD_TYPES = frozenset({RELOCATION_RECORD_TYPE, PREVIEW_DIGEST_RECORD_TYPE,
+                                      CALIBRATION_RECORD_TYPE})
 
 
 def is_capture_record(entry) -> bool:
@@ -467,3 +476,16 @@ def append_manifest_lines(root: Path, lines: list) -> None:
     data = "".join(line + "\n" for line in lines).encode("utf-8")
     with _manifest_append_lock:
         _append_line(metadata_dir / "manifest.jsonl", data)
+
+
+def append_calibration_record(volume_root: Path, payload: Dict) -> None:
+    """Append a colour card shot's line (CALIBRATION_RECORD_TYPE) to a volume's capture manifest.
+
+    `payload` carries every key but `record_type`, which is set here. One
+    O_APPEND write, fsynced, as append_manifest_record writes.
+    """
+    metadata_dir = volume_root / "metadata"
+    metadata_dir.mkdir(parents=True, exist_ok=True)
+    line = (json.dumps({"record_type": CALIBRATION_RECORD_TYPE, **payload}, ensure_ascii=False) + "\n").encode("utf-8")
+    with _manifest_append_lock:
+        _append_line(metadata_dir / "manifest.jsonl", line)

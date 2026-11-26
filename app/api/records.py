@@ -1,4 +1,4 @@
-# Version: 0.2.0
+# Version: 0.3.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query, UploadFile, File
 from fastapi.responses import FileResponse
@@ -23,18 +23,23 @@ from app.schemas.record import (
 	RecordStatusUpdate, BulkStatusUpdate, STATUS_TRANSITIONS,
 	RecordAnnotationCreate, RecordAnnotationRead,
 	RecordRejectRequest, RecordRejectionRead, RecordToRetake,
+	MissingPageRequest, CloseMissingRequest,
 )
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
-from app.core.paths import is_raw_suffix, preview_sidecar_of, resolve_within_storage
+from app.core.paths import (
+	is_raw_suffix, preview_sidecar_of, raw_buffer_of, raw_sidecar_of, resolve_within_storage, same_file,
+)
 from app.core.record_sequence import next_sequences
 from app.core.record_status import change_record_status
 from app.core.capture_naming import CaptureNameRefused, take_filename_index
 from app.core.volume_stem import STEM_REQUIRED_DETAIL, VOLUME_REQUIRED_DETAIL, locked_volume_query, volume_lacks_stem
 from app.core.thumbnail import generate_thumbnail, delete_thumbnail
 from app.core.audit import log_event
+from app.core import recapture_turn
 from app.core.export_jobs import export_jobs
 from app.core.storage_override import refuse_writes_under_unusable_root
+from app.core.testing_space import scope_query, space_query_param
 
 router = APIRouter()
 logger = logging.getLogger(__name__)
@@ -78,8 +83,9 @@ def _image_files_to_unlink(
 	raw_path: Optional[str],
 	raw_thumbnail_path: Optional[str],
 	sibling_paths: Iterable[Optional[str]] = (),
+	db: Optional[Session] = None,
 ) -> List[Path]:
-	"""The files on the card an image row's delete removes: master, `_preview.jpg` sidecar, thumbnail.
+	"""The files on the card an image row's delete removes: master, `_preview.jpg` and `.raw` sidecars, thumbnail.
 
 	Nothing is unlinked here. The delete handlers call this while they hold the
 	record's row lock, commit the row deletion, and only then pass the list to
@@ -118,20 +124,45 @@ def _image_files_to_unlink(
 	which every site that derives it shares (NEH-264). `capture/service.py`
 	uses it too when it rolls back a capture that never reached the manifest;
 	that rollback and these handlers share the name rule and nothing else.
+
+	A multi-format capture (Picamera2Backend with raw) also writes the raw
+	sensor buffer beside its JPEG master as `<stem>.raw` (NEH-261). The JPEG
+	is the row's image and the raw file has no row of its own, so it is found
+	from the master by `raw_sidecar_of`, the name the backend writes it under.
+	Every master names one; a master without a raw buffer names a file that
+	does not exist, and `_unlink_after_commit` skips a missing file. A
+	capture's name is free under every suffix when it is taken
+	(capture_name_taken), so a `<stem>.raw` beside the master belongs to the
+	same capture. The claim goes through `raw_buffer_of`: a RAW master
+	(`f.CR2`) claims no `f.raw`, a `.raw` that does not exist is not listed,
+	and a `.raw` that is the same file as any row's master, in this record
+	or any other (`db` is queried by name for the candidates), is that row's
+	file and is not listed. It is also kept when it is the same file as a
+	surviving sibling's own buffer.
 	"""
 	paths: List[Path] = []
 	master = resolve_within_storage(raw_path)
 	if master is not None:
 		paths.append(master)
-		sidecar = preview_sidecar_of(master)
-		shared = False
-		for raw_sibling in sibling_paths:
-			sibling = resolve_within_storage(raw_sibling)
-			if sibling is not None and preview_sidecar_of(sibling) == sidecar:
-				shared = True
-				break
-		if not shared:
-			paths.append(sidecar)
+		siblings = [
+			sibling
+			for sibling in (resolve_within_storage(s) for s in sibling_paths)
+			if sibling is not None
+		]
+		preview = preview_sidecar_of(master)
+		if not any(preview_sidecar_of(sibling) == preview for sibling in siblings):
+			paths.append(preview)
+		# The raw buffer only through raw_buffer_of: never for a RAW master,
+		# and never a `.raw` that any row, in any record, has as its master.
+		# Ownership is decided by file identity (raw_buffer_of), against the
+		# siblings and every row stored under the buffer's name.
+		from app.core.storage_ops import raw_buffer_candidate_names, rows_master_paths_named
+		candidate = raw_sidecar_of(master)
+		owners = siblings + rows_master_paths_named(db, raw_buffer_candidate_names(candidate))
+		buffer = raw_buffer_of(master, owners)
+		if buffer is not None and not any(
+				not is_raw_suffix(sibling) and same_file(raw_sidecar_of(sibling), buffer) for sibling in siblings):
+			paths.append(buffer)
 	thumbnail = resolve_within_storage(raw_thumbnail_path)
 	if thumbnail is not None:
 		paths.append(thumbnail)
@@ -174,11 +205,15 @@ def _collection_of(rec: Optional[Record]) -> List[int]:
 	return [rec.collection_id] if rec is not None and rec.collection_id is not None else []
 
 
-def _supersede_current_images(record: Record) -> None:
-	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208)."""
+def _supersede_current_images(record: Record, role: Optional[str] = None) -> None:
+	"""Flip every current image on a record to superseded. Used when a recapture is about to add new current image(s) (NEH-208).
+
+	With `role`, only the current images of that role: a page marked missing
+	(mark_missing_page, contract 1.9 §10.4).
+	"""
 	now = datetime.now(timezone.utc)
 	for img in record.images:
-		if img.is_current:
+		if img.is_current and (role is None or img.role == role):
 			img.is_current = False
 			img.superseded_at = now
 
@@ -199,12 +234,30 @@ def create_record(
 	under the volume's row lock (app/core/record_sequence.py); `sequence` in
 	the body is not used. A record outside a volume, or naming a volume that
 	does not exist, is given no sequence.
+
+	The testing account creates records in its own volumes only
+	(app.api.space.enforce_space refuses real ones): a testing record always
+	belongs to a testing volume, so one without `collection_id` is 400
+	`testing_record_needs_volume`, whatever project it names, and one naming
+	a place with no row is 404 `not_found`.
 	"""
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_record_without_volume(rec_in.collection_id)
+		if not testing_space.is_testing(db, project_id=rec_in.project_id, collection_id=rec_in.collection_id):
+			raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
 	sequence = None
 	if rec_in.collection_id is not None:
 		sequences = next_sequences(db, rec_in.collection_id, 1)
 		if sequences is not None:
 			sequence = sequences[0]
+		# Not into a volume an adoption closed; read under the row lock next_sequences took.
+		from app.core.adopt_journal import refuse_if_adopted_away
+		try:
+			refuse_if_adopted_away(db, [rec_in.collection_id])
+		except HTTPException:
+			db.rollback()
+			raise
 	rec = Record(
 		title=rec_in.title,
 		description=rec_in.description,
@@ -235,11 +288,12 @@ def list_records(
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
 	orphaned: Optional[bool] = Query(default=None, description="If true, return only records with no project or collection"),
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""List all records with optional filtering."""
-	query = db.query(Record).options(joinedload(Record.images))
+	"""List the records of the caller's space (app.core.testing_space.scope_query), with optional filtering."""
+	query = scope_query(db.query(Record).options(joinedload(Record.images)), Record, current_user, space)
 	
 	if project_id is not None:
 		query = query.filter(Record.project_id == project_id)
@@ -271,11 +325,12 @@ def list_records(
 def count_records(
 	project_id: Optional[int] = Query(default=None, description="Filter by project ID"),
 	collection_id: Optional[int] = Query(default=None, description="Filter by collection ID"),
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Return the total number of records matching the given filters."""
-	query = db.query(Record)
+	"""Return the number of records of the caller's space matching the given filters."""
+	query = scope_query(db.query(Record), Record, current_user, space)
 	if project_id is not None:
 		query = query.filter(Record.project_id == project_id)
 	if collection_id is not None:
@@ -284,14 +339,17 @@ def count_records(
 
 
 def _to_retake_query(db: Session):
-	"""The rejected records, each with its volume and its latest rejection, in one query.
+	"""The pending records, each with its volume, its latest rejection and why it is pending, in one query.
 
-	The latest rejection is the one with the newest rejected_at (the highest
-	id on a tie), found by a correlated subquery in the join, so the rows
-	come from one statement whatever their number. Both joins are outer: a
-	record in no volume, or rejected with no RecordRejection row, is still
-	waiting.
+	Pending is app.core.recapture_turn's one definition: rejected, prepared
+	for retake, or missing and open. The latest rejection is the one with the
+	newest rejected_at (the highest id on a tie), found by a correlated
+	subquery in the join, so the rows come from one statement whatever their
+	number. Both joins are outer: a record in no volume, or pending with no
+	RecordRejection row (a missing side has none), is still waiting.
 	"""
+	from app.core import recapture_turn
+
 	other = aliased(RecordRejection)
 	latest = (
 		db.query(other.id)
@@ -302,27 +360,47 @@ def _to_retake_query(db: Session):
 		.scalar_subquery()
 	)
 	return (
-		db.query(Record, Collection, RecordRejection)
+		db.query(Record, Collection, RecordRejection, recapture_turn.pending_reason_clause().label("pending_reason"))
 		.outerjoin(Collection, Collection.id == Record.collection_id)
 		.outerjoin(RecordRejection, RecordRejection.id == latest)
-		.filter(Record.status == "rejected")
+		.filter(recapture_turn.pending_clause())
 	)
 
 
 @router.get("/to-retake", response_model=List[RecordToRetake])
 def list_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""Every rejected record, across all volumes, oldest latest rejection first.
+	"""Every pending record, across all volumes, in volume order and then in the volume's order.
 
-	Each row has the record, its volume's project id, name and stem, and its latest
-	rejection's reason code, comment, author and time. A rejected record
-	with no rejection row comes last; ties go by record id.
+	Pending as app.core.recapture_turn defines it: rejected, prepared for
+	retake, or missing and open (a page or a whole opening never captured,
+	and not closed; contract 1.9 §10). Each row has the record, its volume's
+	project id, name and stem, its latest rejection's reason code, comment,
+	author and time, why it is pending (pendingReason), the side it misses
+	(missingSide), and for a missing record what it should hold, the note on
+	it and the Fisqua request it came from (missingExpected, missingNote,
+	requestId). A record with no rejection row, as a missing one has none,
+	has None for the rejection's fields.
+
+	Ordered by volume, its stem (a volume without one after every stemmed
+	volume), name and id, so a record in no volume comes last; then by the
+	record's sequence (one without last) and id, so an operator works
+	through a volume in its own order. GET /to-retake/count counts the same
+	set. Only the records of the caller's space are listed
+	(app.core.testing_space.scope_query).
 	"""
 	rows = (
-		_to_retake_query(db)
-		.order_by(RecordRejection.rejected_at.asc().nulls_last(), Record.id)
+		scope_query(_to_retake_query(db), Record, current_user, space)
+		.order_by(
+			Collection.filename_stem.asc().nulls_last(),
+			Collection.name.asc().nulls_last(),
+			Collection.id.asc().nulls_last(),
+			Record.sequence.asc().nulls_last(),
+			Record.id,
+		)
 		.all()
 	)
 	return [
@@ -338,42 +416,67 @@ def list_records_to_retake(
 			comment=rej.comment if rej else None,
 			rejectedBy=rej.rejected_by if rej else None,
 			rejectedAt=rej.rejected_at if rej else None,
+			pendingReason=reason,
+			missingSide=rec.missing_side,
+			missingExpected=rec.missing_expected,
+			missingNote=rec.missing_note,
+			requestId=rec.missing_request_id,
 		)
-		for rec, col, rej in rows
+		for rec, col, rej, reason in rows
 	]
 
 
 @router.get("/to-retake/count")
 def count_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
-	"""How many records GET /records/to-retake lists, for the side menu's badge."""
-	return {"count": db.query(Record).filter(Record.status == "rejected").count()}
+	"""How many records GET /records/to-retake lists, for the side menu's badge: the same pending set, in the caller's space."""
+	return {"count": _pending_in_space(db, current_user, space)}
+
+
+def _pending_in_space(db: Session, user: User, space: Optional[str]) -> int:
+	"""recapture_turn.pending_records, counted over the caller's space only."""
+	from sqlalchemy import func
+	from app.core import recapture_turn
+	query = db.query(func.count(Record.id)).filter(recapture_turn.pending_clause())
+	return scope_query(query, Record, user, space).scalar() or 0
 
 
 @router.get("/to-retake/summary")
 def summarise_records_to_retake(
+	space: Optional[str] = space_query_param(),
 	current_user: User = Depends(allow_read_only),
 	db: Session = Depends(get_db_dependency)
 ):
 	"""The retakes by volume, and the unit's recapture turn (app.core.recapture_turn).
 
-	pendingRecords is the unit's pending records: rejected, or prepared for
-	retake with the rejected image still current. Each volume with a pending
+	pendingRecords is the unit's pending records: rejected, prepared for
+	retake with the rejected image still current, or missing a side. Each volume with a pending
 	record is listed, most pending first, then by name: `pending` is its
 	pending records, `total` its records with at least one rejection whatever
-	their state now, pendingRecordIds every pending record of the volume by
-	sequence (a record with none last) then id, and firstPendingRecordId the
-	first of them. projectId is the project that owns the volume, through its
+	their state now except excluded, `excluded` its records now excluded by
+	a Fisqua decision (contract 1.6), which are never pending, pendingRecordIds every pending record of the volume by
+	sequence (a record with none last) then id, firstPendingRecordId the
+	first of them, and missingSideRecordIds those of them that miss a side,
+	in the same order. A record that misses a side has no rejection, so it
+	counts in `pending` and not in `total`. projectId is the project that owns the volume, through its
 	parents for a nested one.
 
 	The volumes come from one statement: every record in a volume that is
-	pending or was ever rejected, with its volume, in the order of the list.
+	pending, was ever rejected or is excluded, with its volume, in the order
+	of the list. A volume with exclusions and nothing pending is not listed.
 	Counts, list and first record are taken from the same rows, so a retake
 	committed while the summary is read cannot make them disagree, and a
 	volume left with no pending record is not listed. The same statement
 	runs on PostgreSQL and SQLite, with no array aggregate.
+
+	The volumes and pendingRecords are the caller's space's
+	(app.core.testing_space.scope_query). The turn is the unit's real
+	work's, read over every pending record of real work, as the capture
+	routes read it, whatever the caller's space: no testing record counts
+	for it and no testing volume is named by it (app.core.recapture_turn).
 	"""
 	from sqlalchemy import or_
 	from app.core import recapture_turn
@@ -381,20 +484,29 @@ def summarise_records_to_retake(
 
 	is_pending = recapture_turn.pending_clause()
 	ever_rejected = db.query(RecordRejection.record_id).filter(RecordRejection.record_id == Record.id).exists()
-	rows = (
+	query = (
 		db.query(Collection.id, Collection.name, Collection.filename_stem,
-		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"))
+		         Record.id, is_pending.label("is_pending"), ever_rejected.label("ever_rejected"),
+		         Record.status, recapture_turn.pending_reason_clause().label("pending_reason"))
 		.join(Record, Record.collection_id == Collection.id)
-		.filter(or_(is_pending, ever_rejected))
+		.filter(or_(is_pending, ever_rejected, Record.status == "excluded"))
+	)
+	rows = (
+		scope_query(query, Record, current_user, space)
 		.order_by(Collection.id, Record.sequence.asc().nulls_last(), Record.id)
 		.all()
 	)
 	by_volume: dict = {}
-	for collection_id, name, stem, record_id, pending, rejected in rows:
-		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "total": 0})
+	for collection_id, name, stem, record_id, pending, rejected, status, reason in rows:
+		vol = by_volume.setdefault(collection_id, {"name": name, "stem": stem, "ids": [], "missing": [],
+		                                           "total": 0, "excluded": 0})
 		if pending:
 			vol["ids"].append(record_id)
-		if rejected:
+			if reason == recapture_turn.MISSING_SIDE:
+				vol["missing"].append(record_id)
+		if status == "excluded":
+			vol["excluded"] += 1
+		elif rejected:
 			vol["total"] += 1
 	volumes = []
 	for collection_id, vol in by_volume.items():
@@ -408,15 +520,30 @@ def summarise_records_to_retake(
 			"filenameStem": vol["stem"],
 			"pending": len(vol["ids"]),
 			"total": vol["total"],
+			"excluded": vol["excluded"],
 			"firstPendingRecordId": vol["ids"][0],
 			"pendingRecordIds": vol["ids"],
+			"missingSideRecordIds": vol["missing"],
 		})
 	volumes.sort(key=lambda v: (-v["pending"], v["name"]))
-	pending_records = recapture_turn.pending_records(db)
+	from sqlalchemy import case, func, not_
+	from app.core.testing_space import lists_testing, testing_clause
+	in_space = testing_clause(Record)
+	if not lists_testing(current_user, space):
+		in_space = not_(in_space)
+	# One statement: the unit's pending records of real work, which decide
+	# the turn, and those of the caller's space, which pendingRecords gives.
+	real = recapture_turn.real_work_clause()
+	unit_pending, space_pending = (
+		db.query(func.coalesce(func.sum(case((real, 1), else_=0)), 0),
+		         func.coalesce(func.sum(case((in_space, 1), else_=0)), 0))
+		.filter(recapture_turn.pending_clause())
+		.one()
+	)
 	return {
-		"pendingRecords": pending_records,
+		"pendingRecords": int(space_pending or 0),
 		"volumes": volumes,
-		"turn": recapture_turn.turn(db, pending_records),
+		"turn": recapture_turn.turn(db, int(unit_pending or 0)),
 	}
 
 
@@ -460,6 +587,11 @@ def update_record(
 		data["collection_id"] = None
 	elif set_collection:
 		data["project_id"] = None
+	# A testing record always belongs to a testing volume: the testing
+	# account moves it between its volumes, never out of them.
+	from app.core import testing_space as _testing_space
+	if current_user.role == _testing_space.TESTING_ROLE and ("project_id" in data or "collection_id" in data):
+		_testing_space.refuse_record_without_volume(data.get("collection_id", rec.collection_id))
 
 	# Moving a record between collections is a withdrawal once it has been
 	# handed over, and the handover is a per-collection act by ruling
@@ -477,6 +609,20 @@ def update_record(
 		              data.get("collection_id", rec.collection_id))
 		if new_parent != (rec.project_id, rec.collection_id):
 			assert_movable(rec)
+			# Neither out of nor into a volume an unfinished adoption names:
+			# its recovery decides by where the records are (app.core.adopt_journal).
+			from app.core.adopt_journal import refuse_if_journaled
+			refuse_if_journaled([rec.collection_id, new_parent[1]])
+			# Not between testing and real work (app.core.testing_space); not
+			# between a volume Captua keeps on the unit and one it does
+			# not, nor out of or into a kept one from outside every volume (NEH-320).
+			from app.core import kept_volumes, testing_space
+			try:
+				testing_space.refuse_cross_space(db, (rec.project_id, rec.collection_id), new_parent)
+				kept_volumes.refuse_kept_move(db, rec.collection_id, new_parent[1])
+			except kept_volumes.KeepRefused as exc:
+				db.rollback()
+				raise HTTPException(status_code=exc.status, detail=exc.detail())
 			# A record whose images are in the bucket stays in its volume:
 			# their keys are under the volume's stem and never change. A
 			# record with such images that is outside every volume (one taken
@@ -505,6 +651,13 @@ def update_record(
 		sequences = next_sequences(db, new_collection, 1)
 		if sequences is not None:
 			data["sequence"] = sequences[0]
+		# Not into a volume an adoption closed; read under the row lock next_sequences took.
+		from app.core.adopt_journal import refuse_if_adopted_away
+		try:
+			refuse_if_adopted_away(db, [new_collection])
+		except HTTPException:
+			db.rollback()
+			raise
 
 	for field, value in data.items():
 		setattr(rec, field, value)
@@ -519,6 +672,17 @@ def update_record(
 	return _serialize_record(rec)
 
 
+# Statuses whose records, and their images, only an admin may delete.
+LOCKED_STATUSES = ("in_review", "approved", "excluded")
+
+
+def _locked_detail(what: str, status: str) -> str:
+	if status == "excluded":
+		return (f"Cannot delete {what} with status 'excluded': Fisqua excluded it from the volume, "
+		        "and only an admin can delete it.")
+	return f"Cannot delete {what} with status '{status}'. Move it to 'rejected' first."
+
+
 @router.delete("/{rec_id}")
 def delete_record(
 	rec_id: int,
@@ -529,12 +693,16 @@ def delete_record(
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# Not in a volume an unfinished adoption names (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_journaled
+	refuse_if_journaled([rec.collection_id])
 
-	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first
-	if rec.status in ("in_review", "approved") and current_user.role != "admin":
+	# Locked records (in_review, approved) cannot be deleted; reviewer/admin must move them to rejected first.
+	# An excluded one (a Fisqua decision, contract 1.6) is locked too: its masters stay where they are.
+	if rec.status in LOCKED_STATUSES and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
-			detail=f"Cannot delete a record with status '{rec.status}'. Move it to 'rejected' first."
+			detail=_locked_detail("a record", rec.status)
 		)
 	
 	# Count images before delete/commit; rec.images is unusable once the row is expired
@@ -548,7 +716,12 @@ def delete_record(
 	# sidecar two of these masters share.
 	files_to_unlink: List[Path] = []
 	for img in rec.images:
-		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path))
+		files_to_unlink.extend(_image_files_to_unlink(img.file_path, img.thumbnail_path, db=db))
+	# The testing account's records are testing work: their files go only
+	# where the testing space's removal would take them (app.core.testing_space).
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		files_to_unlink = testing_space.testing_unlinks(db, files_to_unlink)
 
 	# An export of the record's collection reads these files; refused while one
 	# runs. No check of the storage root here: a delete creates nothing.
@@ -597,15 +770,38 @@ async def add_image_to_record(
 	# by the image insert's foreign-key check (FOR KEY SHARE), after the
 	# volume: the opposite order to a retake, and the two deadlock on
 	# PostgreSQL.
+	# The testing account writes no file while free space is below its
+	# reserve, the larger of the testing and storage reserves
+	# (app.core.testing_space). Every other caller is checked against the
+	# storage reserve last, just before the file is written (below).
+	from app.core import storage_override, testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		testing_space.refuse_below_reserve(db)
 	rec = _locked_record(db, rec_id, with_images=False)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
+	# Not into a volume an unfinished adoption names, nor one an adoption closed (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_adopted_away, refuse_if_journaled
+	refuse_if_journaled([rec.collection_id])
+	refuse_if_adopted_away(db, [rec.collection_id])
+	# An excluded record (a Fisqua decision, contract 1.6) takes no image, as
+	# it takes no capture (app.api.cameras): the image would stay out of the
+	# export, and every later decision on the record would be skipped as
+	# images_changed. Refused for every role, before anything is written.
+	if rec.status == "excluded":
+		raise HTTPException(
+			status_code=409,
+			detail=("Cannot add an image to a record with status 'excluded': "
+			        "Fisqua excluded it from the volume."),
+		)
 	# An upload is a capture event for the record's volume, refused on the
 	# same terms as a capture, before anything is written.
 	if rec.collection_id is None:
 		raise HTTPException(status_code=409, detail=VOLUME_REQUIRED_DETAIL)
 	if volume_lacks_stem(db, rec.collection_id):
 		raise HTTPException(status_code=409, detail=STEM_REQUIRED_DETAIL)
+	# A testing volume a purge is removing takes no upload.
+	testing_space.refuse_volume_being_removed(rec.collection)
 
 	allowed_types = {"image/jpeg", "image/png", "image/tiff", "image/webp"}
 	if file.content_type not in allowed_types:
@@ -649,6 +845,17 @@ async def add_image_to_record(
 	# without one is given its own.
 	if not capture_id:
 		capture_id = str(uuid.uuid4())
+
+	# The last refusal before the file is written, measured on the folder it is
+	# written to: free space below the space
+	# Captua keeps for its own work (app.core.storage_override), for every
+	# caller but the testing account. The number taken is rolled back.
+	if current_user.role != testing_space.TESTING_ROLE:
+		try:
+			storage_override.refuse_below_storage_reserve(uploads_dir)
+		except HTTPException:
+			db.rollback()
+			raise
 
 	# Save file, enforcing the cap while streaming so a wrong or absent Content-Length cannot fill the SD. Unlink the partial file on any failure.
 	try:
@@ -814,6 +1021,9 @@ def delete_image(
 	# The files are chosen under this lock and unlinked only once the commit
 	# that removes the row has succeeded (NEH-262).
 	rec = _locked_record(db, img.record_id, with_images=False)
+	# Not in a volume an unfinished adoption names (app.core.adopt_journal).
+	from app.core.adopt_journal import refuse_if_journaled
+	refuse_if_journaled([rec.collection_id] if rec is not None else [])
 	# Read the image again now the record is locked: a move that relocated
 	# its file and committed between the first read and the lock would
 	# otherwise leave the old paths in the list below.
@@ -825,10 +1035,10 @@ def delete_image(
 	)
 	if not img:
 		raise HTTPException(status_code=404, detail="Image not found")
-	if rec and rec.status in ("in_review", "approved") and current_user.role != "admin":
+	if rec and rec.status in LOCKED_STATUSES and current_user.role != "admin":
 		raise HTTPException(
 			status_code=409,
-			detail=f"Cannot delete an image from a record with status '{rec.status}'. Move it to 'rejected' first."
+			detail=_locked_detail("an image from a record", rec.status)
 		)
 
 	# Collect the file, its preview sidecar and the thumbnail; only paths inside
@@ -844,13 +1054,23 @@ def delete_image(
 			RecordImage.id != img.id,
 		)
 	]
-	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings)
+	files_to_unlink = _image_files_to_unlink(img.file_path, img.thumbnail_path, siblings, db)
+	# The testing account's images are testing work: their files go only
+	# where the testing space's removal would take them (app.core.testing_space).
+	from app.core import testing_space
+	if current_user.role == testing_space.TESTING_ROLE:
+		files_to_unlink = testing_space.testing_unlinks(db, files_to_unlink)
 
 	# An export of the record's collection reads this file if it is current;
 	# refused while one runs, and held from before the delete until the file
 	# is unlinked. A superseded image is not read by an export, so it is not
-	# held. No check of the storage root here: a delete creates nothing.
-	with export_jobs.hold_for_file_changes(_collection_of(rec) if img.is_current else []):
+	# held, unless a USB copy holds the volume (app.core.usb_copy): the copy
+	# chose its files when it started, and a retake since then supersedes
+	# images it is still reading. No check of the storage root here: a
+	# delete creates nothing.
+	held = _collection_of(rec)
+	with export_jobs.hold_for_file_changes(
+			held if img.is_current or export_jobs.copying(held) else []):
 		record_id = img.record_id
 		db.delete(img)
 
@@ -885,10 +1105,10 @@ def delete_image(
 # Masters a browser displays as they are, so they are their own preview.
 _BROWSER_DISPLAYABLE_SUFFIXES = (".jpg", ".jpeg", ".png", ".webp")
 
-# Content-Type for the stored master. Capture only writes .cr2 among the RAW
-# formats, so that one carries its conventional type; the other RAW suffixes
-# have no registered type and go out as application/octet-stream, which every
-# client saves as a file.
+# Content-Type for the stored master. Capture writes .cr2 (gphoto2) and .dng
+# (CHDK) among the RAW formats, so those carry their conventional types; the
+# other RAW suffixes have no registered type and go out as
+# application/octet-stream, which every client saves as a file.
 _MASTER_MEDIA_TYPES = {
 	"jpg": "image/jpeg",
 	"jpeg": "image/jpeg",
@@ -897,6 +1117,7 @@ _MASTER_MEDIA_TYPES = {
 	"tif": "image/tiff",
 	"webp": "image/webp",
 	"cr2": "image/x-canon-cr2",
+	"dng": "image/x-adobe-dng",
 }
 
 
@@ -1176,6 +1397,39 @@ def delete_record_annotation(
 # Status management endpoints
 # ==============================================================================
 
+def read_after_lock(db: Session, records, rejections: bool = False) -> None:
+	"""Read the images (and with `rejections`, the rejections) of records whose rows this transaction has locked.
+
+	A separate statement, issued once the locks are held, whose rows replace
+	whatever the session held for these records. On PostgreSQL under READ
+	COMMITTED, a locking statement that waited for another transaction's lock
+	re-reads the locked row once it has it, but rows it joins come from the
+	snapshot it started with: a retake that waited for another retake's commit
+	would see the images from before it, pass its checks on them, and leave
+	two sets current. So every path that locks records and decides something
+	from their images locks the rows alone and reads the images here.
+	"""
+	from sqlalchemy.orm.attributes import set_committed_value
+
+	records = list(records)
+	ids = [rec.id for rec in records]
+	if not ids:
+		return
+	images = {rec_id: [] for rec_id in ids}
+	for img in (db.query(RecordImage).filter(RecordImage.record_id.in_(ids))
+	            .order_by(RecordImage.id).populate_existing()):
+		images[img.record_id].append(img)
+	for rec in records:
+		set_committed_value(rec, "images", images[rec.id])
+	if rejections:
+		found = {rec_id: [] for rec_id in ids}
+		for rej in (db.query(RecordRejection).filter(RecordRejection.record_id.in_(ids))
+		            .order_by(RecordRejection.rejected_at.desc()).populate_existing()):
+			found[rej.record_id].append(rej)
+		for rec in records:
+			set_committed_value(rec, "rejections", found[rec.id])
+
+
 def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	"""Load a record with its row locked for the rest of the transaction.
 
@@ -1189,7 +1443,11 @@ def _locked_record(db: Session, rec_id: int, with_images: bool = True):
 	all, so the tests exercise the surrounding logic and cannot demonstrate the
 	locking. That is verified by reading the emitted SQL, not by the suite.
 	"""
-	return _locked_record_query(db, rec_id, with_images).first()
+	rec = _locked_record_query(db, rec_id, with_images).first()
+	# The images in a second statement, after the lock (read_after_lock).
+	if rec is not None and with_images:
+		read_after_lock(db, [rec])
+	return rec
 
 
 def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
@@ -1197,10 +1455,9 @@ def _locked_record_query(db: Session, rec_id: int, with_images: bool = True):
 	against the PostgreSQL dialect and read the lock clause off the SQL, which
 	is the only way to check it without a server — see
 	tests/unit/test_workflow_row_locking.py."""
-	query = db.query(Record)
-	if with_images:
-		query = query.options(joinedload(Record.images))
-	return query.filter(Record.id == rec_id).with_for_update(of=Record)
+	# The record row alone, whatever `with_images` says: _locked_record reads
+	# the images in a statement of their own, once the lock is held.
+	return db.query(Record).filter(Record.id == rec_id).with_for_update(of=Record)
 
 
 def is_movable(rec: Record) -> bool:
@@ -1238,13 +1495,20 @@ def assert_movable(rec: Record) -> None:
 def _assert_promotable(rec: Record) -> None:
 	"""
 	Refuse to let a record leave 'captured' unless the work is there to hand
-	over: at least one current image, and no current image carrying a
-	rejection_id (NEH-260).
+	over: at least one current image, no current image carrying a
+	rejection_id (NEH-260), and not missing and open. A record that misses a
+	page or a whole opening (records.missing_side, contract 1.9 §10) and has
+	not been closed stays captured on the unit until a dual capture writes
+	both pages: PATCH /{id}/status refuses it, and POST /bulk-status and POST
+	/collections/{id}/promote leave it out. One the operator closed without
+	capturing (records.closed_reason) is handed over as it is, with no image
+	needed: a closed placeholder has none, and the manifest lists it as
+	missing and not as a page (app.core.capture_manifest).
 
-	The second clause is the substantive test. rejection_id is written in
+	The rejection_id clause is the substantive test. rejection_id is written in
 	reject_record below, on the images current at the moment of rejection, and
 	a retake supersedes those while the replacements carry none — so a marked
-	current image means the rejection has not been answered. The first clause
+	current image means the rejection has not been answered. The image clause
 	closes a vacuous pass: delete every current image and a purely negative
 	predicate holds on a record with nothing in it.
 
@@ -1255,8 +1519,17 @@ def _assert_promotable(rec: Record) -> None:
 	the link on images that are still current and still the rejected bytes. No
 	endpoint deletes rejections today; one added later has to account for it.
 	"""
+	if rec.missing_side is not None and rec.closed_reason is None:
+		missing = "both pages" if rec.missing_side == "both" else f"its {rec.missing_side} page"
+		raise HTTPException(
+			status_code=422,
+			detail=(
+				f"Record {rec.id} misses {missing}. "
+				f"Capture the opening, or close it as not to be captured, before handing it over."
+			)
+		)
 	current = [img for img in rec.images if img.is_current]
-	if not current:
+	if not current and rec.missing_side is None:
 		raise HTTPException(
 			status_code=422,
 			detail=f"Record {rec.id} has no current image, so there is nothing to hand over."
@@ -1277,10 +1550,17 @@ def _apply_status_change(
 	rec: Record,
 	new_status: str,
 	user: User,
+	transitions: Optional[dict] = None,
+	note: Optional[str] = None,
 ) -> None:
 	"""
 	Validate and apply a status transition on a Record.
 	Raises HTTPException on invalid transition or insufficient role.
+
+	`transitions` is the table checked, STATUS_TRANSITIONS unless given. Only
+	app.core.fisqua_decisions passes another, DECISION_TRANSITIONS, which adds
+	the moves into and out of "excluded" that no route offers, and `note`,
+	the exclusion's note, which the history row keeps.
 
 	Every promotion goes through here — PATCH /{id}/status, POST /bulk-status
 	and POST /collections/{id}/promote all call it — so the invariant on
@@ -1300,7 +1580,7 @@ def _apply_status_change(
 	if current_status == new_status:
 		return  # no-op
 
-	allowed_roles = STATUS_TRANSITIONS.get((current_status, new_status))
+	allowed_roles = (STATUS_TRANSITIONS if transitions is None else transitions).get((current_status, new_status))
 	if allowed_roles is None:
 		raise HTTPException(
 			status_code=422,
@@ -1315,7 +1595,7 @@ def _apply_status_change(
 	if current_status == "captured":
 		_assert_promotable(rec)
 
-	change_record_status(db, rec, new_status, user.username)
+	change_record_status(db, rec, new_status, user.username, note)
 
 
 @router.patch("/{rec_id}/status", response_model=RecordRead)
@@ -1350,12 +1630,20 @@ def update_record_status(
 	review again only when an operator promotes its volume. The undo transitions above are plain
 	status resets with no new image, no reason and no rejection record; the
 	change itself is dated in record_status_changes, like every other.
+
+	A change that leaves a full rescan with no captured record sends it to
+	review, as POST /collections/{id}/promote does, and opens the recapture
+	turn the first time (recapture_turn.award_rescan_turns, which takes the
+	volume's row and then the turn lock, after this record's lock).
 	"""
 	rec = _locked_record(db, rec_id)
 	if not rec:
 		raise HTTPException(status_code=404, detail="Record not found")
 
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id])
 	_apply_status_change(db, rec, payload.status, current_user)
+	award_rescan_turns(db, rescans, current_user.username)
 
 	db.commit()
 	db.refresh(rec)
@@ -1373,13 +1661,17 @@ def bulk_update_status(
 	Records where the transition is not valid are skipped and reported in the response.
 
 	Returns the updated records.
+
+	Each full rescan the call leaves with no captured record is sent to
+	review, as in PATCH /{rec_id}/status (recapture_turn.award_rescan_turns):
+	after every record lock, the rescans' volume rows in id order, then the
+	turn lock once.
 	"""
 	# Locked for the same reason the single-record path is, and ordered by id
 	# so two bulk calls over overlapping sets take the rows in the same order
 	# and cannot deadlock against each other.
 	records = (
 		db.query(Record)
-		.options(joinedload(Record.images))
 		.filter(Record.id.in_(payload.record_ids))
 		.order_by(Record.id)
 		.with_for_update(of=Record)
@@ -1387,9 +1679,14 @@ def bulk_update_status(
 	)
 	if not records:
 		raise HTTPException(status_code=404, detail="No matching records found")
+	# The images, which _apply_status_change checks, read after the locks.
+	read_after_lock(db, records)
 
 	skipped: list[int] = []
 	updated: list[Record] = []
+
+	from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+	rescans = lock_rescan_volumes(db, [rec.collection_id for rec in records])
 
 	for rec in records:
 		try:
@@ -1399,6 +1696,7 @@ def bulk_update_status(
 			continue
 		updated.append(rec)
 
+	award_rescan_turns(db, rescans, current_user.username)
 	db.commit()
 	for rec in updated:
 		db.refresh(rec)
@@ -1473,6 +1771,213 @@ def reject_record(
 
 	db.commit()
 	db.refresh(rec)
+	return _serialize_record(rec)
+
+
+# ==============================================================================
+# Pages and openings never captured (contract 1.9 §10)
+# ==============================================================================
+
+MISSING_PAGE_SINGLE_RECORD = "missing_page_single_record"
+
+
+def missing_page_refusal(rec: Record, side: str) -> Optional[str]:
+	"""Why `side` cannot be marked missing on the record, as a code; None when it can.
+
+	The one place the rule lives, for POST /{rec_id}/missing-page and for
+	Fisqua's `missing_page` decision. Only a dual record can miss a page; a
+	single one is refused (missing_page_single_record). A dual record with a
+	current image of that side can be marked: mark_missing_page supersedes
+	the image (contract 1.9 §10.4, confirmed by Fisqua).
+	"""
+	if rec.capture_mode != "dual":
+		return MISSING_PAGE_SINGLE_RECORD
+	return None
+
+
+def mark_missing_page(db: Session, rec: Record, side: str, note: Optional[str], actor: Optional[str]) -> bool:
+	"""Mark `side` missing on a locked record that missing_page_refusal passed; return whether anything changed.
+
+	The one place a page is marked missing, for POST /{rec_id}/missing-page
+	and for Fisqua's `missing_page` decision (app.core.fisqua_decisions). A
+	record already missing that side, or both, keeps its side and its images.
+	Otherwise a current image of that side is superseded, as a retake
+	supersedes (_supersede_current_images): its file stays on the unit and in
+	the bucket, and it drops out of the manifest. The record then misses that
+	side, or both when no current image is left (it already missed the
+	other, or it had none), whichever side was named. A side added to a
+	closed record reopens it: its closed_reason and closed_note are cleared,
+	so it is pending again. A
+	note, when given, is kept as records.missing_note. A record in review or
+	approved returns to captured, written to its status history under
+	`actor`, so an operator can capture into it (app.api.cameras refuses a
+	capture into a record a reviewer holds); a rejected one stays rejected.
+	The record is then pending until it is captured into or closed
+	(app.core.recapture_turn). The caller commits.
+	"""
+	changed = False
+	if rec.missing_side not in (side, "both"):
+		_supersede_current_images(rec, role=side)
+		left = any(img.is_current for img in rec.images)
+		rec.missing_side = side if rec.missing_side is None and left else "both"
+		if rec.missing_side == "both":
+			# A whole opening missing keeps no image, even one left on the side
+			# already recorded as missing (the manifest refuses that,
+			# missing_side_contradicted).
+			_supersede_current_images(rec)
+		# A side added to a closed record reopens it: it is pending again.
+		rec.closed_reason = None
+		rec.closed_note = None
+		changed = True
+		if note is not None and note.strip():
+			rec.missing_note = note.strip()
+	if rec.status in ("in_review", "approved") and rec.missing_side is not None and rec.closed_reason is None:
+		change_record_status(db, rec, "captured", actor)
+		changed = True
+	return changed
+
+
+@router.post("/{rec_id}/missing-page", response_model=RecordRead)
+def mark_record_missing_page(
+	rec_id: int,
+	payload: MissingPageRequest,
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Mark a page of a dual record as never captured (contract 1.9 §10.1).
+
+	Body: {"side": "left" | "right", "note": optional, at most 2,000
+	characters}. Applies only to a dual record: a single one answers 409 with
+	code missing_page_single_record, and nothing changes. A current image of
+	that side is superseded (mark_missing_page). A record already missing
+	that side is answered as it is. A record in review or approved returns
+	to captured (mark_missing_page). The record is then pending, listed in GET
+	/to-retake, until a dual capture into it or POST /{rec_id}/close-missing.
+	A volume handed over before is handed over again when nothing else holds
+	it (app.core.fisqua_outbox.hand_over_again_after_missing_change).
+	The record's row is locked, as every path that reads which of its images
+	are current and changes its state takes it.
+	"""
+	rec = _locked_record(db, rec_id)
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	# The volume's row, FOR UPDATE, before any status change: a status-history
+	# row takes FOR KEY SHARE on it (its collection_id foreign key), and the
+	# handover check below would then upgrade that lock, which deadlocks two
+	# such requests on PostgreSQL. As recapture_turn.lock_rescan_volumes does.
+	if rec.collection_id is not None:
+		locked_volume_query(db, rec.collection_id).first()
+	refusal = missing_page_refusal(rec, payload.side)
+	if refusal is not None:
+		raise HTTPException(status_code=409, detail={
+			"code": refusal,
+			"message": f"Record {rec.id} was captured in '{rec.capture_mode}' mode; only a dual opening can miss a page.",
+		})
+	reopened = rec.closed_reason if rec.missing_side not in (payload.side, "both") else None
+	changed = mark_missing_page(db, rec, payload.side, payload.note, current_user.username)
+	queued = None
+	if changed:
+		from app.core.fisqua_outbox import hand_over_again_after_missing_change
+		queued = hand_over_again_after_missing_change(db, rec.collection_id)
+	db.commit()
+	db.refresh(rec)
+	if queued is not None:
+		from app.core.image_upload import image_upload_scheduler
+		image_upload_scheduler.wake()
+	if changed:
+		log_event(db, level="INFO", category="activity", action="missing_page_marked",
+		          actor=current_user.username, subject=rec.title,
+		          detail=(f"record {rec.id} side={payload.side} missing_side={rec.missing_side}"
+		                  + (f" reopened={reopened}" if reopened else "")))
+	return _serialize_record(rec)
+
+
+@router.post("/{rec_id}/close-missing", response_model=RecordRead)
+def close_missing_record(
+	rec_id: int,
+	payload: CloseMissingRequest,
+	current_user: User = Depends(allow_contributor),
+	db: Session = Depends(get_db_dependency)
+):
+	"""Close a missing record without capturing it (contract 1.9 §10.1).
+
+	Body: {"reason": "foliation_skip" | "leaf_missing_from_volume" |
+	"captured_elsewhere" | "other", "note": optional, at most 2,000
+	characters, and required for "other"}. Only a record that misses a page
+	or a whole opening (records.missing_side) and is not closed yet: 409 with
+	code not_missing or already_closed otherwise. The record keeps its
+	missing side, stays in its volume, is no longer pending
+	(app.core.recapture_turn) and is promoted with its volume like a captured
+	record; its volume's manifest lists it as missing with its reason. A dual
+	capture into it later clears the closing. There is no route to reopen
+	one. Writes `missing_record_closed` to the system log.
+
+	Closing a pending record that leaves its volume with none pending
+	completes the volume's recaptures, as a retake does: it writes
+	recapture_volume_completed in the same transaction (app.core.recapture_turn),
+	taking the record's row, then the volume's, then the turn lock, the order
+	of the capture path. A full rescan not yet promoted writes none, as for a
+	retake. Closing a record that was not pending, or one in a volume that
+	still has pending records, writes nothing.
+
+	In a volume handed over before, a closed captured record goes to review
+	(captured -> in_review, through _apply_status_change, as promotion
+	sends it), and the volume is handed over again when nothing else holds
+	it (app.core.fisqua_outbox.hand_over_again_after_missing_change). A
+	record waiting for a retake (rejected, or captured with its rejected image
+	still current; app.core.recapture_turn.retake_clause) is closed and keeps
+	its status, and is still pending. In a volume never
+	handed over the status is left alone; the next promotion sends it.
+	"""
+	rec = _locked_record(db, rec_id)
+	if not rec:
+		raise HTTPException(status_code=404, detail="Record not found")
+	if rec.missing_side is None:
+		raise HTTPException(status_code=409, detail={
+			"code": "not_missing",
+			"message": f"Record {rec.id} is not missing a page, so there is nothing to close.",
+		})
+	if rec.closed_reason is not None:
+		raise HTTPException(status_code=409, detail={
+			"code": "already_closed",
+			"message": f"Record {rec.id} was already closed ({rec.closed_reason}).",
+		})
+	was_pending = recapture_turn.record_is_pending(rec)
+	rec.closed_reason = payload.reason
+	rec.closed_note = payload.note.strip() if payload.note and payload.note.strip() else None
+	# The turn is real work's alone: closing a testing record takes no turn
+	# lock and completes nothing (app.core.recapture_turn).
+	from app.core.testing_space import is_testing
+	if was_pending and rec.collection_id is not None and not is_testing(db, collection_id=rec.collection_id):
+		# As a retake that leaves its volume with nothing pending
+		# (app.api.cameras._record_turn_events): the record's row, then the
+		# volume's, then the turn, and the event in this transaction.
+		volume = locked_volume_query(db, rec.collection_id).first()
+		recapture_turn.lock_turn(db)
+		db.flush()
+		if volume is not None and recapture_turn.volume_pending(db, volume.id) == 0 and not (
+				recapture_turn.volume_is_full_rescan(volume)
+				and not recapture_turn.has_event(db, recapture_turn.RESCAN_COMPLETED_ACTION, volume.id)):
+			recapture_turn.record_event(db, recapture_turn.COMPLETED_ACTION, volume, current_user.username)
+	from app.core.fisqua_outbox import hand_over_again_after_missing_change, handed_over_before
+	if rec.status == "captured" and handed_over_before(db, rec.collection_id) and not any(
+			img.is_current and img.rejection_id is not None for img in rec.images):
+		# Its volume was handed over before: the closed record goes to review
+		# now, as promotion would send it, so the volume can be handed over
+		# again (contract 1.9 §10.3: one with an image needs capture QC).
+		rescans = recapture_turn.lock_rescan_volumes(db, [rec.collection_id])
+		_apply_status_change(db, rec, "in_review", current_user)
+		recapture_turn.award_rescan_turns(db, rescans, current_user.username)
+	queued = hand_over_again_after_missing_change(db, rec.collection_id)
+	db.commit()
+	if queued is not None:
+		from app.core.image_upload import image_upload_scheduler
+		image_upload_scheduler.wake()
+	db.refresh(rec)
+	log_event(db, level="INFO", category="activity", action="missing_record_closed",
+	          actor=current_user.username, subject=rec.title,
+	          detail=(f"record {rec.id} volume {rec.collection_id} missing_side={rec.missing_side} "
+	                  f"reason={rec.closed_reason}"))
 	return _serialize_record(rec)
 
 

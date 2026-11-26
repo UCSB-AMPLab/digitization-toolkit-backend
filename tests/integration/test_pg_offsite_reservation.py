@@ -11,7 +11,7 @@ Opt-in, as tests/integration/test_pg_lock_order.py: skipped unless
 DATABASE_HOST is set and DATABASE_* reach a PostgreSQL server; the tables
 are created in a schema of their own, dropped afterwards.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import os
 import threading
@@ -36,10 +36,7 @@ def pg(monkeypatch):
     from sqlalchemy.exc import OperationalError
     from sqlalchemy.orm import sessionmaker
 
-    from app.core.db import Base, DATABASE_URL
-    from app.models import (  # noqa: F401
-        user, project, project_member, collection, record, camera, system_log, offsite_object,
-    )
+    from app.core.db import Base, DATABASE_URL, init_db
     from app.models.collection import Collection
     from app.models.project import Project
     from app.models.record import Record, RecordImage
@@ -56,6 +53,9 @@ def pg(monkeypatch):
     engine = create_engine(DATABASE_URL, connect_args={"options": f"-csearch_path={schema}"})
     Session = sessionmaker(bind=engine, autocommit=False, autoflush=False)
     try:
+        # init_db imports every model module, so create_all makes every table,
+        # including those the flush hooks read (offsite_objects for a stem).
+        init_db()
         Base.metadata.create_all(engine)
         with Session() as db:
             p = Project(name="P")

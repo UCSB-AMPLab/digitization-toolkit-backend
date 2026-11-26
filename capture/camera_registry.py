@@ -4,7 +4,7 @@ Camera registry and hardware identification system.
 Manages physical camera identification, calibration, and configuration
 at a global level (PROJECTS_ROOT/cameras.json).
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import json
 import logging
@@ -30,6 +30,15 @@ except (ImportError, ValueError):
     _PICAMERA2_AVAILABLE = False
 
 logger = logging.getLogger(__name__)
+
+# The clockwise rotation, in degrees, of a body whose orientation was never
+# saved and which holds no role. See CameraRegistry.effective_orientation.
+DEFAULT_ORIENTATION = 90
+
+# The clockwise rotation of a body whose orientation was never saved, by the
+# role it holds. The two cameras of a unit are mounted mirrored, so the left
+# camera's pictures need 270 and the right camera's 90.
+DEFAULT_ORIENTATION_BY_ROLE = {"left": 270, "right": 90}
 
 class CameraRegistry:
     """
@@ -83,6 +92,15 @@ class CameraRegistry:
             except OSError:
                 pass
             return {"cameras": {}, "version": "1.0"}
+
+    @property
+    def write_refusal(self) -> Optional[str]:
+        """Why this registry cannot be written, or None when it can.
+
+        A registry that refuses writes reads as empty, so an empty answer
+        from it says nothing about what is stored.
+        """
+        return self._write_refusal
 
     def _refuse_write(self) -> None:
         if self._write_refusal is not None:
@@ -333,25 +351,32 @@ class CameraRegistry:
         letting a second resolution pick a different body.
         """
         def change(cameras: Dict) -> None:
-            now = datetime.now(timezone.utc).isoformat()
-            if hardware_id in cameras["cameras"] and not force:
-                cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
-                cameras["cameras"][hardware_id]["last_seen_at"] = now
-            else:
-                cameras["cameras"][hardware_id] = {
-                    "model": info.get("model"),
-                    "serial": info.get("serial"),
-                    "location": info.get("location"),
-                    "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
-                    "label": None,  # Human-readable description
-                    "last_seen_index": camera_index,
-                    "first_registered_at": now,
-                    "last_seen_at": now,
-                    "calibration": calibration_data or {},
-                    "orientation": None,  # Never set; the frontend keeps its own default (NEH-71)
-                }
+            self._register_in(cameras, hardware_id, info, camera_index,
+                              calibration_data, force)
 
         self._mutate(change)
+
+    @staticmethod
+    def _register_in(cameras: Dict, hardware_id: str, info: Dict, camera_index: int,
+                     calibration_data: Optional[Dict] = None, force: bool = False) -> None:
+        """register_resolved's change, applied to an already loaded registry."""
+        now = datetime.now(timezone.utc).isoformat()
+        if hardware_id in cameras["cameras"] and not force:
+            cameras["cameras"][hardware_id]["last_seen_index"] = camera_index
+            cameras["cameras"][hardware_id]["last_seen_at"] = now
+        else:
+            cameras["cameras"][hardware_id] = {
+                "model": info.get("model"),
+                "serial": info.get("serial"),
+                "location": info.get("location"),
+                "machine_id": None,  # User-assigned ID (e.g., "CAM-001", "LEFT")
+                "label": None,  # Human-readable description
+                "last_seen_index": camera_index,
+                "first_registered_at": now,
+                "last_seen_at": now,
+                "calibration": calibration_data or {},
+                "orientation": None,  # Never set; reads as the role's default (effective_orientation)
+            }
 
     def get_camera_by_id(self, hardware_id: str) -> Optional[Dict]:
         """Get camera data by hardware ID."""
@@ -415,6 +440,52 @@ class CameraRegistry:
         """
         return type(value) is int and value in CameraRegistry.VALID_ORIENTATIONS
 
+    @staticmethod
+    def effective_orientation(stored, role) -> int:
+        """The clockwise rotation, in degrees, that applies to a body.
+
+        Args:
+            stored: The body's saved "orientation" from its registry record.
+            role: The body's stored "role" from the same record ("left",
+                "right"), or None when it holds none or is not registered.
+
+        A saved orientation (one of 0, 90, 180, 270) applies as saved,
+        whatever the role. A body whose orientation was never saved - None,
+        a missing key, or a stored value outside the four (a hand edit, a
+        bool, 45) - takes the default for its role from
+        DEFAULT_ORIENTATION_BY_ROLE: 270 for "left", 90 for "right". With no
+        role, or any other value, it takes DEFAULT_ORIENTATION, 90. The role
+        is read when the orientation is, so a never-set body whose role is
+        swapped or reassigned follows its new role.
+
+        Every backend read of a stored orientation goes through this
+        function: the default config used for captures and test captures
+        (which the page layout analysis of a test capture also reads), and
+        the device rows the API reports. It decides the rotation of new
+        captures only; a stored capture keeps the rotate_deg recorded with
+        it, and nothing re-derives that from the registry.
+        """
+        if CameraRegistry.is_valid_orientation(stored):
+            return stored
+        return CameraRegistry.default_orientation(role)
+
+    @staticmethod
+    def default_orientation(role) -> int:
+        """The clockwise rotation, in degrees, that a body's role expects.
+
+        Args:
+            role: The body's stored "role" ("left", "right"), or None.
+
+        From DEFAULT_ORIENTATION_BY_ROLE: 270 for "left", 90 for "right";
+        DEFAULT_ORIENTATION, 90, with no role or any other value. It is what
+        a never-set body takes, and what the device rows report beside the
+        effective angle, so that the capture screen can tell a turn that
+        leaves a body upside down from what its role expects.
+        """
+        if type(role) is str and role in DEFAULT_ORIENTATION_BY_ROLE:
+            return DEFAULT_ORIENTATION_BY_ROLE[role]
+        return DEFAULT_ORIENTATION
+
     def update_orientation(self, hardware_id: str, degrees: int) -> None:
         """Persist the clockwise rotation to apply for this camera body.
 
@@ -425,9 +496,9 @@ class CameraRegistry:
         body if it re-enumerates onto a different index.
 
         A value of None (set at registration, see register_resolved) means
-        orientation was never set for this body; the frontend falls back to
-        its own default rather than treating a missing value as an explicit
-        "no rotation".
+        orientation was never set for this body; it reads as the default for
+        the body's role (270 left, 90 right, 90 with no role), not as "no
+        rotation". See effective_orientation.
 
         Args:
             hardware_id: Hardware ID of the camera.
@@ -449,6 +520,199 @@ class CameraRegistry:
 
         self._mutate(change)
 
+    @staticmethod
+    def is_valid_zoom_step(value) -> bool:
+        """True for a value that can be a stored optical zoom step.
+
+        A step is a non-negative int, and not a bool. The upper bound is the
+        body's own get_zoom_steps() answer, which the registry does not hold;
+        the backend checks it against the camera.
+        """
+        return type(value) is int and value >= 0
+
+    def update_zoom_step(self, hardware_id: str, step: int) -> None:
+        """Persist the optical zoom step for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as orientation: the step is
+        a property of the physical body and its mounting, and has to follow
+        the body if it re-enumerates onto a different index. A body with no
+        "zoom_step" key has never had one set, and the backend leaves its
+        lens where it is.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            step: The zoom step, 0 at the widest.
+
+        Raises:
+            ValueError: step is not a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        if not self.is_valid_zoom_step(step):
+            raise ValueError(f"zoom step must be a non-negative integer; got {step!r}")
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            cameras["cameras"][hardware_id]["zoom_step"] = step
+            cameras["cameras"][hardware_id]["zoom_step_updated_at"] = \
+                datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    @staticmethod
+    def is_valid_focus(value) -> bool:
+        """True for a value that can be a stored focus.
+
+        A stored focus is a dict holding exactly "distance", a positive int in
+        mm as CHDK's get_focus() answers it, and "zoom_step", a valid zoom
+        step: the step the camera reported when the focus was locked. Bools
+        are refused for both.
+        """
+        return (
+            type(value) is dict
+            and set(value) == {"distance", "zoom_step"}
+            and type(value["distance"]) is int
+            and value["distance"] > 0
+            and CameraRegistry.is_valid_zoom_step(value["zoom_step"])
+        )
+
+    def update_focus(self, hardware_id: str, distance: int, zoom_step: int) -> None:
+        """Persist the locked focus for this camera body (CHDK only).
+
+        Keyed by hardware id for the same reason as the zoom step. The
+        distance and the zoom step it was taken at are written together, as
+        one value under "focus", so neither is ever stored without the
+        other. The backend restores the distance only when the camera
+        reports that zoom step.
+
+        Args:
+            hardware_id: Hardware ID of the camera.
+            distance: The focus distance in mm.
+            zoom_step: The zoom step the camera reported for the lock.
+
+        Raises:
+            ValueError: distance is not a positive int, or zoom_step is not
+                a non-negative int.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        focus = {"distance": distance, "zoom_step": zoom_step}
+        if not self.is_valid_focus(focus):
+            raise ValueError(
+                "focus must be a positive integer distance and a non-negative "
+                f"integer zoom step; got {distance!r} at step {zoom_step!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry["focus"] = focus
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    def clear_focus(self, hardware_id: str) -> None:
+        """Remove the stored focus for this camera body (CHDK only).
+
+        The camera then autofocuses on every picture. The time of the change
+        is recorded.
+
+        Raises:
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry.pop("focus", None)
+            entry["focus_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    @staticmethod
+    def is_valid_image_format(value) -> bool:
+        """True for a value that can be stored as a capture format.
+
+        The formats and their old name RAW are capture.backends.base's
+        (IMAGE_FORMATS, normalise_image_format). Imported here, not at the
+        top, so opening the registry does not load the backends.
+        """
+        from .backends.base import normalise_image_format
+        return normalise_image_format(value) is not None
+
+    def update_image_format(self, hardware_id: str, image_format: str) -> None:
+        """Persist the capture format chosen for this camera body.
+
+        Keyed by hardware id for the same reason as the zoom step. The value
+        is stored under its current name, so the old name RAW is written as
+        RAW+JPEG. A body with no "image_format" key has never had one chosen:
+        a CHDK body then captures JPEG, and a gphoto2 DSLR captures in the
+        format the camera holds until one is stored (the backend stores that
+        format at the first session that opens on the body). The time of the
+        change is recorded.
+
+        Raises:
+            ValueError: image_format is not a capture format.
+            KeyError: hardware_id is not a camera the registry knows about.
+        """
+        from .backends.base import IMAGE_FORMATS, normalise_image_format
+
+        stored = normalise_image_format(image_format)
+        if stored is None:
+            raise ValueError(
+                f"image format must be one of {', '.join(IMAGE_FORMATS)}; "
+                f"got {image_format!r}"
+            )
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                raise KeyError(hardware_id)
+            entry = cameras["cameras"][hardware_id]
+            entry["image_format"] = stored
+            entry["image_format_updated_at"] = datetime.now(timezone.utc).isoformat()
+
+        self._mutate(change)
+
+    def adopt_image_format(
+        self, hardware_id: str, image_format: str, info: Dict, camera_index: int
+    ):
+        """Store image_format for the body only if its entry holds no format.
+
+        The entry is read from the file inside the registry's write lock, so
+        a format stored after an earlier read is never replaced. A body the
+        registry does not know is registered first, in the same write.
+        Returns the value the entry holds afterwards: image_format when it
+        was stored, or the value that was already there, as it is (which may
+        name no format; the caller decides what that means).
+
+        Raises:
+            ValueError: image_format is not a capture format.
+        """
+        from .backends.base import IMAGE_FORMATS, normalise_image_format
+
+        stored = normalise_image_format(image_format)
+        if stored is None:
+            raise ValueError(
+                f"image format must be one of {', '.join(IMAGE_FORMATS)}; "
+                f"got {image_format!r}"
+            )
+        result = {}
+
+        def change(cameras: Dict) -> None:
+            if hardware_id not in cameras["cameras"]:
+                self._register_in(cameras, hardware_id, info, camera_index)
+            entry = cameras["cameras"][hardware_id]
+            if entry.get("image_format") is not None:
+                result["value"] = entry["image_format"]
+                return
+            entry["image_format"] = stored
+            entry["image_format_updated_at"] = datetime.now(timezone.utc).isoformat()
+            result["value"] = stored
+
+        self._mutate(change)
+        return result["value"]
+
     def list_cameras(self) -> List[Dict]:
         """List all registered cameras."""
         return list(self.cameras["cameras"].values())
@@ -462,6 +726,112 @@ class CameraRegistry:
         """
         detected = self.detect_cameras()
         return {idx: hw_id for idx, (hw_id, _) in detected.items()}
+
+    # The role a body has, and the pair last confirmed together, are read
+    # here and evaluated by capture.camera_roles. set_roles writes them; a
+    # record written before NEH-342 has none, so every key is optional and a
+    # missing one reads as None.
+    ROLE_RECORD_KEYS = ("role", "role_confirmed_at", "usb_port_at_confirmation")
+
+    # Every key set_roles writes on a body's record, and clears from a record
+    # that loses its role.
+    ROLE_WRITE_KEYS = ("role", "role_confirmed_at", "role_confirmed_by", "usb_port_at_confirmation")
+
+    def set_roles(
+        self,
+        left_hardware_id: str,
+        right_hardware_id: str,
+        *,
+        ports: Dict[str, Optional[str]],
+        backend: str,
+        confirmed_by: str,
+    ) -> None:
+        """Store the roles the operator confirmed for a pair of bodies (NEH-342).
+
+        One _mutate, so one replace of cameras.json, does all of this: it
+        writes role "left" on the first body's record and "right" on the
+        second's, each with the time of confirmation (UTC, ISO 8601), the
+        username that confirmed it and the body's USB socket at that time;
+        it removes the role keys from every other record that held "left"
+        or "right", so no two records hold the same role; and it stores the
+        pair under the top-level "confirmed_pair" key. An absent body keeps
+        the rest of its record. No other key of any record changes.
+
+        Args:
+            left_hardware_id: The body that photographs the left page.
+            right_hardware_id: The body that photographs the right page.
+            ports: The USB socket of each body, keyed "left" and "right";
+                a missing or None value is stored as None.
+            backend: The name of the active camera backend.
+            confirmed_by: The username of the operator who confirmed.
+
+        Raises:
+            ValueError: an id is empty or not a string, or both are the same.
+            KeyError: an id is not a camera the registry knows about. The
+                caller registers a new body first.
+        """
+        for hw_id in (left_hardware_id, right_hardware_id):
+            if not isinstance(hw_id, str) or not hw_id:
+                raise ValueError(f"a hardware id must be a non-empty string; got {hw_id!r}")
+        if left_hardware_id == right_hardware_id:
+            raise ValueError(f"one body cannot hold both roles: {left_hardware_id}")
+
+        chosen = {"left": left_hardware_id, "right": right_hardware_id}
+        socket = {role: (ports or {}).get(role) for role in chosen}
+
+        def change(cameras: Dict) -> None:
+            records = cameras["cameras"]
+            for hw_id in chosen.values():
+                if hw_id not in records:
+                    raise KeyError(hw_id)
+            now = datetime.now(timezone.utc).isoformat()
+            for hw_id, record in records.items():
+                if hw_id not in chosen.values() and record.get("role") in chosen:
+                    for key in self.ROLE_WRITE_KEYS:
+                        record.pop(key, None)
+            for role, hw_id in chosen.items():
+                records[hw_id].update({
+                    "role": role,
+                    "role_confirmed_at": now,
+                    "role_confirmed_by": confirmed_by,
+                    "usb_port_at_confirmation": socket[role],
+                })
+            cameras["confirmed_pair"] = {
+                "left": left_hardware_id,
+                "right": right_hardware_id,
+                "ports": dict(socket),
+                "backend": backend,
+                "confirmed_at": now,
+                "confirmed_by": confirmed_by,
+            }
+
+        self._mutate(change)
+
+    def get_role_record(self, hardware_id: str) -> Dict:
+        """The role fields stored for this body, each None when absent.
+
+        A body the registry does not know has a record of three Nones.
+        """
+        camera = self.cameras.get("cameras", {}).get(hardware_id) or {}
+        return {key: camera.get(key) for key in self.ROLE_RECORD_KEYS}
+
+    def get_role_records(self, hardware_ids) -> Dict[str, Dict]:
+        """get_role_record for each of these hardware ids, keyed by id."""
+        return {hw_id: self.get_role_record(hw_id) for hw_id in hardware_ids}
+
+    def get_confirmed_pair(self) -> Optional[Dict[str, str]]:
+        """The pair last confirmed together, {"left": hw_id, "right": hw_id}.
+
+        None when the file holds no pair, or holds one that is not two
+        non-empty hardware ids under "left" and "right".
+        """
+        pair = self.cameras.get("confirmed_pair")
+        if not isinstance(pair, dict):
+            return None
+        left, right = pair.get("left"), pair.get("right")
+        if not (isinstance(left, str) and left and isinstance(right, str) and right):
+            return None
+        return {"left": left, "right": right}
 
 
 def initialize_camera_system(run_calibration: bool = True) -> Dict:

@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from contextlib import contextmanager
 from typing import Generator
@@ -28,6 +28,10 @@ engine = create_engine(
 	poolclass=QueuePool,
 	pool_pre_ping=True,
 	pool_recycle=1800,
+	# A database error's text names the statement, never the values bound to
+	# it: a failed UPDATE of users would otherwise carry the password's hash
+	# into the exception and the log.
+	hide_parameters=True,
 )
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
@@ -63,6 +67,10 @@ def init_db() -> None:
 	import app.models.project_member # noqa: F401
 	import app.models.offsite_object # noqa: F401
 	import app.models.fisqua         # noqa: F401
+	import app.models.unit_settings  # noqa: F401
+	import app.models.capture_request  # noqa: F401
+	import app.models.adoption_request  # noqa: F401
+	import app.models.colour_card  # noqa: F401
 
 	# Note: Tables are created via Alembic migrations, not create_all()
 	# Run: alembic upgrade head

@@ -9,7 +9,7 @@ custom_attributes.fisqua like any other unmapped field.
 
 Run with: python -m pytest tests/unit/test_import_queue.py
 
-Version: 0.2.0
+Version: 0.3.0
 """
 
 import json
@@ -271,9 +271,9 @@ def test_each_item_is_joined_to_the_volume_with_its_stem(client, db_session, rep
 
     items = {i["filenameStem"]: i for i in _one(client, VALID_ID)["items"]}
     assert items["xx-test-001"]["collectionId"] == v1.id
-    assert items["xx-test-001"]["status"] == {"captured": 1, "in_review": 0, "rejected": 1, "approved": 1}
+    assert items["xx-test-001"]["status"] == {"captured": 1, "in_review": 0, "rejected": 1, "approved": 1, "excluded": 0}
     assert items["xx-test-002"]["collectionId"] == vols["xx-test-002"].id
-    assert items["xx-test-002"]["status"] == {"captured": 0, "in_review": 0, "rejected": 0, "approved": 0}
+    assert items["xx-test-002"]["status"] == {"captured": 0, "in_review": 0, "rejected": 0, "approved": 0, "excluded": 0}
 
 
 @pytest.mark.unit

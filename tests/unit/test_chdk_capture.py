@@ -10,7 +10,7 @@ capture, because nothing it produces could be attributed to a body; and
 neither may a body whose parity another body also claims, because one of the
 two would be filed as the wrong page.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import pytest
@@ -315,8 +315,15 @@ def test_the_backend_reports_what_it_can_do(monkeypatch):
     assert backend.supports_live_adjustment() is False
     capabilities = backend.get_capabilities()
     assert capabilities["live_preview"] is True
+    # Stepped optical zoom (NEH-231); digital "zoom" stays False.
+    assert capabilities["zoom_steps"] is True
+    # Focus lock (NEH-231); "focus_control" stays False.
+    assert capabilities["focus_lock"] is True
+    # The capture formats the settings route accepts (NEH-344).
+    assert capabilities["image_formats"] == ["JPEG", "RAW+JPEG"]
     assert not any(
-        value for key, value in capabilities.items() if key != "live_preview"
+        value for key, value in capabilities.items()
+        if key not in ("live_preview", "zoom_steps", "focus_lock", "image_formats")
     )
 
 

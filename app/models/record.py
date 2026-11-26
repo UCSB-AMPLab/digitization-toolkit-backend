@@ -1,4 +1,4 @@
-# Version: 0.1.0-beta
+# Version: 0.3.0
 
 from datetime import datetime, timezone
 from sqlalchemy import BigInteger, Column, Integer, String, Date, DateTime, Text, ForeignKey, CheckConstraint, JSON, Boolean
@@ -59,8 +59,10 @@ class Record(Base):
 	# QA workflow. A record is born "captured" and stays there until the
 	# operator promotes the collection it belongs to (NEH-260); "in_review"
 	# means handed over for review, which is why deletion is locked from that
-	# point on. See app/schemas/record.py for the transition table.
-	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved
+	# point on. "excluded" is set only by a Fisqua decision (contract 1.6):
+	# the opening is not a page of the volume. See app/schemas/record.py for
+	# the transition table.
+	status = Column(String(20), nullable=False, default="captured")  # captured, in_review, rejected, approved, excluded
 	sequence = Column(Integer, nullable=True)  # ordering within a collection
 
 	# Which camera setup produced this document: "single" (one image) or
@@ -68,6 +70,35 @@ class Record(Base):
 	# capture time and never changed — it's what rejection scope resolution
 	# and the recapture mode-match guard key off of (NEH-208).
 	capture_mode = Column(String(10), nullable=False)  # single, dual
+
+	# The page or pages of a dual opening never captured: "left", "right",
+	# "both", or None (contract 1.9 §10). Three paths write it.
+	# app.core.rebuild_volume sets "left" or "right" on an AHR opening
+	# digitised in 2022-24 where only one camera fired: a dual record with
+	# its one image, on the other side. POST /records/{id}/missing-page, and
+	# a Fisqua `missing_page` decision (app.core.fisqua_decisions), set
+	# "left" or "right" on a dual record with no current image of that side.
+	# A placeholder (app.core.record_sequence.insert_placeholders, from POST
+	# /collections/{id}/records/missing-opening or a Fisqua request) is a
+	# dual record with no image and "both". The record is pending
+	# (app.core.recapture_turn) until a dual capture into it writes both
+	# images, which clears it (app.api.cameras.trigger_dual_capture), or the
+	# operator closes it (closed_reason below). An open one stays captured on
+	# the unit when its volume is promoted; a closed one is promoted.
+	missing_side = Column(String(5), nullable=True)
+	# What a placeholder should hold (the folios expected) and a note on it,
+	# from the operator or Fisqua; cleared by the capture that fills it.
+	missing_expected = Column(Text, nullable=True)
+	missing_note = Column(Text, nullable=True)
+	# The Fisqua request (contract 1.9 §10.4) the placeholder was made from.
+	# Kept after it is captured into, so Fisqua can tell its request was met.
+	missing_request_id = Column(String(64), nullable=True)
+	# Why the operator closed a missing record without capturing it
+	# (POST /records/{id}/close-missing), and her note; set only while
+	# missing_side is (check_record_closed_needs_missing). A capture into the
+	# record clears both.
+	closed_reason = Column(String(32), nullable=True)  # foliation_skip, leaf_missing_from_volume, captured_elsewhere, other
+	closed_note = Column(Text, nullable=True)
 
 	# Audit fields
 	created_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False)
@@ -92,12 +123,25 @@ class Record(Base):
 			name='check_record_single_parent'
 		),
 		CheckConstraint(
-			"status IN ('captured','in_review','rejected','approved')",
+			"status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status'
 		),
 		CheckConstraint(
 			"capture_mode IN ('single','dual')",
 			name='check_record_capture_mode'
+		),
+		CheckConstraint(
+			"missing_side IS NULL OR missing_side IN ('left','right','both')",
+			name='check_record_missing_side'
+		),
+		CheckConstraint(
+			"closed_reason IS NULL OR closed_reason IN "
+			"('foliation_skip','leaf_missing_from_volume','captured_elsewhere','other')",
+			name='check_record_closed_reason'
+		),
+		CheckConstraint(
+			"closed_reason IS NULL OR missing_side IS NOT NULL",
+			name='check_record_closed_needs_missing'
 		),
 		# An end before its start. A half-open range passes: with either end
 		# NULL there is nothing to compare. The two NULL clauses say so
@@ -298,16 +342,22 @@ class RecordStatusChange(Base):
 
 	changed_by = Column(String(255), nullable=True)
 	changed_at = Column(DateTime, default=lambda: datetime.now(timezone.utc), nullable=False, index=True)
+	# The note of the Fisqua decision that made the change, when it has one:
+	# only an exclusion's is kept here (contract 1.6; a rejection's note is
+	# its RecordRejection comment). At most REJECTION_COMMENT_MAX_LENGTH
+	# characters, checked where it is written (app.core.fisqua_decisions),
+	# as the rejection comment is.
+	note = Column(Text, nullable=True)
 
 	record = relationship("Record", back_populates="status_changes")
 
 	__table_args__ = (
 		CheckConstraint(
-			"from_status IN ('captured','in_review','rejected','approved')",
+			"from_status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status_change_from'
 		),
 		CheckConstraint(
-			"to_status IN ('captured','in_review','rejected','approved')",
+			"to_status IN ('captured','in_review','rejected','approved','excluded')",
 			name='check_record_status_change_to'
 		),
 	)

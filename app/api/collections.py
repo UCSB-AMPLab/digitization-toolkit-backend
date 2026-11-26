@@ -1,8 +1,9 @@
-# Version: 0.2.0
+# Version: 0.3.0
 
 from fastapi import APIRouter, Depends, HTTPException, Query
 from fastapi.encoders import jsonable_encoder
 from fastapi.responses import FileResponse, JSONResponse
+from pydantic import BaseModel, ConfigDict
 from typing import List, Optional
 from datetime import datetime
 from sqlalchemy.orm import Session, joinedload, selectinload
@@ -11,31 +12,38 @@ from sqlalchemy.exc import IntegrityError
 import logging
 
 from app.api.deps import get_db_dependency
+from app.core.testing_space import scope_query, space_query_param
 from app.api.auth import get_current_user, RoleChecker
 from app.models.collection import STEM_RESERVED_MESSAGE, Collection, stem_directory_collision
 from app.models.project import Project
 from app.models.record import ImmutableFieldError, Record, RecordImage, RecordStatusChange
 from app.models.user import User
-from app.schemas.collection import CollectionCreate, CollectionRead, CollectionUpdate, CollectionWithChildren
-from app.schemas.record import RecordStatusChangeRead, ReorderRecords
+from app.schemas.collection import (
+    AdoptPlanRead, AdoptRequest, AdoptResultRead, CollectionCreate, CollectionCreateRequest, CollectionRead, CollectionUpdate,
+    CollectionWithChildren,
+)
+from app.schemas.record import MissingOpeningsCreate, RecordRead, RecordStatusChangeRead, ReorderRecords
 # The one place a status transition is validated and applied, so the
 # promotion invariant cannot be skipped by reaching a record from here
 # (NEH-260). cameras.py imports _supersede_current_images the same way.
-from app.api.records import _apply_status_change, _assert_promotable, is_movable
+from app.api.records import _apply_status_change, _assert_promotable, _serialize_record, is_movable
 from app.core.audit import log_event
 from app.core.record_status import record_bulk_status_changes
+from app.core.volume_stem import locked_volume_query
 from app.core.config import settings
 from app.core.db_errors import integrity_conflict
-from app.core.export_jobs import ExportBlockedError, export_jobs
-from app.core.export_service import run_export, workflow_blockers
+from app.core.export_jobs import ExportAdoptionUnfinished, ExportBlockedError, export_jobs
+from app.core.export_service import exported_records, run_export, workflow_blockers
 from app.core.record_sequence import (
     REORDER_IDS_MESSAGE,
     VOLUME_CHANGED_MESSAGE,
+    AfterRecordError,
     ReorderIdsError,
     VolumeChangedError,
     listing_order,
     next_sequences,
     renumber_volume_records,
+    insert_placeholders,
     reorder_volume_records,
 )
 from app.core.storage_ops import (
@@ -75,6 +83,32 @@ def _volume_change_detail(collection_id: int, **changes) -> str:
     return "; ".join(parts)
 
 
+def _volumes_from_fisqua() -> HTTPException:
+    """The 403 for an operator creating a volume or changing its codes in fisqua mode (app.core.unit_mode)."""
+    from app.core import unit_mode
+
+    return HTTPException(status_code=403, detail={"code": unit_mode.VOLUMES_FROM_FISQUA,
+                                                  "message": unit_mode.VOLUMES_FROM_FISQUA_MESSAGE})
+
+
+def _check_codes_with_fisqua(db: Session, codes) -> None:
+    """An admin's new reference codes in fisqua mode, checked with Fisqua (contract 1.8); an HTTPException if refused."""
+    from app.core import unit_mode
+
+    try:
+        unit_mode.check_reference_codes(db, codes)
+    except unit_mode.CodeRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+
+
+def _kept_parent(db: Session, parent_id: int, lock: bool = False) -> bool:
+    """Whether Captua keeps the parent volume on the unit (NEH-320); its row FOR SHARE with `lock`."""
+    query = db.query(Collection.kept_on_unit).filter(Collection.id == parent_id)
+    if lock:
+        query = query.with_for_update(read=True)
+    return bool(query.scalar())
+
+
 def _immutable_message(exc: ImmutableFieldError) -> str:
     """The client-facing message for a refused identity change, without the stored values."""
     text = str(exc)
@@ -83,9 +117,26 @@ def _immutable_message(exc: ImmutableFieldError) -> str:
     return "The volume's external identifier is written once and cannot be changed."
 
 
+def _as_collection_create(payload: CollectionCreateRequest) -> CollectionCreate:
+    """The body validated as CollectionCreate, which requires a stem; a 422 with pydantic's errors otherwise.
+
+    A body with no stem and another invalid field is answered with the
+    other field's error only, since FastAPI refuses it before this runs.
+    The 422 carries each error's type, loc and msg only (app.main).
+    """
+    from fastapi.exceptions import RequestValidationError
+    from pydantic import ValidationError
+
+    try:
+        return CollectionCreate.model_validate(payload.model_dump(mode="json", exclude_unset=True))
+    except ValidationError as exc:
+        raise RequestValidationError(
+            [{**error, "loc": ("body", *error["loc"])} for error in exc.errors(include_url=False)]) from None
+
+
 @router.post("/", response_model=CollectionRead, status_code=201)
 def create_collection(
-    payload: CollectionCreate,
+    payload: CollectionCreateRequest,
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
@@ -93,18 +144,126 @@ def create_collection(
     Create a new collection.
     
     Must specify either project_id (for top-level collection) OR parent_collection_id (for nested subcollection).
+
+    The unit's mode and projects setting (app.core.unit_mode) apply. While
+    projects are hidden, a volume without a parent collection goes into the
+    unit's default project, and any project_id given is ignored; with
+    projects shown, giving neither is still a 400. In fisqua
+    mode an operator is refused with a 403 (`volumes_from_fisqua`); an
+    admin's volume is saved only once Fisqua knows its stem, and its
+    external_id when set (contract 1.8; 422 `unknown_reference_code`, 409
+    `fisqua_no_lookup` or `fisqua_unreachable`), and is logged
+    `volume_created_override`.
+
+    `kept_on_unit` (NEH-320, app.core.kept_volumes): in offline mode every
+    new volume is kept on the unit, whatever is sent. In backup and fisqua
+    mode an admin may ask for it, and in fisqua mode such a volume is not
+    checked with Fisqua, its override logged with the flag; from anyone
+    else, true is a 403 (`kept_on_unit_admin_only`). A subcollection of a
+    kept volume is kept. The mode, and the parent's flag, are read again in
+    the insert's transaction, the settings row and the parent's row FOR
+    SHARE; a switch, or a keep or a release of the parent, committed
+    meanwhile is a 409 `mode_changed` and nothing is created.
+
+    The testing account creates testing volumes only, in every mode: in a
+    testing project (`project_id`, required for a top-level volume and
+    honoured with projects hidden; 400 without it) or under a testing
+    volume. It is not refused in fisqua mode, its volume is kept on the
+    unit whatever `kept_on_unit` says and is not checked with Fisqua, and a
+    `filename_stem` or `external_id` it sends is a 409
+    `testing_volume_codes`. While free space is below the reserve kept for
+    real work the testing account creates none (507 `testing_reserve`,
+    app.core.testing_space.refuse_below_reserve). Every testing volume, whoever creates it, is
+    given its stem from the reserved series in the insert's transaction
+    (app.core.testing_space.series_stem), and no reference code.
     """
+    from app.core import kept_volumes, testing_space, unit_mode
+    from app.core.list_import import ListRefused, ProjectLockUnavailable
+    from app.core.project_names import ProjectDirectoryTaken
+
+    tester = current_user.role == testing_space.TESTING_ROLE
+    if not tester:
+        payload = _as_collection_create(payload)
+    unit = unit_mode.current(db)
+    from_fisqua = unit.mode == unit_mode.FISQUA
+    if tester:
+        try:
+            testing_space.refuse_testing_volume_codes(payload.filename_stem, payload.external_id)
+        except testing_space.SpaceRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+        if payload.project_id is None and payload.parent_collection_id is None:
+            raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
+        # A new testing volume is where testing captures go: none is created
+        # while free space is below the reserve kept for real work.
+        testing_space.refuse_below_reserve(db)
+    if from_fisqua and current_user.role != "admin" and not tester:
+        raise _volumes_from_fisqua()
+    if tester:
+        # A testing volume is kept on the unit (below), whatever is sent.
+        kept = True
+    else:
+        try:
+            kept = kept_volumes.kept_on_create(unit.mode, payload.kept_on_unit, current_user.role == "admin")
+        except kept_volumes.KeepRefused as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+    # A subcollection of a volume Captua keeps on the unit is kept too.
+    parent_kept = (payload.parent_collection_id is not None
+                   and _kept_parent(db, payload.parent_collection_id))
+    if parent_kept:
+        kept = True
+
+    # While projects are hidden every new volume goes into the unit's default
+    # project, whoever creates it but the testing account: a given
+    # project_id is ignored. The testing account's project_id is always
+    # honoured; it never uses the default project. A subcollection
+    # (parent_collection_id) is created as before.
+    project_id = payload.project_id if unit.projects_shown or tester else None
     # Validate that exactly one parent is specified
-    if payload.project_id is None and payload.parent_collection_id is None:
+    if project_id is None and payload.parent_collection_id is None and unit.projects_shown:
         raise HTTPException(status_code=400, detail="Must specify either project_id or parent_collection_id")
     
-    if payload.project_id is not None and payload.parent_collection_id is not None:
+    if project_id is not None and payload.parent_collection_id is not None:
         raise HTTPException(status_code=400, detail="Cannot specify both project_id and parent_collection_id")
-    
-    if payload.project_id is not None:
-        project = db.query(Project).filter(Project.id == payload.project_id).first()
+
+    # A volume in a testing project, or under a testing volume, is testing
+    # work and kept on the unit from here (app.core.testing_space), so it is
+    # not checked with Fisqua. The default project chosen below is never a
+    # testing project.
+    volume_testing = testing_space.is_testing(db, project_id=project_id, collection_id=payload.parent_collection_id)
+    if tester and not volume_testing:
+        # A place that names no row: the testing account creates no real volume.
+        raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+    if volume_testing:
+        kept = True
+    # Its stem and reference code lie in its space's namespace: a real
+    # volume's, and its name, never in the testing one (409 name_reserved), a testing
+    # volume's always (409 testing_name_required). The default project
+    # chosen below is real, as a volume with neither place is.
+    # A real volume's name never lies in it either (app.models.collection).
+    try:
+        testing_space.refuse_namespace(volume_testing, payload.filename_stem, payload.external_id)
+        if not volume_testing:
+            testing_space.refuse_namespace(False, payload.name)
+    except testing_space.SpaceRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+
+    if from_fisqua and not kept:
+        _check_codes_with_fisqua(db, [payload.filename_stem, payload.external_id])
+
+    if project_id is None and payload.parent_collection_id is None:
+        try:
+            project_id = unit_mode.default_project(db, current_user.username)[0].id
+        except ProjectLockUnavailable as exc:
+            raise HTTPException(status_code=503, detail=str(exc))
+        except ProjectDirectoryTaken as exc:
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+        except ListRefused as exc:
+            raise HTTPException(status_code=409, detail={"message": str(exc)})
+
+    if project_id is not None:
+        project = db.query(Project).filter(Project.id == project_id).first()
         if not project:
-            raise HTTPException(status_code=404, detail=f"Project {payload.project_id} not found")
+            raise HTTPException(status_code=404, detail=f"Project {project_id} not found")
     
     if payload.parent_collection_id is not None:
         parent = db.query(Collection).filter(Collection.id == payload.parent_collection_id).first()
@@ -116,7 +275,7 @@ def create_collection(
         description=payload.description,
         collection_type=payload.collection_type,
         archival_metadata=payload.archival_metadata,
-        project_id=payload.project_id,
+        project_id=project_id,
         parent_collection_id=payload.parent_collection_id,
         filename_stem=payload.filename_stem,
         external_id=payload.external_id,
@@ -125,7 +284,8 @@ def create_collection(
         date_end=payload.date_end,
         sequence=payload.sequence,
         custom_attributes=payload.custom_attributes,
-        created_by=payload.created_by or current_user.username
+        created_by=payload.created_by or current_user.username,
+        kept_on_unit=kept,
     )
     
     # A stem may not name a project's directory (app.models.collection).
@@ -134,8 +294,33 @@ def create_collection(
         if message:
             raise HTTPException(status_code=409, detail={"message": message})
 
+    # The mode, and the parent's flag, read again in the insert's transaction
+    # (NEH-320): the settings row FOR SHARE, the parent's row FOR SHARE, so a
+    # switch, a keep or a release either committed before and is seen here,
+    # or waits for this commit. What was decided under another mode, or on a
+    # parent flag that a keep or a release has changed since, is refused
+    # (409 mode_changed) rather than stored with its flag.
+    if unit_mode.mode_for_insert(db) != unit.mode or (
+            payload.parent_collection_id is not None
+            and _kept_parent(db, payload.parent_collection_id, lock=True) != parent_kept):
+        db.rollback()
+        raise HTTPException(status_code=409, detail=unit_mode.ModeChangedDuringWrite().detail())
+    # Under the parent's row: nothing joins a testing tree a purge is removing.
+    if volume_testing and payload.parent_collection_id is not None:
+        try:
+            testing_space.refuse_joining_a_marked_tree(db, payload.parent_collection_id)
+        except HTTPException:
+            db.rollback()
+            raise
+
     try:
         db.add(collection)
+        if volume_testing:
+            # Its stem, from its own id, before anything can capture into it.
+            db.flush()
+            collection.filename_stem = testing_space.series_stem(collection.id)
+            # Kept for a term from now; every capture into it keeps it longer.
+            collection.testing_expires_at = testing_space.expires_at(db)
         db.commit()
     except IntegrityError as e:
         # A duplicate filename_stem or external_id, or a CHECK on the row.
@@ -144,6 +329,13 @@ def create_collection(
     db.refresh(collection)
     log_event(db, level="INFO", category="activity", action="collection_created",
               actor=current_user.username, subject=collection.name)
+    if from_fisqua and not tester:
+        detail = _volume_change_detail(collection.id, stem=(None, collection.filename_stem),
+                                       external_id=(None, collection.external_id))
+        if kept:
+            detail += "; kept on the unit, not checked with Fisqua"
+        log_event(db, level="INFO", category="activity", action="volume_created_override",
+                  actor=current_user.username, subject=collection.name, detail=detail)
     return CollectionRead.model_validate(collection)
 
 
@@ -153,17 +345,18 @@ def list_collections(
     parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection (use 'null' for top-level)"),
     skip: int = Query(default=0, ge=0),
     limit: int = Query(default=100, ge=1, le=1000),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
     """
-    List collections with optional filters.
+    List the collections of the caller's space (app.core.testing_space.scope_query) with optional filters.
     
-    - No filters: Returns all collections
+    - No filters: Returns all collections of the space
     - project_id: Returns all collections under this project (top-level only)
     - parent_collection_id: Returns all subcollections of this collection
     """
-    query = db.query(Collection)
+    query = scope_query(db.query(Collection), Collection, current_user, space)
     
     if project_id is not None:
         query = query.filter(Collection.project_id == project_id)
@@ -198,10 +391,16 @@ def list_collections(
             counts_by_id[collection_id] = count
             last_activity_by_id[collection_id] = last_activity
 
+    from app.core import colour_card
+    from app.core.adopt_journal import journaled_volume_ids
+    cards = colour_card.summaries(db, items)
+    journaled = journaled_volume_ids()  # None: a journal that cannot be read names every volume
     results = []
     for i in items:
         r = CollectionRead.model_validate(i)
         r.record_count = counts_by_id.get(i.id, 0)
+        r.colour_card = cards.get(i.id)
+        r.adoption_unfinished = journaled is None or i.id in journaled
         # Left as None for a collection with no records: "never worked on" is
         # not the same as a date, and a caller listing volumes in progress needs
         # to tell them apart.
@@ -214,11 +413,12 @@ def list_collections(
 def count_collections(
     project_id: Optional[int] = Query(None, description="Filter by project"),
     parent_collection_id: Optional[int] = Query(None, description="Filter by parent collection id"),
+    space: Optional[str] = space_query_param(),
     current_user: User = Depends(allow_read_only),
     db: Session = Depends(get_db_dependency),
 ):
-    """Return the total number of collections matching the given filters."""
-    query = db.query(Collection)
+    """Return the number of collections of the caller's space matching the given filters."""
+    query = scope_query(db.query(Collection), Collection, current_user, space)
     if project_id is not None:
         query = query.filter(Collection.project_id == project_id)
     if parent_collection_id is not None:
@@ -233,10 +433,17 @@ def get_collection(
     db: Session = Depends(get_db_dependency)
 ):
     """Get a specific collection by ID."""
+    from app.core import colour_card
+
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    return CollectionRead.model_validate(collection)
+    from app.core.adopt_journal import journal_names_volume
+
+    read = CollectionRead.model_validate(collection)
+    read.colour_card = colour_card.summaries(db, [collection])[collection.id]
+    read.adoption_unfinished = journal_names_volume(collection.id)
+    return read
 
 
 @router.get("/{collection_id}/offsite")
@@ -259,34 +466,254 @@ def get_collection_offsite_state(
     the volume's capture manifests for Fisqua, newest first, each with its
     delivery state (app.models.fisqua), and `status` is the latest status
     Fisqua gave for the volume, or null.
-    """
-    from app.core.fisqua_outbox import volume_fisqua_state
-    from app.core.image_upload import volume_upload_state
 
+    `kept_on_unit` is true while Captua keeps the volume on the unit
+    (NEH-320): nothing of it is pending, and `total` counts the files Captua
+    would copy once an admin releases it.
+    """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
-    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id)}
+    return _offsite_state(db, collection)
+
+
+def _offsite_state(db: Session, collection) -> dict:
+    from app.core.fisqua_outbox import volume_fisqua_state
+    from app.core.image_upload import volume_upload_state
+    from app.core.offsite_free import restore_available
+
+    # `restorable`: whether this unit can restore freed files (NEH-380), so the
+    # interface offers a restore only where one can run.
+    return {**volume_upload_state(db, collection), "fisqua": volume_fisqua_state(db, collection.id),
+            "restorable": restore_available()}
+
+
+# ==============================================================================
+# Keeping a volume on the unit, and releasing it (NEH-320, app.core.kept_volumes)
+# ==============================================================================
+
+@router.post("/{collection_id}/release-from-unit")
+def release_collection_from_unit(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Release a volume Captua keeps on the unit, and every kept volume inside it, in any mode; admin only.
+
+    Returns the volume's offsite state. From then on their images are
+    copied offsite and, in fisqua mode, their manifests sent like any other
+    volume's. Logged as one `volume_released_from_unit` entry for the
+    volume, naming how many were released with it. A volume not kept is a
+    409 (`not_kept_on_unit`); one whose parent volume is kept is a 409
+    (`kept_parent`), since a volume inside a kept volume is kept; volumes
+    inside it that changed during the request are a 409
+    (`kept_volumes_changed`). In fisqua mode the stem and external_id of
+    each volume it releases are first checked with Fisqua (contract 1.8, as
+    POST /collections/), and any refusal answers Fisqua's status and detail
+    with every volume still kept; offline and backup mode make no call.
+    Locks and their order: kept_volumes.release.
+    """
+    from app.core import kept_volumes, unit_mode
+
+    def fisqua_check(stem, external_id):
+        _check_codes_with_fisqua(db, [stem, external_id])
+
+    def check_for(mode):
+        return fisqua_check if mode == unit_mode.FISQUA else None
+
+    # The mode read here decides the check; release() reads it again under the
+    # settings row's lock and starts again with the right check if it changed.
+    observed = unit_mode.mode(db)
+    try:
+        collection = kept_volumes.release(db, collection_id, current_user.username,
+                                          mode=observed, check_for=check_for)
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if collection is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return _offsite_state(db, collection)
+
+
+@router.post("/{collection_id}/keep-on-unit")
+def keep_collection_on_unit(
+    collection_id: int,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Keep an existing volume on the unit, and every volume inside it, in any mode; admin only.
+
+    Returns the volume's offsite state. Captua then copies none of their
+    images offsite and sends none of their manifests; their unsent outbox
+    rows wait. Logged as one `volume_kept_on_unit` entry for the volume,
+    naming how many were kept with it. Refused as a whole with a 409 when
+    the volume is already kept (`already_kept_on_unit`), when anything of
+    it or of any volume inside it has left the unit (`already_left_unit`):
+    a file uploaded or verified offsite, or a manifest sent or being sent;
+    and when the volumes inside it changed during the request
+    (`kept_volumes_changed`). Locks and their order: kept_volumes.keep.
+    """
+    from app.core import kept_volumes
+
+    try:
+        collection = kept_volumes.keep(db, collection_id, current_user.username)
+    except kept_volumes.KeepRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    if collection is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    return _offsite_state(db, collection)
+
+
+# ==============================================================================
+# Adopting a hand-made volume's captures into the volume Fisqua assigned (NEH-387)
+# ==============================================================================
+#
+# GET is the dry run (the plan; it changes nothing and calls no bucket);
+# POST applies it, synchronously: the renames are on one card, and the
+# bucket is only listed, never written, so it ends within a request.
+
+def _rename_body(r) -> dict:
+    def text(path):
+        return str(path) if path is not None else None
+
+    return {
+        "image_id": r.image_id, "record_id": r.record_id, "is_current": r.is_current, "number": r.number,
+        "old_name": r.old_name, "new_name": r.new_name, "old_path": str(r.old_path), "new_path": str(r.new_path),
+        "old_preview_path": text(r.old_preview_path), "new_preview_path": text(r.new_preview_path),
+        "old_raw_buffer_path": text(r.old_raw_buffer_path), "new_raw_buffer_path": text(r.new_raw_buffer_path),
+        "old_thumbnail_path": text(r.old_thumbnail_path), "new_thumbnail_path": text(r.new_thumbnail_path),
+        "old_pair_id": r.old_pair_id, "new_pair_id": r.new_pair_id, "capture_id": r.capture_id,
+        "old_keys": dict(r.old_keys), "new_keys": dict(r.new_keys),
+    }
+
+
+def _shot_rename_body(r) -> dict:
+    def text(path):
+        return str(path) if path is not None else None
+
+    return {
+        "shot_id": r.shot_id, "set_id": r.set_id, "camera_index": r.camera_index,
+        "old_name": r.old_name, "new_name": r.new_name, "old_path": str(r.old_path), "new_path": str(r.new_path),
+        "old_preview_path": text(r.old_preview_path), "new_preview_path": text(r.new_preview_path),
+        "old_raw_buffer_path": text(r.old_raw_buffer_path), "new_raw_buffer_path": text(r.new_raw_buffer_path),
+        "old_keys": dict(r.old_keys), "new_keys": dict(r.new_keys),
+    }
+
+
+@router.get("/{source_id}/adopt-into/{target_id}", response_model=AdoptPlanRead)
+def plan_adopt_into(
+    source_id: int,
+    target_id: int,
+    limit: int = Query(50, ge=1, le=1000, description="How many renames to list"),
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Dry run of adopting the source volume's captures into the target; admin only.
+
+    The plan (app.core.adopt_captures.plan_adopt_captures): every refusal
+    with its details, the counts, the first `limit` renames and whether
+    more were left out, the colour card sets that move and every shot's
+    renames, the entries no source image or shot owns, the missing
+    thumbnails and both projects. A volume that does not exist is a
+    refusal in the plan, not a 404. Changes nothing.
+    """
+    from app.core.adopt_captures import plan_adopt_captures
+
+    plan = plan_adopt_captures(db, source_id, target_id)
+    db.rollback()  # no transaction stays open from the reads
+    return {
+        "source_id": plan.source_id, "target_id": plan.target_id, "may_adopt": plan.may_adopt,
+        "refusals": plan.refusals, "details": jsonable_encoder(plan.details),
+        "source_stem": plan.source_stem, "target_stem": plan.target_stem,
+        "source_project_id": plan.source_project_id, "target_project_id": plan.target_project_id,
+        "project_changes": plan.project_changes, "records": plan.records,
+        "images_current": plan.images_current, "images_superseded": plan.images_superseded,
+        "bytes": plan.bytes, "counter_before": plan.counter_before, "counter_after": plan.counter_after,
+        "renames_count": len(plan.renames), "renames_truncated": len(plan.renames) > limit,
+        "renames": [_rename_body(r) for r in plan.renames[:limit]],
+        "uncovered": plan.uncovered, "thumbnails_missing": plan.thumbnails_missing,
+        "capture_lines": plan.capture_lines, "unaccounted_capture_lines": plan.unaccounted_capture_lines,
+        "colour_card_set_ids": plan.card_set_ids, "shot_bytes": plan.shot_bytes,
+        "shot_renames": [_shot_rename_body(r) for r in plan.shot_renames],
+    }
+
+
+@router.post("/{source_id}/adopt-into/{target_id}", response_model=AdoptResultRead)
+def adopt_into(
+    source_id: int,
+    target_id: int,
+    body: Optional[AdoptRequest] = None,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Adopt the source volume's captures into the target (app.core.adopt_apply); admin only.
+
+    Returns what it did. 409 with `codes` and `details` when the plan
+    refuses, when the bucket holds objects under the target's stem, when an
+    offsite row of the source is not verified, and when an export of either
+    volume is queued or running or its files are being read for upload or
+    for a USB copy (`volume_held`); 404 `not_found` for a testing volume
+    (app.core.space_routes); 503 when the bucket cannot be listed; 500 when it
+    stopped after it began to rename, with `restored` saying whether every
+    file is back where it was.
+
+    With `client_request_id` (app.core.adoption_requests): a repeat of an id
+    whose request ended answers that request's status and body again, and
+    one recorded for other volumes 409 `client_request_id_in_use`; an id a
+    lookup closed is refused with 409 `adoption_abandoned` and never adopts;
+    409
+    `adoption_in_progress` with `request_id` while it runs, and 409
+    `adoption_interrupted` with its `state` when it never answered. GET
+    /system/adoption/requests/{id} answers its outcome.
+    """
+    from app.core import adoption_requests
+    from app.core.adopt_apply import AdoptFailed, AdoptRefused, adopt_captures
+
+    request_id = body.client_request_id if body is not None else None
+    if request_id is not None:
+        replay = adoption_requests.stored(db, request_id, source_id, target_id)
+        if replay is not None:
+            return _replayed(replay)
+    try:
+        return adopt_captures(db, source_id, target_id, actor=current_user.username, request_id=request_id)
+    except adoption_requests.AlreadyRecorded:
+        replay = adoption_requests.stored(db, request_id, source_id, target_id)
+        if replay is None:  # the row cannot go away: nothing removes one
+            raise
+        return _replayed(replay)
+    except AdoptRefused as exc:
+        raise HTTPException(status_code=exc.status_code, detail=jsonable_encoder(exc.as_detail()))
+    except AdoptFailed as exc:
+        raise HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+
+
+def _replayed(replay: dict):
+    """The recorded answer of an adoption request: its body for a 200, the same HTTPException otherwise."""
+    if replay["status"] == 200:
+        return replay["body"]
+    raise HTTPException(status_code=replay["status"], detail=replay["body"])
 
 
 # ==============================================================================
 # Freeing a received volume from the card, and restoring it (app.core.offsite_free)
 # ==============================================================================
 #
-# Under /{id}/offsite, beside the received indicator they depend on. GET of
+# Under /{id}/offsite, beside the received indicator they depend on. The dry
+# run, the free and a free job's status are the admin's and the operator's;
+# restore and a restore job's status are the admin's. GET of
 # /offsite/free is the dry run (it lists the bucket and changes nothing);
 # POST runs the free. Both POSTs answer 202 with a job to poll, as the export
 # does, because hashing a volume's masters outlasts the proxy's read timeout;
 # what can be refused at once is refused before the job starts, with 409.
 
 def _offsite_refused(exc) -> HTTPException:
-    return HTTPException(status_code=exc.status_code, detail=exc.as_detail())
+    return HTTPException(status_code=exc.status_code, detail=exc.as_detail(),
+                         headers=getattr(exc, "headers", None))
 
 
 @router.get("/{collection_id}/offsite/free")
 def plan_free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
     """Dry run: which masters and previews freeing would remove, their count and bytes, and what it would refuse and why."""
@@ -306,16 +733,17 @@ def _job_body(collection_id: int, job) -> dict:
 @router.post("/{collection_id}/offsite/free", status_code=202)
 def free_collection(
     collection_id: int,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency),
 ):
-    """Free the volume's masters and RAW previews from the card; thumbnails stay.
+    """Free the volume's masters and RAW previews from the card; thumbnails stay. Admin and operator.
 
     Refused with 409 when the volume has no stem, when not every one of its
     objects is verified in the bucket, while an export of it is queued or
     running or its files are being read for upload, when the bucket
-    cannot be listed, and while the offsite upload hold file exists
-    (app.core.offsite_hold; the detail carries `hold_file`). Each file is freed only when its local SHA1 and the
+    cannot be listed, while the offsite upload hold file exists
+    (app.core.offsite_hold; the detail carries `hold_file`), and in offline
+    mode (app.core.unit_mode; the detail's `code` is `off_in_this_mode`). Each file is freed only when its local SHA1 and the
     bucket listing's both equal its offsite row's; the job's result lists
     the files freed and those refused.
     """
@@ -334,11 +762,12 @@ def restore_collection(
     current_user: User = Depends(allow_admin),
     db: Session = Depends(get_db_dependency),
 ):
-    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place.
+    """Copy the volume's freed files back from the bucket, each checked against its SHA1 before it is put in place. Admin only.
 
     Refused with 409 when the volume has no stem, when no read remote is
     configured (CAPTUA_OFFSITE_READ_REMOTE), and while an export of it is
-    queued or running or its files are being read for upload.
+    queued or running or its files are being read for upload. Allowed in
+    offline mode: it reads from the bucket and sends nothing out.
     """
     from app.core.offsite_free import FreeRefused, start_restore
 
@@ -349,18 +778,28 @@ def restore_collection(
     return _job_body(collection_id, job)
 
 
+RESTORE_JOB_ADMIN_ONLY = "Only an administrator can read a restore job."
+
+
 @router.get("/{collection_id}/offsite/jobs/{job_id}")
 def offsite_job_status(
     collection_id: int,
     job_id: str,
-    current_user: User = Depends(allow_admin),
+    current_user: User = Depends(allow_contributor),
 ):
-    """The state of a free or restore job, with its result once done."""
+    """The state of a free or restore job, with its result once done.
+
+    Admin and operator for a free job; a restore job, which only an admin
+    starts, is the admin's alone: an operator is answered 403 for it, with
+    nothing of the job.
+    """
     from app.core.offsite_free import offsite_jobs
 
     job = offsite_jobs.get(job_id)
     if job is None or job.collection_id != collection_id:
         raise HTTPException(status_code=404, detail="Job not found")
+    if job.action == "restore" and current_user.role != "admin":
+        raise HTTPException(status_code=403, detail=RESTORE_JOB_ADMIN_ONLY)
     return job.to_dict()
 
 
@@ -370,7 +809,7 @@ def export_capture_manifest(
     current_user: User = Depends(allow_contributor),
     db: Session = Depends(get_db_dependency)
 ):
-    """The volume's capture manifest for Fisqua (exchange contract 1.1, artefact 2; 1.2), as a JSON download.
+    """The volume's capture manifest for Fisqua (exchange contract 1.6, artefact 2), as a JSON download.
 
     A unit with a Fisqua token sends the manifest itself at handover
     (app.core.fisqua_outbox). This route stays for units without a token
@@ -461,14 +900,149 @@ def update_collection(
     volume in the subtree whose directory changes, and the rows follow. That
     is refused with 409 while an export of any of those volumes is queued or
     running. Other edits are not refused.
+
+    In fisqua mode (app.core.unit_mode) a change of filename_stem or
+    external_id is refused from an operator with a 403
+    (`volumes_from_fisqua`); other fields, and a value equal to the stored
+    one, stay allowed. An admin's change is saved only once Fisqua knows
+    the new code (contract 1.8, as POST /collections/), and is logged
+    `volume_code_override`; clearing the stem is refused with a 422
+    (`stem_required`), since the stem is the volume's Fisqua reference code.
+    A volume Captua keeps on the unit (NEH-320) is not checked with Fisqua:
+    its codes are checked when an admin releases it.
+
+    The testing account never sets or changes filename_stem or
+    external_id (409 `testing_volume_codes`), and a new one lies in the
+    volume's space's namespace (409 `name_reserved` for a real volume,
+    `testing_name_required` for a testing one; app.core.testing_space).
+
+    A re-parent is refused (409 `cross_space`) when one of the volume and
+    its new parent is testing work and the other real work
+    (app.core.testing_space.refuse_cross_space), and (409
+    `kept_on_unit_move`) when the new parent is
+    kept on the unit and the volume is not (kept_volumes.refuse_kept_reparent).
+    Locks: the volume FOR UPDATE (the PATCH may change its unique stem or
+    external_id, which a weaker lock would have to upgrade at the flush)
+    and, with a new parent, the parent FOR SHARE, taken together in
+    ascending id order before any other locked read
+    (kept_volumes.lock_for_reparent), so the PATCH and a records move
+    (refuse_kept_move: source FOR SHARE, target FOR UPDATE), a keep or a
+    release (FOR NO KEY UPDATE) between the same volumes lock them in one
+    order.
     """
+    from app.core import testing_space, unit_mode
+
+    from_fisqua = unit_mode.mode(db) == unit_mode.FISQUA
+    code_fields = {name: value for name, value in payload.model_dump(exclude_unset=True).items()
+                   if name in ("filename_stem", "external_id")}
+    checked: set = set()
+
+    # Before any Fisqua lookup or row lock: the testing account never sets
+    # or changes a volume's stem or reference code (409
+    # testing_volume_codes), and a new code lies in the volume's space's
+    # namespace (409 name_reserved, testing_name_required), as a real
+    # volume's new name does. A value equal
+    # to the stored one changes nothing and passes. The model checks the
+    # namespace again at the flush.
+    new_name = payload.model_dump(exclude_unset=True).get("name")
+    if code_fields or new_name is not None:
+        stored = (db.query(Collection.filename_stem, Collection.external_id, Collection.testing)
+                  .filter(Collection.id == collection_id).first())
+        if stored is not None:
+            new_codes = {name: value for name, value in code_fields.items()
+                         if value != {"filename_stem": stored.filename_stem,
+                                      "external_id": stored.external_id}[name]}
+            try:
+                if new_codes and current_user.role == testing_space.TESTING_ROLE:
+                    raise testing_space.SpaceRefused(409, testing_space.TESTING_VOLUME_CODES,
+                                                     testing_space.TESTING_VOLUME_CODES_MESSAGE)
+                testing_space.refuse_namespace(bool(stored.testing), *new_codes.values())
+                if not stored.testing:
+                    testing_space.refuse_namespace(False, new_name)
+            except testing_space.SpaceRefused as exc:
+                raise HTTPException(status_code=exc.status, detail=exc.detail())
+
+    def code_changes(stem, external_id) -> dict:
+        stored = {"filename_stem": stem, "external_id": external_id}
+        return {name: value for name, value in code_fields.items() if value != stored[name]}
+
+    if from_fisqua and code_fields:
+        # Before the row lock, so that Fisqua is not asked while the row is
+        # held; read as plain columns, so the locked read below loads the
+        # row afresh. Checked again under the lock.
+        stored = (db.query(Collection.filename_stem, Collection.external_id, Collection.kept_on_unit)
+                  .filter(Collection.id == collection_id).first())
+        if stored is not None:
+            changes = code_changes(stored.filename_stem, stored.external_id)
+            if changes and current_user.role != "admin":
+                raise _volumes_from_fisqua()
+            if "filename_stem" in changes and changes["filename_stem"] is None:
+                raise HTTPException(status_code=422, detail={"code": unit_mode.STEM_REQUIRED,
+                                                             "message": unit_mode.STEM_REQUIRED_MESSAGE})
+            new_codes = [value for value in changes.values() if value is not None]
+            if not stored.kept_on_unit:
+                _check_codes_with_fisqua(db, new_codes)
+                checked.update(new_codes)
+
     # Under the row lock, so that a concurrent PATCH setting a first stem or
     # external_id commits before this one reads the row, and the model's
-    # write-once guards compare against the committed value.
-    collection = _locked_collection_query(db, collection_id).first()
+    # write-once guards compare against the committed value. With a new
+    # parent, its row is taken FOR SHARE in the same pass, the two in id
+    # order (kept_volumes.lock_for_reparent), before any other locked read.
+    from app.core import kept_volumes
+    new_parent_id = payload.model_dump(exclude_unset=True).get("parent_collection_id")
+    if new_parent_id is None or new_parent_id == collection_id:
+        collection = _locked_collection_query(db, collection_id).first()
+    else:
+        collection = kept_volumes.lock_for_reparent(db, collection_id, new_parent_id)
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Under the new parent's row: nothing joins a testing tree a purge is removing.
+    if new_parent_id is not None and new_parent_id != collection_id and collection.testing:
+        from app.core import testing_space as _testing_space
+        try:
+            _testing_space.refuse_joining_a_marked_tree(db, new_parent_id)
+        except HTTPException:
+            db.rollback()
+            raise
+
+    code_override = False
+    if from_fisqua and code_fields:
+        changes = code_changes(collection.filename_stem, collection.external_id)
+        if "filename_stem" in changes and changes["filename_stem"] is None:
+            db.rollback()
+            raise HTTPException(status_code=422, detail={"code": unit_mode.STEM_REQUIRED,
+                                                         "message": unit_mode.STEM_REQUIRED_MESSAGE})
+        if changes and current_user.role != "admin":
+            db.rollback()
+            raise _volumes_from_fisqua()
+        unchecked = [value for value in changes.values() if value is not None and value not in checked]
+        if unchecked and not collection.kept_on_unit:
+            # The row changed since the read above: rare, and checked here.
+            try:
+                _check_codes_with_fisqua(db, unchecked)
+            except HTTPException:
+                db.rollback()
+                raise
+        code_override = bool(changes)
     
+    # A re-parent between testing and real work (app.core.testing_space), or
+    # one that would put a volume Captua does not keep inside a kept one
+    # (NEH-320); a kept volume may otherwise move anywhere. A null parent
+    # takes the volume to the top level of its root's project, the same
+    # space as its root, so only a new parent is compared.
+    from app.core import testing_space
+    reparent = payload.model_dump(exclude_unset=True)
+    if "parent_collection_id" in reparent and reparent["parent_collection_id"] != collection.parent_collection_id:
+        try:
+            if reparent["parent_collection_id"] is not None:
+                testing_space.refuse_cross_space(db, (None, collection.id),
+                                                 (None, reparent["parent_collection_id"]))
+            kept_volumes.refuse_kept_reparent(db, collection, reparent["parent_collection_id"])
+        except kept_volumes.KeepRefused as exc:
+            db.rollback()
+            raise HTTPException(status_code=exc.status, detail=exc.detail())
+
     if payload.parent_collection_id is not None:
         # Prevent circular references
         if payload.parent_collection_id == collection_id:
@@ -515,6 +1089,7 @@ def update_collection(
             update_data["project_id"] = root.project_id
     before = (collection.name, collection.filename_stem,
               collection.project_id, collection.parent_collection_id)
+    old_external_id = collection.external_id
     layout_changed = (
         ("name" in update_data and update_data["name"] != collection.name)
         or ("parent_collection_id" in update_data
@@ -591,6 +1166,13 @@ def update_collection(
                       collection_id,
                       project=(old_project, collection.project_id),
                       parent=(old_parent, collection.parent_collection_id)))
+    if code_override and (old_stem, old_external_id) != (collection.filename_stem, collection.external_id):
+        log_event(db, level="INFO", category="activity", action="volume_code_override",
+                  actor=current_user.username, subject=collection.name,
+                  detail=_volume_change_detail(
+                      collection_id,
+                      stem=(old_stem, collection.filename_stem),
+                      external_id=(old_external_id, collection.external_id)))
     if not_moved:
         # Preview sidecars that stayed in the old directory (see relocate_image).
         # The key is outside CollectionRead, so this body bypasses response_model.
@@ -616,6 +1198,9 @@ def move_collection_records(
     source = db.query(Collection).filter(Collection.id == collection_id).first()
     if not source:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Neither out of nor into a volume an unfinished adoption names (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_adopted_away, refuse_if_journaled
+    refuse_if_journaled([collection_id, target_collection_id])
 
     target = db.query(Collection).filter(Collection.id == target_collection_id).first()
     if not target:
@@ -671,6 +1256,16 @@ def move_collection_records(
             },
         )
 
+    # Not between testing and real work (app.core.testing_space), nor between
+    # a volume Captua keeps on the unit and one it does not (NEH-320).
+    from app.core import kept_volumes, testing_space
+    try:
+        testing_space.refuse_cross_space(db, (None, collection_id), (None, target_collection_id))
+        kept_volumes.refuse_kept_move(db, collection_id, target_collection_id)
+    except kept_volumes.KeepRefused as exc:
+        db.rollback()
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+
     # The moved records take the sequences after the target's highest, in
     # their listing order in the source, so no two records of the target
     # share one. The
@@ -679,6 +1274,16 @@ def move_collection_records(
     sequences = next_sequences(db, target_collection_id, len(records))
     if sequences is None:
         raise HTTPException(status_code=404, detail=f"Target collection {target_collection_id} not found")
+    # Again, now the source's records and the target's row are locked: an adoption takes the same locks,
+    # so one that ran while this request waited for them has left its journal, if it kept one, by now.
+    # The check above only refuses early.
+    try:
+        refuse_if_journaled([collection_id, target_collection_id])
+        # Not into a volume an adoption closed (Collection.captures_adopted_at), read under the target's lock.
+        refuse_if_adopted_away(db, [target_collection_id])
+    except HTTPException:
+        db.rollback()
+        raise
 
     not_moved: List[str] = []
     moves: List = []
@@ -721,15 +1326,49 @@ def delete_collection(
     empty collection has no files of its own, so no file is removed: a file
     found in its directory (one no row references, such as a file the volume
     layout migration left there) stays, with the directories above it, and is
-    logged at WARNING.
+    logged at WARNING. A volume whose captures were adopted away
+    (Collection.deletable_after_adoption) is the one exception to the stem
+    refusal: it is deleted, its manifest moved to `.retired-manifests/`
+    (storage_ops.retire_project_manifest), and its stem stays held by its
+    retired offsite keys.
+
+    A testing volume (which only the testing account reaches here) is
+    removed completely, captured or not, with its sub-volumes, records,
+    images, files and manifest (app.core.testing_space.purge_volume): its
+    stem is its own id in the reserved series and is never given out
+    again, so it reserves nothing. 409 `testing_volume_busy`, with no row
+    removed, while it cannot be removed now: a capture holds it, a USB copy
+    is reading it or one of its sub-volumes, or a projects root holding its
+    files cannot be read.
     """
+    from app.core import testing_space
+
+    target = db.query(Collection).filter(Collection.id == collection_id).first()
+    if target is not None and target.testing:
+        name, stem = target.name, target.filename_stem
+        if not testing_space.purge_volume(db, target, reason=testing_space.FOR_DELETE):
+            message = (testing_space.TESTING_VOLUME_COPYING_MESSAGE
+                       if testing_space.copy_running_in(db, collection_id)
+                       else testing_space.TESTING_VOLUME_BUSY_MESSAGE)
+            raise HTTPException(status_code=409, detail={"code": testing_space.TESTING_VOLUME_BUSY,
+                                                         "message": message})
+        log_event(db, level="WARN", category="activity", action="collection_deleted",
+                  actor=current_user.username, subject=name,
+                  detail=f"id={collection_id}; stem {stem!r}; testing volume removed with all it held")
+        return None
     # Under the row lock, so that a PATCH setting a first stem cannot land
     # between this check and the delete.
     collection = _locked_collection_query(db, collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Not a volume an unfinished adoption names, nor one above it (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_journaled
+    refuse_if_journaled(collection_and_descendants(db, collection_id))
 
-    if collection.reserves_its_stem():
+    # A volume that has captured keeps its row, so its stem is never issued again; the one exception is a
+    # volume whose captures were adopted away (Collection.deletable_after_adoption), whose retired keys hold it.
+    adopted_away = collection.reserves_its_stem() and collection.deletable_after_adoption()
+    if collection.reserves_its_stem() and not adopted_away:
         raise HTTPException(status_code=409, detail={"message": STEM_RESERVED_MESSAGE})
 
     # Refuse to delete a non-empty collection; report the blocking counts
@@ -753,10 +1392,19 @@ def delete_collection(
             )
         # Remove the directories first so a filesystem failure aborts before touching the DB
         try:
+            if adopted_away:
+                # Its manifest holds the relocation records of the adopted files: moved out, where the
+                # fixity index keeps reading it (app.core.integrity.manifest_base), never deleted.
+                from app.core.storage_ops import retire_project_manifest
+                retire_project_manifest(col_dir)
             left = remove_empty_dirs(col_dir)
         except OSError as e:
             logger.error(f"Failed to remove collection directory {col_dir}: {e}")
             raise HTTPException(status_code=500, detail="Failed to remove collection files from disk")
+        # The volume's colour card shots are removed with it, after the delete commits.
+        from app.core import colour_card
+        shot_files = {str(p) for p in colour_card.shot_file_paths(db, collection_id)}
+        left = [p for p in left if str(p.resolve()) not in shot_files]
         if left:
             logger.warning(
                 f"Deleting collection {collection_id}: {len(left)} file(s) no record references were left in "
@@ -774,8 +1422,15 @@ def delete_collection(
     )
     deleted = dict(id=collection.id, name=collection.name, stem=collection.filename_stem,
                    project=collection.project_id, parent=collection.parent_collection_id)
+    # Its colour card sets and shots go with it, and their files once the delete commits.
+    from app.core import colour_card
+    card_files = colour_card.remove_volume_shots(db, collection_id)
     db.delete(collection)
     db.commit()
+    if card_files:
+        colour_card.remove_files(card_files)
+        if col_dir is not None:
+            remove_empty_dirs(col_dir)
     log_event(db, level="WARN", category="activity", action="collection_deleted",
               actor=current_user.username, subject=deleted["name"],
               detail=(f"id={deleted['id']}; stem {deleted['stem']!r}; project {deleted['project']}; "
@@ -820,6 +1475,79 @@ def reorder_collection_records(
 
     db.commit()
     return {"reordered": reordered}
+
+
+# ==============================================================================
+# Openings never captured (contract 1.9 §10)
+# ==============================================================================
+
+@router.post("/{collection_id}/records/missing-opening", response_model=List[RecordRead])
+def mark_missing_openings(
+    collection_id: int,
+    payload: MissingOpeningsCreate,
+    current_user: User = Depends(allow_contributor),
+    db: Session = Depends(get_db_dependency)
+):
+    """
+    Mark openings never captured: insert placeholders right after a record of the volume.
+
+    Body: {"afterRecordId", "count" (1 to 50, or null for one), "expected",
+    "note" (each at most 2,000 characters), "requestId" (at most 64)}, all
+    but afterRecordId optional. afterRecordId names a record of this volume,
+    of any status, excluded included. Each placeholder is a dual record with
+    no image that misses both pages (missing_side "both"), captured, carrying
+    what it should hold, the note and the request id
+    (app.core.record_sequence.insert_placeholders). They take the sequences
+    right after the record, and every later record's sequence moves up by
+    the count; no file is renamed or touched (contract 1.9 §10.2). The
+    volume's records and then its row are locked for the transaction
+    (app/core/record_sequence.py); if records keep being added meanwhile it
+    answers 409 with VOLUME_CHANGED_MESSAGE. Returns the placeholders, in
+    order. 404 for an unknown volume or record, 422 for a record of another
+    volume or a bad body. Writes `missing_openings_marked` to the system log.
+    A volume handed over before is handed over again in the same transaction
+    when nothing else holds it (app.core.fisqua_outbox.hand_over_again_after_missing_change).
+    """
+    volume = db.query(Collection).filter(Collection.id == collection_id).first()
+    if volume is None:
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    after = db.get(Record, payload.afterRecordId)
+    if after is None:
+        raise HTTPException(status_code=404, detail=f"Record {payload.afterRecordId} not found")
+    other_volume = (f"Record {payload.afterRecordId} is not in volume {collection_id}, "
+                    "so no opening can be marked after it there.")
+    if after.collection_id != collection_id:
+        raise HTTPException(status_code=422, detail=other_volume)
+    count = payload.count or 1
+    try:
+        made = insert_placeholders(db, collection_id, payload.afterRecordId, count,
+                                   expected=payload.expected, note=payload.note,
+                                   request_id=payload.requestId, created_by=current_user.username)
+    except AfterRecordError:
+        # Moved out of the volume while its records were being locked.
+        db.rollback()
+        raise HTTPException(status_code=422, detail=other_volume)
+    except VolumeChangedError:
+        db.rollback()
+        raise HTTPException(status_code=409, detail=VOLUME_CHANGED_MESSAGE)
+    if made is None:
+        db.rollback()
+        raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # After the volume's locks, as promotion queues its handover after its own.
+    from app.core.fisqua_outbox import hand_over_again_after_missing_change
+    queued = hand_over_again_after_missing_change(db, collection_id)
+    db.commit()
+    if queued is not None:
+        from app.core.image_upload import image_upload_scheduler
+        image_upload_scheduler.wake()
+    for rec in made:
+        db.refresh(rec)
+    out = [_serialize_record(rec) for rec in made]
+    log_event(db, level="INFO", category="activity", action="missing_openings_marked",
+              actor=current_user.username, subject=volume.name,
+              detail=(f"volume {collection_id} after {payload.afterRecordId} count={count} "
+                      f"requestId={payload.requestId} records={[r.id for r in out]}"))
+    return out
 
 
 # ==============================================================================
@@ -881,7 +1609,10 @@ def promote_collection(
 ):
     """
     Hand a finished collection over for review: apply captured -> in_review to
-    every captured record in it.
+    every captured record in it but the open missing ones (records.missing_side
+    set and records.closed_reason not: a page or an opening never captured,
+    contract 1.9 §10), which stay captured until they are captured into or
+    closed. A missing record the operator closed is promoted like any other.
 
     The act is per collection — an operator promotes a tomo when she has
     finished it — while the transition itself stays per record, which is what
@@ -891,11 +1622,35 @@ def promote_collection(
     All or nothing. A collection reads as handed over when none of its records
     is captured, so promoting some of them would leave it unsubmitted while
     reporting success; the records that cannot go are named instead and
-    nothing changes.
+    nothing changes. The one exception is an open missing record: it is
+    pending, not unfinished work to refuse over, so the others go and it
+    stays, and the volume's manifest lists it as missing
+    (app.core.capture_manifest).
 
     Submitted state is derived, never stored. Capture another folio into a
     promoted collection and it is no longer submitted, which is the right
     answer: there is work in it nobody has looked at.
+
+    The first successful promotion of a full rescan opens the recapture turn
+    for one new volume, as finishing a volume's recaptures does: it writes
+    rescan_volume_completed in the handover's transaction
+    (recapture_turn.award_rescan_turns). A volume already carrying that event
+    writes none, so a take-back and a second promotion open no second turn.
+    A refused or empty promotion writes nothing.
+
+    Locks, in the order every path that takes the turn lock keeps: the
+    records, then the volume's row (locked_volume_query, as the capture
+    paths take it), then the turn. A retake holds its volume's row and then
+    asks for the turn; a promotion holding the turn and then needing the row
+    (its status-change rows reference the volume) would deadlock against it.
+    The records locked are all the volume's, open missing ones included, in
+    id order; the ones to promote are chosen from them. Every promotion
+    takes the volume's row FOR UPDATE once, after the records and before any
+    status change or the outbox: a full rescan
+    through lock_rescan_volumes, before the turn, any other volume directly,
+    with no turn lock. So promotion is records, volume, history, outbox, as
+    take-back and the missing changes (contract 1.9 §10) are; the history
+    rows' FOR KEY SHARE on the volume then never needs upgrading.
     """
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
@@ -906,22 +1661,37 @@ def promote_collection(
     # the pre-check below validates a snapshot: a reject arriving between the
     # check and the commit puts a rejected image back on a record this call
     # then hands over (NEH-260, reproduced).
-    records = (
+    # Every record of the volume is locked, open missing ones included, and
+    # the promotable ones are chosen from the locked rows: a close-missing
+    # committed between a narrower lock and the volume's row would leave a
+    # closed captured record out of this handover, and its manifest would
+    # be refused (records_captured).
+    locked = (
         db.query(Record)
-        .options(joinedload(Record.images))
-        .filter(Record.collection_id == collection_id, Record.status == "captured")
+        .filter(Record.collection_id == collection_id)
         .order_by(Record.id)
         .with_for_update(of=Record)
         .all()
     )
-    # A volume with a pending record (rejected, or prepared for retake with
-    # its rejected image still current; app.core.recapture_turn) stays on the
-    # unit until its retakes are done, for every role: Fisqua would hold a
-    # delivery with a rejected record anyway. Counted after the locks, and
-    # before the idempotent return, so a volume whose only records left are
-    # rejected is refused too.
-    from app.core.recapture_turn import volume_pending
-    pending = volume_pending(db, collection_id)
+    # The images, which _apply_status_change checks, read after the locks
+    # (records.read_after_lock).
+    from app.api.records import read_after_lock
+    read_after_lock(db, locked)
+    records = [
+        rec for rec in locked
+        if rec.status == "captured" and (rec.missing_side is None or rec.closed_reason is not None)
+    ]
+    # A volume with a record waiting for a retake (rejected, or prepared for
+    # retake with its rejected image still current; app.core.recapture_turn)
+    # stays on the unit until its retakes are done, for every role: Fisqua
+    # would hold a delivery with a rejected record anyway. Counted after the
+    # locks, and before the idempotent return, so a volume whose only records
+    # left are rejected is refused too. An open missing record is pending
+    # but does not hold the volume back: it is left out of the records
+    # above, stays captured, and is listed as missing in the manifest until
+    # a dual capture writes both pages or the operator closes it.
+    from app.core.recapture_turn import volume_retakes_pending
+    pending = volume_retakes_pending(db, collection_id)
     if pending:
         raise HTTPException(
             status_code=409,
@@ -956,11 +1726,21 @@ def promote_collection(
             },
         )
 
+    # Records, then the volume's row, then the turn: the capture paths' order.
+    # The row is taken before the status changes write their history rows.
+    from app.core import volume_stem
+    from app.core.recapture_turn import award_rescan_turns, lock_rescan_volumes
+    rescans = lock_rescan_volumes(db, [collection_id])
+    if not rescans:
+        # Any other volume's row as well, once, so every promotion is records,
+        # volume, history, outbox, as take-back and the missing changes are.
+        volume_stem.locked_volume_query(db, collection_id).first()
     for rec in records:
         _apply_status_change(db, rec, "in_review", current_user)
+    award_rescan_turns(db, rescans, current_user.username)
     # Queued in the handover's transaction, after the records' locks, so a
     # handover and its manifest are committed together or not at all
-    # (app.core.fisqua_outbox). Nothing is queued when Fisqua is not configured.
+    # (app.core.fisqua_outbox). Queued whatever the configuration (NEH-320).
     from app.core.fisqua_outbox import enqueue_handover
     enqueue_handover(db, collection)
     db.commit()
@@ -1024,6 +1804,11 @@ def take_back_collection(
     ]
     taken_back = 0
     if locked_ids:
+        # The volume's row, FOR UPDATE, after the records and before the
+        # history rows (which take FOR KEY SHARE on it) and the outbox: record,
+        # volume, history, outbox, the order of every path that hands a
+        # volume over or takes it back (app.core.fisqua_outbox).
+        locked_volume_query(db, collection_id).first()
         # RETURNING names the rows the predicate actually matched, so the
         # history rows below are written for those and no others.
         moved_ids = db.execute(
@@ -1095,7 +1880,8 @@ def export_collection_bagit(
     """
     Start a background BagIt export of this collection and return a job to poll.
 
-    Requires all records to be approved. The heavy work (integrity verification and
+    Requires all records to be approved, except those Fisqua excluded, which
+    are skipped (app.core.export_service.exported_records). The heavy work (integrity verification and
     streaming the zip straight into the exports dir, with no staging copy) runs in a
     background job, so proxied clients never hit nginx's read timeout; poll
     GET /{collection_id}/export/status/{job_id} for progress.
@@ -1103,6 +1889,9 @@ def export_collection_bagit(
     collection = db.query(Collection).filter(Collection.id == collection_id).first()
     if not collection:
         raise HTTPException(status_code=404, detail=f"Collection {collection_id} not found")
+    # Not a volume an unfinished adoption names (app.core.adopt_journal).
+    from app.core.adopt_journal import refuse_if_journaled
+    refuse_if_journaled([collection_id])
 
     records = (
         db.query(Record)
@@ -1113,7 +1902,8 @@ def export_collection_bagit(
     # Handover first, approval second — two different things to tell her. A
     # collection she has not promoted is work in progress, not work that failed
     # review (NEH-260). The predicate lives in export_service beside the worker
-    # that re-checks it, so the two cannot drift apart.
+    # that re-checks it, so the two cannot drift apart. It is given every
+    # record, and leaves out excluded ones and closed placeholders itself.
     blocker = workflow_blockers(records)
     if blocker:
         message, blocking_ids = blocker
@@ -1121,6 +1911,7 @@ def export_collection_bagit(
             status_code=422,
             detail={"message": message, "blocking_record_ids": blocking_ids},
         )
+    records = exported_records(records)
 
     image_less = [r.id for r in records if not any(i.is_current for i in r.images)]
     if image_less:
@@ -1134,12 +1925,14 @@ def export_collection_bagit(
 
     # A master freed from the card is in the bucket, not here, and a bag is
     # built from the card. 409: the volume's state, which a restore changes.
-    from app.core.offsite_free import FREED_EXPORT_MESSAGE
+    # `restorable` says whether a restore can bring them back to this unit (restore_available).
+    from app.core.offsite_free import FREED_EXPORT_MESSAGE, restore_available
     freed = [i.id for r in records for i in r.images if i.is_current and i.master_freed_at is not None]
     if freed:
         raise HTTPException(
             status_code=409,
-            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed},
+            detail={"message": FREED_EXPORT_MESSAGE.format(n=len(freed)), "freed_image_ids": freed,
+                    "restorable": restore_available()},
         )
 
     # One export per collection at a time: a retry returns the running job instead of
@@ -1147,6 +1940,8 @@ def export_collection_bagit(
     # zip build happen in the job, surfaced via the status endpoint.
     try:
         job = export_jobs.start(collection_id, lambda j: run_export(j, collection_id))
+    except ExportAdoptionUnfinished as e:
+        raise HTTPException(status_code=409, detail={"code": "adoption_unfinished", "message": str(e)})
     except ExportBlockedError as e:
         raise HTTPException(status_code=409, detail=str(e))
     log_event(db, level="INFO", category="activity", action="export_started",
@@ -1173,6 +1968,67 @@ def export_status(
     if job.state == "done" and job.zip_filename:
         body["download_url"] = f"/collections/{collection_id}/export/download"
     return body
+
+
+class UsbCopyRequest(BaseModel):
+    model_config = ConfigDict(extra="forbid")
+
+    device: str
+
+
+@router.post("/{collection_id}/usb-copy", status_code=202)
+def start_usb_copy(
+    collection_id: int,
+    body: UsbCopyRequest,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Copy a testing volume's pictures to a USB drive, in the background; {job_id}. Admin and the testing account.
+
+    `device` is a name as GET /system/testing/usb lists it. The volume must
+    be a testing volume: the testing account naming a real volume is
+    answered 404 `not_found` (app.api.space), an administrator 409
+    `usb_real_volume`. 409 `usb_copy_busy` while another copy runs on the
+    unit; 422 `usb_not_eligible` for a device not in the list; 409
+    `testing_volume_busy` while a request moves, renames or deletes the
+    volume's files; 404 `not_found` for a volume a purge is removing. The
+    copy itself (app.core.usb_copy) reports its result in the status.
+    """
+    from app.core import testing_space, usb_copy
+
+    volume = db.query(Collection).filter(Collection.id == collection_id).first()
+    if volume is None:
+        raise HTTPException(status_code=404, detail=testing_space.not_found_detail())
+    try:
+        job = usb_copy.usb_copies.start(db, volume, body.device, current_user.username)
+    except usb_copy.UsbRefused as exc:
+        raise HTTPException(status_code=exc.status, detail=exc.detail())
+    return {"job_id": job.id}
+
+
+@router.get("/{collection_id}/usb-copy/status/{job_id}")
+def usb_copy_status(
+    collection_id: int,
+    job_id: str,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """A USB copy's state and progress. Admin and the testing account; 404 unless the job is this volume's.
+
+    {job_id, collection_id, state (queued, running, done, failed), done,
+    total (files), bytes_done, bytes_total, error (a code or null),
+    message, folder (the new folder's name on the drive,
+    `<stem>_<YYYYMMDD-HHMMSS>` in UTC), drive, skipped {not_regular,
+    outside, missing}, unmounted (the copy unmounted the drive it
+    mounted)}. The registry keeps the 20 most recent finished copies; an
+    older one is 404.
+    """
+    from app.core import usb_copy
+
+    job = usb_copy.usb_copies.get(job_id)
+    if job is None or job.collection_id != collection_id:
+        raise HTTPException(status_code=404, detail="USB copy not found")
+    return job.to_dict()
 
 
 @router.get("/{collection_id}/export/download")

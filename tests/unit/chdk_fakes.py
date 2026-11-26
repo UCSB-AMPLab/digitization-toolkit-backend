@@ -13,12 +13,17 @@ lowercased, a malformed file parses as nothing rather than raising. A second
 implementation with rules of its own would let these tests agree with
 themselves while disagreeing with the library.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
+import datetime
 import re
 import threading
 from collections import namedtuple
+
+
+# Stands for a keyword argument the test did not pass.
+_UNSET = object()
 
 
 DeviceInfo = namedtuple("DeviceInfo", [
@@ -32,6 +37,44 @@ class PTPError(Exception):
     def __init__(self, code, message=None):
         self.code = code
         super().__init__(message or f"PTP error 0x{code:04x}")
+
+
+class ScriptSentWhileRunning(BaseException):
+    """A script reached a fake body while another script was still running on it.
+
+    CHDK's ExecuteScript kills a running script unless the request carries
+    the NOKILL flag. On 12 November 2026 the backend sent enter_alt() 0.2 s
+    after a capture's last chunk, while that capture script was still running,
+    and the next picture was delivered without its first 17920 bytes. The fake
+    raises this whenever a script arrives over a running one. It derives from
+    BaseException so that the backend's own `except Exception` handlers cannot
+    turn it into an ordinary failed capture: the test fails instead.
+    """
+
+
+# CHDK's script message types (core/ptp.h), as pychdk's MessageType has them.
+MSG_NONE = 0
+MSG_ERR = 1
+MSG_RET = 2
+
+ScriptMessage = namedtuple(
+    "ScriptMessage", ["msg_type", "data_type", "script_id", "value"]
+)
+
+
+class DngError(ValueError):
+    """Stands in for pychdk.dng.DngError: the DNG parts could not be assembled.
+
+    The library raises it from shoot(dng=True) once every part has arrived,
+    when the header and the raw data do not make a DNG (a raw length that
+    differs from the header's byte count, offsets that do not lay the parts
+    end to end).
+    """
+
+
+# What pychdk's shoot(stream=True, dng=True, jpeg=True) returns: the DNG
+# and the camera's JPEG of the same exposure, both as bytes.
+DngCapture = namedtuple("DngCapture", ["dng", "jpeg"])
 
 
 class TransportError(Exception):
@@ -124,6 +167,7 @@ class Body:
         bus=1,
         address=4,
         serial="1111111",
+        product_id=0x325B,
         product="Canon PowerShot A2500",
         card=None,
         download_error=None,
@@ -137,17 +181,58 @@ class Body:
         version_error=None,
         stuck_in_play=False,
         switch_without_arriving=False,
+        half_press_arrives=False,
+        half_press_reads=1,
         lua_error=None,
+        zoom_steps=None,
+        zoom=0,
+        zoom_follows=True,
+        zoom_lands=None,
+        zoom_error=None,
+        clock_offset_s=0,
+        clock_ignores_set=False,
+        clock_garbage=False,
+        clock_error=None,
+        set_clock_error=None,
+        port_numbers=None,
+        capture_script_reads=0,
+        script_reads=None,
+        script_reads_after_return=None,
+        shot_chunks=None,
+        always_ready=False,
+        strict_scripts=True,
+        af_distance=1489,
+        focus=None,
+        focus_answer=_UNSET,
+        focus_follows=True,
+        focus_error=None,
+        set_focus_error=None,
+        aflock_error=None,
+        aflock_error_after=0,
+        dng=b"",
+        old_library=False,
+        open_error=None,
     ):
         self.bus = bus
         self.address = address
         self.serial = serial
+        self.product_id = product_id
         self.product = product
         self.card = card
         self.download_error = download_error
         self.upload_error = upload_error
         self.frame = frame
         self.image = image
+        # The DNG a shoot(dng=True) returns, as the library assembles it. The
+        # JPEG of the same exposure is assembled from `image` or shot_chunks,
+        # as for a JPEG-only shot. old_library makes the body's device the
+        # pinned pychdk 0.1.3's, whose shoot() has no jpeg argument.
+        self.dng = dng
+        self.old_library = old_library
+        # Raised by the library's ChdkDevice(): a body that is attached and
+        # cannot be opened. open_attempts counts every try, failed or not.
+        self.open_error = open_error
+        self.open_attempts = 0
         self.shoot_error = shoot_error
         self.preview_error = preview_error
         self.mode_error = mode_error
@@ -181,9 +266,123 @@ class Body:
         # not take switch_mode's return as proof.
         self.stuck_in_play = stuck_in_play
         self.switch_without_arriving = switch_without_arriving
+        # A body that takes switch_mode_usb(1), extends the lens and stays in
+        # playback; a half-press of the shutter then completes the switch
+        # without taking a picture. With
+        # half_press_arrives, a click("shoot_half") makes get_mode report
+        # record after half_press_reads further reads that still say play.
+        # Without it, the half-press is counted and changes nothing.
+        self.half_press_arrives = half_press_arrives
+        self.half_press_reads = half_press_reads
+        self.half_presses = 0
+        self._reads_until_record = None
         self.mode_value = False
         self.lua_error = lua_error
         self.lua_calls = []
+        # The timeout each lua_execute call was given, in the order made.
+        self.lua_timeouts = []
+        # Optical zoom. zoom_steps is what get_zoom_steps() answers: None by
+        # default, which is what this fake answered for every script before
+        # zoom was added, and 64 on an A2500 under CHDK 1.5.1. zoom is the
+        # step get_zoom() reports. With zoom_follows, set_zoom(n) moves the
+        # lens to n; without it the lens stays where it is, which is a camera
+        # that does not confirm the step. zoom_lands, when given, is the step
+        # the lens stops at for any set_zoom: a lens that moved but not to
+        # the step asked for. zoom_error is raised by set_zoom.
+        self.zoom_steps = zoom_steps
+        self.zoom = zoom
+        self.zoom_follows = zoom_follows
+        self.zoom_lands = zoom_lands
+        self.zoom_error = zoom_error
+        # The camera's wall clock. clock_offset_s is how far it is from the
+        # unit's time, camera minus unit; the unit's time is
+        # pychdk_module.unit_time, which make_backend sets and the backend
+        # reads through its _now. clock_ignores_set is a camera on which
+        # set_clock changes nothing. clock_garbage makes the read answer text
+        # that is no date. clock_error is raised by the read, and
+        # set_clock_error by set_clock. set_clocks records each set_clock
+        # call's arguments.
+        self.clock_offset_s = clock_offset_s
+        self.clock_ignores_set = clock_ignores_set
+        self.clock_garbage = clock_garbage
+        self.clock_error = clock_error
+        self.set_clock_error = set_clock_error
+        self.set_clocks = []
+        self.pychdk_module = None
+        # Focus lock. af_distance is the distance in mm the camera's
+        # autofocus finds on a half-press; 1489 and 1557 were the answers of
+        # get_focus() on an A2500 on 12 November 2026. A script that starts
+        # with press('shoot_half') - the lock and the restore script -
+        # focuses at af_distance and sets the lock. focus is the distance
+        # get_focus() reports; focus_answer, when given, replaces every
+        # answer of get_focus() (None or 0 is a camera that reports no
+        # distance). With focus_follows, set_focus(d) moves the focus to d;
+        # without it the focus stays where it is, which is a camera that does
+        # not confirm the distance. focus_error is raised by the half-press
+        # scripts, set_focus_error by set_focus, aflock_error by set_aflock
+        # once aflock_error_after calls of set_aflock have succeeded.
+        # aflock is the lock as the camera holds it. A half-press while the
+        # lock is held does not focus again: the focus stays where it is.
+        self.af_distance = af_distance
+        self.focus = af_distance if focus is None else focus
+        self.focus_answer = focus_answer
+        self.focus_follows = focus_follows
+        self.focus_error = focus_error
+        self.set_focus_error = set_focus_error
+        self.aflock_error = aflock_error
+        self.aflock_error_after = aflock_error_after
+        self.aflock_calls = 0
+        self.aflock = False
+        # Every switch_mode and lua_execute call, in the order made.
+        self.events = []
+        # Scripts and their running state. CHDK runs one script at a time, and
+        # ScriptStatus reports whether one is running. Here a running script
+        # is a countdown: running_reads is how many more status reads report
+        # it running; the read that brings it to zero still reports running,
+        # and the next one does not. capture_script_reads is the countdown a
+        # capture leaves behind once its last chunk has been delivered: on
+        # 12 November 2026 the capture script was still running for a short
+        # while after the host had the picture. script_reads maps a substring
+        # of a Lua script to the countdown that script starts, so a set_zoom
+        # can be made to keep running while the lens travels.
+        self.capture_script_reads = capture_script_reads
+        self.script_reads = dict(script_reads or {})
+        # The same, for a script whose RET message is posted at once and
+        # which goes on running afterwards: a host that returns on the RET
+        # finds it still running.
+        self.script_reads_after_return = dict(script_reads_after_return or {})
+        self.running_reads = 0
+        self.running_script = None
+        self.status_reads = 0
+        # Every script that reached the body, in order: its text (or
+        # "<capture>" and "switch_mode_usb(...)" for the two the library
+        # sends itself), the ExecuteScript flags when the backend sent it
+        # (None when the library did), and whether a script was running when
+        # it arrived. With strict_scripts, a script arriving over a running
+        # one raises ScriptSentWhileRunning instead of being recorded.
+        self.scripts = []
+        self.strict_scripts = strict_scripts
+        self.messages = []
+        self._pending_message = None
+        self._next_script_id = 1
+        # Remote capture, chunk by chunk. Each chunk is (bytes, more,
+        # position) as PTP_CHDK_RemoteCaptureGetData describes it: more is
+        # False on the chunk the camera flags last, and position is the seek
+        # (-1 for none). shot_chunks holds one chunk list per shot; when it is
+        # used up, a shot is the whole of `image` in one chunk. The fake's
+        # shoot assembles a picture the way pychdk 0.1.3's
+        # remote_capture_get_data does: it stops at the first chunk flagged
+        # last, zero-fills anything a seek skips over, and leaves the chunks
+        # after that one ready on the camera, where the next shot picks them
+        # up first. ready_chunks is what the camera still offers;
+        # discarded_chunks what a drain read and threw away. always_ready is
+        # a camera that never stops offering data.
+        self.shot_chunks = [list(chunks) for chunks in (shot_chunks or [])]
+        self.ready_chunks = []
+        self.discarded_chunks = []
+        self.always_ready = always_ready
+        self.last_chunks = 0
+        self.last_shot_chunks = []
         # what happened to it
         self.opens = 0
         self.closes = 0
@@ -198,6 +397,9 @@ class Body:
         self.max_live = 0
         self._live_lock = threading.Lock()
         self.gates = {}
+        # The hub ports pyusb reports from the root hub to this body's
+        # socket, as usb.core.Device.port_numbers; None where pyusb cannot say.
+        self.port_numbers = port_numbers
 
     def gate(self, name):
         """Pause the next call to `name` on this body until it is released."""
@@ -209,6 +411,160 @@ class Body:
         gate = self.gates.pop(name, None)
         if gate is not None:
             gate.arrive()
+
+    def _script_arrives(self, script, flags):
+        """Record a script reaching the camera; refuse one sent over another."""
+        running = self.running_reads > 0
+        if running and self.strict_scripts:
+            raise ScriptSentWhileRunning(
+                f"{script!r} was sent while {self.running_script!r} was still "
+                "running on the camera"
+            )
+        self.scripts.append(
+            {"script": script, "flags": flags, "while_running": running}
+        )
+
+    def _start_running(self, script, reads, message=None):
+        """Leave a script running for `reads` status reads, then post `message`."""
+        if reads > 0:
+            self.running_reads = reads
+            self.running_script = script
+            self._pending_message = message
+        elif message is not None:
+            self.messages.append(message)
+
+    def _status(self):
+        """One ScriptStatus read: (running, has_messages)."""
+        self.status_reads += 1
+        running = self.running_reads > 0
+        if running:
+            self.running_reads -= 1
+            if self.running_reads == 0:
+                self.running_script = None
+                if self._pending_message is not None:
+                    self.messages.append(self._pending_message)
+                    self._pending_message = None
+        return running, bool(self.messages)
+
+    def _answer(self, lua_code):
+        """What a Lua script returns on this body; may raise a scripted error."""
+        code = lua_code.strip()
+        if code.startswith("press('shoot_half')"):
+            if self.focus_error is not None:
+                raise self.focus_error
+            if not self.aflock:
+                self.focus = self.af_distance
+            self.aflock = True
+            return None
+        match = re.fullmatch(r"set_aflock\(([01])\)", code)
+        if match:
+            self.aflock_calls += 1
+            if (
+                self.aflock_error is not None
+                and self.aflock_calls > self.aflock_error_after
+            ):
+                raise self.aflock_error
+            self.aflock = match.group(1) == "1"
+            return None
+        match = re.fullmatch(r"set_focus\((-?\d+)\)", code)
+        if match:
+            if self.set_focus_error is not None:
+                raise self.set_focus_error
+            if self.focus_follows:
+                self.focus = int(match.group(1))
+            return None
+        if "get_focus()" in lua_code:
+            if self.focus_answer is not _UNSET:
+                return self.focus_answer
+            return self.focus
+        if "get_zoom_steps" in lua_code:
+            return self.zoom_steps
+        if "get_zoom()" in lua_code:
+            return self.zoom
+        match = re.fullmatch(r"set_zoom\((-?\d+)\)", lua_code.strip())
+        if match:
+            if self.zoom_error is not None:
+                raise self.zoom_error
+            if self.zoom_lands is not None:
+                self.zoom = self.zoom_lands
+            elif self.zoom_follows:
+                self.zoom = int(match.group(1))
+            return None
+        if "os.date" in lua_code:
+            if self.clock_error is not None:
+                raise self.clock_error
+            if self.clock_garbage:
+                return "not a date"
+            camera = self._unit_now() + datetime.timedelta(
+                seconds=self.clock_offset_s
+            )
+            return camera.strftime("%Y-%m-%d %H:%M:%S")
+        match = re.fullmatch(
+            r"set_clock\((\d+), (\d+), (\d+), (\d+), (\d+), (\d+)\)",
+            lua_code.strip(),
+        )
+        if match:
+            if self.set_clock_error is not None:
+                raise self.set_clock_error
+            fields = tuple(int(g) for g in match.groups())
+            self.set_clocks.append(fields)
+            if not self.clock_ignores_set:
+                target = datetime.datetime(*fields)
+                self.clock_offset_s = (target - self._unit_now()).total_seconds()
+            return None
+        if 'click("shoot_half")' in lua_code:
+            self.half_presses += 1
+            if self.half_press_arrives:
+                self._reads_until_record = self.half_press_reads
+            return None
+        if "get_mode" in lua_code:
+            if self._reads_until_record is not None:
+                if self._reads_until_record == 0:
+                    self._reads_until_record = None
+                    self.mode_value = True
+                else:
+                    self._reads_until_record -= 1
+            return self.mode_value
+        return None
+
+    def _unit_now(self):
+        """The unit's local time as the test has set it."""
+        return self.pychdk_module.unit_time
+
+    def _reads_for(self, lua_code):
+        for fragment, reads in self.script_reads.items():
+            if fragment in lua_code:
+                return reads
+        return 0
+
+    def _take_picture(self):
+        """Assemble one shot the way pychdk 0.1.3 does, and leave the rest ready."""
+        if self.shot_chunks:
+            planned = self.shot_chunks.pop(0)
+        elif self.image:
+            planned = [(self.image, False, -1)]
+        else:
+            planned = []
+        chunks = self.ready_chunks + planned
+        self.ready_chunks = []
+        picture = bytearray()
+        cursor = 0
+        used = []
+        for number, (data, more, position) in enumerate(chunks):
+            used.append((len(data), more, position))
+            if position >= 0:
+                cursor = position
+            end = cursor + len(data)
+            if len(picture) < end:
+                picture.extend(bytes(end - len(picture)))
+            picture[cursor:end] = data
+            cursor = end
+            if not more:
+                self.ready_chunks = chunks[number + 1:]
+                break
+        self.last_chunks = len(used)
+        self.last_shot_chunks = used
+        return bytes(picture)
 
     def _opened(self):
         with self._live_lock:
@@ -236,6 +592,14 @@ class _FakeUsbDevice:
             raise self._body.product_error
         return self._body.product
 
+    @property
+    def bus(self):
+        return self._body.bus
+
+    @property
+    def port_numbers(self):
+        return self._body.port_numbers
+
 
 class _FakeChdkPTP:
     """Stands in for ChdkDevice._chdk, which is where get_display_data lives."""
@@ -249,6 +613,66 @@ class _FakeChdkPTP:
         if self._body.version_error is not None:
             raise self._body.version_error
         return (2, 9)
+
+    @property
+    def last_capture_chunks(self):
+        """pychdk 0.1.3 keeps only the count of the last capture's chunks."""
+        return self._body.last_chunks
+
+    def get_script_status(self):
+        return self._body._status()
+
+    def read_script_message(self):
+        if self._body.messages:
+            return self._body.messages.pop(0)
+        return ScriptMessage(MSG_NONE, 1, 0, None)
+
+    def drain_messages(self):
+        self._body.messages.clear()
+
+    def execute_script(self, script, language=0, flags=0):
+        """Start a script. A Lua `return` posts a RET message when it ends."""
+        body = self._body
+        body._script_arrives(script, flags)
+        body.lua_calls.append(script)
+        body.events.append(("lua", script))
+        if body.lua_error is not None:
+            raise body.lua_error
+        value = body._answer(script)
+        script_id = body._next_script_id
+        body._next_script_id += 1
+        message = (
+            ScriptMessage(MSG_RET, 0, script_id, value)
+            if re.search(r"\breturn\b", script) else None
+        )
+        after = next(
+            (reads for fragment, reads in body.script_reads_after_return.items()
+             if fragment in script),
+            0,
+        )
+        if after:
+            if message is not None:
+                body.messages.append(message)
+            body._start_running(script, after)
+        else:
+            body._start_running(script, body._reads_for(script), message)
+        return script_id
+
+    def remote_capture_is_ready(self):
+        if self._body.always_ready or self._body.ready_chunks:
+            return True, 0x01
+        return False, 0
+
+    def remote_capture_get_chunk(self, format_flag):
+        body = self._body
+        if body.ready_chunks:
+            chunk = body.ready_chunks.pop(0)
+        elif body.always_ready:
+            chunk = (b"\x00" * 16, True, -1)
+        else:
+            raise PTPError(0x2002, "no remote capture data")
+        body.discarded_chunks.append((len(chunk[0]), chunk[1], chunk[2]))
+        return chunk
 
     def get_display_data(self, flags=0):
         self._body.frames_served += 1
@@ -274,8 +698,16 @@ class FakeChdkDevice:
     def is_connected(self):
         return self._connected
 
+    @property
+    def last_capture_chunks(self):
+        return self._chdk.last_capture_chunks
+
     def switch_mode(self, mode):
+        self._body._script_arrives(
+            f"switch_mode_usb({1 if mode == 'record' else 0})", None
+        )
         self._body.mode_switches.append(mode)
+        self._body.events.append(("switch", mode))
         self._body._pass("switch_mode")
         if self._body.mode_error is not None:
             raise self._body.mode_error
@@ -293,12 +725,14 @@ class FakeChdkDevice:
         self._body.mode_value = mode == "record"
 
     def lua_execute(self, lua_code, do_return=True, timeout=10.0):
+        """pychdk's lua_execute: one script, waited on until it returns."""
+        self._body._script_arrives(lua_code, None)
         self._body.lua_calls.append(lua_code)
+        self._body.lua_timeouts.append(timeout)
+        self._body.events.append(("lua", lua_code))
         if self._body.lua_error is not None:
             raise self._body.lua_error
-        if "get_mode" in lua_code:
-            return self._body.mode_value
-        return None
+        return self._body._answer(lua_code)
 
     def download_file(self, remote_path):
         self._body._pass("download")
@@ -316,12 +750,33 @@ class FakeChdkDevice:
         self._body.uploads.append((remote_path, payload))
         self._body.card = payload
 
-    def shoot(self, **kwargs):
+    def shoot(self, shutter_speed=_UNSET, market_iso=_UNSET, dng=_UNSET,
+              stream=_UNSET, jpeg=_UNSET):
+        """pychdk's shoot(stream=True): it sends the capture script itself.
+
+        The signature is the library's from the release that added jpeg.
+        Only the arguments the caller passed are recorded in shots. With
+        dng and jpeg it returns a DngCapture of the body's DNG and the JPEG
+        assembled as for a JPEG-only shot; with dng alone, the DNG.
+        """
+        kwargs = {
+            name: value for name, value in (
+                ("shutter_speed", shutter_speed), ("market_iso", market_iso),
+                ("dng", dng), ("stream", stream), ("jpeg", jpeg),
+            ) if value is not _UNSET
+        }
+        self._body._script_arrives("<capture>", None)
         self._body.shots.append(kwargs)
         self._body._pass("shoot")
         if self._body.shoot_error is not None:
             raise self._body.shoot_error
-        return self._body.image
+        picture = self._body._take_picture()
+        self._body._start_running("<capture>", self._body.capture_script_reads)
+        if kwargs.get("dng"):
+            if kwargs.get("jpeg"):
+                return DngCapture(dng=self._body.dng, jpeg=picture)
+            return self._body.dng
+        return picture
 
     def close(self):
         self._connected = False
@@ -330,10 +785,22 @@ class FakeChdkDevice:
         self._body._closed()
 
 
+class FakeChdkDevice013(FakeChdkDevice):
+    """A device from the pinned pychdk 0.1.3, whose shoot() takes no jpeg."""
+
+    def shoot(self, shutter_speed=_UNSET, market_iso=_UNSET, dng=_UNSET,
+              stream=_UNSET):
+        return super().shoot(
+            shutter_speed=shutter_speed, market_iso=market_iso, dng=dng,
+            stream=stream,
+        )
+
+
 class FakePychdk:
     """The module object the backend is given in place of pychdk."""
 
     PTPError = PTPError
+    DngError = DngError
     DeviceInfo = DeviceInfo
     parse_own_txt = staticmethod(parse_own_txt)
     format_own_txt = staticmethod(format_own_txt)
@@ -343,6 +810,7 @@ class FakePychdk:
         self.list_calls = 0
         self.list_error = None
         self.list_gate = None
+        self.presence_calls = 0
 
     def gate_list(self):
         """Pause the next bus scan, which holds the backend's layout lock."""
@@ -365,7 +833,7 @@ class FakePychdk:
         return [
             DeviceInfo(
                 vendor_id=0x04A9,
-                product_id=0x325B,
+                product_id=body.product_id,
                 bus_num=body.bus,
                 device_num=body.address,
                 serial_num=body.serial,
@@ -373,8 +841,23 @@ class FakePychdk:
             for body in self.bodies
         ]
 
+    def attached_keys(self):
+        """The presence scan: (bus, address) of every attached body.
+
+        It stands for a read of the USB descriptors the host already holds,
+        so nothing is recorded on any body.
+        """
+        self.presence_calls += 1
+        return [body.key for body in self.bodies]
+
     def ChdkDevice(self, device_info, _usb_device=None):
         body = self.by_key((device_info.bus_num, device_info.device_num))
+        body.pychdk_module = self
+        body.open_attempts += 1
+        if body.open_error is not None:
+            raise body.open_error
+        if body.old_library:
+            return FakeChdkDevice013(device_info, body)
         return FakeChdkDevice(device_info, body)
 
 
@@ -476,20 +959,136 @@ def park_at_lock(backend, camera_index):
     return held
 
 
+class BusyLock:
+    """A body's lock that another thread is holding.
+
+    A non-blocking acquire fails, as it would while a capture holds the
+    body. A blocking acquire fails the test: it is a thread about to wait on
+    a body it was meant to skip.
+    """
+
+    def __init__(self):
+        self.attempts = []
+
+    def acquire(self, blocking=True, timeout=-1):
+        self.attempts.append(blocking)
+        if blocking:
+            raise AssertionError("waited on a body lock another thread holds")
+        return False
+
+    def release(self):
+        raise AssertionError("released a body lock that was never acquired")
+
+    def __enter__(self):
+        self.acquire()
+        return self
+
+    def __exit__(self, *args):
+        self.release()
+
+
+class NotStartedThread:
+    """What make_backend's _start_thread returns: a thread that never ran.
+
+    The keep-alive loop is driven by the tests themselves, through
+    _keepalive_loop and _keepalive_tick, so no real thread outlives a test.
+    join records the bound it was given.
+    """
+
+    def __init__(self, target, name):
+        self.target = target
+        self.name = name
+        self.joins = []
+
+    def join(self, timeout=None):
+        self.joins.append(timeout)
+
+    def is_alive(self):
+        return False
+
+
+class ScriptedStop:
+    """Stands in for the keep-alive's stop event.
+
+    wait() answers False - keep going - `ticks` times and True after that,
+    and records each timeout it was given.
+    """
+
+    def __init__(self, ticks):
+        self.ticks = ticks
+        self.waits = []
+        self._set = False
+
+    def wait(self, timeout=None):
+        self.waits.append(timeout)
+        if self._set or len(self.waits) > self.ticks:
+            return True
+        return False
+
+    def set(self):
+        self._set = True
+
+    def is_set(self):
+        return self._set
+
+
 def make_pychdk(*bodies):
     """Build the fake module for these bodies, in the USB order given."""
     return FakePychdk(bodies)
 
 
-def make_backend(monkeypatch, fake, logger_name="test-chdk"):
-    """Install the fake and return a ChdkBackend built on it."""
+def make_backend(monkeypatch, fake, logger_name="test-chdk", registry=None):
+    """Install the fake and return a ChdkBackend built on it.
+
+    The backend reads and writes stored zoom steps through its
+    _registry_factory. A test that passes no registry gets a backend with
+    none, so nothing is read from or written to a real cameras.json; a test
+    about stored steps passes a CameraRegistry on a temporary path.
+    """
     import logging
 
     import capture.backends.chdk_backend as cb
 
     monkeypatch.setattr(cb, "pychdk", fake)
     monkeypatch.setattr(cb, "_PYCHDK_AVAILABLE", True)
-    return cb.ChdkBackend(logging.getLogger(logger_name))
+    # The backend waits through its module's _sleep and reads time through
+    # its _monotonic; the tests record the waits on the fake instead of
+    # spending them, and a wait moves the fake's clock on by its length.
+    # fake.advance moves the clock without a wait.
+    fake.sleeps = []
+    fake.now = 1000.0
+    # The unit's local time, which the backend reads through its _now. It
+    # stays where it is until a test changes it.
+    fake.unit_time = datetime.datetime(2026, 11, 12, 15, 30, 0)
+
+    def sleep(seconds):
+        fake.sleeps.append(seconds)
+        fake.now += seconds
+
+    def advance(seconds):
+        fake.now += seconds
+
+    fake.advance = advance
+    monkeypatch.setattr(cb, "_sleep", sleep)
+    monkeypatch.setattr(cb, "_monotonic", lambda: fake.now)
+    monkeypatch.setattr(cb, "_now", lambda: fake.unit_time)
+    # The backend starts its keep-alive thread through _start_thread. No
+    # real thread is started here: fake.threads records what would have
+    # run, and a test drives the loop itself.
+    fake.threads = []
+
+    def start_thread(target, name):
+        thread = NotStartedThread(target, name)
+        fake.threads.append(thread)
+        return thread
+
+    monkeypatch.setattr(cb, "_start_thread", start_thread)
+    backend = cb.ChdkBackend(logging.getLogger(logger_name))
+    backend._registry_factory = lambda: registry
+    # The keep-alive's presence scan reads USB descriptors through pyusb; the
+    # fake answers it from its scripted bodies.
+    backend._presence_scan = fake.attached_keys
+    return backend
 
 
 def viewport_frame(

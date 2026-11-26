@@ -47,29 +47,21 @@ Test: Open your browser and navigate to `http://localhost:8000` to see the healt
 
 ## Camera Backend Configuration
 
-The capture service supports two camera backends:
+The capture service has four camera drivers:
 
-### Picamera2 Backend (Default)
-- Uses official `picamera2` Python library
-- **91.5% faster** than subprocess backend
-- Supports streaming and live preview
-- Enables dynamic settings adjustment
+- `picamera2`: Pi cameras, through the `picamera2` library. Streaming, live preview and settings that change while it runs.
+- `subprocess`: Pi cameras, through the `rpicam-still` command. A fallback for a unit where `picamera2` does not load.
+- `gphoto2`: Canon DSLRs.
+- `chdk`: Canon PowerShot A2500 bodies running CHDK.
 
-### Subprocess Backend (Fallback)
-- Uses `rpicam-still` command-line tool
-- Stable and process-isolated
-- Works out of the box
+**Which one a unit uses.** At start-up the backend settles the kind in this order: the choice an administrator stored with `PUT /system/camera-kind`; `CAMERA_BACKEND` in the environment or `.env`; the cameras that are connected; the last kind it used; `picamera2`. A unit with its cameras connected needs no setting.
 
-**Switch backends:**
-```bash
-export CAMERA_BACKEND=picamera2  # Use picamera2 (default)
-export CAMERA_BACKEND=subprocess # Use subprocess (fallback)
+To set it by hand, add the line to `.env` and restart the service:
+```
+CAMERA_BACKEND=gphoto2
 ```
 
-Or add to `.env` file:
-```
-CAMERA_BACKEND=picamera2
-```
+`GET /system/camera-kind` reports the kind in effect, why it was chosen, what is connected and which drivers the unit has.
 
 See [capture/BACKEND_SWITCHING.md](capture/BACKEND_SWITCHING.md) for detailed comparison.
 
@@ -90,7 +82,7 @@ python -m pytest tests/test_cameras.py -m camera
 
 **Issue: Camera not detected**
 - Verify hardware connection: `rpicam-hello --list-cameras`
-- Check device setup: See [docs/developers/device_setup_pi5_imx519.qmd](../docs/developers/device_setup_pi5_imx519.qmd)
+- Check device setup: see the [Pi 5 and IMX519 guide](https://captua.org/docs/deployment/pi5-imx519/)
 
 **Issue: Picamera2 backend fails**
 - Fall back to subprocess: `export CAMERA_BACKEND=subprocess`

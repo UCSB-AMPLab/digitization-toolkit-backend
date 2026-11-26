@@ -15,7 +15,7 @@ number. The callers turn its CaptureNameRefused into a 409 carrying the
 exception's fixed text, after rolling back, so a refused event consumes no
 number.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 import logging
 import os
@@ -223,6 +223,10 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
     the offsite keys are each read once per call. The contract allows
     gaps in <nnnn> and forbids reuse.
 
+    Into a testing volume, the event sets testing_expires_at on the volume
+    and every ancestor to now plus the term (testing_space.refresh_expiry),
+    in the same transaction.
+
     Raises CaptureNameRefused, leaving the rollback to the caller, when the
     counter would pass MAX_CAPTURE_NUMBER (including while passing over
     taken numbers), or when more than MAX_NUMBERS_PASSED_OVER numbers in a
@@ -242,6 +246,10 @@ def take_filename_index(db: Session, collection_id: int, stem: str, output_dir: 
             raise CaptureNameRefused(CAPTURE_LIMIT_DETAIL)
         index = capture_filename_index(stem, number)
         if number not in in_manifest and number not in offsite and not capture_name_taken(output_dir, index):
+            # A capture event or an upload into a testing volume keeps it, and
+            # every ancestor, for another term (app.core.testing_space).
+            from app.core.testing_space import refresh_expiry
+            refresh_expiry(db, collection_id)
             return index
         logger.warning(f"Capture number {number} of collection {collection_id} is already on disk, in the manifest or offsite ({index}); taking the next")
     raise CaptureNameRefused(CAPTURE_NUMBERS_TAKEN_DETAIL)

@@ -6,7 +6,7 @@ Modelled on test_rescan_route.py: a fake backend stands in for the process
 singleton; the registry itself is a real CameraRegistry pointed at a fresh
 file through the client fixture's projects-root override.
 
-Version: 0.1.0-beta
+Version: 0.3.0
 """
 
 import capture.service as capture_service
@@ -111,7 +111,10 @@ def test_operator_can_set_orientation_and_it_is_saved_and_reported(client, monke
     assert resp.status_code == 200, resp.text
     devices_by_index = {d["index"]: d for d in resp.json()}
     assert devices_by_index[1]["orientation"] == 270
-    assert devices_by_index[0]["orientation"] is None
+    assert devices_by_index[1]["orientation_saved"] is True
+    # Never set: the default, reported as an integer, marked as not saved.
+    assert devices_by_index[0]["orientation"] == 90
+    assert devices_by_index[0]["orientation_saved"] is False
 
 
 @pytest.mark.unit
