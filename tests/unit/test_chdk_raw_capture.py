@@ -518,6 +518,9 @@ def installed(monkeypatch, override_projects_root):
     backend, _ = _backend(monkeypatch, body)
     monkeypatch.setattr(capture_service, "get_backend", lambda: backend)
     monkeypatch.setattr(capture_service, "_backend", backend)
+    # The cameras' pages are taken as set: test_capture_refusals_set_up.py covers that refusal.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed", lambda: None)
     return backend, body
 
 

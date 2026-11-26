@@ -1322,6 +1322,9 @@ def test_a_dual_capture_through_the_route_gives_each_body_its_own_format(
         lambda camera_index, resolution="high", registry=None: (
             {"camera_index": camera_index, "rotate_deg": 0}, "hw"),
     )
+    # The cameras' pages are taken as set: test_capture_refusals_set_up.py covers that refusal.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed", lambda: None)
     api = _installed(client, monkeypatch, backend)
 
     resp = api.post("/cameras/capture/dual", json={

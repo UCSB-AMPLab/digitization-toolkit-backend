@@ -91,6 +91,10 @@ class _RawBackend:
             preview_sidecar_of(out).write_bytes(_jpeg(out.name))
         return out, None
 
+    def list_devices(self):
+        """No body rows: the capture routes' camera set-up check finds nothing to set up."""
+        return []
+
 
 @pytest.fixture
 def rotate():
