@@ -104,7 +104,7 @@ def test_the_steps_are_read_once_on_entering_record_mode(monkeypatch, tmp_path):
     assert held.zoom_steps == 64
     assert held.zoom_step == 5
     # The steps are read after record mode is confirmed.
-    assert body.lua_calls.index(GET_STEPS) > body.lua_calls.index("return get_mode()")
+    assert body.lua_calls.index(GET_STEPS) > body.lua_calls.index(cb._MODE_LUA)
     assert _zoom_calls(body) == []
 
 

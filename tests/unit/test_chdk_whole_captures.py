@@ -335,7 +335,7 @@ def test_every_script_the_backend_sends_carries_nokill(monkeypatch, tmp_path):
     backend.set_zoom_step(0, 5)
 
     sent = _backend_scripts(body)
-    assert [s["script"] for s in sent][:2] == [ENTER_ALT, "return get_mode()"]
+    assert [s["script"] for s in sent][:2] == [ENTER_ALT, cb._MODE_LUA]
     assert all(s["flags"] & cb._SCRIPT_NOKILL for s in sent)
     library = [s["script"] for s in body.scripts if s["flags"] is None]
     assert library == ["switch_mode_usb(1)", "<capture>"]

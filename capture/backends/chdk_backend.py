@@ -327,6 +327,10 @@ _ALT_REASSERT_INTERVAL_S = 30.0
 # whether this keep-alive prevents it has not been measured.
 _KEEPALIVE_INTERVAL_S = 60.0
 _KEEPALIVE_LUA = "return (get_mode())"
+# The one-value read that confirms the switch to record mode. It is a separate
+# script from the keep-alive read, and the trailing semicolon keeps the two
+# distinguishable on the wire and in logs.
+_MODE_LUA = "return (get_mode());"
 # How long cleanup waits for the keep-alive thread to end. A tick in progress
 # finishes the read it is on, which takes at most _SCRIPT_END_WAIT_S for a
 # running script and _LUA_TIMEOUT_S for the read, and sends nothing after the
@@ -2753,7 +2757,7 @@ class ChdkBackend(CameraBackend):
             not_arrived = exc
         else:
             not_arrived = None
-            if self._send_lua(body, "return get_mode()"):
+            if self._send_lua(body, _MODE_LUA):
                 body.in_record_mode = True
                 self.logger.info(f"[chdk] {body.port}: switched to record mode")
                 self._settle_opened_body(body, restore_focus)
@@ -2765,7 +2769,7 @@ class ChdkBackend(CameraBackend):
         while waited < _RECORD_MODE_HALF_PRESS_WAIT_S:
             _sleep(_RECORD_MODE_POLL_INTERVAL_S)
             waited += _RECORD_MODE_POLL_INTERVAL_S
-            if self._send_lua(body, "return get_mode()"):
+            if self._send_lua(body, _MODE_LUA):
                 body.in_record_mode = True
                 self.logger.info(
                     f"[chdk] {body.port}: switched to record mode after a "

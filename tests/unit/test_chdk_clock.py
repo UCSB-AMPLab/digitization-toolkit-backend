@@ -82,7 +82,7 @@ def test_the_clock_is_read_after_record_mode_and_zoom(monkeypatch, tmp_path):
 
     calls = body.lua_calls
     read = next(i for i, c in enumerate(calls) if "os.date" in c)
-    assert read > calls.index("return get_mode()")
+    assert read > calls.index(cb._MODE_LUA)
     assert read > calls.index("return get_zoom()")
 
 
