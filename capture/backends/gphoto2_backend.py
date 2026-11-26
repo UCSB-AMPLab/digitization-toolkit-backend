@@ -1433,6 +1433,11 @@ class GPhoto2Backend(CameraBackend):
         # the serials seeded from the bindings file, until the first complete
         # identification settles whether any of those bodies is still here
         self._seeded_serials: set[str] = set()
+        # the indices a rescan has emptied and the serials it has unpinned in
+        # this process; a save that merges an unread bindings file never
+        # restores a pin on one of them (see _save_pins)
+        self._released_indexes: set[int] = set()
+        self._released_serials: set[str] = set()
         # usb port -> body serial, as last read on that port
         self._serial_by_port: dict[str, str] = {}
         # A role belongs to the last identity read on this published port.
@@ -1608,22 +1613,29 @@ class GPhoto2Backend(CameraBackend):
                 snapshot = {
                     str(index): serial for index, serial in self._pins.items()
                 }
+                released_indexes = set(getattr(self, "_released_indexes", ()))
+                released_serials = set(getattr(self, "_released_serials", ()))
             if getattr(self, "_bindings_unread", False):
                 # This backend never read the file (the root could not take
                 # writes when it started), so its pins were seeded from
                 # nothing. The file is read now, under the same lock, and its
-                # pins kept wherever neither the index nor the body is one of
-                # this backend's: the current pins win, and the operator's
-                # bindings for the rest are not overwritten. The pins in
-                # memory are left as they are.
+                # pins kept wherever neither the index nor the body is, or has
+                # been released from, one of this backend's: the current pins
+                # win, a pin a rescan dropped stays dropped, and the
+                # operator's bindings for the rest are not overwritten. The
+                # pins in memory are left as they are.
                 try:
                     on_disk = self._parse_bindings(path) if path.exists() else {}
                 except Exception as exc:
                     self.logger.warning(f"[gphoto2] {path} is unreadable ({exc}); not merged")
                     on_disk = {}
-                taken = set(snapshot.values())
+                taken = set(snapshot.values()) | released_serials
                 for index, serial in on_disk.items():
-                    if str(index) not in snapshot and serial not in taken:
+                    if (
+                        str(index) not in snapshot
+                        and index not in released_indexes
+                        and serial not in taken
+                    ):
                         snapshot[str(index)] = serial
                         taken.add(serial)
                 snapshot = dict(sorted(snapshot.items(), key=lambda kv: int(kv[0])))
@@ -2034,6 +2046,7 @@ class GPhoto2Backend(CameraBackend):
             if not parked or not free:
                 return
             self._pins[free[0]] = self._pins.pop(parked[0])
+            self._released_indexes.add(parked[0])
 
     def _get_camera_lock(self, camera_index: int) -> threading.Lock:
         with self._map_lock:
@@ -3072,8 +3085,10 @@ class GPhoto2Backend(CameraBackend):
                     dropped = {
                         i: s for i, s in self._pins.items() if s not in present
                     }
-                    for index in dropped:
+                    for index, serial in dropped.items():
                         del self._pins[index]
+                        self._released_indexes.add(index)
+                        self._released_serials.add(serial)
                     if dropped:
                         self.logger.info(
                             f"[gphoto2] rescan: dropped pins {dropped} for "
