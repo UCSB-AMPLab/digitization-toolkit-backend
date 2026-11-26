@@ -109,6 +109,8 @@ SHOT_NOT_FOUND = "colour_card_shot_not_found"
 SHOT_NOT_FOUND_MESSAGE = "This volume has no such colour card shot."
 NO_PREVIEW = "colour_card_no_preview"
 NO_PREVIEW_MESSAGE = "This colour card shot has no image a browser can show."
+PENDING = "colour_card_pending"
+PENDING_MESSAGE = "This volume's colour card shots come before its pages. Take them or skip them, then capture."
 
 
 def refusal(status: int, code: str, message: str, **extra) -> HTTPException:
@@ -257,6 +259,22 @@ def needed(db: Session, volume, *, read_cameras: bool, setting: Optional[bool] =
     if unknown:
         return None, None
     return False, None
+
+
+def refuse_page_while_pending(db: Session, volume) -> None:
+    """409 colour_card_pending while the volume is asked for a set at its start or once after being begun without one.
+
+    The page capture routes call it for a new page, an insert included, and
+    never for a retake. needed() is asked with read_cameras false, so no
+    camera is read: `start` and `begun_without` are decided from the
+    database alone, `settings_changed` (which CHDK's held zoom step can
+    still give) stays a request the capture screen makes, and an unknown
+    answer (None, a gphoto2 volume that has a set) refuses nothing. The
+    detail carries the reason.
+    """
+    is_needed, reason = needed(db, volume, read_cameras=False)
+    if is_needed and reason in (START, BEGUN_WITHOUT):
+        raise refusal(409, PENDING, PENDING_MESSAGE, reason=reason)
 
 
 def _exif_settings(path: Path) -> dict:

@@ -264,6 +264,10 @@ def test_the_capture_route_writes_the_thumbnail_into_the_volume_thumbnails(
             preview_sidecar_of(out).write_bytes(jpeg.getvalue())
             return out, None
 
+        def list_devices(self):
+            """No body rows: the capture routes' camera set-up check finds nothing to set up."""
+            return []
+
     monkeypatch.setattr(service, "get_backend", lambda: Backend())
     monkeypatch.setattr(service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(project_manager_module, "default_camera_config_from_registry",

@@ -54,6 +54,9 @@ def _install_capture_fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "single_capture_image", fake_single)
     monkeypatch.setattr(capture_service, "dual_capture_image", fake_dual)
+    # The cameras' pages are taken as set: test_capture_refusals_set_up.py covers that refusal.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed", lambda: None)
     monkeypatch.setattr(project_manager_module,
                         "default_camera_config_from_registry", fake_config)
 
@@ -221,6 +224,10 @@ def test_a_record_in_review_or_approved_is_not_retaken(client, db_session, test_
     calls = []
     monkeypatch.setattr(capture_service, "single_capture_image", lambda *a, **k: calls.append("single"))
     monkeypatch.setattr(capture_service, "dual_capture_image", lambda *a, **k: calls.append("dual"))
+    # The set-up check's camera listing is a camera call too.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed",
+                        lambda: calls.append("camera_list"))
     rec, old = _record_with_image(db_session, volume, status, capture_mode=mode)
     api = _client_as(client, "op", "operator")
 

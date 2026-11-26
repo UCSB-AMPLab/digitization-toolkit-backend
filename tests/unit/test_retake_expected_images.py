@@ -50,6 +50,11 @@ def _install_capture_fakes(monkeypatch, tmp_path):
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "single_capture_image", fake_single)
     monkeypatch.setattr(capture_service, "dual_capture_image", fake_dual)
+    # The cameras' pages are taken as set: test_capture_refusals_set_up.py covers that refusal.
+    # Its camera listing is noted as a camera call, so "nothing is captured" covers it too.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed",
+                        lambda: calls.append("camera_list"))
     monkeypatch.setattr(project_manager_module,
                         "default_camera_config_from_registry", fake_config)
     return calls
@@ -115,7 +120,7 @@ def test_the_current_images_named_retakes(client, db_session, test_project, volu
                    expected_image_ids=list(reversed(ids)))
 
     assert resp.status_code == 200, resp.text
-    assert calls == [mode]
+    assert calls == ["camera_list", mode]
     assert set(_current_ids(db_session, rec.id)).isdisjoint(ids)
 
 
@@ -179,7 +184,7 @@ def test_without_the_field_a_retake_is_as_before(client, db_session, test_projec
     resp = _retake(api, test_project.name, mode, collection_id=volume.id, record_id=rec.id)
 
     assert resp.status_code == 200, resp.text
-    assert calls == [mode]
+    assert calls == ["camera_list", mode]
 
 
 @pytest.mark.unit

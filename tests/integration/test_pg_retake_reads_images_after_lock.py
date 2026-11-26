@@ -131,6 +131,11 @@ def _install_app(monkeypatch, tmp_path, Session):
         username="op", email="op@example.com", hashed_password="x", role="admin", is_active=True)
     monkeypatch.setattr(capture_service, "is_camera_connected", lambda idx: True)
     monkeypatch.setattr(capture_service, "single_capture_image", fake_single)
+    # The cameras' pages are taken as set: tests/unit/test_capture_refusals_set_up.py covers that refusal.
+    # Its camera listing is noted as a camera call, so "no camera touched" covers it too.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed",
+                        lambda: calls.append("camera_list"))
     monkeypatch.setattr(project_manager_module, "default_camera_config_from_registry",
                         lambda camera_index, resolution="high", registry=None:
                         ({"camera_index": camera_index, "rotate_deg": 0}, "hw"))

@@ -66,6 +66,11 @@ def camera_calls(monkeypatch, tmp_path):
     monkeypatch.setattr(capture_service, "is_camera_connected", fake_connected)
     monkeypatch.setattr(capture_service, "single_capture_image", fake_single)
     monkeypatch.setattr(capture_service, "dual_capture_image", fake_dual)
+    # The cameras' pages are taken as set: test_capture_refusals_set_up.py covers that refusal.
+    # Its camera listing is noted as a camera call, so "no camera touched" covers it too.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed",
+                        lambda: calls.append(("camera_list",)))
     monkeypatch.setattr(project_manager_module,
                         "default_camera_config_from_registry", fake_config)
     return calls

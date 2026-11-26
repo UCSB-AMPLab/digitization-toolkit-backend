@@ -59,6 +59,10 @@ class _MultiFormatBackend:
         raw.write_bytes(RAW_BYTES)
         return (str(jpeg), str(raw)), {"SensorTimestamp": 1}
 
+    def list_devices(self):
+        """No body rows: the capture routes' camera set-up check finds nothing to set up."""
+        return []
+
 
 @pytest.fixture
 def backend(monkeypatch):

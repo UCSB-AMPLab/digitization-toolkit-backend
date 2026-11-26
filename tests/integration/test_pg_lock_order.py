@@ -126,6 +126,9 @@ def _install_app(monkeypatch, tmp_path, Session):
                         lambda project_name, camera_config, check_camera=False,
                         include_resolution=False, collection_name=None, **_kw:
                         (str(tmp_path / "cap.jpg"), "cap-1", None))
+    # The cameras' pages are taken as set: tests/unit/test_capture_refusals_set_up.py covers that refusal.
+    from app.api import cameras as cameras_api
+    monkeypatch.setattr(cameras_api, "_refuse_a_capture_while_camera_setup_is_needed", lambda: None)
     monkeypatch.setattr(project_manager_module, "default_camera_config_from_registry",
                         lambda camera_index, resolution="high", registry=None:
                         ({"camera_index": camera_index, "rotate_deg": 0}, "hw"))
