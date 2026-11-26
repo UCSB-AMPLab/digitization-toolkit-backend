@@ -1560,3 +1560,106 @@ def test_a_session_serial_that_contradicts_the_pins_leaves_the_row_out(
 
     assert "contradicts the pins" in caplog.text
     assert (0, HW_C) not in [(d["index"], d["hardware_id"]) for d in devices]
+
+
+# ----------------------------------------------------------------------
+# (t) a pin a rescan drops stays dropped when the file was unread at start
+# ----------------------------------------------------------------------
+
+class _Drive:
+    """The projects drive: no bindings path until it becomes available."""
+
+    def __init__(self, root):
+        self.root = root
+        self.available = False
+
+    def bindings_path(self):
+        return self.root / BINDINGS if self.available else None
+
+
+def _backend_on_an_unavailable_drive(monkeypatch, bindings_dir, results):
+    drive = _Drive(bindings_dir)
+    monkeypatch.setattr(
+        gb.GPhoto2Backend, "_bindings_path", lambda _self: drive.bindings_path()
+    )
+    backend, _claims, detector, _bodies, _cls = _backend_with(monkeypatch, results)
+    assert backend._bindings_unread
+    return backend, detector, drive
+
+
+def _restart_with(monkeypatch, results):
+    backend, _claims, _detector, _bodies, _cls = _backend_with(monkeypatch, results)
+    return backend
+
+
+def test_a_rescan_drop_survives_the_merge_with_a_file_from_the_last_run(
+    monkeypatch, bindings_dir
+):
+    """File {0: A, 1: B}; drive unavailable at start; autodetect: [A, B], then [A]
+    and a rescan once the drive is back; then a restart.
+    """
+    _write_bindings(bindings_dir, {"0": SERIAL_A, "1": SERIAL_B})
+    backend, detector, drive = _backend_on_an_unavailable_drive(
+        monkeypatch, bindings_dir, [(MODEL, PORT_A), (MODEL, PORT_B)]
+    )
+    backend.list_devices()
+    assert backend._pins == {0: SERIAL_A, 1: SERIAL_B}
+
+    drive.available = True
+    detector.results = [(MODEL, PORT_A)]   # B is unplugged
+    backend.rescan()
+
+    assert backend._pins == {0: SERIAL_A}
+    assert _read_bindings(bindings_dir)["pins"] == {"0": SERIAL_A}, (
+        "the pin the rescan dropped was merged back from the file"
+    )
+
+    restarted = _restart_with(monkeypatch, [(MODEL, PORT_A), (MODEL, PORT_C)])
+    assert restarted._pins == {0: SERIAL_A}, "B's pin came back after the restart"
+
+
+def test_a_rescan_drop_survives_the_merge_with_a_file_this_backend_wrote(
+    monkeypatch, bindings_dir
+):
+    """No file; drive unavailable at start; autodetect: [A]; the drive comes back;
+    [A, B]; then [A] and a rescan.
+    """
+    backend, detector, drive = _backend_on_an_unavailable_drive(
+        monkeypatch, bindings_dir, [(MODEL, PORT_A)]
+    )
+    backend.list_devices()
+    assert backend._pins == {0: SERIAL_A}
+
+    drive.available = True
+    detector.results = [(MODEL, PORT_A), (MODEL, PORT_B)]
+    backend._refresh_port_map()
+    backend.list_devices()
+    assert _read_bindings(bindings_dir)["pins"] == {"0": SERIAL_A, "1": SERIAL_B}
+
+    detector.results = [(MODEL, PORT_A)]   # B is unplugged
+    backend.rescan()
+
+    assert backend._pins == {0: SERIAL_A}
+    assert _read_bindings(bindings_dir)["pins"] == {"0": SERIAL_A}, (
+        "the pin the rescan dropped was merged back from the file"
+    )
+
+
+def test_the_merge_still_keeps_pins_this_backend_never_held(
+    monkeypatch, bindings_dir
+):
+    """File {0: A, 1: B, 3: D}; drive unavailable at start; autodetect: [A, B],
+    then [A] and a rescan once the drive is back. D at 3 was never this
+    backend's, so the merge keeps it.
+    """
+    _write_bindings(bindings_dir, {"0": SERIAL_A, "1": SERIAL_B, "3": SERIAL_D})
+    backend, detector, drive = _backend_on_an_unavailable_drive(
+        monkeypatch, bindings_dir, [(MODEL, PORT_A), (MODEL, PORT_B)]
+    )
+    backend.list_devices()
+
+    drive.available = True
+    detector.results = [(MODEL, PORT_A)]
+    backend.rescan()
+
+    assert _read_bindings(bindings_dir)["pins"] == {"0": SERIAL_A, "3": SERIAL_D}
