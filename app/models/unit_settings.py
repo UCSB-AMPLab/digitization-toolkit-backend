@@ -35,10 +35,16 @@
   first account, and by an administrator (PUT /system/unit).
 - `updated_at`, `updated_by`: the last change, and the username that made it
   (null for the unit itself).
+- `mode_set_at`, `mode_set_by`: when the current mode was stored, and the
+  username of the admin whose switch stored it (null for the mode the unit
+  wrote itself at start-up). They move only when the mode does
+  (app.core.unit_mode.change), never with another setting or a change that
+  repeats the current mode. Both null on a unit whose mode was stored before
+  they existed: nobody knows who set it.
 
 `id` is always 1 (check_unit_settings_single_row).
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 from datetime import datetime, timezone
@@ -83,6 +89,8 @@ class UnitSettings(Base):
     colour_card_shots = Column(Boolean, nullable=False, default=False, server_default=false())
     updated_at = Column(DateTime, nullable=False, default=_utcnow)
     updated_by = Column(String(150), nullable=True)
+    mode_set_at = Column(DateTime, nullable=True)
+    mode_set_by = Column(String(150), nullable=True)
 
     __table_args__ = (
         CheckConstraint(MODE_CHECK, name="check_unit_settings_mode"),

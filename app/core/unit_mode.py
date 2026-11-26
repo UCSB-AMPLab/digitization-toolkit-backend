@@ -56,6 +56,15 @@ PUT's `keptVolumes`): `include` releases them all with the switch, `keep`
 leaves them kept; without one the switch is refused
 (`kept_volumes_decision`). as_api lists them as `keptVolumes`.
 
+**Who set the mode** (NEH-373). The row records when the current mode was
+stored (mode_set_at) and the admin whose switch stored it (mode_set_by):
+change() writes both only when the stored mode changes, so another setting,
+or a change that repeats the current mode, leaves them as they are. The row
+written at start-up records the time and no username (the unit itself). A
+unit whose mode was stored before the columns existed holds null in both.
+In as_api as `modeSetBy` and `modeSetAt` (ISO 8601, UTC, with its offset),
+null when unknown.
+
 **Projects.** Shown only in `offline` mode with projects_enabled on; the
 setting is stored in any mode. While they are hidden every new volume goes
 into the unit's default project (default_project): the stored one, else
@@ -81,7 +90,7 @@ transaction), so a newly set-up unit asks. An administrator changes it
 (set_colour_card_shots); each change is logged
 `unit_colour_card_shots_changed`. In as_api as `colourCardShots`.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 from __future__ import annotations
@@ -198,12 +207,16 @@ def _row(db: Session, lock: bool = False):
     return query.first()
 
 
-def current(db: Session) -> UnitState:
-    """The stored settings, or, with no row yet, the inferred mode with projects off (nothing written)."""
-    row = _row(db)
+def _state(row) -> UnitState:
+    """The settings of `row`, or, for None, the inferred mode with projects off."""
     if row is None:
         return UnitState(inferred()[0], False, None)
     return UnitState(row.mode, bool(row.projects_enabled), row.default_project_id)
+
+
+def current(db: Session) -> UnitState:
+    """The stored settings, or, with no row yet, the inferred mode with projects off (nothing written)."""
+    return _state(_row(db))
 
 
 def mode(db: Session) -> str:
@@ -275,9 +288,25 @@ def prerequisites() -> dict:
     return {BACKUP: backup, FISQUA: fisqua}
 
 
+def _iso_utc(value: Optional[datetime]) -> Optional[str]:
+    """A stored naive UTC time as ISO 8601 with its offset (`+00:00`), or None."""
+    if value is None:
+        return None
+    if value.tzinfo is None:
+        value = value.replace(tzinfo=timezone.utc)
+    return value.astimezone(timezone.utc).isoformat(timespec="seconds")
+
+
 def as_api(db: Session) -> dict:
-    """The GET /system/unit body."""
-    state = current(db)
+    """The GET /system/unit body.
+
+    The mode, the projects setting and who set the mode come from one read
+    of the row, so a switch committed meanwhile cannot pair one mode with
+    another switch's admin and time.
+    """
+    row = _row(db)
+    state = _state(row)
+    set_by, set_at = (row.mode_set_by, row.mode_set_at) if row is not None else (None, None)
     return {
         "mode": state.mode,
         "projectsEnabled": state.projects_enabled,
@@ -289,6 +318,9 @@ def as_api(db: Session) -> dict:
         "defaultLanguage": default_language(db),
         "captureKey": capture_key(db),
         "colourCardShots": colour_card_shots(db),
+        # NEH-373: null when unknown (a mode stored before the columns existed).
+        "modeSetBy": set_by,
+        "modeSetAt": _iso_utc(set_at),
     }
 
 
@@ -311,7 +343,9 @@ def _new_row(db: Session):
     from app.models.unit_settings import UnitSettings
 
     initial, why = inferred()
-    row = UnitSettings(id=ROW_ID, mode=initial, projects_enabled=False, updated_at=_now())
+    now = _now()
+    row = UnitSettings(id=ROW_ID, mode=initial, projects_enabled=False, updated_at=now,
+                       mode_set_at=now, mode_set_by=None)
     db.add(row)
     _log_in_session(db, "unit_mode_initialised", f"{initial}: {why}")
     logger.info("Unit mode initialised to %s: %s", initial, why)
@@ -385,6 +419,10 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
            projects_enabled: Optional[bool] = None, kept: Optional[str] = None,
            transport=None) -> UnitState:
     """Apply an admin's change; commits, and logs unit_mode_changed / unit_projects_changed.
+
+    A change of the stored mode records `actor` and the time as who set
+    it (mode_set_by, mode_set_at); one that leaves the mode as it was does
+    not, though updated_by and updated_at move with every call.
 
     Raises ModeRefused, with nothing changed, when the new mode's
     prerequisites are missing or, for fisqua, the operators PUT carrying it
@@ -465,7 +503,10 @@ def change(db: Session, *, actor: str, mode: Optional[str] = None,
                 db.rollback()
                 _resend_stored(db, told, actor, transport)
                 raise ModeRefused(target, [_problem(kept_volumes.KEPT_VOLUMES_DECISION)])
-            row.mode = target
+            if target != old_mode:
+                row.mode = target
+                row.mode_set_at = _now()
+                row.mode_set_by = actor
             if projects_enabled is not None:
                 row.projects_enabled = bool(projects_enabled)
             if leaving_offline and kept is not None:
