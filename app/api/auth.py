@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 import hmac
 import ipaddress
@@ -377,17 +377,40 @@ def _client_ip(request: Request) -> str:
     return request.client.host if request.client else "unknown"
 
 
-THROTTLED_DETAIL = "Too many failed login attempts. Try again later."
+ACCOUNT_LOCKED = "account_locked"
+ACCOUNT_LOCKED_MESSAGE = "Too many failed login attempts for this account. Try again later."
+MACHINE_LOCKED = "machine_locked"
+MACHINE_LOCKED_MESSAGE = "Too many failed login attempts from this machine. Try again later."
 
 
 def _throttle_keys(username: str, request: Request) -> tuple[str, str]:
-    """The login throttle's keys for an account and the request's client: `user:<username>` and `ip:<address>`."""
-    return f"user:{username.strip().lower()}", f"ip:{_client_ip(request)}"
+    """The login throttle's keys for an account and the request's client: `user:<username>` and `ip:<address>`.
+
+    The username goes into the key exactly as POST /auth/login compares it
+    with the stored one, unstripped and with its case, so two accounts whose
+    names differ only in case or spacing never share a count.
+    """
+    return f"user:{username}", f"ip:{_client_ip(request)}"
 
 
-def _throttled(retry: int) -> HTTPException:
-    """The 429 a throttled account or client is answered with, as POST /auth/login answers it."""
-    return HTTPException(status_code=429, detail=THROTTLED_DETAIL, headers={"Retry-After": str(retry)})
+def _lockout(acct_key: str, ip_key: str) -> Optional[HTTPException]:
+    """The 429 for a locked account or client, as POST /auth/login and POST
+    /auth/password-reset answer it, or None when neither is locked.
+
+    `detail.code` names the lock: `account_locked` when the account is locked,
+    whether or not the client is too, since that lock follows the person to
+    any other machine; `machine_locked` when only the client is. Retry-After
+    is the wait until both are free, the earliest a sign-in from this client
+    can be checked.
+    """
+    retry, locked = login_throttle.lockout(acct_key, ip_key)
+    if not locked:
+        return None
+    if acct_key in locked:
+        detail = {"code": ACCOUNT_LOCKED, "message": ACCOUNT_LOCKED_MESSAGE}
+    else:
+        detail = {"code": MACHINE_LOCKED, "message": MACHINE_LOCKED_MESSAGE}
+    return HTTPException(status_code=429, detail=detail, headers={"Retry-After": str(retry)})
 
 
 @router.post("/login")
@@ -395,11 +418,12 @@ def login(payload: UserLogin, request: Request, response: Response, db: Session 
     # Throttle brute force per account and per client IP on the untrusted LAN.
     acct_key, ip_key = _throttle_keys(payload.username, request)
 
-    retry = login_throttle.retry_after(acct_key, ip_key)
-    if retry > 0:
+    locked = _lockout(acct_key, ip_key)
+    if locked is not None:
         log_event(db, level="WARN", category="access", action="login_throttled",
-                  actor=payload.username, detail=f"locked; retry after {retry}s")
-        raise _throttled(retry)
+                  actor=payload.username,
+                  detail=f"{locked.detail['code']}; retry after {locked.headers['Retry-After']}s")
+        raise locked
 
     def refuse_credentials():
         login_throttle.record_failure(acct_key, ip_key)
@@ -423,8 +447,7 @@ def login(payload: UserLogin, request: Request, response: Response, db: Session 
                   actor=username, detail="cuenta inactiva")
         raise HTTPException(status_code=403, detail="User is inactive")
 
-    # Success: clear the throttle counters and upgrade a legacy/weak hash while we still hold the plaintext
-    login_throttle.reset(acct_key, ip_key)
+    # Upgrade a legacy/weak hash while we still hold the plaintext.
     if needs_rehash(stored_hash):
         # Written only over the hash that was verified: a password set
         # meanwhile is never replaced, and this login is refused.
@@ -436,6 +459,10 @@ def login(payload: UserLogin, request: Request, response: Response, db: Session 
         if upgraded != 1:
             refuse_credentials()
 
+    # The sign-in has succeeded: clear the account's failure count. The
+    # machine's count stays: one valid account must not reset the count of a
+    # station from which other accounts are being tried.
+    login_throttle.reset(acct_key)
     log_event(db, level="INFO", category="access", action="login_success",
               actor=username)
     token = create_access_token(subject=str(user_id), version=version)
@@ -554,11 +581,12 @@ def reset_password(
     # The current password counts against the login throttle as a sign-in
     # does: while the account or the client is locked the route answers as
     # POST /auth/login does without checking it, a wrong one is recorded
-    # against the same keys, and a change that is written clears them.
+    # against the same keys, and a change that is written clears the account's
+    # count, never the machine's, as a successful sign-in does.
     acct_key, ip_key = _throttle_keys(user.username, request)
-    retry = login_throttle.retry_after(acct_key, ip_key)
-    if retry > 0:
-        raise _throttled(retry)
+    locked = _lockout(acct_key, ip_key)
+    if locked is not None:
+        raise locked
     if not verify_password(payload.old_password, user.hashed_password):
         login_throttle.record_failure(acct_key, ip_key)
         raise HTTPException(status_code=401, detail="Old password incorrect")
@@ -579,7 +607,7 @@ def reset_password(
         db.rollback()
         raise HTTPException(status_code=401, detail="Invalid or expired token")
     db.commit()
-    login_throttle.reset(acct_key, ip_key)
+    login_throttle.reset(acct_key)
     return {"detail": "password updated successfully"}
 
 
