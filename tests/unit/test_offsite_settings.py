@@ -1242,7 +1242,7 @@ def test_nothing_is_swept_when_processes_cannot_be_read(tmp_path):
 
 @pytest.mark.skipif(not Path("/proc/self/fd").is_dir(), reason="needs Linux /proc; the unit has it, macOS does not")
 @pytest.mark.parametrize("how", ["cwd", "fd", "env"])
-def test_a_live_child_process_holding_the_directory_keeps_it(tmp_path, how):
+def test_a_live_child_process_holding_the_directory_keeps_it(tmp_path, monkeypatch, how):
     import sys
 
     from app.core import provision_runner
@@ -1258,6 +1258,12 @@ def test_a_live_child_process_holding_the_directory_keeps_it(tmp_path, how):
             "env": "import time; time.sleep(30)"}[how]
     env = dict(os.environ, DTK_OFFSITE_KEY_FILE=str(key_file)) if how == "env" else None
     child = subprocess.Popen([sys.executable, "-c", code], cwd=str(held) if how == "cwd" else None, env=env)
+    real_uid = provision_runner._proc_uid
+    ours = {str(os.getpid()), str(child.pid)}
+    # Only this test and its child. Other processes of the CI user are not this test's, and under
+    # Yama (ptrace_scope 1, Ubuntu's default) their /proc entries are unreadable to a non-ancestor.
+    monkeypatch.setattr(provision_runner, "_proc_uid",
+                        lambda entry: real_uid(entry) if entry.name in ours else -1)
     try:
         deadline = time.time() + 5
         while how == "fd" and time.time() < deadline and not any(
@@ -1431,3 +1437,21 @@ def test_an_access_error_on_the_existence_check_keeps_the_directory(tmp_path, mo
 
     monkeypatch.setattr(provision_runner.os, "lstat", lstat)
     assert provision_runner._referenced(held, proc) is None
+
+
+def test_an_unknown_answer_is_logged_with_the_pid_only(tmp_path, caplog):
+    import logging as _logging
+
+    from app.core import provision_runner
+
+    shm, held, proc = _held_and_proc(tmp_path)
+    entry = _fake_proc(proc, 4242, environ=b"DTK_OFFSITE_KEY_FILE=/somewhere/secret\0")
+    (entry / "cwd").unlink()
+    caplog.set_level(_logging.INFO, logger="app.core.provision_runner")
+    assert provision_runner.sweep_abandoned(shm, proc=proc) == []
+    lines = [r.getMessage() for r in caplog.records if "could not be inspected" in r.getMessage()]
+    assert lines == ["Key directories are kept: process 4242 could not be inspected"]
+    assert str(held) not in caplog.text and "secret" not in caplog.text and str(proc) not in caplog.text
+    caplog.clear()
+    assert provision_runner.sweep_abandoned(shm, proc=tmp_path / "no-proc") == []
+    assert "the process table could not be read" in caplog.text and str(tmp_path) not in caplog.text

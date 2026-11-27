@@ -61,8 +61,12 @@ CAPTUA_OFFSITE_KEY_FILE naming a path in it, read from /proc). A script
 whose backend was killed keeps running in a session of its own, with no
 watchdog, so age alone is no evidence that it has ended. Where /proc, or
 any part of a living process's entry in it, cannot be read, the answer is
-unknown and nothing is swept. The backend also sweeps /dev/shm at
-start (app.main). memory_dir is /dev/shm when it is a tmpfs (or ramfs) directory,
+unknown and nothing is swept; the process that made it so is logged by
+pid. On a host where other processes of the same user cannot be
+inspected (Yama ptrace_scope 1 or more, as on Ubuntu), the sweep
+therefore removes nothing: the chosen conservative outcome. Units run
+Raspberry Pi OS, whose kernel has no Yama. The backend also sweeps
+/dev/shm at start (app.main). memory_dir is /dev/shm when it is a tmpfs (or ramfs) directory,
 else None; the offsite settings flow requires it, and pairing falls back
 to the system's temporary directory (key_file_root).
 
@@ -324,6 +328,7 @@ def _referenced(directory: Path, proc: Path) -> Optional[bool]:
     try:
         entries = [Path(entry.path) for entry in os.scandir(proc) if entry.name.isdigit()]
     except OSError:
+        logger.info("Key directories are kept: the process table could not be read")
         return None
     target = os.path.realpath(directory)
     uid = _uid()
@@ -336,6 +341,7 @@ def _referenced(directory: Path, proc: Path) -> Optional[bool]:
         except OSError as exc:
             if _gone(entry, exc):
                 continue
+            logger.info("Key directories are kept: process %s could not be inspected", entry.name)
             return None
     return False
 
