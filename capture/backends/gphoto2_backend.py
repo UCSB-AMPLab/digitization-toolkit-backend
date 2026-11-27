@@ -45,7 +45,11 @@ Two connected bodies that answer one serial are not told apart before both
 have been read, so the first of them to open may be given the format stored
 under that serial. Canon bodies have distinct serials.
 
-Version: 0.3.0
+Each camera's recent libgphoto2 log lines are kept and written to the log
+directory when a capture fails or times out (camera_log_lines, which says how
+lines are attributed and bounded); CAMERA_LOG_LINES switches it off.
+
+Version: 0.4.0
 """
 
 import contextlib
@@ -85,6 +89,7 @@ from .base import (
 from .errors import CameraNotConnectedError, CaptureTimeoutError, PreviewFrameFailedError
 from ..utils import atomic_write
 from . import usb_topology
+from . import camera_log_lines
 
 
 def _write_raw_preview(raw_path: Path, preview_path: Path, logger) -> bool:
@@ -551,19 +556,28 @@ def _wait_log(port, reason):
 
 
 class _CameraLock:
-    """A per-index lock reports the time a caller waits for that camera."""
+    """A per-index lock reports the time a caller waits for that camera.
 
-    def __init__(self, index):
+    While it is held, the holding thread is bound to the index in log_lines,
+    so the libgphoto2 lines that thread causes are kept for that camera.
+    """
+
+    def __init__(self, index, log_lines=None):
         self._lock = threading.Lock()
         self._index = index
+        self._log_lines = log_lines
 
     def acquire(self, blocking=True, timeout=-1):
         with _wait_log(f"camera {self._index}", "camera lock") as detail:
             acquired = self._lock.acquire(blocking, timeout)
             detail["acquired"] = acquired
+            if acquired and self._log_lines is not None:
+                self._log_lines.bind(self._index)
             return acquired
 
     def release(self):
+        if self._log_lines is not None:
+            self._log_lines.unbind(self._index)
         self._lock.release()
 
     def locked(self):
@@ -642,12 +656,24 @@ class CaptureAttributionError(RuntimeError):
 
 def _new_camera(model, port):
     abilities = gp.CameraAbilitiesList()
-    abilities.load()
+    # Bus-wide: these loads log about every driver and port, not this camera.
+    with camera_log_lines.unattributed():
+        abilities.load()
     cam = gp.Camera()
-    cam.set_abilities(abilities[abilities.lookup_model(model)])
-    ports = gp.PortInfoList()
-    ports.load()
-    cam.set_port_info(ports[ports.lookup_path(port)])
+    try:
+        cam.set_abilities(abilities[abilities.lookup_model(model)])
+        ports = gp.PortInfoList()
+        with camera_log_lines.unattributed():
+            ports.load()
+        cam.set_port_info(ports[ports.lookup_path(port)])
+    except BaseException:
+        # The traceback keeps this frame alive after the raise; the camera
+        # is released here, inside unattributed(), so no later collection
+        # destroys it under some other binding. The exception is not bound
+        # to a name here, so the frame holds no reference back to it.
+        with camera_log_lines.unattributed():
+            cam = None
+        raise
     return cam
 
 
@@ -861,7 +887,11 @@ def _init_once(model, port, attachment, may_reset=False):
         detail["_defer"] = pending
     started = _monotonic()
     paused = False
+    # The failure's text: holding the exception itself in this frame would
+    # make a cycle (exception, traceback, frame) the garbage collector frees
+    # later, under whatever binding its thread then has.
     failure = None
+    cam = None
     initialized = handed_back = False
     try:
         # A queued preview observes a slow failure recorded by the preceding owner.
@@ -880,7 +910,11 @@ def _init_once(model, port, attachment, may_reset=False):
         except BaseException as exc:
             if not initialized:
                 paused = _record_init_failure(port, attachment, exc, held_s)
-            failure = exc
+                # Released here, inside unattributed(): the traceback keeps
+                # this frame alive after the raise.
+                with camera_log_lines.unattributed():
+                    cam = None
+            failure = str(exc)
             raise
         _clear_init_failure(port, attachment)
         handed_back = True
@@ -894,17 +928,19 @@ def _init_once(model, port, attachment, may_reset=False):
             if paused:
                 _WAIT_LOG.info(
                     "[gphoto2] %s: preview init back-off held=%.3fs interval=%gs error=%r (%s)",
-                    _journal_camera(port), held_s, _INIT_BACKOFF_S, str(failure), port,
+                    _journal_camera(port), held_s, _INIT_BACKOFF_S, failure, port,
                 )
         except BaseException:
             handed_back = False
             raise
         finally:
             if initialized and not handed_back:
-                try:
-                    cam.exit()
-                except BaseException:
-                    pass
+                with camera_log_lines.unattributed():
+                    try:
+                        cam.exit()
+                    except BaseException:
+                        pass
+                    cam = None
 
 
 def _close_failed_capture(method):
@@ -1431,13 +1467,23 @@ class _PTPSession:
         return {k: self._get_config(k) for k in keys}
 
     def close(self):
+        """Close the session; its libgphoto2 lines are kept for no camera.
+
+        Every close runs unattributed: by then the position may already be
+        published for the body that replaced this session's. The last
+        reference to the camera is dropped inside the same block, because
+        its destruction (gp_camera_unref) logs too.
+        """
         if self._cam is not None:
-            cam, self._cam = self._cam, None
-            try:
-                with _wait_log(self.port, "session close"):
-                    cam.exit()
-            except Exception:
-                pass
+            with camera_log_lines.unattributed():
+                cam, self._cam = self._cam, None
+                try:
+                    with _wait_log(self.port, "session close"):
+                        cam.exit()
+                except Exception:
+                    pass
+                finally:
+                    del cam
             self._logger.info(f"[gphoto2] Closed session: {self.model} on {self.port}")
 
 
@@ -1468,6 +1514,10 @@ class GPhoto2Backend(CameraBackend):
         after its session has been closed. Anything else would let another
         thread act on an identity while the body was still claimed.
     """
+
+    # Set in __init__; None for a backend built without it.
+    _log_lines = None
+    _camera_log_dir = None
 
     def __init__(self, logger):
         if not _GP_AVAILABLE:
@@ -1559,7 +1609,60 @@ class GPhoto2Backend(CameraBackend):
 
         # Writes a row to the system log (_write_system_log); a test replaces it.
         self._system_log = _write_system_log
+        # Each camera's recent libgphoto2 log lines, or None when switched off.
+        self._log_lines, self._camera_log_dir = self._start_camera_log_lines()
         self._load_pins()
+
+    def _start_camera_log_lines(self):
+        """The process recorder and its directory, or (None, None) when off
+        or when the gphoto2 module has no log callback API.
+
+        Read like the other settings here, function-locally: a test process
+        with no app config keeps the lines on and writes them nowhere.
+        """
+        enabled, log_dir = True, None
+        try:
+            from app.core.config import settings
+
+            enabled = bool(getattr(settings, "CAMERA_LOG_LINES", True))
+            log_dir = settings.log_dir / camera_log_lines.DIR_NAME
+        except Exception:
+            pass
+        if not enabled:
+            return None, None
+        recorder = camera_log_lines.RECORDER
+        try:
+            if not recorder.install(gp):
+                # No libgphoto2 log API: no lines arrive, so none are kept.
+                return None, None
+        except Exception as exc:
+            self.logger.warning(
+                f"[gphoto2] the libgphoto2 log callback was not registered ({exc!r})"
+            )
+            return None, None
+        return recorder, log_dir
+
+    def _write_camera_log_lines(self, camera_index: int, session, exc) -> None:
+        """Write camera_index's recent lines after a failed capture; never raises."""
+        if self._log_lines is None or self._camera_log_dir is None:
+            return
+        try:
+            # The identity known for the position now: the session's serial,
+            # else the one the position's occupant was last known by.
+            body = (getattr(session, "serial", "") or None) or \
+                self._log_lines.occupant_serial(camera_index)
+            reason = (
+                "capture timed out" if isinstance(exc, CaptureTimeoutError)
+                else f"capture failed ({type(exc).__name__})"
+            )
+            self._log_lines.write_failure(
+                self._camera_log_dir, camera_index, body, reason, self.logger
+            )
+        except Exception as write_exc:
+            self.logger.warning(
+                f"[gphoto2] Camera {camera_index}: the camera log lines were not "
+                f"written ({write_exc!r})"
+            )
 
     # ------------------------------------------------------------------
     # Persistent index -> body bindings
@@ -1815,7 +1918,8 @@ class GPhoto2Backend(CameraBackend):
         identity knowledge can pass it back in.
         """
         if detected is None:
-            raw = gp.Camera.autodetect()
+            with camera_log_lines.unattributed():
+                raw = gp.Camera.autodetect()
             detected = [(raw[i][0], raw[i][1]) for i in range(len(raw))]
             self._usb_attachments = {port: _usb_attachment(port) for _, port in detected}
             self._last_detected = list(detected)
@@ -1847,6 +1951,9 @@ class GPhoto2Backend(CameraBackend):
                     index += 1
             port_map[index] = (model, port)
         self._log_port_map_changes(port_map)
+        if self._log_lines is not None:
+            for index, (_model, port) in port_map.items():
+                self._log_lines.occupy(index, port, serial_by_port.get(port))
         if not port_map:
             self.logger.warning("[gphoto2] No cameras detected by autodetect().")
         return port_map
@@ -2053,6 +2160,7 @@ class GPhoto2Backend(CameraBackend):
                     f"[gphoto2] Camera {camera_index}: pinned to body "
                     f"{serial!r} (on {port})"
                 )
+        self._note_occupant(camera_index, port, serial)
         if pinned_now:
             self._save_pins()
         return changed
@@ -2117,7 +2225,9 @@ class GPhoto2Backend(CameraBackend):
     def _get_camera_lock(self, camera_index: int) -> threading.Lock:
         with self._map_lock:
             if camera_index not in self._session_locks:
-                self._session_locks[camera_index] = _CameraLock(camera_index)
+                self._session_locks[camera_index] = _CameraLock(
+                    camera_index, self._log_lines
+                )
             return self._session_locks[camera_index]
 
     # ------------------------------------------------------------------
@@ -2304,6 +2414,8 @@ class GPhoto2Backend(CameraBackend):
     def _record_port_move(self, old, new):
         if old == new:
             return
+        if self._log_lines is not None:
+            self._log_lines.move_port(old, new)
         with self._map_lock:
             self._serial_by_port.pop(old, None)
             self._body_model_by_port.pop(old, None)
@@ -2319,6 +2431,7 @@ class GPhoto2Backend(CameraBackend):
 
     def _finish_identification(self, cam, port, index):
         token = None
+        reader = None
         try:
             token = _OPEN_LABELS.set(self._open_labels(index, port))
             reader = object.__new__(_EventReader)
@@ -2330,6 +2443,10 @@ class GPhoto2Backend(CameraBackend):
                 with _wait_log(port, "identification close"):
                     cam.exit()
             finally:
+                # The caller drops its own reference, the last one, inside
+                # unattributed() (camera_log_lines).
+                if reader is not None:
+                    reader._cam = None
                 if token is not None:
                     _OPEN_LABELS.reset(token)
 
@@ -2502,6 +2619,10 @@ class GPhoto2Backend(CameraBackend):
                             except Exception:
                                 pass
                         self._release_port(camera_index, port)
+                        # The last reference, dropped before the next
+                        # position's lock: its destruction logs too.
+                        with camera_log_lines.unattributed():
+                            cam = None
                 if serial:
                     learned = self._learn_serial(camera_index, read_port, serial) or learned
                     if identified is not None:
@@ -2562,6 +2683,9 @@ class GPhoto2Backend(CameraBackend):
             )
             session._label = self._open_labels(camera_index, session.port)[session.port]
             self._sessions[camera_index] = session
+            self._note_occupant(
+                camera_index, session.port, getattr(session, "serial", "")
+            )
             return session
         except gp.GPhoto2Error as exc:
             # -105 Unknown model usually means ports changed (USB re-enumeration
@@ -2592,8 +2716,16 @@ class GPhoto2Backend(CameraBackend):
                 )
                 session._label = self._open_labels(camera_index, session.port)[session.port]
                 self._sessions[camera_index] = session
+                self._note_occupant(
+                    camera_index, session.port, getattr(session, "serial", "")
+                )
                 return session
             raise
+
+    def _note_occupant(self, camera_index: int, port, serial) -> None:
+        """Tell the log lines which body is at camera_index now."""
+        if self._log_lines is not None:
+            self._log_lines.occupy(camera_index, port, serial)
 
     def _close_session(self, camera_index: int):
         session = self._sessions.pop(camera_index, None)
@@ -2800,7 +2932,13 @@ class GPhoto2Backend(CameraBackend):
         lock = self._get_camera_lock(camera_index)
 
         with lock:
-            session = self._get_or_open_session(camera_index)
+            try:
+                session = self._get_or_open_session(camera_index)
+            except CameraNotConnectedError:
+                raise
+            except Exception as exc:
+                self._write_camera_log_lines(camera_index, None, exc)
+                raise
             # The format this capture is meant to take: the one its
             # configuration names, else the one stored for the body the open
             # session holds, resolved here under the camera lock.
@@ -2845,6 +2983,9 @@ class GPhoto2Backend(CameraBackend):
                 )
                 result = (str(actual_path), None)
             except BaseException as exc:
+                # Written before the close, while the session's identity is at hand.
+                if isinstance(exc, Exception):
+                    self._write_camera_log_lines(camera_index, session, exc)
                 try:
                     self._close_session(camera_index)
                 except BaseException:
@@ -3038,6 +3179,10 @@ class GPhoto2Backend(CameraBackend):
                             except Exception:
                                 pass
                         self._release_port(idx, port)
+                        # The last reference, dropped before the next
+                        # position's lock: its destruction logs too.
+                        with camera_log_lines.unattributed():
+                            cam = None
                     # The claim is gone, so what it read may now be
                     # published.
                     if serial:
