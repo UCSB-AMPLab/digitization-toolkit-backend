@@ -31,7 +31,7 @@ tests/unit/test_testing_space_access.py walks the application's routes and
 fails when a route has no entry, an entry has no route, or a path, query
 or body field named like material is not declared as a target.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 from __future__ import annotations
@@ -330,6 +330,7 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/network/wifi/join"): Entry(testing=True),
     ("POST", "/network/wifi/join"): Entry(),
     ("DELETE", "/network/wifi/saved/{uuid}"): Entry(),
+    ("GET", "/network/tailscale"): Entry(testing=True),
 }
 
 for _entry in ROUTES.values():

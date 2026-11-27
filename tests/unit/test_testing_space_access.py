@@ -25,7 +25,7 @@ G. The image file routes serve a testing image to the testing account and
 
     python -m pytest tests/unit/test_testing_space_access.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import ast
@@ -204,6 +204,7 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/network/wifi/join'): (('admin', 'operator', 'reviewer'),),
     ('POST', '/network/wifi/join'): (('admin', 'operator'),),
     ('DELETE', '/network/wifi/saved/{uuid}'): (('admin', 'operator'),),
+    ('GET', '/network/tailscale'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/health'): (),
 }
 
