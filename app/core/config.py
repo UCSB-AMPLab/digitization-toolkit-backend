@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 import logging
 import os
@@ -100,6 +100,11 @@ class Settings(BaseSettings):
     # which the journal records on the appliance (app.core.logging_setup).
     # LOG_DIR above is something else: the rotating capture logs' folder.
     LOG_LEVEL: str = Field(default="INFO", validation_alias=_names("LOG_LEVEL"))
+    # On: the gphoto2 backend keeps each camera's last libgphoto2 log lines in
+    # memory and writes them to LOG_DIR/camera-logs when a capture fails or
+    # times out (capture.backends.camera_log_lines, which states the caps).
+    # Off: no libgphoto2 log callback is registered and nothing is written.
+    CAMERA_LOG_LINES: bool = Field(default=True, validation_alias=_names("CAMERA_LOG_LINES"))
     
     PROJECTS_ROOT: str = ""
     # The camera driver: picamera2, subprocess, gphoto2 or chdk. Unset: the
