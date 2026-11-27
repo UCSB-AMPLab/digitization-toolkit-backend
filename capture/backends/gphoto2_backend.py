@@ -45,7 +45,7 @@ Two connected bodies that answer one serial are not told apart before both
 have been read, so the first of them to open may be given the format stored
 under that serial. Canon bodies have distinct serials.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import contextlib
@@ -2755,6 +2755,9 @@ class GPhoto2Backend(CameraBackend):
     # capture_image() takes focus_check (NEH-339); capture.service passes it
     # only to a backend class that sets this.
     supports_focus_check = True
+    # capture_image() takes body_identified (NEH-404); capture.service passes
+    # it only to a backend class that sets this.
+    identifies_bodies_at_capture = True
 
     def capture_image(
         self,
@@ -2762,6 +2765,7 @@ class GPhoto2Backend(CameraBackend):
         camera_config,
         capture_output: bool = False,
         focus_check: bool = False,
+        body_identified=None,
     ) -> str:
         """Capture one image to output_path. Returns (path as str, None).
 
@@ -2788,6 +2792,12 @@ class GPhoto2Backend(CameraBackend):
             focus_check: One trigger attempt and a _FOCUS_CHECK_DEADLINE_S
                 deadline after an accepted trigger
                 (see _PTPSession.capture). False uses the exposure-sized deadline.
+            body_identified: Called once under the camera lock, before the
+                shutter, with the hardware id of the body the open session
+                holds (_body_hardware_id); when that identity is unknown or
+                ambiguous, with None and the positional id the device rows
+                give such a body at this index. capture.service reads the
+                rotation there (project_manager.body_rotation).
 
         Returns:
             (path, None): the saved image file's path as a string (`.cr2`
@@ -2801,6 +2811,15 @@ class GPhoto2Backend(CameraBackend):
 
         with lock:
             session = self._get_or_open_session(camera_index)
+            if body_identified is not None:
+                identity = self._body_hardware_id(camera_index, session)
+                if identity is not None:
+                    body_identified(identity)
+                else:
+                    # The id the device rows give a body with no usable identity.
+                    body_identified(
+                        None, _hardware_id(session.model, f"idx{camera_index}")
+                    )
             # The format this capture is meant to take: the one its
             # configuration names, else the one stored for the body the open
             # session holds, resolved here under the camera lock.

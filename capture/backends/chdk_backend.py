@@ -54,7 +54,7 @@ it (``gui_live.lua``, update_canvas_size and the put_to_cd_canvas call under
 it); the same geometry is reproduced here so a page looks on the dashboard
 the way it looks on the camera's screen.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import contextlib
@@ -2004,22 +2004,29 @@ class ChdkBackend(CameraBackend):
             except (_BodyGoneError, _IdentityChangedError):
                 raise gone
 
+    # capture_image() takes body_identified (NEH-404); capture.service passes
+    # it only to a backend class that sets this.
+    identifies_bodies_at_capture = True
+
     def capture_image(
         self,
         output_path: Path,
         camera_config,
         capture_output: bool = False,
+        body_identified=None,
     ) -> str:
         """Capture one still over USB; see _capture_image_once.
 
         A body that has left the bus is replaced and the capture retried
-        once, by _retry_once_if_gone.
+        once, by _retry_once_if_gone; body_identified is then called again,
+        for the body the retry holds.
         """
         camera_index = getattr(camera_config, "camera_index", 0)
         return self._retry_once_if_gone(
             camera_index, "capture",
             lambda expect: self._capture_image_once(
-                output_path, camera_config, capture_output, expect
+                output_path, camera_config, capture_output, expect,
+                body_identified,
             ),
         )
 
@@ -2029,6 +2036,7 @@ class ChdkBackend(CameraBackend):
         camera_config,
         capture_output: bool = False,
         expect_identity=None,
+        body_identified=None,
     ) -> str:
         """Capture one still over USB and write it to output_path.
 
@@ -2054,6 +2062,12 @@ class ChdkBackend(CameraBackend):
                 suffix (capture_name_taken).
             camera_config: CameraConfig; camera_index routes it.
             capture_output: Unused - kept for interface compatibility.
+            expect_identity: See _in_use.
+            body_identified: Called under the body's lock, before the
+                shutter, with the hardware id of the body held; when it has
+                none or another body answers to it, with None and the
+                positional id _row gives it. capture.service reads the
+                rotation there (project_manager.body_rotation).
 
         Returns:
             Tuple of (path string, None), the shape the capture service
@@ -2094,6 +2108,12 @@ class ChdkBackend(CameraBackend):
             camera_index, "capture", refuse_unusable=True,
             expect_identity=expect_identity,
         ) as body:
+            if body_identified is not None:
+                if body.hardware_id is not None and not body.identity_clash:
+                    body_identified(body.hardware_id)
+                else:
+                    # The id _row gives a body with no identity of its own.
+                    body_identified(None, f"{body.slug}_idx{camera_index}")
             if raw and not _shoot_takes_jpeg(body.device.shoot):
                 # Refused before anything is sent: the body is untouched and
                 # stays open for a JPEG capture.
