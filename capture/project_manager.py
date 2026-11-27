@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 from pathlib import Path
 import sys
@@ -248,6 +248,44 @@ def default_camera_config_from_registry(
         )
 
     return config, hw_id
+
+
+# The rotation a capture applies follows the key the registry stores it under.
+# A body the backend identifies at capture uses its own entry, and only its
+# own: the entry of another body is never applied to it. With no entry, it
+# takes the default for no role, 90. A body the backend cannot identify (no
+# serial, a serial that disagrees with the pin or that another body also
+# answers) uses the entry the registry keys by position, the model_idxN-style
+# id the device rows give such a body, for the position the capture actually
+# used, when such an entry exists: a positional id names a position, not a
+# body. Otherwise it takes 90. capture.service._capture_with_body_rotation
+# calls this under the camera lock, with what the backend reports.
+def body_rotation(
+    hardware_id: Optional[str],
+    position_id: Optional[str] = None,
+    registry: Optional[CameraRegistry] = None,
+) -> int:
+    """The clockwise rotation, in degrees, for the body that took a picture.
+
+    Args:
+        hardware_id: The identity of the body the capture used, or None when
+            the backend could not read one.
+        position_id: The registry id for the position the capture used, as
+            the device rows give it to a body with no identity. Read only
+            when hardware_id is None.
+        registry: The camera registry; the default one when not given.
+
+    The saved rotation, or the default for the entry's role, through
+    CameraRegistry.effective_orientation.
+    """
+    key = hardware_id or position_id
+    entry = None
+    if key:
+        if registry is None:
+            registry = CameraRegistry()
+        entry = registry.get_camera_by_id(key)
+    entry = entry or {}
+    return CameraRegistry.effective_orientation(entry.get("orientation"), entry.get("role"))
 
 
 def project_init(

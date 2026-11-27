@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 from dataclasses import dataclass, asdict
 from typing import Optional, Tuple
@@ -64,6 +64,15 @@ class CameraConfig:
     shutter_speed: Optional[str] = None  # e.g. "1/250" (PTP shutterspeed string)
     aperture: Optional[str] = None       # e.g. "5.6" (PTP aperture string)
     image_format: Optional[str] = None   # "JPEG" (default), "RAW" (.cr2, or .dng on CHDK), "RAW+JPEG"
+
+    # Not a dataclass field (no annotation), so never in to_dict() or the
+    # manifest. True when rotate_deg is the rotation resolved for the body at
+    # camera_index when the request was read, rather than one the caller
+    # named: a capture on a backend that identifies bodies at capture then
+    # applies the rotation of the body that took the picture instead
+    # (capture.service._capture_with_body_rotation). Set on the instance by
+    # the page capture routes.
+    rotation_from_body = False
 
     def to_dict(self):
         """Convert to dictionary for logging/serialization."""

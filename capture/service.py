@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 import sys
 from pathlib import Path
@@ -382,6 +382,54 @@ def image_filename(
     return filename
 
 
+def _capture_with_body_rotation(backend, output_path, camera_config, *args, **kwargs):
+    """Capture through backend.capture_image, with the rotation of the body that took the picture.
+
+    For a page capture whose camera_config has rotation_from_body True (its
+    rotate_deg was resolved for the body at the index when the request was
+    read, not named by the caller; CameraConfig.rotation_from_body), and for
+    every colour card shot and test capture. *args and **kwargs are passed
+    to backend.capture_image as given.
+
+    A backend that tells bodies apart (its class sets
+    identifies_bodies_at_capture = True: gphoto2, CHDK) calls body_identified
+    under the camera lock with the hardware id of the body it holds, or None
+    and the registry id of the position when it cannot identify the body.
+    The rotation is read there (project_manager.body_rotation, which states
+    the rule) and set on camera_config, so the EXIF tag, the manifest record
+    and the caller's row all carry it. A capture that returns without
+    reporting a body is given the rotation of an unknown body, 90. The
+    rotation resolved before the lock is never kept on these backends: a
+    rescan in between can have put another body at the index (NEH-404).
+
+    Any other backend (picamera2, subprocess) has fixed bodies at fixed
+    indices, and camera_config keeps the rotation it was built with.
+    """
+    # The class, not the instance: getattr on a mock instance is truthy.
+    if getattr(type(backend), "identifies_bodies_at_capture", False) is not True:
+        return backend.capture_image(output_path, camera_config, *args, **kwargs)
+
+    from .project_manager import body_rotation
+
+    reported = []
+
+    def body_identified(hardware_id, position_id=None):
+        camera_config.rotate_deg = body_rotation(hardware_id, position_id)
+        reported.append(hardware_id)
+        subprocess_logger.info(
+            f"Camera {camera_config.camera_index}: rotate_deg={camera_config.rotate_deg} "
+            f"for the body that took the picture "
+            f"({hardware_id or f'identity unknown, position {position_id}'})"
+        )
+
+    result = backend.capture_image(
+        output_path, camera_config, *args, body_identified=body_identified, **kwargs
+    )
+    if not reported:
+        body_identified(None)
+    return result
+
+
 def capture_image(
         project_name: str,
         camera_config: CameraConfig,
@@ -436,7 +484,10 @@ def capture_image(
         raise FileExistsError(f"A file named {output_path.stem} already exists in {project_path}")
 
     backend = get_backend()
-    result = backend.capture_image(output_path, camera_config, capture_output)
+    if getattr(camera_config, "rotation_from_body", False) is True:
+        result = _capture_with_body_rotation(backend, output_path, camera_config, capture_output)
+    else:
+        result = backend.capture_image(output_path, camera_config, capture_output)
     
     # Result is (path_or_paths, metadata), or a bare path from the subprocess
     # backend. path_or_paths can be:
@@ -534,7 +585,9 @@ def colour_card_capture(camera_config: CameraConfig, output_path: Path) -> tuple
     """Photograph a colour card with one camera into `output_path`, in a volume's calibration folder.
 
     Through the configured backend, as a page is (capture_image), so the
-    backend's own lock on the camera is taken. The rotation is recorded on
+    backend's own lock on the camera is taken. The rotation is that of the
+    body that takes the shot, decided under that lock
+    (_capture_with_body_rotation), and is recorded on camera_config and on
     every JPEG as for a page. No manifest line is written here: the caller
     names the files and writes the shot's line (app.core.colour_card).
 
@@ -543,7 +596,8 @@ def colour_card_capture(camera_config: CameraConfig, output_path: Path) -> tuple
     """
     output_path = Path(output_path)
     output_path.parent.mkdir(parents=True, exist_ok=True)
-    result = get_backend().capture_image(output_path, camera_config, False)
+    # The rotation of the body that takes the shot (_capture_with_body_rotation).
+    result = _capture_with_body_rotation(get_backend(), output_path, camera_config, False)
     if isinstance(result, tuple) and len(result) == 2:
         actual_path, metadata = result
     else:
@@ -624,7 +678,8 @@ def test_capture_bytes(
             capture_kwargs = {}
 
         start_time = time.perf_counter()
-        result = backend.capture_image(output_path, camera_config, **capture_kwargs)
+        # The rotation of the body that takes the picture (_capture_with_body_rotation).
+        result = _capture_with_body_rotation(backend, output_path, camera_config, **capture_kwargs)
         elapsed_time = time.perf_counter() - start_time
 
         # Result is a (path_or_paths, metadata) pair from the picamera2,

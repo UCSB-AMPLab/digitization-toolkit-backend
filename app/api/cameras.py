@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 from datetime import datetime, timezone
 from fastapi import APIRouter, Depends, HTTPException, Path as PathParam, Query, Response
@@ -1826,13 +1826,18 @@ def trigger_capture(
 			request.camera_index,
 			request.resolution
 		)
-		# NEH-71: omitted (None) leaves the body's effective orientation from
-		# default_camera_config_from_registry in place; an explicit value,
-		# including 0, overrides it.
+		# NEH-71: an explicit value, including 0, is applied as given. Omitted
+		# (None), the body's effective orientation applies: on a backend that
+		# identifies bodies at capture, that of the body that takes the
+		# picture, read under the camera lock (rotation_from_body below);
+		# on any other, the one default_camera_config_from_registry resolved.
 		if request.rotate_deg is not None:
 			config_dict["rotate_deg"] = request.rotate_deg
 		_put_capture_format(db, config_dict, request.camera_index, request.collection_id)
 		camera_config = CameraConfig(**config_dict)
+		# A rotation the request does not name is decided under the camera
+		# lock, for the body that takes the picture (NEH-404).
+		camera_config.rotation_from_body = request.rotate_deg is None
 		
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
@@ -2079,8 +2084,8 @@ def trigger_dual_capture(
 		config0_dict, _ = default_camera_config_from_registry(0, request.resolution)
 		config1_dict, _ = default_camera_config_from_registry(1, request.resolution)
 
-		# NEH-71: see trigger_capture - omitted (None) leaves the registry's
-		# effective orientation in place; an explicit value, including 0, overrides it.
+		# NEH-71: see trigger_capture - an explicit value, including 0, is
+		# applied as given; omitted (None), the body's effective orientation.
 		if request.rotate_deg_cam0 is not None:
 			config0_dict["rotate_deg"] = request.rotate_deg_cam0
 		if request.rotate_deg_cam1 is not None:
@@ -2090,6 +2095,9 @@ def trigger_dual_capture(
 		_put_capture_format(db, config1_dict, 1, request.collection_id)
 		cam0_config = CameraConfig(**config0_dict)
 		cam1_config = CameraConfig(**config1_dict)
+		# See trigger_capture: decided under each camera's lock (NEH-404).
+		cam0_config.rotation_from_body = request.rotate_deg_cam0 is None
+		cam1_config.rotation_from_body = request.rotate_deg_cam1 is None
 		
 		# Resolve the path from collection_id via the DB
 		project_name, collection_name, stem = _resolve_capture_target(db, request.project_name, request.collection_id, current_user)
