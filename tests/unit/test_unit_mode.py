@@ -487,7 +487,9 @@ def test_the_operators_body_carries_the_mode(db_session, fisqua):
 
 
 @pytest.mark.unit
-def test_get_unit_shape_for_any_role(client, db_session, fisqua):
+def test_get_unit_shape_for_any_role(client, db_session, fisqua, monkeypatch):
+    from app.core import version
+    monkeypatch.setattr(version, "release_version", lambda backend_dir=None: "9.8.7-shape")
     _unit(db_session, "offline", projects_enabled=True)
     for role in ("reviewer", "operator", "admin"):
         resp = _as(client, role).get("/system/unit")
@@ -496,7 +498,7 @@ def test_get_unit_shape_for_any_role(client, db_session, fisqua):
     assert body == {"mode": "offline", "projectsEnabled": True, "projectsShown": True,
                     "defaultProjectId": None, "prerequisites": {"backup": [], "fisqua": []},
                     "keptVolumes": [], "defaultLanguage": "es", "captureKey": None, "colourCardShots": False,
-                    "modeSetBy": None, "modeSetAt": None}
+                    "modeSetBy": None, "modeSetAt": None, "version": "9.8.7-shape"}
 
 
 @pytest.mark.unit

@@ -282,6 +282,9 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("PUT", "/system/unit"): Entry(),
     # Admin and operator; not the testing account.
     ("PUT", "/system/unit/capture-key"): Entry(),
+    # Read by every role and the testing account; set by an admin.
+    ("GET", "/system/timezone"): Entry(testing=True),
+    ("PUT", "/system/timezone"): Entry(),
     ("GET", "/system/testing"): Entry(),
     ("PUT", "/system/testing"): Entry(),
     ("PATCH", "/system/testing/account"): Entry(),

@@ -229,6 +229,14 @@ class CaptureKeyUpdate(BaseModel):
     capture_key: Optional[CaptureChord]
 
 
+def _unit_body(db: Session) -> dict:
+    """The GET /system/unit body: the unit mode's (app.core.unit_mode.as_api) and the release as `version`."""
+    from app.core import unit_mode
+    from app.core.version import release_version
+
+    return {**unit_mode.as_api(db), "version": release_version()}
+
+
 @router.get("/unit")
 def get_unit(
     current_user: User = Depends(allow_read_only),
@@ -252,7 +260,8 @@ def get_unit(
     switch stored the current mode, and `modeSetAt` when it was stored (ISO
     8601, UTC, with its offset); `modeSetBy` is null for the mode the unit
     wrote itself at start-up, and both are null for a mode stored before
-    they were recorded.
+    they were recorded. `version` is the Captua release the unit runs
+    (app.core.version.release_version).
 
     The testing account receives the same keys, with the mode and the
     projects setting (`mode`, `projectsEnabled`) only: `projectsShown` is
@@ -261,10 +270,9 @@ def get_unit(
     and `keptVolumes` are empty, since they name or count real work, and
     `modeSetBy` is null, since it names an account of the unit.
     """
-    from app.core import unit_mode
     from app.core.testing_space import TESTING_ROLE
 
-    body = unit_mode.as_api(db)
+    body = _unit_body(db)
     if current_user.role == TESTING_ROLE:
         body = {**body, "projectsShown": True, "defaultProjectId": None, "prerequisites": [], "keptVolumes": [],
                 "modeSetBy": None}
@@ -318,7 +326,7 @@ def put_unit(
         unit_mode.set_default_language(db, payload.defaultLanguage, actor=current_user.username)
     if payload.colourCardShots is not None:
         unit_mode.set_colour_card_shots(db, payload.colourCardShots, actor=current_user.username)
-    return unit_mode.as_api(db)
+    return _unit_body(db)
 
 
 @router.put("/unit/capture-key")
@@ -337,7 +345,85 @@ def put_capture_key(
 
     chord = payload.capture_key.model_dump() if payload.capture_key is not None else None
     unit_mode.set_capture_key(db, chord, actor=current_user.username)
-    return unit_mode.as_api(db)
+    return _unit_body(db)
+
+
+# ---------------------------------------------------------------------------
+# The unit's time zone (app.core.timezone; set through the helper's set-timezone)
+# ---------------------------------------------------------------------------
+
+_TIMEZONE_REFUSALS = {
+    "unknown_zone": "This unit does not know that time zone.",
+    "timezone_unavailable": "This unit's system helper cannot set the time zone.",
+    "timezone_set_failed": "The time zone could not be changed.",
+}
+
+
+# Held across each PUT's read before, set, read after and audit entry, so that
+# each entry's "from" and "to" are that request's own. The route is a plain
+# def, which FastAPI runs on its thread pool, in the one uvicorn process the
+# unit runs; a threading lock serialises those threads.
+_timezone_lock = threading.Lock()
+
+
+def _timezone_refused(code: str, status: int) -> HTTPException:
+    return HTTPException(status_code=status, detail={"code": code, "message": _TIMEZONE_REFUSALS[code]})
+
+
+class TimezoneUpdate(BaseModel):
+    """The body of PUT /system/timezone: a zone name, a JSON string. Required."""
+    model_config = ConfigDict(extra="forbid", strict=True)
+
+    zone: str
+
+
+@router.get("/timezone")
+def get_timezone(current_user: User = Depends(allow_read_only)):
+    """The unit's time zone, for every role and the testing account.
+
+    `zone` is the zone the unit is set to, read without root, or null when
+    it cannot be read; `zones` is every name `timedatectl list-timezones`
+    gives, empty when it cannot be read (app.core.timezone). `canSet` is
+    true when the caller is an admin and the installed helper has the
+    `set-timezone` verb.
+    """
+    from app.core import system_helper, timezone
+
+    can_set = current_user.role == "admin" and system_helper.supports(system_helper.SET_TIMEZONE)
+    return {"zone": timezone.current_zone(), "zones": timezone.zones(), "canSet": can_set}
+
+
+@router.put("/timezone")
+def put_timezone(
+    payload: TimezoneUpdate,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Set the unit's time zone through `sudo HELPER set-timezone <zone>`. Admin only.
+
+    Refused, with nothing run, as 422 `unknown_zone` when `zone` is not in
+    the list `timedatectl list-timezones` gives at the time of the request,
+    and as 503 `timezone_unavailable` when the installed helper lacks the
+    verb. A helper that exits non-zero is 500 `timezone_set_failed`; its
+    output goes to the log and never into the response. On success the
+    answer is {zone}, the zone read again after the set, and the change is
+    logged `unit_timezone_changed` with the admin and `<before> -> <after>`.
+    One PUT at a time reads, sets, reads again and logs (_timezone_lock).
+    """
+    from app.core import audit, system_helper, timezone
+
+    if payload.zone not in timezone.zones():
+        raise _timezone_refused("unknown_zone", 422)
+    if not system_helper.supports(system_helper.SET_TIMEZONE):
+        raise _timezone_refused("timezone_unavailable", 503)
+    with _timezone_lock:
+        before = timezone.current_zone()
+        if not system_helper.run(system_helper.SET_TIMEZONE, payload.zone):
+            raise _timezone_refused("timezone_set_failed", 500)
+        after = timezone.current_zone()
+        audit.log_event(db, level="INFO", category="system", action="unit_timezone_changed",
+                        actor=current_user.username, detail=f"{before} -> {after}")
+    return {"zone": after}
 
 
 # ---------------------------------------------------------------------------

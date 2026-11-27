@@ -167,6 +167,8 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/system/catalogue-backup'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/system/unit'): (('admin', 'operator', 'reviewer'),),
     ('PUT', '/system/unit'): (('admin',),),
+    ('GET', '/system/timezone'): (('admin', 'operator', 'reviewer'),),
+    ('PUT', '/system/timezone'): (('admin',),),
     ('PUT', '/system/unit/capture-key'): (('admin', 'operator'),),
     ('GET', '/system/testing'): (('admin',),),
     ('PUT', '/system/testing'): (('admin',),),
