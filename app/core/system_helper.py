@@ -4,7 +4,9 @@ The helper is installed at HELPER, root-owned, with a sudoers line that
 lets the service user run it with any arguments
 (install-system-helper.sh). Each verb is one case label in its `main`;
 an unknown verb exits 1 with "unknown verb". The backend calls it as the
-power route does: `sudo HELPER <verb>`, stdin closed, output captured.
+power route does: `sudo HELPER <verb> [<argument>...]`, as an argument
+list with no shell, stdin closed, output captured, bounded by
+TIMEOUT_SECONDS. Each argument is one argv element; the helper checks it.
 
 A unit's helper is reinstalled only when install-system-helper.sh runs
 again, which update.sh does not do, so a newer backend can meet an older
@@ -12,10 +14,11 @@ helper. supports() reads the installed file for the verb's case label
 (`restart-backend)`) instead of calling it and reading the refusal. A
 helper that cannot be read counts as lacking the verb.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import logging
+import os
 import shutil
 import subprocess
 
@@ -23,6 +26,7 @@ logger = logging.getLogger(__name__)
 
 HELPER = "/usr/local/bin/dtk-system-helper"
 RESTART_BACKEND = "restart-backend"
+SET_TIMEZONE = "set-timezone"
 TIMEOUT_SECONDS = 30
 
 
@@ -38,16 +42,16 @@ def supports(verb: str) -> bool:
     return any(line.strip().startswith(f"{verb})") for line in text.splitlines())
 
 
-def run(verb: str) -> bool:
-    """Run `sudo HELPER <verb>`. True on exit 0. Its output goes to the log only on failure."""
+def run(verb: str, *args: str) -> bool:
+    """Run `sudo HELPER <verb> <args>...`. True on exit 0. Its output goes to the log only on failure."""
     try:
-        result = subprocess.run(["sudo", HELPER, verb], capture_output=True, text=True,
+        result = subprocess.run(["sudo", HELPER, verb, *args], capture_output=True, text=True,
                                 timeout=TIMEOUT_SECONDS, stdin=subprocess.DEVNULL)
     except (OSError, subprocess.SubprocessError) as exc:
-        logger.error("dtk-system-helper %s could not be run: %s", verb, type(exc).__name__)
+        logger.error("%s %s could not be run: %s", os.path.basename(HELPER), verb, type(exc).__name__)
         return False
     if result.returncode != 0:
         detail = (result.stderr or "").strip() or (result.stdout or "").strip() or "no output"
-        logger.error("dtk-system-helper %s failed (rc=%s): %s", verb, result.returncode, detail)
+        logger.error("%s %s failed (rc=%s): %s", os.path.basename(HELPER), verb, result.returncode, detail)
         return False
     return True
