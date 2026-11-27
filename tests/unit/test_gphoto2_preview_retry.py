@@ -297,7 +297,7 @@ def test_a_run_of_failures_on_a_closed_session_does_not_close_its_successor(
     with pytest.raises(RuntimeError, match="DSLR capture failed"):
         backend.capture_image(tmp_path / "a.jpg", SimpleNamespace(camera_index=0))
     assert session_a.close_calls == 1
-    assert backend._preview_failing_since[0][0] is session_a
+    assert backend._preview_failures[0][0] is session_a
 
     # Session B opens on the next poll, which fails at t=12: twelve seconds
     # after A's run began, four after its last failure.
@@ -311,7 +311,7 @@ def test_a_run_of_failures_on_a_closed_session_does_not_close_its_successor(
 
     assert session_b.close_calls == 0
     assert backend._sessions.get(0) is session_b
-    assert backend._preview_failing_since[0][0] is session_b
+    assert backend._preview_failures[0][0] is session_b
 
 
 def test_the_retry_releases_a_real_lock_when_the_index_is_gone(monkeypatch):
@@ -694,7 +694,7 @@ def test_a_failed_re_detect_with_the_node_gone_is_a_404_and_closes_the_session(
     assert resp.status_code == 404, resp.text
     assert session.close_calls == 1
     assert 0 not in backend._sessions
-    assert 0 not in backend._preview_failing_since
+    assert 0 not in backend._preview_failures
 
 
 def test_a_failed_re_detect_with_the_node_back_is_a_503(monkeypatch, api):
@@ -858,7 +858,7 @@ def test_another_body_at_the_index_after_the_second_frame_is_a_404(monkeypatch):
 
     assert session.close_calls == 1
     assert 0 not in backend._sessions
-    assert 0 not in backend._preview_failing_since
+    assert 0 not in backend._preview_failures
 
 
 def test_two_pollers_skipping_each_others_retries_still_close_a_dead_session(
@@ -1030,3 +1030,610 @@ def test_the_wrong_body_on_open_does_not_scan_under_the_lock(monkeypatch):
 
     assert under_lock == []
     assert not lock.locked()
+
+
+# ----------------------------------------------------------------------
+# Two clients polling one camera
+# ----------------------------------------------------------------------
+
+
+def _pause_before_recording(monkeypatch, thread_name):
+    """Make thread_name's second _port_node_exists() call, the one made
+    just before its failure is recorded, wait until released."""
+    reached = threading.Event()
+    release = threading.Event()
+    calls = {"n": 0}
+
+    def node_exists(port):
+        if threading.current_thread().name == thread_name:
+            calls["n"] += 1
+            if calls["n"] == 2:
+                reached.set()
+                release.wait(5)
+        return True
+
+    monkeypatch.setattr(gb, "_port_node_exists", node_exists)
+    return reached, release
+
+
+def test_a_failure_recorded_after_a_later_good_frame_does_not_start_a_run(
+    monkeypatch,
+):
+    # Poll A fails both attempts at t=1000 and pauses before recording; poll
+    # B gets a good frame at t=1001; A then records. Poll C fails at t=1011:
+    # it is the only failure since B's frame, so the session stays open.
+    backend, session, state = _backend(
+        monkeypatch,
+        [_unspecified(), _unspecified(), FRAME, _unspecified(), _unspecified()],
+    )
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    reached, release = _pause_before_recording(monkeypatch, "poll-A")
+    results = {}
+
+    def poll_a():
+        try:
+            results["A"] = backend.capture_preview(0)
+        except Exception as exc:
+            results["A"] = exc
+
+    thread = threading.Thread(target=poll_a, name="poll-A", daemon=True)
+    thread.start()
+    try:
+        assert reached.wait(5)
+        state.clock.now += 1
+        assert backend.capture_preview(0) == FRAME
+    finally:
+        release.set()
+        thread.join(5)
+    assert not thread.is_alive()
+    assert isinstance(results["A"], PreviewFrameFailedError)
+
+    state.clock.now += gb._ROUTINE_SCAN_MIN_S
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    assert session.close_calls == 0
+    assert backend._sessions.get(0) is session
+
+
+def test_the_retry_closes_a_session_whose_run_fell_due_during_the_first_attempt(
+    monkeypatch,
+):
+    # Poll P fails at t=1000. At t=1010 poll B fails its first attempt; while
+    # B waits to retry, poll A takes the lock for its first attempt, so B's
+    # retry is skipped and B's failure brings the run to the window without
+    # closing the session. A's retry must close it before using it again.
+    backend, session, state = _backend(monkeypatch, [])
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    a_in_frame = threading.Event()
+    b_done = threading.Event()
+
+    def a_first_attempt():
+        a_in_frame.set()
+        assert b_done.wait(5)
+        return _unspecified()
+
+    dead = _Cam(
+        [_unspecified(), _unspecified(), _unspecified(), a_first_attempt,
+         _unspecified()]
+    )
+    session._cam = dead
+    fresh = _Session(_Cam([FRAME]))
+    monkeypatch.setattr(backend, "_open_identified_session", lambda *args: fresh)
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+    assert dead.preview_calls == 2
+
+    b_at_gap = threading.Event()
+    b_resume = threading.Event()
+
+    def node_exists(port):
+        if threading.current_thread().name == "poll-B" and not b_at_gap.is_set():
+            b_at_gap.set()
+            b_resume.wait(5)
+        return True
+
+    monkeypatch.setattr(gb, "_port_node_exists", node_exists)
+    results = {}
+
+    def poll(name):
+        try:
+            results[name] = backend.capture_preview(0)
+        except Exception as exc:
+            results[name] = exc
+        if name == "B":
+            b_done.set()
+
+    state.clock.now += gb._ROUTINE_SCAN_MIN_S
+    thread_b = threading.Thread(target=poll, args=("B",), name="poll-B", daemon=True)
+    thread_a = threading.Thread(target=poll, args=("A",), name="poll-A", daemon=True)
+    try:
+        thread_b.start()
+        assert b_at_gap.wait(5)
+        thread_a.start()
+        assert a_in_frame.wait(5)
+        b_resume.set()
+        thread_b.join(5)
+        thread_a.join(5)
+    finally:
+        b_resume.set()
+        b_done.set()
+        thread_b.join(5)
+        thread_a.join(5)
+    assert not thread_b.is_alive() and not thread_a.is_alive()
+
+    assert isinstance(results["B"], PreviewFrameFailedError)
+    # A's retry is served by a new session; the dead one would fail it.
+    assert results["A"] == FRAME
+    # P's two attempts, B's first and A's first: A's retry is not made on
+    # the dead session, which A closes and replaces.
+    assert dead.preview_calls == 4
+    assert session.close_calls == 1
+    assert backend._sessions.get(0) is fresh
+
+
+def test_a_late_failure_on_an_older_session_leaves_the_newer_sessions_run(
+    monkeypatch,
+):
+    # An attempt on session A starts at t=1000; A is then replaced by B,
+    # whose polls fail at t=1000 and t=1005. A's failure is recorded only
+    # after that. B's poll at t=1010 brings B's run to the window.
+    backend, session_a, state = _backend(monkeypatch, [])
+    attempt_on_a = backend._preview_attempt()
+    session_b = _Session(_Cam([_unspecified()] * 6))
+    backend._sessions[0] = session_b
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+    state.clock.now += 5
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    backend._record_preview_failure(0, session_a, attempt_on_a)
+    assert backend._preview_failures[0][0] is session_b
+
+    state.clock.now += 5
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+    assert session_b.close_calls == 1
+    assert 0 not in backend._sessions
+
+
+def test_a_late_failure_is_placed_when_its_attempt_started(monkeypatch):
+    # An attempt starts at t=1000; a poll on the same session fails at
+    # t=1021; the attempt's failure is recorded at t=1031. At its start it
+    # is more than the gap before the poll, so no run spans the window; at
+    # the time it is recorded it would make a run of ten seconds.
+    backend, session, state = _backend(monkeypatch, [_unspecified()] * 2)
+    old_attempt = backend._preview_attempt()
+    state.clock.now += gb._PREVIEW_FAILURE_GAP_S + 1
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+    state.clock.now += gb._ROUTINE_SCAN_MIN_S
+
+    backend._record_preview_failure(0, session, old_attempt)
+
+    assert session.close_calls == 0
+    assert backend._sessions.get(0) is session
+
+
+def test_a_successful_capture_ends_a_run_recorded_on_another_session(
+    monkeypatch, tmp_path
+):
+    # Session A's polls fail; A is replaced by B, which captures. The run on
+    # A is over, and a failure on A from before the capture starts nothing.
+    backend, session_a, state = _backend(monkeypatch, [_unspecified()] * 2)
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+    assert backend._preview_failures[0][0] is session_a
+    attempt_on_a = backend._preview_attempt()
+
+    session_b = _Session(_Cam([]))
+    session_b.apply_dslr_config = lambda config: None
+    session_b.capture = lambda path, **kw: (0.1, path)
+    backend._sessions[0] = session_b
+    state.clock.now += 1
+    backend.capture_image(tmp_path / "b.jpg", SimpleNamespace(camera_index=0))
+
+    assert 0 not in backend._preview_failures
+    backend._record_preview_failure(0, session_a, attempt_on_a)
+    assert 0 not in backend._preview_failures
+
+
+def test_a_late_failure_that_joins_two_runs_closes_at_the_next_acquisition(
+    monkeypatch,
+):
+    # Failures start at t=1000 (poll P), t=1015 (poll A, recorded late) and
+    # t=1021 (poll B, recorded before A). B alone is more than the gap after
+    # P, but A joins them into one run of 21 s. A records while the lock is
+    # held, so the close falls to the next acquisition, poll C's at t=1022.
+    backend, session, state = _backend(monkeypatch, [_unspecified()] * 7)
+    dead = session._cam
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    fresh = _Session(_Cam([FRAME]))
+    monkeypatch.setattr(backend, "_open_identified_session", lambda *args: fresh)
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    state.clock.now = 1015.0
+    reached, release = _pause_before_recording(monkeypatch, "poll-A")
+    results = {}
+
+    def poll_a():
+        try:
+            results["A"] = backend.capture_preview(0)
+        except Exception as exc:
+            results["A"] = exc
+
+    thread = threading.Thread(target=poll_a, name="poll-A", daemon=True)
+    thread.start()
+    try:
+        assert reached.wait(5)
+        state.clock.now = 1021.0
+        with pytest.raises(PreviewFrameFailedError):
+            backend.capture_preview(0)
+        with lock:
+            release.set()
+            thread.join(5)
+            assert not thread.is_alive()
+            assert session.close_calls == 0
+    finally:
+        release.set()
+        thread.join(5)
+    assert isinstance(results["A"], PreviewFrameFailedError)
+
+    state.clock.now = 1022.0
+    assert backend.capture_preview(0) == FRAME
+    assert session.close_calls == 1
+    assert dead.preview_calls == 6
+    assert backend._sessions.get(0) is fresh
+
+
+def _any_run_spans_the_window(starts):
+    """Does some chain of starts, each within the gap of the one before, span the window?"""
+    ordered = sorted(starts)
+    first = ordered[0]
+    for earlier, later in zip(ordered, ordered[1:]):
+        if later - earlier > gb._PREVIEW_FAILURE_GAP_S:
+            first = later
+        elif later - first >= gb._ROUTINE_SCAN_MIN_S:
+            return True
+    return False
+
+
+def test_the_decision_does_not_depend_on_the_order_failures_are_recorded(
+    monkeypatch,
+):
+    # Failures on one session may be recorded in any order. After each
+    # record the session must be due exactly when some chain among the
+    # failures recorded so far spans the window.
+    import itertools
+    import random
+
+    backend, session, _state = _backend(monkeypatch, [])
+    rng = random.Random(385)
+    gap, window = gb._PREVIEW_FAILURE_GAP_S, gb._ROUTINE_SCAN_MIN_S
+    sets = [
+        [0.0, window, window + gap + 1.0],
+        [0.0, gap, gap + 1.0],
+        [0.0, gap, window + gap],
+        [0.0, window, window + gap, window + gap + 1.0],
+        [0.0, window - 0.5, window + gap - 0.5, 2 * window + gap - 1.0],
+    ]
+    for count in range(2, 10):
+        for _ in range(25):
+            sets.append(
+                [rng.uniform(0.0, 4 * (window + gap)) for _ in range(count)]
+            )
+
+    def orders(starts):
+        if len(starts) <= 6:
+            yield from itertools.permutations(starts)
+        else:
+            for _ in range(200):
+                order = list(starts)
+                rng.shuffle(order)
+                yield order
+
+    for starts in sets:
+        number_of = {start: rank for rank, start in enumerate(sorted(starts), 1)}
+        for order in orders(starts):
+            backend._preview_failures.clear()
+            seen = []
+            for start in order:
+                seen.append(start)
+                due = backend._note_preview_failure(
+                    0, session, (number_of[start], start)
+                )
+                assert due == _any_run_spans_the_window(seen), (order, seen)
+
+
+def test_a_failure_recorded_after_a_much_later_one_still_joins_its_run(
+    monkeypatch,
+):
+    # Failures start at t=1000 (poll P), t=1010 (poll A) and t=1031 (poll
+    # B). B records before A, and B is more than the gap after A; A's
+    # record at t=1032 makes P and A a run of ten seconds. A records while
+    # the lock is held, so the next acquisition closes the session.
+    backend, session, state = _backend(monkeypatch, [_unspecified()] * 8)
+    dead = session._cam
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    fresh = _Session(_Cam([FRAME]))
+    monkeypatch.setattr(backend, "_open_identified_session", lambda *args: fresh)
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    state.clock.now = 1010.0
+    reached, release = _pause_before_recording(monkeypatch, "poll-A")
+    results = {}
+
+    def poll_a():
+        try:
+            results["A"] = backend.capture_preview(0)
+        except Exception as exc:
+            results["A"] = exc
+
+    thread = threading.Thread(target=poll_a, name="poll-A", daemon=True)
+    thread.start()
+    try:
+        assert reached.wait(5)
+        state.clock.now = 1031.0
+        with pytest.raises(PreviewFrameFailedError):
+            backend.capture_preview(0)
+        state.clock.now = 1032.0
+        with lock:
+            release.set()
+            thread.join(5)
+            assert not thread.is_alive()
+            assert session.close_calls == 0
+    finally:
+        release.set()
+        thread.join(5)
+    assert isinstance(results["A"], PreviewFrameFailedError)
+
+    state.clock.now = 1032.5
+    try:
+        results["next"] = backend.capture_preview(0)
+    except Exception as exc:
+        results["next"] = exc
+    assert results["next"] == FRAME
+    assert dead.preview_calls == 6
+    assert session.close_calls == 1
+    assert backend._sessions.get(0) is fresh
+
+
+def test_a_due_run_closes_at_the_next_acquisition_whatever_is_still_unrecorded(
+    monkeypatch,
+):
+    # Poll P fails at t=1000. Poll A fails at t=1010 and pauses before
+    # recording. Poll B's retry starts at t=1029 and holds the lock until
+    # t=1031; A records at t=1029.1, which makes the run due while B holds
+    # the lock. B's retry fails and B pauses before recording. The next
+    # acquisition, at t=1031.1, must close the session before its frame.
+    backend, session, state = _backend(monkeypatch, [])
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    b_in_retry = threading.Event()
+    b_retry_go = threading.Event()
+
+    def b_retry():
+        b_in_retry.set()
+        assert b_retry_go.wait(5)
+        return _unspecified()
+
+    dead = _Cam(
+        [_unspecified()] * 5 + [b_retry] + [_unspecified()] * 2
+    )
+    session._cam = dead
+    fresh = _Session(_Cam([FRAME]))
+    monkeypatch.setattr(backend, "_open_identified_session", lambda *args: fresh)
+
+    reached = {"poll-A": threading.Event(), "poll-B": threading.Event()}
+    release = {"poll-A": threading.Event(), "poll-B": threading.Event()}
+    calls = {"poll-A": 0, "poll-B": 0}
+
+    def node_exists(port):
+        name = threading.current_thread().name
+        if name in calls:
+            calls[name] += 1
+            if calls[name] == 2:
+                reached[name].set()
+                release[name].wait(5)
+        return True
+
+    monkeypatch.setattr(gb, "_port_node_exists", node_exists)
+    results = {}
+
+    def poll(name):
+        try:
+            results[name] = backend.capture_preview(0)
+        except Exception as exc:
+            results[name] = exc
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    thread_a = threading.Thread(target=poll, args=("A",), name="poll-A", daemon=True)
+    thread_b = threading.Thread(target=poll, args=("B",), name="poll-B", daemon=True)
+    try:
+        state.clock.now = 1010.0
+        thread_a.start()
+        assert reached["poll-A"].wait(5)
+
+        state.clock.now = 1029.0
+        thread_b.start()
+        assert b_in_retry.wait(5)
+
+        state.clock.now = 1029.1
+        release["poll-A"].set()
+        thread_a.join(5)
+        assert not thread_a.is_alive()
+        assert session.close_calls == 0
+
+        state.clock.now = 1031.0
+        b_retry_go.set()
+        assert reached["poll-B"].wait(5)
+
+        state.clock.now = 1031.1
+        try:
+            results["next"] = backend.capture_preview(0)
+        except Exception as exc:
+            results["next"] = exc
+        assert results["next"] == FRAME
+        assert dead.preview_calls == 6
+        assert session.close_calls == 1
+        assert backend._sessions.get(0) is fresh
+    finally:
+        for event in (*release.values(), b_retry_go):
+            event.set()
+        thread_a.join(5)
+        thread_b.join(5)
+    assert not thread_b.is_alive()
+    assert isinstance(results["A"], PreviewFrameFailedError)
+    assert isinstance(results["B"], PreviewFrameFailedError)
+    assert session.close_calls == 1
+
+
+def test_a_due_run_stays_due_when_a_later_failure_drops_its_first(monkeypatch):
+    # P fails at t=1000; A fails at t=1010 and records at t=1631.1, while
+    # B's retry, started at t=1631, holds the lock: the run of P and A is
+    # due. B records at t=1632, which drops P's failure from the record;
+    # the run must stay due, so the session is closed before the next frame.
+    backend, session, state = _backend(monkeypatch, [])
+    lock = threading.Lock()
+    monkeypatch.setattr(backend, "_get_camera_lock", lambda index: lock)
+    b_in_retry = threading.Event()
+    b_retry_go = threading.Event()
+
+    def b_retry():
+        b_in_retry.set()
+        assert b_retry_go.wait(5)
+        state.clock.now = 1632.0
+        return _unspecified()
+
+    dead = _Cam([_unspecified()] * 5 + [b_retry] + [_unspecified()] * 2)
+    session._cam = dead
+    fresh = _Session(_Cam([FRAME]))
+    monkeypatch.setattr(backend, "_open_identified_session", lambda *args: fresh)
+    reached, release = _pause_before_recording(monkeypatch, "poll-A")
+    results = {}
+
+    def poll(name):
+        try:
+            results[name] = backend.capture_preview(0)
+        except Exception as exc:
+            results[name] = exc
+
+    with pytest.raises(PreviewFrameFailedError):
+        backend.capture_preview(0)
+
+    thread_a = threading.Thread(target=poll, args=("A",), name="poll-A", daemon=True)
+    thread_b = threading.Thread(target=poll, args=("B",), name="poll-B", daemon=True)
+    try:
+        state.clock.now = 1010.0
+        thread_a.start()
+        assert reached.wait(5)
+
+        state.clock.now = 1631.0
+        thread_b.start()
+        assert b_in_retry.wait(5)
+
+        state.clock.now = 1631.1
+        release.set()
+        thread_a.join(5)
+        assert not thread_a.is_alive()
+        assert session.close_calls == 0
+
+        b_retry_go.set()
+        thread_b.join(5)
+        assert not thread_b.is_alive()
+    finally:
+        release.set()
+        b_retry_go.set()
+        thread_a.join(5)
+        thread_b.join(5)
+    assert isinstance(results["A"], PreviewFrameFailedError)
+    assert isinstance(results["B"], PreviewFrameFailedError)
+
+    state.clock.now = 1632.1
+    try:
+        results["next"] = backend.capture_preview(0)
+    except Exception as exc:
+        results["next"] = exc
+    assert results["next"] == FRAME
+    assert dead.preview_calls == 6
+    assert session.close_calls == 1
+    assert backend._sessions.get(0) is fresh
+
+
+def test_the_decision_holds_while_old_failures_are_dropped(monkeypatch):
+    # Starts spread over more than the record keeps, so failures are dropped
+    # as later ones are recorded. The session must never be due unless some
+    # chain among every failure recorded so far spans the window, and must be
+    # due whenever one does, provided no failure's record arrives after the
+    # record of a failure that started more than the horizon after it.
+    import itertools
+    import random
+
+    backend, session, _state = _backend(monkeypatch, [])
+    rng = random.Random(3850)
+    horizon = gb._PREVIEW_FAILURE_HORIZON_S
+    window = gb._ROUTINE_SCAN_MIN_S
+    sets = [
+        [0.0, window, horizon + 1.0],
+        [0.0, window, horizon + window + 21.0],
+        [0.0, window, 2 * horizon],
+        [0.0, 5.0, horizon - 5.0, horizon + window],
+    ]
+    for count in range(3, 9):
+        for _ in range(40):
+            starts = []
+            for centre in sorted(rng.uniform(0.0, 3 * horizon) for _ in range(3)):
+                starts.extend(
+                    centre + rng.uniform(0.0, 2 * window)
+                    for _ in range(rng.randint(1, max(1, count // 2)))
+                )
+            sets.append(starts[:count])
+
+    def orders(starts):
+        if len(starts) <= 6:
+            yield from itertools.permutations(starts)
+        else:
+            for _ in range(300):
+                order = list(starts)
+                rng.shuffle(order)
+                yield order
+
+    def within_the_horizon(order):
+        return all(
+            earlier - later <= horizon
+            for i, later in enumerate(order)
+            for earlier in order[:i]
+        )
+
+    checked = 0
+    for starts in sets:
+        number_of = {start: rank for rank, start in enumerate(sorted(starts), 1)}
+        for order in orders(starts):
+            backend._preview_failures.clear()
+            prompt = within_the_horizon(order)
+            seen = []
+            for start in order:
+                seen.append(start)
+                due = backend._note_preview_failure(
+                    0, session, (number_of[start], start)
+                )
+                expected = _any_run_spans_the_window(seen)
+                if due:
+                    assert expected, (order, seen)
+                if prompt:
+                    assert due == expected, (order, seen)
+                    checked += 1
+    assert checked > 10000
