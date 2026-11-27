@@ -31,7 +31,7 @@ tests/unit/test_testing_space_access.py walks the application's routes and
 fails when a route has no entry, an entry has no route, or a path, query
 or body field named like material is not declared as a target.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 from __future__ import annotations
@@ -290,6 +290,10 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/system/testing/usb"): Entry(testing=True),
     # The offsite keys adoptions retired. A testing volume has no offsite key, so none is listed.
     ("GET", "/system/offsite/retired-keys"): Entry(),
+    ("GET", "/system/offsite"): Entry(),
+    ("POST", "/system/offsite"): Entry(),
+    ("GET", "/system/offsite/template"): Entry(),
+    ("POST", "/system/offsite/import"): Entry(),
     # An unfinished adoption of captures and its repair (app.core.adopt_repair). A testing volume is never adopted.
     ("GET", "/system/adoption"): Entry(),
     ("POST", "/system/adoption/repair"): Entry(),

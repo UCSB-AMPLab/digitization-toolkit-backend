@@ -9,7 +9,7 @@ and scanned.
 
     python -m pytest tests/unit/test_system_pairing.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import json
@@ -51,7 +51,7 @@ def bodies():
 @pytest.fixture
 def unit(monkeypatch, tmp_path, db_session):
     """A never-linked unit with a device id, rclone, and a provisioning script that takes --replace-credential."""
-    from app.core import config, device_id, fisqua_pairing_apply
+    from app.core import config, device_id, provision_runner
 
     data = tmp_path / "data"
     monkeypatch.setattr(config.settings, "DATA_DIR", str(data))
@@ -65,8 +65,8 @@ def unit(monkeypatch, tmp_path, db_session):
     script = tmp_path / "scripts" / "provision-rclone.sh"
     script.parent.mkdir()
     script.write_text("#!/bin/bash\ncase \"$1\" in\n    --replace-credential) : ;;\nesac\n")
-    monkeypatch.setattr(fisqua_pairing_apply, "provision_script", lambda backend_dir=None: script)
-    monkeypatch.setattr(fisqua_pairing_apply, "rclone_available", lambda: True)
+    monkeypatch.setattr(provision_runner, "provision_script", lambda backend_dir=None: script)
+    monkeypatch.setattr(provision_runner, "rclone_available", lambda: True)
     device_id.initialise()
     return data
 
@@ -309,9 +309,9 @@ def test_hold_refused(client, registry, unit):
 
 
 def test_rclone_missing_refused(client, registry, monkeypatch):
-    from app.core import fisqua_pairing_apply
+    from app.core import provision_runner
 
-    monkeypatch.setattr(fisqua_pairing_apply, "rclone_available", lambda: False)
+    monkeypatch.setattr(provision_runner, "rclone_available", lambda: False)
     _refused(client, "rclone_missing")
 
 
@@ -324,19 +324,19 @@ def test_capture_in_progress_refused(client, registry):
 
 
 def test_script_too_old_refused_before_a_code(client, registry, unit, monkeypatch, tmp_path):
-    from app.core import fisqua_pairing_apply
+    from app.core import provision_runner
 
     old = tmp_path / "old.sh"
     old.write_text("#!/bin/bash\n")
-    monkeypatch.setattr(fisqua_pairing_apply, "provision_script", lambda backend_dir=None: old)
+    monkeypatch.setattr(provision_runner, "provision_script", lambda backend_dir=None: old)
     (unit / "rclone.conf").write_text("[b2unit]\n")
     _refused(client, "script_too_old")
 
 
 def test_script_missing_refused(client, registry, monkeypatch, tmp_path):
-    from app.core import fisqua_pairing_apply
+    from app.core import provision_runner
 
-    monkeypatch.setattr(fisqua_pairing_apply, "provision_script", lambda backend_dir=None: tmp_path / "absent.sh")
+    monkeypatch.setattr(provision_runner, "provision_script", lambda backend_dir=None: tmp_path / "absent.sh")
     _refused(client, "script_missing")
 
 

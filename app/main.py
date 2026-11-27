@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 
 from fastapi import Depends, FastAPI, Request
 from fastapi.middleware.cors import CORSMiddleware
@@ -80,6 +80,10 @@ async def lifespan(app: FastAPI):
     init_db()
     # Refuse to serve against an un-migrated schema so the failure is loud at startup rather than a later 500 in the field
     assert_schema_at_head()
+    # Key directories in /dev/shm that an earlier backend left when it was killed (app.core.provision_runner).
+    from app.core import provision_runner
+    if provision_runner.DEV_SHM.is_dir():
+        provision_runner.sweep_abandoned(provision_runner.DEV_SHM)
     # Refuse to serve with a CAMERA_BACKEND this build does not have. Checked
     # here rather than where the backend is built, because that happens lazily
     # on the first capture: the service would otherwise start, answer /health,

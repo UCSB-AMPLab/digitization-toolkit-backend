@@ -56,7 +56,7 @@ Three rules it is built around:
 Nothing here deletes or overwrites anything at the destination, and the B2 key
 is scoped so that it could not.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import gzip
@@ -235,8 +235,8 @@ def rclone_config_file() -> Optional[Path]:
     """CAPTUA_RCLONE_CONFIG as an absolute path, resolved against the backend's working directory as rclone would; None when unset.
 
     Every rclone call takes it from here (_rclone_argv), and so does
-    pairing (fisqua_pairing_apply.rclone_config_path), whose script runs in
-    another directory.
+    provisioning (provision_runner.rclone_config_path, for pairing and for
+    offsite settings), whose script runs in another directory.
     """
     configured = config.settings.RCLONE_CONFIG.strip()
     return absolute_from_backend(configured) if configured else None

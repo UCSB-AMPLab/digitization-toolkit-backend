@@ -7,7 +7,7 @@ settings, writes nothing, or exits non-zero, as told.
 
     python -m pytest tests/unit/test_fisqua_pairing_apply.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import json
@@ -169,14 +169,14 @@ def test_key_file_removed_when_the_run_fails(stub):
 def test_key_file_root_is_dev_shm_when_it_exists(monkeypatch, tmp_path):
     import tempfile
 
-    from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
 
     shm = tmp_path / "shm"
     shm.mkdir()
-    monkeypatch.setattr(fpa, "DEV_SHM", shm)
-    assert fpa.key_file_root() == shm
-    monkeypatch.setattr(fpa, "DEV_SHM", tmp_path / "absent")
-    assert fpa.key_file_root() == Path(tempfile.gettempdir())
+    monkeypatch.setattr(runner, "DEV_SHM", shm)
+    assert runner.key_file_root() == shm
+    monkeypatch.setattr(runner, "DEV_SHM", tmp_path / "absent")
+    assert runner.key_file_root() == Path(tempfile.gettempdir())
 
 
 def test_values_with_newlines_refused(stub):
@@ -311,10 +311,10 @@ def test_config_path_is_the_backends_own(stub, unit, monkeypatch):
 
 
 def test_config_path_defaults_to_the_data_directory(stub, unit, monkeypatch):
-    from app.core import config, fisqua_pairing_apply
+    from app.core import config, provision_runner
 
     monkeypatch.setattr(config.settings, "RCLONE_CONFIG", "")
-    assert fisqua_pairing_apply.rclone_config_path() == unit / "data" / "rclone.conf"
+    assert provision_runner.rclone_config_path() == unit / "data" / "rclone.conf"
     assert apply(stub) == "linked"
     assert stub.argv()[-2:] == ["--config-path", str(unit / "data" / "rclone.conf")]
 
@@ -391,10 +391,10 @@ def test_never_run_with_sudo(stub):
 
 
 def test_script_location_is_beside_the_backend():
-    from app.core import fisqua_pairing_apply
+    from app.core import provision_runner
 
     backend = Path("/home/pi/dtk/backend")
-    assert fisqua_pairing_apply.provision_script(backend) == Path("/home/pi/dtk/scripts/provision-rclone.sh")
+    assert provision_runner.provision_script(backend) == Path("/home/pi/dtk/scripts/provision-rclone.sh")
 
 
 # ---------------------------------------------------------------------------
@@ -480,6 +480,7 @@ def _failing_after(monkeypatch, target, name, calls_before=0):
 def _point_after_launch(point, monkeypatch, wired):
     """Inject one failure at a call made after the script process has started."""
     from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
 
     if point == "wait":
         real_popen = subprocess.Popen
@@ -505,13 +506,13 @@ def _point_after_launch(point, monkeypatch, wired):
         real = fpa.apply_payload
         monkeypatch.setattr(fpa, "apply_payload", lambda body, **kw: real(body, **{**kw, "settings_factory": factory}))
     elif point == "digest_after":
-        _failing_after(monkeypatch, fpa, "_digest", calls_before=2)
+        _failing_after(monkeypatch, runner, "digest", calls_before=2)
     elif point == "verify":
         _failing_after(monkeypatch, fpa, "verify")
     elif point == "key_id":
-        _failing_after(monkeypatch, fpa, "_write_key_id_in")
+        _failing_after(monkeypatch, runner, "write_key_id_in")
     elif point == "rmtree":
-        _failing_after(monkeypatch, fpa.shutil, "rmtree")
+        _failing_after(monkeypatch, runner.shutil, "rmtree")
 
 
 AFTER_LAUNCH = ["wait", "settings_after", "digest_after", "verify", "key_id", "rmtree"]
@@ -585,9 +586,9 @@ def test_a_script_that_cannot_be_started_is_apply_failed(wired, monkeypatch):
 
 
 def test_a_failure_before_launch_resumes(wired, monkeypatch):
-    from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
 
-    _failing_after(monkeypatch, fpa, "_digest")  # the before-snapshot
+    _failing_after(monkeypatch, runner, "digest")  # the before-snapshot
     assert _link() == "apply_failed"
     assert len(_starts(wired.log)) == 3
     assert not wired.stub.ran
@@ -651,9 +652,9 @@ def test_latch_not_set_when_nothing_runs(stub, latch):
 
 
 def test_latch_survives_an_exception_after_launch(stub, latch, monkeypatch):
-    from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
 
-    _failing_after(monkeypatch, fpa, "_digest", calls_before=2)
+    _failing_after(monkeypatch, runner, "digest", calls_before=2)
     assert apply(stub) == "apply_unverified"
     assert latch.is_stale()
 
@@ -675,14 +676,14 @@ def test_no_scheduler_start_while_the_latch_is_set(latch, monkeypatch, caplog):
 # ---------------------------------------------------------------------------
 
 def test_relative_config_resolved_as_the_uploads_resolve_it(stub, unit, monkeypatch):
-    from app.core import catalogue_backup, config, fisqua_pairing_apply
+    from app.core import catalogue_backup, config, provision_runner
 
     monkeypatch.chdir(unit)
     monkeypatch.setattr(config.settings, "RCLONE_CONFIG", "conf/rclone.conf")
     (unit / "conf").mkdir()
     uploads = catalogue_backup._rclone_argv("lsf", "b2unit:x")
     assert uploads[uploads.index("--config") + 1] == str(unit / "conf" / "rclone.conf")
-    assert fisqua_pairing_apply.rclone_config_path() == unit / "conf" / "rclone.conf"
+    assert provision_runner.rclone_config_path() == unit / "conf" / "rclone.conf"
     assert apply(stub) == "linked"
     assert stub.argv()[-2:] == ["--config-path", str(unit / "conf" / "rclone.conf")]
 
@@ -693,7 +694,7 @@ def test_relative_config_resolved_as_the_uploads_resolve_it(stub, unit, monkeypa
 
 @pytest.mark.parametrize("point", ["mkdtemp", "open", "write"])
 def test_key_file_failure_before_launch_is_apply_failed_and_resumes(wired, monkeypatch, point):
-    from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
     from app.core import restart_latch
     from tests.unit.test_system_pairing import Progress
 
@@ -701,11 +702,11 @@ def test_key_file_failure_before_launch_is_apply_failed_and_resumes(wired, monke
         raise OSError(28, "No space left on device")
 
     if point == "mkdtemp":
-        monkeypatch.setattr(fpa.tempfile, "mkdtemp", boom)
+        monkeypatch.setattr(runner.tempfile, "mkdtemp", boom)
     elif point == "open":
-        monkeypatch.setattr(fpa, "_open_key_file", boom)
+        monkeypatch.setattr(runner, "open_key_file", boom)
     else:
-        monkeypatch.setattr(fpa, "_write_key_file", boom)
+        monkeypatch.setattr(runner, "write_key_file", boom)
     session = Progress()
     assert _link(session) == "apply_failed"
     assert session.reasons[-1] == "prepare_failed"
@@ -716,13 +717,13 @@ def test_key_file_failure_before_launch_is_apply_failed_and_resumes(wired, monke
 
 
 def test_relative_data_dir_gives_an_absolute_config_path(stub, unit, monkeypatch):
-    from app.core import config, fisqua_pairing_apply
+    from app.core import config, provision_runner
 
     monkeypatch.chdir(unit)
     monkeypatch.setattr(config.settings, "DATA_DIR", "data")
     monkeypatch.setattr(config.settings, "RCLONE_CONFIG", "")
-    assert fisqua_pairing_apply.rclone_config_path() == unit / "data" / "rclone.conf"
-    assert fisqua_pairing_apply.rclone_config_path().is_absolute()
+    assert provision_runner.rclone_config_path() == unit / "data" / "rclone.conf"
+    assert provision_runner.rclone_config_path().is_absolute()
     assert apply(stub) == "linked"
     assert stub.argv()[-2:] == ["--config-path", str(unit / "data" / "rclone.conf")]
     key_path = Path(stub.read("key_path").strip())
@@ -763,7 +764,7 @@ def test_no_scheduler_start_once_shutdown_begins(latch, caplog):
 
 
 def test_the_wait_after_sigkill_is_bounded(monkeypatch):
-    from app.core import fisqua_pairing_apply as fpa
+    from app.core import provision_runner as runner
 
     class Stuck:
         pid = 999999
@@ -776,7 +777,7 @@ def test_the_wait_after_sigkill_is_bounded(monkeypatch):
         def send_signal(self, sig):
             pass
 
-    monkeypatch.setattr(fpa, "_signal_group", lambda process, sig: None)
-    monkeypatch.setattr(fpa.restart_latch, "set_stale_unless_shutting_down", lambda: True)
-    exit_code, killed = fpa._run_script(["stub"], {}, "/", lambda *a, **k: Stuck(), 0.01, 0.01)
+    monkeypatch.setattr(runner, "signal_group", lambda process, sig: None)
+    monkeypatch.setattr(runner.restart_latch, "set_stale_unless_shutting_down", lambda: True)
+    exit_code, killed = runner.run_script(["stub"], {}, "/", lambda *a, **k: Stuck(), 0.01, 0.01)
     assert (exit_code, killed) == (None, True)
