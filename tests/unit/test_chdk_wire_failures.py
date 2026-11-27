@@ -284,7 +284,7 @@ def test_the_mode_is_confirmed_once_and_then_trusted(monkeypatch, tmp_path):
     # default, so no other zoom script follows. The clock is read once after
     # it; the fake's clock agrees with the unit's.
     assert body.lua_calls == [
-        "enter_alt()", "return get_mode()", "set_aflock(0)",
+        "enter_alt()", cb._MODE_LUA, "set_aflock(0)",
         "return get_zoom_steps()", cb._READ_CLOCK_LUA, "enter_alt()",
     ], "get_mode is asked once; ALT mode is asserted on every capture"
     assert len(body.shots) == 2

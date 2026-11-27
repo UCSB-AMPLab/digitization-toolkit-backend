@@ -67,6 +67,10 @@ class _FakeBackend:
             raise RuntimeError(f"cam{camera_config.camera_index} failed after writing")
         return out, None
 
+    def list_devices(self):
+        """No body rows: the capture routes' camera set-up check finds nothing to set up."""
+        return []
+
 
 @pytest.fixture
 def backend(monkeypatch):

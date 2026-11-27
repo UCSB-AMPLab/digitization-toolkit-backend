@@ -1,4 +1,4 @@
-# Version: 0.3.0
+# Version: 0.4.0
 """The network screen's routes (NEH-253), over app.core.network.
 
 GET    /network/status              what the unit is connected to
@@ -6,14 +6,19 @@ GET    /network/wifi                the Wi-Fi networks in range and the saved on
 POST   /network/wifi/join           start a join (202); its outcome is read from:
 GET    /network/wifi/join           the last join's state
 DELETE /network/wifi/saved/{uuid}   forget a saved Wi-Fi network (204)
+GET    /network/tailscale           the unit's Tailscale status, read-only
 
-Without nmcli every route answers 501. A read that NetworkManager does not
+Without nmcli every nmcli route answers 501. A read that NetworkManager does not
 answer is a 503 with the problem `network_manager_unavailable`. A refusal is
 a 409 whose detail lists {code, message} problems, as app.core.unit_mode's
 ModeRefused does; the frontend translates by code. `not_permitted` (join, forget)
 means polkit does not let the backend activate or save connections; GET
 /network/status reports the three permissions. A scan is never refused for
 lack of the scan permission: it answers from the cached list.
+
+GET /network/tailscale does not need nmcli (app.core.tailscale). Without the
+tailscale binary it answers 200 with `installed: false`; a status that
+cannot be read is a 503 with the problem `tailscale_unavailable`.
 
 A request that fails validation answers 422 with each error's `loc`,
 `type` and `msg` only (_NetworkRoute): FastAPI's default body echoes the
@@ -37,7 +42,7 @@ from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker
 from app.api.deps import get_db_dependency
-from app.core import network
+from app.core import network, tailscale
 from app.core.validation_errors import plain_errors
 from app.core.audit import log_event
 from app.models.user import User
@@ -72,6 +77,13 @@ def _unavailable() -> HTTPException:
     return HTTPException(status_code=503, detail={
         "message": "NetworkManager is not answering.",
         "problems": [{"code": "network_manager_unavailable"}],
+    })
+
+
+def _tailscale_unavailable() -> HTTPException:
+    return HTTPException(status_code=503, detail={
+        "message": "Tailscale is not answering.",
+        "problems": [{"code": "tailscale_unavailable"}],
     })
 
 
@@ -201,3 +213,18 @@ def delete_saved(
     log_event(db, level="INFO", category="system", action="network_forget", actor=current_user.username,
               subject=ssid)
     return Response(status_code=204)
+
+
+@router.get("/tailscale")
+def get_tailscale(current_user: User = Depends(allow_network_read)):
+    """`{installed, state, online, name, addresses, health, needs_login}`
+    from `tailscale status --json --peers=false` (app.core.tailscale.status):
+    BackendState, Self.Online, Self.DNSName without its trailing dot,
+    TailscaleIPs, the number of health warnings, and whether BackendState is
+    NeedsLogin. No text written by Tailscale is returned. 503
+    tailscale_unavailable when tailscale is installed and its status cannot
+    be read."""
+    try:
+        return tailscale.status()
+    except tailscale.TailscaleUnavailable:
+        raise _tailscale_unavailable()

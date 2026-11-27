@@ -74,6 +74,9 @@ def test_an_administrator_turns_it_on_and_off(client, db_session):
 
 @pytest.mark.unit
 def test_the_setting_alone_changes_nothing_else(client, db_session):
+    from app.core import unit_mode
+    # The row the unit writes at start-up, so that the PUT does not write it (and its mode_set_at).
+    unit_mode.initialise()
     _admin, headers = _account(db_session, "admin")
     before = client.get("/system/unit", headers=headers).json()
     after = client.put("/system/unit", json={"colourCardShots": True}, headers=headers).json()

@@ -11,7 +11,7 @@ projects on), every new volume goes into the unit's default project.
 
     python -m pytest tests/unit/test_unit_mode.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import importlib.util
@@ -495,7 +495,8 @@ def test_get_unit_shape_for_any_role(client, db_session, fisqua):
     body = resp.json()
     assert body == {"mode": "offline", "projectsEnabled": True, "projectsShown": True,
                     "defaultProjectId": None, "prerequisites": {"backup": [], "fisqua": []},
-                    "keptVolumes": [], "defaultLanguage": "es", "captureKey": None, "colourCardShots": False}
+                    "keptVolumes": [], "defaultLanguage": "es", "captureKey": None, "colourCardShots": False,
+                    "modeSetBy": None, "modeSetAt": None}
 
 
 @pytest.mark.unit

@@ -875,6 +875,57 @@ def _setup_report(raw_devices, registry) -> CameraSetupResponse:
 	)
 
 
+CAMERA_SETUP_NEEDED = "camera_setup_needed"
+CAMERA_SETUP_NEEDED_MESSAGE = "The cameras' pages are not set. Confirm which page each camera photographs, then capture."
+# The reason a capture's set-up refusal gives when the bodies could not be listed.
+CAMERA_LIST_UNREADABLE = "camera_list_unreadable"
+CAMERA_LIST_UNREADABLE_MESSAGE = "Captua could not read the camera list to check which page each camera photographs. Reload the camera list, then capture."
+
+
+def _refuse_a_capture_while_camera_setup_is_needed() -> None:
+	"""409 camera_setup_needed while the cameras' pages are not set, or when the camera list cannot be read.
+
+	The check GET /cameras/setup reports (_setup_report), on one listing of
+	the backend's bodies: one list_devices call per capture request, beside
+	the one default_camera_config_from_registry makes for each camera on
+	the gphoto2 and CHDK backends. The detail's `reasons` are the setup
+	report's reason codes, or `camera_list_unreadable` when the listing
+	fails or the capture system cannot be reached. Every page capture,
+	retakes and inserts included, is checked; the camera check's test
+	captures are not. Called after the volume and retake refusals, before
+	the unit's turn lock is taken, any number taken or any camera touched.
+	"""
+	try:
+		from capture.service import get_backend
+		raw_devices = get_backend().list_devices()
+	except Exception as exc:
+		logger.warning(f"Listing cameras for the capture's set-up check failed: {exc!r}")
+		raise HTTPException(status_code=409, detail={
+			"code": CAMERA_SETUP_NEEDED,
+			"message": CAMERA_LIST_UNREADABLE_MESSAGE,
+			"reasons": [CAMERA_LIST_UNREADABLE],
+		})
+	report = _setup_report(raw_devices, _get_camera_registry())
+	if report.needs_setup:
+		raise HTTPException(status_code=409, detail={
+			"code": CAMERA_SETUP_NEEDED,
+			"message": CAMERA_SETUP_NEEDED_MESSAGE,
+			"reasons": [reason.code for reason in report.reasons],
+		})
+
+
+def _refuse_a_page_before_its_colour_card_shots(db: Session, collection_id: int, retake_record: Optional[Record]) -> None:
+	"""409 colour_card_pending for a new page while the volume's colour card shots are due (app.core.colour_card).
+
+	A retake is never refused. Called after the volume refusals, with the
+	volume's row locked, before any number is taken or camera touched.
+	"""
+	if retake_record is not None:
+		return
+	from app.core import colour_card
+	colour_card.refuse_page_while_pending(db, db.get(Collection, collection_id))
+
+
 @router.get("/setup", response_model=CameraSetupResponse)
 def get_camera_setup(current_user: User = Depends(allow_read_only)):
 	"""
@@ -1747,6 +1798,8 @@ def trigger_capture(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the dual-capture endpoint to recapture it."
 		)
+	_refuse_a_capture_while_camera_setup_is_needed()
+	_refuse_a_page_before_its_colour_card_shots(db, request.collection_id, retake_record)
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:
@@ -1997,6 +2050,8 @@ def trigger_dual_capture(
 			status_code=422,
 			detail=f"Record {retake_record.id} was captured in '{retake_record.capture_mode}' mode; use the single-capture endpoint to recapture it."
 		)
+	_refuse_a_capture_while_camera_setup_is_needed()
+	_refuse_a_page_before_its_colour_card_shots(db, request.collection_id, retake_record)
 	starts_volume = _refuse_a_new_volume_out_of_turn(db, request.collection_id, retake_record, current_user)
 	retook_pending = retake_record is not None and recapture_turn.record_is_pending(retake_record)
 	try:

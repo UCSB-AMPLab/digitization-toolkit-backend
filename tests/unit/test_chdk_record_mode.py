@@ -9,12 +9,14 @@ Version: 0.3.0
 """
 
 import logging
+import re
 
 import pytest
 
 import capture.backends.chdk_backend as cb
 from capture.camera import CameraConfig
 
+from . import chdk_fakes
 from .chdk_fakes import Body, TransportError, make_backend, make_pychdk, viewport_frame
 
 
@@ -238,3 +240,82 @@ def test_a_failed_enter_alt_propagates_and_no_switch_is_attempted(monkeypatch):
     assert body.mode_switches == []
     assert body.half_presses == 0
     assert held.in_record_mode is False
+
+
+def _queue_every_return_value(monkeypatch):
+    """Make the fake camera post one answer per value a script returns.
+
+    CHDK's Lua get_mode() returns three values (is_record, is_video, mode),
+    and the camera posts one message for each. A script written as
+    `return (get_mode())` returns one.
+    """
+    original = chdk_fakes._FakeChdkPTP.execute_script
+
+    def execute_script(self, script, language=0, flags=0):
+        script_id = original(self, script, language, flags)
+        if re.search(r"\breturn\s+get_mode\(\)", script):
+            first = self._body.messages[-1].value
+            for extra in (False, 1):
+                self._body.messages.append(
+                    chdk_fakes.ScriptMessage(
+                        chdk_fakes.MSG_RET, 0, script_id, extra
+                    )
+                )
+            assert first is not None
+        return script_id
+
+    monkeypatch.setattr(
+        chdk_fakes._FakeChdkPTP, "execute_script", execute_script
+    )
+
+
+def _queued_when_settling(monkeypatch, backend, body):
+    """Record the answers still queued when the settle steps begin.
+
+    Those steps send scripts, and each script first drains the queue, so the
+    answers a confirmation left behind are visible only up to that point.
+    """
+    queued = []
+    settle = backend._settle_opened_body
+
+    def settle_opened_body(*args, **kwargs):
+        queued.append(list(body.messages))
+        return settle(*args, **kwargs)
+
+    monkeypatch.setattr(backend, "_settle_opened_body", settle_opened_body)
+    return queued
+
+
+@pytest.mark.unit
+def test_the_confirmation_leaves_no_answer_queued(monkeypatch):
+    _queue_every_return_value(monkeypatch)
+    body = Body(serial="AAA111", card=EVEN_CARD, image=JPEG)
+    backend, _ = _backend(monkeypatch, body)
+    held = backend._body_at(0)
+
+    queued = _queued_when_settling(monkeypatch, backend, body)
+
+    backend._ensure_record_mode(held)
+
+    assert held.in_record_mode is True
+    assert queued == [[]]
+
+
+@pytest.mark.unit
+def test_the_confirmation_after_a_half_press_leaves_no_answer_queued(
+    monkeypatch
+):
+    _queue_every_return_value(monkeypatch)
+    body = Body(
+        serial="AAA111", card=EVEN_CARD, image=JPEG, stuck_in_play=True,
+        half_press_arrives=True, half_press_reads=1,
+    )
+    backend, _ = _backend(monkeypatch, body)
+    held = backend._body_at(0)
+
+    queued = _queued_when_settling(monkeypatch, backend, body)
+
+    backend._ensure_record_mode(held)
+
+    assert held.in_record_mode is True
+    assert queued == [[]]

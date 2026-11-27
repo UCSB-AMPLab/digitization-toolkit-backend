@@ -248,20 +248,26 @@ def get_unit(
     `keptVolumes` lists every volume Captua keeps on the unit (NEH-320) as
     {id, name, files}, `files` being the count it would copy offsite.
     `colourCardShots` is whether operators are asked for colour card shots
-    (app.core.colour_card).
+    (app.core.colour_card). `modeSetBy` is the username of the admin whose
+    switch stored the current mode, and `modeSetAt` when it was stored (ISO
+    8601, UTC, with its offset); `modeSetBy` is null for the mode the unit
+    wrote itself at start-up, and both are null for a mode stored before
+    they were recorded.
 
     The testing account receives the same keys, with the mode and the
     projects setting (`mode`, `projectsEnabled`) only: `projectsShown` is
     true, since the account always works in its own projects and never in
     the default project, `defaultProjectId` is null and `prerequisites`
-    and `keptVolumes` are empty, since they name or count real work.
+    and `keptVolumes` are empty, since they name or count real work, and
+    `modeSetBy` is null, since it names an account of the unit.
     """
     from app.core import unit_mode
     from app.core.testing_space import TESTING_ROLE
 
     body = unit_mode.as_api(db)
     if current_user.role == TESTING_ROLE:
-        body = {**body, "projectsShown": True, "defaultProjectId": None, "prerequisites": [], "keptVolumes": []}
+        body = {**body, "projectsShown": True, "defaultProjectId": None, "prerequisites": [], "keptVolumes": [],
+                "modeSetBy": None}
     return body
 
 
@@ -281,7 +287,9 @@ def put_unit(
     `mode_changed` when another change was committed meanwhile. Switching down from fisqua tells Fisqua the new mode, best
     effort. `projectsEnabled` is stored in any mode, and matters only in
     offline mode. Each change is logged: `unit_mode_changed`,
-    `unit_projects_changed`.
+    `unit_projects_changed`. A change of the stored mode records the admin
+    and the time as `modeSetBy` and `modeSetAt`; any other change, or one
+    that repeats the current mode, leaves them as they are.
 
     Leaving offline mode while volumes are kept on the unit (NEH-320) needs
     `keptVolumes`: absent, a 409 with the problem `kept_volumes_decision`

@@ -152,7 +152,7 @@ def test_the_lock_script_follows_record_mode_and_one_enter_alt(monkeypatch, tmp_
     backend.lock_focus(0)
 
     assert body.lua_calls.count("enter_alt()") == 1
-    assert body.lua_calls.index(LOCK) > body.lua_calls.index("return get_mode()")
+    assert body.lua_calls.index(LOCK) > body.lua_calls.index(cb._MODE_LUA)
     assert body.lua_calls.index(LOCK) > body.lua_calls.index(GET_ZOOM)
 
 
@@ -541,7 +541,7 @@ def test_an_unlock_on_an_opened_body_does_not_restore_the_stored_focus(
 
     after = _after(body, UNLOCK)
     assert RESTORE not in after
-    assert GET_ZOOM not in after and "return get_mode()" not in after, (
+    assert GET_ZOOM not in after and cb._MODE_LUA not in after, (
         "the opening steps ran again"
     )
     assert len(body.shots) == 1
@@ -1239,7 +1239,7 @@ def test_the_release_on_opening_comes_before_the_zoom_and_any_restore(
 
     backend.capture_image(tmp_path / "one.jpg", _config())
 
-    assert _after(body, "return get_mode()")[:6] == [
+    assert _after(body, cb._MODE_LUA)[:6] == [
         UNLOCK, "return get_zoom_steps()", GET_ZOOM, "set_zoom(20)", GET_ZOOM,
         RESTORE,
     ]

@@ -208,6 +208,7 @@ ROLE_LISTS_BEFORE = {
     ('GET', '/network/wifi/join'): (('admin', 'operator', 'reviewer'),),
     ('POST', '/network/wifi/join'): (('admin', 'operator'),),
     ('DELETE', '/network/wifi/saved/{uuid}'): (('admin', 'operator'),),
+    ('GET', '/network/tailscale'): (('admin', 'operator', 'reviewer'),),
     ('GET', '/health'): (),
 }
 

@@ -283,6 +283,59 @@ _PREVIEW_RETRY_DELAY_S = 0.1
 # starts a new run, so an old failure cannot close a session at once.
 _PREVIEW_FAILURE_GAP_S = 2 * _ROUTINE_SCAN_MIN_S
 
+# The one assumption the record of a session's failed preview attempts makes
+# about timing: a failure whose record arrives after the record of a failure
+# that started more than _PREVIEW_FAILURE_HORIZON_S after it may be dropped
+# and then cannot join its run. Nothing between a failed frame call and its
+# record takes that long. The poll pauses _PREVIEW_RETRY_DELAY_S before its
+# retry and, when the port's device node has gone, re-detects the bus first;
+# before recording it waits for _map_lock, which a bus scan holds for the
+# length of the scan (gp.Camera.autodetect(), tens of milliseconds as
+# measured on the bench, with no deadline of its own), and reads the device
+# node.
+_PREVIEW_FAILURE_HORIZON_S = 600.0
+
+# The record keeps the failures that started no more than this long before
+# the newest one. Once a run is found to span the window the record keeps it
+# found (_note_preview_failure), so dropping a failure only matters to a run
+# not yet found. Such a run has a stretch that spans the window and lasts less
+# than _ROUTINE_SCAN_MIN_S + _PREVIEW_FAILURE_GAP_S: from its first failure
+# to the first that is _ROUTINE_SCAN_MIN_S or more after it. When the last of
+# that stretch's failures is recorded, every failure recorded before it
+# started no more than _PREVIEW_FAILURE_HORIZON_S after it, unless the
+# assumption above fails, so within this bound of every failure in the
+# stretch: none of them has been dropped, and the stretch is found.
+_PREVIEW_FAILURES_KEPT_S = (
+    _PREVIEW_FAILURE_HORIZON_S + _ROUTINE_SCAN_MIN_S + _PREVIEW_FAILURE_GAP_S
+)
+
+
+# No ordering of two clients can close a session early or keep it open late:
+# attempts and successes are numbered under the camera lock, the decision is
+# made afresh each time from the failed attempts after the latest success,
+# placed at their start times rather than when they were recorded, it holds
+# when some chain of them spans the window, which adding a failure can only
+# make true and dropping an old one does not undo, so the order in which they
+# are recorded does not change it, and every acquisition for a preview
+# attempt, the retry's included, closes a due session before using it.
+def _due_preview_run(failures) -> "tuple[float, float] | None":
+    """Start times of the first and last failure of a run that spans the window, or None.
+
+    failures holds (attempt number, start time) pairs in any order. A run is
+    a chain of failures, sorted by start time, each within
+    _PREVIEW_FAILURE_GAP_S of the one before; the session is due to be
+    closed when some run spans _ROUTINE_SCAN_MIN_S or more.
+    """
+    starts = sorted(start for _, start in failures)
+    first = starts[0]
+    for earlier, later in zip(starts, starts[1:]):
+        if later - earlier > _PREVIEW_FAILURE_GAP_S:
+            first = later
+        elif later - first >= _ROUTINE_SCAN_MIN_S:
+            return first, later
+    return None
+
+
 _USB_PORT_RE = re.compile(r"usb:([0-9]{3}),([0-9]{3})")
 
 # Where the USB topology path of a port is looked up; a module-level name so
@@ -1458,15 +1511,28 @@ class GPhoto2Backend(CameraBackend):
         self._last_scan_at: "float | None" = None
         # camera_index -> open _PTPSession
         self._sessions: dict[int, _PTPSession] = {}
-        # camera_index -> (session, _monotonic() of the first and of the last
-        # failed preview poll in the current run of failures on it); read and
-        # written under _preview_record_lock (see _note_preview_failure)
-        self._preview_failing_since: dict[
-            int, tuple[_PTPSession, float, float]
+        # camera_index -> (session, the failed preview attempts on it after
+        # the latest good attempt at the index, as (attempt number, start
+        # time) pairs, the first and last start time of the run that spans
+        # the window once one has been found, or None); read and written
+        # under _preview_record_lock (see _note_preview_failure)
+        self._preview_failures: dict[
+            int,
+            tuple[
+                _PTPSession,
+                list[tuple[int, float]],
+                "tuple[float, float] | None",
+            ],
         ] = {}
-        # guards _preview_failing_since alone, so a poll that cannot have the
-        # camera lock can still record its failure; it may be taken with a
-        # camera lock held, and no other lock is taken while it is held
+        # the number of the last attempt on any session (_preview_attempt)
+        self._preview_attempts = 0
+        # camera_index -> the number of the latest attempt that used the
+        # session at that index successfully (_end_preview_failure_run_at)
+        self._preview_good_attempt: dict[int, int] = {}
+        # guards _preview_failures, _preview_attempts and
+        # _preview_good_attempt alone, so a poll that cannot have the camera
+        # lock can still record its failure; it may be taken with a camera
+        # lock held, and no other lock is taken while it is held
         self._preview_record_lock = threading.Lock()
         # usb port -> the index that currently holds a PTP claim on it. This
         # is the record of what is claimed *now*, which self._sessions is not:
@@ -2769,9 +2835,11 @@ class GPhoto2Backend(CameraBackend):
                     f"[gphoto2] Camera {camera_index}: captured {actual_path.name} "
                     f"in {elapsed:.2f}s"
                 )
-                # The session works, so any run of failed preview polls on it
-                # is over.
-                self._end_preview_failure_run(camera_index, session)
+                # The session works, so any run of failed preview polls at
+                # this index is over.
+                self._end_preview_failure_run_at(
+                    camera_index, self._preview_attempt()[0]
+                )
                 mismatch = self._check_produced_format(
                     camera_index, session, intended, actual_path
                 )
@@ -3149,14 +3217,16 @@ class GPhoto2Backend(CameraBackend):
         from the evidence the backend holds at that moment. A run of failed
         polls that lasts _ROUTINE_SCAN_MIN_S closes the session (see
         _note_preview_failure), at once when the camera lock is free and
-        otherwise at the next acquisition here (_close_session_if_run_due).
+        otherwise at the next acquisition here (_close_session_if_run_due),
+        the retry's included.
         """
         lock = self._get_camera_lock(camera_index)
         with lock:
             self._close_session_if_run_due(camera_index)
             session = self._get_or_open_session(camera_index, False)
+            attempt = self._preview_attempt()
             try:
-                return self._preview_frame(camera_index, session)
+                return self._preview_frame(camera_index, session, attempt)
             except gp.GPhoto2Error as exc:
                 first_exc = exc
                 self.logger.warning(
@@ -3175,18 +3245,21 @@ class GPhoto2Backend(CameraBackend):
                     f"preview retry failed: {exc}"
                 )
                 self._raise_no_frame_or_not_connected(
-                    camera_index, session, first_exc,
+                    camera_index, session, attempt, first_exc,
                     f"re-detect failed: {exc}; not retried",
                 )
 
         if not lock.acquire(blocking=False):
             self._raise_no_frame_or_not_connected(
-                camera_index, session, first_exc, "camera busy; not retried"
+                camera_index, session, attempt, first_exc,
+                "camera busy; not retried",
             )
         try:
+            self._close_session_if_run_due(camera_index)
             session = self._get_or_open_session(camera_index, False)
+            attempt = self._preview_attempt()
             try:
-                return self._preview_frame(camera_index, session)
+                return self._preview_frame(camera_index, session, attempt)
             except gp.GPhoto2Error as exc:
                 self.logger.error(
                     f"[gphoto2] Camera {camera_index}: preview capture failed: {exc}"
@@ -3194,12 +3267,13 @@ class GPhoto2Backend(CameraBackend):
                 failed = exc
         finally:
             lock.release()
-        self._raise_no_frame_or_not_connected(camera_index, session, failed)
+        self._raise_no_frame_or_not_connected(camera_index, session, attempt, failed)
 
     def _raise_no_frame_or_not_connected(
         self,
         camera_index: int,
         session: "_PTPSession",
+        attempt: tuple[int, float],
         cause: Exception,
         note: str = "",
     ):
@@ -3210,8 +3284,9 @@ class GPhoto2Backend(CameraBackend):
         body is not there: the map as published now (read under _map_lock;
         no bus scan is made) has no entry at camera_index, or has an entry
         other than session's own model and port, or session's port has no
-        usbfs node (_port_node_exists). Otherwise records the failure in the
-        run (_record_preview_failure) and raises PreviewFrameFailedError.
+        usbfs node (_port_node_exists). Otherwise records the failure of the
+        poll's last attempt (attempt, from _preview_attempt) in the run
+        (_record_preview_failure) and raises PreviewFrameFailedError.
         This is the only place in the backend that raises
         PreviewFrameFailedError. The caller must not hold the camera lock.
         """
@@ -3224,7 +3299,7 @@ class GPhoto2Backend(CameraBackend):
         elif not _port_node_exists(session.port):
             reason = f"the device node for {session.port} is gone"
         else:
-            self._record_preview_failure(camera_index, session)
+            self._record_preview_failure(camera_index, session, attempt)
             raise PreviewFrameFailedError(
                 f"DSLR preview capture failed: {cause}"
                 + (f" ({note})" if note else "")
@@ -3254,26 +3329,60 @@ class GPhoto2Backend(CameraBackend):
             )
             self._close_session(camera_index)
 
-    def _preview_frame(self, camera_index: int, session: "_PTPSession") -> bytes:
-        """One capture_preview() on session; a good frame clears the failure record.
+    def _preview_attempt(self) -> tuple[int, float]:
+        """Number and start time (_monotonic()) of an attempt about to be made on a session.
 
-        Caller holds the camera lock.
+        Caller holds the camera lock and makes the attempt before releasing
+        it, so at one index the numbers order the attempts as they used the
+        session, whenever each is later recorded.
+        """
+        with self._preview_record_lock:
+            self._preview_attempts += 1
+            return self._preview_attempts, _monotonic()
+
+    def _preview_frame(
+        self,
+        camera_index: int,
+        session: "_PTPSession",
+        attempt: tuple[int, float],
+    ) -> bytes:
+        """One capture_preview() on session; a good frame ends the run of failures.
+
+        Caller holds the camera lock; attempt is from _preview_attempt.
         """
         camera_file = session._cam.capture_preview()
         data = bytes(camera_file.get_data_and_size())
-        self._end_preview_failure_run(camera_index)
+        self._end_preview_failure_run_at(camera_index, attempt[0])
         return data
+
+    def _end_preview_failure_run_at(self, camera_index: int, number: int):
+        """End the run of failed polls at camera_index with a good attempt numbered number.
+
+        Caller holds the camera lock. A failed attempt numbered below the
+        latest good one is not counted in any run (_note_preview_failure).
+        """
+        with self._preview_record_lock:
+            if number > self._preview_good_attempt.get(camera_index, 0):
+                self._preview_good_attempt[camera_index] = number
+            recorded = self._preview_failures.get(camera_index)
+            if recorded is not None and max(n for n, _ in recorded[1]) < number:
+                del self._preview_failures[camera_index]
 
     def _end_preview_failure_run(
         self, camera_index: int, session: "_PTPSession | None" = None
     ):
         """Forget the run of failed polls at camera_index (only session's, if given)."""
         with self._preview_record_lock:
-            recorded = self._preview_failing_since.get(camera_index)
+            recorded = self._preview_failures.get(camera_index)
             if recorded is not None and (session is None or recorded[0] is session):
-                del self._preview_failing_since[camera_index]
+                del self._preview_failures[camera_index]
 
-    def _note_preview_failure(self, camera_index: int, session: "_PTPSession") -> bool:
+    def _note_preview_failure(
+        self,
+        camera_index: int,
+        session: "_PTPSession",
+        attempt: tuple[int, float],
+    ) -> bool:
         """Record a failed poll; True once the run of failures spans the scan interval.
 
         Takes _preview_record_lock and nothing else, so it may be called with
@@ -3281,31 +3390,56 @@ class GPhoto2Backend(CameraBackend):
         one session, each within _PREVIEW_FAILURE_GAP_S of the one before,
         with no good frame and no successful capture on that session in
         between; a failure after a longer gap, or on another session, starts
-        a new run. The window is _ROUTINE_SCAN_MIN_S because the capture
-        service asks is_camera_connected() before every poll and that
-        re-detects the bus at least that often: once a run has lasted that
-        long, the body has been seen on the bus again during it and the
-        session is what is failing, so it is to be closed and the next poll
-        re-opens it. A run of one poll never spans the window, so a single
-        failed poll never closes the session. The record stays in place
-        until the session is closed (_close_session_if_run_due) or the run
-        ends.
+        a new run. A failure is placed by its attempt (number and start time
+        from _preview_attempt), not by when it is recorded, and the record
+        keeps the failed attempts themselves, so a failure recorded late can
+        still join failures on either side of it into one run
+        (_due_preview_run). A failure numbered below the latest good attempt
+        at the index, or below the newest failure recorded on another
+        session, is not counted. The runs are looked for with the new
+        failure added and before failures that started more than
+        _PREVIEW_FAILURES_KEPT_S before the newest are dropped; once a run
+        spans the window the record keeps it found, whatever is recorded or
+        dropped after it, until a good attempt at the index ends the run
+        (_end_preview_failure_run_at), the session is closed, or failures on
+        a newer session replace the record. The window
+        is _ROUTINE_SCAN_MIN_S because the capture service asks
+        is_camera_connected() before every poll and that re-detects the bus
+        at least that often: once a run has lasted that long, the body has
+        been seen on the bus again during it and the session is what is
+        failing, so it is to be closed and the next poll re-opens it. A run
+        of one poll never spans the window, so a single failed poll never
+        closes the session. The record stays in place until the session is
+        closed (_close_session_if_run_due) or the run ends.
         """
-        now = _monotonic()
+        number, started = attempt
         with self._preview_record_lock:
-            recorded = self._preview_failing_since.get(camera_index)
-            if (
-                recorded is None
-                or recorded[0] is not session
-                or now - recorded[2] > _PREVIEW_FAILURE_GAP_S
-            ):
-                self._preview_failing_since[camera_index] = (session, now, now)
+            if number < self._preview_good_attempt.get(camera_index, 0):
                 return False
-            first = recorded[1]
-            self._preview_failing_since[camera_index] = (session, first, now)
-            return now - first >= _ROUTINE_SCAN_MIN_S
+            recorded = self._preview_failures.get(camera_index)
+            if recorded is not None and recorded[0] is session:
+                failures, due = recorded[1], recorded[2]
+            elif recorded is not None and number < max(n for n, _ in recorded[1]):
+                return False
+            else:
+                failures, due = [], None
+            failures.append((number, started))
+            if due is None:
+                due = _due_preview_run(failures)
+            newest = max(start for _, start in failures)
+            failures = [
+                failure for failure in failures
+                if newest - failure[1] <= _PREVIEW_FAILURES_KEPT_S
+            ]
+            self._preview_failures[camera_index] = (session, failures, due)
+            return due is not None
 
-    def _record_preview_failure(self, camera_index: int, session: "_PTPSession"):
+    def _record_preview_failure(
+        self,
+        camera_index: int,
+        session: "_PTPSession",
+        attempt: tuple[int, float],
+    ):
         """Record a failed poll in the run, closing session if the run now spans the window.
 
         Called with the camera lock not held, and never waits for it: the
@@ -3315,7 +3449,7 @@ class GPhoto2Backend(CameraBackend):
         lock in capture_preview() closes the session
         (_close_session_if_run_due).
         """
-        if not self._note_preview_failure(camera_index, session):
+        if not self._note_preview_failure(camera_index, session, attempt):
             return
         lock = self._get_camera_lock(camera_index)
         if not lock.acquire(blocking=False):
@@ -3326,27 +3460,23 @@ class GPhoto2Backend(CameraBackend):
             lock.release()
 
     def _close_session_if_run_due(self, camera_index: int):
-        """Close the cached session if its recorded run of failed polls spans the window.
+        """Close the cached session if a recorded run of its failed polls spans the window.
 
-        Caller holds the camera lock. A run spans the window when its first
-        and last failures are _ROUTINE_SCAN_MIN_S or more apart; a record
-        whose last failure is more than _PREVIEW_FAILURE_GAP_S old is not
-        acted on, as a new failure would start a new run. A record for a
-        session that is no longer the cached one closes nothing.
+        Caller holds the camera lock. A record in which a run has been found
+        to span the window (_note_preview_failure) closes the session at the
+        next acquisition, unless a good attempt at the index has ended the
+        run since (_end_preview_failure_run_at); nothing else expires it. A
+        record for a session that is no longer the cached one closes nothing.
         """
-        now = _monotonic()
         with self._preview_record_lock:
-            recorded = self._preview_failing_since.get(camera_index)
+            recorded = self._preview_failures.get(camera_index)
             if recorded is None:
                 return
-            session, first, last = recorded
-            if (
-                self._sessions.get(camera_index) is not session
-                or last - first < _ROUTINE_SCAN_MIN_S
-                or now - last > _PREVIEW_FAILURE_GAP_S
-            ):
+            session, _failures, due = recorded
+            if self._sessions.get(camera_index) is not session or due is None:
                 return
-            del self._preview_failing_since[camera_index]
+            del self._preview_failures[camera_index]
+        first, last = due
         self.logger.error(
             f"[gphoto2] Camera {camera_index}: every preview frame has failed "
             f"for {last - first:.0f}s; closing the session"

@@ -83,6 +83,10 @@ class _FakeBackend:
         self.written[out.name] = _sha(out)
         return out, None
 
+    def list_devices(self):
+        """No body rows: the capture routes' camera set-up check finds nothing to set up."""
+        return []
+
 
 @pytest.fixture
 def rotations():

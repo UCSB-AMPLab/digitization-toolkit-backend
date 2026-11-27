@@ -334,6 +334,7 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/network/wifi/join"): Entry(testing=True),
     ("POST", "/network/wifi/join"): Entry(),
     ("DELETE", "/network/wifi/saved/{uuid}"): Entry(),
+    ("GET", "/network/tailscale"): Entry(testing=True),
 }
 
 for _entry in ROUTES.values():
