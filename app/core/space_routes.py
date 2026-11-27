@@ -290,6 +290,10 @@ ROUTES: Dict[Tuple[str, str], Entry] = {
     ("GET", "/system/testing/usb"): Entry(testing=True),
     # The offsite keys adoptions retired. A testing volume has no offsite key, so none is listed.
     ("GET", "/system/offsite/retired-keys"): Entry(),
+    ("GET", "/system/offsite"): Entry(),
+    ("POST", "/system/offsite"): Entry(),
+    ("GET", "/system/offsite/template"): Entry(),
+    ("POST", "/system/offsite/import"): Entry(),
     # An unfinished adoption of captures and its repair (app.core.adopt_repair). A testing volume is never adopted.
     ("GET", "/system/adoption"): Entry(),
     ("POST", "/system/adoption/repair"): Entry(),

@@ -83,7 +83,7 @@ daemon, so it never holds the process.
 **One session per process** (PairingRegistry), the same single-process
 assumption as catalogue_backup's scheduler.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import logging
@@ -423,6 +423,12 @@ class PairingSession:
             self._finish("cancelled")
             return True
 
+    def end_unstarted(self) -> None:
+        """End a session whose worker thread could not be started (`error`, reason `worker_not_started`)."""
+        with self._lock:
+            if self.running:
+                self._finish("error", "worker_not_started")
+
     def stop(self, timeout: float = STOP_JOIN_SECONDS) -> None:
         """Cancel, and wait for the thread to exit."""
         self.cancel()
@@ -491,9 +497,14 @@ class PairingRegistry:
                                  apply=lambda payload: self._apply(payload, session),
                                  before_code=self._before_code, before_apply=before_apply, clock=self._clock,
                                  actor=actor)
-        self._session = session
         if start_thread if start_thread is not None else self._start_threads:
-            session.start()
+            try:
+                session.start()
+            except BaseException:
+                # No worker: the session ends here and is never published, so it never reads as running.
+                session.end_unstarted()
+                raise
+        self._session = session
         return session
 
     def begin(self, unit_name: str, *, actor: Optional[str] = None,

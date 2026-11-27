@@ -1,14 +1,14 @@
 """One fact about this process: its settings may be stale, so a restart is required.
 
 The backend reads its settings once, at import (app.core.config). The
-moment pairing starts provision-rclone.sh, the files those settings came
-from may change, and this process can no longer tell what it would read
-from them. So the latch is set then, immediately before the script
-process is launched (fisqua_pairing_apply._run_script), and cleared only
-by the one branch that has positive evidence nothing changed: the script
-refused, and the settings and the digests of the rclone config and
-offsite.env read the same after the run as before
-(fisqua_pairing_apply.apply_payload). Nothing else clears it. It lives in
+moment pairing or an offsite settings save starts provision-rclone.sh,
+the files those settings came from may change, and this process can no
+longer tell what it would read from them. So the latch is set then,
+immediately before the script process is launched
+(provision_runner.run_script), and cleared only by the one branch that
+has positive evidence nothing changed: the script refused, and the
+settings and the digests of the rclone config and offsite.env read the
+same after the run as before (provision_runner.run_with_evidence). Nothing else clears it. It lives in
 memory only, so a restart clears it by construction.
 
 A second fact sits beside it, under the same lock: shutdown has begun
@@ -17,12 +17,13 @@ only through set_stale_unless_shutting_down, so once shutdown has begun no
 provisioning run starts, and pairing starts no scheduler.
 
 While the latch is set: no pairing session can begin or renew
-(fisqua_pairing_policy.start_refusal answers `restart_required`); pairing
+(fisqua_pairing_policy.start_refusal answers `restart_required`), and
+no offsite settings save begins (app.core.offsite_settings); pairing
 starts no scheduler (fisqua_pairing_service._start_again); and GET
 /system/pairing reports `restartRequired`, so the card offers the unit's
 restart after a reload, or to a second administrator.
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import threading

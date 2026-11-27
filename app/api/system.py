@@ -13,7 +13,8 @@ from typing import Annotated, Literal, Optional
 
 from fastapi import APIRouter, BackgroundTasks, Depends, HTTPException, Query
 from fastapi import Path as PathParam
-from pydantic import BaseModel, ConfigDict, Field, StrictBool, StringConstraints, field_validator, model_validator
+from pydantic import (BaseModel, ConfigDict, Field, SecretStr, StrictBool, StringConstraints, field_validator,
+                      model_validator)
 from sqlalchemy.orm import Session
 
 from app.api.auth import RoleChecker, get_current_user
@@ -535,6 +536,7 @@ _PAIRING_REFUSALS = {
     "script_too_old": "The unit's provisioning script cannot replace its storage credential; the unit must be updated.",
     "not_renewable": "There is no lapsed code to replace.",
     "restart_required": "A link was written or may have been; restart the unit before asking for a new code.",
+    "offsite_save_running": "Offsite settings are being saved; try again when that ends.",
     "unit_name": "The unit name must be 1 to 64 characters.",
 }
 
@@ -579,7 +581,7 @@ def start_pairing(
     422 `unit_name` for a name that is not 1 to 64 characters. 409 with
     {code, message} when the unit may not pair now: `mode_not_eligible`,
     `busy_capturing`, `offsite_held`, `rclone_missing`, `script_missing`,
-    `script_too_old`, `restart_required`, `device_id_missing`, `device_id_invalid`,
+    `script_too_old`, `restart_required`, `offsite_save_running`, `device_id_missing`, `device_id_invalid`,
     `device_id_unreadable`. A session already running is returned as it is.
     """
     from app.core import fisqua_pairing, fisqua_pairing_service
@@ -683,6 +685,14 @@ def _parse_lsblk() -> list[dict]:
 
     _walk(data.get("blockdevices", []))
     return partitions
+
+
+def _require_captua_mount(target: Path, message: str) -> None:
+    """HTTPException 400 unless `target` resolves under _MOUNT_BASE: a path Captua mounted."""
+    try:
+        target.resolve().relative_to(_MOUNT_BASE.resolve())
+    except ValueError:
+        raise HTTPException(status_code=400, detail=message) from None
 
 
 class MountRequest(BaseModel):
@@ -859,10 +869,7 @@ def unmount_device(
     target = Path(body.mountpoint)
 
     # Only allow unmounting paths we own - must be under _MOUNT_BASE
-    try:
-        target.resolve().relative_to(_MOUNT_BASE.resolve())
-    except ValueError:
-        raise HTTPException(status_code=400, detail="Only paths Captua mounted can be unmounted.")
+    _require_captua_mount(target, "Only paths Captua mounted can be unmounted.")
     _refuse_usb_copy_drive(path=target)
 
     # No drive is unmounted while an adoption is running or unfinished
@@ -996,6 +1003,119 @@ def reset_storage(
 
     from app.core.storage_override import get_storage_override  # should be None now
     return {"projects_path": str(settings.projects_dir), "message": "Reverted to the default storage."}
+
+
+# ---------------------------------------------------------------------------
+# Offsite settings without a terminal (NEH-341, app.core.offsite_settings)
+# ---------------------------------------------------------------------------
+
+class OffsiteForm(BaseModel):
+    """The form's five values and whether a different storage key on the unit is to be replaced.
+
+    The key id and the key are SecretStr, so that the model's repr and str hold neither.
+    """
+    model_config = ConfigDict(extra="forbid")
+
+    bucketName: str
+    applicationKeyId: SecretStr
+    applicationKey: SecretStr
+    tenant: str
+    cataloguePublicKey: str
+    replace: StrictBool = False
+
+
+class OffsiteImport(BaseModel):
+    """A drive Captua mounted, holding captua-offsite.txt at its top level."""
+    model_config = ConfigDict(extra="forbid")
+
+    mountpoint: str
+    replace: StrictBool = False
+
+
+def _offsite_refused(exc) -> HTTPException:
+    return HTTPException(status_code=exc.status, detail=exc.detail())
+
+
+@router.get("/offsite")
+def get_offsite_settings(current_user: User = Depends(allow_admin)):
+    """The unit's offsite settings. Admin only. Never the application key.
+
+    {configured, bucketName, tenant, applicationKeyId, cataloguePublicKey,
+    restartRequired}: read from this process's settings and the rclone
+    config's [b2unit]; `restartRequired` while a provisioning run may have
+    changed them (app.core.restart_latch).
+    """
+    from app.core import offsite_settings
+
+    return offsite_settings.current()
+
+
+@router.get("/offsite/template")
+def get_offsite_template(current_user: User = Depends(allow_admin)):
+    """The settings file to fill in, as captua-offsite.txt. Admin only. Holds no value."""
+    from fastapi.responses import PlainTextResponse
+    from app.core import offsite_settings
+
+    return PlainTextResponse(offsite_settings.template_text(), headers={
+        "Content-Disposition": f'attachment; filename="{offsite_settings.STICK_FILE}"'})
+
+
+@router.post("/offsite")
+def save_offsite_settings(
+    body: OffsiteForm,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Save the five values typed at the unit. Admin only.
+
+    {outcome: `restarting` | `restart_needed` | `unchanged`, stickFile:
+    null} after a verified save; `unchanged` when nothing needed changing
+    (no restart). A refusal is 422 for a value (`empty_value`,
+    `bad_value`, with `key` naming the file's key: BUCKET_NAME,
+    APPLICATION_KEY_ID, APPLICATION_KEY, TENANT, CATALOGUE_PUBLIC_KEY) and
+    409 otherwise, with {code, message} (app.core.offsite_settings):
+    `pairing_running`, `offsite_save_running`, `fisqua_linked`,
+    `no_memory_directory`, `listing_failed`, `saved_credential_unusable`
+    among them.
+    `replace` is needed when the unit has a different storage key.
+    """
+    from app.core import offsite_settings
+
+    fields = {"BUCKET_NAME": body.bucketName, "APPLICATION_KEY_ID": body.applicationKeyId.get_secret_value(),
+              "APPLICATION_KEY": body.applicationKey.get_secret_value(), "TENANT": body.tenant,
+              "CATALOGUE_PUBLIC_KEY": body.cataloguePublicKey}
+    try:
+        return offsite_settings.save_form(db, fields, replace=body.replace, actor=current_user.username)
+    except offsite_settings.Refused as exc:
+        raise _offsite_refused(exc) from None
+
+
+@router.post("/offsite/import")
+def import_offsite_settings(
+    body: OffsiteImport,
+    current_user: User = Depends(allow_admin),
+    db: Session = Depends(get_db_dependency),
+):
+    """Import captua-offsite.txt from a drive Captua mounted. Admin only.
+
+    `not_a_drive` (400) unless the path, taken as written and never
+    resolved, names a mount point directly under the mounts base
+    (offsite_settings.open_stick). Otherwise as POST /system/offsite, with
+    the file's own refusals (422: `file_missing`, `file_not_regular`,
+    `file_too_large`, `file_unreadable`, `file_not_deletable`,
+    `file_not_text`, `bad_line` and `unknown_key` with `line`,
+    `duplicate_key`, `missing_key`); every refusal past the path carries
+    stickFile `kept`. After a verified save the stick's copy is deleted:
+    stickFile `deleted`, or `not_deleted` when that failed or the file
+    there is no longer the one read.
+    """
+    from app.core import offsite_settings
+
+    try:
+        return offsite_settings.import_stick(db, body.mountpoint, base=_MOUNT_BASE, replace=body.replace,
+                                             actor=current_user.username)
+    except offsite_settings.Refused as exc:
+        raise _offsite_refused(exc) from None
 
 
 # ---------------------------------------------------------------------------

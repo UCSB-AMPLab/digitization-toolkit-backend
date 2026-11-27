@@ -9,7 +9,7 @@ The host a unit asks is fisqua_pairing_http.pairing_target. After a link
 the unit does not change its mode: nothing here or in the apply step
 switches it, and the card offers the existing switch (PUT /system/unit).
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import logging
@@ -30,6 +30,8 @@ SCRIPT_TOO_OLD = "script_too_old"
 OTHER_WORKSPACE = "other_workspace"
 RESTART_REQUIRED = "restart_required"
 OFFSITE_JOB_RUNNING = "offsite_job_running"
+# provision_runner.BUSY_CODES[OFFSITE_SAVE], named here with the others.
+OFFSITE_SAVE_RUNNING = "offsite_save_running"
 
 
 def mode_gate(db: Session) -> Optional[str]:
@@ -54,9 +56,12 @@ def mode_gate(db: Session) -> Optional[str]:
 def start_refusal(db: Session, *, include_capture: bool = True) -> Optional[str]:
     """The first reason a code may not be asked for now, or None.
 
-    In order: the process's restart latch (`restart_required`: a
-    provisioning run may have changed the settings this process holds); the
-    mode; a capture in progress, then an offsite free or restore (neither
+    In order: the admission to run the provisioning script, held by an
+    offsite settings save (`offsite_save_running`,
+    provision_runner.refusal; begin and renew ask under the registry's
+    lock, which the save holds while it takes the admission); the
+    process's restart latch (`restart_required`: a provisioning run may
+    have changed the settings this process holds); the mode; a capture in progress, then an offsite free or restore (neither
     interrupted: the session is not begun); the offsite hold; rclone; the provisioning
     script, which must exist and, on a unit that already has a credential,
     take --replace-credential. Each is checked here so that no code is
@@ -65,8 +70,11 @@ def start_refusal(db: Session, *, include_capture: bool = True) -> Optional[str]
     capture check, so that a capture begun while a code is shown does not
     end it.
     """
-    from app.core import unit_activity, fisqua_pairing_apply, offsite_hold, restart_latch
+    from app.core import offsite_hold, provision_runner, restart_latch, unit_activity
 
+    busy = provision_runner.refusal(provision_runner.PAIRING)
+    if busy is not None:
+        return busy
     if restart_latch.is_stale():
         return RESTART_REQUIRED
     refusal = mode_gate(db)
@@ -78,12 +86,12 @@ def start_refusal(db: Session, *, include_capture: bool = True) -> Optional[str]
         return OFFSITE_JOB_RUNNING
     if offsite_hold.is_held():
         return OFFSITE_HELD
-    if not fisqua_pairing_apply.rclone_available():
+    if not provision_runner.rclone_available():
         return RCLONE_MISSING
-    script = fisqua_pairing_apply.provision_script()
+    script = provision_runner.provision_script()
     if not script.is_file():
         return SCRIPT_MISSING
-    if fisqua_pairing_apply.has_credential() and not fisqua_pairing_apply.script_supports_replace(script):
+    if provision_runner.has_credential() and not provision_runner.script_supports_replace(script):
         return SCRIPT_TOO_OLD
     return None
 
