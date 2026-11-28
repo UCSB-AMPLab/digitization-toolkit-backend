@@ -4,9 +4,11 @@ The kind is resolved once, in the lifespan, before the start-up guard
 (capture.service.assert_camera_backend_configured), in this order:
 
 1. the administrator's stored choice (PUT /system/camera-kind);
-2. an explicit CAMERA_BACKEND in the process environment or an env file,
-   passed on as written, so the guard still refuses a value the build
-   does not have;
+2. an explicit CAMERA_BACKEND in the process environment or an env file
+   that names a driver this build has (capture.service.KNOWN_CAMERA_BACKENDS),
+   passed on as written. A value that names none is logged, set aside, and
+   reported (`ignored_environment`), and the kind is chosen as for an unset
+   value, so the service starts (NEH-405);
 3. detection: the kind of the cameras connected now, when there is
    exactly one kind;
 4. the kind the unit last started with, else picamera2.
@@ -94,6 +96,8 @@ class Resolution(NamedTuple):
     kind: str
     source: str
     detection: Optional[dict]
+    # The explicit CAMERA_BACKEND set aside because it names no driver, as written.
+    ignored: Optional[str] = None
 
 
 def _canonical(value) -> str:
@@ -400,8 +404,22 @@ def resolve() -> Resolution:
     if choice is not None:
         return Resolution(choice, STORED, None)
     explicit = _explicit(_capture_settings().CAMERA_BACKEND)
+    ignored = None
     if explicit is not None:
-        return Resolution(explicit, ENVIRONMENT, None)
+        from capture.service import KNOWN_CAMERA_BACKENDS
+
+        if _canonical(explicit) in KNOWN_CAMERA_BACKENDS:
+            return Resolution(explicit, ENVIRONMENT, None)
+        ignored = explicit
+        logger.warning("CAMERA_BACKEND is set to %r, which is not a driver this build has (%s); "
+                       "ignored, and the kind is chosen as if it were unset",
+                       explicit, ", ".join(KNOWN_CAMERA_BACKENDS))
+    resolution = _resolve_without_explicit()
+    return resolution._replace(ignored=ignored)
+
+
+def _resolve_without_explicit() -> Resolution:
+    """Detection, then the kind last used, then picamera2."""
     detection = detect()
     available = _availability()
     choosing = dict(detection["connected"])
@@ -442,8 +460,9 @@ def apply_at_startup() -> Resolution:
     for settings in targets.values():
         if settings.CAMERA_BACKEND != resolution.kind:
             settings.CAMERA_BACKEND = resolution.kind
-    global _applied_choice
+    global _applied_choice, _ignored_environment
     _applied_choice = resolution.kind if resolution.source == STORED else None
+    _ignored_environment = resolution.ignored
     _in_effect = {"kind": _canonical(resolution.kind), "source": resolution.source}
     logger.info("Camera kind %s (%s)", _in_effect["kind"], resolution.source)
     return resolution
@@ -457,6 +476,15 @@ _applied_choice: Optional[str] = None
 
 def applied_choice() -> Optional[str]:
     return _applied_choice
+
+
+# The explicit CAMERA_BACKEND this process set aside at its start (None: none
+# was), set once by apply_at_startup.
+_ignored_environment: Optional[str] = None
+
+
+def ignored_environment() -> Optional[str]:
+    return _ignored_environment
 
 
 # Whether this process has remembered the kind of a driver it built.
@@ -535,6 +563,8 @@ def _held(backend) -> Optional[int]:
 #   pending_restart  the stored choice differs from the one this process
 #              started with (null counts as a value): the next start
 #              applies it
+#   ignored_environment  the CAMERA_BACKEND this start set aside because it
+#              names no driver, as written; null when none was
 #
 # Start-up detection (resolve) differs in two ways: with neither picamera2
 # importable nor rpicam-still on PATH the Pi count is 0, not unknown; and a
@@ -568,4 +598,5 @@ def report(backend) -> dict:
         "available": _availability(),
         "mixed": found["mixed"],
         "mismatch": mine == 0 and any(_measured_positive(n) for k, n in connected.items() if k != key),
+        "ignored_environment": _ignored_environment,
     }

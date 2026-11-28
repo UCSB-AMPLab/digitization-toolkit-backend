@@ -84,12 +84,13 @@ async def lifespan(app: FastAPI):
     from app.core import provision_runner
     if provision_runner.DEV_SHM.is_dir():
         provision_runner.sweep_abandoned(provision_runner.DEV_SHM)
-    # Refuse to serve with a CAMERA_BACKEND this build does not have. Checked
-    # here rather than where the backend is built, because that happens lazily
-    # on the first capture: the service would otherwise start, answer /health,
-    # and fail only when an operator tried to take a photograph (NEH-268).
-    # Imported inside the lifespan, as shutdown_backend is, so importing the
-    # application does not pull in the capture stack.
+    # Never serve with a CAMERA_BACKEND this build does not have (NEH-268).
+    # Checked here rather than where the backend is built, because that
+    # happens lazily on the first capture. apply_at_startup sets an unknown
+    # explicit value aside and resolves a kind the build has (NEH-405), so the
+    # guard passes and the service starts; it refuses only a kind resolution
+    # did not settle. Imported inside the lifespan, as shutdown_backend is, so
+    # importing the application does not pull in the capture stack.
     from capture.service import assert_camera_backend_configured
     # Which kind of camera the unit drives: the administrator's stored
     # choice, an explicit CAMERA_BACKEND, detection, or the kind last used

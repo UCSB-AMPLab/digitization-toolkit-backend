@@ -375,10 +375,41 @@ def test_an_explicit_value_wins_over_detection(monkeypatch):
 
 @pytest.mark.unit
 def test_an_explicit_value_is_passed_on_as_written(monkeypatch):
-    """The start-up guard reads it and refuses a value the build does not have."""
-    _explicit(monkeypatch, "gphoto")
+    """A value the build has, in whatever case and spacing, reaches the guard as written."""
+    _explicit(monkeypatch, " GPhoto2 ")
     r = camera_kind.resolve()
-    assert (r.kind, r.source) == ("gphoto", "environment")
+    assert (r.kind, r.source, r.ignored) == (" GPhoto2 ", "environment", None)
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("value", ["gphoto", "libgphoto2", "none"])
+def test_an_unknown_explicit_value_is_ignored_for_detection(monkeypatch, caplog, value):
+    """NEH-405: a value no driver has is logged and set aside; detection chooses the kind."""
+    _explicit(monkeypatch, value)
+    _probes(monkeypatch, canon=[A2500])
+    with caplog.at_level(logging.WARNING, logger="app.core.camera_kind"):
+        r = camera_kind.resolve()
+    assert (r.kind, r.source, r.ignored) == ("chdk", "detected", value)
+    assert repr(value) in caplog.text
+    for known in capture_service.KNOWN_CAMERA_BACKENDS:
+        assert known in caplog.text
+
+
+@pytest.mark.unit
+def test_an_unknown_explicit_value_falls_back_as_an_unset_one_does(monkeypatch):
+    _explicit(monkeypatch, "gphoto")
+    _probes(monkeypatch)
+    camera_kind.record_last_used("gphoto2")
+    r = camera_kind.resolve()
+    assert (r.kind, r.source, r.ignored) == ("gphoto2", "last_used", "gphoto")
+
+
+@pytest.mark.unit
+def test_a_stored_choice_reads_no_explicit_value_and_ignores_none(monkeypatch):
+    _explicit(monkeypatch, "gphoto")
+    camera_kind.store_choice("chdk")
+    r = camera_kind.resolve()
+    assert (r.kind, r.source, r.ignored) == ("chdk", "stored", None)
 
 
 @pytest.mark.unit
@@ -668,12 +699,29 @@ def test_start_up_with_probes_failing_still_starts(monkeypatch):
 
 
 @pytest.mark.unit
-def test_start_up_refusing_a_value_remembers_nothing(monkeypatch):
+def test_start_up_with_an_unknown_value_starts_on_the_detected_kind(monkeypatch):
+    """NEH-405: the service starts, so systemd has no failure to restart."""
+    from app.core import config
+
     app_main, scans = _stub_lifespan(monkeypatch)
     _explicit(monkeypatch, "gphoto")
-    with pytest.raises(capture_service.UnknownCameraBackend):
-        _serve(app_main)
+    _probes(monkeypatch, canon=[OTHER_CANON])
+    _serve(app_main)
+    assert scans == ["gphoto2"]
+    assert capture_service.settings.CAMERA_BACKEND == "gphoto2"
+    assert config.settings.CAMERA_BACKEND == "gphoto2"
+    assert camera_kind.in_effect() == {"kind": "gphoto2", "source": "detected"}
+    assert camera_kind.ignored_environment() == "gphoto"
+    # Nothing was built: the start-up scan is stubbed, so nothing is remembered.
     assert camera_kind.last_used() is None
+
+
+@pytest.mark.unit
+def test_start_up_with_a_known_value_ignores_nothing(monkeypatch):
+    app_main, scans = _stub_lifespan(monkeypatch)
+    _explicit(monkeypatch, "chdk")
+    _serve(app_main)
+    assert camera_kind.ignored_environment() is None
 
 
 @pytest.mark.unit
@@ -932,8 +980,42 @@ def test_every_signed_in_role_reads_the_kind_without_a_backend(client, monkeypat
                            "pending_restart": False, "detected": "gphoto2",
                            "connected": {"picamera2": 0, "gphoto2": 2, "chdk": 0},
                            "available": {"picamera2": True, "gphoto2": True, "chdk": True},
-                           "mixed": False, "mismatch": False}
+                           "mixed": False, "mismatch": False, "ignored_environment": None}
     assert built == []
+
+
+@pytest.mark.unit
+def test_a_start_with_an_unknown_value_reports_it_as_written_on_both_routes(client, monkeypatch):
+    """The value is the raw one, spaces and case kept: nothing seeds the reporting global."""
+    from tests.unit.test_capture_manifest_export import _as
+
+    app_main, scans = _stub_lifespan(monkeypatch)
+    _explicit(monkeypatch, " GPhoto ")
+    _probes(monkeypatch, canon=[OTHER_CANON])
+    _serve(app_main)
+    assert scans == ["gphoto2"]
+    monkeypatch.setattr(capture_service, "get_backend", lambda: _Backend("gphoto2"))
+    monkeypatch.setattr(capture_service, "_backend", None)
+    for route in ("/system/camera-kind", "/cameras/capabilities"):
+        resp = _as(client, "operator").get(route)
+        assert resp.status_code == 200, resp.text
+        body = resp.json()
+        assert body["ignored_environment"] == " GPhoto ", route
+        assert (body["configured"], body["source"]) == ("gphoto2", "detected"), route
+
+
+@pytest.mark.unit
+@pytest.mark.parametrize("route", ["/system/camera-kind", "/cameras/capabilities"])
+def test_the_routes_report_an_ignored_value(client, monkeypatch, route):
+    from tests.unit.test_capture_manifest_export import _as
+
+    monkeypatch.setattr(capture_service, "get_backend", lambda: _Backend("gphoto2"))
+    monkeypatch.setattr(capture_service, "_backend", None)
+    _effect(monkeypatch, "gphoto2", source="detected")
+    monkeypatch.setattr(camera_kind, "_ignored_environment", "gphoto", raising=False)
+    resp = _as(client, "operator").get(route)
+    assert resp.status_code == 200, resp.text
+    assert resp.json()["ignored_environment"] == "gphoto"
 
 
 @pytest.mark.unit
