@@ -121,7 +121,9 @@ def assert_camera_backend_configured() -> str:
     the machine furthest from help, so a typo in one line of .env would be
     indistinguishable from a dead camera (NEH-268).
 
-    Called from the application's lifespan as well as from the dispatch below.
+    Called from the application's lifespan, after camera_kind.apply_at_startup
+    has set an unknown explicit value aside (NEH-405), as well as from the
+    dispatch below.
     The dispatch alone is not enough: the backend is constructed lazily on the
     first capture, so a check that lived only here would let the service start,
     answer /health, and fail at the moment someone tried to photograph
@@ -142,9 +144,9 @@ def assert_camera_backend_configured() -> str:
         raise UnknownCameraBackend(
             f"CAMERA_BACKEND is set to {settings.CAMERA_BACKEND!r}, which is not "
             f"a backend this build has. Valid values: "
-            f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env and restart. "
-            f"The service refuses to start rather than fall back, because a "
-            f"fallback to another backend presents as a dead camera."
+            f"{', '.join(KNOWN_CAMERA_BACKENDS)}. Correct it in .env. No other "
+            f"backend is built in its place, because a fallback to another "
+            f"backend presents as a dead camera."
         )
     return configured
 

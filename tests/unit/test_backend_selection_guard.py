@@ -7,10 +7,10 @@ RpicamBackend is a third backend, neither the one configured nor the one
 intended: on a DSLR rig it yields no cameras and presents as a hardware fault,
 so a typo in one line of .env would be indistinguishable from a dead camera.
 
-Two things have to hold: the value is refused, AND it is refused at startup.
-The backend is built lazily on the first capture, so a guard that lived only in
-the dispatch would let the service start, answer /health, and fail at the
-moment someone tried to photograph something.
+The guard refuses such a value wherever a backend is built. At startup the
+application never reaches it with one (NEH-405): the lifespan sets an unknown
+value aside, logs it, reports it, and chooses the kind as for an unset value,
+so the service starts and systemd has no failure to restart.
 
 CI runs `pytest -m "not camera"`. The backend's root conftest.py adds
 @pytest.mark.camera only to the hardware files in HARDWARE_TEST_FILES, so
@@ -18,7 +18,7 @@ these tests run in CI whatever their names say.
 
 Run with: python -m pytest tests/unit/test_backend_selection_guard.py
 
-Version: 0.3.0
+Version: 0.4.0
 """
 
 import pytest
@@ -158,8 +158,8 @@ def test_an_unrecognised_value_builds_nothing_at_all(monkeypatch):
 
 
 @pytest.mark.unit
-def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
-    """The wiring. Without this the guard above never runs on a real unit.
+def test_the_application_lifespan_starts_past_an_unrecognised_value(monkeypatch):
+    """NEH-405: the service starts on a kind it has, never on the value it was given.
 
     Follows test_backend_shutdown.py's pattern for exercising the real
     lifespan with the rest of the startup work stubbed out.
@@ -194,9 +194,9 @@ def test_the_application_lifespan_refuses_an_unrecognised_value(monkeypatch):
         async with app_main.app.router.lifespan_context(app_main.app):
             served.append(1)
 
-    with pytest.raises(capture_service.UnknownCameraBackend):
-        asyncio.run(serve())
-    assert served == [], "the application started with a backend it does not have"
+    asyncio.run(serve())
+    assert served == [1], "the application refused to start on an unknown value"
+    assert capture_service.settings.CAMERA_BACKEND in capture_service.KNOWN_CAMERA_BACKENDS
 
 
 @pytest.mark.unit

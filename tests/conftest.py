@@ -452,6 +452,7 @@ def _camera_kind_isolated(monkeypatch, tmp_path_factory):
     monkeypatch.setattr(camera_kind, "_probe_failures", {}, raising=False)
     monkeypatch.setattr(camera_kind, "_built_recorded", False, raising=False)
     monkeypatch.setattr(camera_kind, "_applied_choice", None, raising=False)
+    monkeypatch.setattr(camera_kind, "_ignored_environment", None, raising=False)
     monkeypatch.setattr(camera_kind, "_availability",
                         lambda: {"picamera2": True, "gphoto2": True, "chdk": True}, raising=False)
     monkeypatch.setattr(camera_kind, "_rpicam_available", lambda: True, raising=False)
